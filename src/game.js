@@ -36,6 +36,7 @@ import { createRendererController } from './core/renderer.js';
 import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
+  SCALE_STAGE_IDS,
   canScaleStageDamageTarget,
   getScaleStage,
   isScaleSandboxAtomicEnabled,
@@ -655,6 +656,31 @@ let inputController, rendererController;
             shake = Math.max(shake, baseAmount * activeScaleStage.playerShakeMultiplier);
         }
 
+        function canSpawnTankForCurrentProgression() {
+            // Phase 1B: Max時だけ既存のTank spawn回帰を許可する。
+            // Growth MVPでは `stage === MAX && wantedLevel === MAX` へ置き換える入口。
+            return activeScaleStageId === SCALE_STAGE_IDS.MAX;
+        }
+
+        function syncTankSandboxState() {
+            const allowTank = canSpawnTankForCurrentProgression();
+            for (const en of entities) {
+                if (en.type !== 'tank') continue;
+                en.sandboxSuppressed = !allowTank;
+                if (en.sandboxSuppressed) en.mesh.visible = false;
+            }
+
+            if (!allowTank) {
+                for (let i = bullets.length - 1; i >= 0; i--) {
+                    const bullet = bullets[i];
+                    if (bullet.owner?.type !== 'tank') continue;
+                    scene.remove(bullet.mesh);
+                    safeDispose(bullet.mesh);
+                    bullets.splice(i, 1);
+                }
+            }
+        }
+
         function applyScaleStage(stageId, { resetCamera = true } = {}) {
             const nextStage = getScaleStage(stageId);
             activeScaleStageId = stageId;
@@ -679,6 +705,7 @@ let inputController, rendererController;
             }
 
             resetAtomicChargeForScaleSandbox();
+            syncTankSandboxState();
         }
 
         function applyHumanVisualScale(scale) {
@@ -769,7 +796,9 @@ let inputController, rendererController;
                 camera.lookAt(-40, lobbyTerrainY + 50, 5200);
 
                 // 【修正】戦車を少しカニに近づけ、対峙する構図にします
-                spawnEntity('tank', -800, 4700, Math.PI * 0.45);
+                if (canSpawnTankForCurrentProgression()) {
+                    spawnEntity('tank', -800, 4700, Math.PI * 0.45);
+                }
             }
             
             // animationIdを確実にキャンセルしたうえで、一本のスレッドスケジュールを保証する
@@ -1640,8 +1669,10 @@ let inputController, rendererController;
                     spawnEntity('school', tc.x, tc.z, 0);
                 } else if (tc.type === 'military') {
                     spawnEntity('tower', tc.x, tc.z, 0);
-                    spawnEntity('tank', tc.baseX - 150, tc.baseZ + 120);
-                    spawnEntity('tank', tc.baseX + 150, tc.baseZ - 120);
+                    if (canSpawnTankForCurrentProgression()) {
+                        spawnEntity('tank', tc.baseX - 150, tc.baseZ + 120);
+                        spawnEntity('tank', tc.baseX + 150, tc.baseZ - 120);
+                    }
                 } else if (tc.type === 'suburb') {
                     spawnEntity('church', tc.x, tc.z, Math.PI);
                 }
@@ -2931,6 +2962,7 @@ let inputController, rendererController;
             for (let en of entities) {
                 if (en.isDead) continue;
                 if (en.type === 'human' || en.type === 'tank') {
+                    if (en.type === 'tank' && en.sandboxSuppressed) continue;
                     if (Math.abs(en.mesh.position.x - pPos.x) > 3000 || 
                         Math.abs(en.mesh.position.z - pPos.z) > 3000) continue;
 
@@ -4027,7 +4059,9 @@ let inputController, rendererController;
             const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));
             const spawnChance = 0.012 + Math.min(0.028, score * 0.000003); // 破壊規模に応じて最大4.0%まで頻度向上
             
-            if (tankCount < currentAllowedTanks && frameRateIndependentChance(spawnChance, dtScale)) {
+            // Scoreは将来の手配度ではない。正式GrowthではcanSpawnTankForCurrentProgressionだけを置き換える。
+            const tankSpawnAllowed = canSpawnTankForCurrentProgression();
+            if (tankSpawnAllowed && tankCount < currentAllowedTanks && frameRateIndependentChance(spawnChance, dtScale)) {
                 const SPAWN_ABLE_BASE_DIST_SQ = 5800 * 5800;
                 const activeBases = militaryBases.filter(mb => {
                     if (mb.isDead) return false;
@@ -4122,6 +4156,12 @@ let inputController, rendererController;
                 } 
 
                 const dSq = en.mesh.position.distanceToSquared(pPos);
+
+                // Tiny/Mid中の既存Tankは配列とAI stateを保持したまま、描画・更新・攻撃を停止する。
+                if (en.type === 'tank' && en.sandboxSuppressed) {
+                    en.mesh.visible = false;
+                    continue;
+                }
 
                 // 【不具合修正】プレイヤーから一定距離以上遠く離れた戦車を自動消滅（デスポーン）させる
                 // これにより、遠くの基地に溜まったまま一歩も動かない戦車を安全にリサイクルし、偏りやスタックを解消
@@ -4744,6 +4784,12 @@ let inputController, rendererController;
 
             for (let i = bullets.length - 1; i >= 0; i--) {
                 const b = bullets[i];
+                if (b.owner?.type === 'tank' && b.owner.sandboxSuppressed) {
+                    scene.remove(b.mesh);
+                    safeDispose(b.mesh);
+                    bullets.splice(i, 1);
+                    continue;
+                }
                 const baseBVel = b.type === 'acid' ? BOSS_ACID_SPEED : TANK_BULLET_SPEED;
                 b.mesh.position.addScaledVector(b.dir, baseBVel * difficultyScale * dtScale);
                 
@@ -4946,7 +4992,7 @@ let inputController, rendererController;
         function updateCompass() {
             let nearest = null, nearestDistSq = Infinity;
             for (let en of entities) {
-                if ((en.type === 'tank' || en.type === 'boss') && !en.isDead) {
+                if ((en.type === 'tank' || en.type === 'boss') && !en.isDead && !en.sandboxSuppressed) {
                     const dSq = en.mesh.position.distanceToSquared(player.mesh.position);
                     if (dSq < nearestDistSq) { nearestDistSq = dSq; nearest = en; }
                 }
@@ -5099,7 +5145,7 @@ let inputController, rendererController;
             player.mesh.rotation.x = 0; // コケた傾きを元に戻す
             player.mesh.rotation.z = 0; // コケた傾きを元に戻す
             yaw = landingSpot.facingAngle; // 通常カメラの水平向きをカニの向きに合わせておく
-            pitch = activeScaleStageId === 'MAX' ? 0.45 : activeScaleStage.cameraPitch;
+            pitch = activeScaleStageId === SCALE_STAGE_IDS.MAX ? 0.45 : activeScaleStage.cameraPitch;
 
             // オープニング演出: 池の中から陸へ上がる歩行＆トラッキングカメラ
             isIntroPlaying = true;
@@ -5215,7 +5261,9 @@ let inputController, rendererController;
             camera.position.set(220, lobbyTerrainY + 80, 5580);
             camera.lookAt(-40, lobbyTerrainY + 50, 5200);
             // 初回ロビーと同様、対峙する戦車を再配置
-            spawnEntity('tank', -800, 4700, Math.PI * 0.45);
+            if (canSpawnTankForCurrentProgression()) {
+                spawnEntity('tank', -800, 4700, Math.PI * 0.45);
+            }
 
             // UIを最初の状態（スタート画面）に復元
             document.getElementById('start-screen').style.display = 'flex';
@@ -5495,12 +5543,16 @@ let inputController, rendererController;
                 `Collision: ${activeScaleStage.collisionRadius.toFixed(2)} | Speed: ${activeScaleStage.movementSpeed.toFixed(1)} | ` +
                 `Jump: ${activeScaleStage.jumpVelocity.toFixed(1)} | Attack: ${activeScaleStage.singleAttackRadius}/${activeScaleStage.doubleAttackRadius} | ` +
                 `Camera: ${camDist.toFixed(0)} | Pitch: ${pitch.toFixed(2)} | Yaw: ${yawDegrees.toFixed(0)}° | ` +
-                `Shake: x${activeScaleStage.playerShakeMultiplier.toFixed(2)}`;
+                `Shake: x${activeScaleStage.playerShakeMultiplier.toFixed(2)} | ` +
+                `Tank normal spawn: ${canSpawnTankForCurrentProgression() ? 'Yes' : 'No'}`;
             document.getElementById('debug-human-scale').value = String(humanVisualScale);
             const spawnBtn = document.getElementById('debug-spawn-boss-btn');
             const killBtn = document.getElementById('debug-kill-boss-btn');
+            const spawnTankBtn = document.getElementById('debug-spawn-tank-btn');
             spawnBtn.disabled = !gameRunning || bossActive;
             killBtn.disabled = !bossActive;
+            spawnTankBtn.disabled = !gameRunning || !canSpawnTankForCurrentProgression();
+            spawnTankBtn.innerText = canSpawnTankForCurrentProgression() ? '召喚' : 'Maxのみ';
         }
 
         function openDebugModal() {
@@ -5545,6 +5597,16 @@ let inputController, rendererController;
         });
         document.getElementById('debug-human-scale').addEventListener('change', event => {
             applyHumanVisualScale(Number(event.target.value));
+            refreshDebugModal();
+        });
+        document.getElementById('debug-spawn-tank-btn').addEventListener('click', () => {
+            if (!gameRunning || !canSpawnTankForCurrentProgression()) return;
+            const angle = Math.random() * Math.PI * 2;
+            spawnEntity(
+                'tank',
+                player.mesh.position.x + Math.cos(angle) * 900,
+                player.mesh.position.z + Math.sin(angle) * 900
+            );
             refreshDebugModal();
         });
         document.getElementById('debug-spawn-boss-btn').addEventListener('click', () => {
