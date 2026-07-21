@@ -115,19 +115,68 @@ test('TINY and MID use independently tuned visual, collision, movement, attack, 
   assert.equal(tiny.movementSpeed, PLAYER_SPEED * 0.5);
   assert.equal(tiny.jumpVelocity, PLAYER_JUMP_VELOCITY * 0.6);
   assert.equal(tiny.singleAttackRadius, 70);
-  assert.equal(tiny.cameraDistance, 120);
+  assert.equal(tiny.cameraDistance, 140);
   assert.equal(tiny.cameraNear, 1);
+  assert.equal(tiny.cameraMinDistance, 90);
+  assert.equal(tiny.cameraMaxDistance, 360);
+  assert.equal(tiny.cameraMinPitch, 0.05);
+  assert.equal(tiny.cameraMaxPitch, 1.5);
+  assert.equal(tiny.playerShakeMultiplier, 0.15);
 
   assert.equal(mid.visualScale, 0.45);
   assert.equal(mid.collisionRadius, PLAYER_RADIUS * 0.45);
   assert.equal(mid.movementSpeed, PLAYER_SPEED * 0.75);
   assert.equal(mid.jumpVelocity, PLAYER_JUMP_VELOCITY * 0.8);
   assert.equal(mid.singleAttackRadius, 165);
-  assert.equal(mid.cameraDistance, 260);
+  assert.equal(mid.cameraDistance, 280);
   assert.equal(mid.cameraNear, 4);
+  assert.equal(mid.cameraMinDistance, 180);
+  assert.equal(mid.cameraMaxDistance, 650);
+  assert.equal(mid.cameraMinPitch, 0.08);
+  assert.equal(mid.cameraMaxPitch, 1.42);
+  assert.equal(mid.playerShakeMultiplier, 0.45);
 
   assert.notEqual(tiny.movementSpeed / PLAYER_SPEED, tiny.visualScale);
   assert.notEqual(mid.singleAttackRadius / 350, mid.visualScale);
+});
+
+test('all stages retain full yaw, tuned pitch/distance bounds, and safe near-camera settings', () => {
+  const tiny = SCALE_STAGES.TINY;
+  const mid = SCALE_STAGES.MID;
+  const max = SCALE_STAGES.MAX;
+
+  for (const stage of [tiny, mid, max]) {
+    assert.equal(stage.cameraYawRestriction, 'FULL');
+    assert.equal(stage.cameraRotationSensitivity, 1);
+    assert.ok(stage.cameraMinPitch < stage.cameraPitch);
+    assert.ok(stage.cameraPitch < stage.cameraMaxPitch);
+    assert.ok(stage.cameraMinDistance <= stage.cameraDistance);
+    assert.ok(stage.cameraDistance <= stage.cameraMaxDistance);
+  }
+  assert.deepEqual(
+    [tiny.cameraGroundClearance, mid.cameraGroundClearance, max.cameraGroundClearance],
+    [6, 10, 12],
+  );
+  assert.deepEqual([tiny.cameraNear, mid.cameraNear, max.cameraNear], [1, 4, 10]);
+
+  assert.match(game, /yaw -= e\.movementX \* CAM_MOUSE_ROTATION_SPEED \* settings\.mouseSensitivity \* activeScaleStage\.cameraRotationSensitivity;/);
+  assert.doesNotMatch(game, /yaw\s*=\s*Math\.(?:max|min)|Math\.(?:max|min)\([^\n]*yaw/);
+});
+
+test('stage-scaled Player shake, stage reset, and camera ground protection are explicit', () => {
+  const [tiny, mid, max] = [SCALE_STAGES.TINY, SCALE_STAGES.MID, SCALE_STAGES.MAX];
+  assert.deepEqual(
+    [tiny.playerShakeMultiplier, mid.playerShakeMultiplier, max.playerShakeMultiplier],
+    [0.15, 0.45, 1],
+  );
+  assert.deepEqual([tiny.cameraShakeCap, mid.cameraShakeCap, max.cameraShakeCap], [36, 96, Infinity]);
+
+  const applyStage = extractFunction(game, 'applyScaleStage');
+  assert.match(applyStage, /shake = 0;/);
+  const playerShake = extractFunction(game, 'applyPlayerCameraShake');
+  assert.match(playerShake, /baseAmount \* activeScaleStage\.playerShakeMultiplier/);
+  assert.match(game, /const appliedShake = Math\.min\(shake, activeScaleStage\.cameraShakeCap\) \* settings\.cameraShake;/);
+  assert.match(game, /camera\.position\.y = Math\.max\(\s*player\.mesh\.position\.y \+ activeScaleStage\.cameraGroundClearance,/s);
 });
 
 test('stage switching reuses Player, Renderer, RAF, and listeners while preserving World state', () => {
@@ -210,6 +259,39 @@ test('Human scale comparison remains visual-only and exposes the three approved 
   assert.match(html, /<option value="1">Current<\/option>/);
   assert.match(html, /<option value="0\.65">0\.65<\/option>/);
   assert.match(html, /<option value="0\.4">0\.40<\/option>/);
+});
+
+test('Tank spawn is stage-gated without introducing wanted, threat, or score proxy state', () => {
+  const tankGate = extractFunction(game, 'canSpawnTankForCurrentProgression');
+  assert.match(tankGate, /return activeScaleStageId === SCALE_STAGE_IDS\.MAX;/);
+  assert.doesNotMatch(tankGate.replace(/\/\/[^\n]*/g, ''), /score|wantedLevel|threat/i);
+  assert.doesNotMatch(game, /\b(?:let|const|var)\s+(?:wantedLevel|threat(?:Level)?|tankUnlock)\b/i);
+
+  assert.match(game, /const tankSpawnAllowed = canSpawnTankForCurrentProgression\(\);/);
+  assert.match(game, /if \(tankSpawnAllowed && tankCount < currentAllowedTanks && frameRateIndependentChance\(spawnChance, dtScale\)\)/);
+  assert.ok((game.match(/if \(canSpawnTankForCurrentProgression\(\)\) \{/g) || []).length >= 3);
+});
+
+test('existing Tanks are suppressed and resumed without deleting their gameplay state', () => {
+  const syncTanks = extractFunction(game, 'syncTankSandboxState');
+  assert.match(syncTanks, /en\.sandboxSuppressed = !allowTank;/);
+  assert.match(syncTanks, /if \(en\.sandboxSuppressed\) en\.mesh\.visible = false;/);
+  assert.doesNotMatch(syncTanks, /entities\.splice|entities\.filter|en\.isDead\s*=/);
+
+  assert.match(game, /if \(en\.type === 'tank' && en\.sandboxSuppressed\) \{\s*en\.mesh\.visible = false;\s*continue;/s);
+  assert.match(game, /if \(b\.owner\?\.type === 'tank' && b\.owner\.sandboxSuppressed\) \{/);
+  assert.match(game, /if \(\(en\.type === 'tank' \|\| en\.type === 'boss'\) && !en\.isDead && !en\.sandboxSuppressed\)/);
+});
+
+test('the debug Tank route is Max-only and reports the current stage camera and Tank state', () => {
+  assert.match(html, /id="debug-spawn-tank-btn"/);
+  assert.match(game, /Tank normal spawn: \$\{canSpawnTankForCurrentProgression\(\) \? 'Yes' : 'No'\}/);
+  assert.match(game, /spawnTankBtn\.disabled = !gameRunning \|\| !canSpawnTankForCurrentProgression\(\);/);
+  assert.match(game, /spawnTankBtn\.innerText = canSpawnTankForCurrentProgression\(\) \? '召喚' : 'Maxのみ';/);
+  assert.match(game, /debug-spawn-tank-btn'\)\.addEventListener\('click', \(\) => \{\s*if \(!gameRunning \|\| !canSpawnTankForCurrentProgression\(\)\) return;/s);
+  for (const label of ['Camera:', 'Pitch:', 'Yaw:', 'Shake:', 'Tank normal spawn:']) {
+    assert.ok(game.includes(label), `missing debug status: ${label}`);
+  }
 });
 
 test('the sandbox does not introduce growth, perk, save, Terrain, Chunk, Query, or Seed systems', () => {

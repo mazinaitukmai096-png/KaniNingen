@@ -63,11 +63,20 @@ test('Tank and military spawn chance has identical elapsed-time probability at 3
     }
   }
 
-  const currentSpawn = sliceBetween(game, 'const currentAllowedTanks', 'let activeShelterBuildings')
-    .replace('frameRateIndependentChance(spawnChance, dtScale)', 'Math.random() < spawnChance')
-    .trim();
-  const baselineSpawn = sliceBetween(baselineGame, 'const currentAllowedTanks', 'for (let ei = 0; ei < entities.length; ei++)').trim();
-  assert.equal(currentSpawn, baselineSpawn);
+  const currentSpawn = sliceBetween(game, 'const currentAllowedTanks', 'let activeShelterBuildings');
+  const baselineSpawn = sliceBetween(baselineGame, 'const currentAllowedTanks', 'for (let ei = 0; ei < entities.length; ei++)');
+  for (const snippet of [
+    'const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));',
+    'const spawnChance = 0.012 + Math.min(0.028, score * 0.000003);',
+    'const SPAWN_ABLE_BASE_DIST_SQ = 5800 * 5800;',
+    "spawnEntity('tank',",
+    'score > 2500',
+  ]) {
+    assert.ok(currentSpawn.includes(snippet));
+    assert.ok(baselineSpawn.includes(snippet));
+  }
+  assert.match(currentSpawn, /const tankSpawnAllowed = canSpawnTankForCurrentProgression\(\);/);
+  assert.match(currentSpawn, /if \(tankSpawnAllowed && tankCount < currentAllowedTanks && frameRateIndependentChance\(spawnChance, dtScale\)\)/);
 });
 
 test('time-based Particle generation preserves the 60fps event expectation', () => {
@@ -108,7 +117,7 @@ test('Human and Boss state probabilities use elapsed-time conversion without cha
 
 test('Tank count remains bounded by the unchanged gameplay cap', () => {
   assert.match(game, /const currentAllowedTanks = bossActive \? 2 : Math\.min\(10, 4 \+ Math\.floor\(score \/ 6000\)\);/);
-  assert.match(game, /if \(tankCount < currentAllowedTanks && frameRateIndependentChance\(spawnChance, dtScale\)\)/);
+  assert.match(game, /if \(tankSpawnAllowed && tankCount < currentAllowedTanks && frameRateIndependentChance\(spawnChance, dtScale\)\)/);
   assert.doesNotMatch(game, /currentAllowedTanks[^\n]*MAX_TANKS/);
 
   for (const cap of [2, 4, 10]) {
@@ -170,10 +179,12 @@ test('Building feedback, World generation, Input, Renderer, and locked HUD behav
   for (const path of ['src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
     assert.equal(readCurrent(path), readBaseline(path));
   }
-  assert.equal(
-    sliceBetween(game, 'function initMap()', 'function createParticles('),
-    sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
-  );
+  const currentMap = sliceBetween(game, 'function initMap()', 'function createParticles(')
+    .replace(
+      /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
+      '\n                    $1\n                    $2',
+    );
+  assert.equal(currentMap, sliceBetween(baselineGame, 'function initMap()', 'function createParticles('));
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');
   for (const lockedHudSnippet of [

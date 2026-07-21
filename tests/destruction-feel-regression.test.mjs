@@ -67,7 +67,8 @@ test('building feedback is gated to the six civilian building types and has no a
   const damageEntity = sliceBetween(currentGame, 'function damageEntity(', 'function isOnBridge(');
   const buildingFeedback = sliceBetween(damageEntity, 'const isDestructibleBuilding', "if (en.type !== 'human')");
   assert.match(damageEntity, /DESTRUCTIBLE_BUILDING_TYPES\.has\(en\.type\)/);
-  assert.match(buildingFeedback, /if \(en\.hp <= 0\) \{\s*buildingHitStopUntil = Math\.max\(buildingHitStopUntil, performance\.now\(\) \+ 65\);\s*shake = Math\.max\(shake, Math\.min\(88, 50 \+ en\.radius \* 0\.21\)\);/s);
+  assert.match(buildingFeedback, /if \(en\.hp <= 0\) \{\s*buildingHitStopUntil = Math\.max\(buildingHitStopUntil, performance\.now\(\) \+ 65\);\s*const buildingShake = Math\.min\(88, 50 \+ en\.radius \* 0\.21\);/s);
+  assert.match(buildingFeedback, /if \(shakeSource === 'world'\) \{\s*shake = Math\.max\(shake, buildingShake\);\s*\} else \{\s*applyPlayerCameraShake\(buildingShake\);/s);
   assert.match(buildingFeedback, /else \{\s*buildingHitStopUntil = Math\.max\(buildingHitStopUntil, performance\.now\(\) \+ 32\);\s*playHitSound\(false\);/s);
   assert.doesNotMatch(buildingFeedback, /createParticles|createShockwave|PointLight|setTimeout/);
   assert.doesNotMatch(currentGame, /function (scheduleDestructionFeedback|flashBuildingHit|createBuildingDestructionBurst)/);
