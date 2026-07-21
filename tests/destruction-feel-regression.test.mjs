@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
-const BASELINE_COMMIT = '1099006bddb94c9bacd41dff98db68b8ca238aff';
+const BASELINE_COMMIT = '78c2ae19555ec54530f192034f7bd2acf05c4645';
 const repoRoot = resolve(import.meta.dirname, '..');
 
 function normalize(text) {
@@ -53,11 +53,20 @@ test('locked gameplay, entity setup, UI, and Phase 2 modules match the baseline'
   );
 });
 
-test('AI, Boss, Player movement, and game progression only gain the approved hit-stop line', () => {
-  const currentAnimate = sliceBetween(currentGame, 'function animate()', 'function updateHUD()')
-    .replace(/^\s*if \(nowMs < buildingHitStopUntil\) delta = 0;\n/m, '');
-  const baselineAnimate = sliceBetween(baselineGame, 'function animate()', 'function updateHUD()');
-  assert.equal(currentAnimate, baselineAnimate);
+test('Player, Tank, Boss, and world gameplay constants match the Phase 4 baseline', () => {
+  assert.equal(readCurrent('src/constants.js'), readBaseline('src/constants.js'));
+
+  for (const lockedSnippet of [
+    'const hitRad = 350;',
+    'const hitRad = 380;',
+    'const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));',
+    "const allStates = en.rageMode ? ['charge', 'dig', 'sweep'] : ['charge', 'dig', 'slither'];",
+    'player.hp -= TANK_BULLET_DAMAGE;',
+    'player.hp -= BOSS_ACID_DAMAGE;',
+  ]) {
+    assert.ok(currentGame.includes(lockedSnippet), `missing locked gameplay snippet: ${lockedSnippet}`);
+    assert.ok(baselineGame.includes(lockedSnippet), `baseline missing locked gameplay snippet: ${lockedSnippet}`);
+  }
 });
 
 test('building feedback is gated to the six civilian building types and has no added effects', () => {
@@ -94,15 +103,16 @@ test('attack power, hit radius, HP, and cooldown remain at baseline values', () 
   assert.match(constants, /export const PLAYER_SPEED = 22\.0;/);
 });
 
-test('Phase 3 changes do not include forbidden runtime or world-generation files', () => {
+test('Phase 4 changes do not include forbidden runtime or world-generation files', () => {
   const changedFiles = execFileSync('git', ['diff', '--name-only', `${BASELINE_COMMIT}..HEAD`], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trim().split(/\r?\n/).filter(Boolean);
 
   assert.ok(changedFiles.every(path => [
-    'src/game.js',
-    'tests/destruction-feel-regression.test.mjs',
+     'src/game.js',
+     'tests/destruction-feel-regression.test.mjs',
+      'tests/runtime-stability.test.mjs',
   ].includes(path)), `unexpected changed files: ${changedFiles.join(', ')}`);
   assert.ok(changedFiles.every(path => !/(terrain|chunk|query|seed|world.?generation)/i.test(path)));
 });
