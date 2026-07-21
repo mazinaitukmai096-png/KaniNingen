@@ -117,6 +117,8 @@ let inputController, rendererController;
         let introStartLookAt = null;
         const entities = [], particles = [], bullets = [], scars = [], shockwaves = [];
         const DESTRUCTIBLE_BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
+        const MOBILE_COLLISION_OBSTACLE_TYPES = new Set(['house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory']);
+        const BOSS_COLLISION_OBSTACLE_TYPES = new Set(['house', 'rock', 'pebble', 'tower', 'church', 'school']);
         let buildingHitStopUntil = 0;
         // 水域（川・池）データ専用の独立配列。{ x, z, radius } のみを保持する純粋な地形データで、
         // entities配列（攻撃判定・スコア・耐久力を持つオブジェクト群）とは完全に分離して管理する。
@@ -279,6 +281,42 @@ let inputController, rendererController;
                         }
                     });
                 }
+            }
+        }
+
+        // 既存の「60fps時の1frame確率」を、経過した基準frame数へ変換する。
+        // 状態遷移・spawnのように1更新内で最大1回だけ起きる処理に使用する。
+        function timeAdjustedProbability(frameProbability, frameScale) {
+            if (frameProbability <= 0 || frameScale <= 0) return 0;
+            if (frameProbability >= 1) return 1;
+            return 1 - Math.pow(1 - frameProbability, frameScale);
+        }
+
+        function frameRateIndependentChance(frameProbability, frameScale) {
+            return Math.random() < timeAdjustedProbability(frameProbability, frameScale);
+        }
+
+        // 継続Particleは単位時間当たりの生成期待数を維持する。
+        // dtScaleの既存上限（最大4）に従うため、極端な停止後も一度に4回を超えない。
+        function referenceFrameEventCount(frameProbability, frameScale, random = Math.random) {
+            if (frameProbability <= 0 || frameScale <= 0) return 0;
+            const probability = Math.min(1, frameProbability);
+            const boundedScale = Math.min(4, frameScale);
+            const wholeFrames = Math.floor(boundedScale);
+            const fractionalFrame = boundedScale - wholeFrames;
+            let eventCount = 0;
+            for (let i = 0; i < wholeFrames; i++) {
+                if (random() < probability) eventCount++;
+            }
+            if (fractionalFrame > 0 && random() < probability * fractionalFrame) eventCount++;
+            return eventCount;
+        }
+
+        function makeParticleRoom(limit) {
+            while (particles.length >= limit) {
+                const old = particles.shift();
+                scene.remove(old.mesh);
+                safeDispose(old.mesh);
             }
         }
 
@@ -2314,11 +2352,7 @@ let inputController, rendererController;
             const isBlood = (color === 0xaa0000 || color === 0x990000);
 
             for (let i = 0; i < pCount; i++) {
-                if (particles.length >= PARTICLE_CAP_NORMAL) { 
-                    const old = particles.shift(); 
-                    scene.remove(old.mesh); 
-                    safeDispose(old.mesh);
-                }
+                makeParticleRoom(PARTICLE_CAP_NORMAL);
                 const p = new THREE.Mesh(geometries.box, matToUse);
                 
                 if (isBlood) {
@@ -2377,11 +2411,7 @@ let inputController, rendererController;
                 localPos.applyAxisAngle(new THREE.Vector3(0, 1, 0), pRot);
                 const worldPos = pPos.clone().add(localPos);
                 
-                if (particles.length >= PARTICLE_CAP_HEAVY) { 
-                    const old = particles.shift(); 
-                    scene.remove(old.mesh); 
-                    safeDispose(old.mesh);
-                }
+                makeParticleRoom(PARTICLE_CAP_HEAVY);
                 
                 const p = new THREE.Mesh(geometries.box, materials.windArc);
                 
@@ -2449,6 +2479,7 @@ let inputController, rendererController;
             
             const ringCount = Math.max(6, Math.round(26 * PARTICLE_COUNT_SCALE));
             for (let i = 0; i < ringCount; i++) {
+                makeParticleRoom(PARTICLE_CAP_HEAVY);
                 const angle = (i / ringCount) * Math.PI * 2;
                 const p = new THREE.Mesh(geometries.box, materials.atomic);
                 p.scale.set(320, 90, 320); p.position.copy(pos); 
@@ -2499,11 +2530,7 @@ let inputController, rendererController;
             // 画質プリセットに応じてシャード数を調整（低画質は0＝破片を飛ばさず割れ跡のみ残す）
             const shardCount = ROCK_SHARD_CAP; const baseSize = en.radius * 0.4;
             for (let i = 0; i < shardCount; i++) {
-                if (particles.length >= PARTICLE_CAP_NORMAL) { 
-                    const old = particles.shift(); 
-                    scene.remove(old.mesh); 
-                    safeDispose(old.mesh);
-                }
+                makeParticleRoom(PARTICLE_CAP_NORMAL);
                 const shard = new THREE.Mesh(geometries.dodeca, en.debrisMaterial || materials.rock);
                 shard.scale.setScalar(baseSize * (0.6 + Math.random())); shard.position.copy(en.mesh.position); shard.position.y += 15;
                 const v = new THREE.Vector3(hitDir.x + (Math.random() - 0.5) * 1.5, 0.5 + Math.random(), hitDir.z + (Math.random() - 0.5) * 1.5).normalize().multiplyScalar(400 + Math.random() * 600);
@@ -2583,6 +2610,7 @@ let inputController, rendererController;
                             
                             targetSeg.children.forEach(meshChild => {
                                 if (meshChild.isMesh) {
+                                    makeParticleRoom(PARTICLE_CAP_HEAVY);
                                     meshChild.material = materials.charred;
                                     scene.attach(meshChild);
                                     const v = new THREE.Vector3(
@@ -2646,6 +2674,7 @@ let inputController, rendererController;
                 } else if (en.type === 'boss') {
                     spawnMushroomCloud(en.mesh.position);
                     en.segments.forEach(seg => {
+                        makeParticleRoom(PARTICLE_CAP_HEAVY);
                         const v = new THREE.Vector3((Math.random() - 0.5) * 1800, Math.random() * 2500, (Math.random() - 0.5) * 1800);
                         particles.push({ mesh: seg, vel: v, life: 4.5, rotVel: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5), settleY: 15 });
                     });
@@ -2665,11 +2694,7 @@ let inputController, rendererController;
 
                     const debrisCount = Math.min(DEBRIS_PIECE_CAP, 6);
                     for (let i = 0; i < debrisCount; i++) {
-                        if (particles.length >= PARTICLE_CAP_NORMAL) {
-                            const old = particles.shift();
-                            scene.remove(old.mesh);
-                            safeDispose(old.mesh);
-                        }
+                        makeParticleRoom(PARTICLE_CAP_NORMAL);
                         // 木の場合: 1つ目は幹（茶色の箱）、残りは葉（記録した色のかけら）にする
                         const isTrunkPiece = (en.type === 'tree' && i === 0);
                         const debrisGeom = isTrunkPiece ? geometries.box : geometries.dodeca;
@@ -2720,6 +2745,7 @@ let inputController, rendererController;
 
                     limitParts.forEach(c => {
                         if (c.isMesh) {
+                            makeParticleRoom(PARTICLE_CAP_NORMAL);
                             c.material = materials.charred;
                             const worldPos = new THREE.Vector3(); 
                             c.getWorldPosition(worldPos); 
@@ -2788,6 +2814,13 @@ let inputController, rendererController;
         function handleCollisions() {
             const pPos = player.mesh.position;
             const pRadius = player.radius;
+            const mobileCollisionObstacles = [];
+            const bossCollisionObstacles = [];
+            for (const candidate of entities) {
+                if (candidate.isDead) continue;
+                if (MOBILE_COLLISION_OBSTACLE_TYPES.has(candidate.type)) mobileCollisionObstacles.push(candidate);
+                if (BOSS_COLLISION_OBSTACLE_TYPES.has(candidate.type)) bossCollisionObstacles.push(candidate);
+            }
 
             const playerDistFromCenter = Math.sqrt(pPos.x * pPos.x + pPos.z * pPos.z);
             if (playerDistFromCenter > MAP_RADIUS_LIMIT) {
@@ -2830,16 +2863,13 @@ let inputController, rendererController;
                     const pToEnSq = en.mesh.position.distanceToSquared(pPos);
                     if (pToEnSq > 3000 * 3000) continue; 
 
-                    for (let obstacle of entities) {
-                        if (obstacle.isDead || obstacle === en) continue;
-                        if (obstacle.type === 'house' || obstacle.type === 'rock' || obstacle.type === 'pebble' || obstacle.type === 'tower' || obstacle.type === 'church' || obstacle.type === 'school' || obstacle.type === 'militaryBase' || obstacle.type === 'barn' || obstacle.type === 'factory') {
-                            
-                            const maxDist = en.radius + obstacle.radius;
-                            if (Math.abs(en.mesh.position.x - obstacle.mesh.position.x) > maxDist ||
-                                Math.abs(en.mesh.position.z - obstacle.mesh.position.z) > maxDist) continue;
+                    for (let obstacle of mobileCollisionObstacles) {
+                        if (obstacle === en) continue;
+                        const maxDist = en.radius + obstacle.radius;
+                        if (Math.abs(en.mesh.position.x - obstacle.mesh.position.x) > maxDist ||
+                            Math.abs(en.mesh.position.z - obstacle.mesh.position.z) > maxDist) continue;
 
-                            pushOutOf(en.mesh.position, en.radius, obstacle.mesh.position, obstacle.radius);
-                        }
+                        pushOutOf(en.mesh.position, en.radius, obstacle.mesh.position, obstacle.radius);
                     }
                 }
             }
@@ -2877,22 +2907,17 @@ let inputController, rendererController;
                     const segRadius = seg.userData.radius || 100;
                     const segPos = seg.position;
 
-                    for (let obstacle of entities) {
+                    for (let obstacle of bossCollisionObstacles) {
                         if (obstacle.isDead) continue;
+                        const limitDist = segRadius + obstacle.radius;
+                        if (Math.abs(obstacle.mesh.position.x - segPos.x) > limitDist ||
+                            Math.abs(obstacle.mesh.position.z - segPos.z) > limitDist) continue;
                         
-                        if (obstacle.type === 'house' || obstacle.type === 'rock' || obstacle.type === 'pebble' || 
-                            obstacle.type === 'tower' || obstacle.type === 'church' || obstacle.type === 'school') {
-                            
-                            const limitDist = segRadius + obstacle.radius;
-                            if (Math.abs(obstacle.mesh.position.x - segPos.x) > limitDist ||
-                                Math.abs(obstacle.mesh.position.z - segPos.z) > limitDist) continue;
-                            
-                            const distSq = obstacle.mesh.position.distanceToSquared(segPos);
-                            if (distSq < limitDist * limitDist) {
-                                const pushDir = obstacle.mesh.position.clone().sub(segPos).setY(0).normalize();
-                                damageEntity(obstacle, obstacle.hp, pushDir);
-                                playHitSound(true);
-                            }
+                        const distSq = obstacle.mesh.position.distanceToSquared(segPos);
+                        if (distSq < limitDist * limitDist) {
+                            const pushDir = obstacle.mesh.position.clone().sub(segPos).setY(0).normalize();
+                            damageEntity(obstacle, obstacle.hp, pushDir);
+                            playHitSound(true);
                         }
                     }
                 }
@@ -3163,7 +3188,9 @@ let inputController, rendererController;
             }
 
             // 崩れ落ちる灰・砂塵を静かに降らせる演出
-            if (Math.random() < 0.35 * dtScale) {
+            const lobbyAshEvents = referenceFrameEventCount(0.35, dtScale);
+            for (let ashEvent = 0; ashEvent < lobbyAshEvents; ashEvent++) {
+                if (particles.length >= PARTICLE_CAP_NORMAL) break;
                 const pMat = ashMaterials[Math.floor(Math.random() * ashMaterials.length)];
                 const cp = new THREE.Mesh(geometries.box, pMat);
                 cp.scale.set(2 + Math.random() * 3, 2 + Math.random() * 3, 2 + Math.random() * 3);
@@ -3406,6 +3433,7 @@ let inputController, rendererController;
 
                         const landDustCount = 14; 
                         for (let j = 0; j < landDustCount; j++) {
+                            makeParticleRoom(PARTICLE_CAP_HEAVY);
                             const angle = (j / landDustCount) * Math.PI * 2;
                             const p = new THREE.Mesh(geometries.box, materials.sandDust);
                             p.scale.setScalar(15 + Math.random() * 20);
@@ -3427,7 +3455,8 @@ let inputController, rendererController;
                 
                 if (player.debuffTimer > 0) {
                     player.debuffTimer -= delta;
-                    if (Math.random() < 0.2) {
+                    const debuffParticleEvents = referenceFrameEventCount(0.2, dtScale);
+                    for (let debuffEvent = 0; debuffEvent < debuffParticleEvents; debuffEvent++) {
                         createParticles(player.mesh.position, 0x39ff14, 2, 8);
                     }
                 }
@@ -3902,7 +3931,7 @@ let inputController, rendererController;
             const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));
             const spawnChance = 0.012 + Math.min(0.028, score * 0.000003); // 破壊規模に応じて最大4.0%まで頻度向上
             
-            if (tankCount < currentAllowedTanks && Math.random() < spawnChance) {
+            if (tankCount < currentAllowedTanks && frameRateIndependentChance(spawnChance, dtScale)) {
                 const SPAWN_ABLE_BASE_DIST_SQ = 5800 * 5800;
                 const activeBases = militaryBases.filter(mb => {
                     if (mb.isDead) return false;
@@ -3928,6 +3957,8 @@ let inputController, rendererController;
                 }
             }
 
+            let activeShelterBuildings = null;
+            let lineOfSightObstacles = null;
             for (let ei = 0; ei < entities.length; ei++) {
                 const en = entities[ei];
                 if (en.isDead) {
@@ -3954,36 +3985,36 @@ let inputController, rendererController;
                             }
                         } else if (en.mesh.visible) {
                             // 寿命が残っている間だけ、リアルな黒煙をたなびかせる (非表示時は生成しない)
-                            if (Math.random() < 0.12 * dtScale) {
+                            const smokeEvents = referenceFrameEventCount(0.12, dtScale);
+                            for (let smokeEvent = 0; smokeEvent < smokeEvents; smokeEvent++) {
+                                if (particles.length >= PARTICLE_CAP_NORMAL) break;
                                 const smokePos = en.mesh.position.clone();
                                 smokePos.x += (Math.random() - 0.5) * en.radius * 0.8;
                                 smokePos.z += (Math.random() - 0.5) * en.radius * 0.8;
                                 smokePos.y += 12 + Math.random() * 15;
 
-                                if (particles.length < 800) {
-                                    const p = new THREE.Mesh(geometries.sphere, materials.ruinSmoke);
-                                    p.scale.setScalar(12 + Math.random() * 16);
-                                    p.userData.baseScale = p.scale.clone(); // 追加: フェードアウト時のクラッシュ防止
-                                    p.position.copy(smokePos);
+                                const p = new THREE.Mesh(geometries.sphere, materials.ruinSmoke);
+                                p.scale.setScalar(12 + Math.random() * 16);
+                                p.userData.baseScale = p.scale.clone(); // 追加: フェードアウト時のクラッシュ防止
+                                p.position.copy(smokePos);
 
-                                    const v = new THREE.Vector3(
-                                        (Math.random() - 0.5) * 35, 
-                                        85 + Math.random() * 65, 
-                                        (Math.random() - 0.5) * 35
-                                    );
+                                const v = new THREE.Vector3(
+                                    (Math.random() - 0.5) * 35,
+                                    85 + Math.random() * 65,
+                                    (Math.random() - 0.5) * 35
+                                );
 
-                                    particles.push({
-                                        mesh: p,
-                                        vel: v,
-                                        life: 1.1 + Math.random() * 0.5,
-                                        maxLife: 1.6,
-                                        rotVel: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.1),
-                                        settleY: -9999,
-                                        noGravity: true, // 空中に上昇し続ける
-                                        isWindFade: true
-                                    });
-                                    scene.add(p);
-                                }
+                                particles.push({
+                                    mesh: p,
+                                    vel: v,
+                                    life: 1.1 + Math.random() * 0.5,
+                                    maxLife: 1.6,
+                                    rotVel: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.1),
+                                    settleY: -9999,
+                                    noGravity: true, // 空中に上昇し続ける
+                                    isWindFade: true
+                                });
+                                scene.add(p);
                             }
                         }
                     } else {
@@ -4040,14 +4071,14 @@ let inputController, rendererController;
                             if (Math.random() < 0.3) {
                                 let nearestBldg = null;
                                 let minDistBldg = Infinity;
-                                for (let bldg of entities) {
-                                    if (bldg.isDead) continue;
-                                    if (['house', 'church', 'school', 'tower', 'barn', 'factory'].includes(bldg.type)) {
-                                        let d = bldg.mesh.position.distanceToSquared(en.mesh.position);
-                                        if (d < 3000 * 3000 && d < minDistBldg) {
-                                            minDistBldg = d;
-                                            nearestBldg = bldg;
-                                        }
+                                if (!activeShelterBuildings) {
+                                    activeShelterBuildings = entities.filter(bldg => !bldg.isDead && DESTRUCTIBLE_BUILDING_TYPES.has(bldg.type));
+                                }
+                                for (let bldg of activeShelterBuildings) {
+                                    let d = bldg.mesh.position.distanceToSquared(en.mesh.position);
+                                    if (d < 3000 * 3000 && d < minDistBldg) {
+                                        minDistBldg = d;
+                                        nearestBldg = bldg;
                                     }
                                 }
                                 en.targetBuilding = nearestBldg;
@@ -4096,13 +4127,13 @@ let inputController, rendererController;
                         en.humanTimer += delta;
                         
                         // 逃走中、稀に地面につまずいて大げさに転ぶ
-                        if (en.humanTimer > 0.8 && Math.random() < 0.003 * dtScale) {
+                        if (en.humanTimer > 0.8 && frameRateIndependentChance(0.003, dtScale)) {
                             en.humanState = 'tripped';
                             en.tripTimer = 1.0 + Math.random() * 0.8;
                             en.pushVel.set(0, 0, 0);
                         } 
                         // 途中で周囲確認や方向転換を追加（一瞬立ち止まる）
-                        else if (en.humanTimer > 1.5 && Math.random() < 0.005 * dtScale) {
+                        else if (en.humanTimer > 1.5 && frameRateIndependentChance(0.005, dtScale)) {
                             en.humanState = 'recovering';
                             en.tripTimer = 0.3 + Math.random() * 0.4;
                             en.fleeAngleOffset = (Math.random() - 0.5) * Math.PI / 2;
@@ -4222,8 +4253,11 @@ let inputController, rendererController;
                     const toPlayerVec = pPos.clone().sub(en.mesh.position);
                     const distToPlayer = toPlayerVec.length();
                     const rayDir = toPlayerVec.clone().normalize();
-                    for (let obs of entities) {
-                        if (obs.isDead || obs === en || obs.type === 'human' || obs.type === 'boss' || obs.type === 'pebble') continue;
+                    if (!lineOfSightObstacles) {
+                        lineOfSightObstacles = entities.filter(obs => !obs.isDead && obs.type !== 'human' && obs.type !== 'boss' && obs.type !== 'pebble');
+                    }
+                    for (let obs of lineOfSightObstacles) {
+                        if (obs === en) continue;
                         const toObs = obs.mesh.position.clone().sub(en.mesh.position);
                         const proj = toObs.dot(rayDir);
                         if (proj > 0 && proj < distToPlayer) {
@@ -4317,7 +4351,7 @@ let inputController, rendererController;
                         en.mesh.position.y = 70 + Math.sin(time * 3) * 45;
 
                         // hyperRage時はslither中にも酸を吐く
-                        if (en.hyperRage && Math.random() < BOSS_SLITHER_ACID_SPIT_CHANCE * dtScale) {
+                        if (en.hyperRage && frameRateIndependentChance(BOSS_SLITHER_ACID_SPIT_CHANCE, dtScale)) {
                             const spitBomb = new THREE.Mesh(geometries.sphere, materials.acid);
                             spitBomb.scale.setScalar(35);
                             spitBomb.position.copy(en.mesh.position).add(new THREE.Vector3(0, 90, 60).applyAxisAngle(new THREE.Vector3(0,1,0), en.mesh.rotation.y));
@@ -4395,7 +4429,7 @@ let inputController, rendererController;
                         en.mesh.rotation.z += (en.rageMode ? 0.6 : 0.4) * dtScale;
                         
                         shake = Math.max(shake, 14);
-                        if (Math.random() < 0.3) {
+                        if (frameRateIndependentChance(0.3, dtScale)) {
                             createParticles(en.mesh.position, 0xa08060, 3, 30, false, materials.sandDust);
                             playRumbleSound();
                         }
@@ -4429,12 +4463,15 @@ let inputController, rendererController;
                             en.mesh.position.y = BOSS_DIG_MAX_DEPTH;
                         }
 
-                        const dustPos = en.mesh.position.clone();
-                        dustPos.y = 5;
-                        createParticles(dustPos, 0xa08060, 2, 35, false, materials.sandDust);
-                        createParticles(dustPos, 0xff5500, 2, 18, false, materials.orangeSpark);
+                        const dustEvents = referenceFrameEventCount(1, dtScale);
+                        for (let dustEvent = 0; dustEvent < dustEvents; dustEvent++) {
+                            const dustPos = en.mesh.position.clone();
+                            dustPos.y = 5;
+                            createParticles(dustPos, 0xa08060, 2, 35, false, materials.sandDust);
+                            createParticles(dustPos, 0xff5500, 2, 18, false, materials.orangeSpark);
+                        }
 
-                        if (Math.random() < 0.4) {
+                        if (frameRateIndependentChance(0.4, dtScale)) {
                             playRumbleSound();
                         }
 
@@ -4552,7 +4589,9 @@ let inputController, rendererController;
                         en.mesh.rotation.y += 0.08 * dtScale;
                         en.mesh.rotation.x = Math.sin(time * 6) * 0.4;
                         
-                        if (Math.random() < 0.45) {
+                        const recoverStarEvents = referenceFrameEventCount(0.45, dtScale);
+                        for (let starEvent = 0; starEvent < recoverStarEvents; starEvent++) {
+                            makeParticleRoom(PARTICLE_CAP_NORMAL);
                             const starPos = en.mesh.position.clone().add(new THREE.Vector3(0, 140, 0));
                             const star = new THREE.Mesh(geometries.box, materials.dizzyStar);
                             star.scale.setScalar(12 + Math.random() * 12); star.position.copy(starPos);
@@ -4725,6 +4764,7 @@ let inputController, rendererController;
         // --- コミカル吹っ飛び＆スローモーション死亡演出の更新 ---
         // animate() から player.hp <= 0 の間、毎フレーム呼び出される。ロジックは元のまま。
         function updateDeathSequence(rawDelta, dtScale) {
+            const rawFrameScale = Math.min(rawDelta * 60, 4);
             if (!player.isDying) {
                 player.isDying = true;
                 player.deathTimer = 3; // 3秒間の劇的スローモーション
@@ -4767,19 +4807,20 @@ let inputController, rendererController;
             }
 
             // 体から黒煙（炭化粒子）とオレンジの火花をボコボコと放出する
-            if (Math.random() < 0.35) {
+            const deathParticleEvents = referenceFrameEventCount(0.35, rawFrameScale);
+            for (let deathEvent = 0; deathEvent < deathParticleEvents; deathEvent++) {
                 createParticles(player.mesh.position, 0x3d3936, 4, 18, false, materials.charred); // 黒煙
                 createParticles(player.mesh.position, 0xff5500, 2, 8, false, materials.orangeSpark); // 火花
             }
 
             // カメラをカニ人間の周りをゆっくり回転させながら、静かに上空へ引き上げる（速度を穏やかに減速）
-            yaw += 0.003; // ゆっくりと周囲を旋回（約1/5の速度に減速）
-            pitch = Math.max(0.2, pitch - 0.001); // なだらかな見上げ角度の変化（1/5の速度に減速）
-            camDist = Math.min(1000, camDist + 0.8); // 静かにじわじわとズームアウト（約1/6の速度に減速）
+            yaw += 0.003 * rawFrameScale; // ゆっくりと周囲を旋回（約1/5の速度に減速）
+            pitch = Math.max(0.2, pitch - 0.001 * rawFrameScale); // なだらかな見上げ角度の変化（1/5の速度に減速）
+            camDist = Math.min(1000, camDist + 0.8 * rawFrameScale); // 静かにじわじわとズームアウト（約1/6の速度に減速）
 
             // カニの体をゆっくり地面に転がらせる（コミカルなゴロゴロ横転回転）
-            player.mesh.rotation.z += 0.015;
-            player.mesh.rotation.x += 0.010;
+            player.mesh.rotation.z += 0.015 * rawFrameScale;
+            player.mesh.rotation.x += 0.010 * rawFrameScale;
 
             // 【死亡中専用シネマティックカメラワークのリアルタイム適用】
             // 生存時のカメラ処理が止まってしまうため、ここでカメラの座標と注視点を上書き更新します。
