@@ -651,6 +651,10 @@ let inputController, rendererController;
             }
         }
 
+        function applyPlayerCameraShake(baseAmount) {
+            shake = Math.max(shake, baseAmount * activeScaleStage.playerShakeMultiplier);
+        }
+
         function applyScaleStage(stageId, { resetCamera = true } = {}) {
             const nextStage = getScaleStage(stageId);
             activeScaleStageId = stageId;
@@ -659,6 +663,8 @@ let inputController, rendererController;
             // 同一Player instanceのrootだけを拡縮し、HP・位置・Score・World stateには触れない。
             player.mesh.scale.setScalar(nextStage.visualScale);
             player.radius = nextStage.collisionRadius;
+            // Stage間で大きさの異なる揺れを持ち越さない。
+            shake = 0;
 
             if (camera) {
                 camera.near = nextStage.cameraNear;
@@ -2607,7 +2613,7 @@ let inputController, rendererController;
             scene.remove(en.mesh);
         }
 
-        function damageEntity(en, damage, hitDir) {
+        function damageEntity(en, damage, hitDir, shakeSource = 'world') {
             if (en.isDead) return;
             en.hp -= damage;
             
@@ -2621,7 +2627,12 @@ let inputController, rendererController;
             if (isDestructibleBuilding) {
                 if (en.hp <= 0) {
                     buildingHitStopUntil = Math.max(buildingHitStopUntil, performance.now() + 65);
-                    shake = Math.max(shake, Math.min(88, 50 + en.radius * 0.21));
+                    const buildingShake = Math.min(88, 50 + en.radius * 0.21);
+                    if (shakeSource === 'world') {
+                        shake = Math.max(shake, buildingShake);
+                    } else {
+                        applyPlayerCameraShake(buildingShake);
+                    }
                 } else {
                     buildingHitStopUntil = Math.max(buildingHitStopUntil, performance.now() + 32);
                     playHitSound(false);
@@ -2698,7 +2709,13 @@ let inputController, rendererController;
                 }
             }
 
-            shake = Math.max(shake, damage / 7);
+            if (shakeSource !== 'playerLanding') {
+                if (shakeSource === 'world') {
+                    shake = Math.max(shake, damage / 7);
+                } else {
+                    applyPlayerCameraShake(damage / 7);
+                }
+            }
             if (en.hp <= 0) {
                 en.hp = 0; en.isDead = true;
                 if (en.type !== 'tank' && en.type !== 'boss') score += en.scoreVal;
@@ -2982,7 +2999,7 @@ let inputController, rendererController;
 
         }
 
-        function explodeAt(center, damageRadius, damageAmount, pushRadius, excludeType = null, damageFilter = null) {
+        function explodeAt(center, damageRadius, damageAmount, pushRadius, excludeType = null, damageFilter = null, shakeSource = 'world') {
             const radSq = damageRadius * damageRadius;
             const pushSq = pushRadius * pushRadius;
             for (let en of entities) {
@@ -3020,7 +3037,7 @@ let inputController, rendererController;
                     } else {
                         pDir.normalize();
                     }
-                    damageEntity(en, dmg, pDir);
+                    damageEntity(en, dmg, pDir, shakeSource);
                 } else if (dSq < pushSq && !isUnderground) {
                     let pushDir = en.mesh.position.clone().sub(center);
                     if (pushDir.lengthSq() < 0.001) {
@@ -3079,7 +3096,7 @@ let inputController, rendererController;
                         } else {
                             hitVec.normalize();
                         }
-                        damageEntity(en, scaleDmg, hitVec);
+                        damageEntity(en, scaleDmg, hitVec, 'player');
                     }
                 }
             }
@@ -3138,7 +3155,7 @@ let inputController, rendererController;
                         } else {
                             hitVec.normalize();
                         }
-                        damageEntity(en, scaleDmg, hitVec);
+                        damageEntity(en, scaleDmg, hitVec, 'player');
                     }
                 }
             }
@@ -3323,7 +3340,7 @@ let inputController, rendererController;
                 gameRunning = true;
 
                 // ドロップ着地時の巨大な衝撃波＆煙エフェクト
-                shake = 180;
+                applyPlayerCameraShake(180);
                 playBoomSound();
                 explodeAt(player.mesh.position, 600, 1000, 1200);
                 createShockwave(player.mesh.position, 650, 0xff3300);
@@ -3497,7 +3514,8 @@ let inputController, rendererController;
                             800,
                             activeScaleStage.landingPushRadius,
                             null,
-                            en => canScaleStageDamageTarget(activeScaleStageId, en)
+                            en => canScaleStageDamageTarget(activeScaleStageId, en),
+                            'playerLanding'
                         );
                         playHitSound(true);
 
@@ -3720,7 +3738,7 @@ let inputController, rendererController;
                         
                         if (player.chargeTime > CHARGE_THRESHOLD) { 
                             document.getElementById('charge-ui').classList.add('ready'); 
-                            shake = 10; 
+                            applyPlayerCameraShake(10);
                             
                             // 【空中起爆ナビゲーション】地上と空中をリアルタイムで判別してHUDを変化
                             const label = document.getElementById('charge-label');
@@ -4795,11 +4813,17 @@ let inputController, rendererController;
             updateCompass();
 
             if (shake > 0) {
-                const appliedShake = shake * settings.cameraShake;
+                // Player由来はStage倍率で縮小済み、World由来はStageごとの上限で安全に見せる。
+                const appliedShake = Math.min(shake, activeScaleStage.cameraShakeCap) * settings.cameraShake;
                 camera.position.x += (Math.random() - 0.5) * appliedShake;
                 camera.position.y += (Math.random() - 0.5) * appliedShake;
                 shake *= Math.pow(0.85, dtScale);
             }
+            // 近距離StageでShakeが地面へCameraを押し込まないための最小保護。
+            camera.position.y = Math.max(
+                player.mesh.position.y + activeScaleStage.cameraGroundClearance,
+                camera.position.y
+            );
 
             rendererController.render();
         }
@@ -4849,7 +4873,7 @@ let inputController, rendererController;
             if (!player.isDying) {
                 player.isDying = true;
                 player.deathTimer = 3; // 3秒間の劇的スローモーション
-                shake = 20; // 大揺れによる3D酔いを完全に防止する、一瞬の微小な衝撃揺れ
+                applyPlayerCameraShake(20); // 大揺れによる3D酔いを完全に防止する、一瞬の微小な衝撃揺れ
                 playBoomSound(); // 大爆発音
 
                 // 【コミカル吹っ飛び物理】死んだ瞬間に、カニを軽く上空へピョーンと跳ね上げる
@@ -4876,7 +4900,7 @@ let inputController, rendererController;
                     player.mesh.position.y = 0;
                     player.isGrounded = true;
                     playHitSound(true); // ゴンと鈍い着地音
-                    shake = 50;
+                    applyPlayerCameraShake(50);
                 }
             }
 
@@ -5075,7 +5099,7 @@ let inputController, rendererController;
             player.mesh.rotation.x = 0; // コケた傾きを元に戻す
             player.mesh.rotation.z = 0; // コケた傾きを元に戻す
             yaw = landingSpot.facingAngle; // 通常カメラの水平向きをカニの向きに合わせておく
-            pitch = 0.45;
+            pitch = activeScaleStageId === 'MAX' ? 0.45 : activeScaleStage.cameraPitch;
 
             // オープニング演出: 池の中から陸へ上がる歩行＆トラッキングカメラ
             isIntroPlaying = true;
@@ -5246,7 +5270,7 @@ let inputController, rendererController;
             if (isIntroPlaying) return;
 
             if (document.pointerLockElement) {
-                yaw -= e.movementX * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity;
+                yaw -= e.movementX * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity * activeScaleStage.cameraRotationSensitivity;
                 pitch = Math.max(
                     activeScaleStage.cameraMinPitch,
                     Math.min(
@@ -5360,7 +5384,7 @@ let inputController, rendererController;
                     const now = Date.now();
                     if (now - player.lastBombTime > BOMB_COOLDOWN) {
                         player.lastBombTime = now;
-                        shake = 450;
+                        applyPlayerCameraShake(450);
                         document.getElementById('flash').style.opacity = 1;
                         setTimeout(() => document.getElementById('flash').style.opacity = 0, 300);
                         spawnMushroomCloud(player.mesh.position);
@@ -5465,11 +5489,13 @@ let inputController, rendererController;
                 button.classList.toggle('debug-on', button.dataset.scaleStage === activeScaleStageId);
             });
             const stageValues = document.getElementById('debug-scale-values');
+            const yawDegrees = ((yaw * 180 / Math.PI) % 360 + 360) % 360;
             stageValues.innerText =
                 `Stage: ${activeScaleStage.id} | Visual: ${activeScaleStage.visualScale.toFixed(2)} | ` +
                 `Collision: ${activeScaleStage.collisionRadius.toFixed(2)} | Speed: ${activeScaleStage.movementSpeed.toFixed(1)} | ` +
                 `Jump: ${activeScaleStage.jumpVelocity.toFixed(1)} | Attack: ${activeScaleStage.singleAttackRadius}/${activeScaleStage.doubleAttackRadius} | ` +
-                `Camera: ${activeScaleStage.cameraDistance}`;
+                `Camera: ${camDist.toFixed(0)} | Pitch: ${pitch.toFixed(2)} | Yaw: ${yawDegrees.toFixed(0)}° | ` +
+                `Shake: x${activeScaleStage.playerShakeMultiplier.toFixed(2)}`;
             document.getElementById('debug-human-scale').value = String(humanVisualScale);
             const spawnBtn = document.getElementById('debug-spawn-boss-btn');
             const killBtn = document.getElementById('debug-kill-boss-btn');
