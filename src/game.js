@@ -41,6 +41,15 @@ import {
   getScaleStage,
   isScaleSandboxAtomicEnabled,
 } from './scale-sandbox.js';
+import {
+  PRODUCTION_HUMAN_VISUAL_SCALE,
+  PRODUCTION_TANK_VISUAL_SCALE,
+  WORLD_DETAIL_INSTANCE_CAPACITY,
+  WORLD_DETAIL_PARTS,
+  WORLD_DETAIL_ROADSIDE_OFFSET,
+  WORLD_DETAIL_TYPES,
+  WORLD_DETAILS_PER_TOWN,
+} from './world-scale-rebalance.js';
 
 let bossHPDelay = 100;
 
@@ -119,7 +128,7 @@ let inputController, rendererController;
 
         let activeScaleStageId = INITIAL_SCALE_STAGE_ID;
         let activeScaleStage = getScaleStage(activeScaleStageId);
-        let humanVisualScale = HUMAN_VISUAL_SCALES.CURRENT;
+        let humanVisualScale = PRODUCTION_HUMAN_VISUAL_SCALE;
         let camDist = CAM_INITIAL_DIST;
         // --- 追加: ゲーム開始時の映画的カメラ演出（確立ショット→通常視点） ---
         let isIntroPlaying = false;
@@ -226,7 +235,8 @@ let inputController, rendererController;
             factoryTrim: new THREE.MeshPhongMaterial({color: 0xb5651d}),
             farmField: new THREE.MeshPhongMaterial({color: 0x6b7a2e}),
             water: new THREE.MeshPhongMaterial({color: 0x2f6fa8, transparent: true, opacity: 0.82, shininess: 70}),
-            bridgeDeck: new THREE.MeshPhongMaterial({color: 0x8b6337, shininess: 8})
+            bridgeDeck: new THREE.MeshPhongMaterial({color: 0x8b6337, shininess: 8}),
+            worldDetail: new THREE.MeshPhongMaterial({color: 0xffffff, shininess: 8})
         };
 
         const roofColorPalette = [
@@ -610,6 +620,7 @@ let inputController, rendererController;
         let nextBushInstanceIndex = 0;
         let flowerInstancedMesh = null;
         let nextFlowerInstanceIndex = 0;
+        let worldDetailInstancedMesh = null;
         const clouds = []; // 追加: 雲オブジェクト配列
 
         const player = {
@@ -1453,6 +1464,7 @@ let inputController, rendererController;
             
             group.position.set(x, 0, z);
             if (type === 'human') group.scale.setScalar(humanVisualScale);
+            if (type === 'tank') group.scale.setScalar(PRODUCTION_TANK_VISUAL_SCALE);
             if (forceAngle !== null) {
                 group.rotation.y = forceAngle;
             } else {
@@ -1508,6 +1520,67 @@ let inputController, rendererController;
             return data;
         }
 
+        function populateWorldScaleDetails(townCenters, pathTiles) {
+            const dummy = new THREE.Object3D();
+            const colorCache = new Map();
+            let instanceIndex = 0;
+            let propCount = 0;
+
+            const addPart = (baseX, baseZ, baseAngle, detailPart) => {
+                if (instanceIndex >= WORLD_DETAIL_INSTANCE_CAPACITY) return;
+                const sin = Math.sin(baseAngle);
+                const cos = Math.cos(baseAngle);
+                dummy.position.set(
+                    baseX + detailPart.x * cos + detailPart.z * sin,
+                    detailPart.y,
+                    baseZ - detailPart.x * sin + detailPart.z * cos
+                );
+                dummy.rotation.set(0, baseAngle + detailPart.rotationY, 0);
+                dummy.scale.set(detailPart.width, detailPart.height, detailPart.depth);
+                dummy.updateMatrix();
+                worldDetailInstancedMesh.setMatrixAt(instanceIndex, dummy.matrix);
+
+                let color = colorCache.get(detailPart.color);
+                if (!color) {
+                    color = new THREE.Color(detailPart.color);
+                    colorCache.set(detailPart.color, color);
+                }
+                worldDetailInstancedMesh.setColorAt(instanceIndex, color);
+                instanceIndex++;
+            };
+
+            townCenters.forEach(tc => {
+                const townPaths = pathTiles.filter(tile => tile.tc === tc);
+                if (townPaths.length === 0) return;
+
+                for (let detailIndex = 0; detailIndex < WORLD_DETAILS_PER_TOWN; detailIndex++) {
+                    const pathIndex = Math.floor((detailIndex + 0.5) * townPaths.length / WORLD_DETAILS_PER_TOWN)
+                        % townPaths.length;
+                    const tile = townPaths[pathIndex];
+                    const radialAngle = Math.atan2(tile.x - tc.x, tile.z - tc.z);
+                    const side = detailIndex % 2 === 0 ? 1 : -1;
+                    const sideAngle = radialAngle + side * Math.PI / 2;
+                    const baseX = tile.x + Math.sin(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
+                    const baseZ = tile.z + Math.cos(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
+                    const type = WORLD_DETAIL_TYPES[detailIndex % WORLD_DETAIL_TYPES.length];
+
+                    for (const detailPart of WORLD_DETAIL_PARTS[type]) {
+                        addPart(baseX, baseZ, radialAngle, detailPart);
+                    }
+                    propCount++;
+                }
+            });
+
+            worldDetailInstancedMesh.count = instanceIndex;
+            worldDetailInstancedMesh.instanceMatrix.needsUpdate = true;
+            if (worldDetailInstancedMesh.instanceColor) {
+                worldDetailInstancedMesh.instanceColor.needsUpdate = true;
+            }
+            worldDetailInstancedMesh.computeBoundingSphere();
+            worldDetailInstancedMesh.userData.worldDetailPropCount = propCount;
+            worldDetailInstancedMesh.userData.worldDetailInstanceCount = instanceIndex;
+        }
+
         // --- 都市・村計画配置システム (Town Planning System) ---
         function initMap() {
             militaryBases.length = 0; // 再生成時に古いオブジェクトデータ参照が残り続けるバグを防止
@@ -1533,6 +1606,17 @@ let inputController, rendererController;
 
             scene.add(rockInstancedMesh);
             scene.add(pebbleInstancedMesh);
+
+            worldDetailInstancedMesh = new THREE.InstancedMesh(
+                geometries.box,
+                materials.worldDetail,
+                WORLD_DETAIL_INSTANCE_CAPACITY
+            );
+            worldDetailInstancedMesh.count = 0;
+            worldDetailInstancedMesh.castShadow = false;
+            worldDetailInstancedMesh.receiveShadow = false;
+            worldDetailInstancedMesh.frustumCulled = true;
+            scene.add(worldDetailInstancedMesh);
 
             // 追加: 木のInstancedMesh生成（葉は白クローン材質でsetColorAtによりバイオームごとに色分け）
             const instancedLeafMat = materials.treeLeaves.clone();
@@ -2110,6 +2194,8 @@ let inputController, rendererController;
                     }
                 }
             });
+
+            populateWorldScaleDetails(townCenters, pathTiles);
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
             // 木・岩の密度は下のメイン装飾配置ループで距離に応じたグラデーションをかけて

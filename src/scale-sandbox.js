@@ -124,6 +124,7 @@ export const SCALE_STAGES = Object.freeze({
 export const HUMAN_VISUAL_SCALES = Object.freeze({
   CURRENT: 1,
   COMPARE_065: 0.65,
+  PRODUCTION_050: 0.5,
   COMPARE_040: 0.4,
 });
 
