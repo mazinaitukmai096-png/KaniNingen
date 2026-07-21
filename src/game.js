@@ -1,6 +1,7 @@
 import {
-  CAM_MIN_DIST,CAM_MAX_DIST,ATTACK_COOLDOWN,CHARGE_THRESHOLD,BOMB_COOLDOWN,BOMB_DAMAGE_RADIUS,BOMB_PUSH_RADIUS,BOMB_DAMAGE_AMOUNT,MAP_RADIUS_LIMIT,
-  PLAYER_MAX_HP,PLAYER_SPEED,DEBUFF_SPEED_MULT,
+  CAM_MIN_DIST,CAM_MAX_DIST,CAM_INITIAL_DIST,CAM_INITIAL_PITCH,CAM_MIN_PITCH,CAM_MAX_PITCH,CAM_MOUSE_ROTATION_SPEED,CAM_WHEEL_ZOOM_SCALE,
+  ATTACK_COOLDOWN,CHARGE_THRESHOLD,ATTACK_INPUT_DELAY_MS,INTRO_DURATION_MS,BOMB_COOLDOWN,BOMB_DAMAGE_RADIUS,BOMB_PUSH_RADIUS,BOMB_DAMAGE_AMOUNT,MAP_RADIUS_LIMIT,MAP_SIZE,
+  PLAYER_MAX_HP,PLAYER_SPEED,PLAYER_RADIUS,PLAYER_JUMP_VELOCITY,PLAYER_GRAVITY,DEBUFF_SPEED_MULT,
   TANK_HP,TANK_RADIUS,TANK_SCORE_VALUE,TANK_DESPAWN_DIST,TANK_ENGAGE_RANGE,TANK_APPROACH_DIST,
   TANK_MOVE_SPEED,TANK_BODY_TURN_SPEED,TANK_TURRET_TURN_SPEED,TANK_GUN_PITCH_SPEED,
   TANK_STUCK_CHECK_INTERVAL,TANK_STUCK_DIST_THRESHOLD_SQ,TANK_STUCK_AVOID_TIMER,
@@ -72,7 +73,7 @@ let inputController, rendererController;
         let fpsLastSampleTime = performance.now();
         let lastFps = 0; // デバッグモーダル表示用に直近のFPS値を保持
         let lastRenderedFrameTime = 0;
-        let yaw = 0, pitch = 0.55, score = 0, shake = 0, gameRunning = false, isGameOver = false;
+        let yaw = 0, pitch = CAM_INITIAL_PITCH, score = 0, shake = 0, gameRunning = false, isGameOver = false;
         // 地面の高さを返す関数（現在は平坦な地形のため常に0を返します）
         function getTerrainHeight(x, z) {
         return 0;
@@ -108,11 +109,10 @@ let inputController, rendererController;
             noclip: false,    // ノークリップ：建物・ボスに当たらず、移動速度も上がる
         };
 
-        let camDist = 550;
+        let camDist = CAM_INITIAL_DIST;
         // --- 追加: ゲーム開始時の映画的カメラ演出（確立ショット→通常視点） ---
         let isIntroPlaying = false;
         let introStartTime = 0;
-        const INTRO_DURATION_MS = 6000; // 2200 から 6000 (6秒) に延長
         let introStartCamPos = null;
         let introStartLookAt = null;
         const entities = [], particles = [], bullets = [], scars = [], shockwaves = [];
@@ -562,7 +562,7 @@ let inputController, rendererController;
         const clouds = []; // 追加: 雲オブジェクト配列
 
         const player = {
-            hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP, mesh: new THREE.Group(), radius: 65, yVel: 0, isGrounded: true,
+            hp: PLAYER_MAX_HP, maxHp: PLAYER_MAX_HP, mesh: new THREE.Group(), radius: PLAYER_RADIUS, yVel: 0, isGrounded: true,
             isCharging: false, chargeTime: 0, isLeftDown: false, isRightDown: false, legs: [],
             pushVel: new THREE.Vector3(), // ノックバック用（着地の衝撃・尻尾攻撃などで加算し、徐々に減衰する）
             knockbackGraceTimer: 0, // この値が0より大きい間、ボス本体との「めり込み解消」を一時的に止める（意図的なノックバック演出を邪魔しないため）
@@ -1383,8 +1383,6 @@ let inputController, rendererController;
             humanSpawnPool.length = 0; // 人間の配置候補プールも再生成時にリセット
             humanPoolActivatedCount = 0;
             waterZones.length = 0; // 池・川の位置データも再生成時にリセット（追加：蓄積バグ防止）
-            const MAP_SIZE = 27000;
-
             // 1500個ずつの最大容量でインスタンスを事前生成（ドローコールを1回に集約）
             // ベースマテリアルの色を白色 (0xffffff) にしたクローンを使うことで、
             // setColorAt で色が掛け算（乗算）されて暗く退化する現象を完全に防止します。
@@ -3376,9 +3374,9 @@ let inputController, rendererController;
                     if (inputSnapshot.isPressed('KeyD')) moveVec.x += 1;
                 }
 
-                if (inputSnapshot.isPressed('Space') && player.isGrounded && !isIntroPlaying) { player.yVel = 32; player.isGrounded = false; }
+                if (inputSnapshot.isPressed('Space') && player.isGrounded && !isIntroPlaying) { player.yVel = PLAYER_JUMP_VELOCITY; player.isGrounded = false; }
                 if (!player.isGrounded) {
-                    player.yVel -= 1.4 * dtScale; player.mesh.position.y += player.yVel * dtScale;
+                    player.yVel -= PLAYER_GRAVITY * dtScale; player.mesh.position.y += player.yVel * dtScale;
                     if (player.mesh.position.y <= 0) {
                         player.mesh.position.y = 0; player.isGrounded = true;
                         
@@ -4732,7 +4730,7 @@ let inputController, rendererController;
 
             // 死亡中のスローモーション空中落下（重力）物理のリアル計算
             if (!player.isGrounded) {
-                player.yVel -= 1.4 * dtScale; // 重力落下
+                player.yVel -= PLAYER_GRAVITY * dtScale; // 重力落下
                 player.mesh.position.y += player.yVel * dtScale;
 
                 // 地面（Y=0）に着地した瞬間
@@ -4890,7 +4888,7 @@ let inputController, rendererController;
             isPaused = false; // ポーズ状態を確実にクリア
             tankCount = 0; score = 0; shake = 0; bossActive = false;
             nextBossScore = 35000; 
-            yaw = 0; pitch = 0.55;
+            yaw = 0; pitch = CAM_INITIAL_PITCH;
             player.hp = PLAYER_MAX_HP; player.yVel = 0; player.isGrounded = true;
             player.isDying = false; // 初期化
             player.deathTimer = 0;  // 初期化
@@ -5002,7 +5000,7 @@ let inputController, rendererController;
             entities.length = 0; particles.length = 0; bullets.length = 0; scars.length = 0;
             tankCount = 0; score = 0; shake = 0; bossActive = false; 
             nextBossScore = 35000; 
-            yaw = 0; pitch = 0.55;
+            yaw = 0; pitch = CAM_INITIAL_PITCH;
             player.hp = PLAYER_MAX_HP; player.yVel = 0; player.isGrounded = true;
             player.isDying = false; // 初期化
             player.deathTimer = 0;  // 初期化
@@ -5107,15 +5105,15 @@ let inputController, rendererController;
             if (isIntroPlaying) return;
 
             if (document.pointerLockElement) {
-                yaw -= e.movementX * 0.003 * settings.mouseSensitivity;
-                pitch = Math.max(0.1, Math.min(1.4, pitch + e.movementY * 0.003 * settings.mouseSensitivity));
+                yaw -= e.movementX * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity;
+                pitch = Math.max(CAM_MIN_PITCH, Math.min(CAM_MAX_PITCH, pitch + e.movementY * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity));
             }
           },
           onWheel: e => {
             // イントロ再生中はホイールによるカメラ距離の調整を禁止します
             if (isIntroPlaying) return;
 
-            if (gameRunning) camDist = Math.max(CAM_MIN_DIST, Math.min(CAM_MAX_DIST, camDist + e.deltaY * 0.9));
+            if (gameRunning) camDist = Math.max(CAM_MIN_DIST, Math.min(CAM_MAX_DIST, camDist + e.deltaY * CAM_WHEEL_ZOOM_SCALE));
           },
           onMouseDown: e => {
             // プレイ中にロックが外れている場合、画面クリックで復帰を試みる
@@ -5159,7 +5157,7 @@ let inputController, rendererController;
                                 player.pendingAttack = null;
                             }
                             player.attackDelayTimer = null;
-                        }, 120);
+                        }, ATTACK_INPUT_DELAY_MS);
                     }
                     if (e.button === 2 && !wasRight) {
                         player.pendingAttack = 'right';
@@ -5169,7 +5167,7 @@ let inputController, rendererController;
                                 player.pendingAttack = null;
                             }
                             player.attackDelayTimer = null;
-                        }, 120);
+                        }, ATTACK_INPUT_DELAY_MS);
                     }
                 }
             }

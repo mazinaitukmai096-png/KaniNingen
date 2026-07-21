@@ -2,9 +2,17 @@
 
 export const CAM_MIN_DIST = 300;
 export const CAM_MAX_DIST = 1400;
+export const CAM_INITIAL_DIST = 550;
+export const CAM_INITIAL_PITCH = 0.55;
+export const CAM_MIN_PITCH = 0.1;
+export const CAM_MAX_PITCH = 1.4;
+export const CAM_MOUSE_ROTATION_SPEED = 0.003;
+export const CAM_WHEEL_ZOOM_SCALE = 0.9;
 
 export const ATTACK_COOLDOWN = 380;
 export const CHARGE_THRESHOLD = 1800;
+export const ATTACK_INPUT_DELAY_MS = 120;
+export const INTRO_DURATION_MS = 6000;
 
 export const BOMB_COOLDOWN = 12000;
 export const BOMB_DAMAGE_RADIUS = 1800;
@@ -12,6 +20,7 @@ export const BOMB_PUSH_RADIUS = 3500;
 export const BOMB_DAMAGE_AMOUNT = 8000;
 
 export const MAP_RADIUS_LIMIT = 12300;
+export const MAP_SIZE = 27000;
 
 // ===== セーブデータ管理用（save.js実装時に使用予定） =====
 // セーブフォーマットを変更した場合はこの数値をインクリメントし、
@@ -21,6 +30,9 @@ export const SAVE_VERSION = 1;
 // ===== プレイヤー基本パラメータ =====
 export const PLAYER_MAX_HP = 100;
 export const PLAYER_SPEED = 22.0;
+export const PLAYER_RADIUS = 65;
+export const PLAYER_JUMP_VELOCITY = 32;
+export const PLAYER_GRAVITY = 1.4;
 export const DEBUFF_SPEED_MULT = 0.75;
 
 // ===== 戦車（tank）パラメータ =====
