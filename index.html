@@ -47,16 +47,12 @@
         .menu-btn:active {
             opacity: 0.7;
         }
-        #new-world-button.menu-btn {
+        #start-button.menu-btn {
             background: #ff3b1f; border-color: #ff3b1f; color: #f3ede2;
             box-shadow: 0 10px 24px rgba(255,59,31,0.35);
         }
-        #new-world-button.menu-btn:hover {
+        #start-button.menu-btn:hover {
             background: #ffb020; border-color: #ffb020; color: #0b0805;
-        }
-        #world-save-warning {
-            display: none; max-width: 520px; margin: 12px auto 0; color: #ffd4a8;
-            font-size: 14px; line-height: 1.4; text-align: center;
         }
 
         #ui {
@@ -200,13 +196,6 @@
             margin-top: 25px; padding: 16px 36px; font-size: 26px; background: #ff4500; border: 4px solid white;
             color: white; border-radius: 15px; cursor: pointer; font-family: 'Arial Black';
         }
-        #generation-summary { display: none; max-width: 720px; font-size: 20px; }
-        #birth-candidates { display: none; flex-direction: column; gap: 12px; width: min(760px, 90vw); }
-        .birth-candidate-button, #generation-home-button {
-            padding: 14px 20px; font-size: 18px; color: white; background: #913b20;
-            border: 2px solid white; border-radius: 10px; cursor: pointer;
-        }
-        #generation-home-button { display: none; margin-top: 14px; background: #333; }
         #warning-overlay {
             position: fixed; top: 0; left: 0; width: 100%; height: 100%;
             background: rgba(255,0,0,0.25); pointer-events: none; display: none; z-index: 400;
@@ -471,11 +460,9 @@
             <h1 class="fg-title">カニ人間</h1>
         </div>
         <div class="menu-btn-container">
-            <button id="new-world-button" class="menu-btn">NEW WORLD</button>
-            <button id="continue-world-button" class="menu-btn" disabled>CONTINUE</button>
+            <button id="start-button" class="menu-btn">DROP INTO CANYON!</button>
             <button id="lobby-settings-btn" class="menu-btn">⚙ SETTINGS</button>
         </div>
-        <p id="world-save-warning" role="status"></p>
     </div>
     <!-- ロード画面 -->
     <div id="loading-screen">
@@ -536,11 +523,6 @@
             <div id="hp-counter-text">HP <span id="hp-number">100</span></div>
         </div>
         <div id="atomic-status">ATOMIC CD: <span id="atomic-cd-label" style="color:#39ff14; font-family: monospace;">READY</span></div>
-        <div id="p1-goal-panel" style="margin-top:8px;padding:8px 12px;background:rgba(0,0,0,.55);color:#fff;font:14px sans-serif;pointer-events:none">
-            <div id="p1-current-region">現在地域: 港湾側（Z &gt;= 0）</div>
-            <div id="p1-harbor-goal">港湾突破: 0/30</div>
-            <div id="p1-inland-goal">内陸信頼: 支持 0/20・脅威 0/10以下</div>
-        </div>
     </div>
     <div id="charge-ui">
         <div id="charge-bar-container"><div id="charge-bar-fill"></div></div>
@@ -564,11 +546,8 @@
     </div>
     <div id="game-over">
         <h1>CRUSHED...</h1>
-        <p class="generation-score-line" style="font-size:28px;">最終スコア: <span id="final-score">0</span></p>
-        <p id="generation-summary"></p>
-        <div id="birth-candidates"></div>
+        <p style="font-size:28px;">最終スコア: <span id="final-score">0</span></p>
         <button id="restart-button">RETRY</button>
-        <button id="generation-home-button" type="button">RETURN TO HOME</button>
     </div>
     <!-- Escで閉じた時の復帰用クッション画面 -->
     <div id="resume-overlay">
@@ -665,9 +644,5 @@
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
 <script type="module" src="src/game.js"></script>
-<script type="module" src="src/regional-news-runtime.js"></script>
-<script type="module" src="src/generation-runtime.js"></script>
-<script type="module" src="src/world-save-runtime.js"></script>
-<script type="module" src="src/playable-loop-runtime.js"></script>
 </body>
 </html>

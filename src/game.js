@@ -30,16 +30,8 @@ import {
   HUMAN_WATER_AVOID_DURATION,HUMAN_WATER_AVOID_BLEND,
   DEBUG_NOCLIP_SPEED_MULT,DEBUG_SCORE_STEP,DEBUG_BOSS_SPAWN_DIST
 } from './constants.js';
-import { on, emit } from './events.js';
-import { getRegionIdFromPosition } from './regions.js';
-import './world-events.js'; // M1：低水準イベントを地域情報付きの意味イベントへ変換する
-import { getRegionalMilitaryResponse, getGenerationState, isP1InlandTrustActive } from './world.js';
-import { applyRegionalSpawnMultiplier } from './regional-military-response.js';
 
 let bossHPDelay = 100;
-let nextDeathToken = 1;
-let activeDeathToken = null;
-let lastReportedPlayerRegionId = null;
 
 function renderBossHP(en) {
     const hpRatio = Math.max(0, en.hp / en.maxHp) * 100;
@@ -595,12 +587,6 @@ let scene, camera, renderer, clock, animationId;
             doubleDownTime: 0 // 同時押しが開始された時刻を保持するタイマー（チャージ画面暴発防止用）
         };
 
-        function applyGameplayEnvironment() {
-            const skyColor = 0x5dade2;
-            scene.background = new THREE.Color(skyColor);
-            scene.fog = new THREE.Fog(skyColor, 3000, 14000);
-        }
-
         function init() {
             scene = new THREE.Scene();
             
@@ -609,7 +595,9 @@ let scene, camera, renderer, clock, animationId;
                 scene.background = new THREE.Color(0x3a2c22);
                 scene.fog = new THREE.Fog(0x3a2c22, 2000, 9000); 
             } else {
-                applyGameplayEnvironment();
+                const skyColor = 0x5dade2; // 少し深みのある青空
+                scene.background = new THREE.Color(skyColor);
+                scene.fog = new THREE.Fog(skyColor, 3000, 14000); // フォグの色を空と完全に一致させる
             }
 
             camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 10, 35000);
@@ -2636,7 +2624,6 @@ let scene, camera, renderer, clock, animationId;
             if (en.hp <= 0) {
                 en.hp = 0; en.isDead = true;
                 if (en.type !== 'tank' && en.type !== 'boss') score += en.scoreVal;
-                emit('entityKilled', { type: en.type, entity: en });
                 
                 if (player.hp > 0) {
                     let healAmount = 0;
@@ -3915,15 +3902,7 @@ let scene, camera, renderer, clock, animationId;
             // 2. プレイヤーとの距離が5800px未満のアクティブな基地のみを対象とすることで、遠すぎることによる即時デスポーン消滅を防止
             // 【軍の反撃強化】街を破壊（スコア獲得）するほど軍の警戒度が上がり、戦車の同時上限数とスポーン確率が動的に上昇
             const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));
-            const baseSpawnChance = 0.012 + Math.min(0.028, score * 0.000003); // 破壊規模に応じて最大4.0%まで頻度向上
-            const currentRegionId = getRegionIdFromPosition(pPos);
-            if (currentRegionId !== lastReportedPlayerRegionId) {
-                lastReportedPlayerRegionId = currentRegionId;
-                emit('playerRegionChanged', { regionId: currentRegionId });
-            }
-            const regionalResponseDisabled = globalThis.__KANI_DEV_FLAGS__?.disableRegionalMilitaryResponse === true;
-            const regionalResponse = getRegionalMilitaryResponse(currentRegionId, { disabled: regionalResponseDisabled });
-            const spawnChance = applyRegionalSpawnMultiplier(baseSpawnChance, regionalResponse?.multiplier);
+            const spawnChance = 0.012 + Math.min(0.028, score * 0.000003); // 破壊規模に応じて最大4.0%まで頻度向上
             
             if (tankCount < currentAllowedTanks && Math.random() < spawnChance) {
                 const SPAWN_ABLE_BASE_DIST_SQ = 5800 * 5800;
@@ -4052,9 +4031,7 @@ let scene, camera, renderer, clock, animationId;
                     }
                     
                     // カニが近づいたら逃走モードへ
-                    const humanRegionId = getRegionIdFromPosition(en.mesh.position);
-                    const fleeDistance = humanRegionId === 'inland' && isP1InlandTrustActive() ? 900 : 2200;
-                    if (dSq < fleeDistance * fleeDistance) {
+                    if (dSq < 2200 * 2200) {
                         if (en.humanState !== 'flee' && en.humanState !== 'tripped' && en.humanState !== 'recovering') {
                             en.humanState = 'flee';
                             en.humanTimer = 0;
@@ -4752,8 +4729,6 @@ let scene, camera, renderer, clock, animationId;
         function updateDeathSequence(rawDelta, dtScale) {
             if (!player.isDying) {
                 player.isDying = true;
-                activeDeathToken = `death-${nextDeathToken++}`;
-                emit('generationDyingStarted', { deathToken: activeDeathToken });
                 player.deathTimer = 3; // 3秒間の劇的スローモーション
                 shake = 20; // 大揺れによる3D酔いを完全に防止する、一瞬の微小な衝撃揺れ
                 playBoomSound(); // 大爆発音
@@ -4820,7 +4795,7 @@ let scene, camera, renderer, clock, animationId;
             camera.lookAt(player.mesh.position.x, player.mesh.position.y + 40, player.mesh.position.z);
 
             if (player.deathTimer <= 0) {
-                triggerGameOver(); // 演出タイマーが切れたら世代終了画面へ進む
+                triggerGameOver(); // 演出タイマーが切れたらゲームオーバー画面を表示
             }
         }
 
@@ -4841,7 +4816,6 @@ let scene, camera, renderer, clock, animationId;
             document.getElementById('compass-arrow').style.transform = `translate(-50%, -60%) rotate(${relativeAngle}rad)`;
         }
         function triggerGameOver() {
-          if (isGameOver) return;
           isGameOver = true; gameRunning = false; playRoarSound();
             document.getElementById('final-score').innerText = "$" + (score * 10000).toLocaleString();
            document.getElementById('game-over').style.display = 'flex';
@@ -4852,89 +4826,6 @@ let scene, camera, renderer, clock, animationId;
            document.getElementById('compass').style.display = 'none';
           document.getElementById('crosshair').style.display = 'none';
           if (document.pointerLockElement) document.exitPointerLock();
-          emit('generationDeathReady', {
-            deathToken: activeDeathToken,
-            deathCause: 'combat',
-            worldTime: Math.floor(performance.now()),
-          });
-        }
-
-        function clearHomeOnlyRuntimeObjects() {
-            if (!window.lobbyMushroomCloud) return;
-            scene.remove(window.lobbyMushroomCloud);
-            window.lobbyMushroomCloud.children.forEach(child => safeDispose(child));
-            window.lobbyMushroomCloud = null;
-        }
-
-        function resetIndividualRuntimeForNextGeneration(spawnPoint) {
-            if (!spawnPoint || !Number.isFinite(spawnPoint.x) || !Number.isFinite(spawnPoint.z)) return false;
-
-            clearHomeOnlyRuntimeObjects();
-
-            const transientTypes = new Set(['human', 'tank', 'boss', 'cow']);
-            for (let index = entities.length - 1; index >= 0; index--) {
-                const entity = entities[index];
-                if (!transientTypes.has(entity.type)) continue;
-                if (Array.isArray(entity.segments)) {
-                    for (const segment of entity.segments) {
-                        scene.remove(segment);
-                        safeDispose(segment);
-                    }
-                } else if (entity.mesh) {
-                    scene.remove(entity.mesh);
-                    entity.mesh.traverse(child => safeDispose(child));
-                }
-                entities.splice(index, 1);
-            }
-            for (const collection of [particles, bullets]) {
-                for (const item of collection) {
-                    if (item.mesh) {
-                        scene.remove(item.mesh);
-                        safeDispose(item.mesh);
-                    }
-                }
-                collection.length = 0;
-            }
-            for (const shockwave of shockwaves) {
-                if (shockwave.mesh) {
-                    scene.remove(shockwave.mesh);
-                    safeDispose(shockwave.mesh);
-                }
-            }
-            shockwaves.length = 0;
-
-            if (player.mesh) {
-                scene.remove(player.mesh);
-                player.mesh.traverse(child => safeDispose(child));
-            }
-            tankCount = 0; score = 0; shake = 0; bossActive = false;
-            yaw = spawnPoint.facingAngle; pitch = 0.45;
-            player.hp = PLAYER_MAX_HP; player.yVel = 0; player.isGrounded = true;
-            player.isDying = false; player.deathTimer = 0;
-            activeDeathToken = null;
-            player.isCharging = false; player.chargeTime = 0;
-            player.isLeftDown = false; player.isRightDown = false;
-            player.debuffTimer = 0; player.lastBombTime = -99999;
-            player.chargeBlock = false; player.attackLTimer = 0; player.attackRTimer = 0;
-            player.attackType = ''; player.pendingAttack = null;
-            if (player.attackDelayTimer) clearTimeout(player.attackDelayTimer);
-            player.attackDelayTimer = null; player.doubleAttackPending = false;
-            player.chargeZoom = 0; player.doubleDownTime = 0;
-
-            initPlayer();
-            player.mesh.position.set(spawnPoint.x, getTerrainHeight(spawnPoint.x, spawnPoint.z), spawnPoint.z);
-            player.mesh.rotation.set(0, spawnPoint.facingAngle, 0);
-            isMenu = false; isDropping = false; isPaused = false;
-            isGameOver = false; gameRunning = true; isIntroPlaying = false;
-            applyGameplayEnvironment();
-            document.getElementById('start-screen').style.display = 'none';
-            document.getElementById('game-over').style.display = 'none';
-            document.getElementById('ui').style.display = 'block';
-            document.getElementById('boss-ui').style.display = 'none';
-            document.getElementById('charge-ui').style.display = 'none';
-            document.getElementById('news-ticker').style.display = 'none';
-            renderer.domElement.requestPointerLock();
-            return true;
         }
 
         function showLoadingScreen(text) {
@@ -4978,8 +4869,12 @@ let scene, camera, renderer, clock, animationId;
             });
             shockwaves.length = 0;
 
-            // 待機画面専用オブジェクトは通常STARTと世代交代開始で同じ処理を使う。
-            clearHomeOnlyRuntimeObjects();
+            // 待機画面のキノコ雲を削除
+            if (window.lobbyMushroomCloud) {
+                scene.remove(window.lobbyMushroomCloud);
+                window.lobbyMushroomCloud.children.forEach(child => safeDispose(child));
+                window.lobbyMushroomCloud = null;
+            }
 
             // 追加: 半透明状態の解除
             transparentObjects.forEach(obj => {
@@ -5194,25 +5089,11 @@ let scene, camera, renderer, clock, animationId;
             animationId = requestAnimationFrame(animate);
         }
 
-        on('worldSessionReady', () => {
-            const generation = getGenerationState();
-            if (generation?.phase && generation.phase !== 'ALIVE') {
-                document.getElementById('start-screen').style.display = 'none';
-                emit('resumeGenerationFlowRequested');
-                return;
-            }
-            startGame();
+        document.getElementById('start-button').addEventListener('click', startGame);
+        document.getElementById('restart-button').addEventListener('click', () => {
+            // RETRYボタンを押した時に、直接開始するのではなく、一度ロビー画面へ戻す
+            returnToMenu();
         });
-
-        on('nextGenerationRequested', ({ candidate, spawnPoint }) => {
-            if (!resetIndividualRuntimeForNextGeneration(spawnPoint)) return;
-            emit('nextGenerationRuntimeReady', {
-                candidateId: candidate.candidateId,
-                worldTime: Math.floor(performance.now()),
-            });
-        });
-
-        on('generationHomeRequested', () => returnToMenu());
         
         document.addEventListener('keydown', e => { 
             keys[e.code] = true; 

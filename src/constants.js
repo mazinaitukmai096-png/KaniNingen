@@ -150,14 +150,3 @@ export const HUMAN_WATER_AVOID_BLEND = 0.8;    // 岸沿い方向への引き寄
 export const DEBUG_NOCLIP_SPEED_MULT = 3.0;  // ノークリップ中の移動速度倍率
 export const DEBUG_SCORE_STEP = 5000;        // +/-キーでのスコア（被害総額）増減量
 export const DEBUG_BOSS_SPAWN_DIST = 3000;   // 即時召喚時、プレイヤーからボスを離す距離
-
-// ===== 世論・派閥システム（world.js用） =====
-// ※数値は仮置きです。-100〜+100の範囲でクランプされます（world.js参照）。バランスは要調整。
-export const OPINION_DELTA_HUMAN_KILLED = -3;          // 民間人を殺すと世論が悪化
-export const OPINION_DELTA_TANK_DESTROYED = -1;        // 戦車破壊も基本的には世論を少し悪化させる（怪獣被害として報道される想定）
-export const OPINION_DELTA_BOSS_DESTROYED = 15;        // ボス討伐は脅威除去として世論が大きく好転
-
-export const FACTION_DELTA_CITIZENS_ON_HUMAN_KILLED = -5;    // 民間人殺害で市民の敵対度が上がる
-export const FACTION_DELTA_MILITARY_ON_TANK_DESTROYED = -8;  // 戦車破壊で軍の敵対度が上がる
-export const FACTION_DELTA_MILITARY_ON_BOSS_DESTROYED = 10;  // 共通の脅威(ボス)排除に軍が協力的評価
-export const FACTION_DELTA_CITIZENS_ON_BOSS_DESTROYED = 20;  // 市民はボス討伐を歓迎し好感度が上がる
