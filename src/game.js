@@ -1,7 +1,7 @@
 import {
-  CAM_MIN_DIST,CAM_MAX_DIST,CAM_INITIAL_DIST,CAM_INITIAL_PITCH,CAM_MIN_PITCH,CAM_MAX_PITCH,CAM_MOUSE_ROTATION_SPEED,CAM_WHEEL_ZOOM_SCALE,
+  CAM_INITIAL_DIST,CAM_INITIAL_PITCH,CAM_MOUSE_ROTATION_SPEED,CAM_WHEEL_ZOOM_SCALE,
   ATTACK_COOLDOWN,CHARGE_THRESHOLD,ATTACK_INPUT_DELAY_MS,INTRO_DURATION_MS,BOMB_COOLDOWN,BOMB_DAMAGE_RADIUS,BOMB_PUSH_RADIUS,BOMB_DAMAGE_AMOUNT,MAP_RADIUS_LIMIT,MAP_SIZE,
-  PLAYER_MAX_HP,PLAYER_SPEED,PLAYER_RADIUS,PLAYER_JUMP_VELOCITY,PLAYER_GRAVITY,DEBUFF_SPEED_MULT,
+  PLAYER_MAX_HP,PLAYER_SPEED,PLAYER_RADIUS,PLAYER_GRAVITY,DEBUFF_SPEED_MULT,
   TANK_HP,TANK_RADIUS,TANK_SCORE_VALUE,TANK_DESPAWN_DIST,TANK_ENGAGE_RANGE,TANK_APPROACH_DIST,
   TANK_MOVE_SPEED,TANK_BODY_TURN_SPEED,TANK_TURRET_TURN_SPEED,TANK_GUN_PITCH_SPEED,
   TANK_STUCK_CHECK_INTERVAL,TANK_STUCK_DIST_THRESHOLD_SQ,TANK_STUCK_AVOID_TIMER,
@@ -33,6 +33,13 @@ import {
 } from './constants.js';
 import { createInputController } from './core/input.js';
 import { createRendererController } from './core/renderer.js';
+import {
+  HUMAN_VISUAL_SCALES,
+  INITIAL_SCALE_STAGE_ID,
+  canScaleStageDamageTarget,
+  getScaleStage,
+  isScaleSandboxAtomicEnabled,
+} from './scale-sandbox.js';
 
 let bossHPDelay = 100;
 
@@ -109,6 +116,9 @@ let inputController, rendererController;
             noclip: false,    // ノークリップ：建物・ボスに当たらず、移動速度も上がる
         };
 
+        let activeScaleStageId = INITIAL_SCALE_STAGE_ID;
+        let activeScaleStage = getScaleStage(activeScaleStageId);
+        let humanVisualScale = HUMAN_VISUAL_SCALES.CURRENT;
         let camDist = CAM_INITIAL_DIST;
         // --- 追加: ゲーム開始時の映画的カメラ演出（確立ショット→通常視点） ---
         let isIntroPlaying = false;
@@ -629,6 +639,50 @@ let inputController, rendererController;
             doubleDownTime: 0 // 同時押しが開始された時刻を保持するタイマー（チャージ画面暴発防止用）
         };
 
+        function resetAtomicChargeForScaleSandbox() {
+            player.isCharging = false;
+            player.chargeTime = 0;
+            player.chargeZoom = 0;
+            player.chargeBlock = false;
+            const chargeUi = document.getElementById('charge-ui');
+            if (chargeUi) {
+                chargeUi.style.display = 'none';
+                chargeUi.classList.remove('ready');
+            }
+        }
+
+        function applyScaleStage(stageId, { resetCamera = true } = {}) {
+            const nextStage = getScaleStage(stageId);
+            activeScaleStageId = stageId;
+            activeScaleStage = nextStage;
+
+            // 同一Player instanceのrootだけを拡縮し、HP・位置・Score・World stateには触れない。
+            player.mesh.scale.setScalar(nextStage.visualScale);
+            player.radius = nextStage.collisionRadius;
+
+            if (camera) {
+                camera.near = nextStage.cameraNear;
+                camera.updateProjectionMatrix();
+            }
+            if (resetCamera) {
+                camDist = nextStage.cameraDistance;
+                pitch = nextStage.cameraPitch;
+            } else {
+                camDist = Math.max(nextStage.cameraMinDistance, Math.min(nextStage.cameraMaxDistance, camDist));
+                pitch = Math.max(nextStage.cameraMinPitch, Math.min(nextStage.cameraMaxPitch, pitch));
+            }
+
+            resetAtomicChargeForScaleSandbox();
+        }
+
+        function applyHumanVisualScale(scale) {
+            if (!Object.values(HUMAN_VISUAL_SCALES).includes(scale)) return;
+            humanVisualScale = scale;
+            for (const en of entities) {
+                if (en.type === 'human') en.mesh.scale.setScalar(humanVisualScale);
+            }
+        }
+
         function init() {
             if (!rendererController) {
                 rendererController = createRendererController({
@@ -762,6 +816,7 @@ let inputController, rendererController;
                 player.mesh.add(leg); player.legs.push(leg);
             }
             scene.add(player.mesh);
+            applyScaleStage(activeScaleStageId, { resetCamera: false });
         }
 
         function spawnRuins(pos, sizeScale = 1.0) {
@@ -1362,6 +1417,7 @@ let inputController, rendererController;
             }
             
             group.position.set(x, 0, z);
+            if (type === 'human') group.scale.setScalar(humanVisualScale);
             if (forceAngle !== null) {
                 group.rotation.y = forceAngle;
             } else {
@@ -2394,7 +2450,8 @@ let inputController, rendererController;
             // スイングの軌道を弧状にマッピング
             const startAngle = isLeft ? 1.1 : -1.1;
             const endAngle = isLeft ? -0.3 : 0.3;
-            const radius = 180;
+            const radius = activeScaleStage.windArcRadius;
+            const particleScale = activeScaleStage.windArcParticleScale;
             
             for (let i = 0; i < particleCount; i++) {
                 const t = i / (particleCount - 1);
@@ -2405,7 +2462,7 @@ let inputController, rendererController;
                 // プレイヤーの爪の高さで円弧上の座標を算出
                 const localPos = new THREE.Vector3(
                     Math.sin(angleOffset) * radius, 
-                    30 + (Math.random() - 0.5) * 4, // 散らばり幅をよりタイトにしてくっきり密な線にする
+                    30 * activeScaleStage.visualScale + (Math.random() - 0.5) * 4 * particleScale, // Stageごとの爪の高さへ合わせる
                     Math.cos(angleOffset) * radius
                 );
                 localPos.applyAxisAngle(new THREE.Vector3(0, 1, 0), pRot);
@@ -2416,8 +2473,8 @@ let inputController, rendererController;
                 const p = new THREE.Mesh(geometries.box, materials.windArc);
                 
                 // 太さと長さを「はっきりと」スケールアップ
-                const scaleLen = 8 + Math.random() * 6;
-                p.scale.set(2.6, scaleLen, 2.6); // 従来の0.8から2.6へと太く調整
+                const scaleLen = (8 + Math.random() * 6) * particleScale;
+                p.scale.set(2.6 * particleScale, scaleLen, 2.6 * particleScale); // Maxでは承認済みの太さを維持
                 p.userData.baseScale = p.scale.clone(); // フェードアウト用に初期スケールを保存
                 p.position.copy(worldPos);
                 
@@ -2428,7 +2485,7 @@ let inputController, rendererController;
                 // 弧に沿う放出推進速度（軌道形状を乱さない程度に微速化）
                 const flowDir = new THREE.Vector3(Math.cos(finalAngle), 0, -Math.sin(finalAngle)).normalize();
                 if (!isLeft) flowDir.negate();
-                const v = flowDir.multiplyScalar(45 + Math.random() * 35);
+                const v = flowDir.multiplyScalar((45 + Math.random() * 35) * particleScale);
                 
                 const pLife = 0.45 + Math.random() * 0.25; // 寿命を少し伸ばして空間保持力を強化
                 particles.push({
@@ -2925,12 +2982,13 @@ let inputController, rendererController;
 
         }
 
-        function explodeAt(center, damageRadius, damageAmount, pushRadius, excludeType = null) {
+        function explodeAt(center, damageRadius, damageAmount, pushRadius, excludeType = null, damageFilter = null) {
             const radSq = damageRadius * damageRadius;
             const pushSq = pushRadius * pushRadius;
             for (let en of entities) {
                 if (en.isDead) continue;
                 if (excludeType && en.type === excludeType) continue; 
+                if (damageFilter && !damageFilter(en)) continue;
                 
                 // 事前カリング
                 if (Math.abs(en.mesh.position.x - center.x) > pushRadius || 
@@ -2994,13 +3052,18 @@ let inputController, rendererController;
 
             // 行う手によって当たり判定位置を変更 (左手は左前方、右手は右前方)
             const hitPos = player.mesh.position.clone().add(
-                new THREE.Vector3(isLeft ? 180 : -180, 0, 180).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
+                new THREE.Vector3(
+                    isLeft ? activeScaleStage.attackOffsetX : -activeScaleStage.attackOffsetX,
+                    0,
+                    activeScaleStage.attackOffsetZ
+                ).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
             );
-            const hitRad = 350;
+            const hitRad = activeScaleStage.singleAttackRadius;
             const hitRadSq = hitRad * hitRad; // 手が偏っている分、個別判定の半径を既存 of 500 から 350 に調整
             
             for (let en of entities) {
                 if (!en.isDead) {
+                    if (!canScaleStageDamageTarget(activeScaleStageId, en)) continue;
                     if (en.type === 'boss' && en.mesh.position.y < -20) continue;
                     
                     if (Math.abs(en.mesh.position.x - hitPos.x) > hitRad ||
@@ -3042,16 +3105,19 @@ let inputController, rendererController;
 
             // 左右両方の領域に当たり判定座標をセット
             const hitPosL = player.mesh.position.clone().add(
-                new THREE.Vector3(180, 0, 180).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
+                new THREE.Vector3(activeScaleStage.attackOffsetX, 0, activeScaleStage.attackOffsetZ)
+                    .applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
             );
             const hitPosR = player.mesh.position.clone().add(
-                new THREE.Vector3(-180, 0, 180).applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
+                new THREE.Vector3(-activeScaleStage.attackOffsetX, 0, activeScaleStage.attackOffsetZ)
+                    .applyAxisAngle(new THREE.Vector3(0, 1, 0), player.mesh.rotation.y)
             );
-            const hitRad = 380;
+            const hitRad = activeScaleStage.doubleAttackRadius;
             const hitRadSq = hitRad * hitRad;
 
             for (let en of entities) {
                 if (!en.isDead) {
+                    if (!canScaleStageDamageTarget(activeScaleStageId, en)) continue;
                     if (en.type === 'boss' && en.mesh.position.y < -20) continue;
                     
                     const dxL = Math.abs(en.mesh.position.x - hitPosL.x);
@@ -3418,28 +3484,36 @@ let inputController, rendererController;
                     if (inputSnapshot.isPressed('KeyD')) moveVec.x += 1;
                 }
 
-                if (inputSnapshot.isPressed('Space') && player.isGrounded && !isIntroPlaying) { player.yVel = PLAYER_JUMP_VELOCITY; player.isGrounded = false; }
+                if (inputSnapshot.isPressed('Space') && player.isGrounded && !isIntroPlaying) { player.yVel = activeScaleStage.jumpVelocity; player.isGrounded = false; }
                 if (!player.isGrounded) {
-                    player.yVel -= PLAYER_GRAVITY * dtScale; player.mesh.position.y += player.yVel * dtScale;
+                    player.yVel -= activeScaleStage.gravity * dtScale; player.mesh.position.y += player.yVel * dtScale;
                     if (player.mesh.position.y <= 0) {
                         player.mesh.position.y = 0; player.isGrounded = true;
                         
-                        shake = 80; 
-                        explodeAt(player.mesh.position, 500, 800, 1000); 
+                        shake = activeScaleStage.landingShake;
+                        explodeAt(
+                            player.mesh.position,
+                            activeScaleStage.landingRadius,
+                            800,
+                            activeScaleStage.landingPushRadius,
+                            null,
+                            en => canScaleStageDamageTarget(activeScaleStageId, en)
+                        );
                         playHitSound(true);
 
-                        createShockwave(player.mesh.position, 550, 0xff3300); 
-                        createShockwave(player.mesh.position, 380, 0xffaa00); 
+                        createShockwave(player.mesh.position, activeScaleStage.landingRadius * 1.1, 0xff3300);
+                        createShockwave(player.mesh.position, activeScaleStage.landingRadius * 0.76, 0xffaa00);
 
-                        const landDustCount = 14; 
+                        const landingEffectScale = Math.max(0.35, activeScaleStage.visualScale);
+                        const landDustCount = Math.max(4, Math.round(14 * activeScaleStage.visualScale));
                         for (let j = 0; j < landDustCount; j++) {
                             makeParticleRoom(PARTICLE_CAP_HEAVY);
                             const angle = (j / landDustCount) * Math.PI * 2;
                             const p = new THREE.Mesh(geometries.box, materials.sandDust);
-                            p.scale.setScalar(15 + Math.random() * 20);
+                            p.scale.setScalar((15 + Math.random() * 20) * landingEffectScale);
                             p.position.copy(player.mesh.position);
                             p.position.y = 5;
-                            const speed = 400 + Math.random() * 500;
+                            const speed = (400 + Math.random() * 500) * landingEffectScale;
                             const v = new THREE.Vector3(Math.cos(angle) * speed, 10 + Math.random() * 80, Math.sin(angle) * speed);
                             particles.push({
                                 mesh: p,
@@ -3475,7 +3549,7 @@ let inputController, rendererController;
 
                 const speedMult = player.debuffTimer > 0 ? DEBUFF_SPEED_MULT : 1.0;
                 // 演出中は歩行速度を約3.5割（0.35）に落とし、のっそりとした前進にします
-                const currentMoveSpeed = PLAYER_SPEED * speedMult * (isIntroPlaying ? 0.35 : 1.0) * (debugState.noclip ? DEBUG_NOCLIP_SPEED_MULT : 1.0);
+                const currentMoveSpeed = activeScaleStage.movementSpeed * speedMult * (isIntroPlaying ? 0.35 : 1.0) * (debugState.noclip ? DEBUG_NOCLIP_SPEED_MULT : 1.0);
 
                 // --- プレイヤー胴体および脚のアニメーションリセット ---
                 player.mesh.rotation.x = 0;
@@ -3637,7 +3711,7 @@ let inputController, rendererController;
                 const isDoublePressed = player.isLeftDown && player.isRightDown;
                 const pressDuration = isDoublePressed && player.doubleDownTime ? (Date.now() - player.doubleDownTime) : 0;
 
-                if (isDoublePressed && !player.chargeBlock && pressDuration >= CHARGE_DELAY) {
+                if (isScaleSandboxAtomicEnabled(activeScaleStageId) && isDoublePressed && !player.chargeBlock && pressDuration >= CHARGE_DELAY) {
                     const now = Date.now();
                     if (now - player.lastBombTime > BOMB_COOLDOWN) {
                         player.isCharging = true; player.chargeTime += delta * 1000;
@@ -3727,10 +3801,14 @@ let inputController, rendererController;
                 // 通常のターゲットカメラ位置
                 const targetCamPos = new THREE.Vector3(
                     player.mesh.position.x + activeCamDist * Math.sin(yaw) * Math.cos(pitch),
-                    player.mesh.position.y + activeCamDist * Math.sin(pitch) + 200,
+                    player.mesh.position.y + activeCamDist * Math.sin(pitch) + activeScaleStage.cameraHeight,
                     player.mesh.position.z + activeCamDist * Math.cos(yaw) * Math.cos(pitch)
                 );
-                const targetLookAt = new THREE.Vector3(player.mesh.position.x, player.mesh.position.y + 120, player.mesh.position.z);
+                const targetLookAt = new THREE.Vector3(
+                    player.mesh.position.x,
+                    player.mesh.position.y + activeScaleStage.cameraTargetHeight,
+                    player.mesh.position.z
+                );
 
                 if (isIntroPlaying) {
                     // 演出の進行度 (0.0 〜 1.0)
@@ -4751,7 +4829,10 @@ let inputController, rendererController;
             const cdRemaining = Math.max(0, BOMB_COOLDOWN - (Date.now() - player.lastBombTime));
             const cdLabel = document.getElementById('atomic-cd-label');
             if (cdLabel) {
-                if (cdRemaining > 0) {
+                if (!isScaleSandboxAtomicEnabled(activeScaleStageId)) {
+                    cdLabel.innerText = "SCALE SANDBOX: LOCKED";
+                    cdLabel.style.color = "#888888";
+                } else if (cdRemaining > 0) {
                     cdLabel.innerText = "COOLDOWN (" + Math.ceil(cdRemaining / 1000) + "s)";
                     cdLabel.style.color = "#ff3300";
                 } else {
@@ -5166,14 +5247,25 @@ let inputController, rendererController;
 
             if (document.pointerLockElement) {
                 yaw -= e.movementX * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity;
-                pitch = Math.max(CAM_MIN_PITCH, Math.min(CAM_MAX_PITCH, pitch + e.movementY * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity));
+                pitch = Math.max(
+                    activeScaleStage.cameraMinPitch,
+                    Math.min(
+                        activeScaleStage.cameraMaxPitch,
+                        pitch + e.movementY * CAM_MOUSE_ROTATION_SPEED * settings.mouseSensitivity
+                    )
+                );
             }
           },
           onWheel: e => {
             // イントロ再生中はホイールによるカメラ距離の調整を禁止します
             if (isIntroPlaying) return;
 
-            if (gameRunning) camDist = Math.max(CAM_MIN_DIST, Math.min(CAM_MAX_DIST, camDist + e.deltaY * CAM_WHEEL_ZOOM_SCALE));
+            if (gameRunning) {
+                camDist = Math.max(
+                    activeScaleStage.cameraMinDistance,
+                    Math.min(activeScaleStage.cameraMaxDistance, camDist + e.deltaY * CAM_WHEEL_ZOOM_SCALE)
+                );
+            }
           },
           onMouseDown: e => {
             // プレイ中にロックが外れている場合、画面クリックで復帰を試みる
@@ -5262,7 +5354,7 @@ let inputController, rendererController;
                 }
             }
             
-            if (wasCharging && chargeCompleted && player.hp > 0) {
+            if (isScaleSandboxAtomicEnabled(activeScaleStageId) && wasCharging && chargeCompleted && player.hp > 0) {
                 // 変更点：プレイヤーがジャンプ中（空中：isGrounded が false）のときのみ起爆するように制限
                 if (!player.isGrounded) {
                     const now = Date.now();
@@ -5369,6 +5461,16 @@ let inputController, rendererController;
             document.getElementById('debug-noclip-btn').innerText = debugState.noclip ? 'ON' : 'OFF';
             document.getElementById('debug-noclip-btn').classList.toggle('debug-on', debugState.noclip);
             document.getElementById('debug-score-val').innerText = score;
+            document.querySelectorAll('[data-scale-stage]').forEach(button => {
+                button.classList.toggle('debug-on', button.dataset.scaleStage === activeScaleStageId);
+            });
+            const stageValues = document.getElementById('debug-scale-values');
+            stageValues.innerText =
+                `Stage: ${activeScaleStage.id} | Visual: ${activeScaleStage.visualScale.toFixed(2)} | ` +
+                `Collision: ${activeScaleStage.collisionRadius.toFixed(2)} | Speed: ${activeScaleStage.movementSpeed.toFixed(1)} | ` +
+                `Jump: ${activeScaleStage.jumpVelocity.toFixed(1)} | Attack: ${activeScaleStage.singleAttackRadius}/${activeScaleStage.doubleAttackRadius} | ` +
+                `Camera: ${activeScaleStage.cameraDistance}`;
+            document.getElementById('debug-human-scale').value = String(humanVisualScale);
             const spawnBtn = document.getElementById('debug-spawn-boss-btn');
             const killBtn = document.getElementById('debug-kill-boss-btn');
             spawnBtn.disabled = !gameRunning || bossActive;
@@ -5409,6 +5511,16 @@ let inputController, rendererController;
         document.getElementById('debug-close-btn').addEventListener('click', () => closeDebugModal(true));
         document.getElementById('debug-god-btn').addEventListener('click', toggleGodMode);
         document.getElementById('debug-noclip-btn').addEventListener('click', toggleNoclip);
+        document.querySelectorAll('[data-scale-stage]').forEach(button => {
+            button.addEventListener('click', () => {
+                applyScaleStage(button.dataset.scaleStage);
+                refreshDebugModal();
+            });
+        });
+        document.getElementById('debug-human-scale').addEventListener('change', event => {
+            applyHumanVisualScale(Number(event.target.value));
+            refreshDebugModal();
+        });
         document.getElementById('debug-spawn-boss-btn').addEventListener('click', () => {
             if (!gameRunning || bossActive) return;
             const angle = Math.random() * Math.PI * 2;
