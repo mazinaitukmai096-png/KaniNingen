@@ -246,10 +246,11 @@ test('Atomic assets remain present while use is disabled throughout the Scale Sa
   assert.match(game, /SCALE SANDBOX: LOCKED/);
 });
 
-test('Human scale comparison remains visual-only and exposes the three approved values', () => {
+test('Human scale comparison remains visual-only and exposes the approved values including Production 0.50', () => {
   assert.deepEqual(HUMAN_VISUAL_SCALES, {
     CURRENT: 1,
     COMPARE_065: 0.65,
+    PRODUCTION_050: 0.5,
     COMPARE_040: 0.4,
   });
   const applyHumanScale = extractFunction(game, 'applyHumanVisualScale');
@@ -258,6 +259,7 @@ test('Human scale comparison remains visual-only and exposes the three approved 
   assert.match(html, /Human見た目Scale（比較専用・AI\/Collision不変）/);
   assert.match(html, /<option value="1">Current<\/option>/);
   assert.match(html, /<option value="0\.65">0\.65<\/option>/);
+  assert.match(html, /<option value="0\.5">0\.50 \(Production\)<\/option>/);
   assert.match(html, /<option value="0\.4">0\.40<\/option>/);
 });
 

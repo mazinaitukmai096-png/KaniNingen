@@ -183,7 +183,12 @@ test('Building feedback, World generation, Input, Renderer, and locked HUD behav
     .replace(
       /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
       '\n                    $1\n                    $2',
-    );
+    )
+    .replace(
+      /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
+      '\n',
+    )
+    .replace(/\n\s+populateWorldScaleDetails\(townCenters, pathTiles\);\n/, '\n');
   assert.equal(currentMap, sliceBetween(baselineGame, 'function initMap()', 'function createParticles('));
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');

@@ -102,9 +102,11 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
      'index.html',
      'src/game.js',
      'src/scale-sandbox.js',
+     'src/world-scale-rebalance.js',
      'tests/destruction-feel-regression.test.mjs',
      'tests/runtime-stability.test.mjs',
      'tests/scale-sandbox.test.mjs',
+     'tests/world-scale-rebalance.test.mjs',
   ].includes(path)), `unexpected changed files: ${changedFiles.join(', ')}`);
   assert.ok(changedFiles.every(path => !/(terrain|chunk|query|seed|world.?generation)/i.test(path)));
 });
