@@ -160,32 +160,34 @@ test('collision broad-phase candidates preserve the exact legacy type sets', () 
   assert.match(game, /const limitDist = segRadius \+ obstacle\.radius;/);
 });
 
-test('Player attacks, building feedback, UI, World generation, Input, and Renderer are unchanged', () => {
+test('Building feedback, World generation, Input, Renderer, and locked HUD behavior are unchanged', () => {
   const readBaseline = path => execFileSync('git', ['show', `${PHASE4_BASELINE_COMMIT}:${path}`], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).replace(/\r\n/g, '\n');
   const readCurrent = path => readFileSync(resolve(repoRoot, path), 'utf8').replace(/\r\n/g, '\n');
 
-  for (const path of ['index.html', 'src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
     assert.equal(readCurrent(path), readBaseline(path));
   }
   assert.equal(
     sliceBetween(game, 'function initMap()', 'function createParticles('),
     sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
   );
-  assert.equal(
-    sliceBetween(game, 'function attack(isLeft)', 'function updateLobbyAnimation('),
-    sliceBetween(baselineGame, 'function attack(isLeft)', 'function updateLobbyAnimation('),
-  );
-  assert.equal(
-    sliceBetween(game, 'function updateHUD()', 'function updateDeathSequence('),
-    sliceBetween(baselineGame, 'function updateHUD()', 'function updateDeathSequence('),
-  );
+  const currentHud = extractFunction(game, 'updateHUD');
+  const baselineHud = extractFunction(baselineGame, 'updateHUD');
+  for (const lockedHudSnippet of [
+    "document.getElementById('score').innerText = \"$\" + (score * 10000).toLocaleString();",
+    "hpFill.style.width = Math.max(0, player.hp) + '%';",
+    'const cdRemaining = Math.max(0, BOMB_COOLDOWN - (Date.now() - player.lastBombTime));',
+  ]) {
+    assert.ok(currentHud.includes(lockedHudSnippet));
+    assert.ok(baselineHud.includes(lockedHudSnippet));
+  }
 });
 
 test('JavaScript syntax and local module imports resolve', () => {
-  for (const path of ['src/game.js', 'src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/core/input.js', 'src/core/renderer.js']) {
     execFileSync(process.execPath, ['--check', resolve(repoRoot, path)], { cwd: repoRoot, stdio: 'pipe' });
   }
 

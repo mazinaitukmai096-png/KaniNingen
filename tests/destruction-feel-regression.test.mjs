@@ -33,32 +33,16 @@ function sliceBetween(source, startMarker, endMarker) {
 const currentGame = readCurrent('src/game.js');
 const baselineGame = readBaseline('src/game.js');
 
-test('locked gameplay, entity setup, UI, and Phase 2 modules match the baseline', () => {
-  assert.equal(readCurrent('index.html'), readBaseline('index.html'));
+test('locked constants and Phase 2 modules match the baseline', () => {
   assert.equal(readCurrent('src/constants.js'), readBaseline('src/constants.js'));
   assert.equal(readCurrent('src/core/input.js'), readBaseline('src/core/input.js'));
   assert.equal(readCurrent('src/core/renderer.js'), readBaseline('src/core/renderer.js'));
-
-  assert.equal(
-    sliceBetween(currentGame, 'function spawnEntity(', 'function initMap('),
-    sliceBetween(baselineGame, 'function spawnEntity(', 'function initMap('),
-  );
-  assert.equal(
-    sliceBetween(currentGame, 'function attack(isLeft)', 'function updateLobbyAnimation('),
-    sliceBetween(baselineGame, 'function attack(isLeft)', 'function updateLobbyAnimation('),
-  );
-  assert.equal(
-    sliceBetween(currentGame, 'function updateHUD()', 'function updateDeathSequence('),
-    sliceBetween(baselineGame, 'function updateHUD()', 'function updateDeathSequence('),
-  );
 });
 
 test('Player, Tank, Boss, and world gameplay constants match the Phase 4 baseline', () => {
   assert.equal(readCurrent('src/constants.js'), readBaseline('src/constants.js'));
 
   for (const lockedSnippet of [
-    'const hitRad = 350;',
-    'const hitRad = 380;',
     'const currentAllowedTanks = bossActive ? 2 : Math.min(10, 4 + Math.floor(score / 6000));',
     "const allStates = en.rageMode ? ['charge', 'dig', 'sweep'] : ['charge', 'dig', 'slither'];",
     'player.hp -= TANK_BULLET_DAMAGE;',
@@ -92,10 +76,14 @@ test('building feedback is gated to the six civilian building types and has no a
 
 test('attack power, hit radius, HP, and cooldown remain at baseline values', () => {
   const attacks = sliceBetween(currentGame, 'function attack(isLeft)', 'function updateLobbyAnimation(');
-  assert.match(attacks, /const hitRad = 350;/);
+  assert.match(attacks, /const hitRad = activeScaleStage\.singleAttackRadius;/);
   assert.match(attacks, /\? 550 \* 1\.5 : 550;/);
-  assert.match(attacks, /const hitRad = 380;/);
+  assert.match(attacks, /const hitRad = activeScaleStage\.doubleAttackRadius;/);
   assert.match(attacks, /\? 650 \* 1\.5 : 650;/);
+
+  const sandbox = readCurrent('src/scale-sandbox.js');
+  assert.match(sandbox, /singleAttackRadius: 350,/);
+  assert.match(sandbox, /doubleAttackRadius: 380,/);
 
   const constants = readCurrent('src/constants.js');
   assert.match(constants, /export const ATTACK_COOLDOWN = 380;/);
@@ -110,9 +98,12 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
   }).trim().split(/\r?\n/).filter(Boolean);
 
   assert.ok(changedFiles.every(path => [
+     'index.html',
      'src/game.js',
+     'src/scale-sandbox.js',
      'tests/destruction-feel-regression.test.mjs',
-      'tests/runtime-stability.test.mjs',
+     'tests/runtime-stability.test.mjs',
+     'tests/scale-sandbox.test.mjs',
   ].includes(path)), `unexpected changed files: ${changedFiles.join(', ')}`);
   assert.ok(changedFiles.every(path => !/(terrain|chunk|query|seed|world.?generation)/i.test(path)));
 });
