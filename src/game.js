@@ -117,8 +117,6 @@ let inputController, rendererController;
         let introStartLookAt = null;
         const entities = [], particles = [], bullets = [], scars = [], shockwaves = [];
         const DESTRUCTIBLE_BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
-        const destructionFeedbackTimers = new Set();
-        const destructionFlashLights = new Set();
         let buildingHitStopUntil = 0;
         // 水域（川・池）データ専用の独立配列。{ x, z, radius } のみを保持する純粋な地形データで、
         // entities配列（攻撃判定・スコア・耐久力を持つオブジェクト群）とは完全に分離して管理する。
@@ -2438,117 +2436,6 @@ let inputController, rendererController;
             });
         }
 
-        function scheduleDestructionFeedback(callback, delayMs) {
-            const timerId = setTimeout(() => {
-                destructionFeedbackTimers.delete(timerId);
-                callback();
-            }, delayMs);
-            destructionFeedbackTimers.add(timerId);
-        }
-
-        function clearDestructionFeedback() {
-            destructionFeedbackTimers.forEach(timerId => clearTimeout(timerId));
-            destructionFeedbackTimers.clear();
-            destructionFlashLights.forEach(light => {
-                if (light.parent) light.parent.remove(light);
-            });
-            destructionFlashLights.clear();
-            buildingHitStopUntil = 0;
-        }
-
-        function flashBuildingHit(en) {
-            const flashedMeshes = [];
-            en.mesh.traverse(child => {
-                if (!child.isMesh || !child.material) return;
-
-                const originalMaterial = child.material;
-                const sourceMaterials = Array.isArray(originalMaterial) ? originalMaterial : [originalMaterial];
-                const flashMaterials = sourceMaterials.map(sourceMaterial => {
-                    const flashMaterial = sourceMaterial.clone();
-                    if (flashMaterial.color) flashMaterial.color.setHex(0xffffff);
-                    if (flashMaterial.emissive) {
-                        flashMaterial.emissive.setHex(0xffdd88);
-                        flashMaterial.emissiveIntensity = 1.8;
-                    }
-                    return flashMaterial;
-                });
-                const appliedMaterial = Array.isArray(originalMaterial) ? flashMaterials : flashMaterials[0];
-                child.material = appliedMaterial;
-                flashedMeshes.push({ child, originalMaterial, appliedMaterial, flashMaterials });
-            });
-
-            scheduleDestructionFeedback(() => {
-                flashedMeshes.forEach(({ child, originalMaterial, appliedMaterial, flashMaterials }) => {
-                    if (child.material === appliedMaterial) child.material = originalMaterial;
-                    flashMaterials.forEach(material => material.dispose());
-                });
-            }, 55);
-        }
-
-        function createBuildingDestructionBurst(en, hitDir) {
-            const effectScene = scene;
-            const burstPos = en.mesh.position.clone();
-            burstPos.y += Math.max(35, en.radius * 0.55);
-
-            buildingHitStopUntil = Math.max(buildingHitStopUntil, performance.now() + 65);
-            shake = Math.max(shake, Math.min(125, 72 + en.radius * 0.3));
-
-            createParticles(burstPos, 0xffdd44, 16, 10, false, materials.goldSpark);
-            createParticles(burstPos, 0xff5500, 10, 15, false, materials.orangeSpark);
-            createParticles(burstPos, 0xa08060, 18, Math.max(22, en.radius * 0.18), false, materials.sandDust);
-            createShockwave(en.mesh.position, Math.max(240, en.radius * 2.4), 0xffaa33);
-
-            const flashLight = new THREE.PointLight(0xffaa33, 7, Math.max(650, en.radius * 6), 2);
-            flashLight.position.copy(burstPos);
-            effectScene.add(flashLight);
-            destructionFlashLights.add(flashLight);
-
-            const smokeCount = Math.max(4, Math.round(10 * PARTICLE_COUNT_SCALE));
-            for (let i = 0; i < smokeCount; i++) {
-                if (particles.length >= PARTICLE_CAP_NORMAL) {
-                    const old = particles.shift();
-                    scene.remove(old.mesh);
-                    safeDispose(old.mesh);
-                }
-                const smoke = new THREE.Mesh(geometries.sphere, materials.ruinSmoke);
-                smoke.scale.setScalar(Math.max(18, en.radius * (0.15 + Math.random() * 0.12)));
-                smoke.userData.baseScale = smoke.scale.clone();
-                smoke.position.copy(burstPos);
-                smoke.position.x += (Math.random() - 0.5) * en.radius;
-                smoke.position.z += (Math.random() - 0.5) * en.radius;
-
-                const smokeLife = 1.3 + Math.random() * 0.7;
-                const smokeVelocity = new THREE.Vector3(
-                    hitDir.x * 45 + (Math.random() - 0.5) * 55,
-                    80 + Math.random() * 90,
-                    hitDir.z * 45 + (Math.random() - 0.5) * 55
-                );
-                particles.push({
-                    mesh: smoke,
-                    vel: smokeVelocity,
-                    life: smokeLife,
-                    maxLife: smokeLife,
-                    rotVel: new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).multiplyScalar(0.08),
-                    settleY: -9999,
-                    noGravity: true,
-                    isWindFade: true
-                });
-                scene.add(smoke);
-            }
-
-            scheduleDestructionFeedback(() => {
-                if (scene !== effectScene || !gameRunning) return;
-                playBoomSound();
-                createParticles(burstPos, 0xa08060, 12, Math.max(26, en.radius * 0.2), false, materials.sandDust);
-                createShockwave(en.mesh.position, Math.max(170, en.radius * 1.65), 0x6b5140);
-            }, 45);
-
-            scheduleDestructionFeedback(() => {
-                if (flashLight.parent) flashLight.parent.remove(flashLight);
-                destructionFlashLights.delete(flashLight);
-            }, 90);
-        }
-
         function spawnMushroomCloud(pos) {
             playAtomicExplosionSound();
             createParticles(pos, 0xffffff, 80, 50, true);
@@ -2649,10 +2536,10 @@ let inputController, rendererController;
             const isDestructibleBuilding = DESTRUCTIBLE_BUILDING_TYPES.has(en.type);
             if (isDestructibleBuilding) {
                 if (en.hp <= 0) {
-                    createBuildingDestructionBurst(en, hDir);
+                    buildingHitStopUntil = Math.max(buildingHitStopUntil, performance.now() + 65);
+                    shake = Math.max(shake, Math.min(88, 50 + en.radius * 0.21));
                 } else {
                     buildingHitStopUntil = Math.max(buildingHitStopUntil, performance.now() + 32);
-                    flashBuildingHit(en);
                     playHitSound(false);
                 }
             }
@@ -4971,7 +4858,7 @@ let inputController, rendererController;
 
             ensureAudio();
             if (animationId) cancelAnimationFrame(animationId);
-            clearDestructionFeedback();
+            buildingHitStopUntil = 0;
             
             shockwaves.forEach(sw => {
                 if(sw.mesh) {
@@ -5091,7 +4978,7 @@ let inputController, rendererController;
         function returnToMenu() {
             ensureAudio();
             if (animationId) cancelAnimationFrame(animationId);
-            clearDestructionFeedback();
+            buildingHitStopUntil = 0;
             
             // 画面上の古い3Dオブジェクトや敵をすべてきれいに削除（クリーンアップ）
             shockwaves.forEach(sw => {

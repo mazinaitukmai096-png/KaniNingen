@@ -60,7 +60,7 @@ test('AI, Boss, Player movement, and game progression only gain the approved hit
   assert.equal(currentAnimate, baselineAnimate);
 });
 
-test('building feedback is gated to the six civilian building types', () => {
+test('building feedback is gated to the six civilian building types and has no added effects', () => {
   const typeDeclaration = currentGame.match(/const DESTRUCTIBLE_BUILDING_TYPES = new Set\(\[([^\]]+)\]\);/);
   assert.ok(typeDeclaration, 'building type allow-list is missing');
 
@@ -72,9 +72,13 @@ test('building feedback is gated to the six civilian building types', () => {
   assert.ok(!types.includes('boss'));
 
   const damageEntity = sliceBetween(currentGame, 'function damageEntity(', 'function isOnBridge(');
+  const buildingFeedback = sliceBetween(damageEntity, 'const isDestructibleBuilding', "if (en.type !== 'human')");
   assert.match(damageEntity, /DESTRUCTIBLE_BUILDING_TYPES\.has\(en\.type\)/);
-  assert.match(damageEntity, /if \(en\.hp <= 0\) \{\s*createBuildingDestructionBurst\(en, hDir\);/);
-  assert.match(damageEntity, /else \{\s*buildingHitStopUntil[^}]+flashBuildingHit\(en\);[^}]+playHitSound\(false\);/s);
+  assert.match(buildingFeedback, /if \(en\.hp <= 0\) \{\s*buildingHitStopUntil = Math\.max\(buildingHitStopUntil, performance\.now\(\) \+ 65\);\s*shake = Math\.max\(shake, Math\.min\(88, 50 \+ en\.radius \* 0\.21\)\);/s);
+  assert.match(buildingFeedback, /else \{\s*buildingHitStopUntil = Math\.max\(buildingHitStopUntil, performance\.now\(\) \+ 32\);\s*playHitSound\(false\);/s);
+  assert.doesNotMatch(buildingFeedback, /createParticles|createShockwave|PointLight|setTimeout/);
+  assert.doesNotMatch(currentGame, /function (scheduleDestructionFeedback|flashBuildingHit|createBuildingDestructionBurst)/);
+  assert.doesNotMatch(currentGame, /destructionFeedbackTimers|destructionFlashLights/);
 });
 
 test('attack power, hit radius, HP, and cooldown remain at baseline values', () => {
