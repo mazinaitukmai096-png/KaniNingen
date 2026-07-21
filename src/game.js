@@ -30,6 +30,8 @@ import {
   HUMAN_WATER_AVOID_DURATION,HUMAN_WATER_AVOID_BLEND,
   DEBUG_NOCLIP_SPEED_MULT,DEBUG_SCORE_STEP,DEBUG_BOSS_SPAWN_DIST
 } from './constants.js';
+import { createInputController } from './core/input.js';
+import { createRendererController } from './core/renderer.js';
 
 let bossHPDelay = 100;
 
@@ -44,6 +46,7 @@ function renderBossHP(en) {
 }
 
 let scene, camera, renderer, clock, animationId;
+let inputController, rendererController;
 
         // --- 追加: カメラ透視（障害物の半透明化）用の変数 ---
         const cameraRaycaster = new THREE.Raycaster();
@@ -128,7 +131,6 @@ let scene, camera, renderer, clock, animationId;
         let MAX_TANKS = 4;
         let nextBossScore = 35000; 
         let bossActive = false;
-        const keys = {};
         let hudHidden = false; // HUD表示ON/OFF状態
         let lastAttackTime = -9999;
 
@@ -588,38 +590,18 @@ let scene, camera, renderer, clock, animationId;
         };
 
         function init() {
-            scene = new THREE.Scene();
-            
-            // 待機画面時はシネマティックな薄暮スモークカラー、通常時は深みのある青空に設定
-            if (isMenu) {
-                scene.background = new THREE.Color(0x3a2c22);
-                scene.fog = new THREE.Fog(0x3a2c22, 2000, 9000); 
-            } else {
-                const skyColor = 0x5dade2; // 少し深みのある青空
-                scene.background = new THREE.Color(skyColor);
-                scene.fog = new THREE.Fog(skyColor, 3000, 14000); // フォグの色を空と完全に一致させる
+            if (!rendererController) {
+                rendererController = createRendererController({
+                    THREE,
+                    antialias: settings.antialias,
+                    container: document.body,
+                    viewport: window,
+                });
             }
-
-            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 10, 35000);
-            
-            // WebGLRendererの二重生成によるメモリリークとDOM脱着 PointerLock 拒否を解決
-            if (!renderer) {
-                renderer = new THREE.WebGLRenderer({ antialias: settings.antialias, powerPreference: "high-performance", logarithmicDepthBuffer: true });
-                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-                renderer.setSize(window.innerWidth, window.innerHeight);
-                renderer.shadowMap.enabled = true;
-                renderer.shadowMap.type = THREE.PCFSoftShadowMap; 
-                document.body.appendChild(renderer.domElement);
-            }
-            
-            scene.add(new THREE.HemisphereLight(0xffcfa0, 0x4a5c2e, 1.3));
-            const sun = new THREE.DirectionalLight(0xffeb3b, 1.2); 
-            sun.position.set(1500, 2500, 1000); sun.castShadow = true;
-            sun.shadow.camera.left = -5000; sun.shadow.camera.right = 5000;
-            sun.shadow.camera.top = 5000; sun.shadow.camera.bottom = -5000;
-            sun.shadow.mapSize.width = 1024; 
-            sun.shadow.mapSize.height = 1024;
-            scene.add(sun);
+            const renderState = rendererController.createScene({ isMenu });
+            scene = renderState.scene;
+            camera = renderState.camera;
+            renderer = renderState.renderer;
 
             // --- 地面に色のムラ（まだら模様）を作る ---
             // ジオメトリを細かく分割（150x150）して頂点カラーを適用できるようにする
@@ -3297,14 +3279,14 @@ let scene, camera, renderer, clock, animationId;
             // --- スタート待機画面（フォールガイズ風ロビー）の更新ループ ---
             if (isMenu) {
                 updateLobbyAnimation(delta, dtScale, time);
-                renderer.render(scene, camera);
+                rendererController.render();
                 return;
             }
 
             // --- DROP（急降下）演出 of 処理 ---
             if (isDropping) {
                 updateDropSequence(dtScale, time);
-                renderer.render(scene, camera);
+                rendererController.render();
                 return;
             }
 
@@ -3382,18 +3364,19 @@ let scene, camera, renderer, clock, animationId;
             // HPが0より大きく、かつ死亡演出中でない場合のみ操作を受け付ける
             if (player.hp > 0 && !player.isDying) {
                 const moveVec = new THREE.Vector3();
+                const inputSnapshot = inputController.getInputSnapshot();
                 
                 if (isIntroPlaying) {
                     // オープニング演出中は強制的に前進（陸へ上がる）
                     moveVec.z = -1; 
                 } else {
-                    if (keys['KeyW']) moveVec.z -= 1;
-                    if (keys['KeyS']) moveVec.z += 1;
-                    if (keys['KeyA']) moveVec.x -= 1;
-                    if (keys['KeyD']) moveVec.x += 1;
+                    if (inputSnapshot.isPressed('KeyW')) moveVec.z -= 1;
+                    if (inputSnapshot.isPressed('KeyS')) moveVec.z += 1;
+                    if (inputSnapshot.isPressed('KeyA')) moveVec.x -= 1;
+                    if (inputSnapshot.isPressed('KeyD')) moveVec.x += 1;
                 }
 
-                if (keys['Space'] && player.isGrounded && !isIntroPlaying) { player.yVel = 32; player.isGrounded = false; }
+                if (inputSnapshot.isPressed('Space') && player.isGrounded && !isIntroPlaying) { player.yVel = 32; player.isGrounded = false; }
                 if (!player.isGrounded) {
                     player.yVel -= 1.4 * dtScale; player.mesh.position.y += player.yVel * dtScale;
                     if (player.mesh.position.y <= 0) {
@@ -4686,7 +4669,7 @@ let scene, camera, renderer, clock, animationId;
                 shake *= Math.pow(0.85, dtScale);
             }
 
-            renderer.render(scene, camera);
+            rendererController.render();
         }
 
         // --- HUD（HPバー・スコア・原爆クールタイム）の更新 ---
@@ -5095,8 +5078,8 @@ let scene, camera, renderer, clock, animationId;
             returnToMenu();
         });
         
-        document.addEventListener('keydown', e => { 
-            keys[e.code] = true; 
+        inputController = createInputController({
+          onKeyDown: e => {
             if (e.code === 'Escape' && confirmModal.style.display === 'flex') {
             hideConfirmModal();
             } else if (e.code === 'Escape' && settingsModal.style.display === 'flex') {
@@ -5118,9 +5101,8 @@ let scene, camera, renderer, clock, animationId;
                     openDebugModal();
                 }
             }
-        });
-        document.addEventListener('keyup',   e => { keys[e.code] = false; });
-        document.addEventListener('mousemove', e => {
+          },
+          onMouseMove: e => {
             // イントロ再生中はカメラの自由な旋回を禁止します
             if (isIntroPlaying) return;
 
@@ -5128,14 +5110,14 @@ let scene, camera, renderer, clock, animationId;
                 yaw -= e.movementX * 0.003 * settings.mouseSensitivity;
                 pitch = Math.max(0.1, Math.min(1.4, pitch + e.movementY * 0.003 * settings.mouseSensitivity));
             }
-        });
-        document.addEventListener('wheel', e => {
+          },
+          onWheel: e => {
             // イントロ再生中はホイールによるカメラ距離の調整を禁止します
             if (isIntroPlaying) return;
 
             if (gameRunning) camDist = Math.max(CAM_MIN_DIST, Math.min(CAM_MAX_DIST, camDist + e.deltaY * 0.9));
-        }, { passive: true });
-        document.addEventListener('mousedown', e => {
+          },
+          onMouseDown: e => {
             // プレイ中にロックが外れている場合、画面クリックで復帰を試みる
             if (gameRunning && !document.pointerLockElement && settingsModal.style.display !== 'flex' && debugModal.style.display !== 'flex') {
                 renderer.domElement.requestPointerLock();
@@ -5191,8 +5173,8 @@ let scene, camera, renderer, clock, animationId;
                     }
                 }
             }
-        });
-        document.addEventListener('mouseup', e => {
+          },
+          onMouseUp: e => {
             const wasCharging = player.isCharging;
             const chargeCompleted = player.chargeTime > CHARGE_THRESHOLD;
 
@@ -5237,6 +5219,23 @@ let scene, camera, renderer, clock, animationId;
                 }
             }
             player.isCharging = false; player.chargeTime = 0;
+          },
+          onPointerLockChange: () => {
+            if (gameRunning && !isGameOver) {
+                if (!document.pointerLockElement) {
+                    // ゲーム中にロックが外れた場合（Escを押した等）
+                    if (settingsModal.style.display !== 'flex' && resumeOverlay.style.display !== 'flex' && debugModal.style.display !== 'flex') {
+                        openSettings();
+                    }
+                } else {
+                    // ロックが成功（カーソルが消えた）した場合、すべて閉じて再開
+                    settingsModal.style.display = 'none';
+                    debugModal.style.display = 'none';
+                    resumeOverlay.style.display = 'none';
+                    isPaused = false;
+                }
+            }
+          },
         });
         // --- 設定モーダル開閉ロジック ---
         const settingsModal = document.getElementById('settings-modal');
@@ -5434,30 +5433,4 @@ let scene, camera, renderer, clock, animationId;
         settingsModal.style.display = 'none';
         startGame();
          });
-        });
-
-        // ポインターロック状態の監視
-        document.addEventListener('pointerlockchange', () => {
-            if (gameRunning && !isGameOver) {
-                if (!document.pointerLockElement) {
-                    // ゲーム中にロックが外れた場合（Escを押した等）
-                    if (settingsModal.style.display !== 'flex' && resumeOverlay.style.display !== 'flex' && debugModal.style.display !== 'flex') {
-                        openSettings();
-                    }
-                } else {
-                    // ロックが成功（カーソルが消えた）した場合、すべて閉じて再開
-                    settingsModal.style.display = 'none';
-                    debugModal.style.display = 'none';
-                    resumeOverlay.style.display = 'none';
-                    isPaused = false;
-                }
-            }
-        });
-        window.addEventListener('contextmenu', e => e.preventDefault());
-        window.addEventListener('resize', () => {
-            if (camera && renderer) {
-                camera.aspect = window.innerWidth / window.innerHeight;
-                camera.updateProjectionMatrix();
-                renderer.setSize(window.innerWidth, window.innerHeight);
-            }
         });
