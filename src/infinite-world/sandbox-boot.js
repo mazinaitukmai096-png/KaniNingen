@@ -19,6 +19,7 @@ import {
   createProductionVisualAssetLibrary,
 } from './render/production-visual-assets.js';
 import { InfiniteWorldSaveStore, InfiniteWorldState } from './world-state-store.js';
+import { createInfiniteExperienceShell } from './experience-shell.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -275,6 +276,7 @@ export async function bootInfiniteWorldSandbox({
   let saveStore = null;
   let gameplayRenderAdapter = null;
   let gameplay = null;
+  let experienceShell = null;
   let renderer = null;
   let visualAssets = null;
   let scene = null;
@@ -449,7 +451,6 @@ export async function bootInfiniteWorldSandbox({
       state.initialGameplayEntityCount = gameplaySnapshot.simulatedEntityCount;
     });
 
-    const keys = new Set();
     let transitionTargetKey = null;
     let transitionError = null;
     let saveStatus = state.saveLoaded ? 'loaded' : 'new';
@@ -466,13 +467,6 @@ export async function bootInfiniteWorldSandbox({
     };
     running = true;
 
-    function onKey(event, pressed) {
-      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'ShiftRight'].includes(event.code)) {
-        event.preventDefault();
-        if (pressed) keys.add(event.code);
-        else keys.delete(event.code);
-      }
-    }
     async function saveWorld() {
       try {
         await saveStore.save(worldState);
@@ -496,28 +490,31 @@ export async function bootInfiniteWorldSandbox({
         saveStatus = 'failed';
       }
     }
-    const onKeyDown = event => {
-      onKey(event, true);
-      const stageId = { Digit1: 'TINY', Digit2: 'MID', Digit3: 'MAX' }[event.code];
-      if (stageId) {
-        event.preventDefault();
-        worldState.setScaleStage(stageId);
-      } else if (event.code === 'Space' || event.code === 'KeyF') {
-        event.preventDefault();
-        gameplay.attack(event.code === 'KeyF' ? 'double' : 'single');
-      } else if (event.code === 'KeyP') {
-        event.preventDefault();
-        void saveWorld();
-      } else if (event.code === 'KeyL') {
-        event.preventDefault();
-        void loadWorld();
-      }
-    };
-    const onKeyUp = event => onKey(event, false);
     const addWindowListener = (type, listener) => globalObject.addEventListener?.(type, listener);
     const removeWindowListener = (type, listener) => globalObject.removeEventListener?.(type, listener);
-    addWindowListener('keydown', onKeyDown);
-    addWindowListener('keyup', onKeyUp);
+
+    experienceShell = createInfiniteExperienceShell({
+      globalObject,
+      documentObject: globalObject.document,
+      canvas: renderer.domElement,
+      camera,
+      playerMarker,
+      worldState,
+      initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
+      onAttack: mode => gameplay.attack(mode),
+      onSave: () => { void saveWorld(); },
+      onLoad: () => { void loadWorld(); },
+      onHome: () => {
+        logicalPlayer.x = generator.reviewSpawn.x;
+        logicalPlayer.z = generator.reviewSpawn.z;
+        logicalPlayer.facingY = 0;
+      },
+      onSettingsChanged: settings => {
+        const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
+        renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
+      },
+    });
+    if (measurement.mode) experienceShell.start();
 
     function resize() {
       const width = measurementViewport?.width ?? globalObject.innerWidth;
@@ -557,20 +554,12 @@ export async function bootInfiniteWorldSandbox({
     }
 
     function updatePlayer(deltaSeconds) {
-      let dx = measurement.mode === 'steady'
-        ? 0 : Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
-      let dz = measurement.mode === 'steady'
-        ? 0 : Number(keys.has('KeyS')) - Number(keys.has('KeyW'));
-      if (dx || dz) {
-        const length = Math.hypot(dx, dz);
-        dx /= length;
-        dz /= length;
-        const sprinting = keys.has('ShiftLeft') || keys.has('ShiftRight');
-        const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
-        const speedMetersPerSecond = scaleProfile.movementMetersPerSecond * (sprinting ? 1.45 : 1);
-        logicalPlayer.x += dx * speedMetersPerSecond * deltaSeconds;
-        logicalPlayer.z += dz * speedMetersPerSecond * deltaSeconds;
-        logicalPlayer.facingY = Math.atan2(dx, dz);
+      const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
+      if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
+        logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
+        logicalPlayer.facingY = Math.PI / 2;
+      } else if (!measurement.mode) {
+        experienceShell.updatePlayer({ deltaSeconds, player: logicalPlayer, scaleProfile });
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       requestTransition(owner);
@@ -581,9 +570,9 @@ export async function bootInfiniteWorldSandbox({
         origin.renderOriginChunkX,
         origin.renderOriginChunkZ,
       );
-      playerMarker.position.set(renderLocal.x, 0, renderLocal.z);
+      playerMarker.position.x = renderLocal.x;
+      playerMarker.position.z = renderLocal.z;
       playerMarker.rotation.y = logicalPlayer.facingY;
-      const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
       const productionScale = scaleProfile.stage.visualScale
         * UNITS_PER_METER / PRODUCTION_VISUAL_UNITS_PER_METER;
       playerMarker.scale.set(
@@ -591,22 +580,7 @@ export async function bootInfiniteWorldSandbox({
         productionScale,
         productionScale,
       );
-      const cameraDistance = scaleProfile.cameraDistanceMeters * UNITS_PER_METER;
-      const cameraOffset = {
-        x: cameraDistance * Math.SQRT1_2,
-        y: scaleProfile.cameraHeightMeters * UNITS_PER_METER,
-        z: cameraDistance * Math.SQRT1_2,
-      };
-      camera.position.set(
-        renderLocal.x + cameraOffset.x,
-        cameraOffset.y,
-        renderLocal.z + cameraOffset.z,
-      );
-      camera.lookAt(
-        renderLocal.x,
-        scaleProfile.cameraTargetHeightMeters * UNITS_PER_METER,
-        renderLocal.z,
-      );
+      experienceShell.updateCamera({ renderLocal, scaleProfile, unitsPerMeter: UNITS_PER_METER });
       return owner;
     }
 
@@ -648,6 +622,17 @@ Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metric
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
 Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderAdapter.resourceSnapshot().sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
+      experienceShell.renderHud({
+        fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
+        gameplaySnapshot,
+        runtimeSnapshot,
+        saveStatus,
+        renderInfo: {
+          drawCalls: renderInfo?.render?.calls ?? null,
+          geometries: renderInfo?.memory?.geometries ?? null,
+        },
+        resources: renderAdapter.resourceSnapshot(),
+      });
     }
 
     function failRuntimeLoop(error) {
@@ -672,18 +657,17 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
           measurement.samplingStartedAt = frameNow;
           measurement.status = 'sampling';
-          if (measurement.mode === 'crossing') keys.add('KeyD');
         }
         if (!measurement.mode || measurement.status === 'sampling') runtime.recordFrame(rawFrameMs);
         if (measurement.status === 'sampling'
           && frameNow - measurement.samplingStartedAt >= measurement.sampleMs) {
-          if (measurement.mode === 'crossing') keys.delete('KeyD');
           measurement.completedAt = frameNow;
           measurement.status = 'complete';
         }
-        const owner = updatePlayer(deltaSeconds);
+        const effectiveDeltaSeconds = experienceShell.isPaused() && !measurement.mode ? 0 : deltaSeconds;
+        const owner = updatePlayer(effectiveDeltaSeconds);
         gameplay.update({
-          deltaSeconds,
+          deltaSeconds: effectiveDeltaSeconds,
           player: logicalPlayer,
           renderOrigin: runtime.snapshot().renderOrigin,
         });
@@ -718,8 +702,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       running = false;
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
       removeWindowListener('resize', resize);
-      removeWindowListener('keydown', onKeyDown);
-      removeWindowListener('keyup', onKeyUp);
+      experienceShell.dispose();
       await saveWorld();
       await gameplay.shutdown();
       await runtime.shutdown();
@@ -741,6 +724,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         resources: renderAdapter.resourceSnapshot(),
         generator: generator.snapshot(),
         gameplay: gameplay.snapshot(),
+        experience: experienceShell.snapshot(),
         save: saveStore.snapshot(),
         measurement: Object.freeze({ ...measurement }),
         sceneObjectCount: countSceneObjects(scene),
@@ -761,6 +745,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     recordSandboxBootFailure({ state, hud, error, clock });
     try {
       if (gameplay) await gameplay.shutdown();
+      experienceShell?.dispose?.();
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       visualAssets?.dispose?.();

@@ -1,0 +1,184 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import {
+  createExperienceCameraState,
+  createInfiniteExperienceShell,
+} from '../src/infinite-world/experience-shell.js';
+import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
+
+const repoRoot = resolve(import.meta.dirname, '..');
+
+class FakeEventTarget {
+  constructor() { this.listeners = new Map(); }
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  removeEventListener(type, listener) {
+    this.listeners.set(type, (this.listeners.get(type) ?? []).filter(item => item !== listener));
+  }
+  dispatch(type, event = {}) {
+    for (const listener of [...(this.listeners.get(type) ?? [])]) listener({
+      preventDefault() {}, target: this, ...event,
+    });
+  }
+}
+
+function createElement() {
+  return Object.assign(new FakeEventTarget(), {
+    style: {}, textContent: '', value: '', checked: false, dataset: {},
+  });
+}
+
+function createFixture() {
+  const ids = [
+    'start-screen', 'start-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
+    'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill',
+    'atomic-status', 'boss-ui', 'charge-ui', 'news-ticker', 'settings-modal',
+    'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
+    'debug-close-btn', 'debug-summary', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
+    'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
+  ];
+  const elements = new Map(ids.map(id => [id, createElement()]));
+  elements.get('set-quality').value = 'high';
+  const bodyClasses = new Set();
+  const documentObject = new FakeEventTarget();
+  Object.assign(documentObject, {
+    body: { classList: { toggle(name, enabled) {
+      if (enabled) bodyClasses.add(name); else bodyClasses.delete(name);
+    } } },
+    pointerLockElement: null,
+    getElementById: id => elements.get(id) ?? null,
+    querySelectorAll: () => [],
+    exitPointerLock() { this.pointerLockElement = null; this.dispatch('pointerlockchange'); },
+  });
+  const globalObject = new FakeEventTarget();
+  const canvas = createElement();
+  canvas.requestPointerLock = () => {
+    documentObject.pointerLockElement = canvas;
+    documentObject.dispatch('pointerlockchange');
+  };
+  const camera = {
+    near: 0, position: { set(x, y, z) { Object.assign(this, { x, y, z }); } },
+    updateProjectionMatrix() {}, lookAt(x, y, z) { this.lookTarget = { x, y, z }; },
+  };
+  const playerMarker = { position: { y: 0 } };
+  const worldState = {
+    activeScaleStageId: 'MAX',
+    setScaleStage(stageId) { this.activeScaleStageId = stageId; },
+  };
+  const calls = { attacks: [], saves: 0, loads: 0, homes: 0 };
+  const shell = createInfiniteExperienceShell({
+    globalObject, documentObject, canvas, camera, playerMarker, worldState,
+    initialScaleProfile: getW6ScaleProfile('MAX'),
+    onAttack: mode => calls.attacks.push(mode),
+    onSave: () => { calls.saves += 1; },
+    onLoad: () => { calls.loads += 1; },
+    onHome: () => { calls.homes += 1; },
+  });
+  return { shell, globalObject, documentObject, canvas, camera, playerMarker, worldState, calls, elements, bodyClasses };
+}
+
+test('W7 camera state is sourced from the protected scale profile', () => {
+  for (const stageId of ['TINY', 'MID', 'MAX']) {
+    const profile = getW6ScaleProfile(stageId);
+    const camera = createExperienceCameraState(profile);
+    assert.equal(camera.yaw, 0);
+    assert.equal(camera.pitch, profile.stage.cameraPitch);
+    assert.equal(camera.distanceMeters, profile.cameraDistanceMeters);
+  }
+});
+
+test('W7 experience shell restores movement, jump, camera, scale, attacks, save and load controls', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  assert.equal(fixture.shell.isPaused(), false);
+  assert.equal(fixture.documentObject.pointerLockElement, fixture.canvas);
+
+  const player = { x: 0, z: 0, facingY: 0 };
+  const profile = getW6ScaleProfile('MAX');
+  fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+  fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+  fixture.globalObject.dispatch('keyup', { code: 'KeyD' });
+  assert.equal(player.x, profile.movementMetersPerSecond);
+  assert.equal(player.z, 0);
+
+  fixture.globalObject.dispatch('keydown', { code: 'Space' });
+  fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
+  assert.ok(fixture.shell.snapshot().camera.verticalMeters > 0);
+  fixture.globalObject.dispatch('keydown', { code: 'KeyQ' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyF' });
+  fixture.globalObject.dispatch('keydown', { code: 'Digit1' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyP' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyL' });
+  assert.deepEqual(fixture.calls.attacks, ['single', 'double']);
+  assert.equal(fixture.worldState.activeScaleStageId, 'TINY');
+  assert.equal(fixture.calls.saves, 1);
+  assert.equal(fixture.calls.loads, 1);
+
+  fixture.globalObject.dispatch('mousemove', { movementX: 10, movementY: 5 });
+  fixture.globalObject.dispatch('wheel', { deltaY: 20 });
+  fixture.shell.updateCamera({ renderLocal: { x: 4, z: 7 }, scaleProfile: profile, unitsPerMeter: 40 });
+  assert.notEqual(fixture.shell.snapshot().camera.yaw, 0);
+  assert.ok(Number.isFinite(fixture.camera.position.x));
+  assert.ok(Number.isFinite(fixture.camera.position.y));
+  assert.ok(Number.isFinite(fixture.camera.position.z));
+  fixture.shell.dispose();
+});
+
+test('normal HUD is a read-only adapter and W7D-only shells remain inactive', () => {
+  const fixture = createFixture();
+  const gameplaySnapshot = {
+    state: {
+      player: { hp: 75, maxHp: 100, score: 300 }, activeScaleStageId: 'MID',
+      destroyedFeatureCount: 2, destroyedEntityCount: 1,
+    },
+    activeSimulationChunkCount: 9, simulatedEntityCount: 8, simulatedStaticTargetCount: 44,
+  };
+  const before = structuredClone(gameplaySnapshot);
+  fixture.shell.renderHud({
+    fps: 60,
+    gameplaySnapshot,
+    runtimeSnapshot: {
+      centerChunkX: 1, centerChunkZ: -2, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 11, max: 20 } },
+    },
+    saveStatus: 'saved', renderInfo: { drawCalls: 12, geometries: 8 },
+    resources: { sharedMaterialCount: 7 },
+  });
+  assert.deepEqual(gameplaySnapshot, before);
+  assert.equal(fixture.elements.get('score').textContent, '$3,000,000');
+  assert.equal(fixture.elements.get('scale-label').textContent, 'MID');
+  assert.equal(fixture.elements.get('hp-number').textContent, 75);
+  assert.equal(fixture.elements.get('hp-bar-fill').style.width, '75%');
+  assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
+  assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
+  assert.equal(fixture.elements.get('atomic-status').textContent, '');
+  fixture.shell.dispose();
+});
+
+test('debug, HUD hide, settings and home controls remain shell state only', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  fixture.globalObject.dispatch('keydown', { code: 'KeyH' });
+  assert.equal(fixture.bodyClasses.has('hud-hidden'), true);
+  fixture.globalObject.dispatch('keydown', { code: 'Tab' });
+  assert.equal(fixture.shell.snapshot().debugOpen, true);
+  assert.equal(fixture.shell.isPaused(), true);
+  fixture.elements.get('debug-close-btn').dispatch('click');
+  fixture.elements.get('set-home-btn').dispatch('click');
+  assert.equal(fixture.calls.homes, 1);
+  assert.equal(fixture.shell.snapshot().mode, 'menu');
+  fixture.shell.dispose();
+});
+
+test('W7B extends the W6 runtime without a second gameplay state, entity registry or save system', () => {
+  const source = readFileSync(resolve(repoRoot, 'src/infinite-world/experience-shell.js'), 'utf8');
+  assert.match(source, /createInputController/);
+  assert.match(source, /finiteWorldUnitsToMeters/);
+  assert.doesNotMatch(source, /new\s+InfiniteWorldState|new\s+InfiniteWorldSaveStore|new\s+Map\s*\(/);
+  assert.doesNotMatch(source, /\bplayerHp\b|\bownedScore\b|\bdestroyedStableIds\b/);
+});
