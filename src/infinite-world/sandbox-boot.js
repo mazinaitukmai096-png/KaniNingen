@@ -131,7 +131,7 @@ export function snapshotSandboxBootState(state) {
 
 export function renderSandboxBootStatus(hud, state) {
   if (!hud) return;
-  const badge = '<span id="badge">W6 / INFINITE WORLD GAMEPLAY</span>';
+  const badge = '<span id="badge">W7 / FULL EXPERIENCE</span>';
   if (state.status === 'failed') {
     hud.innerHTML = `${badge}\n<span id="error">起動失敗: ${escapeHtml(state.stage)}</span>\n${escapeHtml(state.bootError?.message ?? 'unknown error')}`;
     return;
@@ -308,6 +308,7 @@ export async function bootInfiniteWorldSandbox({
     generator = await runStage('Legacy Core', () => generatorFactory({ worldSeed: requestedSeed }));
     await runStage('Save State', async () => {
       worldState = worldStateFactory({
+        worldSeed: generator.worldSeed,
         worldSeedHash: generator.worldSeedHash,
         playerSpawn: generator.reviewSpawn,
       });
@@ -494,6 +495,10 @@ export async function bootInfiniteWorldSandbox({
     const addWindowListener = (type, listener) => globalObject.addEventListener?.(type, listener);
     const removeWindowListener = (type, listener) => globalObject.removeEventListener?.(type, listener);
 
+    const applyRuntimeSettings = settings => {
+      const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
+      renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
+    };
     experienceShell = createInfiniteExperienceShell({
       globalObject,
       documentObject: globalObject.document,
@@ -548,11 +553,9 @@ export async function bootInfiniteWorldSandbox({
           return Object.freeze({ accepted: false, reason: 'runtime-error', error });
         }
       },
-      onSettingsChanged: settings => {
-        const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
-        renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
-      },
+      onSettingsChanged: applyRuntimeSettings,
     });
+    applyRuntimeSettings(worldState.experience.settings);
     if (measurement.mode) experienceShell.start();
 
     function resize() {
@@ -636,7 +639,7 @@ export async function bootInfiniteWorldSandbox({
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
-      hud.innerHTML = `<span id="badge">W6 / INFINITE WORLD GAMEPLAY</span>
+      hud.innerHTML = `<span id="badge">W7 / FULL EXPERIENCE</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)

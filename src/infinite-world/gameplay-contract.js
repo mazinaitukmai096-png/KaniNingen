@@ -57,6 +57,10 @@ export const W6_GAMEPLAY_SCHEMA = 'w6-infinite-gameplay-1';
 export const W6_SAVE_SCHEMA = 'w6-infinite-world-save-1';
 export const W6_SAVE_ENVELOPE_SCHEMA = 'w6-infinite-world-save-envelope-1';
 export const W6_SAVE_VERSION = SAVE_VERSION;
+export const W7_GAMEPLAY_SCHEMA = 'w7-infinite-full-experience-1';
+export const W7_SAVE_SCHEMA = 'w7-infinite-world-save-2';
+export const W7_SAVE_ENVELOPE_SCHEMA = 'w7-infinite-world-save-envelope-2';
+export const W7_SAVE_SCHEMA_VERSION = 2;
 export const W6_INITIAL_SCALE_STAGE_ID = INITIAL_SCALE_STAGE_ID;
 export const W6_PLAYER_MAX_HP = PLAYER_MAX_HP;
 

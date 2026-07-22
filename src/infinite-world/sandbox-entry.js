@@ -9,14 +9,14 @@ function describeEntryError(error) {
 
 function renderModuleBoot(hud) {
   if (!hud) return;
-  hud.textContent = 'W6 / INFINITE WORLD GAMEPLAY\n起動中: MODULE_BOOT';
+  hud.textContent = 'W7 / FULL EXPERIENCE\n起動中: MODULE_BOOT';
 }
 
 function renderModuleImportFailure({ hud, error, moduleUrl, entryBridge }) {
   const described = describeEntryError(error);
   if (!entryBridge?.snapshot?.().reported && hud) {
     hud.textContent = [
-      'W6 / INFINITE WORLD GAMEPLAY',
+      'W7 / FULL EXPERIENCE',
       '起動失敗: MODULE_IMPORT',
       `${described.name}: ${described.message}`,
       `Stack: ${described.stackFirstLine}`,

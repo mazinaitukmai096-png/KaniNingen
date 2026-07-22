@@ -73,7 +73,21 @@ function createFixture() {
   const playerMarker = { position: { y: 0 } };
   const worldState = {
     activeScaleStageId: 'MAX',
+    experience: {
+      hudHidden: false,
+      settings: {
+        mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
+        fpsCap: 0, cameraShake: 1,
+      },
+    },
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
+    updateExperience(patch) {
+      this.experience = {
+        ...this.experience,
+        ...patch,
+        settings: { ...this.experience.settings, ...(patch.settings ?? {}) },
+      };
+    },
   };
   const calls = {
     attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
@@ -174,11 +188,15 @@ test('normal HUD is a read-only adapter and no Boss UI appears without a manual 
   fixture.shell.dispose();
 });
 
-test('debug, HUD hide, settings and home controls remain shell state only', () => {
+test('debug stays transient while HUD visibility and settings use the existing World State', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
   fixture.globalObject.dispatch('keydown', { code: 'KeyH' });
   assert.equal(fixture.bodyClasses.has('hud-hidden'), true);
+  assert.equal(fixture.worldState.experience.hudHidden, true);
+  fixture.elements.get('set-vol').value = '0.25';
+  fixture.elements.get('set-vol').dispatch('input');
+  assert.equal(fixture.worldState.experience.settings.volume, 0.25);
   fixture.globalObject.dispatch('keydown', { code: 'Tab' });
   assert.equal(fixture.shell.snapshot().debugOpen, true);
   assert.equal(fixture.shell.isPaused(), true);

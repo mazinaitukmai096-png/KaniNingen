@@ -348,10 +348,10 @@ test('Infinite World is the documented official runtime while the finite entry r
   const infiniteEntry = readFileSync(resolve(repoRoot, 'infinite-world-sandbox.html'), 'utf8');
   const finiteEntry = readFileSync(resolve(repoRoot, 'index.html'), 'utf8');
   const runtimeDocument = readFileSync(resolve(repoRoot, 'docs/infinite-world/RUNTIME-ENTRY.md'), 'utf8');
-  assert.match(infiniteEntry, /W6 \/ INFINITE WORLD GAMEPLAY/);
+  assert.match(infiniteEntry, /W7 \/ FULL EXPERIENCE/);
   assert.match(infiniteEntry, /sandbox-entry\.js\?v=w7-full-experience/);
   assert.doesNotMatch(infiniteEntry, /src\/game\.js/);
   assert.match(finiteEntry, /src\/game\.js/);
-  assert.match(runtimeDocument, /official KaniNingen runtime is `infinite-world-sandbox\.html`/);
+  assert.match(runtimeDocument, /official KaniNingen full-experience runtime is `infinite-world-sandbox\.html`/);
   assert.match(runtimeDocument, /finite World remains byte-for-byte protected at `index\.html`/);
 });

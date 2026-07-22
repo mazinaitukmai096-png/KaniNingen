@@ -9,6 +9,10 @@ import {
   W6_SAVE_SCHEMA,
   W6_SAVE_VERSION,
   W6_STATIC_TARGET_CONTRACTS,
+  W7_GAMEPLAY_SCHEMA,
+  W7_SAVE_ENVELOPE_SCHEMA,
+  W7_SAVE_SCHEMA,
+  W7_SAVE_SCHEMA_VERSION,
   createW6PlayerState,
   isW6ScaleStageId,
 } from './gameplay-contract.js';
@@ -17,6 +21,17 @@ import { parseChunkKey } from './chunk-coordinates.js';
 const FEATURE_MAX_HP_VALUES = new Set(
   Object.values(W6_STATIC_TARGET_CONTRACTS).map(contract => contract.maxHp),
 );
+const DEFAULT_EXPERIENCE_STATE = Object.freeze({
+  hudHidden: false,
+  settings: Object.freeze({
+    mouseSensitivity: 1,
+    volume: 0.5,
+    quality: 'high',
+    showFps: false,
+    fpsCap: 0,
+    cameraShake: 1,
+  }),
+});
 
 function finite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
@@ -31,6 +46,66 @@ function nonNegative(value, name) {
 function requiredString(value, name) {
   if (typeof value !== 'string' || !value) throw new TypeError(`${name} is required`);
   return value;
+}
+
+function numberInRange(value, minimum, maximum, name) {
+  const result = finite(value, name);
+  if (result < minimum || result > maximum) throw new RangeError(`${name} is outside its supported range`);
+  return result;
+}
+
+function validateExperience(experience = DEFAULT_EXPERIENCE_STATE) {
+  if (!experience || typeof experience !== 'object' || !experience.settings) {
+    throw new TypeError('experience settings are required');
+  }
+  const settings = experience.settings;
+  if (!['high', 'medium', 'low'].includes(settings.quality)) {
+    throw new RangeError('unsupported graphics quality');
+  }
+  if (![0, 30, 60, 120].includes(settings.fpsCap)) throw new RangeError('unsupported FPS cap');
+  if (typeof settings.showFps !== 'boolean' || typeof experience.hudHidden !== 'boolean') {
+    throw new TypeError('HUD and FPS visibility must be boolean');
+  }
+  return {
+    hudHidden: experience.hudHidden,
+    settings: {
+      mouseSensitivity: numberInRange(settings.mouseSensitivity, 0.1, 3, 'mouseSensitivity'),
+      volume: numberInRange(settings.volume, 0, 1, 'volume'),
+      quality: settings.quality,
+      showFps: settings.showFps,
+      fpsCap: settings.fpsCap,
+      cameraShake: numberInRange(settings.cameraShake, 0, 2, 'cameraShake'),
+    },
+  };
+}
+
+function migrateW6SaveSnapshot(snapshot, { worldSeed }) {
+  if (snapshot?.schemaVersion !== W6_SAVE_SCHEMA
+    || snapshot?.gameplaySchemaVersion !== W6_GAMEPLAY_SCHEMA
+    || snapshot?.saveVersion !== W6_SAVE_VERSION) {
+    throw new Error('unsupported legacy Infinite World save schema or version');
+  }
+  const manualBossStableId = snapshot.manualBossStableId ?? null;
+  const entityStates = Array.isArray(snapshot.entityStates)
+    ? snapshot.entityStates.filter(record => record?.type !== 'boss'
+      || record.stableId === manualBossStableId)
+    : snapshot.entityStates;
+  return {
+    schemaVersion: W7_SAVE_SCHEMA,
+    schemaVersionNumber: W7_SAVE_SCHEMA_VERSION,
+    gameplaySchemaVersion: W7_GAMEPLAY_SCHEMA,
+    legacySaveVersion: W6_SAVE_VERSION,
+    worldSeed: requiredString(worldSeed, 'worldSeed'),
+    worldSeedHash: snapshot.worldSeedHash,
+    activeScaleStageId: snapshot.activeScaleStageId,
+    player: snapshot.player,
+    featureDamage: snapshot.featureDamage,
+    entityStates,
+    manualBossStableId,
+    manualBossSequence: manualBossStableId ? (snapshot.manualBossSequence ?? 1) : 0,
+    nuclearCooldownMs: snapshot.nuclearCooldownMs ?? 0,
+    experience: structuredClone(DEFAULT_EXPERIENCE_STATE),
+  };
 }
 
 function sortedRecords(map) {
@@ -111,8 +186,9 @@ function validateEntityStates(records) {
 }
 
 export class InfiniteWorldState {
-  constructor({ worldSeedHash, playerSpawn } = {}) {
+  constructor({ worldSeedHash, worldSeed = worldSeedHash, playerSpawn } = {}) {
     this.worldSeedHash = requiredString(worldSeedHash, 'worldSeedHash');
+    this.worldSeed = requiredString(worldSeed, 'worldSeed');
     this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
     this.player = cloneRecord(createW6PlayerState(playerSpawn));
     this.featureDamage = new Map();
@@ -120,6 +196,7 @@ export class InfiniteWorldState {
     this.manualBossStableId = null;
     this.manualBossSequence = 0;
     this.nuclearCooldownMs = 0;
+    this.experience = validateExperience(DEFAULT_EXPERIENCE_STATE);
     this.revision = 0;
   }
 
@@ -130,6 +207,20 @@ export class InfiniteWorldState {
       this.revision += 1;
     }
     return stageId;
+  }
+
+  updateExperience(patch = {}) {
+    const next = validateExperience({
+      ...this.experience,
+      ...patch,
+      settings: { ...this.experience.settings, ...(patch.settings ?? {}) },
+    });
+    this.experience = next;
+    this.revision += 1;
+    return Object.freeze({
+      hudHidden: next.hudHidden,
+      settings: Object.freeze({ ...next.settings }),
+    });
   }
 
   updatePlayer(patch) {
@@ -173,6 +264,9 @@ export class InfiniteWorldState {
 
   ensureEntity(descriptor) {
     const stableId = requiredString(descriptor?.stableId, 'entity descriptor stableId');
+    if (this.featureDamage.has(stableId)) {
+      throw new Error(`Stable ID collision between feature and entity state: ${stableId}`);
+    }
     const existing = this.entityStates.get(stableId);
     if (existing) {
       if (existing.ownerChunkKey !== descriptor.ownerChunkKey
@@ -255,6 +349,9 @@ export class InfiniteWorldState {
 
   damageFeature(descriptor, amount) {
     const stableId = requiredString(descriptor?.stableId, 'feature stableId');
+    if (this.entityStates.has(stableId)) {
+      throw new Error(`Stable ID collision between feature and entity state: ${stableId}`);
+    }
     const maxHp = nonNegative(descriptor.maxHp, 'feature maxHp');
     if (!FEATURE_MAX_HP_VALUES.has(maxHp)) throw new Error(`unknown feature maxHp: ${stableId}`);
     const damageAmount = nonNegative(amount, 'feature damage');
@@ -279,9 +376,11 @@ export class InfiniteWorldState {
 
   createSaveSnapshot() {
     return {
-      schemaVersion: W6_SAVE_SCHEMA,
-      gameplaySchemaVersion: W6_GAMEPLAY_SCHEMA,
-      saveVersion: W6_SAVE_VERSION,
+      schemaVersion: W7_SAVE_SCHEMA,
+      schemaVersionNumber: W7_SAVE_SCHEMA_VERSION,
+      gameplaySchemaVersion: W7_GAMEPLAY_SCHEMA,
+      legacySaveVersion: W6_SAVE_VERSION,
+      worldSeed: this.worldSeed,
       worldSeedHash: this.worldSeedHash,
       activeScaleStageId: this.activeScaleStageId,
       player: { ...this.player },
@@ -290,23 +389,36 @@ export class InfiniteWorldState {
       manualBossStableId: this.manualBossStableId,
       manualBossSequence: this.manualBossSequence,
       nuclearCooldownMs: this.nuclearCooldownMs,
+      experience: structuredClone(this.experience),
     };
   }
 
   restoreSaveSnapshot(snapshot) {
-    if (snapshot?.schemaVersion !== W6_SAVE_SCHEMA
-      || snapshot?.gameplaySchemaVersion !== W6_GAMEPLAY_SCHEMA
-      || snapshot?.saveVersion !== W6_SAVE_VERSION) {
+    const candidate = snapshot?.schemaVersion === W6_SAVE_SCHEMA
+      ? migrateW6SaveSnapshot(snapshot, { worldSeed: this.worldSeed })
+      : structuredClone(snapshot);
+    if (candidate?.schemaVersion !== W7_SAVE_SCHEMA
+      || candidate?.schemaVersionNumber !== W7_SAVE_SCHEMA_VERSION
+      || candidate?.gameplaySchemaVersion !== W7_GAMEPLAY_SCHEMA
+      || candidate?.legacySaveVersion !== W6_SAVE_VERSION) {
       throw new Error('unsupported Infinite World save schema or version');
     }
-    if (snapshot.worldSeedHash !== this.worldSeedHash) throw new Error('save world seed does not match runtime');
-    if (!isW6ScaleStageId(snapshot.activeScaleStageId)) throw new Error('invalid saved scale stage');
-    const player = validatePlayer(snapshot.player);
-    const featureDamage = validateFeatureDamage(snapshot.featureDamage);
-    const entityStates = validateEntityStates(snapshot.entityStates);
-    const manualBossStableId = snapshot.manualBossStableId ?? null;
-    const manualBossSequence = snapshot.manualBossSequence ?? 0;
-    const nuclearCooldownMs = nonNegative(snapshot.nuclearCooldownMs ?? 0, 'nuclearCooldownMs');
+    if (candidate.worldSeedHash !== this.worldSeedHash || candidate.worldSeed !== this.worldSeed) {
+      throw new Error('save world seed does not match runtime');
+    }
+    if (!isW6ScaleStageId(candidate.activeScaleStageId)) throw new Error('invalid saved scale stage');
+    const player = validatePlayer(candidate.player);
+    const featureDamage = validateFeatureDamage(candidate.featureDamage);
+    const entityStates = validateEntityStates(candidate.entityStates);
+    for (const stableId of featureDamage.keys()) {
+      if (entityStates.has(stableId)) {
+        throw new Error(`Stable ID collision between feature and entity state: ${stableId}`);
+      }
+    }
+    const manualBossStableId = candidate.manualBossStableId ?? null;
+    const manualBossSequence = candidate.manualBossSequence ?? 0;
+    const nuclearCooldownMs = nonNegative(candidate.nuclearCooldownMs ?? 0, 'nuclearCooldownMs');
+    const experience = validateExperience(candidate.experience);
     if (!Number.isSafeInteger(manualBossSequence) || manualBossSequence < 0) {
       throw new TypeError('manualBossSequence must be a non-negative integer');
     }
@@ -318,20 +430,22 @@ export class InfiniteWorldState {
     } else if (manualBossSequence !== 0) {
       throw new Error('manual Boss sequence requires a Stable ID');
     }
-    this.activeScaleStageId = snapshot.activeScaleStageId;
+    this.activeScaleStageId = candidate.activeScaleStageId;
     Object.assign(this.player, player);
     this.featureDamage = featureDamage;
     this.entityStates = entityStates;
     this.manualBossStableId = manualBossStableId;
     this.manualBossSequence = manualBossSequence;
     this.nuclearCooldownMs = nuclearCooldownMs;
+    this.experience = experience;
     this.revision += 1;
     return this.snapshot();
   }
 
   snapshot() {
     return Object.freeze({
-      schemaVersion: W6_GAMEPLAY_SCHEMA,
+      schemaVersion: W7_GAMEPLAY_SCHEMA,
+      worldSeed: this.worldSeed,
       worldSeedHash: this.worldSeedHash,
       activeScaleStageId: this.activeScaleStageId,
       player: Object.freeze({ ...this.player }),
@@ -345,6 +459,10 @@ export class InfiniteWorldState {
         ...cloneRecord(this.entityStates.get(this.manualBossStableId)),
       }),
       nuclearCooldownMs: this.nuclearCooldownMs,
+      experience: Object.freeze({
+        hudHidden: this.experience.hudHidden,
+        settings: Object.freeze({ ...this.experience.settings }),
+      }),
       revision: this.revision,
     });
   }
@@ -356,8 +474,14 @@ async function checksumForPayload(payload) {
 
 export async function encodeInfiniteWorldSave(snapshot) {
   const payload = structuredClone(snapshot);
+  const schemaVersion = payload?.schemaVersion === W7_SAVE_SCHEMA
+    ? W7_SAVE_ENVELOPE_SCHEMA
+    : payload?.schemaVersion === W6_SAVE_SCHEMA
+      ? W6_SAVE_ENVELOPE_SCHEMA
+      : null;
+  if (!schemaVersion) throw new Error('unsupported Infinite World save payload schema');
   return JSON.stringify({
-    schemaVersion: W6_SAVE_ENVELOPE_SCHEMA,
+    schemaVersion,
     checksum: await checksumForPayload(payload),
     payload,
   });
@@ -370,8 +494,13 @@ export async function decodeInfiniteWorldSave(serialized, { worldSeedHash } = {}
   } catch (error) {
     throw new Error(`Infinite World save is not valid JSON: ${error.message}`);
   }
-  if (envelope?.schemaVersion !== W6_SAVE_ENVELOPE_SCHEMA
-    || typeof envelope?.checksum !== 'string' || !envelope.payload) {
+  const matchingPayloadSchema = envelope?.schemaVersion === W6_SAVE_ENVELOPE_SCHEMA
+    ? W6_SAVE_SCHEMA
+    : envelope?.schemaVersion === W7_SAVE_ENVELOPE_SCHEMA
+      ? W7_SAVE_SCHEMA
+      : null;
+  if (!matchingPayloadSchema || typeof envelope?.checksum !== 'string' || !envelope.payload
+    || envelope.payload.schemaVersion !== matchingPayloadSchema) {
     throw new Error('invalid Infinite World save envelope');
   }
   const actualChecksum = await checksumForPayload(envelope.payload);
@@ -433,13 +562,18 @@ export class InfiniteWorldSaveStore {
   async loadInto(state) {
     const snapshot = await this.loadSnapshot();
     if (!snapshot) return null;
-    state.restoreSaveSnapshot(snapshot);
-    return state.snapshot();
+    try {
+      state.restoreSaveSnapshot(snapshot);
+      return state.snapshot();
+    } catch (error) {
+      this.counts.failed += 1;
+      throw error;
+    }
   }
 
   snapshot() {
     return Object.freeze({
-      schemaVersion: W6_SAVE_ENVELOPE_SCHEMA,
+      schemaVersion: W7_SAVE_ENVELOPE_SCHEMA,
       key: this.key,
       persistentStorage: this.storage !== null,
       counts: Object.freeze({ ...this.counts }),

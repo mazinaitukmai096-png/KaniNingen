@@ -51,6 +51,13 @@ export function createInfiniteExperienceShell({
   }
   const byId = id => documentObject?.getElementById?.(id) ?? null;
   const body = documentObject?.body ?? null;
+  const persistedExperience = worldState.experience ?? {
+    hudHidden: false,
+    settings: {
+      mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
+      fpsCap: 0, cameraShake: 1,
+    },
+  };
   const elements = {
     start: byId('start-screen'), startButton: byId('start-button'), lobbySettings: byId('lobby-settings-btn'),
     ui: byId('ui'), crosshair: byId('crosshair'), compass: byId('compass'), compassArrow: byId('compass-arrow'),
@@ -71,7 +78,7 @@ export function createInfiniteExperienceShell({
   const state = {
     mode: elements.startButton ? 'menu' : 'playing',
     paused: Boolean(elements.startButton),
-    hudHidden: false,
+    hudHidden: persistedExperience.hudHidden,
     debugOpen: false,
     settingsOpen: false,
     bossActive: false,
@@ -79,14 +86,7 @@ export function createInfiniteExperienceShell({
     attackButtons: new Set(),
     nuclearChargeStartedAt: null,
     camera: createExperienceCameraState(initialScaleProfile),
-    settings: {
-      mouseSensitivity: 1,
-      volume: 0.5,
-      quality: 'high',
-      showFps: false,
-      fpsCap: 0,
-      cameraShake: 1,
-    },
+    settings: { ...persistedExperience.settings },
   };
   const removers = [];
   const listen = (target, type, listener, options) => {
@@ -116,6 +116,22 @@ export function createInfiniteExperienceShell({
     setVisible(elements.charge, state.mode === 'playing' && state.nuclearChargeStartedAt !== null);
     setVisible(elements.news, state.mode === 'playing' && state.newsActive);
     setVisible(elements.gameOver, state.mode === 'gameover');
+  }
+
+  function syncSettingsControls() {
+    if (elements.mouse) elements.mouse.value = String(state.settings.mouseSensitivity);
+    if (elements.mouseValue) elements.mouseValue.textContent = state.settings.mouseSensitivity.toFixed(1);
+    if (elements.volume) elements.volume.value = String(state.settings.volume);
+    if (elements.volumeValue) elements.volumeValue.textContent = `${Math.round(state.settings.volume * 100)}%`;
+    if (elements.quality) elements.quality.value = state.settings.quality;
+    if (elements.fpsToggle) elements.fpsToggle.checked = state.settings.showFps;
+    if (elements.fpsCap) elements.fpsCap.value = String(state.settings.fpsCap);
+    if (elements.shake) elements.shake.value = String(state.settings.cameraShake);
+    if (elements.shakeValue) elements.shakeValue.textContent = state.settings.cameraShake.toFixed(1);
+  }
+
+  function persistExperience(patch) {
+    if (typeof worldState.updateExperience === 'function') worldState.updateExperience(patch);
   }
 
   function resume() {
@@ -164,7 +180,10 @@ export function createInfiniteExperienceShell({
   }
 
   const setting = (element, event, apply) => listen(element, event, value => {
-    apply(value.target); onSettingsChanged(Object.freeze({ ...state.settings })); syncShellVisibility();
+    apply(value.target);
+    persistExperience({ settings: state.settings });
+    onSettingsChanged(Object.freeze({ ...state.settings }));
+    syncShellVisibility();
   });
   setting(elements.mouse, 'input', target => {
     state.settings.mouseSensitivity = Number(target.value); if (elements.mouseValue) elements.mouseValue.textContent = state.settings.mouseSensitivity.toFixed(1);
@@ -194,7 +213,11 @@ export function createInfiniteExperienceShell({
       else if (event.code === 'KeyF' && !state.paused) onAttack('double');
       else if (event.code === 'KeyP') onSave();
       else if (event.code === 'KeyL') onLoad();
-      else if (event.code === 'KeyH') { state.hudHidden = !state.hudHidden; syncShellVisibility(); }
+      else if (event.code === 'KeyH') {
+        state.hudHidden = !state.hudHidden;
+        persistExperience({ hudHidden: state.hudHidden });
+        syncShellVisibility();
+      }
       else if (event.code === 'Tab') { event.preventDefault?.(); state.debugOpen ? closeDebug() : openDebug(); }
       else if (event.code === 'Escape' && state.mode === 'playing') openSettings();
     },
@@ -320,6 +343,17 @@ export function createInfiniteExperienceShell({
   }
 
   function renderHud({ fps, gameplaySnapshot, runtimeSnapshot, saveStatus, renderInfo, resources }) {
+    const savedExperience = gameplaySnapshot.state.experience;
+    if (savedExperience) {
+      const settingsChanged = Object.entries(savedExperience.settings)
+        .some(([key, value]) => state.settings[key] !== value);
+      state.hudHidden = savedExperience.hudHidden;
+      if (settingsChanged) {
+        state.settings = { ...savedExperience.settings };
+        syncSettingsControls();
+        onSettingsChanged(Object.freeze({ ...state.settings }));
+      }
+    }
     const player = gameplaySnapshot.state.player;
     const hpPercent = player.maxHp ? player.hp / player.maxHp * 100 : 0;
     if (elements.score) elements.score.textContent = money(player.score);
@@ -374,6 +408,7 @@ export function createInfiniteExperienceShell({
     ].join('\n');
   }
 
+  syncSettingsControls();
   syncShellVisibility();
   return Object.freeze({
     updatePlayer,
