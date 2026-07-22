@@ -156,7 +156,9 @@ export class ChunkRenderAdapter {
       geometries: Object.freeze({ road: new PlaneGeometry(1, 1), building }),
       materials: Object.freeze({
         road: new MeshLambertMaterial({ color: 0x66615a, flatShading: true }),
-        building: new MeshLambertMaterial({ color: 0x9a8569, flatShading: true }),
+        buildingRural: new MeshLambertMaterial({ color: 0x9a8569, flatShading: true }),
+        buildingTown: new MeshLambertMaterial({ color: 0xb69f7e, flatShading: true }),
+        buildingCity: new MeshLambertMaterial({ color: 0x667078, flatShading: true }),
       }),
     });
     return this.settlementResources;
@@ -258,7 +260,8 @@ export class ChunkRenderAdapter {
         resources.materials.road,
         Math.max(1, roads.length),
       );
-      roadMesh.name = 'w4-rural-roads';
+      roadMesh.name = chunkData.generatorVersion?.major >= 500
+        ? 'infinite-settlement-roads' : 'w4-rural-roads';
       roadMesh.count = roads.length;
       roads.forEach((road, index) => {
         const dx = road.end.x - road.start.x;
@@ -286,10 +289,15 @@ export class ChunkRenderAdapter {
 
       const buildingMesh = new InstancedMesh(
         resources.geometries.building,
-        resources.materials.building,
+        resources.materials[{
+          CITY: 'buildingCity',
+          TOWN: 'buildingTown',
+          RURAL: 'buildingRural',
+        }[buildings[0]?.settlementType] ?? 'buildingRural'],
         Math.max(1, buildings.length),
       );
-      buildingMesh.name = 'w4-rural-buildings';
+      buildingMesh.name = chunkData.generatorVersion?.major >= 500
+        ? 'infinite-settlement-buildings' : 'w4-rural-buildings';
       buildingMesh.count = buildings.length;
       buildings.forEach((building, index) => {
         const localX = building.worldPosition.x

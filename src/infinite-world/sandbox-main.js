@@ -6,7 +6,7 @@ import {
   logicalWorldToRenderLocal,
 } from './chunk-coordinates.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
-import { createSingleRuralChunkGenerator } from './single-rural-chunk-generator.js';
+import { createDistributedSettlementChunkGenerator } from './distributed-settlement-chunk-generator.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 
 const THREE = globalThis.THREE;
@@ -17,7 +17,7 @@ if (!viewport || !hud) throw new Error('sandbox DOM is incomplete');
 
 const query = new URLSearchParams(globalThis.location.search);
 const requestedSeed = query.get('seed') ?? 'KaniNingen Infinite Natural World';
-const generator = await createSingleRuralChunkGenerator({ worldSeed: requestedSeed });
+const generator = await createDistributedSettlementChunkGenerator({ worldSeed: requestedSeed });
 const chunkSizeBenchmark = runW1BChunkSizeBenchmark({ iterations: 25_000, rounds: 5 });
 const selectedRenderChunkSize = chunkSizeBenchmark.decision.selectedRenderChunkSize;
 
@@ -54,7 +54,7 @@ scene.add(playerMarker);
 const renderAdapter = new ChunkRenderAdapter({ THREE, scene, renderChunkSize: selectedRenderChunkSize });
 const chunkIndex = new PersistentChunkIndex({ capacity: 65_536 });
 const runtime = new ChunkRuntimeManager({ generator, renderAdapter, cacheCapacity: 81, chunkIndex });
-const logicalPlayer = { x: 8, z: 8 };
+const logicalPlayer = { x: generator.reviewSpawn.x, z: generator.reviewSpawn.z };
 const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
 await runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ);
 
@@ -142,14 +142,16 @@ function updateHud(owner) {
   const transition = state.latestTransition;
   const warningText = state.warnings.length ? `\n警告: ${state.warnings.join(' / ')}` : '';
   const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
-  hud.innerHTML = `<span id="badge">W4 / SINGLE RURAL SETTLEMENT</span>
+  const settlementReference = currentChunk?.settlementReferences?.[0];
+  hud.innerHTML = `<span id="badge">W5 / INFINITE SETTLEMENT DISTRIBUTION</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
 Natural Biome: ${escapeHtml(currentChunk?.biomeField?.primaryBiomeId ?? 'loading')}  Height range: ${number(currentChunk?.terrain?.heightRangeMeters?.minimum)}..${number(currentChunk?.terrain?.heightRangeMeters?.maximum)}m
 Formal Vegetation: ${currentChunk?.vegetationCandidates?.length ?? 0}  Formal Rocks: ${currentChunk?.rockCandidates?.length ?? 0}  Persistent Index: ${state.chunkIndex?.size ?? 0}/${state.chunkIndex?.capacity ?? 0}
-RURAL Settlement: ${escapeHtml(generator.settlement.settlementId)}  Roads: ${generator.settlement.roads.length}  Buildings: ${generator.settlement.buildings.length}/${generator.settlement.requestedBuildingCount}
-Current Chunk Settlement features: ${currentChunk?.settlementFeatures?.length ?? 0}
+Settlement: ${escapeHtml(settlementReference?.settlementType ?? 'NATURAL')} / ${escapeHtml(settlementReference?.townType ?? 'none')}  Stable ID: ${escapeHtml(settlementReference?.settlementId ?? 'none')}
+Current Chunk Settlement features: ${currentChunk?.settlementFeatures?.length ?? 0}  Buildings: ${settlementReference?.buildingCount ?? 0}/${settlementReference?.requestedBuildingCount ?? 0}
+Distribution: Seed + 768m Macro Region + minimum distance + urbanization + terrain suitability (fixed total: none)
 Render Origin Chunk: (${state.renderOrigin.renderOriginChunkX}, ${state.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${chunkSizeBenchmark.decision.selectedUnitsPerMeter} units/m; 4096/2048 compared)
 Rendered: ${state.renderedCount}/9  Prefetched Data: ${state.activeDataCount}/25  Cache: ${state.cacheSize}/${state.cacheCapacity}

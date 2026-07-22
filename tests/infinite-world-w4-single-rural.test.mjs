@@ -231,7 +231,7 @@ test('W4 renderer lazily shares Settlement resources and releases all streamed C
   await runtime.initialize(0, 0);
   let resources = adapter.resourceSnapshot();
   assert.equal(resources.sharedGeometryCount, 6);
-  assert.equal(resources.sharedMaterialCount, 7);
+  assert.equal(resources.sharedMaterialCount, 9);
   assert.equal(resources.liveChunkGroups, 9);
   assert.equal(resources.liveChunkOwnedGeometryCount, 9);
   assert.ok([...adapter.loaded.values()].some(projected => (
@@ -251,11 +251,10 @@ test('W4 renderer lazily shares Settlement resources and releases all streamed C
   assert.equal(resources.sharedDisposed, true);
 });
 
-test('W4 production sources connect no Gameplay, TOWN, CITY, Growth, Worker, or LOD systems', () => {
+test('W4 entry connects no Gameplay, Growth, Worker, or LOD systems', () => {
   const sources = [
-    'src/infinite-world/single-rural-settlement.js',
     'src/infinite-world/single-rural-chunk-generator.js',
   ].map(path => readFileSync(resolve(repoRoot, path), 'utf8')).join('\n');
-  assert.doesNotMatch(sources, /from ['"]\.\.\/game\.js|SETTLEMENT_TYPES\.(?:TOWN|CITY)|\b(?:Growth|Wanted|Threat|Nation|Worker|LOD)\b/);
+  assert.doesNotMatch(sources, /from ['"]\.\.\/game\.js|\b(?:Growth|Wanted|Threat|Nation|Worker|LOD)\b/);
   assert.doesNotMatch(sources, /Math\.random|\b(?:THREE|document|window|WebGL|HTMLElement)\b/);
 });
