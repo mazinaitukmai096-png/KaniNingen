@@ -232,7 +232,7 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
 });
 
 test('JavaScript syntax and local module imports resolve', () => {
-  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/building-lot.js', 'src/settlement-type.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/building-lot.js', 'src/settlement-type.js', 'src/settlement-road-parameters.js', 'src/core/input.js', 'src/core/renderer.js']) {
     execFileSync(process.execPath, ['--check', resolve(repoRoot, path)], { cwd: repoRoot, stdio: 'pipe' });
   }
 
