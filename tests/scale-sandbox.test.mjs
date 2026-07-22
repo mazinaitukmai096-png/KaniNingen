@@ -223,9 +223,12 @@ test('temporary destruction gates allow only the intended target classes', () =>
   assert.equal(canScaleStageDamageTarget('MID', target('pebble', 20)), true);
   assert.equal(canScaleStageDamageTarget('MID', target('human', 25)), true);
   assert.equal(canScaleStageDamageTarget('MID', target('house', 55)), true);
-  assert.equal(canScaleStageDamageTarget('MID', target('house', 75)), false);
+  assert.equal(canScaleStageDamageTarget('MID', target('house', 75)), true);
+  assert.equal(canScaleStageDamageTarget('MID', target('house', 500)), true);
   assert.equal(canScaleStageDamageTarget('MID', target('tank', 70)), false);
   assert.equal(canScaleStageDamageTarget('MID', target('militaryBase', 160)), false);
+  assert.equal(canScaleStageDamageTarget('MID', target('church', 115)), false);
+  assert.equal(canScaleStageDamageTarget('MID', target('factory', 160)), false);
 
   for (const type of ['pebble', 'tree', 'human', 'house', 'tank', 'militaryBase', 'boss']) {
     assert.equal(canScaleStageDamageTarget('MAX', target(type, 500)), true);

@@ -147,7 +147,7 @@ export function canScaleStageDamageTarget(stageId, target) {
     return target.type === 'tree'
       || target.type === 'pebble'
       || target.type === 'human'
-      || (target.type === 'house' && target.radius <= 60);
+      || target.type === 'house';
   }
 
   return false;

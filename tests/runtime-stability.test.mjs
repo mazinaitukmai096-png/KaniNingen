@@ -188,7 +188,7 @@ test('Building feedback, World generation, Input, Renderer, and locked HUD behav
       /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
       '\n',
     )
-    .replace(/\n\s+populateWorldScaleDetails\(townCenters, pathTiles\);\n/, '\n');
+    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n');
   assert.equal(currentMap, sliceBetween(baselineGame, 'function initMap()', 'function createParticles('));
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');

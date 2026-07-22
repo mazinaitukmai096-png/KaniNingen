@@ -44,11 +44,15 @@ import {
 import {
   PRODUCTION_HUMAN_VISUAL_SCALE,
   PRODUCTION_TANK_VISUAL_SCALE,
+  START_POND_WORLD_DETAIL_TYPES,
   WORLD_DETAIL_INSTANCE_CAPACITY,
+  WORLD_DETAIL_INTERACTION_RADII,
   WORLD_DETAIL_PARTS,
   WORLD_DETAIL_ROADSIDE_OFFSET,
   WORLD_DETAIL_TYPES,
+  WORLD_DETAILS_PER_START_POND,
   WORLD_DETAILS_PER_TOWN,
+  canStageDestroyWorldDetail,
 } from './world-scale-rebalance.js';
 
 let bossHPDelay = 100;
@@ -621,6 +625,7 @@ let inputController, rendererController;
         let flowerInstancedMesh = null;
         let nextFlowerInstanceIndex = 0;
         let worldDetailInstancedMesh = null;
+        const worldDetailProps = [];
         const clouds = []; // 追加: 雲オブジェクト配列
 
         const player = {
@@ -1520,14 +1525,14 @@ let inputController, rendererController;
             return data;
         }
 
-        function populateWorldScaleDetails(townCenters, pathTiles) {
+        function populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, worldWaterZones) {
             const dummy = new THREE.Object3D();
             const colorCache = new Map();
             let instanceIndex = 0;
-            let propCount = 0;
+            worldDetailProps.length = 0;
 
             const addPart = (baseX, baseZ, baseAngle, detailPart) => {
-                if (instanceIndex >= WORLD_DETAIL_INSTANCE_CAPACITY) return;
+                if (instanceIndex >= WORLD_DETAIL_INSTANCE_CAPACITY) return -1;
                 const sin = Math.sin(baseAngle);
                 const cos = Math.cos(baseAngle);
                 dummy.position.set(
@@ -1546,28 +1551,99 @@ let inputController, rendererController;
                     colorCache.set(detailPart.color, color);
                 }
                 worldDetailInstancedMesh.setColorAt(instanceIndex, color);
-                instanceIndex++;
+                return instanceIndex++;
+            };
+
+            const addProp = (baseX, baseZ, baseAngle, type) => {
+                const instanceIndices = [];
+                for (const detailPart of WORLD_DETAIL_PARTS[type]) {
+                    const index = addPart(baseX, baseZ, baseAngle, detailPart);
+                    if (index !== -1) instanceIndices.push(index);
+                }
+                if (instanceIndices.length === 0) return;
+                worldDetailProps.push({
+                    type,
+                    x: baseX,
+                    z: baseZ,
+                    radius: WORLD_DETAIL_INTERACTION_RADII[type] || 0,
+                    instanceIndices,
+                    destroyed: false,
+                });
+            };
+
+            const selectPriorityTiles = (tc, townPaths) => {
+                const distanceSq = (tile, x, z) => (tile.x - x) ** 2 + (tile.z - z) ** 2;
+                const townSpots = placedTownSpots.filter(
+                    spot => (spot.x - tc.x) ** 2 + (spot.z - tc.z) ** 2 < tc.radius ** 2
+                );
+                const buildingDistanceByTile = new Map(townPaths.map(tile => [
+                    tile,
+                    townSpots.reduce(
+                        (nearest, spot) => Math.min(nearest, distanceSq(tile, spot.x, spot.z)),
+                        Infinity
+                    ),
+                ]));
+                const pathDensityByTile = new Map(townPaths.map(tile => [
+                    tile,
+                    townPaths.reduce(
+                        (count, other) => count + (distanceSq(tile, other.x, other.z) < 130 ** 2 ? 1 : 0),
+                        0
+                    ),
+                ]));
+
+                const candidateGroups = [
+                    [...townPaths].sort((a, b) => distanceSq(a, tc.x, tc.z) - distanceSq(b, tc.x, tc.z)),
+                    [...townPaths].sort((a, b) => distanceSq(a, tc.park.x, tc.park.z) - distanceSq(b, tc.park.x, tc.park.z)),
+                    [...townPaths].sort((a, b) => buildingDistanceByTile.get(a) - buildingDistanceByTile.get(b)),
+                    [...townPaths].sort((a, b) => pathDensityByTile.get(b) - pathDensityByTile.get(a)),
+                ];
+                const cursors = candidateGroups.map(() => 0);
+                const selected = [];
+                const used = new Set();
+
+                while (selected.length < WORLD_DETAILS_PER_TOWN) {
+                    let added = false;
+                    candidateGroups.forEach((group, groupIndex) => {
+                        while (cursors[groupIndex] < group.length && used.has(group[cursors[groupIndex]])) {
+                            cursors[groupIndex]++;
+                        }
+                        if (selected.length >= WORLD_DETAILS_PER_TOWN || cursors[groupIndex] >= group.length) return;
+                        const tile = group[cursors[groupIndex]++];
+                        used.add(tile);
+                        selected.push(tile);
+                        added = true;
+                    });
+                    if (!added) break;
+                }
+                return selected;
             };
 
             townCenters.forEach(tc => {
                 const townPaths = pathTiles.filter(tile => tile.tc === tc);
                 if (townPaths.length === 0) return;
+                const priorityTiles = selectPriorityTiles(tc, townPaths);
 
-                for (let detailIndex = 0; detailIndex < WORLD_DETAILS_PER_TOWN; detailIndex++) {
-                    const pathIndex = Math.floor((detailIndex + 0.5) * townPaths.length / WORLD_DETAILS_PER_TOWN)
-                        % townPaths.length;
-                    const tile = townPaths[pathIndex];
+                priorityTiles.forEach((tile, detailIndex) => {
                     const radialAngle = Math.atan2(tile.x - tc.x, tile.z - tc.z);
                     const side = detailIndex % 2 === 0 ? 1 : -1;
                     const sideAngle = radialAngle + side * Math.PI / 2;
                     const baseX = tile.x + Math.sin(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
                     const baseZ = tile.z + Math.cos(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
                     const type = WORLD_DETAIL_TYPES[detailIndex % WORLD_DETAIL_TYPES.length];
+                    addProp(baseX, baseZ, radialAngle, type);
+                });
+            });
 
-                    for (const detailPart of WORLD_DETAIL_PARTS[type]) {
-                        addPart(baseX, baseZ, radialAngle, detailPart);
-                    }
-                    propCount++;
+            worldWaterZones.filter(zone => zone.isPond).forEach(pond => {
+                for (let detailIndex = 0; detailIndex < WORLD_DETAILS_PER_START_POND; detailIndex++) {
+                    const angle = detailIndex / WORLD_DETAILS_PER_START_POND * Math.PI * 2;
+                    const radius = pond.radius + 42;
+                    const baseX = pond.x + Math.cos(angle) * radius;
+                    const baseZ = pond.z + Math.sin(angle) * radius;
+                    const type = START_POND_WORLD_DETAIL_TYPES[
+                        detailIndex % START_POND_WORLD_DETAIL_TYPES.length
+                    ];
+                    addProp(baseX, baseZ, angle + Math.PI / 2, type);
                 }
             });
 
@@ -1577,8 +1653,43 @@ let inputController, rendererController;
                 worldDetailInstancedMesh.instanceColor.needsUpdate = true;
             }
             worldDetailInstancedMesh.computeBoundingSphere();
-            worldDetailInstancedMesh.userData.worldDetailPropCount = propCount;
+            worldDetailInstancedMesh.userData.worldDetailPropCount = worldDetailProps.length;
             worldDetailInstancedMesh.userData.worldDetailInstanceCount = instanceIndex;
+        }
+
+        function damageWorldDetailsAt(hitPositions, hitRadius) {
+            let destroyedCount = 0;
+            const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+
+            for (const prop of worldDetailProps) {
+                if (prop.destroyed || !canStageDestroyWorldDetail(activeScaleStageId, prop.type)) continue;
+                const combinedRadius = hitRadius + prop.radius;
+                const wasHit = hitPositions.some(hitPosition => {
+                    const dx = prop.x - hitPosition.x;
+                    const dz = prop.z - hitPosition.z;
+                    return dx * dx + dz * dz < combinedRadius * combinedRadius;
+                });
+                if (!wasHit) continue;
+
+                prop.destroyed = true;
+                for (const instanceIndex of prop.instanceIndices) {
+                    worldDetailInstancedMesh.setMatrixAt(instanceIndex, hiddenMatrix);
+                }
+                createParticles(
+                    new THREE.Vector3(prop.x, 16, prop.z),
+                    WORLD_DETAIL_PARTS[prop.type][0].color,
+                    6,
+                    4
+                );
+                destroyedCount++;
+            }
+
+            if (destroyedCount > 0) {
+                worldDetailInstancedMesh.instanceMatrix.needsUpdate = true;
+                playHitSound(false);
+                applyPlayerCameraShake(8);
+            }
+            return destroyedCount;
         }
 
         // --- 都市・村計画配置システム (Town Planning System) ---
@@ -2195,7 +2306,7 @@ let inputController, rendererController;
                 }
             });
 
-            populateWorldScaleDetails(townCenters, pathTiles);
+            populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, waterZones);
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
             // 木・岩の密度は下のメイン装飾配置ループで距離に応じたグラデーションをかけて
@@ -3218,6 +3329,7 @@ let inputController, rendererController;
                     }
                 }
             }
+            damageWorldDetailsAt([hitPos], hitRad);
         }
 
         // ダブルパンチ攻撃関数
@@ -3277,6 +3389,7 @@ let inputController, rendererController;
                     }
                 }
             }
+            damageWorldDetailsAt([hitPosL, hitPosR], hitRad);
         }
 
         function updateLobbyAnimation(delta, dtScale, time) {
@@ -3635,6 +3748,7 @@ let inputController, rendererController;
                             en => canScaleStageDamageTarget(activeScaleStageId, en),
                             'playerLanding'
                         );
+                        damageWorldDetailsAt([player.mesh.position], activeScaleStage.landingRadius);
                         playHitSound(true);
 
                         createShockwave(player.mesh.position, activeScaleStage.landingRadius * 1.1, 0xff3300);

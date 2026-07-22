@@ -8,10 +8,15 @@ import { HUMAN_VISUAL_SCALES } from '../src/scale-sandbox.js';
 import {
   PRODUCTION_HUMAN_VISUAL_SCALE,
   PRODUCTION_TANK_VISUAL_SCALE,
+  START_POND_WORLD_DETAIL_TYPES,
+  TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES,
   WORLD_DETAIL_INSTANCE_CAPACITY,
+  WORLD_DETAIL_INTERACTION_RADII,
   WORLD_DETAIL_PARTS,
   WORLD_DETAIL_TYPES,
+  WORLD_DETAILS_PER_START_POND,
   WORLD_DETAILS_PER_TOWN,
+  canStageDestroyWorldDetail,
   getWorldDetailCounts,
   getWorldDetailInstanceCount,
 } from '../src/world-scale-rebalance.js';
@@ -52,21 +57,68 @@ test('formal Human and Tank visual scales are explicit and visual-only', () => {
   assert.equal(currentSpawn, extractFunction(baselineGame, 'spawnEntity'));
 });
 
-test('six towns receive exactly 96 balanced roadside props and 264 instances', () => {
-  assert.equal(WORLD_DETAILS_PER_TOWN, 16);
-  assert.deepEqual(getWorldDetailCounts(6), {
+test('priority town routes and two start ponds receive exactly 96 props and 258 instances', () => {
+  assert.equal(WORLD_DETAILS_PER_TOWN, 12);
+  assert.equal(WORLD_DETAILS_PER_START_POND, 12);
+  assert.deepEqual(getWorldDetailCounts(6, 2), {
     streetLamp: 12,
-    bench: 12,
-    trashBin: 12,
-    roadSign: 12,
+    bench: 18,
+    trashBin: 18,
+    roadSign: 18,
     planter: 12,
-    vendingMachine: 12,
-    parkedCar: 12,
-    fence: 12,
+    vendingMachine: 6,
+    parkedCar: 6,
+    fence: 6,
   });
-  assert.equal(Object.values(getWorldDetailCounts(6)).reduce((sum, count) => sum + count, 0), 96);
-  assert.equal(getWorldDetailInstanceCount(6), 264);
-  assert.ok(getWorldDetailInstanceCount(6) <= WORLD_DETAIL_INSTANCE_CAPACITY);
+  assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((sum, count) => sum + count, 0), 96);
+  assert.equal(getWorldDetailInstanceCount(6, 2), 258);
+  assert.ok(getWorldDetailInstanceCount(6, 2) <= WORLD_DETAIL_INSTANCE_CAPACITY);
+});
+
+test('Tiny street interactions are limited to four approved InstancedMesh prop types', () => {
+  assert.deepEqual(TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES, [
+    'trashBin',
+    'roadSign',
+    'bench',
+    'planter',
+  ]);
+  assert.equal(START_POND_WORLD_DETAIL_TYPES, TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES);
+  assert.deepEqual(WORLD_DETAIL_INTERACTION_RADII, {
+    bench: 35,
+    trashBin: 18,
+    roadSign: 20,
+    planter: 22,
+  });
+  for (const stage of ['TINY', 'MID', 'MAX']) {
+    for (const type of TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES) {
+      assert.equal(canStageDestroyWorldDetail(stage, type), true);
+    }
+    assert.equal(canStageDestroyWorldDetail(stage, 'parkedCar'), false);
+  }
+});
+
+test('street interaction hides only hit instances and reuses existing feedback paths', () => {
+  const damageDetails = extractFunction(game, 'damageWorldDetailsAt');
+  assert.match(damageDetails, /prop\.destroyed = true;/);
+  assert.match(damageDetails, /worldDetailInstancedMesh\.setMatrixAt\(instanceIndex, hiddenMatrix\);/);
+  assert.match(damageDetails, /createParticles\(/);
+  assert.match(damageDetails, /playHitSound\(false\);/);
+  assert.match(damageDetails, /applyPlayerCameraShake\(8\);/);
+  assert.doesNotMatch(damageDetails, /entities\.(?:push|splice)|new THREE\.(?:Mesh|Group|InstancedMesh)/);
+  assert.equal((game.match(/damageWorldDetailsAt\(/g) || []).length, 4);
+});
+
+test('street props prioritize centers, parks, building roads, intersections, and both start ponds', () => {
+  const populate = extractFunction(game, 'populateWorldScaleDetails');
+  for (const snippet of [
+    'distanceSq(a, tc.x, tc.z)',
+    'distanceSq(a, tc.park.x, tc.park.z)',
+    'buildingDistanceByTile.get(a)',
+    'pathDensityByTile.get(b)',
+    'worldWaterZones.filter(zone => zone.isPond)',
+    'WORLD_DETAILS_PER_START_POND',
+  ]) assert.ok(populate.includes(snippet), `missing priority placement: ${snippet}`);
+  assert.doesNotMatch(populate, /\(detailIndex \+ 0\.5\) \* townPaths\.length/);
 });
 
 test('world detail templates use valid Three.js primitive part data and no external assets', () => {

@@ -12,9 +12,26 @@ export const WORLD_DETAIL_TYPES = Object.freeze([
   'fence',
 ]);
 
-export const WORLD_DETAILS_PER_TOWN = 16;
+export const WORLD_DETAILS_PER_TOWN = 12;
+export const WORLD_DETAILS_PER_START_POND = 12;
 export const WORLD_DETAIL_INSTANCE_CAPACITY = 320;
 export const WORLD_DETAIL_ROADSIDE_OFFSET = 62;
+
+export const TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES = Object.freeze([
+  'trashBin',
+  'roadSign',
+  'bench',
+  'planter',
+]);
+
+export const START_POND_WORLD_DETAIL_TYPES = TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES;
+
+export const WORLD_DETAIL_INTERACTION_RADII = Object.freeze({
+  bench: 35,
+  trashBin: 18,
+  roadSign: 20,
+  planter: 22,
+});
 
 const part = (x, y, z, width, height, depth, color, rotationY = 0) => Object.freeze({
   x, y, z, width, height, depth, color, rotationY,
@@ -61,9 +78,15 @@ export const WORLD_DETAIL_PARTS = Object.freeze({
   ]),
 });
 
-export function getWorldDetailCounts(townCount) {
-  if (!Number.isInteger(townCount) || townCount < 0) {
-    throw new RangeError('townCount must be a non-negative integer');
+export function canStageDestroyWorldDetail(stageId, type) {
+  return (stageId === 'TINY' || stageId === 'MID' || stageId === 'MAX')
+    && TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES.includes(type);
+}
+
+export function getWorldDetailCounts(townCount, startPondCount = 0) {
+  if (!Number.isInteger(townCount) || townCount < 0
+      || !Number.isInteger(startPondCount) || startPondCount < 0) {
+    throw new RangeError('counts must be non-negative integers');
   }
 
   const counts = Object.fromEntries(WORLD_DETAIL_TYPES.map(type => [type, 0]));
@@ -72,11 +95,16 @@ export function getWorldDetailCounts(townCount) {
       counts[WORLD_DETAIL_TYPES[detailIndex % WORLD_DETAIL_TYPES.length]]++;
     }
   }
+  for (let pondIndex = 0; pondIndex < startPondCount; pondIndex++) {
+    for (let detailIndex = 0; detailIndex < WORLD_DETAILS_PER_START_POND; detailIndex++) {
+      counts[START_POND_WORLD_DETAIL_TYPES[detailIndex % START_POND_WORLD_DETAIL_TYPES.length]]++;
+    }
+  }
   return counts;
 }
 
-export function getWorldDetailInstanceCount(townCount) {
-  const counts = getWorldDetailCounts(townCount);
+export function getWorldDetailInstanceCount(townCount, startPondCount = 0) {
+  const counts = getWorldDetailCounts(townCount, startPondCount);
   return WORLD_DETAIL_TYPES.reduce(
     (total, type) => total + counts[type] * WORLD_DETAIL_PARTS[type].length,
     0,
