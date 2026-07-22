@@ -27,6 +27,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
     this.disposed = false;
+    this.settlementResources = null;
     this.counts = {
       projected: 0,
       loaded: 0,
@@ -134,6 +135,33 @@ export class ChunkRenderAdapter {
     return geometry;
   }
 
+  #ensureSettlementResources() {
+    if (this.settlementResources) return this.settlementResources;
+    const PlaneGeometry = requireConstructor(this.THREE, 'PlaneGeometry');
+    const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
+    const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
+    const MeshLambertMaterial = requireConstructor(this.THREE, 'MeshLambertMaterial');
+    const building = new BufferGeometry();
+    building.setAttribute('position', new Float32BufferAttribute([
+      -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
+      -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
+    ], 3));
+    building.setIndex([
+      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+      0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
+      1, 2, 6, 1, 6, 5, 0, 4, 7, 0, 7, 3,
+    ]);
+    building.computeVertexNormals();
+    this.settlementResources = Object.freeze({
+      geometries: Object.freeze({ road: new PlaneGeometry(1, 1), building }),
+      materials: Object.freeze({
+        road: new MeshLambertMaterial({ color: 0x66615a, flatShading: true }),
+        building: new MeshLambertMaterial({ color: 0x9a8569, flatShading: true }),
+      }),
+    });
+    return this.settlementResources;
+  }
+
   async projectChunk(chunkData) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
@@ -144,6 +172,7 @@ export class ChunkRenderAdapter {
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
     const vegetation = chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? [];
     const rocks = chunkData.rockCandidates ?? chunkData.rockProxies ?? [];
+    const settlementFeatures = chunkData.settlementFeatures ?? [];
     const group = new Group();
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
@@ -220,6 +249,71 @@ export class ChunkRenderAdapter {
     rockMesh.instanceMatrix.needsUpdate = true;
     group.add(rockMesh);
 
+    if (settlementFeatures.length) {
+      const resources = this.#ensureSettlementResources();
+      const roads = settlementFeatures.filter(feature => feature.featureType === 'settlement-road');
+      const buildings = settlementFeatures.filter(feature => feature.featureType === 'settlement-building');
+      const roadMesh = new InstancedMesh(
+        resources.geometries.road,
+        resources.materials.road,
+        Math.max(1, roads.length),
+      );
+      roadMesh.name = 'w4-rural-roads';
+      roadMesh.count = roads.length;
+      roads.forEach((road, index) => {
+        const dx = road.end.x - road.start.x;
+        const dz = road.end.z - road.start.z;
+        const localX = (road.start.x + road.end.x) / 2
+          - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+        const localZ = (road.start.z + road.end.z) / 2
+          - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+        transform.position.set(
+          localX * this.unitsPerMeter,
+          road.worldPosition.y * this.unitsPerMeter + 3,
+          localZ * this.unitsPerMeter,
+        );
+        transform.rotation.set(-Math.PI / 2, 0, Math.atan2(dz, dx));
+        transform.scale.set(
+          Math.hypot(dx, dz) * this.unitsPerMeter,
+          road.widthMeters * this.unitsPerMeter,
+          1,
+        );
+        transform.updateMatrix();
+        roadMesh.setMatrixAt(index, transform.matrix);
+      });
+      roadMesh.instanceMatrix.needsUpdate = true;
+      group.add(roadMesh);
+
+      const buildingMesh = new InstancedMesh(
+        resources.geometries.building,
+        resources.materials.building,
+        Math.max(1, buildings.length),
+      );
+      buildingMesh.name = 'w4-rural-buildings';
+      buildingMesh.count = buildings.length;
+      buildings.forEach((building, index) => {
+        const localX = building.worldPosition.x
+          - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+        const localZ = building.worldPosition.z
+          - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+        transform.position.set(
+          localX * this.unitsPerMeter,
+          (building.worldPosition.y + building.heightMeters / 2) * this.unitsPerMeter,
+          localZ * this.unitsPerMeter,
+        );
+        transform.rotation.set(0, building.rotationY, 0);
+        transform.scale.set(
+          building.widthMeters * this.unitsPerMeter,
+          building.heightMeters * this.unitsPerMeter,
+          building.depthMeters * this.unitsPerMeter,
+        );
+        transform.updateMatrix();
+        buildingMesh.setMatrixAt(index, transform.matrix);
+      });
+      buildingMesh.instanceMatrix.needsUpdate = true;
+      group.add(buildingMesh);
+    }
+
     const border = new LineSegments(this.geometries.border, this.materials.border);
     border.name = 'w1a-chunk-border';
     group.add(border);
@@ -259,8 +353,10 @@ export class ChunkRenderAdapter {
   resourceSnapshot() {
     return Object.freeze({
       liveChunkGroups: this.loaded.size,
-      sharedGeometryCount: Object.keys(this.geometries).length,
-      sharedMaterialCount: Object.keys(this.materials).length,
+      sharedGeometryCount: Object.keys(this.geometries).length
+        + (this.settlementResources ? Object.keys(this.settlementResources.geometries).length : 0),
+      sharedMaterialCount: Object.keys(this.materials).length
+        + (this.settlementResources ? Object.keys(this.settlementResources.materials).length : 0),
       sharedDisposed: this.disposed,
       projectedCount: this.counts.projected,
       loadedCount: this.counts.loaded,
@@ -282,6 +378,10 @@ export class ChunkRenderAdapter {
     this.scene.remove(this.worldRoot);
     for (const geometry of Object.values(this.geometries)) geometry.dispose();
     for (const material of Object.values(this.materials)) material.dispose();
+    if (this.settlementResources) {
+      for (const geometry of Object.values(this.settlementResources.geometries)) geometry.dispose();
+      for (const material of Object.values(this.settlementResources.materials)) material.dispose();
+    }
     this.disposed = true;
   }
 }

@@ -224,6 +224,7 @@ export class ChunkRuntimeManager {
       const features = [
         ...(chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? []),
         ...(chunkData.rockCandidates ?? chunkData.rockProxies ?? []),
+        ...(chunkData.settlementFeatures ?? []),
       ];
       for (const feature of features) {
         const stableId = feature.candidateId ?? feature.stableId;

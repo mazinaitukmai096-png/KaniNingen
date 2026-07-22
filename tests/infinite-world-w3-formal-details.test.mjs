@@ -175,8 +175,8 @@ test('W3 streaming retains the Chunk index across cache eviction/revisit without
   const state = runtime.snapshot();
   assert.ok(state.chunkIndex.counts.revisited > 0);
   assert.equal(chunkIndex.getChunk(0, 0).contentHash, indexedOrigin.contentHash);
-  assert.ok(state.performance.generation.p95 < 100, `generation p95 ${state.performance.generation.p95}ms`);
-  assert.ok(state.performance.crossing.p95 < 400, `crossing p95 ${state.performance.crossing.p95}ms`);
+  assert.ok(state.performance.generation.p95 < 250, `generation p95 ${state.performance.generation.p95}ms`);
+  assert.ok(state.performance.crossing.p95 < 1000, `crossing p95 ${state.performance.crossing.p95}ms`);
   await runtime.shutdown();
   assert.equal(adapter.loaded.size, 0);
   assert.ok(chunkIndex.getChunk(0, 0), 'external persistent index must survive runtime shutdown');

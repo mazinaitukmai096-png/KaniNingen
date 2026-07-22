@@ -4,6 +4,7 @@ function candidateCollections(chunkData) {
   return [
     ...(chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? []),
     ...(chunkData.rockCandidates ?? chunkData.rockProxies ?? []),
+    ...(chunkData.settlementFeatures ?? []),
   ];
 }
 
@@ -63,6 +64,7 @@ export class PersistentChunkIndex {
       candidateIds: Object.freeze([...ids]),
       vegetationCount: (chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? []).length,
       rockCount: (chunkData.rockCandidates ?? chunkData.rockProxies ?? []).length,
+      settlementFeatureCount: (chunkData.settlementFeatures ?? []).length,
       lastUsed: ++this.accessTick,
     });
     this.entries.set(key, entry);
