@@ -39,9 +39,10 @@ function createFixture() {
     'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill',
     'atomic-status', 'boss-ui', 'charge-ui', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
-    'debug-close-btn', 'debug-summary', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
+    'debug-close-btn', 'debug-summary', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'game-over', 'restart-button',
+    'nuclear-flash',
   ];
   const elements = new Map(ids.map(id => [id, createElement()]));
   elements.get('set-quality').value = 'high';
@@ -57,6 +58,9 @@ function createFixture() {
     exitPointerLock() { this.pointerLockElement = null; this.dispatch('pointerlockchange'); },
   });
   const globalObject = new FakeEventTarget();
+  let now = 0;
+  globalObject.performance = { now: () => now };
+  globalObject.setTimeout = callback => { callback(); return 1; };
   const canvas = createElement();
   canvas.requestPointerLock = () => {
     documentObject.pointerLockElement = canvas;
@@ -71,7 +75,10 @@ function createFixture() {
     activeScaleStageId: 'MAX',
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
   };
-  const calls = { attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0 };
+  const calls = {
+    attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
+    nuclear: [], bossSpawns: 0,
+  };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
     initialScaleProfile: getW6ScaleProfile('MAX'),
@@ -80,8 +87,13 @@ function createFixture() {
     onLoad: () => { calls.loads += 1; },
     onHome: () => { calls.homes += 1; },
     onRestart: () => { calls.restarts += 1; },
+    onNuclearRelease: input => { calls.nuclear.push(input); },
+    onSpawnManualBoss: () => { calls.bossSpawns += 1; },
   });
-  return { shell, globalObject, documentObject, canvas, camera, playerMarker, worldState, calls, elements, bodyClasses };
+  return {
+    shell, globalObject, documentObject, canvas, camera, playerMarker, worldState,
+    calls, elements, bodyClasses, setNow(value) { now = value; },
+  };
 }
 
 test('W7 camera state is sourced from the protected scale profile', () => {
@@ -131,7 +143,7 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   fixture.shell.dispose();
 });
 
-test('normal HUD is a read-only adapter and W7D-only shells remain inactive', () => {
+test('normal HUD is a read-only adapter and no Boss UI appears without a manual Boss', () => {
   const fixture = createFixture();
   const gameplaySnapshot = {
     state: {
@@ -158,7 +170,7 @@ test('normal HUD is a read-only adapter and W7D-only shells remain inactive', ()
   assert.equal(fixture.elements.get('hp-bar-fill').style.width, '75%');
   assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
   assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
-  assert.equal(fixture.elements.get('atomic-status').textContent, '');
+  assert.equal(fixture.elements.get('atomic-status').textContent, 'ATOMIC: MAX SCALE ONLY');
   fixture.shell.dispose();
 });
 
@@ -202,6 +214,24 @@ test('zero HP enters Game Over and Retry delegates to the existing runtime resta
   await Promise.resolve();
   assert.equal(fixture.calls.restarts, 1);
   assert.equal(fixture.shell.snapshot().mode, 'playing');
+  fixture.shell.dispose();
+});
+
+test('W7D mouse charge releases nuclear input only after the protected threshold and exposes manual Boss debug', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  fixture.globalObject.dispatch('keydown', { code: 'Space' });
+  fixture.globalObject.dispatch('mousedown', { button: 0 });
+  fixture.globalObject.dispatch('mousedown', { button: 2 });
+  fixture.setNow(1800);
+  fixture.globalObject.dispatch('mouseup', { button: 0 });
+  assert.deepEqual(fixture.calls.nuclear, [{ airborne: true, chargeMs: 1800 }]);
+  assert.equal(fixture.calls.attacks.length, 0);
+
+  fixture.elements.get('debug-spawn-boss-btn').dispatch('click');
+  assert.equal(fixture.calls.bossSpawns, 1);
+  assert.equal(fixture.shell.triggerNuclearEffect(), true);
+  assert.equal(fixture.elements.get('nuclear-flash').style.opacity, '0');
   fixture.shell.dispose();
 });
 

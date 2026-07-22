@@ -9,6 +9,8 @@ import {
   W6_ENTITY_CONTRACTS,
   W6_STATIC_TARGET_CONTRACTS,
   W7_CORE_COMBAT_CONTRACT,
+  W7_MANUAL_BOSS_CONTRACT,
+  W7_NUCLEAR_CONTRACT,
   canW6StageDamageTarget,
   finiteWorldFrameSpeedToMetersPerSecond,
   finiteWorldUnitsToMeters,
@@ -45,6 +47,31 @@ function pointSegmentDistanceSquared(point, start, end) {
 
 function ownerContains(ownerChunkKey, x, z) {
   return logicalWorldToOwnedChunk(x, z).key === ownerChunkKey;
+}
+
+export function chunksIntersectingLogicalCircle(centerX, centerZ, radiusMeters) {
+  if (![centerX, centerZ, radiusMeters].every(Number.isFinite) || radiusMeters < 0) {
+    throw new TypeError('finite circle center and non-negative radius are required');
+  }
+  const minimumChunkX = Math.floor((centerX - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const maximumChunkX = Math.floor((centerX + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkZ = Math.floor((centerZ - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const maximumChunkZ = Math.floor((centerZ + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const coordinates = [];
+  for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
+    for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
+      const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+      const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+      const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+      const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+      const nearestX = Math.max(minimumX, Math.min(maximumX, centerX));
+      const nearestZ = Math.max(minimumZ, Math.min(maximumZ, centerZ));
+      if ((nearestX - centerX) ** 2 + (nearestZ - centerZ) ** 2 <= radiusMeters ** 2) {
+        coordinates.push(Object.freeze({ chunkX, chunkZ, key: createChunkKey(chunkX, chunkZ) }));
+      }
+    }
+  }
+  return Object.freeze(coordinates);
 }
 
 function clampToOwner(state) {
@@ -109,11 +136,10 @@ async function humanDescriptor({ building, chunkData, worldSeedHash, generatorMa
 
 async function settlementEntityDescriptor({ reference, chunkData, worldSeedHash, generatorMajor }) {
   const isTank = reference.townType === 'military';
-  const isBoss = reference.settlementType === 'CITY';
-  if (!isTank && !isBoss) return null;
+  if (!isTank) return null;
   const owner = logicalWorldToOwnedChunk(reference.center.x, reference.center.z);
   if (owner.chunkX !== chunkData.chunkX || owner.chunkZ !== chunkData.chunkZ) return null;
-  const type = isBoss ? 'boss' : 'tank';
+  const type = 'tank';
   const contract = W6_ENTITY_CONTRACTS[type];
   const result = await entityStableId({
     worldSeedHash,
@@ -133,7 +159,7 @@ async function settlementEntityDescriptor({ reference, chunkData, worldSeedHash,
     x: reference.center.x,
     z: reference.center.z,
     rotationY: 0,
-    aiState: type === 'boss' ? 'slither' : 'engage',
+    aiState: 'engage',
   });
 }
 
@@ -225,6 +251,7 @@ export class InfiniteGameplayRuntime {
     state,
     renderAdapter,
     featureRenderAdapter = null,
+    getChunkDataForQuery = null,
     clock = () => globalThis.performance?.now?.() ?? Date.now(),
   } = {}) {
     if (typeof worldSeedHash !== 'string' || !worldSeedHash) throw new TypeError('worldSeedHash is required');
@@ -233,11 +260,15 @@ export class InfiniteGameplayRuntime {
     for (const method of ['rebase', 'loadChunk', 'syncEntity', 'unloadChunk', 'snapshot', 'shutdown']) {
       if (typeof renderAdapter?.[method] !== 'function') throw new TypeError(`gameplay renderAdapter.${method} is required`);
     }
+    if (getChunkDataForQuery !== null && typeof getChunkDataForQuery !== 'function') {
+      throw new TypeError('getChunkDataForQuery must be a function when provided');
+    }
     this.worldSeedHash = worldSeedHash;
     this.generatorMajor = generatorMajor;
     this.state = state;
     this.renderAdapter = renderAdapter;
     this.featureRenderAdapter = featureRenderAdapter;
+    this.getChunkDataForQuery = getChunkDataForQuery;
     this.clock = clock;
     this.activeChunks = new Map();
     this.stableIdOwners = new Map();
@@ -264,6 +295,10 @@ export class InfiniteGameplayRuntime {
       playerDeaths: 0,
       combatEffects: 0,
       restarts: 0,
+      nuclearAttacks: 0,
+      nuclearChunksQueried: 0,
+      nuclearTargetsHit: 0,
+      manualBossSpawns: 0,
     };
   }
 
@@ -331,6 +366,11 @@ export class InfiniteGameplayRuntime {
     }
     if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
     await this.renderAdapter.rebase(renderOrigin);
+    this.renderAdapter.syncManualBoss?.(
+      this.state.manualBossStableId
+        ? this.state.entityStates.get(this.state.manualBossStableId) ?? null
+        : null,
+    );
     this.#syncTransientCombat();
     this.featureRenderAdapter?.refreshFeatureStates?.();
     return this.snapshot();
@@ -366,6 +406,7 @@ export class InfiniteGameplayRuntime {
       }
     }
     this.state.updatePlayer({ x: player.x, z: player.z });
+    this.state.tickNuclearCooldown(boundedDelta * 1000);
     for (const model of this.activeChunks.values()) {
       for (const descriptor of model.entityDescriptors) {
         const entity = this.state.entityStates.get(descriptor.stableId);
@@ -427,6 +468,64 @@ export class InfiniteGameplayRuntime {
         this.renderAdapter.syncEntity(entity);
         this.counts.entityUpdates += 1;
       }
+    }
+    const manualBoss = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)
+      : null;
+    if (manualBoss?.alive) {
+      const contract = W6_ENTITY_CONTRACTS.boss;
+      const distance = Math.sqrt(distanceSquared(manualBoss, player));
+      const bossCombat = W7_MANUAL_BOSS_CONTRACT;
+      const cycleSeconds = bossCombat.slitherDurationSeconds + bossCombat.chargeDurationSeconds;
+      const cycleTime = manualBoss.aiClock % cycleSeconds;
+      const charging = cycleTime >= bossCombat.slitherDurationSeconds;
+      const rage = manualBoss.hp / manualBoss.maxHp <= 0.5;
+      manualBoss.aiState = charging ? 'charge' : 'slither';
+      if (charging || distance > finiteWorldUnitsToMeters(contract.approachDistance)) {
+        let dx = player.x - manualBoss.x;
+        let dz = player.z - manualBoss.z;
+        const length = Math.hypot(dx, dz);
+        if (length > 1e-9) {
+          dx /= length;
+          dz /= length;
+          const speed = charging
+            ? (rage ? bossCombat.chargeSpeedRage : bossCombat.chargeSpeed)
+            : (rage ? contract.rageMoveSpeed : contract.moveSpeed);
+          manualBoss.x += dx * finiteWorldFrameSpeedToMetersPerSecond(speed) * boundedDelta;
+          manualBoss.z += dz * finiteWorldFrameSpeedToMetersPerSecond(speed) * boundedDelta;
+          manualBoss.rotationY = Math.atan2(dx, dz);
+          const nextOwner = logicalWorldToOwnedChunk(manualBoss.x, manualBoss.z).key;
+          this.state.moveEntityOwner(manualBoss.stableId, nextOwner);
+          this.stableIdOwners.set(manualBoss.stableId, nextOwner);
+        }
+      }
+      const playerHitRange = finiteWorldUnitsToMeters(
+        charging ? bossCombat.chargeHitRadius : bossCombat.bodyContactRange,
+      );
+      const hitDistance = Math.sqrt(distanceSquared(manualBoss, player));
+      if (boundedDelta > 0 && this.state.player.hp > 0 && hitDistance <= playerHitRange) {
+        const damagePerFrame = charging
+          ? (rage ? bossCombat.chargeDamageRage : bossCombat.chargeDamage)
+          : bossCombat.bodyContactDamage;
+        const wasAlive = this.state.player.hp > 0;
+        this.state.damagePlayer(damagePerFrame * boundedDelta * 60);
+        this.pendingCameraShake = Math.max(this.pendingCameraShake, charging ? 25 : 14);
+        this.counts.playerHits += 1;
+        if (charging && hitDistance > 1e-9) {
+          this.applyPlayerKnockback({
+            directionX: player.x - manualBoss.x,
+            directionZ: player.z - manualBoss.z,
+            metersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(bossCombat.chargePushForce),
+            decayPerFrame: bossCombat.playerKnockbackDecay,
+          });
+        }
+        if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
+      }
+      manualBoss.aiClock += boundedDelta;
+      this.renderAdapter.syncManualBoss?.(manualBoss);
+      this.counts.entityUpdates += 1;
+    } else {
+      this.renderAdapter.syncManualBoss?.(manualBoss);
     }
     const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
     const bulletHitRadius = finiteWorldUnitsToMeters(W7_CORE_COMBAT_CONTRACT.tank.bulletHitRadius);
@@ -539,8 +638,181 @@ export class InfiniteGameplayRuntime {
         hits.push(Object.freeze({ stableId: entity.stableId, type: entity.type, destroyed: !result.alive }));
       }
     }
+    const manualBoss = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)
+      : null;
+    if (manualBoss?.alive
+      && canW6StageDamageTarget(this.state.activeScaleStageId, manualBoss)
+      && insideAttack(manualBoss)) {
+      const result = this.state.damageEntity(manualBoss.stableId, damage);
+      if (!result.alive) {
+        this.counts.destroyedEntities += 1;
+        this.state.player.score += W6_ENTITY_CONTRACTS.boss.scoreValue;
+      }
+      this.#emitCombatEffect({
+        type: result.alive ? 'entity-impact' : 'entity-destruction',
+        x: manualBoss.x,
+        z: manualBoss.z,
+        durationSeconds: result.alive ? 0.16 : 0.8,
+        cameraShake: damage / 7 * profile.stage.playerShakeMultiplier,
+      });
+      this.renderAdapter.syncManualBoss?.(manualBoss);
+      hits.push(Object.freeze({
+        stableId: manualBoss.stableId,
+        type: 'boss',
+        destroyed: !result.alive,
+      }));
+    }
     this.#syncTransientCombat();
     return Object.freeze({ accepted: true, mode, damage, radiusMeters: radius, hits: Object.freeze(hits) });
+  }
+
+  async spawnManualBoss() {
+    const existing = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)
+      : null;
+    if (existing?.alive) {
+      return Object.freeze({ accepted: false, reason: 'manual-boss-already-active', stableId: existing.stableId });
+    }
+    const sequence = this.state.manualBossSequence + 1;
+    const result = await entityStableId({
+      worldSeedHash: this.worldSeedHash,
+      generatorMajor: this.generatorMajor,
+      featureType: 'boss',
+      parentStableId: `infinite-world:${this.worldSeedHash}`,
+      purposeKey: `w7-manual-boss:${sequence}`,
+    });
+    const spawnDistanceMeters = finiteWorldUnitsToMeters(W7_MANUAL_BOSS_CONTRACT.spawnDistance);
+    const x = this.state.player.x + Math.sin(this.state.player.facingY) * spawnDistanceMeters;
+    const z = this.state.player.z + Math.cos(this.state.player.facingY) * spawnDistanceMeters;
+    const ownerChunkKey = logicalWorldToOwnedChunk(x, z).key;
+    const descriptor = {
+      stableId: result.stableId,
+      canonicalInput: result.canonicalInput,
+      ownerChunkKey,
+      type: 'boss',
+      maxHp: W6_ENTITY_CONTRACTS.boss.maxHp,
+      radius: W6_ENTITY_CONTRACTS.boss.radius,
+      scoreValue: W6_ENTITY_CONTRACTS.boss.scoreValue,
+      x: q6(x),
+      z: q6(z),
+      rotationY: q6(this.state.player.facingY + Math.PI),
+      aiState: 'slither',
+    };
+    this.#registerStableId(descriptor.stableId, ownerChunkKey);
+    const boss = this.state.ensureEntity(descriptor);
+    this.state.setManualBoss(boss.stableId, sequence);
+    this.renderAdapter.syncManualBoss?.(boss);
+    this.counts.manualBossSpawns += 1;
+    return Object.freeze({
+      accepted: true,
+      stableId: boss.stableId,
+      sequence,
+      spawnDistanceMeters,
+      ownerChunkKey,
+    });
+  }
+
+  async nuclearAttack({ x = this.state.player.x, z = this.state.player.z, airborne = false } = {}) {
+    if (this.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId) {
+      return Object.freeze({ accepted: false, reason: 'scale-not-allowed', hitStableIds: Object.freeze([]) });
+    }
+    if (!airborne) {
+      return Object.freeze({ accepted: false, reason: 'air-release-required', hitStableIds: Object.freeze([]) });
+    }
+    if (this.state.nuclearCooldownMs > 0) {
+      return Object.freeze({
+        accepted: false,
+        reason: 'cooldown',
+        cooldownRemainingMs: this.state.nuclearCooldownMs,
+        hitStableIds: Object.freeze([]),
+      });
+    }
+    if (typeof this.getChunkDataForQuery !== 'function') {
+      throw new Error('nuclear attack requires the existing ChunkData query');
+    }
+    const radiusMeters = finiteWorldUnitsToMeters(W7_NUCLEAR_CONTRACT.damageRadius);
+    const coordinates = chunksIntersectingLogicalCircle(x, z, radiusMeters);
+    const models = await Promise.all(coordinates.map(async coordinate => createW6ChunkGameplay({
+      chunkData: await this.getChunkDataForQuery(coordinate.chunkX, coordinate.chunkZ),
+      worldSeedHash: this.worldSeedHash,
+      generatorMajor: this.generatorMajor,
+    })));
+    const staticTargets = new Map();
+    const entityDescriptors = new Map();
+    for (const model of models) {
+      for (const target of model.staticTargets) {
+        const existing = staticTargets.get(target.stableId);
+        if (existing && existing.ownerChunkKey !== target.ownerChunkKey) {
+          throw new Error(`Stable ID collision in nuclear query: ${target.stableId}`);
+        }
+        staticTargets.set(target.stableId, target);
+        this.#registerStableId(target.stableId, target.ownerChunkKey);
+      }
+      for (const descriptor of model.entityDescriptors) {
+        const existing = entityDescriptors.get(descriptor.stableId);
+        if (existing && existing.ownerChunkKey !== descriptor.ownerChunkKey) {
+          throw new Error(`Stable ID collision in nuclear query: ${descriptor.stableId}`);
+        }
+        entityDescriptors.set(descriptor.stableId, descriptor);
+        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+      }
+    }
+    const inside = target => distanceSquared(target, { x, z }) <= radiusMeters ** 2;
+    const hitStableIds = [];
+    for (const target of [...staticTargets.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
+      if (!inside(target) || this.state.isFeatureDestroyed(target.stableId)) continue;
+      const wasDestroyed = this.state.isFeatureDestroyed(target.stableId);
+      const damaged = this.state.damageFeature(target, W7_NUCLEAR_CONTRACT.damageAmount);
+      if (!wasDestroyed && damaged.destroyed) {
+        this.state.player.score += target.scoreValue;
+        this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[target.type] ?? 0);
+        this.counts.destroyedFeatures += 1;
+      }
+      hitStableIds.push(target.stableId);
+    }
+    for (const descriptor of [...entityDescriptors.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
+      const entity = this.state.ensureEntity(descriptor);
+      if (!entity.alive || !inside(entity)) continue;
+      const damaged = this.state.damageEntity(entity.stableId, W7_NUCLEAR_CONTRACT.damageAmount);
+      if (!damaged.alive) {
+        this.state.player.score += descriptor.scoreValue;
+        this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[entity.type] ?? 0);
+        this.counts.destroyedEntities += 1;
+      }
+      this.renderAdapter.syncEntity(entity);
+      hitStableIds.push(entity.stableId);
+    }
+    const manualBoss = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)
+      : null;
+    if (manualBoss?.alive && inside(manualBoss) && !hitStableIds.includes(manualBoss.stableId)) {
+      const damaged = this.state.damageEntity(manualBoss.stableId, W7_NUCLEAR_CONTRACT.damageAmount);
+      if (!damaged.alive) {
+        this.state.player.score += W6_ENTITY_CONTRACTS.boss.scoreValue;
+        this.counts.destroyedEntities += 1;
+      }
+      this.renderAdapter.syncManualBoss?.(manualBoss);
+      hitStableIds.push(manualBoss.stableId);
+    }
+    hitStableIds.sort((a, b) => a.localeCompare(b));
+    this.state.setNuclearCooldown(W7_NUCLEAR_CONTRACT.cooldownMs);
+    this.#emitCombatEffect({
+      type: 'nuclear-destruction', x, z, durationSeconds: 2.2,
+      cameraShake: W7_NUCLEAR_CONTRACT.cameraShake,
+    });
+    this.featureRenderAdapter?.refreshFeatureStates?.();
+    this.#syncTransientCombat();
+    this.counts.nuclearAttacks += 1;
+    this.counts.nuclearChunksQueried += coordinates.length;
+    this.counts.nuclearTargetsHit += hitStableIds.length;
+    return Object.freeze({
+      accepted: true,
+      radiusMeters,
+      damage: W7_NUCLEAR_CONTRACT.damageAmount,
+      queriedChunkKeys: Object.freeze(coordinates.map(value => value.key)),
+      hitStableIds: Object.freeze(hitStableIds),
+    });
   }
 
   isHitStopped(now = this.clock()) {
@@ -607,6 +879,11 @@ export class InfiniteGameplayRuntime {
       await this.renderAdapter.loadChunk(key, states);
     }
     await this.renderAdapter.rebase(renderOrigin);
+    this.renderAdapter.syncManualBoss?.(
+      this.state.manualBossStableId
+        ? this.state.entityStates.get(this.state.manualBossStableId) ?? null
+        : null,
+    );
     this.featureRenderAdapter?.refreshFeatureStates?.();
   }
 
@@ -639,6 +916,7 @@ export class InfiniteGameplayRuntime {
     this.stableIdOwners.clear();
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
+    this.renderAdapter.syncManualBoss?.(null);
     this.#syncTransientCombat();
     this.isShutdown = true;
   }

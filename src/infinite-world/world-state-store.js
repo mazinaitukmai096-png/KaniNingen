@@ -117,6 +117,9 @@ export class InfiniteWorldState {
     this.player = cloneRecord(createW6PlayerState(playerSpawn));
     this.featureDamage = new Map();
     this.entityStates = new Map();
+    this.manualBossStableId = null;
+    this.manualBossSequence = 0;
+    this.nuclearCooldownMs = 0;
     this.revision = 0;
   }
 
@@ -161,6 +164,9 @@ export class InfiniteWorldState {
     Object.assign(this.player, createW6PlayerState(spawn));
     this.featureDamage.clear();
     this.entityStates.clear();
+    this.manualBossStableId = null;
+    this.manualBossSequence = 0;
+    this.nuclearCooldownMs = 0;
     this.revision += 1;
     return this.snapshot();
   }
@@ -199,6 +205,41 @@ export class InfiniteWorldState {
     this.entityStates.set(stableId, state);
     this.revision += 1;
     return state;
+  }
+
+  moveEntityOwner(stableId, ownerChunkKey) {
+    const state = this.entityStates.get(requiredString(stableId, 'entity stableId'));
+    if (!state) throw new Error(`unknown entity Stable ID: ${stableId}`);
+    parseChunkKey(requiredString(ownerChunkKey, 'entity ownerChunkKey'));
+    if (state.ownerChunkKey !== ownerChunkKey) {
+      state.ownerChunkKey = ownerChunkKey;
+      this.revision += 1;
+    }
+    return state;
+  }
+
+  setManualBoss(stableId, sequence) {
+    const entity = this.entityStates.get(requiredString(stableId, 'manual Boss Stable ID'));
+    if (!entity || entity.type !== 'boss') throw new Error('manual Boss must exist in the entity registry');
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError('manual Boss sequence must be positive');
+    this.manualBossStableId = stableId;
+    this.manualBossSequence = sequence;
+    this.revision += 1;
+    return entity;
+  }
+
+  setNuclearCooldown(milliseconds) {
+    this.nuclearCooldownMs = nonNegative(milliseconds, 'nuclear cooldown');
+    this.revision += 1;
+    return this.nuclearCooldownMs;
+  }
+
+  tickNuclearCooldown(deltaMilliseconds) {
+    const delta = nonNegative(deltaMilliseconds, 'nuclear cooldown delta');
+    if (delta === 0 || this.nuclearCooldownMs === 0) return this.nuclearCooldownMs;
+    this.nuclearCooldownMs = Math.max(0, this.nuclearCooldownMs - delta);
+    this.revision += 1;
+    return this.nuclearCooldownMs;
   }
 
   damageEntity(stableId, amount) {
@@ -246,6 +287,9 @@ export class InfiniteWorldState {
       player: { ...this.player },
       featureDamage: sortedRecords(this.featureDamage).map(cloneRecord),
       entityStates: sortedRecords(this.entityStates).map(cloneRecord),
+      manualBossStableId: this.manualBossStableId,
+      manualBossSequence: this.manualBossSequence,
+      nuclearCooldownMs: this.nuclearCooldownMs,
     };
   }
 
@@ -260,10 +304,27 @@ export class InfiniteWorldState {
     const player = validatePlayer(snapshot.player);
     const featureDamage = validateFeatureDamage(snapshot.featureDamage);
     const entityStates = validateEntityStates(snapshot.entityStates);
+    const manualBossStableId = snapshot.manualBossStableId ?? null;
+    const manualBossSequence = snapshot.manualBossSequence ?? 0;
+    const nuclearCooldownMs = nonNegative(snapshot.nuclearCooldownMs ?? 0, 'nuclearCooldownMs');
+    if (!Number.isSafeInteger(manualBossSequence) || manualBossSequence < 0) {
+      throw new TypeError('manualBossSequence must be a non-negative integer');
+    }
+    if (manualBossStableId !== null) {
+      const boss = entityStates.get(requiredString(manualBossStableId, 'manualBossStableId'));
+      if (!boss || boss.type !== 'boss' || manualBossSequence < 1) {
+        throw new Error('manual Boss save record does not match the entity registry');
+      }
+    } else if (manualBossSequence !== 0) {
+      throw new Error('manual Boss sequence requires a Stable ID');
+    }
     this.activeScaleStageId = snapshot.activeScaleStageId;
     Object.assign(this.player, player);
     this.featureDamage = featureDamage;
     this.entityStates = entityStates;
+    this.manualBossStableId = manualBossStableId;
+    this.manualBossSequence = manualBossSequence;
+    this.nuclearCooldownMs = nuclearCooldownMs;
     this.revision += 1;
     return this.snapshot();
   }
@@ -278,6 +339,12 @@ export class InfiniteWorldState {
       destroyedFeatureCount: [...this.featureDamage.values()].filter(value => value.destroyed).length,
       entityStateCount: this.entityStates.size,
       destroyedEntityCount: [...this.entityStates.values()].filter(value => !value.alive).length,
+      manualBoss: this.manualBossStableId === null ? null : Object.freeze({
+        stableId: this.manualBossStableId,
+        sequence: this.manualBossSequence,
+        ...cloneRecord(this.entityStates.get(this.manualBossStableId)),
+      }),
+      nuclearCooldownMs: this.nuclearCooldownMs,
       revision: this.revision,
     });
   }

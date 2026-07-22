@@ -17,7 +17,7 @@
       background: rgba(11,20,25,.88); border: 1px solid rgba(198,231,167,.4); border-radius: 8px;
     }
     body.experience-ready #hud { display: none; }
-    body.experience-ready.debug-open #hud { display: block; top: 70px; max-height: calc(100vh - 90px); overflow: auto; }
+    body.experience-ready.debug-open #hud { display: block; top: 70px; left:auto; right:14px; max-height: calc(100vh - 90px); overflow: auto; }
     #badge { color: #bfe58f; font-weight: 700; } #error { color: #ffad9f; }
     #start-screen {
       position: fixed; inset: 0; z-index: 2000; display: flex; flex-direction: column; justify-content: space-between;
@@ -53,6 +53,7 @@
     #charge-bar-fill { width: 0; height: 100%; background: linear-gradient(90deg,#ffaa00,#ff3300); }
     #news-ticker { position: fixed; top: 0; left: 0; right: 0; height: 32px; z-index: 1800; display: none; overflow: hidden; color: white; background: #c00; line-height: 32px; }
     #news-ticker-text { white-space: nowrap; padding-left: 100%; animation: ticker 25s linear infinite; } @keyframes ticker { to { transform: translateX(-140%); } }
+    #nuclear-flash { position:fixed; inset:0; z-index:1900; pointer-events:none; opacity:0; background:#fff8d8; transition:opacity .3s ease-out; }
     .overlay { position: fixed; inset: 0; z-index: 3000; display: none; align-items: center; justify-content: center; background: #080a0ddd; backdrop-filter: blur(7px); }
     .panel { width: min(680px, 92vw); max-height: 90vh; overflow: auto; padding: 26px; color: #ece8e1; background: #16181a; border: 1px solid #ff465566; }
     .panel h2 { margin-top: 0; color: #ff4655; letter-spacing: .08em; }
@@ -62,7 +63,7 @@
     .panel-btn { min-width: 150px; }
     #resume-overlay { cursor: pointer; color: #00e5ff; font-size: 28px; }
     #game-over { flex-direction: column; color: #fff; text-align: center; } #game-over h1 { color:#ff3b1f; font-size:72px; }
-    #debug-modal { align-items: flex-start; justify-content: flex-start; padding: 14px; background: #12000de8; }
+    #debug-modal { z-index:4500; align-items: flex-start; justify-content: flex-start; padding: 14px; background: #12000de8; }
     #debug-modal .panel { width: min(720px, 94vw); border-color:#ff3fa477; }
     .debug-stats { color:#7dffb2; font: 12px/1.5 Consolas,monospace; white-space:pre-wrap; }
     .inactive { color:#888 !important; }
@@ -79,11 +80,12 @@
   <div id="boss-ui"><div id="boss-title">ギガ・ミミズ</div><div class="boss-bar"><div id="boss-hp-fill"></div></div></div>
   <div id="charge-ui"><div id="charge-bar"><div id="charge-bar-fill"></div></div><div id="charge-label">ATOMIC CHARGING...</div></div>
   <div id="news-ticker"><div id="news-ticker-text">【緊急特撮ニュース】超巨大地底蟲が出現――防衛軍は警戒レベルを最大へ引き上げました。</div></div>
+  <div id="nuclear-flash"></div>
   <div id="resume-overlay" class="overlay"><div>▶ 画面をクリックしてゲームに戻る</div></div>
   <div id="settings-modal" class="overlay"><div class="panel"><h2>設定</h2><div class="setting-row"><label>マウス感度 <span id="val-mouse">1.0</span></label><input id="set-mouse" type="range" min="0.1" max="3" step="0.1" value="1"></div><div class="setting-row"><label>マスター音量 <span id="val-vol">50%</span></label><input id="set-vol" type="range" min="0" max="1" step="0.05" value="0.5"></div><div class="setting-row"><label>グラフィック品質</label><select id="set-quality"><option value="high">高品質</option><option value="medium">標準</option><option value="low">低品質</option></select></div><div class="setting-row"><label>FPS表示</label><input id="set-fps-counter" type="checkbox"></div><div class="setting-row"><label>FPS上限</label><select id="set-fps-cap"><option value="0">無制限</option><option value="30">30 FPS</option><option value="60">60 FPS</option><option value="120">120 FPS</option></select></div><div class="setting-row"><label>Camera Shake <span id="val-shake">1.0</span></label><input id="set-shake" type="range" min="0" max="2" step="0.1" value="1"></div><div class="panel-actions"><button id="set-home-btn" class="panel-btn">タイトルへ</button><button id="set-reset-btn" class="panel-btn">ホーム位置へ</button><button id="settings-close-btn" class="panel-btn">閉じる</button></div></div></div>
   <div id="debug-modal" class="overlay"><div class="panel"><h2>DEBUG OVERLAY</h2><div id="debug-summary" class="debug-stats">Runtime loading...</div><div class="debug-row"><span>Scale Stage</span><span><button class="panel-btn" data-scale-stage="TINY">Tiny</button><button class="panel-btn" data-scale-stage="MID">Mid</button><button class="panel-btn" data-scale-stage="MAX">Max</button></span></div><div class="debug-row"><span>Manual Boss</span><button id="debug-spawn-boss-btn" class="panel-btn" disabled>W7D INACTIVE</button></div><button id="debug-close-btn" class="panel-btn">閉じる (Tab)</button></div></div>
   <div id="game-over" class="overlay"><h1>CRUSHED...</h1><p>最終スコア: <span id="final-score">$0</span></p><button id="restart-button" class="menu-btn">RETRY</button></div>
-  <div id="help">WASD: 移動　Space: Jump　Mouse L/R: 攻撃　1/2/3: Scale　H: HUD　Tab: Debug　P/L: 保存/読込</div>
+  <div id="help">WASD: 移動　Space: Jump　Mouse L/R: 攻撃　Both Hold + Air Release: Atomic　1/2/3: Scale　H: HUD　Tab: Debug　P/L: 保存/読込</div>
   <div id="hud"><span id="badge">W7 / FULL EXPERIENCE</span>
 起動中: DOMContentLoaded</div>
   <script id="w6-entry-error-bridge">
@@ -98,6 +100,6 @@
     })();
   </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
-  <script type="module" src="./src/infinite-world/sandbox-entry.js?v=w6-official-runtime"></script>
+  <script type="module" src="./src/infinite-world/sandbox-entry.js?v=w7-full-experience"></script>
 </body>
 </html>

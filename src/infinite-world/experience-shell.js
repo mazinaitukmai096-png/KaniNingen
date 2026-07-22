@@ -3,7 +3,10 @@ import {
   CAM_WHEEL_ZOOM_SCALE,
 } from '../constants.js';
 import { createInputController } from '../core/input.js';
-import { finiteWorldUnitsToMeters } from './gameplay-contract.js';
+import {
+  W7_NUCLEAR_CONTRACT,
+  finiteWorldUnitsToMeters,
+} from './gameplay-contract.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 const money = score => `$${Math.round(score * 10_000).toLocaleString('en-US')}`;
@@ -39,6 +42,8 @@ export function createInfiniteExperienceShell({
   onLoad = () => {},
   onHome = () => {},
   onRestart = () => {},
+  onNuclearRelease = () => {},
+  onSpawnManualBoss = () => {},
   onSettingsChanged = () => {},
 } = {}) {
   if (!worldState || typeof worldState.setScaleStage !== 'function') {
@@ -51,6 +56,8 @@ export function createInfiniteExperienceShell({
     ui: byId('ui'), crosshair: byId('crosshair'), compass: byId('compass'), compassArrow: byId('compass-arrow'),
     fps: byId('fps-counter'), score: byId('score'), scale: byId('scale-label'), hp: byId('hp-number'),
     hpFill: byId('hp-bar-fill'), atomic: byId('atomic-status'), boss: byId('boss-ui'), charge: byId('charge-ui'),
+    chargeFill: byId('charge-bar-fill'), chargeLabel: byId('charge-label'),
+    bossFill: byId('boss-hp-fill'), bossTitle: byId('boss-title'),
     news: byId('news-ticker'), settings: byId('settings-modal'), settingsClose: byId('settings-close-btn'),
     home: byId('set-home-btn'), reset: byId('set-reset-btn'), resume: byId('resume-overlay'),
     debug: byId('debug-modal'), debugClose: byId('debug-close-btn'), debugSummary: byId('debug-summary'),
@@ -58,6 +65,8 @@ export function createInfiniteExperienceShell({
     quality: byId('set-quality'), fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
     shake: byId('set-shake'), shakeValue: byId('val-shake'), finalScore: byId('final-score'),
     gameOver: byId('game-over'), restart: byId('restart-button'),
+    spawnBoss: byId('debug-spawn-boss-btn'),
+    nuclearFlash: byId('nuclear-flash'),
   };
   const state = {
     mode: elements.startButton ? 'menu' : 'playing',
@@ -65,6 +74,10 @@ export function createInfiniteExperienceShell({
     hudHidden: false,
     debugOpen: false,
     settingsOpen: false,
+    bossActive: false,
+    newsActive: false,
+    attackButtons: new Set(),
+    nuclearChargeStartedAt: null,
     camera: createExperienceCameraState(initialScaleProfile),
     settings: {
       mouseSensitivity: 1,
@@ -99,9 +112,9 @@ export function createInfiniteExperienceShell({
     setVisible(elements.resume, state.mode === 'playing' && state.paused
       && !state.settingsOpen && !state.debugOpen);
     setVisible(elements.fps, state.settings.showFps, 'block');
-    setVisible(elements.boss, false);
-    setVisible(elements.charge, false);
-    setVisible(elements.news, false);
+    setVisible(elements.boss, state.mode === 'playing' && state.bossActive);
+    setVisible(elements.charge, state.mode === 'playing' && state.nuclearChargeStartedAt !== null);
+    setVisible(elements.news, state.mode === 'playing' && state.newsActive);
     setVisible(elements.gameOver, state.mode === 'gameover');
   }
 
@@ -144,6 +157,7 @@ export function createInfiniteExperienceShell({
   listen(elements.debugClose, 'click', closeDebug);
   listen(elements.home, 'click', returnHome);
   listen(elements.restart, 'click', () => { void restart(); });
+  listen(elements.spawnBoss, 'click', () => { void onSpawnManualBoss(); });
   listen(elements.reset, 'click', () => { onHome(); if (state.mode === 'playing') resume(); });
   for (const button of documentObject?.querySelectorAll?.('[data-scale-stage]') ?? []) {
     listen(button, 'click', () => worldState.setScaleStage(button.dataset.scaleStage));
@@ -213,8 +227,32 @@ export function createInfiniteExperienceShell({
         requestLock();
         return;
       }
-      if (event.button === 0) onAttack('single');
-      if (event.button === 2) onAttack('double');
+      if (event.button !== 0 && event.button !== 2) return;
+      state.attackButtons.add(event.button);
+      if (state.attackButtons.has(0) && state.attackButtons.has(2)
+        && state.nuclearChargeStartedAt === null) {
+        state.nuclearChargeStartedAt = globalObject.performance?.now?.() ?? Date.now();
+        syncShellVisibility();
+      }
+    },
+    onMouseUp(event) {
+      if (event.button !== 0 && event.button !== 2) return;
+      const wasCharging = state.nuclearChargeStartedAt !== null;
+      const releasedAt = globalObject.performance?.now?.() ?? Date.now();
+      const chargeMs = wasCharging ? releasedAt - state.nuclearChargeStartedAt : 0;
+      state.attackButtons.delete(event.button);
+      if (wasCharging) {
+        state.attackButtons.clear();
+        state.nuclearChargeStartedAt = null;
+        if (chargeMs >= W7_NUCLEAR_CONTRACT.chargeThresholdMs) {
+          void onNuclearRelease({ airborne: !state.camera.grounded, chargeMs });
+        } else {
+          onAttack('double');
+        }
+        syncShellVisibility();
+      } else if (state.mode === 'playing' && !state.paused) {
+        onAttack('single');
+      }
     },
     onPointerLockChange() {
       if (state.mode !== 'playing') return;
@@ -290,6 +328,36 @@ export function createInfiniteExperienceShell({
     if (elements.hpFill?.style) elements.hpFill.style.width = `${clamp(hpPercent, 0, 100)}%`;
     if (elements.fps) elements.fps.textContent = `FPS: ${Math.round(fps)}`;
     if (elements.compassArrow?.style) elements.compassArrow.style.transform = `rotate(${state.camera.yaw}rad)`;
+    const boss = gameplaySnapshot.state.manualBoss;
+    state.bossActive = boss?.alive === true;
+    state.newsActive = state.bossActive;
+    if (elements.bossFill?.style && boss) {
+      elements.bossFill.style.width = `${clamp(boss.hp / boss.maxHp * 100, 0, 100)}%`;
+    }
+    if (elements.bossTitle && boss) {
+      elements.bossTitle.textContent = boss.hp / boss.maxHp <= 0.5
+        ? '【狂暴怒り】ギガ・ミミズ' : 'ギガ・ミミズ';
+    }
+    const cooldownMs = gameplaySnapshot.state.nuclearCooldownMs ?? 0;
+    if (elements.atomic) {
+      elements.atomic.textContent = gameplaySnapshot.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId
+        ? 'ATOMIC: MAX SCALE ONLY'
+        : cooldownMs > 0 ? `ATOMIC CD: ${(cooldownMs / 1000).toFixed(1)}s` : 'ATOMIC: READY';
+      elements.atomic.classList?.toggle?.('inactive', cooldownMs > 0
+        || gameplaySnapshot.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId);
+    }
+    if (state.nuclearChargeStartedAt !== null) {
+      const elapsed = (globalObject.performance?.now?.() ?? Date.now()) - state.nuclearChargeStartedAt;
+      const progress = clamp(elapsed / W7_NUCLEAR_CONTRACT.chargeThresholdMs, 0, 1);
+      if (elements.chargeFill?.style) elements.chargeFill.style.width = `${progress * 100}%`;
+      if (elements.chargeLabel) elements.chargeLabel.textContent = progress >= 1
+        ? 'AIR RELEASE TO DETONATE' : 'ATOMIC CHARGING...';
+    }
+    if (elements.spawnBoss) {
+      elements.spawnBoss.disabled = state.bossActive;
+      elements.spawnBoss.textContent = state.bossActive ? 'BOSS ACTIVE' : 'SPAWN MANUAL BOSS';
+    }
+    syncShellVisibility();
     if (player.hp <= 0 && state.mode === 'playing') {
       state.mode = 'gameover';
       state.paused = true;
@@ -315,6 +383,12 @@ export function createInfiniteExperienceShell({
       const amountMeters = finiteWorldUnitsToMeters(amountFiniteWorldUnits);
       state.camera.shake = Math.max(state.camera.shake, amountMeters);
       return state.camera.shake;
+    },
+    triggerNuclearEffect() {
+      if (!elements.nuclearFlash?.style) return false;
+      elements.nuclearFlash.style.opacity = '1';
+      globalObject.setTimeout?.(() => { elements.nuclearFlash.style.opacity = '0'; }, 300);
+      return true;
     },
     start,
     resume,

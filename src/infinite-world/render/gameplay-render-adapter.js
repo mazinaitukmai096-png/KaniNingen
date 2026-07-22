@@ -39,6 +39,7 @@ export class GameplayRenderAdapter {
     this.entityMeshes = new Map();
     this.projectileMeshes = new Map();
     this.effectMeshes = new Map();
+    this.manualBossEntry = null;
     this.disposed = false;
     this.counts = {
       loaded: 0, unloaded: 0, created: 0, removed: 0, rebased: 0,
@@ -88,6 +89,7 @@ export class GameplayRenderAdapter {
     for (const entry of this.loaded.values()) this.#positionGroup(entry);
     for (const entry of this.projectileMeshes.values()) this.#positionTransient(entry);
     for (const entry of this.effectMeshes.values()) this.#positionTransient(entry);
+    if (this.manualBossEntry) this.#positionManualBoss();
     this.counts.rebased += 1;
   }
 
@@ -134,14 +136,58 @@ export class GameplayRenderAdapter {
     });
     this.#syncTransientSet(this.effectMeshes, effects, state => {
       const destructive = state.type.includes('destruction');
+      const nuclear = state.type.startsWith('nuclear');
       const mesh = new Mesh(
         this.visualAssets.geometries.dodeca,
         this.visualAssets.materials[destructive ? 'gold' : 'charred'],
       );
       mesh.name = `combat-${state.type}`;
-      mesh.scale.setScalar((destructive ? 1.35 : 0.45) * this.unitsPerMeter);
-      return { mesh, state, height: (destructive ? 0.8 : 0.3) * this.unitsPerMeter };
+      mesh.scale.setScalar((nuclear ? 9 : destructive ? 1.35 : 0.45) * this.unitsPerMeter);
+      return { mesh, state, height: (nuclear ? 5 : destructive ? 0.8 : 0.3) * this.unitsPerMeter };
     });
+    return true;
+  }
+
+  #positionManualBoss() {
+    if (!this.manualBossEntry) return;
+    const { state, mesh } = this.manualBossEntry;
+    const local = logicalWorldToRenderLocal(
+      state.x,
+      state.z,
+      this.origin.renderOriginChunkX,
+      this.origin.renderOriginChunkZ,
+      this.renderChunkSize,
+    );
+    mesh.position.set(local.x, 0, local.z);
+    mesh.rotation.y = state.rotationY;
+  }
+
+  syncManualBoss(state) {
+    if (this.disposed) return false;
+    if (!state?.alive) {
+      if (this.manualBossEntry) {
+        this.combatRoot.remove(this.manualBossEntry.mesh);
+        this.manualBossEntry = null;
+        this.counts.transientRemoved += 1;
+      }
+      return true;
+    }
+    if (this.manualBossEntry?.state.stableId !== state.stableId) {
+      if (this.manualBossEntry) {
+        this.combatRoot.remove(this.manualBossEntry.mesh);
+        this.counts.transientRemoved += 1;
+      }
+      const mesh = this.visualAssets.createEntityModel('boss');
+      mesh.name = 'manual-production-boss';
+      mesh.userData = { stableId: state.stableId, type: 'boss', manual: true };
+      this.#scaleMesh(mesh, state);
+      this.manualBossEntry = { mesh, state };
+      this.combatRoot.add(mesh);
+      this.counts.transientCreated += 1;
+    } else {
+      this.manualBossEntry.state = state;
+    }
+    this.#positionManualBoss();
     return true;
   }
 
@@ -199,6 +245,7 @@ export class GameplayRenderAdapter {
       liveEntityMeshes: this.entityMeshes.size,
       liveProjectileMeshes: this.projectileMeshes.size,
       liveCombatEffectMeshes: this.effectMeshes.size,
+      liveManualBossMeshes: this.manualBossEntry ? 1 : 0,
       sharedGeometryCount: this.visualAssets.snapshot().sharedGeometryCount,
       sharedMaterialCount: this.visualAssets.snapshot().sharedMaterialCount,
       sharedDisposed: this.disposed
@@ -212,6 +259,7 @@ export class GameplayRenderAdapter {
     if (this.disposed) return;
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
     this.syncTransientCombat([], []);
+    this.syncManualBoss(null);
     this.scene.remove(this.root);
     this.scene.remove(this.combatRoot);
     if (this.ownsVisualAssets) this.visualAssets.dispose();

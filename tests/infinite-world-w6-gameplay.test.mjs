@@ -208,7 +208,7 @@ test('only the rendered 3x3 Chunk set simulates and unload/revisit restores dest
   assert.equal(renderer.snapshot().sharedDisposed, true);
 });
 
-test('Human, Tank, and Boss use deterministic Stable IDs and owner-Chunk lifecycle descriptors', async () => {
+test('Human and Tank use deterministic Stable IDs while W7D excludes natural Boss descriptors', async () => {
   const generator = await createDistributedSettlementChunkGenerator({ worldSeed: 'W6 entity types' });
   const chunkData = {
     chunkX: 0,
@@ -234,15 +234,15 @@ test('Human, Tank, and Boss use deterministic Stable IDs and owner-Chunk lifecyc
     worldSeedHash: generator.worldSeedHash,
     generatorMajor: generator.generatorVersion.major,
   });
-  assert.deepEqual(model.entityDescriptors.map(value => value.type).sort(), ['boss', 'human', 'tank']);
+  assert.deepEqual(model.entityDescriptors.map(value => value.type).sort(), ['human', 'tank']);
   assert.equal(model.entityDescriptors.every(value => value.ownerChunkKey === '0,0'), true);
   assert.equal(model.entityDescriptors.every(value => value.stableId.startsWith(`wf1:${value.type}:`)), true);
 });
 
-test('real W5 military and capital Settlements materialize Tank and Boss lifecycle owners', async () => {
+test('real W5 military materializes Tank while capital no longer materializes a natural Boss', async () => {
   const generator = await createDistributedSettlementChunkGenerator({ worldSeed: 'W6 real entity distribution' });
   const candidates = await generator.distributor.findInMacroRange(-8, 8, -8, 8);
-  for (const [townType, expectedEntityType] of [['military', 'tank'], ['capital', 'boss']]) {
+  for (const [townType, expectedEntityType] of [['military', 'tank']]) {
     const candidate = candidates.find(value => value.townType === townType);
     assert.ok(candidate, `${townType} candidate must exist in the deterministic fixture`);
     const owner = logicalWorldToOwnedChunk(candidate.center.x, candidate.center.z);
@@ -257,6 +257,16 @@ test('real W5 military and capital Settlements materialize Tank and Boss lifecyc
     assert.equal(entity.ownerChunkKey, owner.key);
     assert.equal(entity.stableId.startsWith(`wf1:${expectedEntityType}:`), true);
   }
+  const capital = candidates.find(value => value.townType === 'capital');
+  assert.ok(capital);
+  const capitalOwner = logicalWorldToOwnedChunk(capital.center.x, capital.center.z);
+  const capitalChunk = await generator.generateChunk(capitalOwner.chunkX, capitalOwner.chunkZ);
+  const capitalModel = await createW6ChunkGameplay({
+    chunkData: capitalChunk,
+    worldSeedHash: generator.worldSeedHash,
+    generatorMajor: generator.generatorVersion.major,
+  });
+  assert.equal(capitalModel.entityDescriptors.some(value => value.type === 'boss'), false);
 });
 
 test('Tiny/Mid/Max damage gates and legacy attack values drive active W6 gameplay', async () => {
@@ -298,11 +308,9 @@ test('Tiny/Mid/Max damage gates and legacy attack values drive active W6 gamepla
   assert.equal(mid.hits.some(value => value.type === 'human' && value.destroyed), true);
   assert.equal(mid.hits.some(value => value.type === 'house' && value.destroyed), true);
   assert.equal(state.entityStates.get(byType.tank.stableId).hp, TANK_HP);
-  assert.equal(state.entityStates.get(byType.boss.stableId).hp, BOSS_HP);
   state.setScaleStage('MAX');
   const max = runtime.attack('single', ATTACK_COOLDOWN * 2);
   assert.equal(max.hits.some(value => value.type === 'tank' && value.destroyed), true);
-  assert.equal(state.entityStates.get(byType.boss.stableId).hp, BOSS_HP - 550);
   await runtime.shutdown();
 });
 
@@ -341,7 +349,7 @@ test('Infinite World is the documented official runtime while the finite entry r
   const finiteEntry = readFileSync(resolve(repoRoot, 'index.html'), 'utf8');
   const runtimeDocument = readFileSync(resolve(repoRoot, 'docs/infinite-world/RUNTIME-ENTRY.md'), 'utf8');
   assert.match(infiniteEntry, /W6 \/ INFINITE WORLD GAMEPLAY/);
-  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w6-official-runtime/);
+  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w7-full-experience/);
   assert.doesNotMatch(infiniteEntry, /src\/game\.js/);
   assert.match(finiteEntry, /src\/game\.js/);
   assert.match(runtimeDocument, /official KaniNingen runtime is `infinite-world-sandbox\.html`/);

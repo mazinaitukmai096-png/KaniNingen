@@ -1,4 +1,4 @@
-export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w6-official-runtime';
+export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w7-full-experience';
 
 function describeEntryError(error) {
   const name = String(error?.name || 'Error');
@@ -32,7 +32,7 @@ export function createSandboxModuleEntry({
   hud = documentObject?.querySelector?.('#hud'),
   moduleSpecifier = SANDBOX_MAIN_MODULE_SPECIFIER,
   moduleUrl = new URL(moduleSpecifier, import.meta.url).href,
-  importModule = () => import('./sandbox-main.js?v=w6-official-runtime'),
+  importModule = () => import('./sandbox-main.js?v=w7-full-experience'),
 } = {}) {
   let entryPromise = null;
   let importExecutionCount = 0;

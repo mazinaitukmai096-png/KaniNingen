@@ -381,11 +381,11 @@ test('pre-module bridge reports the first module error and suppresses duplicates
 test('pre-module bridge reports the bootstrap URL for a non-bubbling module resource load failure', () => {
   const fixture = loadPreModuleBridge();
   fixture.listeners.get('error')({
-    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w6-official-runtime' },
+    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w7-full-experience' },
   });
   assert.match(fixture.hud.textContent, /起動失敗: MODULE_LOAD/);
   assert.match(fixture.hud.textContent, /Error: Module script failed to load/);
-  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w6-official-runtime/);
+  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w7-full-experience/);
 });
 
 test('pre-module bridge reports an unhandled rejection and disables itself after module start', () => {
@@ -436,7 +436,7 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
-  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w6-official-runtime"><\/script>/);
+  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w7-full-experience"><\/script>/);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js')), true);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);

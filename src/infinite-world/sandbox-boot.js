@@ -438,6 +438,7 @@ export async function bootInfiniteWorldSandbox({
         state: worldState,
         renderAdapter: gameplayRenderAdapter,
         featureRenderAdapter: renderAdapter,
+        getChunkDataForQuery: (chunkX, chunkZ) => generator.generateChunk(chunkX, chunkZ),
         clock,
       });
       const runtimeSnapshot = runtime.snapshot();
@@ -523,6 +524,29 @@ export async function bootInfiniteWorldSandbox({
           renderOrigin: restartRuntime.renderOrigin,
         });
         await saveWorld();
+      },
+      onNuclearRelease: async ({ airborne }) => {
+        try {
+          const result = await gameplay.nuclearAttack({ airborne });
+          if (result.accepted) {
+            experienceShell.triggerNuclearEffect();
+            await saveWorld();
+          }
+          return result;
+        } catch (error) {
+          transitionError = error;
+          return Object.freeze({ accepted: false, reason: 'runtime-error', error });
+        }
+      },
+      onSpawnManualBoss: async () => {
+        try {
+          const result = await gameplay.spawnManualBoss();
+          if (result.accepted) await saveWorld();
+          return result;
+        } catch (error) {
+          transitionError = error;
+          return Object.freeze({ accepted: false, reason: 'runtime-error', error });
+        }
       },
       onSettingsChanged: settings => {
         const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
