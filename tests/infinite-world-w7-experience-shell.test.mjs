@@ -96,6 +96,7 @@ function createFixture() {
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
     initialScaleProfile: getW6ScaleProfile('MAX'),
+    getTerrainHeightMeters: (x, z) => 1 + x * 0.01 + z * 0.02,
     onAttack: mode => calls.attacks.push(mode),
     onSave: () => { calls.saves += 1; },
     onLoad: () => { calls.loads += 1; },
@@ -136,7 +137,9 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
 
   fixture.globalObject.dispatch('keydown', { code: 'Space' });
   fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
-  assert.ok(fixture.shell.snapshot().camera.verticalMeters > 0);
+  const airborne = fixture.shell.snapshot().playerVertical;
+  assert.equal(airborne.grounded, false);
+  assert.ok(airborne.rootY > airborne.groundRootY);
   fixture.globalObject.dispatch('keydown', { code: 'KeyQ' });
   fixture.globalObject.dispatch('keydown', { code: 'KeyF' });
   fixture.globalObject.dispatch('keydown', { code: 'Digit1' });
@@ -210,6 +213,12 @@ test('debug stays transient while HUD visibility and settings use the existing W
 test('zero HP enters Game Over and Retry delegates to the existing runtime restart', async () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 0, z: 0, facingY: 0 };
+  const profile = getW6ScaleProfile('MAX');
+  fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: profile });
+  fixture.globalObject.dispatch('keydown', { code: 'Space' });
+  fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, false);
   fixture.shell.renderHud({
     fps: 60,
     gameplaySnapshot: {
@@ -232,6 +241,35 @@ test('zero HP enters Game Over and Retry delegates to the existing runtime resta
   await Promise.resolve();
   assert.equal(fixture.calls.restarts, 1);
   assert.equal(fixture.shell.snapshot().mode, 'playing');
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
+  assert.equal(fixture.shell.snapshot().playerVertical.velocityMetersPerSecond, 0);
+  fixture.shell.dispose();
+});
+
+test('Space is edge-triggered and held or repeated keydown cannot add another jump impulse', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 0, z: 0, facingY: 0 };
+  const profile = getW6ScaleProfile('MAX');
+  fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: profile });
+  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
+  const initialVelocity = fixture.shell.snapshot().playerVertical.velocityMetersPerSecond;
+  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
+  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
+  assert.equal(fixture.shell.snapshot().playerVertical.velocityMetersPerSecond, initialVelocity);
+
+  for (let frame = 0; frame < 600 && !fixture.shell.snapshot().playerVertical.grounded; frame += 1) {
+    fixture.shell.updatePlayer({ deltaSeconds: 1 / 120, player, scaleProfile: profile });
+    fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
+  }
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
+  assert.equal(fixture.shell.snapshot().playerVertical.velocityMetersPerSecond, 0);
+  fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
+
+  fixture.globalObject.dispatch('keyup', { code: 'Space' });
+  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, false);
   fixture.shell.dispose();
 });
 

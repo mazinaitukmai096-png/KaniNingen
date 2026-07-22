@@ -20,6 +20,7 @@ import {
 } from './render/production-visual-assets.js';
 import { InfiniteWorldSaveStore, InfiniteWorldState } from './world-state-store.js';
 import { createInfiniteExperienceShell } from './experience-shell.js';
+import { sampleFormalTerrainHeightMeters } from './player-vertical-movement.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -455,6 +456,7 @@ export async function bootInfiniteWorldSandbox({
 
     let transitionTargetKey = null;
     let transitionError = null;
+    let playerRelocationInProgress = false;
     let saveStatus = state.saveLoaded ? 'loaded' : 'new';
     let lastFrameAt = clock();
     let lastHudAt = 0;
@@ -469,6 +471,28 @@ export async function bootInfiniteWorldSandbox({
     };
     running = true;
 
+    function getPlayerTerrainHeightMeters(logicalWorldX, logicalWorldZ) {
+      const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
+      const chunkData = runtime.getChunkData(owner.chunkX, owner.chunkZ);
+      if (!chunkData) throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
+      return sampleFormalTerrainHeightMeters(chunkData, logicalWorldX, logicalWorldZ);
+    }
+
+    async function synchronizeRuntimeToLogicalPlayer({ refreshGameplay = false } = {}) {
+      const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      await runtime.transitionToChunk(owner.chunkX, owner.chunkZ);
+      const runtimeSnapshot = runtime.snapshot();
+      await gameplay.syncActiveChunks({
+        renderedKeys: runtimeSnapshot.renderedKeys,
+        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+        renderOrigin: runtimeSnapshot.renderOrigin,
+      });
+      if (refreshGameplay) {
+        await gameplay.refreshFromState({ renderOrigin: runtimeSnapshot.renderOrigin });
+      }
+      return owner;
+    }
+
     async function saveWorld() {
       try {
         await saveStore.save(worldState);
@@ -479,17 +503,24 @@ export async function bootInfiniteWorldSandbox({
       }
     }
     async function loadWorld() {
+      playerRelocationInProgress = true;
       try {
         const loaded = await saveStore.loadInto(worldState);
         if (!loaded) {
           saveStatus = 'missing';
           return;
         }
-        await gameplay.refreshFromState({ renderOrigin: runtime.snapshot().renderOrigin });
+        await synchronizeRuntimeToLogicalPlayer({ refreshGameplay: true });
+        experienceShell?.resetPlayerVerticalMovement({
+          player: logicalPlayer,
+          scaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
+        });
         saveStatus = 'loaded';
       } catch (error) {
         transitionError = error;
         saveStatus = 'failed';
+      } finally {
+        playerRelocationInProgress = false;
       }
     }
     const addWindowListener = (type, listener) => globalObject.addEventListener?.(type, listener);
@@ -507,28 +538,35 @@ export async function bootInfiniteWorldSandbox({
       playerMarker,
       worldState,
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
+      getTerrainHeightMeters: getPlayerTerrainHeightMeters,
       onAttack: mode => gameplay.attack(mode),
       onSave: () => { void saveWorld(); },
       onLoad: () => { void loadWorld(); },
-      onHome: () => {
-        logicalPlayer.x = generator.reviewSpawn.x;
-        logicalPlayer.z = generator.reviewSpawn.z;
-        logicalPlayer.facingY = 0;
+      onHome: async () => {
+        playerRelocationInProgress = true;
+        try {
+          logicalPlayer.x = generator.reviewSpawn.x;
+          logicalPlayer.z = generator.reviewSpawn.z;
+          logicalPlayer.facingY = 0;
+          await synchronizeRuntimeToLogicalPlayer();
+        } catch (error) {
+          transitionError = error;
+        } finally {
+          playerRelocationInProgress = false;
+        }
       },
       onRestart: async () => {
-        await gameplay.restart({
-          playerSpawn: generator.reviewSpawn,
-          renderOrigin: runtime.snapshot().renderOrigin,
-        });
-        const restartOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-        await runtime.transitionToChunk(restartOwner.chunkX, restartOwner.chunkZ);
-        const restartRuntime = runtime.snapshot();
-        await gameplay.syncActiveChunks({
-          renderedKeys: restartRuntime.renderedKeys,
-          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-          renderOrigin: restartRuntime.renderOrigin,
-        });
-        await saveWorld();
+        playerRelocationInProgress = true;
+        try {
+          await gameplay.restart({
+            playerSpawn: generator.reviewSpawn,
+            renderOrigin: runtime.snapshot().renderOrigin,
+          });
+          await synchronizeRuntimeToLogicalPlayer();
+          await saveWorld();
+        } finally {
+          playerRelocationInProgress = false;
+        }
       },
       onNuclearRelease: async ({ airborne }) => {
         try {
@@ -708,6 +746,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         }
         const effectiveDeltaSeconds = (experienceShell.isPaused() && !measurement.mode)
           || gameplay.isHitStopped(frameNow) ? 0 : deltaSeconds;
+        if (playerRelocationInProgress) {
+          renderer.render(scene, camera);
+          animationFrameId = requestAnimationFrameFn(frame);
+          return;
+        }
         const owner = updatePlayer(effectiveDeltaSeconds);
         gameplay.update({
           deltaSeconds: effectiveDeltaSeconds,
