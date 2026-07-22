@@ -169,7 +169,7 @@ test('collision broad-phase candidates preserve the exact legacy type sets', () 
   assert.match(game, /const limitDist = segRadius \+ obstacle\.radius;/);
 });
 
-test('Building feedback, World generation, Input, Renderer, and locked HUD behavior are unchanged', () => {
+test('Building feedback, non-road World generation, Input, Renderer, and locked HUD behavior are unchanged', () => {
   const readBaseline = path => execFileSync('git', ['show', `${PHASE4_BASELINE_COMMIT}:${path}`], {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -179,7 +179,16 @@ test('Building feedback, World generation, Input, Renderer, and locked HUD behav
   for (const path of ['src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
     assert.equal(readCurrent(path), readBaseline(path));
   }
-  const currentMap = sliceBetween(game, 'function initMap()', 'function createParticles(')
+  const normalizeRoadHierarchy = source => {
+    const startMarker = '            // --- 街道（道と橋）の生成（人間の営みロジック） ---';
+    const endMarker = '            // --- 建物クラスターの生成';
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start);
+    assert.notEqual(start, -1, 'missing road hierarchy start');
+    assert.notEqual(end, -1, 'missing road hierarchy end');
+    return `${source.slice(0, start)}            // ROAD HIERARCHY CHANGE ALLOWED\n${source.slice(end)}`;
+  };
+  const currentMap = normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
     .replace(
       /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
       '\n                    $1\n                    $2',
@@ -188,8 +197,11 @@ test('Building feedback, World generation, Input, Renderer, and locked HUD behav
       /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
       '\n',
     )
-    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n');
-  assert.equal(currentMap, sliceBetween(baselineGame, 'function initMap()', 'function createParticles('));
+    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n'));
+  const baselineMap = normalizeRoadHierarchy(
+    sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
+  );
+  assert.equal(currentMap, baselineMap);
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');
   for (const lockedHudSnippet of [

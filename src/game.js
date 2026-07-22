@@ -33,6 +33,7 @@ import {
 } from './constants.js';
 import { createInputController } from './core/input.js';
 import { createRendererController } from './core/renderer.js';
+import { buildRoadHierarchy } from './road-town-structure.js';
 import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
@@ -188,7 +189,8 @@ let inputController, rendererController;
             sphere: new THREE.SphereGeometry(1, 12, 12),
             dodeca: new THREE.DodecahedronGeometry(1),
             ringUnit: new THREE.RingGeometry(0.1, 1, 20),
-            circleUnit: new THREE.CircleGeometry(1, 10)
+            circleUnit: new THREE.CircleGeometry(1, 10),
+            roadPlane: new THREE.PlaneGeometry(1, 1)
         };
 
         const materials = {
@@ -1976,131 +1978,75 @@ let inputController, rendererController;
             }
 
             // --- 街道（道と橋）の生成（人間の営みロジック） ---
-            const pathTiles = []; 
-            const PATH_TILE = 70;
+            // Road Hierarchy Foundation
+            // Road Segmentを正本とし、既存の建物・植生・街路Object処理へは互換pathSamplesを渡す。
             const PATH_Y = 3.0;
-
-            // 1. 町の中にローカルな小道を作る（建物を密集させるため）
-            townCenters.forEach(tc => {
-                const branchCount = 3 + Math.floor(tc.radius / 500);
-                for (let b = 0; b < branchCount; b++) {
-                    let angle = Math.random() * Math.PI * 2;
-                    let px = tc.x, pz = tc.z;
-                    let dist = 0;
-                    const maxDist = tc.radius * 0.7;
-                    while (dist < maxDist) {
-                        angle += (Math.random() - 0.5) * 0.5; // 蛇行を弱め、迷路っぽさを緩和（0.8→0.5）
-                        const stepLen = PATH_TILE * 0.8;
-                        px += Math.sin(angle) * stepLen;
-                        pz += Math.cos(angle) * stepLen;
-                        dist += stepLen;
-                        
-                        let inWater = false;
-                        for (const wz of waterZones) {
-                            if ((px - wz.x)**2 + (pz - wz.z)**2 < (wz.radius + 20)**2) { inWater = true; break; }
-                        }
-                        if (inWater) continue;
-
-                        const size = PATH_TILE * (0.85 + Math.random() * 0.35);
-                        const tile = new THREE.Mesh(new THREE.PlaneGeometry(size, size), materials.road);
-                        tile.rotation.x = -Math.PI / 2;
-                        tile.rotation.z = (Math.random() - 0.5) * 0.12; // タイルのギザギザ回転を抑制
-                        tile.position.set(px, PATH_Y, pz);
-                        tile.receiveShadow = true;
-                        tile.matrixAutoUpdate = false;
-                        tile.updateMatrix();
-                        scene.add(tile);
-                        pathTiles.push({ x: px, z: pz, tc });
-                    }
-                }
+            const roadExclusionTypes = new Set(['tower', 'church', 'school', 'militaryBase']);
+            const roadExclusionZones = entities
+                .filter(entity => roadExclusionTypes.has(entity.type) && !entity.isDead)
+                .map(entity => ({
+                    x: entity.mesh.position.x,
+                    z: entity.mesh.position.z,
+                    radius: entity.radius,
+                }));
+            const roadHierarchy = buildRoadHierarchy({
+                townCenters,
+                waterZones,
+                exclusionZones: roadExclusionZones,
             });
+            const pathSamples = roadHierarchy.pathSamples;
+            const pathTiles = pathSamples;
 
-            // 2. 町と町を結ぶ「街道」を敷き、川にぶつかったら「橋」を架ける
-            for (let i = 0; i < townCenters.length; i++) {
-                for (let j = i + 1; j < townCenters.length; j++) {
-                    const tcA = townCenters[i], tcB = townCenters[j];
-                    const distSq = (tcA.x - tcB.x)**2 + (tcA.z - tcB.z)**2;
-                    
-                    // 近隣の町同士（距離11000以内）だけを街道で結ぶ
-                    if (distSq > 11000 * 11000) continue;
+            // 道路Segmentと最小矩形Junctionを、同じ共有Geometry/Materialの1 InstancedMeshで描画する。
+            const roadDisplaySurfaces = [
+                ...roadHierarchy.roadSurfaces.map(surface => ({ ...surface, y: PATH_Y })),
+                ...roadHierarchy.junctionSurfaces.map(surface => ({ ...surface, y: PATH_Y + 0.02 })),
+            ];
+            const roadSurfaceMesh = new THREE.InstancedMesh(
+                geometries.roadPlane,
+                materials.road,
+                roadDisplaySurfaces.length,
+            );
+            const roadSurfaceTransform = new THREE.Object3D();
+            for (let surfaceIndex = 0; surfaceIndex < roadDisplaySurfaces.length; surfaceIndex++) {
+                const surface = roadDisplaySurfaces[surfaceIndex];
+                roadSurfaceTransform.position.set(surface.x, surface.y, surface.z);
+                roadSurfaceTransform.rotation.set(
+                    -Math.PI / 2,
+                    0,
+                    Math.atan2(surface.tangentX, surface.tangentZ),
+                );
+                roadSurfaceTransform.scale.set(surface.width, surface.length, 1);
+                roadSurfaceTransform.updateMatrix();
+                roadSurfaceMesh.setMatrixAt(surfaceIndex, roadSurfaceTransform.matrix);
+            }
+            roadSurfaceMesh.instanceMatrix.needsUpdate = true;
+            roadSurfaceMesh.receiveShadow = true;
+            roadSurfaceMesh.frustumCulled = false;
+            scene.add(roadSurfaceMesh);
 
-                    let px = tcA.x, pz = tcA.z;
-                    let isBridging = false;
-                    let bridgeStartX = 0, bridgeStartZ = 0;
-                    let steps = 0;
+            // 水域上のpathSamplesは道路面を作らず、同じRoad routeの両岸を既存Bridge形式で接続する。
+            for (const bridgeSpan of roadHierarchy.bridgeSpans) {
+                const bdx = bridgeSpan.end.x - bridgeSpan.start.x;
+                const bdz = bridgeSpan.end.z - bridgeSpan.start.z;
+                const bridgeLen = Math.hypot(bdx, bdz);
+                const bridgeAngle = Math.atan2(bdx, bdz);
+                const midX = (bridgeSpan.start.x + bridgeSpan.end.x) / 2;
+                const midZ = (bridgeSpan.start.z + bridgeSpan.end.z) / 2;
+                const halfLength = bridgeLen / 2 + 40;
+                const halfWidth = bridgeSpan.width / 2;
 
-                    while (steps < 1000) {
-                        steps++;
-                        const dx = tcB.x - px, dz = tcB.z - pz;
-                        if (dx*dx + dz*dz < 400 * 400) break; // 目的地（町B）に到着
+                bridges.push({ x: midX, z: midZ, angle: bridgeAngle, halfLength, halfWidth });
 
-                        const targetAngle = Math.atan2(dx, dz);
-                        // 橋の上は一直線、陸地は少し蛇行しながら進む
-                        const moveAngle = isBridging ? targetAngle : targetAngle + (Math.random() - 0.5) * 0.6;
-                        
-                        const stepLen = PATH_TILE * 0.8;
-                        px += Math.sin(moveAngle) * stepLen;
-                        pz += Math.cos(moveAngle) * stepLen;
-
-                        // 現在地が水域か判定
-                        let inWater = false;
-                        for (const wz of waterZones) {
-                            if ((px - wz.x)**2 + (pz - wz.z)**2 < (wz.radius + 30)**2) { 
-                                inWater = true; break; 
-                            }
-                        }
-
-                        if (inWater && !isBridging) {
-                            // 水際に到達 -> 橋の建設開始
-                            isBridging = true;
-                            bridgeStartX = px; bridgeStartZ = pz;
-                        } else if (!inWater && isBridging) {
-                            // 対岸に到達 -> 橋を架ける
-                            isBridging = false;
-                            const bdx = px - bridgeStartX, bdz = pz - bridgeStartZ;
-                            const bridgeLen = Math.sqrt(bdx*bdx + bdz*bdz);
-                            
-                            if (bridgeLen > 50) {
-                                const bridgeAngle = Math.atan2(bdx, bdz);
-                                const midX = (bridgeStartX + px) / 2;
-                                const midZ = (bridgeStartZ + pz) / 2;
-                                const halfLength = (bridgeLen / 2) + 40; // 両岸に食い込ませる
-                                const halfWidth = 55;
-                                
-                                bridges.push({ x: midX, z: midZ, angle: bridgeAngle, halfLength, halfWidth });
-
-                                const bridgeMesh = new THREE.Mesh(
-                                    new THREE.BoxGeometry(halfWidth * 2, 14, halfLength * 2),
-                                    materials.bridgeDeck
-                                );
-                                bridgeMesh.position.set(midX, 8, midZ);
-                                bridgeMesh.rotation.y = bridgeAngle;
-                                bridgeMesh.castShadow = true;
-                                bridgeMesh.receiveShadow = true;
-                                bridgeMesh.matrixAutoUpdate = false;
-                                bridgeMesh.updateMatrix();
-                                scene.add(bridgeMesh);
-                            }
-                        }
-
-                        // 陸地なら道タイルを敷く
-                        if (!isBridging) {
-                            const size = PATH_TILE * (0.85 + Math.random() * 0.35);
-                            const tile = new THREE.Mesh(new THREE.PlaneGeometry(size, size), materials.road);
-                            tile.rotation.x = -Math.PI / 2;
-                            tile.rotation.z = (Math.random() - 0.5) * 0.12; // タイルのギザギザ回転を抑制
-                            tile.position.set(px, PATH_Y, pz);
-                            tile.receiveShadow = true;
-                            tile.matrixAutoUpdate = false;
-                            tile.updateMatrix();
-                            scene.add(tile);
-                            
-                            // 街道沿いにも建物を建てるため、近い方の町に所属させる
-                            const tc = (dx*dx + dz*dz) < distSq / 4 ? tcB : tcA;
-                            pathTiles.push({ x: px, z: pz, tc });
-                        }
-                    }
-                }
+                const bridgeMesh = new THREE.Mesh(geometries.box, materials.bridgeDeck);
+                bridgeMesh.position.set(midX, 8, midZ);
+                bridgeMesh.rotation.y = bridgeAngle;
+                bridgeMesh.scale.set(halfWidth * 2, 14, halfLength * 2);
+                bridgeMesh.castShadow = true;
+                bridgeMesh.receiveShadow = true;
+                bridgeMesh.matrixAutoUpdate = false;
+                bridgeMesh.updateMatrix();
+                scene.add(bridgeMesh);
             }
             // --- 建物クラスターの生成 (マイクラ村風の密集配置) ---
             // 道からあまり離れない範囲にランダムに建物を寄せて建て、隙間の少ない密集した村にする。
