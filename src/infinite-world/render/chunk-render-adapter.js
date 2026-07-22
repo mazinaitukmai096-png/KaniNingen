@@ -27,7 +27,14 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
     this.disposed = false;
-    this.counts = { projected: 0, loaded: 0, unloaded: 0, rebased: 0 };
+    this.counts = {
+      projected: 0,
+      loaded: 0,
+      unloaded: 0,
+      rebased: 0,
+      chunkOwnedGeometriesCreated: 0,
+      chunkOwnedGeometriesDisposed: 0,
+    };
 
     const Group = requireConstructor(THREE, 'Group');
     const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
@@ -57,6 +64,7 @@ export class ChunkRenderAdapter {
       tree: new MeshLambertMaterial({ color: 0x245c32, flatShading: true }),
       rock: new MeshLambertMaterial({ color: 0x787b80, flatShading: true }),
       border: new LineBasicMaterial({ color: 0xa9d17d, transparent: true, opacity: 0.75 }),
+      naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: false }),
     });
   }
 
@@ -79,6 +87,53 @@ export class ChunkRenderAdapter {
     projected.group.position.set(position.x, 0, position.z);
   }
 
+  #createNaturalTerrainGeometry(terrain) {
+    const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
+    const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
+    const width = terrain.resolution.x;
+    const depth = terrain.resolution.z;
+    const positions = [];
+    const colors = [];
+    const indices = [];
+    const palette = [
+      [0.34, 0.53, 0.22],
+      [0.45, 0.35, 0.22],
+      [0.24, 0.31, 0.2],
+      [0.58, 0.52, 0.34],
+      [0.43, 0.44, 0.42],
+    ];
+    for (let z = 0; z < depth; z += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = z * width + x;
+        positions.push(
+          x / (width - 1) * this.renderChunkSize,
+          terrain.heights[index] * terrain.heightUnitMeters * this.unitsPerMeter,
+          z / (depth - 1) * this.renderChunkSize,
+        );
+        const weights = terrain.materialWeights.slice(index * 5, index * 5 + 5);
+        for (let channel = 0; channel < 3; channel += 1) {
+          colors.push(weights.reduce((sum, weight, material) => sum + weight * palette[material][channel], 0));
+        }
+      }
+    }
+    for (let z = 0; z < depth - 1; z += 1) {
+      for (let x = 0; x < width - 1; x += 1) {
+        const northwest = z * width + x;
+        const northeast = northwest + 1;
+        const southwest = northwest + width;
+        const southeast = southwest + 1;
+        indices.push(northwest, southwest, northeast, northeast, southwest, southeast);
+      }
+    }
+    const geometry = new BufferGeometry();
+    geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new Float32BufferAttribute(colors, 3));
+    geometry.setIndex(indices);
+    geometry.computeVertexNormals();
+    this.counts.chunkOwnedGeometriesCreated += 1;
+    return geometry;
+  }
+
   async projectChunk(chunkData) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
@@ -91,10 +146,19 @@ export class ChunkRenderAdapter {
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
 
-    const terrain = new Mesh(this.geometries.terrain, this.materials.terrain);
-    terrain.name = 'w1a-terrain';
-    terrain.rotation.x = -Math.PI / 2;
-    terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
+    const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
+    const terrainGeometry = naturalTerrain
+      ? this.#createNaturalTerrainGeometry(chunkData.terrain)
+      : this.geometries.terrain;
+    const terrain = new Mesh(
+      terrainGeometry,
+      naturalTerrain ? this.materials.naturalTerrain : this.materials.terrain,
+    );
+    terrain.name = naturalTerrain ? 'w2-natural-terrain' : 'w1a-terrain';
+    if (!naturalTerrain) {
+      terrain.rotation.x = -Math.PI / 2;
+      terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
+    }
     group.add(terrain);
 
     const treeMesh = new InstancedMesh(
@@ -135,7 +199,13 @@ export class ChunkRenderAdapter {
     const border = new LineSegments(this.geometries.border, this.materials.border);
     border.name = 'w1a-chunk-border';
     group.add(border);
-    const projected = { key, chunkX: chunkData.chunkX, chunkZ: chunkData.chunkZ, group };
+    const projected = {
+      key,
+      chunkX: chunkData.chunkX,
+      chunkZ: chunkData.chunkZ,
+      group,
+      ownedGeometries: naturalTerrain ? [terrainGeometry] : [],
+    };
     this.#positionGroup(projected);
     this.counts.projected += 1;
     return projected;
@@ -153,6 +223,10 @@ export class ChunkRenderAdapter {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
     this.worldRoot.remove(projected.group);
+    for (const geometry of projected.ownedGeometries) {
+      geometry.dispose();
+      this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
     projected.group.clear();
     this.loaded.delete(key);
     this.counts.unloaded += 1;
@@ -168,6 +242,10 @@ export class ChunkRenderAdapter {
       loadedCount: this.counts.loaded,
       unloadedCount: this.counts.unloaded,
       rebaseCount: this.counts.rebased,
+      liveChunkOwnedGeometryCount: this.counts.chunkOwnedGeometriesCreated
+        - this.counts.chunkOwnedGeometriesDisposed,
+      chunkOwnedGeometriesCreated: this.counts.chunkOwnedGeometriesCreated,
+      chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
       )),

@@ -101,15 +101,16 @@ export class ChunkRuntimeManager {
     const desiredDataKeys = new Set(desiredDataCoordinates.map(coordinate => coordinate.key));
     const missingCoordinates = desiredDataCoordinates.filter(coordinate => !this.cache.has(coordinate.key));
 
-    const generatedChunks = await Promise.all(missingCoordinates.map(async coordinate => {
+    const generatedChunks = [];
+    for (const coordinate of missingCoordinates) {
       const generationStartedAt = this.clock();
       const chunkData = await this.generator.generateChunk(coordinate.chunkX, coordinate.chunkZ);
       this.performance.record('generation', this.clock() - generationStartedAt);
       if (!chunkData || chunkData.chunkX !== coordinate.chunkX || chunkData.chunkZ !== coordinate.chunkZ) {
         throw new Error(`generator returned invalid ChunkData for ${coordinate.key}`);
       }
-      return chunkData;
-    }));
+      generatedChunks.push(chunkData);
+    }
     missingCoordinates.forEach((coordinate, index) => {
       const chunkData = generatedChunks[index];
       const existing = this.cache.get(coordinate.key);

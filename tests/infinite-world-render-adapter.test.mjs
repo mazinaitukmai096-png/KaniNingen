@@ -69,7 +69,7 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
   const initialResources = adapter.resourceSnapshot();
   assert.equal(initialResources.sharedGeometryCount, 4);
-  assert.equal(initialResources.sharedMaterialCount, 4);
+  assert.equal(initialResources.sharedMaterialCount, 5);
   assert.equal(initialResources.sharedDisposed, false);
 
   for (let iteration = 0; iteration < 12; iteration += 1) {
@@ -86,7 +86,7 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
     assert.equal(afterUnload.liveChunkGroups, 0);
     assert.equal(afterUnload.sharedDisposed, false);
     assert.equal(afterUnload.sharedGeometryCount, 4);
-    assert.equal(afterUnload.sharedMaterialCount, 4);
+    assert.equal(afterUnload.sharedMaterialCount, 5);
   }
   assert.equal(scene.children.includes(adapter.worldRoot), true);
   await adapter.shutdown();

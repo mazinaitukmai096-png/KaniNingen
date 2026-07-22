@@ -1,0 +1,22 @@
+{
+  "phase": "W2",
+  "sourceRepository": "C:\\KaniGame(開発用)",
+  "sourceCommit": "4210c069314a084b528d97e3d5a5e1345d38ad94",
+  "acquisition": "git show from the fixed commit; dirty working-tree content was not read",
+  "files": [
+    {
+      "source": "src/world-generation/g3/biome-terrain.js",
+      "destination": "src/infinite-world/legacy-core/g3/biome-terrain.js",
+      "gitBlob": "c648b9e44e715fd12e55cd9a82cf1149ad337472",
+      "sha256": "5f05e87e24eda1d41ba53894d1793645563ad9a2921f896da6bca48e76b647a5",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g5/macro-terrain.js",
+      "destination": "src/infinite-world/legacy-core/g5/macro-terrain.js",
+      "gitBlob": "df79b70f681d9a1a4b304b7e3fd1503008e2fde1",
+      "sha256": "22abf1a22fb4d7874e5137a493ad6ac88f5569930f246356f0d75963376f9cb2",
+      "importsAdjusted": false
+    }
+  ]
+}

@@ -6,7 +6,7 @@ import {
   logicalWorldToRenderLocal,
 } from './chunk-coordinates.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
-import { createSandboxChunkGenerator } from './sandbox-chunk-generator.js';
+import { createNaturalChunkGenerator } from './natural-chunk-generator.js';
 
 const THREE = globalThis.THREE;
 const viewport = document.querySelector('#viewport');
@@ -15,8 +15,8 @@ if (!THREE) throw new Error('Three.js failed to load');
 if (!viewport || !hud) throw new Error('sandbox DOM is incomplete');
 
 const query = new URLSearchParams(globalThis.location.search);
-const requestedSeed = query.get('seed') ?? 'KaniNingen W1A';
-const generator = await createSandboxChunkGenerator({ worldSeed: requestedSeed });
+const requestedSeed = query.get('seed') ?? 'KaniNingen Infinite Natural World';
+const generator = await createNaturalChunkGenerator({ worldSeed: requestedSeed });
 const chunkSizeBenchmark = runW1BChunkSizeBenchmark({ iterations: 25_000, rounds: 5 });
 const selectedRenderChunkSize = chunkSizeBenchmark.decision.selectedRenderChunkSize;
 
@@ -135,14 +135,16 @@ function escapeHtml(value) {
 
 function updateHud(owner) {
   const state = runtime.snapshot();
+  const currentChunk = runtime.getChunkData(owner.chunkX, owner.chunkZ);
   const metrics = state.performance;
   const transition = state.latestTransition;
   const warningText = state.warnings.length ? `\n警告: ${state.warnings.join(' / ')}` : '';
   const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
-  hud.innerHTML = `<span id="badge">W1A / ISOLATED INFINITE WORLD SANDBOX</span>
+  hud.innerHTML = `<span id="badge">W2 / INFINITE NATURAL WORLD SANDBOX</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
+Natural Biome: ${escapeHtml(currentChunk?.biomeField?.primaryBiomeId ?? 'loading')}  Height range: ${number(currentChunk?.terrain?.heightRangeMeters?.minimum)}..${number(currentChunk?.terrain?.heightRangeMeters?.maximum)}m
 Render Origin Chunk: (${state.renderOrigin.renderOriginChunkX}, ${state.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${chunkSizeBenchmark.decision.selectedUnitsPerMeter} units/m; 4096/2048 compared)
 Rendered: ${state.renderedCount}/9  Prefetched Data: ${state.activeDataCount}/25  Cache: ${state.cacheSize}/${state.cacheCapacity}
