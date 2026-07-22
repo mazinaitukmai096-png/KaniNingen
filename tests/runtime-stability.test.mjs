@@ -197,7 +197,11 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
     assert.notEqual(end, -1, 'missing building frontage end');
     return `${source.slice(0, start)}            // BUILDING FRONTAGE CHANGE ALLOWED\n${source.slice(end)}`;
   };
-  const currentMap = normalizeBuildingFrontage(normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
+  const normalizeBuildingLotVegetation = source => source.replace(
+    /\n\s*\/\/ BUILDING LOT VEGETATION EXCLUSION START[\s\S]*?\/\/ BUILDING LOT VEGETATION EXCLUSION END\n/g,
+    '\n',
+  );
+  const currentMap = normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
     .replace(
       /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
       '\n                    $1\n                    $2',
@@ -206,10 +210,10 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
       /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
       '\n',
     )
-    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n')));
-  const baselineMap = normalizeBuildingFrontage(normalizeRoadHierarchy(
+    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n'))));
+  const baselineMap = normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(
     sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
-  ));
+  )));
   assert.equal(currentMap, baselineMap);
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');
@@ -224,7 +228,7 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
 });
 
 test('JavaScript syntax and local module imports resolve', () => {
-  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/building-lot.js', 'src/core/input.js', 'src/core/renderer.js']) {
     execFileSync(process.execPath, ['--check', resolve(repoRoot, path)], { cwd: repoRoot, stdio: 'pipe' });
   }
 

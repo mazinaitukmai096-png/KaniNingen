@@ -47,6 +47,19 @@ import {
   selectFrontageRoad,
 } from './building-frontage.js';
 import {
+  LOT_BUILDING_TYPES,
+  LOT_STATUS,
+  TINY_MINIMUM_LOT_PASSAGE,
+  bridgeToRectangle,
+  createBuildingLot,
+  getLotSurfaceDescriptors,
+  omitBuildingLot,
+  orientedRectangleIntersectsCircle,
+  orientedRectanglesOverlap,
+  pointInOrientedRectangle,
+  roadSurfaceToRectangle,
+} from './building-lot.js';
+import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
   SCALE_STAGE_IDS,
@@ -241,6 +254,8 @@ let inputController, rendererController;
             dizzyStar: new THREE.MeshBasicMaterial({color: 0xffeb3b}), 
 
             road: new THREE.MeshPhongMaterial({color: 0xc2a878, shininess: 3}),
+            lotResidential: new THREE.MeshPhongMaterial({color: 0xa58c68, shininess: 2}),
+            lotCivic: new THREE.MeshPhongMaterial({color: 0x918d84, shininess: 4}),
 
             barnWall: new THREE.MeshPhongMaterial({color: 0x8b3a2f}),
             barnTrim: new THREE.MeshPhongMaterial({color: 0xf5f5f0}),
@@ -640,6 +655,11 @@ let inputController, rendererController;
         let nextFlowerInstanceIndex = 0;
         let worldDetailInstancedMesh = null;
         const worldDetailProps = [];
+        let residentialLotSurfaceMesh = null;
+        let civicLotSurfaceMesh = null;
+        const buildingLots = [];
+        const lotVegetationExclusionSurfaces = [];
+        const lotSurfaceVegetationExclusionSurfaces = [];
         const clouds = []; // 追加: 雲オブジェクト配列
 
         const player = {
@@ -1671,6 +1691,218 @@ let inputController, rendererController;
             worldDetailInstancedMesh.userData.worldDetailInstanceCount = instanceIndex;
         }
 
+        function populateBuildingLots({
+            frontageBuildings,
+            roads,
+            roadSurfaces,
+            junctionSurfaces,
+            currentBridges,
+            worldWaterZones,
+            parkZones,
+            exclusionZones,
+            collisionEntities,
+            surfaceY,
+        }) {
+            if (residentialLotSurfaceMesh) scene.remove(residentialLotSurfaceMesh);
+            if (civicLotSurfaceMesh) scene.remove(civicLotSurfaceMesh);
+            residentialLotSurfaceMesh = null;
+            civicLotSurfaceMesh = null;
+            buildingLots.length = 0;
+            lotVegetationExclusionSurfaces.length = 0;
+            lotSurfaceVegetationExclusionSurfaces.length = 0;
+
+            const roadById = new Map(roads.map(road => [road.roadId, road]));
+            const roadRectangles = roadSurfaces.map(surface => ({
+                surface,
+                rectangle: roadSurfaceToRectangle(surface),
+            }));
+            const junctionRectangles = junctionSurfaces.map(roadSurfaceToRectangle);
+            const bridgeRectangles = currentBridges.map(bridgeToRectangle);
+            const acceptedLotRectangles = [];
+            const acceptedPathRectangles = [];
+            const omissionReasonCounts = {
+                roadCollision: 0,
+                junctionCollision: 0,
+                bridgeCollision: 0,
+                waterCollision: 0,
+                parkCollision: 0,
+                landmarkCollision: 0,
+                militaryBaseCollision: 0,
+                buildingCollision: 0,
+                lotCollision: 0,
+                invalidFrontage: 0,
+                invalidEntrance: 0,
+                noRoadAccess: 0,
+            };
+            const typeLotCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
+            const typeOmittedCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
+            const residentialSurfaces = [];
+            const civicSurfaces = [];
+
+            const findOmissionReason = (lot, building, road) => {
+                if (!road || road.kind === 'START_APPROACH'
+                    || lot.frontageRoadId !== road.roadId
+                    || lot.frontageRoadKind !== road.kind) return 'invalidFrontage';
+                if (!Number.isFinite(lot.entranceX) || !Number.isFinite(lot.entranceZ)
+                    || !pointInOrientedRectangle(lot.entranceX, lot.entranceZ, lot)) {
+                    return 'invalidEntrance';
+                }
+                const ownRoadSurfaces = roadRectangles.filter(item => item.surface.roadId === road.roadId);
+                if (!lot.hasEntrancePath || lot.pathLength <= 0
+                    || !ownRoadSurfaces.some(item => (
+                        pointInOrientedRectangle(lot.roadAccessX, lot.roadAccessZ, item.rectangle, 1)
+                    ))) return 'noRoadAccess';
+                if (roadRectangles.some(item => orientedRectanglesOverlap(lot, item.rectangle))) {
+                    return 'roadCollision';
+                }
+                if (roadRectangles.some(item => (
+                    item.surface.roadId !== road.roadId
+                    && orientedRectanglesOverlap(lot.pathRectangle, item.rectangle)
+                ))) return 'roadCollision';
+                if (junctionRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot, rectangle)
+                    || orientedRectanglesOverlap(lot.pathRectangle, rectangle)
+                ))) return 'junctionCollision';
+                if (bridgeRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot, rectangle)
+                    || orientedRectanglesOverlap(lot.pathRectangle, rectangle)
+                ))) return 'bridgeCollision';
+                if (worldWaterZones.some(zone => (
+                    orientedRectangleIntersectsCircle(lot, zone)
+                    || orientedRectangleIntersectsCircle(lot.pathRectangle, zone)
+                ))) return 'waterCollision';
+                if (parkZones.some(zone => (
+                    orientedRectangleIntersectsCircle(lot, zone)
+                    || orientedRectangleIntersectsCircle(lot.pathRectangle, zone)
+                ))) return 'parkCollision';
+                for (const zone of exclusionZones) {
+                    if (!orientedRectangleIntersectsCircle(lot, zone)
+                        && !orientedRectangleIntersectsCircle(lot.pathRectangle, zone)) continue;
+                    return zone.type === 'militaryBase' ? 'militaryBaseCollision' : 'landmarkCollision';
+                }
+                for (const entity of collisionEntities) {
+                    if (entity === building || entity.isDead || !Number.isFinite(entity.radius)) continue;
+                    const circle = {
+                        x: entity.mesh.position.x,
+                        z: entity.mesh.position.z,
+                        radius: entity.radius,
+                    };
+                    if (orientedRectangleIntersectsCircle(lot, circle)
+                        || orientedRectangleIntersectsCircle(lot.pathRectangle, circle)) {
+                        return 'buildingCollision';
+                    }
+                }
+                if (acceptedLotRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot, rectangle, TINY_MINIMUM_LOT_PASSAGE)
+                )) || acceptedPathRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot.pathRectangle, rectangle)
+                    || orientedRectanglesOverlap(lot, rectangle)
+                )) || acceptedLotRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot.pathRectangle, rectangle)
+                ))) return 'lotCollision';
+                return null;
+            };
+
+            frontageBuildings.forEach((building, buildingIndex) => {
+                const road = roadById.get(building.frontageRoadId);
+                let lot;
+                typeLotCounts[building.type]++;
+                try {
+                    lot = createBuildingLot({
+                        buildingType: building.type,
+                        buildingIndex,
+                        buildingX: building.mesh.position.x,
+                        buildingZ: building.mesh.position.z,
+                        rotationY: building.mesh.rotation.y,
+                        frontage: building,
+                        road,
+                    });
+                } catch {
+                    const fallback = Object.freeze({
+                        lotId: `lot-${String(buildingIndex).padStart(4, '0')}`,
+                        buildingIndex,
+                        buildingType: building.type,
+                        frontageRoadId: building.frontageRoadId ?? null,
+                        centerX: null,
+                        centerZ: null,
+                        rotationY: null,
+                        width: null,
+                        depth: null,
+                        frontX: null,
+                        frontZ: null,
+                        entranceX: null,
+                        entranceZ: null,
+                        roadAccessX: null,
+                        roadAccessZ: null,
+                        frontageNormalX: null,
+                        frontageNormalZ: null,
+                        lotStatus: LOT_STATUS.OMITTED_UNSAFE,
+                        omissionReason: 'invalidFrontage',
+                        hasEntrancePath: false,
+                    });
+                    buildingLots.push(fallback);
+                    typeOmittedCounts[building.type]++;
+                    omissionReasonCounts.invalidFrontage++;
+                    return;
+                }
+                const omissionReason = findOmissionReason(lot, building, road);
+                if (omissionReason) {
+                    buildingLots.push(omitBuildingLot(lot, omissionReason));
+                    typeOmittedCounts[building.type]++;
+                    omissionReasonCounts[omissionReason]++;
+                    return;
+                }
+
+                buildingLots.push(lot);
+                acceptedLotRectangles.push(lot);
+                acceptedPathRectangles.push(lot.pathRectangle);
+                lotVegetationExclusionSurfaces.push(lot, lot.pathRectangle);
+                const surfaces = getLotSurfaceDescriptors(lot);
+                lotSurfaceVegetationExclusionSurfaces.push(...surfaces);
+                if (lot.surfaceClass === 'CIVIC') civicSurfaces.push(...surfaces);
+                else residentialSurfaces.push(...surfaces);
+            });
+
+            const createSurfaceMesh = (surfaces, material) => {
+                const mesh = new THREE.InstancedMesh(
+                    geometries.roadPlane,
+                    material,
+                    Math.max(1, surfaces.length),
+                );
+                const transform = new THREE.Object3D();
+                surfaces.forEach((surface, surfaceIndex) => {
+                    transform.position.set(surface.centerX, surfaceY, surface.centerZ);
+                    transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
+                    transform.scale.set(surface.width, surface.depth, 1);
+                    transform.updateMatrix();
+                    mesh.setMatrixAt(surfaceIndex, transform.matrix);
+                });
+                mesh.count = surfaces.length;
+                mesh.instanceMatrix.needsUpdate = true;
+                mesh.receiveShadow = true;
+                mesh.frustumCulled = false;
+                scene.add(mesh);
+                return mesh;
+            };
+
+            residentialLotSurfaceMesh = createSurfaceMesh(residentialSurfaces, materials.lotResidential);
+            civicLotSurfaceMesh = createSurfaceMesh(civicSurfaces, materials.lotCivic);
+            const activeLots = buildingLots.filter(lot => lot.lotStatus === LOT_STATUS.ACTIVE);
+            scene.userData.buildingLots = Object.freeze([...buildingLots]);
+            scene.userData.buildingLotSummary = Object.freeze({
+                targetLotCount: frontageBuildings.length,
+                activeLotCount: activeLots.length,
+                omittedLotCount: buildingLots.length - activeLots.length,
+                entrancePathCount: activeLots.filter(lot => lot.hasEntrancePath).length,
+                forecourtCount: activeLots.filter(lot => lot.surfaceClass === 'CIVIC').length,
+                typeLotCounts: Object.freeze(typeLotCounts),
+                typeOmittedCounts: Object.freeze(typeOmittedCounts),
+                omissionReasonCounts: Object.freeze(omissionReasonCounts),
+                residentialInstanceCount: residentialSurfaces.length,
+                civicInstanceCount: civicSurfaces.length,
+            });
+        }
+
         function damageWorldDetailsAt(hitPositions, hitRadius) {
             let destroyedCount = 0;
             const hiddenMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
@@ -2460,6 +2692,25 @@ let inputController, rendererController;
                 }
             });
 
+            const lotCollisionTypes = new Set([
+                'house', 'tower', 'school', 'church', 'militaryBase', 'factory', 'barn',
+            ]);
+            populateBuildingLots({
+                frontageBuildings: entities.filter(entity => (
+                    LOT_BUILDING_TYPES.includes(entity.type)
+                    && entity.frontageRoadId
+                    && !entity.isDead
+                )),
+                roads: roadHierarchy.roads,
+                roadSurfaces: roadHierarchy.roadSurfaces,
+                junctionSurfaces: roadHierarchy.junctionSurfaces,
+                currentBridges: bridges,
+                worldWaterZones: waterZones,
+                parkZones,
+                exclusionZones: roadExclusionZones,
+                collisionEntities: entities.filter(entity => lotCollisionTypes.has(entity.type)),
+                surfaceY: PATH_Y + 0.03,
+            });
             populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, waterZones);
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
@@ -2601,6 +2852,12 @@ let inputController, rendererController;
                 }
                 if (onPath) continue;
 
+                // BUILDING LOT VEGETATION EXCLUSION START
+                if (lotVegetationExclusionSurfaces.some(surface => (
+                    pointInOrientedRectangle(x, z, surface, 60)
+                ))) continue;
+                // BUILDING LOT VEGETATION EXCLUSION END
+
                 // 田舎（町の外）に人間は配置しない。人間は町・村クラスター内にのみ生息させ、
                 // 「田舎に人間ばかりで人間っぽくない」問題を解消。空いた分は木・岩・小石・茂みの装飾に配分。
                 const r = Math.random();
@@ -2652,6 +2909,12 @@ let inputController, rendererController;
                     if (Math.abs(x - pt.x) < 50 && Math.abs(z - pt.z) < 50) { invalidSpot = true; break; }
                 }
                 if (invalidSpot) continue;
+
+                // BUILDING LOT VEGETATION EXCLUSION START
+                if (lotSurfaceVegetationExclusionSurfaces.some(surface => (
+                    pointInOrientedRectangle(x, z, surface, 6)
+                ))) continue;
+                // BUILDING LOT VEGETATION EXCLUSION END
 
                 // バイオーム判定
                 let nearestTown = null;
@@ -2752,6 +3015,12 @@ let inputController, rendererController;
                         const offsetZ = (Math.random() - 0.5) * 90;
                         const petalHeight = 10 + Math.random() * 8;
                         const petalWidth = 5 + Math.random() * 4;
+
+                        // BUILDING LOT VEGETATION EXCLUSION START
+                        if (lotSurfaceVegetationExclusionSurfaces.some(surface => (
+                            pointInOrientedRectangle(x + offsetX, z + offsetZ, surface, 4)
+                        ))) continue;
+                        // BUILDING LOT VEGETATION EXCLUSION END
 
                         dummyFlower.position.set(x + offsetX, petalHeight / 2, z + offsetZ);
                         dummyFlower.scale.set(petalWidth, petalHeight, petalWidth);
