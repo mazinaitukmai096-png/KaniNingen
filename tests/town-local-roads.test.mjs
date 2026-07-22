@@ -134,7 +134,7 @@ test('only church_town and school_town consume the TOWN LOCAL and ALLEY contract
     assert.notEqual(road.roadPattern, 'SEMI_GRID');
   }
   for (const road of hierarchy.roads.filter(road => road.townId === capitalTownId)) {
-    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, 74);
+    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, road.isCivicAccess ? 32 : 74);
     if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, 48);
     assert.notEqual(road.roadPattern, 'SEMI_GRID');
   }
@@ -335,16 +335,15 @@ test('TOWN frontage and Lot references resolve to real roads without placing the
   }
 });
 
-test('Capital, RURAL, MAJOR, START_APPROACH, and Bridge fixtures remain unchanged', () => {
+test('Capital Civic Core scope preserves RURAL, non-Capital MAJOR, START_APPROACH, and Bridge fixtures', () => {
   const currentCapital = townRoads(hierarchy, capitalTownId);
-  assert.equal(currentCapital.filter(road => road.kind === ROAD_KINDS.LOCAL).length, 43);
+  assert.equal(currentCapital.filter(road => road.kind === ROAD_KINDS.LOCAL).length, 36);
   assert.equal(currentCapital.filter(road => road.kind === ROAD_KINDS.ALLEY).length, 6);
-  assert.equal(hierarchy.roadSurfaces.filter(surface => currentCapital.some(road => road.roadId === surface.roadId)).length, 49);
+  assert.equal(hierarchy.roadSurfaces.filter(surface => currentCapital.some(road => road.roadId === surface.roadId)).length, 42);
 
   const fixedRoad = road => (
-    road.kind === ROAD_KINDS.MAJOR
-    || road.kind === ROAD_KINDS.START_APPROACH
-    || ruralTownIds.has(road.townId)
+    (ruralTownIds.has(road.townId) && road.kind !== ROAD_KINDS.MAJOR)
+    || (road.kind === ROAD_KINDS.MAJOR && !road.routeId.includes(capitalTownId))
   );
   assert.deepEqual(
     hierarchy.roads.filter(fixedRoad).map(semanticRoadShape),

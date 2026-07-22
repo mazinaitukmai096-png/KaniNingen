@@ -35,6 +35,10 @@ import { createInputController } from './core/input.js';
 import { createRendererController } from './core/renderer.js';
 import { buildRoadHierarchy } from './road-town-structure.js';
 import {
+  circleIntersectsCapitalCivicCore,
+  isPointInCapitalCivicCore,
+} from './capital-civic-core.js';
+import {
   FRONTAGE_BUILDING_TYPES,
   buildFrontageAnchorPlan,
   circleIntersectsBridge,
@@ -1591,10 +1595,11 @@ let inputController, rendererController;
             return data;
         }
 
-        function populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, worldWaterZones) {
+        function populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, worldWaterZones, civicCore) {
             const dummy = new THREE.Object3D();
             const colorCache = new Map();
             let instanceIndex = 0;
+            let civicCoreRejectedCount = 0;
             worldDetailProps.length = 0;
 
             const addPart = (baseX, baseZ, baseAngle, detailPart) => {
@@ -1637,6 +1642,17 @@ let inputController, rendererController;
                 });
             };
 
+            const getPlacement = (tc, tile, detailIndex) => {
+                const radialAngle = Math.atan2(tile.x - tc.x, tile.z - tc.z);
+                const side = detailIndex % 2 === 0 ? 1 : -1;
+                const sideAngle = radialAngle + side * Math.PI / 2;
+                return {
+                    radialAngle,
+                    baseX: tile.x + Math.sin(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET,
+                    baseZ: tile.z + Math.cos(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET,
+                };
+            };
+
             const selectPriorityTiles = (tc, townPaths) => {
                 const distanceSq = (tile, x, z) => (tile.x - x) ** 2 + (tile.z - z) ** 2;
                 const townSpots = placedTownSpots.filter(
@@ -1676,6 +1692,18 @@ let inputController, rendererController;
                         if (selected.length >= WORLD_DETAILS_PER_TOWN || cursors[groupIndex] >= group.length) return;
                         const tile = group[cursors[groupIndex]++];
                         used.add(tile);
+                        const placement = getPlacement(tc, tile, selected.length);
+                        const detailType = WORLD_DETAIL_TYPES[selected.length % WORLD_DETAIL_TYPES.length];
+                        if (tc.type === 'capital' && circleIntersectsCapitalCivicCore(
+                            placement.baseX,
+                            placement.baseZ,
+                            WORLD_DETAIL_INTERACTION_RADII[detailType] || 0,
+                            civicCore,
+                            civicCore.clearance,
+                        )) {
+                            civicCoreRejectedCount++;
+                            return;
+                        }
                         selected.push(tile);
                         added = true;
                     });
@@ -1690,11 +1718,7 @@ let inputController, rendererController;
                 const priorityTiles = selectPriorityTiles(tc, townPaths);
 
                 priorityTiles.forEach((tile, detailIndex) => {
-                    const radialAngle = Math.atan2(tile.x - tc.x, tile.z - tc.z);
-                    const side = detailIndex % 2 === 0 ? 1 : -1;
-                    const sideAngle = radialAngle + side * Math.PI / 2;
-                    const baseX = tile.x + Math.sin(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
-                    const baseZ = tile.z + Math.cos(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET;
+                    const { radialAngle, baseX, baseZ } = getPlacement(tc, tile, detailIndex);
                     const type = WORLD_DETAIL_TYPES[detailIndex % WORLD_DETAIL_TYPES.length];
                     addProp(baseX, baseZ, radialAngle, type);
                 });
@@ -1721,6 +1745,11 @@ let inputController, rendererController;
             worldDetailInstancedMesh.computeBoundingSphere();
             worldDetailInstancedMesh.userData.worldDetailPropCount = worldDetailProps.length;
             worldDetailInstancedMesh.userData.worldDetailInstanceCount = instanceIndex;
+            scene.userData.capitalCivicCoreWorldDetailSummary = Object.freeze({
+                rejectedCount: civicCoreRejectedCount,
+                propCount: worldDetailProps.length,
+                instanceCount: instanceIndex,
+            });
         }
 
         function populateBuildingLots({
@@ -1733,6 +1762,7 @@ let inputController, rendererController;
             parkZones,
             exclusionZones,
             collisionEntities,
+            civicCore,
             surfaceY,
         }) {
             if (residentialLotSurfaceMesh) scene.remove(residentialLotSurfaceMesh);
@@ -1750,6 +1780,13 @@ let inputController, rendererController;
             }));
             const junctionRectangles = junctionSurfaces.map(roadSurfaceToRectangle);
             const bridgeRectangles = currentBridges.map(bridgeToRectangle);
+            const civicCoreRectangle = {
+                centerX: civicCore.centerX,
+                centerZ: civicCore.centerZ,
+                rotationY: civicCore.rotationY,
+                width: civicCore.halfWidth * 2,
+                depth: civicCore.halfDepth * 2,
+            };
             const acceptedLotRectangles = [];
             const acceptedPathRectangles = [];
             const omissionReasonCounts = {
@@ -1765,6 +1802,7 @@ let inputController, rendererController;
                 invalidFrontage: 0,
                 invalidEntrance: 0,
                 noRoadAccess: 0,
+                civicCoreCollision: 0,
             };
             const typeLotCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
             const typeOmittedCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
@@ -1784,6 +1822,10 @@ let inputController, rendererController;
                     || !ownRoadSurfaces.some(item => (
                         pointInOrientedRectangle(lot.roadAccessX, lot.roadAccessZ, item.rectangle, 1)
                     ))) return 'noRoadAccess';
+                if (orientedRectanglesOverlap(lot, civicCoreRectangle, civicCore.clearance)
+                    || orientedRectanglesOverlap(lot.pathRectangle, civicCoreRectangle, civicCore.clearance)) {
+                    return 'civicCoreCollision';
+                }
                 if (roadRectangles.some(item => orientedRectanglesOverlap(lot, item.rectangle))) {
                     return 'roadCollision';
                 }
@@ -2296,11 +2338,17 @@ let inputController, rendererController;
             });
             const pathSamples = roadHierarchy.pathSamples;
             const pathTiles = pathSamples;
+            const capitalCivicCore = roadHierarchy.capitalCivicCore;
+            scene.userData.capitalCivicCore = capitalCivicCore;
+            scene.userData.capitalTopology = roadHierarchy.capitalTopology;
+            scene.userData.capitalCivicCoreSummary = roadHierarchy.capitalCivicCoreSummary;
 
             // 道路Segmentと最小矩形Junctionを、同じ共有Geometry/Materialの1 InstancedMeshで描画する。
             const roadDisplaySurfaces = [
                 ...roadHierarchy.roadSurfaces.map(surface => ({ ...surface, y: PATH_Y })),
-                ...roadHierarchy.junctionSurfaces.map(surface => ({ ...surface, y: PATH_Y + 0.02 })),
+                ...roadHierarchy.junctionSurfaces
+                    .filter(surface => surface.shape === 'RECTANGLE')
+                    .map(surface => ({ ...surface, y: PATH_Y + 0.02 })),
             ];
             const roadSurfaceMesh = new THREE.InstancedMesh(
                 geometries.roadPlane,
@@ -2324,6 +2372,27 @@ let inputController, rendererController;
             roadSurfaceMesh.receiveShadow = true;
             roadSurfaceMesh.frustumCulled = false;
             scene.add(roadSurfaceMesh);
+
+            for (const surface of roadHierarchy.junctionSurfaces.filter(candidate => (
+                candidate.shape === 'ATTACHED_ROAD_UNION'
+            ))) {
+                const positions = new Float32Array(surface.vertices.length * 3);
+                surface.vertices.forEach((vertex, vertexIndex) => {
+                    positions[vertexIndex * 3] = vertex.x;
+                    positions[vertexIndex * 3 + 1] = 0;
+                    positions[vertexIndex * 3 + 2] = vertex.z;
+                });
+                const junctionGeometry = new THREE.BufferGeometry();
+                junctionGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+                junctionGeometry.setIndex(surface.triangles.flat());
+                junctionGeometry.computeVertexNormals();
+                const junctionMesh = new THREE.Mesh(junctionGeometry, materials.road);
+                junctionMesh.position.set(surface.x, PATH_Y + 0.02, surface.z);
+                junctionMesh.receiveShadow = true;
+                junctionMesh.matrixAutoUpdate = false;
+                junctionMesh.updateMatrix();
+                scene.add(junctionMesh);
+            }
 
             // 水域上のpathSamplesは道路面を作らず、同じRoad routeの両岸を既存Bridge形式で接続する。
             for (const bridgeSpan of roadHierarchy.bridgeSpans) {
@@ -2381,12 +2450,30 @@ let inputController, rendererController;
                 const parkAngle = Math.random() * Math.PI * 2;
                 const parkRadius = Math.max(240, tc.coreRadius * 0.24);
                 const parkDist = 260 + parkRadius + Math.random() * Math.max(100, tc.coreRadius * 0.35);
-                const park = {
-                    x: tc.x + Math.sin(parkAngle) * parkDist,
-                    z: tc.z + Math.cos(parkAngle) * parkDist,
-                    radius: parkRadius,
-                    tc
-                };
+                let park = null;
+                let civicCoreParkRetryCount = 0;
+                for (let parkCandidateIndex = 0; parkCandidateIndex < 8; parkCandidateIndex++) {
+                    const candidateAngle = parkAngle + parkCandidateIndex * Math.PI / 4;
+                    const candidate = {
+                        x: tc.x + Math.sin(candidateAngle) * parkDist,
+                        z: tc.z + Math.cos(candidateAngle) * parkDist,
+                        radius: parkRadius,
+                        tc
+                    };
+                    if (tc.type === 'capital' && circleIntersectsCapitalCivicCore(
+                        candidate.x,
+                        candidate.z,
+                        candidate.radius,
+                        capitalCivicCore,
+                        capitalCivicCore.clearance,
+                    )) {
+                        civicCoreParkRetryCount++;
+                        continue;
+                    }
+                    park = candidate;
+                    break;
+                }
+                if (!park) throw new RangeError(`no safe park outside Capital Civic Core: ${frontageTownId}`);
                 parkZones.push(park);
                 tc.park = park;
 
@@ -2411,6 +2498,7 @@ let inputController, rendererController;
                     outOfTown: 0,
                     routeEnd: 0,
                     noValidSide: 0,
+                    civicCoreCollision: 0,
                 };
 
                 while (placed < targetCount && attempts < targetCount * 18) {
@@ -2470,6 +2558,16 @@ let inputController, rendererController;
                     if (plannedBuildingType) spawnType = plannedBuildingType;
 
                     let newApproxRadius = APPROX_RADIUS[spawnType];
+                    if (tc.type === 'capital' && spawnType === 'tree' && circleIntersectsCapitalCivicCore(
+                        px,
+                        pz,
+                        newApproxRadius,
+                        capitalCivicCore,
+                        capitalCivicCore.clearance,
+                    )) {
+                        rejectedCandidateCounts.civicCoreCollision++;
+                        continue;
+                    }
                     let towerReplacedByHouse = false;
                     let frontage = null;
                     if (frontageBuildingTypes.has(spawnType)) {
@@ -2522,6 +2620,16 @@ let inputController, rendererController;
                             if (candidateFromCenterSq < (220 + newApproxRadius) ** 2
                                 || candidateFromCenterSq > (tc.radius * 0.98 - newApproxRadius) ** 2) {
                                 rejectedCandidateCounts.outOfTown++;
+                                continue;
+                            }
+                            if (tc.type === 'capital' && circleIntersectsCapitalCivicCore(
+                                candidate.x,
+                                candidate.z,
+                                newApproxRadius,
+                                capitalCivicCore,
+                                capitalCivicCore.clearance + TINY_MINIMUM_LOT_PASSAGE,
+                            )) {
+                                rejectedCandidateCounts.civicCoreCollision++;
                                 continue;
                             }
                             if (circleIntersectsCircle(candidate.x, candidate.z, newApproxRadius, park, 20)) {
@@ -2733,6 +2841,7 @@ let inputController, rendererController;
                     maximumAlongRoadGap,
                     regionCounts: Object.freeze({ ...frontageRegionCounts }),
                     rejectedCandidateCounts: Object.freeze({ ...rejectedCandidateCounts }),
+                    civicCoreParkRetryCount,
                 });
 
                 // --- 公園エリアの緑化：建物を避けたゾーンに木と芝生を密に配置し、公園らしい緑地にする ---
@@ -2843,9 +2952,10 @@ let inputController, rendererController;
                 parkZones,
                 exclusionZones: roadExclusionZones,
                 collisionEntities: entities.filter(entity => lotCollisionTypes.has(entity.type)),
+                civicCore: capitalCivicCore,
                 surfaceY: PATH_Y + 0.03,
             });
-            populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, waterZones);
+            populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, waterZones, capitalCivicCore);
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
             // 木・岩の密度は下のメイン装飾配置ループで距離に応じたグラデーションをかけて
@@ -2925,10 +3035,21 @@ let inputController, rendererController;
                 forest: 0x1b5e20, meadow: 0x7cb342, plateau: 0xaed581, highland: 0x8d9e7a, default: 0x2e7d32
             };
             const dummyBush = new THREE.Object3D();
+            let capitalCivicCoreVegetationRejectedCount = 0;
 
             for (let i = 0; i < TOTAL_OBJECTS + RURAL_OBJECTS; i++) {
                 const x = (Math.random() - 0.5) * MAP_SIZE;
                 const z = (Math.random() - 0.5) * MAP_SIZE;
+
+                if (isPointInCapitalCivicCore(
+                    x,
+                    z,
+                    capitalCivicCore,
+                    capitalCivicCore.clearance + 40,
+                )) {
+                    capitalCivicCoreVegetationRejectedCount++;
+                    continue;
+                }
 
                 // 【修正】タイトル画面のカメラ視野から木・岩・小石を排除し、視界をクリアにします
                 if (x > -900 && x < 900 && z > 3800 && z < 6000) {
@@ -3029,6 +3150,16 @@ let inputController, rendererController;
                 const x = (Math.random() - 0.5) * MAP_SIZE;
                 const z = (Math.random() - 0.5) * MAP_SIZE;
 
+                if (isPointInCapitalCivicCore(
+                    x,
+                    z,
+                    capitalCivicCore,
+                    capitalCivicCore.clearance,
+                )) {
+                    capitalCivicCoreVegetationRejectedCount++;
+                    continue;
+                }
+
                 // タイトル画面のカメラ視野から排除
                 if (x > -900 && x < 900 && z > 3800 && z < 6000) continue;
                 if (Math.sqrt(x*x + z*z) > 12150) continue;
@@ -3113,6 +3244,16 @@ let inputController, rendererController;
                 const x = (Math.random() - 0.5) * MAP_SIZE;
                 const z = (Math.random() - 0.5) * MAP_SIZE;
 
+                if (isPointInCapitalCivicCore(
+                    x,
+                    z,
+                    capitalCivicCore,
+                    capitalCivicCore.clearance + 45,
+                )) {
+                    capitalCivicCoreVegetationRejectedCount++;
+                    continue;
+                }
+
                 if (x > -900 && x < 900 && z > 3800 && z < 6000) continue;
                 if (Math.sqrt(x*x + z*z) > 12150) continue;
 
@@ -3150,6 +3291,16 @@ let inputController, rendererController;
                         const petalHeight = 10 + Math.random() * 8;
                         const petalWidth = 5 + Math.random() * 4;
 
+                        if (isPointInCapitalCivicCore(
+                            x + offsetX,
+                            z + offsetZ,
+                            capitalCivicCore,
+                            capitalCivicCore.clearance,
+                        )) {
+                            capitalCivicCoreVegetationRejectedCount++;
+                            continue;
+                        }
+
                         // BUILDING LOT VEGETATION EXCLUSION START
                         if (lotSurfaceVegetationExclusionSurfaces.some(surface => (
                             pointInOrientedRectangle(x + offsetX, z + offsetZ, surface, 4)
@@ -3174,6 +3325,9 @@ let inputController, rendererController;
                 flowerInstancedMesh.instanceMatrix.needsUpdate = true;
                 if (flowerInstancedMesh.instanceColor) flowerInstancedMesh.instanceColor.needsUpdate = true;
             }
+            scene.userData.capitalCivicCoreVegetationSummary = Object.freeze({
+                rejectedCount: capitalCivicCoreVegetationRejectedCount,
+            });
 
             // プールに記録した人間の配置候補地点から、現在の画質プリセットに応じた人数だけ実体化する
             applyHumanDensity(settings.quality);

@@ -223,9 +223,8 @@ test('normal town building opportunities retain legacy non-building thresholds a
   assert.doesNotMatch(source, /requestAnimationFrame|addEventListener|setInterval|setTimeout/);
 });
 
-test('roads, world interactions, and unrelated gameplay modules remain at the Phase 3A-2B HEAD', () => {
+test('unrelated gameplay modules remain at the Phase 3A-2B HEAD', () => {
   for (const path of [
-    'src/road-town-structure.js',
     'src/world-scale-rebalance.js',
     'src/scale-sandbox.js',
     'src/constants.js',

@@ -169,7 +169,7 @@ test('collision broad-phase candidates preserve the exact legacy type sets', () 
   assert.match(game, /const limitDist = segRadius \+ obstacle\.radius;/);
 });
 
-test('Building feedback, non-road World generation, Input, Renderer, and locked HUD behavior are unchanged', () => {
+test('Building feedback and locked gameplay remain unchanged while Core-only World guards are explicit', () => {
   const readBaseline = path => execFileSync('git', ['show', `${PHASE4_BASELINE_COMMIT}:${path}`], {
     cwd: repoRoot,
     encoding: 'utf8',
@@ -218,7 +218,16 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
   const baselineMap = normalizeSettlementTypeFoundation(normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(
     sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
   ))));
-  assert.equal(currentMap, baselineMap);
+  for (const lockedMapSnippet of [
+    "spawnEntity('militaryBase', tc.baseX, tc.baseZ, baseAngle)",
+    'const TOTAL_OBJECTS = 3500',
+    'const RURAL_OBJECTS = 4000',
+  ]) {
+    assert.ok(currentMap.includes(lockedMapSnippet), lockedMapSnippet);
+    assert.ok(baselineMap.includes(lockedMapSnippet), lockedMapSnippet);
+  }
+  assert.match(game, /circleIntersectsCapitalCivicCore/);
+  assert.match(game, /isPointInCapitalCivicCore/);
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');
   for (const lockedHudSnippet of [

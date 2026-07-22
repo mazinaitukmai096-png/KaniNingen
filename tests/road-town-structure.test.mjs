@@ -400,7 +400,7 @@ test('the same inputs produce an identical hierarchy without a Seed system', () 
   assert.doesNotMatch(roadModule, /Math\.random|Seed|Chunk|Query|Terrain|Growth|Threat|Wanted|Perk/i);
 });
 
-test('game integration renders Segment and Junction rectangles through one shared InstancedMesh', () => {
+test('game integration keeps rectangular roads instanced and isolates the Capital union surface', () => {
   assert.match(game, /import \{ buildRoadHierarchy \} from '\.\/road-town-structure\.js';/);
   const roadBlock = sliceBetween(
     game,
@@ -411,17 +411,19 @@ test('game integration renders Segment and Junction rectangles through one share
   assert.match(roadBlock, /const pathSamples = roadHierarchy\.pathSamples;/);
   assert.match(roadBlock, /const pathTiles = pathSamples;/);
   assert.match(roadBlock, /\.\.\.roadHierarchy\.roadSurfaces\.map/);
-  assert.match(roadBlock, /\.\.\.roadHierarchy\.junctionSurfaces\.map/);
+  assert.match(roadBlock, /roadHierarchy\.junctionSurfaces[\s\S]*?\.filter\(surface => surface\.shape === 'RECTANGLE'\)[\s\S]*?\.map/);
   assert.match(roadBlock, /new THREE\.InstancedMesh\([\s\S]*?geometries\.roadPlane,[\s\S]*?materials\.road,/);
   assert.match(roadBlock, /Math\.atan2\(surface\.tangentX, surface\.tangentZ\)/);
   assert.match(roadBlock, /roadSurfaceTransform\.scale\.set\(surface\.width, surface\.length, 1\);/);
-  assert.doesNotMatch(roadBlock, /new THREE\.Mesh\(geometries\.roadPlane/);
+  assert.match(roadBlock, /candidate\.shape === 'ATTACHED_ROAD_UNION'/);
+  assert.match(roadBlock, /new THREE\.BufferGeometry\(\)/);
+  assert.match(roadBlock, /junctionGeometry\.setIndex\(surface\.triangles\.flat\(\)\)/);
   assert.doesNotMatch(roadBlock, /geometries\.circleUnit, materials\.road/);
   assert.doesNotMatch(roadBlock, /new THREE\.(?:PlaneGeometry|MeshPhongMaterial)/);
   assert.doesNotMatch(roadBlock, /Math\.random/);
 });
 
-test('Player start and World Interaction Phase2 remain at baseline while building visuals are isolated', () => {
+test('Player start remains locked while World Interaction avoids only the Capital Civic Core', () => {
   const spawnEntity = extractFunction(game, 'spawnEntity');
   for (const lockedSnippet of [
     "if (type === 'human') group.scale.setScalar(humanVisualScale);",
@@ -431,7 +433,10 @@ test('Player start and World Interaction Phase2 remain at baseline while buildin
     assert.ok(spawnEntity.includes(lockedSnippet));
     assert.ok(extractFunction(baselineGame, 'spawnEntity').includes(lockedSnippet));
   }
-  assert.equal(extractFunction(game, 'populateWorldScaleDetails'), extractFunction(baselineGame, 'populateWorldScaleDetails'));
+  const populateWorldScaleDetails = extractFunction(game, 'populateWorldScaleDetails');
+  assert.match(populateWorldScaleDetails, /tc\.type === 'capital' && circleIntersectsCapitalCivicCore/);
+  assert.match(populateWorldScaleDetails, /while \(selected\.length < WORLD_DETAILS_PER_TOWN\)/);
+  assert.match(populateWorldScaleDetails, /worldDetailInstancedMesh\.userData\.worldDetailPropCount = worldDetailProps\.length/);
   assert.equal(extractFunction(game, 'findLandingSpot'), extractFunction(baselineGame, 'findLandingSpot'));
   assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((sum, count) => sum + count, 0), 96);
   assert.equal(getWorldDetailInstanceCount(6, 2), 258);

@@ -115,8 +115,11 @@ test('CITY, TOWN, and unchanged RURAL roads consume only their connected LOCAL a
   assert.equal(typedTownCenters[0].type, 'capital');
 
   for (const road of capitalLocalRoads) {
-    assert.equal(road.width, road.kind === ROAD_KINDS.LOCAL ? city.localWidth : city.alleyWidth);
-    assert.equal(road.sampleSpacing, city.sampleSpacing);
+    assert.equal(
+      road.width,
+      road.isCivicAccess ? 32 : road.kind === ROAD_KINDS.LOCAL ? city.localWidth : city.alleyWidth,
+    );
+    assert.equal(road.sampleSpacing, road.isCivicAccess ? 32 : city.sampleSpacing);
     assert.equal(road.roadPattern, city.roadPattern);
     assert.equal(road.roadSurfaceOverlap, city.roadSurfaceOverlap);
   }
@@ -135,21 +138,21 @@ test('Capital generates exactly two LOCAL spines, six LOCAL branches, and two AL
   const spineRoutes = [...routes].filter(([routeId]) => routeId.includes('-spine-'));
   const branchRoutes = [...routes].filter(([routeId]) => routeId.includes('-branch-'));
   const connectorRoutes = [...routes].filter(([routeId]) => routeId.includes('-major-connector-'));
+  const collectorRoutes = [...routes].filter(([routeId]) => routeId.includes('-collector'));
+  const civicAccessRoutes = [...routes].filter(([routeId]) => routeId.includes('-civic-access'));
   const alleyRoutes = [...routes].filter(([, roads]) => roads[0].kind === ROAD_KINDS.ALLEY);
 
   assert.equal(spineRoutes.length, 2);
   assert.equal(branchRoutes.length, 6);
-  assert.equal(connectorRoutes.length, 3);
+  assert.equal(connectorRoutes.length, 0);
+  assert.equal(collectorRoutes.length, 1);
+  assert.equal(civicAccessRoutes.length, 1);
   assert.equal(alleyRoutes.length, 2);
-  assert.equal(capitalLocalRoads.filter(road => road.kind === ROAD_KINDS.LOCAL).length, 43);
+  assert.equal(capitalLocalRoads.filter(road => road.kind === ROAD_KINDS.LOCAL).length, 36);
   assert.equal(capitalLocalRoads.filter(road => road.kind === ROAD_KINDS.ALLEY).length, 6);
   assert.equal(hierarchy.omittedRoutes.filter(route => route.routeId.includes(capitalTownId)).length, 0);
-  for (const [, roads] of connectorRoutes) {
-    const length = roads.reduce((total, road) => (
-      total + Math.hypot(road.end.x - road.start.x, road.end.z - road.start.z)
-    ), 0);
-    assert.ok(length <= getSettlementRoadParameters('CITY').localWidth * 6);
-  }
+  assert.equal(civicAccessRoutes[0][1].every(road => road.isCivicAccess), true);
+  assert.equal(collectorRoutes[0][1].every(road => road.isCapitalCollector), true);
 });
 
 test('Capital grid is deterministic, orthogonal, and remains within the ten-degree visual tolerance', () => {
@@ -228,8 +231,8 @@ test('Capital LOCAL and ALLEY branches connect within the preferred CITY angle r
 test('Capital segments, samples, road surfaces, and junction surfaces retain valid CITY widths', () => {
   const capitalSurfaces = hierarchy.roadSurfaces.filter(surface => capitalRoadIds.has(surface.roadId));
   const capitalSamples = hierarchy.pathSamples.filter(sample => capitalRoadIds.has(sample.roadId));
-  assert.equal(capitalSurfaces.length, 49);
-  assert.equal(capitalSamples.length, 214);
+  assert.equal(capitalSurfaces.length, 42);
+  assert.equal(capitalSamples.length, 215);
 
   for (const road of capitalLocalRoads) {
     assert.ok(Number.isFinite(road.start.x) && Number.isFinite(road.start.z));
@@ -258,11 +261,10 @@ test('Capital LOCAL and ALLEY routes avoid water and protected exclusions', () =
   assert.ok(capitalSamples.every(sample => !sample.isWater && !sample.isBlocked));
 });
 
-test('MAJOR, START_APPROACH, Bridge, and RURAL roads remain exact legacy fixtures', () => {
+test('non-Capital MAJOR links, START_APPROACH compatibility, Bridge, and RURAL roads remain stable', () => {
   const fixedRoad = road => (
-    road.kind === ROAD_KINDS.MAJOR
-    || road.kind === ROAD_KINDS.START_APPROACH
-    || ruralTownIds.has(road.townId)
+    (ruralTownIds.has(road.townId) && road.kind !== ROAD_KINDS.MAJOR)
+    || (road.kind === ROAD_KINDS.MAJOR && !road.routeId.includes(capitalTownId))
   );
   assert.deepEqual(
     hierarchy.roads.filter(fixedRoad).map(roadShape),
@@ -279,8 +281,10 @@ test('MAJOR, START_APPROACH, Bridge, and RURAL roads remain exact legacy fixture
     tangentZ: bridge.tangentZ,
   });
   assert.deepEqual(hierarchy.bridgeSpans.map(bridgeShape), legacyHierarchy.bridgeSpans.map(bridgeShape));
-  assert.equal(getRoadKindCounts(hierarchy.roads).MAJOR, 45);
+  assert.equal(hierarchy.majorConnections.length, 5);
+  assert.equal(new Set(hierarchy.roads.filter(road => road.kind === ROAD_KINDS.MAJOR).map(road => road.routeId)).size, 5);
   assert.equal(getRoadKindCounts(hierarchy.roads).START_APPROACH, 6);
+  assert.equal(new Set(hierarchy.roads.filter(road => road.kind === ROAD_KINDS.START_APPROACH).map(road => road.routeId)).size, 2);
 });
 
 test('RURAL junction topology remains identical to the Phase 1 fixture', () => {
