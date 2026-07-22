@@ -217,8 +217,8 @@ test('natural terrain projection owns and disposes only per-Chunk geometry under
   let resources = adapter.resourceSnapshot();
   assert.equal(resources.liveChunkGroups, 9);
   assert.equal(resources.liveChunkOwnedGeometryCount, 9);
-  assert.equal(resources.sharedGeometryCount, 4);
-  assert.equal(resources.sharedMaterialCount, 5);
+  assert.equal(resources.sharedGeometryCount, 6);
+  assert.equal(resources.sharedMaterialCount, 26);
   for (let x = 1; x <= 12; x += 1) {
     await runtime.transitionToChunk(x, x % 2);
     resources = adapter.resourceSnapshot();

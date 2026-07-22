@@ -225,11 +225,16 @@ test('renderer consumes formal candidates at terrain height and releases all Chu
   const scene = new Scene();
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
   const projected = await adapter.projectChunk(chunk);
-  const treeMesh = projected.group.children.find(child => child.name === 'w3-formal-vegetation');
-  const rockMesh = projected.group.children.find(child => child.name === 'w3-formal-rocks');
-  assert.equal(treeMesh.count, chunk.vegetationCandidates.length);
-  assert.equal(rockMesh.count, chunk.rockCandidates.length);
-  if (treeMesh.count) assert.ok(treeMesh.matrices[0].position.y > 0);
+  const treeMeshes = projected.group.children.filter(child => child.name.startsWith('production-vegetation-'));
+  const rockMeshes = projected.group.children.filter(child => child.name.startsWith('production-rock-'));
+  assert.ok(treeMeshes.reduce((sum, mesh) => sum + mesh.count, 0) >= chunk.vegetationCandidates.length);
+  assert.ok(rockMeshes.reduce((sum, mesh) => sum + mesh.count, 0) >= chunk.rockCandidates.length);
+  assert.ok(chunk.vegetationCandidates.every(candidate => adapter.featureInstances.has(candidate.candidateId)));
+  assert.ok(chunk.rockCandidates.every(candidate => adapter.featureInstances.has(candidate.candidateId)));
+  if (chunk.vegetationCandidates.length) {
+    const entry = adapter.featureInstances.get(chunk.vegetationCandidates[0].candidateId);
+    assert.ok(entry.parts[0].mesh.matrices[entry.parts[0].index].position.y > 0);
+  }
   await adapter.loadProjected(projected);
   assert.equal(adapter.resourceSnapshot().liveChunkOwnedGeometryCount, 1);
   await adapter.unloadChunk(projected.key);

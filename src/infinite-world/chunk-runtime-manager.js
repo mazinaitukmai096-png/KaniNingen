@@ -274,6 +274,10 @@ export class ChunkRuntimeManager {
     return this.performance.record('frame', durationMs);
   }
 
+  resetPerformance(names) {
+    this.performance.reset(names);
+  }
+
   snapshot() {
     const performance = this.performance.snapshot();
     return Object.freeze({

@@ -35,6 +35,11 @@ export class MetricSeries {
       max: sorted.at(-1) ?? 0,
     });
   }
+
+  reset() {
+    this.values = [];
+    this.totalCount = 0;
+  }
 }
 
 export class PerformanceLedger {
@@ -54,6 +59,14 @@ export class PerformanceLedger {
     const series = this.series[name];
     if (!series) throw new TypeError(`unknown performance metric ${name}`);
     return series.record(durationMs);
+  }
+
+  reset(names = Object.keys(this.series)) {
+    for (const name of names) {
+      const series = this.series[name];
+      if (!series) throw new TypeError(`unknown performance metric ${name}`);
+      series.reset();
+    }
   }
 
   snapshot() {

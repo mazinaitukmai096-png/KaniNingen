@@ -68,25 +68,26 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
   const scene = new Scene();
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
   const initialResources = adapter.resourceSnapshot();
-  assert.equal(initialResources.sharedGeometryCount, 4);
-  assert.equal(initialResources.sharedMaterialCount, 5);
+  assert.equal(initialResources.sharedGeometryCount, 6);
+  assert.equal(initialResources.sharedMaterialCount, 26);
   assert.equal(initialResources.sharedDisposed, false);
 
   for (let iteration = 0; iteration < 12; iteration += 1) {
     const data = await generator.generateChunk(iteration, -iteration);
     await adapter.rebase({ renderOriginChunkX: iteration, renderOriginChunkZ: -iteration, rebaseCount: iteration });
     const projected = await adapter.projectChunk(data);
-    assert.equal(projected.group.children.length, 4);
+    assert.ok(projected.group.children.length >= 3 && projected.group.children.length <= 4);
+    const projectedRenderableCount = projected.group.children.length;
     assert.deepEqual({ x: projected.group.position.x, z: projected.group.position.z }, { x: 0, z: 0 });
     await adapter.loadProjected(projected);
     assert.equal(adapter.resourceSnapshot().liveChunkGroups, 1);
-    assert.equal(adapter.resourceSnapshot().chunkRenderables[`${iteration},${-iteration}`], 4);
+    assert.equal(adapter.resourceSnapshot().chunkRenderables[`${iteration},${-iteration}`], projectedRenderableCount);
     await adapter.unloadChunk(`${iteration},${-iteration}`);
     const afterUnload = adapter.resourceSnapshot();
     assert.equal(afterUnload.liveChunkGroups, 0);
     assert.equal(afterUnload.sharedDisposed, false);
-    assert.equal(afterUnload.sharedGeometryCount, 4);
-    assert.equal(afterUnload.sharedMaterialCount, 5);
+    assert.equal(afterUnload.sharedGeometryCount, 6);
+    assert.equal(afterUnload.sharedMaterialCount, 26);
   }
   assert.equal(scene.children.includes(adapter.worldRoot), true);
   await adapter.shutdown();

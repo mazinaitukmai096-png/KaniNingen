@@ -5,6 +5,7 @@ import {
   chunkRenderPosition,
   createChunkKey,
 } from '../chunk-coordinates.js';
+import { createProductionVisualAssetLibrary } from './production-visual-assets.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -17,6 +18,7 @@ export class ChunkRenderAdapter {
     scene,
     renderChunkSize = RENDER_CHUNK_SIZE,
     isFeatureDestroyed = () => false,
+    visualAssets = null,
   } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
@@ -36,6 +38,8 @@ export class ChunkRenderAdapter {
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
     this.disposed = false;
+    this.visualAssets = visualAssets ?? createProductionVisualAssetLibrary({ THREE });
+    this.ownsVisualAssets = visualAssets === null;
     this.settlementResources = null;
     this.counts = {
       projected: 0,
@@ -48,33 +52,16 @@ export class ChunkRenderAdapter {
 
     const Group = requireConstructor(THREE, 'Group');
     const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
-    const ConeGeometry = requireConstructor(THREE, 'ConeGeometry');
-    const DodecahedronGeometry = requireConstructor(THREE, 'DodecahedronGeometry');
-    const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
-    const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
     const MeshLambertMaterial = requireConstructor(THREE, 'MeshLambertMaterial');
-    const LineBasicMaterial = requireConstructor(THREE, 'LineBasicMaterial');
     const Object3D = requireConstructor(THREE, 'Object3D');
     this.worldRoot = new Group();
     this.worldRoot.name = 'w1a-render-root';
     this.scene.add(this.worldRoot);
     this.geometries = Object.freeze({
       terrain: new PlaneGeometry(renderChunkSize, renderChunkSize),
-      tree: new ConeGeometry(105, 520, 5),
-      rock: new DodecahedronGeometry(135, 0),
-      border: new BufferGeometry(),
     });
-    this.geometries.border.setAttribute('position', new Float32BufferAttribute([
-      0, 8, 0, renderChunkSize, 8, 0,
-      renderChunkSize, 8, 0, renderChunkSize, 8, renderChunkSize,
-      renderChunkSize, 8, renderChunkSize, 0, 8, renderChunkSize,
-      0, 8, renderChunkSize, 0, 8, 0,
-    ], 3));
     this.materials = Object.freeze({
       terrain: new MeshLambertMaterial({ color: 0x668c54, flatShading: true }),
-      tree: new MeshLambertMaterial({ color: 0x245c32, flatShading: true }),
-      rock: new MeshLambertMaterial({ color: 0x787b80, flatShading: true }),
-      border: new LineBasicMaterial({ color: 0xa9d17d, transparent: true, opacity: 0.75 }),
       naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: false }),
     });
     const hiddenTransform = new Object3D();
@@ -89,31 +76,39 @@ export class ChunkRenderAdapter {
 
   #registerFeatureInstance({ stableId, chunkKey, mesh, index, matrix }) {
     if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
-    const existing = this.featureInstances.get(stableId);
+    let existing = this.featureInstances.get(stableId);
     if (existing && existing.chunkKey !== chunkKey) {
       throw new Error(`Stable ID collision in render adapter: ${stableId}`);
     }
-    const entry = { stableId, chunkKey, mesh, index, originalMatrix: this.#cloneMatrix(matrix) };
-    this.featureInstances.set(stableId, entry);
+    const part = { mesh, index, originalMatrix: this.#cloneMatrix(matrix) };
+    if (!existing) {
+      existing = { stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix, parts: [] };
+      this.featureInstances.set(stableId, existing);
+    }
+    existing.parts.push(part);
     if (!this.chunkFeatureIds.has(chunkKey)) this.chunkFeatureIds.set(chunkKey, new Set());
     this.chunkFeatureIds.get(chunkKey).add(stableId);
     mesh.setMatrixAt(index, this.isFeatureDestroyed(stableId)
-      ? this.hiddenFeatureMatrix : entry.originalMatrix);
+      ? this.hiddenFeatureMatrix : part.originalMatrix);
   }
 
   setFeatureDestroyed(stableId, destroyed = true) {
     const entry = this.featureInstances.get(stableId);
     if (!entry) return false;
-    entry.mesh.setMatrixAt(entry.index, destroyed ? this.hiddenFeatureMatrix : entry.originalMatrix);
-    entry.mesh.instanceMatrix.needsUpdate = true;
+    for (const part of entry.parts) {
+      part.mesh.setMatrixAt(part.index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
+      part.mesh.instanceMatrix.needsUpdate = true;
+    }
     return true;
   }
 
   refreshFeatureStates() {
     for (const [stableId, entry] of this.featureInstances) {
-      entry.mesh.setMatrixAt(entry.index, this.isFeatureDestroyed(stableId)
-        ? this.hiddenFeatureMatrix : entry.originalMatrix);
-      entry.mesh.instanceMatrix.needsUpdate = true;
+      for (const part of entry.parts) {
+        part.mesh.setMatrixAt(part.index, this.isFeatureDestroyed(stableId)
+          ? this.hiddenFeatureMatrix : part.originalMatrix);
+        part.mesh.instanceMatrix.needsUpdate = true;
+      }
     }
   }
 
@@ -186,37 +181,56 @@ export class ChunkRenderAdapter {
   #ensureSettlementResources() {
     if (this.settlementResources) return this.settlementResources;
     const PlaneGeometry = requireConstructor(this.THREE, 'PlaneGeometry');
-    const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
-    const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
-    const MeshLambertMaterial = requireConstructor(this.THREE, 'MeshLambertMaterial');
-    const building = new BufferGeometry();
-    building.setAttribute('position', new Float32BufferAttribute([
-      -0.5, -0.5, -0.5, 0.5, -0.5, -0.5, 0.5, 0.5, -0.5, -0.5, 0.5, -0.5,
-      -0.5, -0.5, 0.5, 0.5, -0.5, 0.5, 0.5, 0.5, 0.5, -0.5, 0.5, 0.5,
-    ], 3));
-    building.setIndex([
-      0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
-      0, 1, 5, 0, 5, 4, 3, 7, 6, 3, 6, 2,
-      1, 2, 6, 1, 6, 5, 0, 4, 7, 0, 7, 3,
-    ]);
-    building.computeVertexNormals();
     this.settlementResources = Object.freeze({
-      geometries: Object.freeze({ road: new PlaneGeometry(1, 1), building }),
+      geometries: Object.freeze({ road: new PlaneGeometry(1, 1) }),
       materials: Object.freeze({
-        road: new MeshLambertMaterial({ color: 0x66615a, flatShading: true }),
-        buildingRural: new MeshLambertMaterial({ color: 0x9a8569, flatShading: true }),
-        buildingTown: new MeshLambertMaterial({ color: 0xb69f7e, flatShading: true }),
-        buildingCity: new MeshLambertMaterial({ color: 0x667078, flatShading: true }),
+        road: this.visualAssets.materials.road,
       }),
     });
     return this.settlementResources;
   }
 
+  #createProductionPartMeshes({ group, chunkKey, name, items }) {
+    if (!items.length) return [];
+    const InstancedMesh = requireConstructor(this.THREE, 'InstancedMesh');
+    const byResource = new Map();
+    for (const item of items) {
+      const resourceKey = `${item.part.geometry}:${item.part.material}`;
+      if (!byResource.has(resourceKey)) byResource.set(resourceKey, []);
+      byResource.get(resourceKey).push(item);
+    }
+    const meshes = [];
+    for (const [resourceKey, resourceItems] of byResource) {
+      const descriptor = resourceItems[0].part;
+      const mesh = new InstancedMesh(
+        this.visualAssets.geometries[descriptor.geometry],
+        this.visualAssets.materials[descriptor.material],
+        Math.max(1, resourceItems.length),
+      );
+      mesh.name = `${name}-${resourceKey.replace(':', '-')}`;
+      mesh.count = resourceItems.length;
+      resourceItems.forEach((item, index) => {
+        mesh.setMatrixAt(index, item.matrix);
+        this.#registerFeatureInstance({
+          stableId: item.stableId,
+          chunkKey,
+          mesh,
+          index,
+          matrix: item.matrix,
+        });
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      group.add(mesh);
+      meshes.push(mesh);
+    }
+    return meshes;
+  }
+
   async projectChunk(chunkData) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
-    const { Group, Mesh, InstancedMesh, LineSegments, Object3D } = this.THREE;
-    for (const name of ['Group', 'Mesh', 'InstancedMesh', 'LineSegments', 'Object3D']) {
+    const { Group, Mesh, InstancedMesh, Object3D } = this.THREE;
+    for (const name of ['Group', 'Mesh', 'InstancedMesh', 'Object3D']) {
       requireConstructor(this.THREE, name);
     }
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
@@ -242,53 +256,34 @@ export class ChunkRenderAdapter {
     }
     group.add(terrain);
 
-    const treeMesh = new InstancedMesh(
-      this.geometries.tree,
-      this.materials.tree,
-      Math.max(1, vegetation.length),
-    );
-    treeMesh.name = chunkData.vegetationCandidates ? 'w3-formal-vegetation' : 'w1a-tree-proxies';
-    treeMesh.count = vegetation.length;
     const transform = new Object3D();
-    vegetation.forEach((candidate, index) => {
-      const formal = candidate.candidateId !== undefined;
-      const scale = formal
-        ? (candidate.subtype === 'shrub' ? 0.38 : 0.72) * (0.82 + candidate.variationSeed * 0.36)
-        : candidate.scale;
-      const localX = formal
-        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
-        : candidate.logicalLocalX;
-      const localZ = formal
-        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
-        : candidate.logicalLocalZ;
-      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
-      transform.position.set(localX * this.unitsPerMeter, groundY + 260 * scale, localZ * this.unitsPerMeter);
-      transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
-      transform.scale.set(scale, scale, scale);
+    const createPartMatrix = ({ localX, localZ, groundY, rotationY, width, height, depth, part }) => {
+      const offsetX = part.position[0] * width;
+      const offsetZ = part.position[2] * depth;
+      const cosine = Math.cos(rotationY);
+      const sine = Math.sin(rotationY);
+      transform.position.set(
+        localX * this.unitsPerMeter + offsetX * cosine + offsetZ * sine,
+        groundY + part.position[1] * height,
+        localZ * this.unitsPerMeter - offsetX * sine + offsetZ * cosine,
+      );
+      transform.rotation.set(
+        part.rotation[0],
+        rotationY + part.rotation[1],
+        part.rotation[2],
+      );
+      transform.scale.set(
+        width * part.scale[0],
+        height * part.scale[1],
+        depth * part.scale[2],
+      );
       transform.updateMatrix();
-      this.#registerFeatureInstance({
-        stableId: candidate.candidateId ?? candidate.stableId,
-        chunkKey: key,
-        mesh: treeMesh,
-        index,
-        matrix: transform.matrix,
-      });
-    });
-    treeMesh.instanceMatrix.needsUpdate = true;
-    group.add(treeMesh);
+      return this.#cloneMatrix(transform.matrix);
+    };
 
-    const rockMesh = new InstancedMesh(
-      this.geometries.rock,
-      this.materials.rock,
-      Math.max(1, rocks.length),
-    );
-    rockMesh.name = chunkData.rockCandidates ? 'w3-formal-rocks' : 'w1a-rock-proxies';
-    rockMesh.count = rocks.length;
-    rocks.forEach((candidate, index) => {
+    const vegetationParts = [];
+    vegetation.forEach(candidate => {
       const formal = candidate.candidateId !== undefined;
-      const scale = formal
-        ? candidate.metadata.candidateRadiusMeters * this.unitsPerMeter / 135 * (0.9 + candidate.variationSeed * 0.2)
-        : candidate.scale;
       const localX = formal
         ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalX;
@@ -296,20 +291,62 @@ export class ChunkRenderAdapter {
         ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
       const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
-      transform.position.set(localX * this.unitsPerMeter, groundY + 85 * scale, localZ * this.unitsPerMeter);
-      transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
-      transform.scale.set(scale, scale * 0.65, scale);
-      transform.updateMatrix();
-      this.#registerFeatureInstance({
+      const variation = formal ? 0.84 + candidate.variationSeed * 0.32 : 1;
+      const shrub = formal && candidate.subtype === 'shrub';
+      const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.32;
+      const width = radiusMeters * 2.2 * variation * this.unitsPerMeter;
+      const height = (shrub ? 0.85 : 3.5) * variation * this.unitsPerMeter;
+      const rotationY = formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians;
+      const visualKind = shrub ? 'shrub'
+        : formal && ['broadleaf-tree', 'wetland-tree'].includes(candidate.subtype)
+          ? 'broadleafTree' : 'tree';
+      for (const descriptor of this.visualAssets.featureParts[visualKind]) {
+        vegetationParts.push({
+          stableId: candidate.candidateId ?? candidate.stableId,
+          part: descriptor,
+          matrix: createPartMatrix({
+            localX, localZ, groundY, rotationY, width, height, depth: width, part: descriptor,
+          }),
+        });
+      }
+    });
+    this.#createProductionPartMeshes({
+      group,
+      chunkKey: key,
+      name: 'production-vegetation',
+      items: vegetationParts,
+    });
+
+    const rockParts = [];
+    rocks.forEach(candidate => {
+      const formal = candidate.candidateId !== undefined;
+      const localX = formal
+        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalX;
+      const localZ = formal
+        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalZ;
+      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
+      const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.45;
+      const variation = formal ? 0.9 + candidate.variationSeed * 0.2 : 1;
+      const width = radiusMeters * 2 * variation * this.unitsPerMeter;
+      const height = radiusMeters * 1.25 * variation * this.unitsPerMeter;
+      const rotationY = formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians;
+      const descriptor = this.visualAssets.featureParts.rock[0];
+      rockParts.push({
         stableId: candidate.candidateId ?? candidate.stableId,
-        chunkKey: key,
-        mesh: rockMesh,
-        index,
-        matrix: transform.matrix,
+        part: descriptor,
+        matrix: createPartMatrix({
+          localX, localZ, groundY, rotationY, width, height, depth: width, part: descriptor,
+        }),
       });
     });
-    rockMesh.instanceMatrix.needsUpdate = true;
-    group.add(rockMesh);
+    this.#createProductionPartMeshes({
+      group,
+      chunkKey: key,
+      name: 'production-rock',
+      items: rockParts,
+    });
 
     if (settlementFeatures.length) {
       const resources = this.#ensureSettlementResources();
@@ -347,50 +384,40 @@ export class ChunkRenderAdapter {
       roadMesh.instanceMatrix.needsUpdate = true;
       group.add(roadMesh);
 
-      const buildingMesh = new InstancedMesh(
-        resources.geometries.building,
-        resources.materials[{
-          CITY: 'buildingCity',
-          TOWN: 'buildingTown',
-          RURAL: 'buildingRural',
-        }[buildings[0]?.settlementType] ?? 'buildingRural'],
-        Math.max(1, buildings.length),
-      );
-      buildingMesh.name = chunkData.generatorVersion?.major >= 500
-        ? 'infinite-settlement-buildings' : 'w4-rural-buildings';
-      buildingMesh.count = buildings.length;
-      buildings.forEach((building, index) => {
+      const buildingParts = [];
+      buildings.forEach(building => {
         const localX = building.worldPosition.x
           - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
         const localZ = building.worldPosition.z
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-        transform.position.set(
-          localX * this.unitsPerMeter,
-          (building.worldPosition.y + building.heightMeters / 2) * this.unitsPerMeter,
-          localZ * this.unitsPerMeter,
-        );
-        transform.rotation.set(0, building.rotationY, 0);
-        transform.scale.set(
-          building.widthMeters * this.unitsPerMeter,
-          building.heightMeters * this.unitsPerMeter,
-          building.depthMeters * this.unitsPerMeter,
-        );
-        transform.updateMatrix();
-        this.#registerFeatureInstance({
-          stableId: building.stableId,
-          chunkKey: key,
-          mesh: buildingMesh,
-          index,
-          matrix: transform.matrix,
-        });
+        const descriptors = this.visualAssets.featureParts[building.buildingType];
+        if (!descriptors) throw new Error(`unsupported production building visual: ${building.buildingType}`);
+        for (const descriptor of descriptors) {
+          buildingParts.push({
+            stableId: building.stableId,
+            part: descriptor,
+            matrix: createPartMatrix({
+              localX,
+              localZ,
+              groundY: building.worldPosition.y * this.unitsPerMeter,
+              rotationY: building.rotationY,
+              width: building.widthMeters * this.unitsPerMeter,
+              height: building.heightMeters * this.unitsPerMeter,
+              depth: building.depthMeters * this.unitsPerMeter,
+              part: descriptor,
+            }),
+          });
+        }
       });
-      buildingMesh.instanceMatrix.needsUpdate = true;
-      group.add(buildingMesh);
+      this.#createProductionPartMeshes({
+        group,
+        chunkKey: key,
+        name: chunkData.generatorVersion?.major >= 500
+          ? 'production-infinite-settlement-building' : 'production-rural-building',
+        items: buildingParts,
+      });
     }
 
-    const border = new LineSegments(this.geometries.border, this.materials.border);
-    border.name = 'w1a-chunk-border';
-    group.add(border);
     const projected = {
       key,
       chunkX: chunkData.chunkX,
@@ -427,13 +454,16 @@ export class ChunkRenderAdapter {
   }
 
   resourceSnapshot() {
+    const visualResources = this.visualAssets.snapshot();
     return Object.freeze({
       liveChunkGroups: this.loaded.size,
       sharedGeometryCount: Object.keys(this.geometries).length
-        + (this.settlementResources ? Object.keys(this.settlementResources.geometries).length : 0),
+        + (this.settlementResources ? Object.keys(this.settlementResources.geometries).length : 0)
+        + visualResources.sharedGeometryCount,
       sharedMaterialCount: Object.keys(this.materials).length
-        + (this.settlementResources ? Object.keys(this.settlementResources.materials).length : 0),
-      sharedDisposed: this.disposed,
+        + visualResources.sharedMaterialCount,
+      sharedDisposed: this.disposed && (!this.ownsVisualAssets || visualResources.disposed),
+      productionVisuals: visualResources,
       projectedCount: this.counts.projected,
       loadedCount: this.counts.loaded,
       unloadedCount: this.counts.unloaded,
@@ -457,8 +487,8 @@ export class ChunkRenderAdapter {
     for (const material of Object.values(this.materials)) material.dispose();
     if (this.settlementResources) {
       for (const geometry of Object.values(this.settlementResources.geometries)) geometry.dispose();
-      for (const material of Object.values(this.settlementResources.materials)) material.dispose();
     }
+    if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.featureInstances.clear();
     this.chunkFeatureIds.clear();
     this.disposed = true;

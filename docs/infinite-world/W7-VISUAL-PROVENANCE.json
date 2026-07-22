@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "w7-production-visual-provenance-1",
+  "sourceCommit": "f8bc9f80c2af417bb585bff26c99522c4229ab8e",
+  "extractionMethod": "git show from the fixed finite World baseline; no dirty worktree source",
+  "sourceHashes": {
+    "src/game.js": "a69f03c549117bb848d8baab03adf5b412756f5bd5577dc73399d2648e92ccee",
+    "src/world-scale-rebalance.js": "0884b939347d2978d35ba9a3f7fbeab64fa18c01fa63e9d707865f926941bc92",
+    "src/scale-sandbox.js": "2720cfce173926b365a508a1849c1c9b7592d0fb3bbed958314123307a3fc02a",
+    "src/settlement-building-visuals.js": "dac59d9d3c15a281206c4aada7a6d2f986c3db6b13c8fe524830c9e7f3efec84"
+  },
+  "destination": {
+    "path": "src/infinite-world/render/production-visual-assets.js",
+    "sha256": "f21d458838f1362b1aead019cd6dd659146d86964a44e2c8b18b79cd2b1ee9f6"
+  },
+  "assets": [
+    { "asset": "Player Crab", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/scale-sandbox.js"], "change": "shared primitive geometry, material palette, part composition, and protected stage scale" },
+    { "asset": "Human", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/world-scale-rebalance.js"], "change": "production body/head composition and protected 0.50 visual scale" },
+    { "asset": "Tank", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/world-scale-rebalance.js"], "change": "production chassis, tracks, turret, hatch, and gun with protected 1.35 visual scale" },
+    { "asset": "House", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/settlement-building-visuals.js"], "change": "normalized wall and roof parts projected over existing W5 dimensions" },
+    { "asset": "Tower", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/settlement-building-visuals.js"], "change": "normalized tower, roof, and window parts projected over existing W5 dimensions" },
+    { "asset": "School", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/settlement-building-visuals.js"], "change": "normalized main block, clock tower, roof, and clock parts" },
+    { "asset": "Church", "status": "MIGRATED", "sourcePaths": ["src/game.js", "src/settlement-building-visuals.js"], "change": "normalized nave, steeple, roof, and cross parts" },
+    { "asset": "Tree", "status": "MIGRATED", "sourcePaths": ["src/game.js"], "change": "shared trunk plus conifer or broadleaf crown selected from existing W3 subtype" },
+    { "asset": "Rock", "status": "MIGRATED", "sourcePaths": ["src/game.js"], "change": "shared low-poly dodecahedron projected over existing W3 radius" },
+    { "asset": "Bush", "status": "MIGRATED", "sourcePaths": ["src/game.js"], "change": "shared low-poly shrub for existing W3 shrub subtype" },
+    { "asset": "Factory", "status": "REFERENCE_ONLY", "sourcePaths": ["src/game.js"], "change": "not present in W5/W6 projection; no logical feature added" },
+    { "asset": "Military Base", "status": "REFERENCE_ONLY", "sourcePaths": ["src/game.js"], "change": "not present as a W5/W6 building feature; no logical feature added" },
+    { "asset": "Grass", "status": "REFERENCE_ONLY", "sourcePaths": ["src/game.js"], "change": "not present as a W5/W6 stable logical type; no candidate added" },
+    { "asset": "Flower", "status": "REFERENCE_ONLY", "sourcePaths": ["src/game.js"], "change": "not present as a W5/W6 stable logical type; no candidate added" },
+    { "asset": "Street Object", "status": "REFERENCE_ONLY", "sourcePaths": ["src/game.js"], "change": "not present in W5/W6 projection; no logical feature added" }
+  ]
+}

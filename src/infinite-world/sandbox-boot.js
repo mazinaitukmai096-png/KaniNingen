@@ -14,6 +14,10 @@ import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import { getW6ScaleProfile } from './gameplay-contract.js';
 import { GameplayRenderAdapter } from './render/gameplay-render-adapter.js';
+import {
+  PRODUCTION_VISUAL_UNITS_PER_METER,
+  createProductionVisualAssetLibrary,
+} from './render/production-visual-assets.js';
 import { InfiniteWorldSaveStore, InfiniteWorldState } from './world-state-store.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
@@ -30,6 +34,26 @@ function escapeHtml(value) {
 
 function number(value) {
   return Number(value ?? 0).toFixed(2);
+}
+
+function parseMeasurementViewport(value) {
+  if (!value) return null;
+  const match = /^(\d{3,5})x(\d{3,5})$/.exec(String(value));
+  if (!match) throw new RangeError('measurementViewport must use WIDTHxHEIGHT');
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width < 320 || height < 240 || width > 8192 || height > 8192) {
+    throw new RangeError('measurementViewport is outside the supported range');
+  }
+  return Object.freeze({ width, height });
+}
+
+function parseMeasurementMode(value) {
+  if (!value) return null;
+  if (!['steady', 'crossing'].includes(value)) {
+    throw new RangeError('measurementMode must be steady or crossing');
+  }
+  return value;
 }
 
 function appendElement(parent, child) {
@@ -216,6 +240,12 @@ export async function bootInfiniteWorldSandbox({
   hud = globalObject.document?.querySelector?.('#hud'),
   requestedSeed = new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('seed')
     ?? 'KaniNingen Infinite Natural World',
+  measurementViewport = parseMeasurementViewport(
+    new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('measurementViewport'),
+  ),
+  measurementMode = parseMeasurementMode(
+    new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('measurementMode'),
+  ),
   state = createSandboxBootState(),
   generatorFactory = createDistributedSettlementChunkGenerator,
   renderAdapterFactory = options => new ChunkRenderAdapter(options),
@@ -246,9 +276,7 @@ export async function bootInfiniteWorldSandbox({
   let gameplayRenderAdapter = null;
   let gameplay = null;
   let renderer = null;
-  let markerBody = null;
-  let markerMaterial = null;
-  let markerDirection = null;
+  let visualAssets = null;
   let scene = null;
   let running = false;
   let animationFrameId = null;
@@ -292,18 +320,20 @@ export async function bootInfiniteWorldSandbox({
     const selectedRenderChunkSize = renderProfile.selectedRenderChunkSize;
 
     const rendererContext = await runStage('Renderer', () => {
+      const viewportWidth = measurementViewport?.width ?? globalObject.innerWidth;
+      const viewportHeight = measurementViewport?.height ?? globalObject.innerHeight;
       const nextScene = new THREE.Scene();
       nextScene.background = new THREE.Color(0x9bb6c5);
       nextScene.fog = new THREE.Fog(0x9bb6c5, 9000, 26000);
       const nextCamera = new THREE.PerspectiveCamera(
         52,
-        globalObject.innerWidth / globalObject.innerHeight,
+        viewportWidth / viewportHeight,
         8,
         42000,
       );
       const nextRenderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
       nextRenderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, 2));
-      nextRenderer.setSize(globalObject.innerWidth, globalObject.innerHeight);
+      nextRenderer.setSize(viewportWidth, viewportHeight);
       nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
       appendElement(viewport, nextRenderer.domElement);
 
@@ -312,19 +342,8 @@ export async function bootInfiniteWorldSandbox({
       sun.position.set(-5000, 9000, 3000);
       nextScene.add(sun);
 
-      const playerMarker = new THREE.Group();
-      playerMarker.name = 'w1a-player-marker';
-      markerMaterial = new THREE.MeshLambertMaterial({ color: 0xc84b3f, flatShading: true });
-      markerBody = new THREE.Mesh(new THREE.CylinderGeometry(125, 175, 90, 8), markerMaterial);
-      markerBody.position.y = 90;
-      playerMarker.add(markerBody);
-      markerDirection = new THREE.Mesh(
-        new THREE.ConeGeometry(75, 260, 5),
-        new THREE.MeshLambertMaterial({ color: 0xf2c35d, flatShading: true }),
-      );
-      markerDirection.rotation.x = Math.PI / 2;
-      markerDirection.position.set(0, 95, -180);
-      playerMarker.add(markerDirection);
+      visualAssets = createProductionVisualAssetLibrary({ THREE });
+      const playerMarker = visualAssets.createPlayerModel();
       nextScene.add(playerMarker);
       return { nextScene, nextCamera, nextRenderer, playerMarker };
     });
@@ -339,6 +358,7 @@ export async function bootInfiniteWorldSandbox({
         scene,
         renderChunkSize: selectedRenderChunkSize,
         isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
+        visualAssets,
       });
       const chunkIndex = chunkIndexFactory({ capacity: 65_536 });
       const logicalPlayer = worldState.player;
@@ -408,6 +428,7 @@ export async function bootInfiniteWorldSandbox({
         THREE,
         scene,
         renderChunkSize: selectedRenderChunkSize,
+        visualAssets,
       });
       gameplay = gameplayRuntimeFactory({
         worldSeedHash: generator.worldSeedHash,
@@ -434,6 +455,15 @@ export async function bootInfiniteWorldSandbox({
     let saveStatus = state.saveLoaded ? 'loaded' : 'new';
     let lastFrameAt = clock();
     let lastHudAt = 0;
+    const measurement = {
+      mode: measurementMode,
+      warmupMs: 10_000,
+      sampleMs: 30_000,
+      protocolStartedAt: null,
+      samplingStartedAt: null,
+      completedAt: null,
+      status: measurementMode ? 'warmup' : 'disabled',
+    };
     running = true;
 
     function onKey(event, pressed) {
@@ -490,9 +520,20 @@ export async function bootInfiniteWorldSandbox({
     addWindowListener('keyup', onKeyUp);
 
     function resize() {
-      camera.aspect = globalObject.innerWidth / globalObject.innerHeight;
+      const width = measurementViewport?.width ?? globalObject.innerWidth;
+      const height = measurementViewport?.height ?? globalObject.innerHeight;
+      camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      renderer.setSize(globalObject.innerWidth, globalObject.innerHeight);
+      renderer.setSize(width, height);
+    }
+    function setMeasurementViewport(width, height) {
+      if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
+        throw new RangeError('measurement viewport dimensions must be positive finite numbers');
+      }
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height, false);
+      return Object.freeze({ width, height });
     }
     addWindowListener('resize', resize);
 
@@ -516,8 +557,10 @@ export async function bootInfiniteWorldSandbox({
     }
 
     function updatePlayer(deltaSeconds) {
-      let dx = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
-      let dz = Number(keys.has('KeyS')) - Number(keys.has('KeyW'));
+      let dx = measurement.mode === 'steady'
+        ? 0 : Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
+      let dz = measurement.mode === 'steady'
+        ? 0 : Number(keys.has('KeyS')) - Number(keys.has('KeyW'));
       if (dx || dz) {
         const length = Math.hypot(dx, dz);
         dx /= length;
@@ -541,10 +584,12 @@ export async function bootInfiniteWorldSandbox({
       playerMarker.position.set(renderLocal.x, 0, renderLocal.z);
       playerMarker.rotation.y = logicalPlayer.facingY;
       const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
+      const productionScale = scaleProfile.stage.visualScale
+        * UNITS_PER_METER / PRODUCTION_VISUAL_UNITS_PER_METER;
       playerMarker.scale.set(
-        scaleProfile.stage.visualScale,
-        scaleProfile.stage.visualScale,
-        scaleProfile.stage.visualScale,
+        productionScale,
+        productionScale,
+        productionScale,
       );
       const cameraDistance = scaleProfile.cameraDistanceMeters * UNITS_PER_METER;
       const cameraOffset = {
@@ -571,6 +616,10 @@ export async function bootInfiniteWorldSandbox({
       const metrics = runtimeSnapshot.performance;
       const transition = runtimeSnapshot.latestTransition;
       const gameplaySnapshot = gameplay.snapshot();
+      const renderInfo = renderer.info;
+      const measurementText = measurement.mode
+        ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 30s`
+        : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
@@ -597,7 +646,8 @@ Projection ms latest/p50/p95/max: ${number(metrics.projection.latest)} / ${numbe
 Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.load.p50)} / ${number(metrics.load.p95)} / ${number(metrics.load.max)}
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
-Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
+Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderAdapter.resourceSnapshot().sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
     }
 
     function failRuntimeLoop(error) {
@@ -615,7 +665,22 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
         const deltaSeconds = Math.min(rawFrameMs / 1000, 0.05);
         lastFrameAt = frameNow;
-        runtime.recordFrame(rawFrameMs);
+        if (measurement.protocolStartedAt === null) measurement.protocolStartedAt = frameNow;
+        const measurementElapsed = frameNow - measurement.protocolStartedAt;
+        if (measurement.mode && measurement.status === 'warmup'
+          && measurementElapsed >= measurement.warmupMs) {
+          runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
+          measurement.samplingStartedAt = frameNow;
+          measurement.status = 'sampling';
+          if (measurement.mode === 'crossing') keys.add('KeyD');
+        }
+        if (!measurement.mode || measurement.status === 'sampling') runtime.recordFrame(rawFrameMs);
+        if (measurement.status === 'sampling'
+          && frameNow - measurement.samplingStartedAt >= measurement.sampleMs) {
+          if (measurement.mode === 'crossing') keys.delete('KeyD');
+          measurement.completedAt = frameNow;
+          measurement.status = 'complete';
+        }
         const owner = updatePlayer(deltaSeconds);
         gameplay.update({
           deltaSeconds,
@@ -658,10 +723,7 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
       await saveWorld();
       await gameplay.shutdown();
       await runtime.shutdown();
-      markerBody.geometry.dispose();
-      markerMaterial.dispose();
-      markerDirection.geometry.dispose();
-      markerDirection.material.dispose();
+      visualAssets.dispose();
       renderer.dispose();
       renderer.domElement.remove();
     }
@@ -680,8 +742,18 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
         generator: generator.snapshot(),
         gameplay: gameplay.snapshot(),
         save: saveStore.snapshot(),
+        measurement: Object.freeze({ ...measurement }),
         sceneObjectCount: countSceneObjects(scene),
+        renderInfo: Object.freeze({
+          drawCalls: renderer.info?.render?.calls ?? null,
+          triangles: renderer.info?.render?.triangles ?? null,
+          geometries: renderer.info?.memory?.geometries ?? null,
+          textures: renderer.info?.memory?.textures ?? null,
+          canvasWidth: renderer.domElement?.width ?? null,
+          canvasHeight: renderer.domElement?.height ?? null,
+        }),
       }),
+      setMeasurementViewport,
       shutdown,
       constants: Object.freeze({ unitsPerMeter: UNITS_PER_METER }),
     });
@@ -691,6 +763,7 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
       if (gameplay) await gameplay.shutdown();
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
+      visualAssets?.dispose?.();
       renderer?.dispose?.();
       renderer?.domElement?.remove?.();
     } catch {

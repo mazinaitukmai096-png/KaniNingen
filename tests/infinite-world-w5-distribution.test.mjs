@@ -274,8 +274,8 @@ test('W5 renderer shows distributed Settlement resources and disposes them witho
   const startZ = Math.floor(generator.reviewSpawn.z / 16);
   await runtime.initialize(startX, startZ);
   let resources = adapter.resourceSnapshot();
-  assert.equal(resources.sharedGeometryCount, 6);
-  assert.equal(resources.sharedMaterialCount, 9);
+  assert.equal(resources.sharedGeometryCount, 7);
+  assert.equal(resources.sharedMaterialCount, 26);
   assert.equal(resources.liveChunkGroups, 9);
   assert.ok([...adapter.loaded.values()].some(projected => projected.group.children.some(child => (
     child.name === 'infinite-settlement-roads' || child.name === 'infinite-settlement-buildings'

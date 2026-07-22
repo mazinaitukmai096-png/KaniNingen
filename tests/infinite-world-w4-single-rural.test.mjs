@@ -230,8 +230,8 @@ test('W4 renderer lazily shares Settlement resources and releases all streamed C
   const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 40 });
   await runtime.initialize(0, 0);
   let resources = adapter.resourceSnapshot();
-  assert.equal(resources.sharedGeometryCount, 6);
-  assert.equal(resources.sharedMaterialCount, 9);
+  assert.equal(resources.sharedGeometryCount, 7);
+  assert.equal(resources.sharedMaterialCount, 26);
   assert.equal(resources.liveChunkGroups, 9);
   assert.equal(resources.liveChunkOwnedGeometryCount, 9);
   assert.ok([...adapter.loaded.values()].some(projected => (

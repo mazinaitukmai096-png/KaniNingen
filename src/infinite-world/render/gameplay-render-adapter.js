@@ -5,7 +5,10 @@ import {
   createChunkKey,
   parseChunkKey,
 } from '../chunk-coordinates.js';
-import { finiteWorldUnitsToMeters } from '../gameplay-contract.js';
+import {
+  PRODUCTION_VISUAL_UNITS_PER_METER,
+  createProductionVisualAssetLibrary,
+} from './production-visual-assets.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -13,13 +16,11 @@ function requireConstructor(THREE, name) {
 }
 
 export class GameplayRenderAdapter {
-  constructor({ THREE, scene, renderChunkSize = RENDER_CHUNK_SIZE } = {}) {
+  constructor({ THREE, scene, renderChunkSize = RENDER_CHUNK_SIZE, visualAssets = null } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
     }
     const Group = requireConstructor(THREE, 'Group');
-    const DodecahedronGeometry = requireConstructor(THREE, 'DodecahedronGeometry');
-    const MeshLambertMaterial = requireConstructor(THREE, 'MeshLambertMaterial');
     this.THREE = THREE;
     this.scene = scene;
     this.renderChunkSize = renderChunkSize;
@@ -28,16 +29,8 @@ export class GameplayRenderAdapter {
     this.root = new Group();
     this.root.name = 'w6-gameplay-root';
     this.scene.add(this.root);
-    this.geometries = Object.freeze({
-      human: new DodecahedronGeometry(1, 0),
-      tank: new DodecahedronGeometry(1, 0),
-      boss: new DodecahedronGeometry(1, 1),
-    });
-    this.materials = Object.freeze({
-      human: new MeshLambertMaterial({ color: 0x3366ff, flatShading: true }),
-      tank: new MeshLambertMaterial({ color: 0x536b3b, flatShading: true }),
-      boss: new MeshLambertMaterial({ color: 0x6b1628, flatShading: true }),
-    });
+    this.visualAssets = visualAssets ?? createProductionVisualAssetLibrary({ THREE });
+    this.ownsVisualAssets = visualAssets === null;
     this.loaded = new Map();
     this.entityMeshes = new Map();
     this.disposed = false;
@@ -45,15 +38,13 @@ export class GameplayRenderAdapter {
   }
 
   #scaleMesh(mesh, state) {
-    const scale = this.unitsPerMeter;
-    if (state.type === 'human') {
-      mesh.scale.set(0.32 * scale, 0.875 * scale, 0.32 * scale);
-    } else if (state.type === 'tank') {
-      mesh.scale.set(1.82 * scale, 0.72 * scale, 2.7 * scale);
-    } else {
-      const radiusMeters = finiteWorldUnitsToMeters(320);
-      mesh.scale.set(radiusMeters * scale, radiusMeters * 0.9 * scale, radiusMeters * scale);
-    }
+    const finiteUnitScale = this.unitsPerMeter / PRODUCTION_VISUAL_UNITS_PER_METER;
+    const visualScale = Number(mesh.userData.productionVisualScale ?? 1);
+    mesh.scale.set(
+      finiteUnitScale * visualScale,
+      finiteUnitScale * visualScale,
+      finiteUnitScale * visualScale,
+    );
   }
 
   #positionGroup(entry) {
@@ -70,11 +61,9 @@ export class GameplayRenderAdapter {
   #positionMesh(mesh, state, entry) {
     const localX = state.x - entry.chunkX * LOGICAL_CHUNK_SIZE_METERS;
     const localZ = state.z - entry.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const centerHeightMeters = state.type === 'human' ? 0.875
-      : state.type === 'tank' ? 0.72 : finiteWorldUnitsToMeters(320);
     mesh.position.set(
       localX * this.unitsPerMeter,
-      centerHeightMeters * this.unitsPerMeter,
+      0,
       localZ * this.unitsPerMeter,
     );
     mesh.rotation.y = state.rotationY;
@@ -96,19 +85,15 @@ export class GameplayRenderAdapter {
     if (this.loaded.has(key)) throw new Error(`gameplay chunk already loaded: ${key}`);
     const { chunkX, chunkZ } = parseChunkKey(key);
     const Group = requireConstructor(this.THREE, 'Group');
-    const Mesh = requireConstructor(this.THREE, 'Mesh');
     const group = new Group();
     group.name = `w6-gameplay-chunk-${key}`;
     group.userData = { chunkKey: key };
     const entry = { key, chunkX, chunkZ, group, entityIds: new Set() };
     this.#positionGroup(entry);
     for (const state of entityStates) {
-      if (!this.geometries[state.type] || !this.materials[state.type]) {
-        throw new Error(`unsupported gameplay entity type: ${state.type}`);
-      }
       if (this.entityMeshes.has(state.stableId)) throw new Error(`duplicate live gameplay Stable ID: ${state.stableId}`);
-      const mesh = new Mesh(this.geometries[state.type], this.materials[state.type]);
-      mesh.name = `w6-${state.type}`;
+      const mesh = this.visualAssets.createEntityModel(state.type);
+      mesh.name = `production-${state.type}`;
       mesh.userData = { stableId: state.stableId, ownerChunkKey: key, type: state.type };
       this.#scaleMesh(mesh, state);
       this.#positionMesh(mesh, state, entry);
@@ -147,9 +132,11 @@ export class GameplayRenderAdapter {
       schemaVersion: 'w6-gameplay-render-adapter-1',
       liveChunkGroups: this.loaded.size,
       liveEntityMeshes: this.entityMeshes.size,
-      sharedGeometryCount: Object.keys(this.geometries).length,
-      sharedMaterialCount: Object.keys(this.materials).length,
-      sharedDisposed: this.disposed,
+      sharedGeometryCount: this.visualAssets.snapshot().sharedGeometryCount,
+      sharedMaterialCount: this.visualAssets.snapshot().sharedMaterialCount,
+      sharedDisposed: this.disposed
+        && (!this.ownsVisualAssets || this.visualAssets.snapshot().disposed),
+      productionVisuals: this.visualAssets.snapshot(),
       counts: Object.freeze({ ...this.counts }),
     });
   }
@@ -158,8 +145,7 @@ export class GameplayRenderAdapter {
     if (this.disposed) return;
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
     this.scene.remove(this.root);
-    for (const geometry of Object.values(this.geometries)) geometry.dispose();
-    for (const material of Object.values(this.materials)) material.dispose();
+    if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.disposed = true;
   }
 }
