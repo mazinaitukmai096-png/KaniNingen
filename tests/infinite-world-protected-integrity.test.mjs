@@ -37,7 +37,7 @@ test('every worktree change stays inside the isolated W1A sandbox allowlist', ()
   const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
     cwd: repoRoot,
     encoding: 'utf8',
-  }).trim().split(/\r?\n/).filter(Boolean);
+  }).trimEnd().split(/\r?\n/).filter(Boolean);
   const changedPaths = status.map(line => line.slice(3).replaceAll('\\', '/'));
   assert.ok(changedPaths.length > 0);
   for (const path of changedPaths) {

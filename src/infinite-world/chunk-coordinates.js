@@ -1,6 +1,17 @@
 export const LOGICAL_CHUNK_SIZE_METERS = 16;
 export const RENDER_CHUNK_SIZE = 4096;
 export const UNITS_PER_METER = RENDER_CHUNK_SIZE / LOGICAL_CHUNK_SIZE_METERS;
+export const SUPPORTED_RENDER_CHUNK_SIZES = Object.freeze([4096, 2048]);
+
+export function createRenderScale(renderChunkSize = RENDER_CHUNK_SIZE) {
+  if (!SUPPORTED_RENDER_CHUNK_SIZES.includes(renderChunkSize)) {
+    throw new RangeError(`renderChunkSize must be one of ${SUPPORTED_RENDER_CHUNK_SIZES.join(', ')}`);
+  }
+  return Object.freeze({
+    renderChunkSize,
+    unitsPerMeter: renderChunkSize / LOGICAL_CHUNK_SIZE_METERS,
+  });
+}
 
 export const MAX_LOGICAL_CHUNK_COORDINATE = Math.floor(
   (Number.MAX_SAFE_INTEGER - LOGICAL_CHUNK_SIZE_METERS) / LOGICAL_CHUNK_SIZE_METERS,
@@ -75,19 +86,33 @@ export function logicalLocalToWorldMeters(chunkX, chunkZ, logicalLocalX, logical
   });
 }
 
-export function chunkRenderPosition(chunkX, chunkZ, renderOriginChunkX, renderOriginChunkZ) {
+export function chunkRenderPosition(
+  chunkX,
+  chunkZ,
+  renderOriginChunkX,
+  renderOriginChunkZ,
+  renderChunkSize = RENDER_CHUNK_SIZE,
+) {
+  const scale = createRenderScale(renderChunkSize);
   return Object.freeze({
     x: (assertLogicalChunkCoordinate(chunkX, 'chunkX')
-      - assertLogicalChunkCoordinate(renderOriginChunkX, 'renderOriginChunkX')) * RENDER_CHUNK_SIZE,
+      - assertLogicalChunkCoordinate(renderOriginChunkX, 'renderOriginChunkX')) * scale.renderChunkSize,
     z: (assertLogicalChunkCoordinate(chunkZ, 'chunkZ')
-      - assertLogicalChunkCoordinate(renderOriginChunkZ, 'renderOriginChunkZ')) * RENDER_CHUNK_SIZE,
+      - assertLogicalChunkCoordinate(renderOriginChunkZ, 'renderOriginChunkZ')) * scale.renderChunkSize,
   });
 }
 
-export function logicalWorldToRenderLocal(worldX, worldZ, renderOriginChunkX, renderOriginChunkZ) {
+export function logicalWorldToRenderLocal(
+  worldX,
+  worldZ,
+  renderOriginChunkX,
+  renderOriginChunkZ,
+  renderChunkSize = RENDER_CHUNK_SIZE,
+) {
+  const scale = createRenderScale(renderChunkSize);
   return Object.freeze({
-    x: (worldX - renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
-    z: (worldZ - renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
+    x: (worldX - renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS) * scale.unitsPerMeter,
+    z: (worldZ - renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * scale.unitsPerMeter,
   });
 }
 

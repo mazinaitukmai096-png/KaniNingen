@@ -4,6 +4,7 @@ import {
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import { FloatingOrigin } from './floating-origin.js';
+import { validateTerrainEdgePair } from './legacy-core/g2/terrain-edge.js';
 import { evaluateW1APerformanceWarnings, PerformanceLedger } from './performance-metrics.js';
 
 function defaultClock() {
@@ -15,7 +16,13 @@ function sortedKeys(values) {
 }
 
 export class ChunkRuntimeManager {
-  constructor({ generator, renderAdapter, cacheCapacity = 81, clock = defaultClock } = {}) {
+  constructor({
+    generator,
+    renderAdapter,
+    cacheCapacity = 81,
+    identityAuditCapacity = 4096,
+    clock = defaultClock,
+  } = {}) {
     if (typeof generator?.generateChunk !== 'function') throw new TypeError('generator.generateChunk is required');
     for (const method of ['rebase', 'projectChunk', 'loadProjected', 'unloadChunk', 'shutdown']) {
       if (typeof renderAdapter?.[method] !== 'function') throw new TypeError(`renderAdapter.${method} is required`);
@@ -23,14 +30,19 @@ export class ChunkRuntimeManager {
     if (!Number.isSafeInteger(cacheCapacity) || cacheCapacity < 25) {
       throw new RangeError('cacheCapacity must retain at least the active 5x5 data set');
     }
+    if (!Number.isSafeInteger(identityAuditCapacity) || identityAuditCapacity < cacheCapacity) {
+      throw new RangeError('identityAuditCapacity must be an integer at least as large as cacheCapacity');
+    }
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
     this.generator = generator;
     this.renderAdapter = renderAdapter;
     this.cacheCapacity = cacheCapacity;
+    this.identityAuditCapacity = identityAuditCapacity;
     this.clock = clock;
     this.floatingOrigin = new FloatingOrigin();
     this.performance = new PerformanceLedger();
     this.cache = new Map();
+    this.identityAudit = new Map();
     this.activeDataKeys = new Set();
     this.renderedKeys = new Set();
     this.centerChunkX = null;
@@ -47,6 +59,13 @@ export class ChunkRuntimeManager {
       dataEvicted: 0,
       renderLoaded: 0,
       renderUnloaded: 0,
+      transitionsRequested: 0,
+      transitionsPerformed: 0,
+      transitionsCoalesced: 0,
+      identityAuditEvicted: 0,
+      maxCacheSize: 0,
+      maxActiveDataCount: 0,
+      maxRenderedCount: 0,
     };
   }
 
@@ -57,6 +76,7 @@ export class ChunkRuntimeManager {
   transitionToChunk(chunkXInput, chunkZInput) {
     const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'centerChunkX');
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'centerChunkZ');
+    this.counts.transitionsRequested += 1;
     const operation = this.transitionChain.then(() => this.#performTransition(chunkX, chunkZ));
     this.transitionChain = operation.catch(() => {});
     return operation;
@@ -65,6 +85,7 @@ export class ChunkRuntimeManager {
   async #performTransition(chunkX, chunkZ) {
     if (this.isShutdown) throw new Error('chunk runtime manager is shut down');
     if (this.centerChunkX === chunkX && this.centerChunkZ === chunkZ) {
+      this.counts.transitionsCoalesced += 1;
       return this.latestTransition;
     }
     const startedAt = this.clock();
@@ -80,23 +101,28 @@ export class ChunkRuntimeManager {
     const desiredDataKeys = new Set(desiredDataCoordinates.map(coordinate => coordinate.key));
     const missingCoordinates = desiredDataCoordinates.filter(coordinate => !this.cache.has(coordinate.key));
 
-    await Promise.all(missingCoordinates.map(async coordinate => {
+    const generatedChunks = await Promise.all(missingCoordinates.map(async coordinate => {
       const generationStartedAt = this.clock();
       const chunkData = await this.generator.generateChunk(coordinate.chunkX, coordinate.chunkZ);
       this.performance.record('generation', this.clock() - generationStartedAt);
       if (!chunkData || chunkData.chunkX !== coordinate.chunkX || chunkData.chunkZ !== coordinate.chunkZ) {
         throw new Error(`generator returned invalid ChunkData for ${coordinate.key}`);
       }
+      return chunkData;
+    }));
+    missingCoordinates.forEach((coordinate, index) => {
+      const chunkData = generatedChunks[index];
       const existing = this.cache.get(coordinate.key);
       if (existing && (existing.data.chunkId !== chunkData.chunkId
         || existing.data.contentHash !== chunkData.contentHash)) {
         throw new Error(`same chunk key produced differing identity/content: ${coordinate.key}`);
       }
+      this.#registerIdentity(coordinate.key, chunkData);
       if (!existing) {
         this.cache.set(coordinate.key, { data: chunkData, lastUsed: ++this.accessTick });
         this.counts.generated += 1;
       }
-    }));
+    });
 
     for (const coordinate of desiredDataCoordinates) {
       const entry = this.cache.get(coordinate.key);
@@ -136,6 +162,11 @@ export class ChunkRuntimeManager {
     this.centerChunkX = chunkX;
     this.centerChunkZ = chunkZ;
     this.#evictInactiveCacheEntries();
+    this.#validateRuntimeInvariants();
+    this.counts.transitionsPerformed += 1;
+    this.counts.maxCacheSize = Math.max(this.counts.maxCacheSize, this.cache.size);
+    this.counts.maxActiveDataCount = Math.max(this.counts.maxActiveDataCount, this.activeDataKeys.size);
+    this.counts.maxRenderedCount = Math.max(this.counts.maxRenderedCount, this.renderedKeys.size);
     const durationMs = this.clock() - startedAt;
     if (!initial) this.performance.record('crossing', durationMs);
     this.latestTransition = Object.freeze({
@@ -151,6 +182,57 @@ export class ChunkRuntimeManager {
       durationMs,
     });
     return this.latestTransition;
+  }
+
+  #registerIdentity(key, chunkData) {
+    const identity = Object.freeze({ chunkId: chunkData.chunkId, contentHash: chunkData.contentHash });
+    const existing = this.identityAudit.get(key);
+    if (existing && (existing.chunkId !== identity.chunkId || existing.contentHash !== identity.contentHash)) {
+      throw new Error(`regenerated chunk changed identity/content: ${key}`);
+    }
+    if (existing) this.identityAudit.delete(key);
+    this.identityAudit.set(key, identity);
+    while (this.identityAudit.size > this.identityAuditCapacity) {
+      this.identityAudit.delete(this.identityAudit.keys().next().value);
+      this.counts.identityAuditEvicted += 1;
+    }
+  }
+
+  #validateRuntimeInvariants() {
+    if (this.activeDataKeys.size !== 25) throw new Error(`active data set must remain 25, got ${this.activeDataKeys.size}`);
+    if (this.renderedKeys.size !== 9) throw new Error(`render set must remain 9, got ${this.renderedKeys.size}`);
+    if (this.cache.size > this.cacheCapacity) throw new Error('cache exceeded its explicit capacity');
+    for (const key of this.renderedKeys) {
+      if (!this.activeDataKeys.has(key)) throw new Error(`rendered chunk is outside active data set: ${key}`);
+    }
+    const chunkIds = new Map();
+    const featureIds = new Set();
+    for (const key of this.activeDataKeys) {
+      const chunkData = this.cache.get(key)?.data;
+      if (!chunkData) throw new Error(`active ChunkData is undefined: ${key}`);
+      const priorKey = chunkIds.get(chunkData.chunkId);
+      if (priorKey && priorKey !== key) throw new Error(`duplicate chunkId across ${priorKey} and ${key}`);
+      chunkIds.set(chunkData.chunkId, key);
+      for (const proxy of [...chunkData.vegetationProxies, ...chunkData.rockProxies]) {
+        if (featureIds.has(proxy.stableId)) throw new Error(`duplicate Stable ID in active set: ${proxy.stableId}`);
+        featureIds.add(proxy.stableId);
+      }
+      for (const [edge, offsetX, offsetZ, opposite] of [
+        ['east', 1, 0, 'west'],
+        ['south', 0, 1, 'north'],
+      ]) {
+        const neighbor = this.cache.get(createChunkKey(
+          chunkData.chunkX + offsetX,
+          chunkData.chunkZ + offsetZ,
+        ))?.data;
+        if (!neighbor || !this.activeDataKeys.has(createChunkKey(neighbor.chunkX, neighbor.chunkZ))) continue;
+        if (chunkData.edgeData[edge].hash !== neighbor.edgeData[opposite].hash) {
+          throw new Error(`shared edge hash mismatch: ${key}:${edge}`);
+        }
+        const validation = validateTerrainEdgePair(chunkData.terrain, edge, neighbor.terrain, opposite);
+        if (!validation.valid) throw new Error(`shared terrain edge mismatch: ${key}:${edge}: ${validation.errors.join('; ')}`);
+      }
+    }
   }
 
   #evictInactiveCacheEntries() {
@@ -187,6 +269,8 @@ export class ChunkRuntimeManager {
       renderedCount: this.renderedKeys.size,
       cacheSize: this.cache.size,
       cacheCapacity: this.cacheCapacity,
+      identityAuditSize: this.identityAudit.size,
+      identityAuditCapacity: this.identityAuditCapacity,
       activeDataKeys: Object.freeze(sortedKeys(this.activeDataKeys)),
       renderedKeys: Object.freeze(sortedKeys(this.renderedKeys)),
       counts: Object.freeze({ ...this.counts }),
@@ -208,6 +292,7 @@ export class ChunkRuntimeManager {
     this.renderedKeys.clear();
     this.activeDataKeys.clear();
     this.cache.clear();
+    this.identityAudit.clear();
     await this.renderAdapter.shutdown();
     this.isShutdown = true;
   }

@@ -1,6 +1,7 @@
 import {
+  LOGICAL_CHUNK_SIZE_METERS,
   RENDER_CHUNK_SIZE,
-  UNITS_PER_METER,
+  SUPPORTED_RENDER_CHUNK_SIZES,
   chunkRenderPosition,
   createChunkKey,
 } from '../chunk-coordinates.js';
@@ -15,12 +16,13 @@ export class ChunkRenderAdapter {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
     }
-    if (renderChunkSize !== RENDER_CHUNK_SIZE) {
-      throw new RangeError(`W1A renderChunkSize must remain ${RENDER_CHUNK_SIZE}`);
+    if (!SUPPORTED_RENDER_CHUNK_SIZES.includes(renderChunkSize)) {
+      throw new RangeError(`renderChunkSize must be one of ${SUPPORTED_RENDER_CHUNK_SIZES.join(', ')}`);
     }
     this.THREE = THREE;
     this.scene = scene;
     this.renderChunkSize = renderChunkSize;
+    this.unitsPerMeter = renderChunkSize / LOGICAL_CHUNK_SIZE_METERS;
     this.renderOriginChunkX = 0;
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
@@ -72,6 +74,7 @@ export class ChunkRenderAdapter {
       projected.chunkZ,
       this.renderOriginChunkX,
       this.renderOriginChunkZ,
+      this.renderChunkSize,
     );
     projected.group.position.set(position.x, 0, position.z);
   }
@@ -103,7 +106,7 @@ export class ChunkRenderAdapter {
     treeMesh.count = chunkData.vegetationProxies.length;
     const transform = new Object3D();
     chunkData.vegetationProxies.forEach((proxy, index) => {
-      transform.position.set(proxy.logicalLocalX * UNITS_PER_METER, 260 * proxy.scale, proxy.logicalLocalZ * UNITS_PER_METER);
+      transform.position.set(proxy.logicalLocalX * this.unitsPerMeter, 260 * proxy.scale, proxy.logicalLocalZ * this.unitsPerMeter);
       transform.rotation.set(0, proxy.yawRadians, 0);
       transform.scale.set(proxy.scale, proxy.scale, proxy.scale);
       transform.updateMatrix();
@@ -120,7 +123,7 @@ export class ChunkRenderAdapter {
     rockMesh.name = 'w1a-rock-proxies';
     rockMesh.count = chunkData.rockProxies.length;
     chunkData.rockProxies.forEach((proxy, index) => {
-      transform.position.set(proxy.logicalLocalX * UNITS_PER_METER, 85 * proxy.scale, proxy.logicalLocalZ * UNITS_PER_METER);
+      transform.position.set(proxy.logicalLocalX * this.unitsPerMeter, 85 * proxy.scale, proxy.logicalLocalZ * this.unitsPerMeter);
       transform.rotation.set(0, proxy.yawRadians, 0);
       transform.scale.set(proxy.scale, proxy.scale * 0.65, proxy.scale);
       transform.updateMatrix();

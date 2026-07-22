@@ -1,4 +1,5 @@
 import { ChunkRuntimeManager } from './chunk-runtime-manager.js';
+import { runW1BChunkSizeBenchmark } from './chunk-size-benchmark.js';
 import {
   UNITS_PER_METER,
   decomposeLogicalWorldPosition,
@@ -16,6 +17,8 @@ if (!viewport || !hud) throw new Error('sandbox DOM is incomplete');
 const query = new URLSearchParams(globalThis.location.search);
 const requestedSeed = query.get('seed') ?? 'KaniNingen W1A';
 const generator = await createSandboxChunkGenerator({ worldSeed: requestedSeed });
+const chunkSizeBenchmark = runW1BChunkSizeBenchmark({ iterations: 25_000, rounds: 5 });
+const selectedRenderChunkSize = chunkSizeBenchmark.decision.selectedRenderChunkSize;
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x9bb6c5);
@@ -47,7 +50,7 @@ markerDirection.position.set(0, 95, -180);
 playerMarker.add(markerDirection);
 scene.add(playerMarker);
 
-const renderAdapter = new ChunkRenderAdapter({ THREE, scene });
+const renderAdapter = new ChunkRenderAdapter({ THREE, scene, renderChunkSize: selectedRenderChunkSize });
 const runtime = new ChunkRuntimeManager({ generator, renderAdapter, cacheCapacity: 81 });
 const logicalPlayer = { x: 8, z: 8 };
 const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
@@ -141,6 +144,7 @@ World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
 Render Origin Chunk: (${state.renderOrigin.renderOriginChunkX}, ${state.renderOrigin.renderOriginChunkZ})
+W1B Render Profile: ${selectedRenderChunkSize} (${chunkSizeBenchmark.decision.selectedUnitsPerMeter} units/m; 4096/2048 compared)
 Rendered: ${state.renderedCount}/9  Prefetched Data: ${state.activeDataCount}/25  Cache: ${state.cacheSize}/${state.cacheCapacity}
 Generated: ${state.counts.generated}  Loaded: ${state.counts.renderLoaded}  Unloaded: ${state.counts.renderUnloaded}  Rebase: ${state.renderOrigin.rebaseCount}
 Latest crossing: ${number(transition?.durationMs)}ms  generated Δ${transition?.generatedDelta ?? 0}  load Δ${transition?.renderLoadedDelta ?? 0}  unload Δ${transition?.renderUnloadedDelta ?? 0}
@@ -187,6 +191,7 @@ globalThis.__w1aSandbox = Object.freeze({
   runtime,
   generator,
   renderAdapter,
+  chunkSizeBenchmark,
   logicalPlayer,
   snapshot: () => ({ runtime: runtime.snapshot(), resources: renderAdapter.resourceSnapshot() }),
   shutdown,
