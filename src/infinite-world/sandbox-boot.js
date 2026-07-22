@@ -509,6 +509,21 @@ export async function bootInfiniteWorldSandbox({
         logicalPlayer.z = generator.reviewSpawn.z;
         logicalPlayer.facingY = 0;
       },
+      onRestart: async () => {
+        await gameplay.restart({
+          playerSpawn: generator.reviewSpawn,
+          renderOrigin: runtime.snapshot().renderOrigin,
+        });
+        const restartOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+        await runtime.transitionToChunk(restartOwner.chunkX, restartOwner.chunkZ);
+        const restartRuntime = runtime.snapshot();
+        await gameplay.syncActiveChunks({
+          renderedKeys: restartRuntime.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: restartRuntime.renderOrigin,
+        });
+        await saveWorld();
+      },
       onSettingsChanged: settings => {
         const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
         renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
@@ -664,13 +679,18 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           measurement.completedAt = frameNow;
           measurement.status = 'complete';
         }
-        const effectiveDeltaSeconds = experienceShell.isPaused() && !measurement.mode ? 0 : deltaSeconds;
+        const effectiveDeltaSeconds = (experienceShell.isPaused() && !measurement.mode)
+          || gameplay.isHitStopped(frameNow) ? 0 : deltaSeconds;
         const owner = updatePlayer(effectiveDeltaSeconds);
         gameplay.update({
           deltaSeconds: effectiveDeltaSeconds,
           player: logicalPlayer,
           renderOrigin: runtime.snapshot().renderOrigin,
         });
+        const presentation = gameplay.consumePresentationEffects();
+        if (presentation.cameraShake > 0) {
+          experienceShell.applyCameraShake(presentation.cameraShake);
+        }
         renderer.render(scene, camera);
         if (frameNow - lastHudAt > 120) {
           updateHud(owner);

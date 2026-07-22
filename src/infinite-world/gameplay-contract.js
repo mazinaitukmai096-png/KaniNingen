@@ -9,8 +9,15 @@ import {
   PLAYER_MAX_HP,
   SAVE_VERSION,
   TANK_APPROACH_DIST,
+  TANK_BULLET_DAMAGE,
+  TANK_BULLET_HIT_RADIUS,
+  TANK_BULLET_LIFE,
+  TANK_BULLET_SPEED,
   TANK_DESPAWN_DIST,
   TANK_ENGAGE_RANGE,
+  TANK_FIRE_INTERVAL_BASE,
+  TANK_FIRE_INTERVAL_MIN,
+  TANK_FIRE_INTERVAL_SCORE_DIVISOR,
   TANK_HP,
   TANK_MOVE_SPEED,
   TANK_RADIUS,
@@ -40,6 +47,35 @@ export const W6_ATTACK_CONTRACT = Object.freeze({
   cooldownMs: ATTACK_COOLDOWN,
   singleDamage: 550,
   doubleDamage: 650,
+});
+
+export const W7_CORE_COMBAT_CONTRACT = Object.freeze({
+  tank: Object.freeze({
+    fireIntervalMinimumMs: TANK_FIRE_INTERVAL_MIN,
+    fireIntervalBaseMs: TANK_FIRE_INTERVAL_BASE,
+    fireIntervalScoreDivisor: TANK_FIRE_INTERVAL_SCORE_DIVISOR,
+    bulletSpeed: TANK_BULLET_SPEED,
+    bulletLifeFrames: TANK_BULLET_LIFE,
+    bulletHitRadius: TANK_BULLET_HIT_RADIUS,
+    bulletDamage: TANK_BULLET_DAMAGE,
+    bulletCameraShake: 35,
+  }),
+  building: Object.freeze({
+    damagedHitStopMs: 32,
+    destroyedHitStopMs: 65,
+    destroyedShakeMinimum: 50,
+    destroyedShakeRadiusFactor: 0.21,
+    destroyedShakeMaximum: 88,
+  }),
+  healing: Object.freeze({
+    human: 1,
+    house: 3,
+    tower: 5,
+    church: 10,
+    school: 12,
+    rock: 2,
+    pebble: 0.5,
+  }),
 });
 
 export const W6_ENTITY_CONTRACTS = Object.freeze({

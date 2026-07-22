@@ -18,6 +18,7 @@ export function createExperienceCameraState(scaleProfile) {
     verticalVelocityMetersPerSecond: 0,
     grounded: true,
     shake: 0,
+    shakePhase: 0,
   };
 }
 
@@ -37,6 +38,7 @@ export function createInfiniteExperienceShell({
   onSave = () => {},
   onLoad = () => {},
   onHome = () => {},
+  onRestart = () => {},
   onSettingsChanged = () => {},
 } = {}) {
   if (!worldState || typeof worldState.setScaleStage !== 'function') {
@@ -55,6 +57,7 @@ export function createInfiniteExperienceShell({
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
     quality: byId('set-quality'), fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
     shake: byId('set-shake'), shakeValue: byId('val-shake'), finalScore: byId('final-score'),
+    gameOver: byId('game-over'), restart: byId('restart-button'),
   };
   const state = {
     mode: elements.startButton ? 'menu' : 'playing',
@@ -99,6 +102,7 @@ export function createInfiniteExperienceShell({
     setVisible(elements.boss, false);
     setVisible(elements.charge, false);
     setVisible(elements.news, false);
+    setVisible(elements.gameOver, state.mode === 'gameover');
   }
 
   function resume() {
@@ -121,6 +125,17 @@ export function createInfiniteExperienceShell({
     state.mode = 'menu'; state.paused = true; state.settingsOpen = false; state.debugOpen = false;
     leaveLock(); onHome(); syncShellVisibility();
   }
+  async function restart() {
+    await onRestart();
+    state.mode = 'playing';
+    state.paused = false;
+    state.camera.verticalMeters = 0;
+    state.camera.verticalVelocityMetersPerSecond = 0;
+    state.camera.grounded = true;
+    state.camera.shake = 0;
+    syncShellVisibility();
+    requestLock();
+  }
 
   listen(elements.startButton, 'click', start);
   listen(elements.lobbySettings, 'click', openSettings);
@@ -128,6 +143,7 @@ export function createInfiniteExperienceShell({
   listen(elements.resume, 'click', resume);
   listen(elements.debugClose, 'click', closeDebug);
   listen(elements.home, 'click', returnHome);
+  listen(elements.restart, 'click', () => { void restart(); });
   listen(elements.reset, 'click', () => { onHome(); if (state.mode === 'playing') resume(); });
   for (const button of documentObject?.querySelectorAll?.('[data-scale-stage]') ?? []) {
     listen(button, 'click', () => worldState.setScaleStage(button.dataset.scaleStage));
@@ -247,10 +263,17 @@ export function createInfiniteExperienceShell({
     const horizontal = Math.cos(state.camera.pitch) * state.camera.distanceMeters * unitsPerMeter;
     const vertical = (Math.sin(state.camera.pitch) * state.camera.distanceMeters
       + scaleProfile.cameraHeightMeters) * unitsPerMeter;
+    state.camera.shakePhase += 1.61803398875;
+    const shakeRender = state.camera.shake * state.settings.cameraShake * unitsPerMeter;
+    const shakeX = Math.sin(state.camera.shakePhase * 2.31) * shakeRender;
+    const shakeY = Math.sin(state.camera.shakePhase * 3.17) * shakeRender * 0.55;
+    const shakeZ = Math.cos(state.camera.shakePhase * 1.87) * shakeRender;
+    state.camera.shake *= 0.88;
+    if (state.camera.shake < 0.001) state.camera.shake = 0;
     camera.position.set(
-      renderLocal.x + Math.sin(state.camera.yaw) * horizontal,
-      targetY + vertical,
-      renderLocal.z + Math.cos(state.camera.yaw) * horizontal,
+      renderLocal.x + Math.sin(state.camera.yaw) * horizontal + shakeX,
+      targetY + vertical + shakeY,
+      renderLocal.z + Math.cos(state.camera.yaw) * horizontal + shakeZ,
     );
     camera.near = scaleProfile.stage.cameraNear;
     camera.updateProjectionMatrix?.();
@@ -267,6 +290,13 @@ export function createInfiniteExperienceShell({
     if (elements.hpFill?.style) elements.hpFill.style.width = `${clamp(hpPercent, 0, 100)}%`;
     if (elements.fps) elements.fps.textContent = `FPS: ${Math.round(fps)}`;
     if (elements.compassArrow?.style) elements.compassArrow.style.transform = `rotate(${state.camera.yaw}rad)`;
+    if (player.hp <= 0 && state.mode === 'playing') {
+      state.mode = 'gameover';
+      state.paused = true;
+      leaveLock();
+      if (elements.finalScore) elements.finalScore.textContent = money(player.score);
+      syncShellVisibility();
+    }
     if (elements.debugSummary) elements.debugSummary.textContent = [
       `Chunk ${runtimeSnapshot.centerChunkX},${runtimeSnapshot.centerChunkZ}  Rendered ${runtimeSnapshot.renderedCount}/9  Data ${runtimeSnapshot.activeDataCount}/25`,
       `Simulation ${gameplaySnapshot.activeSimulationChunkCount}/9  Entities ${gameplaySnapshot.simulatedEntityCount}  Targets ${gameplaySnapshot.simulatedStaticTargetCount}`,
@@ -281,6 +311,11 @@ export function createInfiniteExperienceShell({
     updatePlayer,
     updateCamera,
     renderHud,
+    applyCameraShake(amountFiniteWorldUnits) {
+      const amountMeters = finiteWorldUnitsToMeters(amountFiniteWorldUnits);
+      state.camera.shake = Math.max(state.camera.shake, amountMeters);
+      return state.camera.shake;
+    },
     start,
     resume,
     openSettings,

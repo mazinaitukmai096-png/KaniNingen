@@ -136,6 +136,35 @@ export class InfiniteWorldState {
     return Object.freeze({ ...next });
   }
 
+  damagePlayer(amount) {
+    const damage = nonNegative(amount, 'player damage');
+    if (damage === 0 || this.player.hp <= 0) return Object.freeze({ ...this.player });
+    this.player.hp = Math.max(0, this.player.hp - damage);
+    this.revision += 1;
+    return Object.freeze({ ...this.player });
+  }
+
+  healPlayer(amount) {
+    const healing = nonNegative(amount, 'player healing');
+    if (healing === 0 || this.player.hp <= 0) return Object.freeze({ ...this.player });
+    this.player.hp = Math.min(this.player.maxHp, this.player.hp + healing);
+    this.revision += 1;
+    return Object.freeze({ ...this.player });
+  }
+
+  restartRun({ playerSpawn } = {}) {
+    const spawn = {
+      x: finite(playerSpawn?.x, 'restart playerSpawn.x'),
+      z: finite(playerSpawn?.z, 'restart playerSpawn.z'),
+    };
+    this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
+    Object.assign(this.player, createW6PlayerState(spawn));
+    this.featureDamage.clear();
+    this.entityStates.clear();
+    this.revision += 1;
+    return this.snapshot();
+  }
+
   ensureEntity(descriptor) {
     const stableId = requiredString(descriptor?.stableId, 'entity descriptor stableId');
     const existing = this.entityStates.get(stableId);

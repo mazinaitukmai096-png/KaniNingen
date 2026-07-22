@@ -3,6 +3,7 @@ import {
   RENDER_CHUNK_SIZE,
   chunkRenderPosition,
   createChunkKey,
+  logicalWorldToRenderLocal,
   parseChunkKey,
 } from '../chunk-coordinates.js';
 import {
@@ -29,12 +30,20 @@ export class GameplayRenderAdapter {
     this.root = new Group();
     this.root.name = 'w6-gameplay-root';
     this.scene.add(this.root);
+    this.combatRoot = new Group();
+    this.combatRoot.name = 'w7-core-combat-root';
+    this.scene.add(this.combatRoot);
     this.visualAssets = visualAssets ?? createProductionVisualAssetLibrary({ THREE });
     this.ownsVisualAssets = visualAssets === null;
     this.loaded = new Map();
     this.entityMeshes = new Map();
+    this.projectileMeshes = new Map();
+    this.effectMeshes = new Map();
     this.disposed = false;
-    this.counts = { loaded: 0, unloaded: 0, created: 0, removed: 0, rebased: 0 };
+    this.counts = {
+      loaded: 0, unloaded: 0, created: 0, removed: 0, rebased: 0,
+      transientCreated: 0, transientRemoved: 0,
+    };
   }
 
   #scaleMesh(mesh, state) {
@@ -77,7 +86,63 @@ export class GameplayRenderAdapter {
       renderOriginChunkZ: origin.renderOriginChunkZ,
     };
     for (const entry of this.loaded.values()) this.#positionGroup(entry);
+    for (const entry of this.projectileMeshes.values()) this.#positionTransient(entry);
+    for (const entry of this.effectMeshes.values()) this.#positionTransient(entry);
     this.counts.rebased += 1;
+  }
+
+  #positionTransient(entry) {
+    const local = logicalWorldToRenderLocal(
+      entry.state.x,
+      entry.state.z,
+      this.origin.renderOriginChunkX,
+      this.origin.renderOriginChunkZ,
+      this.renderChunkSize,
+    );
+    entry.mesh.position.set(local.x, entry.height, local.z);
+  }
+
+  #syncTransientSet(map, states, createMesh) {
+    const desired = new Set(states.map(state => state.id));
+    for (const [id, entry] of map) {
+      if (desired.has(id)) continue;
+      this.combatRoot.remove(entry.mesh);
+      map.delete(id);
+      this.counts.transientRemoved += 1;
+    }
+    for (const state of states) {
+      let entry = map.get(state.id);
+      if (!entry) {
+        entry = createMesh(state);
+        map.set(state.id, entry);
+        this.combatRoot.add(entry.mesh);
+        this.counts.transientCreated += 1;
+      }
+      entry.state = state;
+      this.#positionTransient(entry);
+    }
+  }
+
+  syncTransientCombat(projectiles, effects) {
+    if (this.disposed) return false;
+    const Mesh = requireConstructor(this.THREE, 'Mesh');
+    this.#syncTransientSet(this.projectileMeshes, projectiles, state => {
+      const mesh = new Mesh(this.visualAssets.geometries.sphere, this.visualAssets.materials.gold);
+      mesh.name = 'tank-projectile';
+      mesh.scale.setScalar(0.5 * this.unitsPerMeter);
+      return { mesh, state, height: 0.55 * this.unitsPerMeter };
+    });
+    this.#syncTransientSet(this.effectMeshes, effects, state => {
+      const destructive = state.type.includes('destruction');
+      const mesh = new Mesh(
+        this.visualAssets.geometries.dodeca,
+        this.visualAssets.materials[destructive ? 'gold' : 'charred'],
+      );
+      mesh.name = `combat-${state.type}`;
+      mesh.scale.setScalar((destructive ? 1.35 : 0.45) * this.unitsPerMeter);
+      return { mesh, state, height: (destructive ? 0.8 : 0.3) * this.unitsPerMeter };
+    });
+    return true;
   }
 
   async loadChunk(key, entityStates) {
@@ -132,6 +197,8 @@ export class GameplayRenderAdapter {
       schemaVersion: 'w6-gameplay-render-adapter-1',
       liveChunkGroups: this.loaded.size,
       liveEntityMeshes: this.entityMeshes.size,
+      liveProjectileMeshes: this.projectileMeshes.size,
+      liveCombatEffectMeshes: this.effectMeshes.size,
       sharedGeometryCount: this.visualAssets.snapshot().sharedGeometryCount,
       sharedMaterialCount: this.visualAssets.snapshot().sharedMaterialCount,
       sharedDisposed: this.disposed
@@ -144,7 +211,9 @@ export class GameplayRenderAdapter {
   async shutdown() {
     if (this.disposed) return;
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
+    this.syncTransientCombat([], []);
     this.scene.remove(this.root);
+    this.scene.remove(this.combatRoot);
     if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.disposed = true;
   }

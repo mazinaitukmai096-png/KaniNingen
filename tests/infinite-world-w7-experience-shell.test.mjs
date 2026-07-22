@@ -41,6 +41,7 @@ function createFixture() {
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
     'debug-close-btn', 'debug-summary', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
+    'game-over', 'restart-button',
   ];
   const elements = new Map(ids.map(id => [id, createElement()]));
   elements.get('set-quality').value = 'high';
@@ -70,7 +71,7 @@ function createFixture() {
     activeScaleStageId: 'MAX',
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
   };
-  const calls = { attacks: [], saves: 0, loads: 0, homes: 0 };
+  const calls = { attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0 };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
     initialScaleProfile: getW6ScaleProfile('MAX'),
@@ -78,6 +79,7 @@ function createFixture() {
     onSave: () => { calls.saves += 1; },
     onLoad: () => { calls.loads += 1; },
     onHome: () => { calls.homes += 1; },
+    onRestart: () => { calls.restarts += 1; },
   });
   return { shell, globalObject, documentObject, canvas, camera, playerMarker, worldState, calls, elements, bodyClasses };
 }
@@ -172,6 +174,34 @@ test('debug, HUD hide, settings and home controls remain shell state only', () =
   fixture.elements.get('set-home-btn').dispatch('click');
   assert.equal(fixture.calls.homes, 1);
   assert.equal(fixture.shell.snapshot().mode, 'menu');
+  fixture.shell.dispose();
+});
+
+test('zero HP enters Game Over and Retry delegates to the existing runtime restart', async () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  fixture.shell.renderHud({
+    fps: 60,
+    gameplaySnapshot: {
+      state: {
+        player: { hp: 0, maxHp: 100, score: 450 }, activeScaleStageId: 'MAX',
+        destroyedFeatureCount: 0, destroyedEntityCount: 0,
+      },
+      activeSimulationChunkCount: 9, simulatedEntityCount: 1, simulatedStaticTargetCount: 1,
+    },
+    runtimeSnapshot: {
+      centerChunkX: 0, centerChunkZ: 0, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 20 } },
+    },
+    saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
+  });
+  assert.equal(fixture.shell.snapshot().mode, 'gameover');
+  assert.equal(fixture.elements.get('game-over').style.display, 'flex');
+  assert.equal(fixture.elements.get('final-score').textContent, '$4,500,000');
+  fixture.elements.get('restart-button').dispatch('click');
+  await Promise.resolve();
+  assert.equal(fixture.calls.restarts, 1);
+  assert.equal(fixture.shell.snapshot().mode, 'playing');
   fixture.shell.dispose();
 });
 

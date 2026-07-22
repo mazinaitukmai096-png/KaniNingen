@@ -8,6 +8,7 @@ import {
   W6_ATTACK_CONTRACT,
   W6_ENTITY_CONTRACTS,
   W6_STATIC_TARGET_CONTRACTS,
+  W7_CORE_COMBAT_CONTRACT,
   canW6StageDamageTarget,
   finiteWorldFrameSpeedToMetersPerSecond,
   finiteWorldUnitsToMeters,
@@ -17,6 +18,7 @@ import { createDeterministicRandom, deriveLocalSeed64 } from './legacy-core/g0/d
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 
 const EPSILON_METERS = 0.05;
+const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school']);
 
 function sorted(values) {
   return [...values].sort((a, b) => a.localeCompare(b));
@@ -29,6 +31,16 @@ function q6(value) {
 
 function distanceSquared(a, b) {
   return (a.x - b.x) ** 2 + (a.z - b.z) ** 2;
+}
+
+function pointSegmentDistanceSquared(point, start, end) {
+  const dx = end.x - start.x;
+  const dz = end.z - start.z;
+  const lengthSquared = dx * dx + dz * dz;
+  if (lengthSquared <= 1e-12) return distanceSquared(point, start);
+  const projection = Math.max(0, Math.min(1,
+    ((point.x - start.x) * dx + (point.z - start.z) * dz) / lengthSquared));
+  return distanceSquared(point, { x: start.x + dx * projection, z: start.z + dz * projection });
 }
 
 function ownerContains(ownerChunkKey, x, z) {
@@ -230,6 +242,12 @@ export class InfiniteGameplayRuntime {
     this.activeChunks = new Map();
     this.stableIdOwners = new Map();
     this.lastAttackAt = -Infinity;
+    this.projectiles = [];
+    this.combatEffects = [];
+    this.combatSequence = 0;
+    this.pendingCameraShake = 0;
+    this.hitStopUntil = -Infinity;
+    this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.isShutdown = false;
     this.counts = {
       chunksLoaded: 0,
@@ -241,7 +259,31 @@ export class InfiniteGameplayRuntime {
       destroyedFeatures: 0,
       destroyedEntities: 0,
       revisits: 0,
+      tankShots: 0,
+      playerHits: 0,
+      playerDeaths: 0,
+      combatEffects: 0,
+      restarts: 0,
     };
+  }
+
+  #emitCombatEffect({ type, x, z, durationSeconds, cameraShake = 0, hitStopMs = 0 }) {
+    const effect = {
+      id: `combat-effect:${++this.combatSequence}`,
+      type,
+      x: q6(x),
+      z: q6(z),
+      remainingSeconds: durationSeconds,
+    };
+    this.combatEffects.push(effect);
+    this.pendingCameraShake = Math.max(this.pendingCameraShake, cameraShake);
+    if (hitStopMs > 0) this.hitStopUntil = Math.max(this.hitStopUntil, this.clock() + hitStopMs);
+    this.counts.combatEffects += 1;
+    return effect;
+  }
+
+  #syncTransientCombat() {
+    this.renderAdapter.syncTransientCombat?.(this.projectiles, this.combatEffects);
   }
 
   #registerStableId(stableId, ownerChunkKey) {
@@ -262,6 +304,7 @@ export class InfiniteGameplayRuntime {
       if (desired.has(key)) continue;
       await this.renderAdapter.unloadChunk(key);
       this.activeChunks.delete(key);
+      this.projectiles = this.projectiles.filter(projectile => projectile.ownerChunkKey !== key);
       this.counts.chunksUnloaded += 1;
     }
     for (const key of sorted(desired)) {
@@ -288,6 +331,7 @@ export class InfiniteGameplayRuntime {
     }
     if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
     await this.renderAdapter.rebase(renderOrigin);
+    this.#syncTransientCombat();
     this.featureRenderAdapter?.refreshFeatureStates?.();
     return this.snapshot();
   }
@@ -309,8 +353,19 @@ export class InfiniteGameplayRuntime {
   update({ deltaSeconds, player } = {}) {
     if (this.isShutdown) return;
     if (!Number.isFinite(deltaSeconds) || deltaSeconds < 0) throw new TypeError('deltaSeconds must be non-negative');
-    this.state.updatePlayer({ x: player.x, z: player.z });
     const boundedDelta = Math.min(deltaSeconds, 0.05);
+    if (boundedDelta > 0 && (this.playerKnockback.x !== 0 || this.playerKnockback.z !== 0)) {
+      player.x += this.playerKnockback.x * boundedDelta;
+      player.z += this.playerKnockback.z * boundedDelta;
+      const decay = this.playerKnockback.decayPerFrame ** (boundedDelta * 60);
+      this.playerKnockback.x *= decay;
+      this.playerKnockback.z *= decay;
+      if (Math.hypot(this.playerKnockback.x, this.playerKnockback.z) < 0.01) {
+        this.playerKnockback.x = 0;
+        this.playerKnockback.z = 0;
+      }
+    }
+    this.state.updatePlayer({ x: player.x, z: player.z });
     for (const model of this.activeChunks.values()) {
       for (const descriptor of model.entityDescriptors) {
         const entity = this.state.entityStates.get(descriptor.stableId);
@@ -336,6 +391,30 @@ export class InfiniteGameplayRuntime {
             this.#moveToward(entity, player,
               finiteWorldFrameSpeedToMetersPerSecond(contract.moveSpeed), boundedDelta);
           } else entity.aiState = 'hold';
+          const combat = W7_CORE_COMBAT_CONTRACT.tank;
+          const intervalSeconds = Math.max(
+            combat.fireIntervalMinimumMs,
+            combat.fireIntervalBaseMs - this.state.player.score * combat.fireIntervalScoreDivisor,
+          ) / 1000;
+          const nextAiClock = entity.aiClock + boundedDelta;
+          if (distance <= finiteWorldUnitsToMeters(contract.engageRange)
+            && Math.floor(nextAiClock / intervalSeconds) > Math.floor(entity.aiClock / intervalSeconds)) {
+            const dx = player.x - entity.x;
+            const dz = player.z - entity.z;
+            const length = Math.hypot(dx, dz);
+            if (length > 1e-9) {
+              this.projectiles.push({
+                id: `${entity.stableId}:shot:${Math.floor(nextAiClock / intervalSeconds)}`,
+                ownerChunkKey: entity.ownerChunkKey,
+                x: entity.x,
+                z: entity.z,
+                directionX: dx / length,
+                directionZ: dz / length,
+                remainingSeconds: combat.bulletLifeFrames / 60,
+              });
+              this.counts.tankShots += 1;
+            }
+          }
         } else if (entity.type === 'boss') {
           const contract = W6_ENTITY_CONTRACTS.boss;
           if (distance > finiteWorldUnitsToMeters(contract.approachDistance)) {
@@ -349,11 +428,44 @@ export class InfiniteGameplayRuntime {
         this.counts.entityUpdates += 1;
       }
     }
+    const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
+    const bulletHitRadius = finiteWorldUnitsToMeters(W7_CORE_COMBAT_CONTRACT.tank.bulletHitRadius);
+    for (let index = this.projectiles.length - 1; index >= 0; index -= 1) {
+      const projectile = this.projectiles[index];
+      const start = { x: projectile.x, z: projectile.z };
+      projectile.x += projectile.directionX * bulletSpeed * boundedDelta;
+      projectile.z += projectile.directionZ * bulletSpeed * boundedDelta;
+      projectile.remainingSeconds -= boundedDelta;
+      const hit = this.state.player.hp > 0 && pointSegmentDistanceSquared(
+        this.state.player,
+        start,
+        projectile,
+      ) <= bulletHitRadius ** 2;
+      if (hit) {
+        const wasAlive = this.state.player.hp > 0;
+        this.state.damagePlayer(W7_CORE_COMBAT_CONTRACT.tank.bulletDamage);
+        this.#emitCombatEffect({
+          type: 'tank-impact', x: projectile.x, z: projectile.z, durationSeconds: 0.18,
+          cameraShake: W7_CORE_COMBAT_CONTRACT.tank.bulletCameraShake,
+        });
+        this.counts.playerHits += 1;
+        if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
+      }
+      if (hit || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
+    }
+    for (let index = this.combatEffects.length - 1; index >= 0; index -= 1) {
+      this.combatEffects[index].remainingSeconds -= boundedDelta;
+      if (this.combatEffects[index].remainingSeconds <= 0) this.combatEffects.splice(index, 1);
+    }
+    this.#syncTransientCombat();
     this.counts.simulationTicks += 1;
   }
 
   attack(mode = 'single', now = this.clock()) {
     if (!['single', 'double'].includes(mode)) throw new RangeError('attack mode must be single or double');
+    if (this.state.player.hp <= 0) {
+      return Object.freeze({ accepted: false, reason: 'player-dead', hits: Object.freeze([]) });
+    }
     if (now - this.lastAttackAt < W6_ATTACK_CONTRACT.cooldownMs) {
       this.counts.attackCooldownRejected += 1;
       return Object.freeze({ accepted: false, hits: Object.freeze([]) });
@@ -384,8 +496,25 @@ export class InfiniteGameplayRuntime {
         if (!beforeDestroyed && result.destroyed) {
           this.counts.destroyedFeatures += 1;
           this.state.player.score += target.scoreValue;
+          this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[target.type] ?? 0);
           this.featureRenderAdapter?.setFeatureDestroyed?.(target.stableId, true);
         }
+        const building = W7_CORE_COMBAT_CONTRACT.building;
+        const destroyedNow = !beforeDestroyed && result.destroyed;
+        const buildingHitStopMs = BUILDING_TYPES.has(target.type)
+          ? (destroyedNow ? building.destroyedHitStopMs : building.damagedHitStopMs) : 0;
+        const buildingShake = destroyedNow && BUILDING_TYPES.has(target.type)
+          ? Math.min(building.destroyedShakeMaximum,
+            building.destroyedShakeMinimum + target.radius * building.destroyedShakeRadiusFactor)
+          : damage / 7 * profile.stage.playerShakeMultiplier;
+        this.#emitCombatEffect({
+          type: destroyedNow ? 'destruction' : 'impact',
+          x: target.x,
+          z: target.z,
+          durationSeconds: destroyedNow ? 0.45 : 0.16,
+          cameraShake: buildingShake,
+          hitStopMs: buildingHitStopMs,
+        });
         hits.push(Object.freeze({ stableId: target.stableId, type: target.type, destroyed: result.destroyed }));
       }
       for (const descriptor of model.entityDescriptors) {
@@ -397,12 +526,59 @@ export class InfiniteGameplayRuntime {
         if (!result.alive) {
           this.counts.destroyedEntities += 1;
           this.state.player.score += descriptor.scoreValue;
+          this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[entity.type] ?? 0);
         }
+        this.#emitCombatEffect({
+          type: result.alive ? 'entity-impact' : 'entity-destruction',
+          x: entity.x,
+          z: entity.z,
+          durationSeconds: result.alive ? 0.16 : 0.45,
+          cameraShake: damage / 7 * profile.stage.playerShakeMultiplier,
+        });
         this.renderAdapter.syncEntity(this.state.entityStates.get(entity.stableId));
         hits.push(Object.freeze({ stableId: entity.stableId, type: entity.type, destroyed: !result.alive }));
       }
     }
+    this.#syncTransientCombat();
     return Object.freeze({ accepted: true, mode, damage, radiusMeters: radius, hits: Object.freeze(hits) });
+  }
+
+  isHitStopped(now = this.clock()) {
+    return now < this.hitStopUntil;
+  }
+
+  applyPlayerKnockback({ directionX, directionZ, metersPerSecond, decayPerFrame = 0.85 } = {}) {
+    const length = Math.hypot(directionX, directionZ);
+    if (!Number.isFinite(length) || length <= 1e-9 || !Number.isFinite(metersPerSecond)
+      || metersPerSecond < 0 || !Number.isFinite(decayPerFrame) || decayPerFrame < 0 || decayPerFrame > 1) {
+      throw new TypeError('valid player knockback vector, speed, and decay are required');
+    }
+    this.playerKnockback = {
+      x: directionX / length * metersPerSecond,
+      z: directionZ / length * metersPerSecond,
+      decayPerFrame,
+    };
+    return Object.freeze({ ...this.playerKnockback });
+  }
+
+  consumePresentationEffects() {
+    const result = Object.freeze({ cameraShake: this.pendingCameraShake });
+    this.pendingCameraShake = 0;
+    return result;
+  }
+
+  async restart({ playerSpawn, renderOrigin } = {}) {
+    this.state.restartRun({ playerSpawn });
+    this.projectiles.length = 0;
+    this.combatEffects.length = 0;
+    this.pendingCameraShake = 0;
+    this.hitStopUntil = -Infinity;
+    this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.lastAttackAt = -Infinity;
+    this.counts.restarts += 1;
+    await this.refreshFromState({ renderOrigin });
+    this.#syncTransientCombat();
+    return this.snapshot();
   }
 
   damageStableId(stableId, amount) {
@@ -447,6 +623,9 @@ export class InfiniteGameplayRuntime {
       activeSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
       simulatedEntityCount,
       simulatedStaticTargetCount,
+      activeProjectileCount: this.projectiles.length,
+      activeCombatEffectCount: this.combatEffects.length,
+      hitStopped: this.isHitStopped(),
       state: this.state.snapshot(),
       render: this.renderAdapter.snapshot(),
       counts: Object.freeze({ ...this.counts }),
@@ -458,6 +637,9 @@ export class InfiniteGameplayRuntime {
     await this.renderAdapter.shutdown();
     this.activeChunks.clear();
     this.stableIdOwners.clear();
+    this.projectiles.length = 0;
+    this.combatEffects.length = 0;
+    this.#syncTransientCombat();
     this.isShutdown = true;
   }
 }
