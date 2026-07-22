@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 const BASELINE_COMMIT = '78c2ae19555ec54530f192034f7bd2acf05c4645';
+const FINITE_WORLD_CHECKPOINT = 'f8bc9f80c2af417bb585bff26c99522c4229ab8e';
 const repoRoot = resolve(import.meta.dirname, '..');
 
 function normalize(text) {
@@ -15,11 +16,31 @@ function readCurrent(path) {
   return normalize(readFileSync(resolve(repoRoot, path), 'utf8'));
 }
 
-function readBaseline(path) {
-  return normalize(execFileSync('git', ['show', `${BASELINE_COMMIT}:${path}`], {
+function readCommit(commit, path) {
+  return normalize(execFileSync('git', ['show', `${commit}:${path}`], {
     cwd: repoRoot,
     encoding: 'utf8',
   }));
+}
+
+function readBaseline(path) {
+  return readCommit(BASELINE_COMMIT, path);
+}
+
+function listFiniteCheckpointFiles() {
+  return execFileSync('git', [
+    'ls-tree', '-r', '--name-only', FINITE_WORLD_CHECKPOINT, '--', 'index.html', 'src', 'tests',
+  ], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  }).trim().split(/\r?\n/).filter(Boolean)
+    .filter(path => path !== 'tests/destruction-feel-regression.test.mjs');
+}
+
+function findFiniteCheckpointMismatches(currentReader = readCurrent) {
+  return listFiniteCheckpointFiles().filter(path => (
+    currentReader(path) !== readCommit(FINITE_WORLD_CHECKPOINT, path)
+  ));
 }
 
 function sliceBetween(source, startMarker, endMarker) {
@@ -93,7 +114,7 @@ test('attack power, hit radius, HP, and cooldown remain at baseline values', () 
 });
 
 test('Phase 4 changes do not include forbidden runtime or world-generation files', () => {
-  const changedFiles = execFileSync('git', ['diff', '--name-only', `${BASELINE_COMMIT}..HEAD`], {
+  const changedFiles = execFileSync('git', ['diff', '--name-only', `${BASELINE_COMMIT}..${FINITE_WORLD_CHECKPOINT}`], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trim().split(/\r?\n/).filter(Boolean);
@@ -130,4 +151,17 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
      'tests/world-scale-rebalance.test.mjs',
   ].includes(path)), `unexpected changed files: ${changedFiles.join(', ')}`);
   assert.ok(changedFiles.every(path => !/(terrain|chunk|query|seed|world.?generation)/i.test(path)));
+});
+
+test('finite World sources and existing regression fixtures remain fixed at the formal checkpoint', () => {
+  const finiteCheckpointFiles = listFiniteCheckpointFiles();
+  assert.ok(finiteCheckpointFiles.length > 0);
+  assert.equal(finiteCheckpointFiles.some(path => path.includes('infinite-world')), false);
+  assert.deepEqual(findFiniteCheckpointMismatches(), []);
+
+  const simulatedChangedPath = 'src/constants.js';
+  const mismatchesWithSimulatedFiniteEdit = findFiniteCheckpointMismatches(path => (
+    path === simulatedChangedPath ? `${readCurrent(path)}\n// simulated finite-world edit` : readCurrent(path)
+  ));
+  assert.deepEqual(mismatchesWithSimulatedFiniteEdit, [simulatedChangedPath]);
 });
