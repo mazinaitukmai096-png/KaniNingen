@@ -11,6 +11,10 @@ import {
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import { createDistributedSettlementChunkGenerator } from './distributed-settlement-chunk-generator.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
+import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
+import { getW6ScaleProfile } from './gameplay-contract.js';
+import { GameplayRenderAdapter } from './render/gameplay-render-adapter.js';
+import { InfiniteWorldSaveStore, InfiniteWorldState } from './world-state-store.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -62,7 +66,7 @@ async function settleWithin(promise, { stage, timeoutMs, setTimeoutFn, clearTime
 export function createSandboxBootState({ clock = defaultClock } = {}) {
   const startedAt = clock();
   return {
-    schemaVersion: 'w5-sandbox-boot-state-1',
+    schemaVersion: 'w6-sandbox-boot-state-1',
     status: 'booting',
     stage: 'DOMContentLoaded',
     bootStartedAt: startedAt,
@@ -86,6 +90,9 @@ export function createSandboxBootState({ clock = defaultClock } = {}) {
     renderProjectionMs: 0,
     startupSurveyExecuted: false,
     startupBenchmarkExecuted: false,
+    initialSimulationChunkCount: 0,
+    initialGameplayEntityCount: 0,
+    saveLoaded: false,
   };
 }
 
@@ -99,7 +106,7 @@ export function snapshotSandboxBootState(state) {
 
 export function renderSandboxBootStatus(hud, state) {
   if (!hud) return;
-  const badge = '<span id="badge">W5 / INFINITE SETTLEMENT DISTRIBUTION</span>';
+  const badge = '<span id="badge">W6 / INFINITE WORLD GAMEPLAY</span>';
   if (state.status === 'failed') {
     hud.innerHTML = `${badge}\n<span id="error">起動失敗: ${escapeHtml(state.stage)}</span>\n${escapeHtml(state.bootError?.message ?? 'unknown error')}`;
     return;
@@ -214,6 +221,10 @@ export async function bootInfiniteWorldSandbox({
   renderAdapterFactory = options => new ChunkRenderAdapter(options),
   runtimeFactory = options => new ChunkRuntimeManager(options),
   chunkIndexFactory = options => new PersistentChunkIndex(options),
+  worldStateFactory = options => new InfiniteWorldState(options),
+  saveStoreFactory = options => new InfiniteWorldSaveStore(options),
+  gameplayRenderAdapterFactory = options => new GameplayRenderAdapter(options),
+  gameplayRuntimeFactory = options => new InfiniteGameplayRuntime(options),
   clock = () => globalObject.performance?.now?.() ?? Date.now(),
   requestAnimationFrameFn = globalObject.requestAnimationFrame?.bind(globalObject),
   cancelAnimationFrameFn = globalObject.cancelAnimationFrame?.bind(globalObject) ?? (() => {}),
@@ -230,6 +241,10 @@ export async function bootInfiniteWorldSandbox({
   let generator = null;
   let renderAdapter = null;
   let runtime = null;
+  let worldState = null;
+  let saveStore = null;
+  let gameplayRenderAdapter = null;
+  let gameplay = null;
   let renderer = null;
   let markerBody = null;
   let markerMaterial = null;
@@ -261,6 +276,18 @@ export async function bootInfiniteWorldSandbox({
 
   try {
     generator = await runStage('Legacy Core', () => generatorFactory({ worldSeed: requestedSeed }));
+    await runStage('Save State', async () => {
+      worldState = worldStateFactory({
+        worldSeedHash: generator.worldSeedHash,
+        playerSpawn: generator.reviewSpawn,
+      });
+      let storage = null;
+      try {
+        if (globalObject.window === globalObject) storage = globalObject.localStorage ?? null;
+      } catch { storage = null; }
+      saveStore = saveStoreFactory({ storage, worldSeedHash: generator.worldSeedHash });
+      state.saveLoaded = (await saveStore.loadInto(worldState)) !== null;
+    });
     const renderProfile = createRuntimeRenderProfile();
     const selectedRenderChunkSize = renderProfile.selectedRenderChunkSize;
 
@@ -307,9 +334,14 @@ export async function bootInfiniteWorldSandbox({
     const playerMarker = rendererContext.playerMarker;
 
     const runtimeContext = await runStage('Chunk Runtime', () => {
-      renderAdapter = renderAdapterFactory({ THREE, scene, renderChunkSize: selectedRenderChunkSize });
+      renderAdapter = renderAdapterFactory({
+        THREE,
+        scene,
+        renderChunkSize: selectedRenderChunkSize,
+        isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
+      });
       const chunkIndex = chunkIndexFactory({ capacity: 65_536 });
-      const logicalPlayer = { x: generator.reviewSpawn.x, z: generator.reviewSpawn.z };
+      const logicalPlayer = worldState.player;
       const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       let chunkGenerationMs = 0;
       let renderProjectionMs = 0;
@@ -371,9 +403,35 @@ export async function bootInfiniteWorldSandbox({
       state.settlementGenerationMs = generatorSnapshot.templateGenerationMs;
     });
 
+    await runStage('Gameplay', async () => {
+      gameplayRenderAdapter = gameplayRenderAdapterFactory({
+        THREE,
+        scene,
+        renderChunkSize: selectedRenderChunkSize,
+      });
+      gameplay = gameplayRuntimeFactory({
+        worldSeedHash: generator.worldSeedHash,
+        generatorMajor: generator.generatorVersion.major,
+        state: worldState,
+        renderAdapter: gameplayRenderAdapter,
+        featureRenderAdapter: renderAdapter,
+        clock,
+      });
+      const runtimeSnapshot = runtime.snapshot();
+      await gameplay.syncActiveChunks({
+        renderedKeys: runtimeSnapshot.renderedKeys,
+        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+        renderOrigin: runtimeSnapshot.renderOrigin,
+      });
+      const gameplaySnapshot = gameplay.snapshot();
+      state.initialSimulationChunkCount = gameplaySnapshot.activeSimulationChunkCount;
+      state.initialGameplayEntityCount = gameplaySnapshot.simulatedEntityCount;
+    });
+
     const keys = new Set();
     let transitionTargetKey = null;
     let transitionError = null;
+    let saveStatus = state.saveLoaded ? 'loaded' : 'new';
     let lastFrameAt = clock();
     let lastHudAt = 0;
     running = true;
@@ -385,7 +443,46 @@ export async function bootInfiniteWorldSandbox({
         else keys.delete(event.code);
       }
     }
-    const onKeyDown = event => onKey(event, true);
+    async function saveWorld() {
+      try {
+        await saveStore.save(worldState);
+        saveStatus = 'saved';
+      } catch (error) {
+        transitionError = error;
+        saveStatus = 'failed';
+      }
+    }
+    async function loadWorld() {
+      try {
+        const loaded = await saveStore.loadInto(worldState);
+        if (!loaded) {
+          saveStatus = 'missing';
+          return;
+        }
+        await gameplay.refreshFromState({ renderOrigin: runtime.snapshot().renderOrigin });
+        saveStatus = 'loaded';
+      } catch (error) {
+        transitionError = error;
+        saveStatus = 'failed';
+      }
+    }
+    const onKeyDown = event => {
+      onKey(event, true);
+      const stageId = { Digit1: 'TINY', Digit2: 'MID', Digit3: 'MAX' }[event.code];
+      if (stageId) {
+        event.preventDefault();
+        worldState.setScaleStage(stageId);
+      } else if (event.code === 'Space' || event.code === 'KeyF') {
+        event.preventDefault();
+        gameplay.attack(event.code === 'KeyF' ? 'double' : 'single');
+      } else if (event.code === 'KeyP') {
+        event.preventDefault();
+        void saveWorld();
+      } else if (event.code === 'KeyL') {
+        event.preventDefault();
+        void loadWorld();
+      }
+    };
     const onKeyUp = event => onKey(event, false);
     const addWindowListener = (type, listener) => globalObject.addEventListener?.(type, listener);
     const removeWindowListener = (type, listener) => globalObject.removeEventListener?.(type, listener);
@@ -405,6 +502,15 @@ export async function bootInfiniteWorldSandbox({
         || (runtimeSnapshot.centerChunkX === owner.chunkX && runtimeSnapshot.centerChunkZ === owner.chunkZ)) return;
       transitionTargetKey = owner.key;
       runtime.transitionToChunk(owner.chunkX, owner.chunkZ)
+        .then(() => {
+          const nextSnapshot = runtime.snapshot();
+          return gameplay.syncActiveChunks({
+            renderedKeys: nextSnapshot.renderedKeys,
+            getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+            renderOrigin: nextSnapshot.renderOrigin,
+          });
+        })
+        .then(() => saveWorld())
         .catch(error => { transitionError = error; })
         .finally(() => { transitionTargetKey = null; });
     }
@@ -417,9 +523,11 @@ export async function bootInfiniteWorldSandbox({
         dx /= length;
         dz /= length;
         const sprinting = keys.has('ShiftLeft') || keys.has('ShiftRight');
-        const speedMetersPerSecond = sprinting ? 32 : 5;
+        const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
+        const speedMetersPerSecond = scaleProfile.movementMetersPerSecond * (sprinting ? 1.45 : 1);
         logicalPlayer.x += dx * speedMetersPerSecond * deltaSeconds;
         logicalPlayer.z += dz * speedMetersPerSecond * deltaSeconds;
+        logicalPlayer.facingY = Math.atan2(dx, dz);
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       requestTransition(owner);
@@ -431,13 +539,29 @@ export async function bootInfiniteWorldSandbox({
         origin.renderOriginChunkZ,
       );
       playerMarker.position.set(renderLocal.x, 0, renderLocal.z);
-      const cameraOffset = { x: 5200, y: 6500, z: 6100 };
+      playerMarker.rotation.y = logicalPlayer.facingY;
+      const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
+      playerMarker.scale.set(
+        scaleProfile.stage.visualScale,
+        scaleProfile.stage.visualScale,
+        scaleProfile.stage.visualScale,
+      );
+      const cameraDistance = scaleProfile.cameraDistanceMeters * UNITS_PER_METER;
+      const cameraOffset = {
+        x: cameraDistance * Math.SQRT1_2,
+        y: scaleProfile.cameraHeightMeters * UNITS_PER_METER,
+        z: cameraDistance * Math.SQRT1_2,
+      };
       camera.position.set(
         renderLocal.x + cameraOffset.x,
         cameraOffset.y,
         renderLocal.z + cameraOffset.z,
       );
-      camera.lookAt(renderLocal.x, 0, renderLocal.z);
+      camera.lookAt(
+        renderLocal.x,
+        scaleProfile.cameraTargetHeightMeters * UNITS_PER_METER,
+        renderLocal.z,
+      );
       return owner;
     }
 
@@ -446,10 +570,11 @@ export async function bootInfiniteWorldSandbox({
       const currentChunk = runtime.getChunkData(owner.chunkX, owner.chunkZ);
       const metrics = runtimeSnapshot.performance;
       const transition = runtimeSnapshot.latestTransition;
+      const gameplaySnapshot = gameplay.snapshot();
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
-      hud.innerHTML = `<span id="badge">W5 / INFINITE SETTLEMENT DISTRIBUTION</span>
+      hud.innerHTML = `<span id="badge">W6 / INFINITE WORLD GAMEPLAY</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
@@ -458,6 +583,10 @@ Formal Vegetation: ${currentChunk?.vegetationCandidates?.length ?? 0}  Formal Ro
 Settlement: ${escapeHtml(settlementReference?.settlementType ?? 'NATURAL')} / ${escapeHtml(settlementReference?.townType ?? 'none')}  Stable ID: ${escapeHtml(settlementReference?.settlementId ?? 'none')}
 Current Chunk Settlement features: ${currentChunk?.settlementFeatures?.length ?? 0}  Buildings: ${settlementReference?.buildingCount ?? 0}/${settlementReference?.requestedBuildingCount ?? 0}
 Distribution: Seed + 768m Macro Region + minimum distance + urbanization + terrain suitability (fixed total: none)
+Scale: ${escapeHtml(worldState.activeScaleStageId)}  Player HP: ${number(worldState.player.hp)}/${number(worldState.player.maxHp)}  Score: ${number(worldState.player.score)}
+Gameplay Simulation: ${gameplaySnapshot.activeSimulationChunkCount}/9 nearby Chunk only  Entities: ${gameplaySnapshot.simulatedEntityCount}  Targets: ${gameplaySnapshot.simulatedStaticTargetCount}
+Destroyed Stable IDs: ${gameplaySnapshot.state.destroyedFeatureCount + gameplaySnapshot.state.destroyedEntityCount}  Save: ${escapeHtml(saveStatus)} (P save / L load)
+Controls: WASD move / Shift sprint / 1 Tiny / 2 Mid / 3 Max / Space single / F double
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
@@ -488,6 +617,11 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
         lastFrameAt = frameNow;
         runtime.recordFrame(rawFrameMs);
         const owner = updatePlayer(deltaSeconds);
+        gameplay.update({
+          deltaSeconds,
+          player: logicalPlayer,
+          renderOrigin: runtime.snapshot().renderOrigin,
+        });
         renderer.render(scene, camera);
         if (frameNow - lastHudAt > 120) {
           updateHud(owner);
@@ -521,6 +655,8 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
       removeWindowListener('resize', resize);
       removeWindowListener('keydown', onKeyDown);
       removeWindowListener('keyup', onKeyUp);
+      await saveWorld();
+      await gameplay.shutdown();
       await runtime.shutdown();
       markerBody.geometry.dispose();
       markerMaterial.dispose();
@@ -542,6 +678,8 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
         runtime: runtime.snapshot(),
         resources: renderAdapter.resourceSnapshot(),
         generator: generator.snapshot(),
+        gameplay: gameplay.snapshot(),
+        save: saveStore.snapshot(),
         sceneObjectCount: countSceneObjects(scene),
       }),
       shutdown,
@@ -550,6 +688,7 @@ Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.
   } catch (error) {
     recordSandboxBootFailure({ state, hud, error, clock });
     try {
+      if (gameplay) await gameplay.shutdown();
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       renderer?.dispose?.();

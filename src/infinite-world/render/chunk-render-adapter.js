@@ -12,7 +12,12 @@ function requireConstructor(THREE, name) {
 }
 
 export class ChunkRenderAdapter {
-  constructor({ THREE, scene, renderChunkSize = RENDER_CHUNK_SIZE } = {}) {
+  constructor({
+    THREE,
+    scene,
+    renderChunkSize = RENDER_CHUNK_SIZE,
+    isFeatureDestroyed = () => false,
+  } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
     }
@@ -26,6 +31,10 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkX = 0;
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
+    if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
+    this.isFeatureDestroyed = isFeatureDestroyed;
+    this.featureInstances = new Map();
+    this.chunkFeatureIds = new Map();
     this.disposed = false;
     this.settlementResources = null;
     this.counts = {
@@ -45,6 +54,7 @@ export class ChunkRenderAdapter {
     const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
     const MeshLambertMaterial = requireConstructor(THREE, 'MeshLambertMaterial');
     const LineBasicMaterial = requireConstructor(THREE, 'LineBasicMaterial');
+    const Object3D = requireConstructor(THREE, 'Object3D');
     this.worldRoot = new Group();
     this.worldRoot.name = 'w1a-render-root';
     this.scene.add(this.worldRoot);
@@ -67,6 +77,44 @@ export class ChunkRenderAdapter {
       border: new LineBasicMaterial({ color: 0xa9d17d, transparent: true, opacity: 0.75 }),
       naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: false }),
     });
+    const hiddenTransform = new Object3D();
+    hiddenTransform.scale.set(0, 0, 0);
+    hiddenTransform.updateMatrix();
+    this.hiddenFeatureMatrix = hiddenTransform.matrix.clone?.() ?? structuredClone(hiddenTransform.matrix);
+  }
+
+  #cloneMatrix(matrix) {
+    return matrix.clone?.() ?? structuredClone(matrix);
+  }
+
+  #registerFeatureInstance({ stableId, chunkKey, mesh, index, matrix }) {
+    if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
+    const existing = this.featureInstances.get(stableId);
+    if (existing && existing.chunkKey !== chunkKey) {
+      throw new Error(`Stable ID collision in render adapter: ${stableId}`);
+    }
+    const entry = { stableId, chunkKey, mesh, index, originalMatrix: this.#cloneMatrix(matrix) };
+    this.featureInstances.set(stableId, entry);
+    if (!this.chunkFeatureIds.has(chunkKey)) this.chunkFeatureIds.set(chunkKey, new Set());
+    this.chunkFeatureIds.get(chunkKey).add(stableId);
+    mesh.setMatrixAt(index, this.isFeatureDestroyed(stableId)
+      ? this.hiddenFeatureMatrix : entry.originalMatrix);
+  }
+
+  setFeatureDestroyed(stableId, destroyed = true) {
+    const entry = this.featureInstances.get(stableId);
+    if (!entry) return false;
+    entry.mesh.setMatrixAt(entry.index, destroyed ? this.hiddenFeatureMatrix : entry.originalMatrix);
+    entry.mesh.instanceMatrix.needsUpdate = true;
+    return true;
+  }
+
+  refreshFeatureStates() {
+    for (const [stableId, entry] of this.featureInstances) {
+      entry.mesh.setMatrixAt(entry.index, this.isFeatureDestroyed(stableId)
+        ? this.hiddenFeatureMatrix : entry.originalMatrix);
+      entry.mesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   async rebase(origin) {
@@ -218,7 +266,13 @@ export class ChunkRenderAdapter {
       transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
       transform.scale.set(scale, scale, scale);
       transform.updateMatrix();
-      treeMesh.setMatrixAt(index, transform.matrix);
+      this.#registerFeatureInstance({
+        stableId: candidate.candidateId ?? candidate.stableId,
+        chunkKey: key,
+        mesh: treeMesh,
+        index,
+        matrix: transform.matrix,
+      });
     });
     treeMesh.instanceMatrix.needsUpdate = true;
     group.add(treeMesh);
@@ -246,7 +300,13 @@ export class ChunkRenderAdapter {
       transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
       transform.scale.set(scale, scale * 0.65, scale);
       transform.updateMatrix();
-      rockMesh.setMatrixAt(index, transform.matrix);
+      this.#registerFeatureInstance({
+        stableId: candidate.candidateId ?? candidate.stableId,
+        chunkKey: key,
+        mesh: rockMesh,
+        index,
+        matrix: transform.matrix,
+      });
     });
     rockMesh.instanceMatrix.needsUpdate = true;
     group.add(rockMesh);
@@ -316,7 +376,13 @@ export class ChunkRenderAdapter {
           building.depthMeters * this.unitsPerMeter,
         );
         transform.updateMatrix();
-        buildingMesh.setMatrixAt(index, transform.matrix);
+        this.#registerFeatureInstance({
+          stableId: building.stableId,
+          chunkKey: key,
+          mesh: buildingMesh,
+          index,
+          matrix: transform.matrix,
+        });
       });
       buildingMesh.instanceMatrix.needsUpdate = true;
       group.add(buildingMesh);
@@ -354,6 +420,8 @@ export class ChunkRenderAdapter {
       this.counts.chunkOwnedGeometriesDisposed += 1;
     }
     projected.group.clear();
+    for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.featureInstances.delete(stableId);
+    this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
     this.counts.unloaded += 1;
   }
@@ -374,6 +442,7 @@ export class ChunkRenderAdapter {
         - this.counts.chunkOwnedGeometriesDisposed,
       chunkOwnedGeometriesCreated: this.counts.chunkOwnedGeometriesCreated,
       chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
+      trackedFeatureInstanceCount: this.featureInstances.size,
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
       )),
@@ -390,6 +459,8 @@ export class ChunkRenderAdapter {
       for (const geometry of Object.values(this.settlementResources.geometries)) geometry.dispose();
       for (const material of Object.values(this.settlementResources.materials)) material.dispose();
     }
+    this.featureInstances.clear();
+    this.chunkFeatureIds.clear();
     this.disposed = true;
   }
 }

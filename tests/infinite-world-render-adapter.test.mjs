@@ -96,3 +96,31 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
   assert.ok(Object.values(adapter.materials).every(material => material.disposed));
   await adapter.shutdown();
 });
+
+test('render adapter applies Stable-ID destruction without allocating or leaking Chunk resources', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'renderer-destruction-state' });
+  const data = await generator.generateChunk(0, 0);
+  const stableId = (data.vegetationProxies[0] ?? data.rockProxies[0]).stableId;
+  const destroyed = new Set();
+  const adapter = new ChunkRenderAdapter({
+    THREE: FakeThree,
+    scene: new Scene(),
+    isFeatureDestroyed: id => destroyed.has(id),
+  });
+  const projected = await adapter.projectChunk(data);
+  await adapter.loadProjected(projected);
+  const entry = adapter.featureInstances.get(stableId);
+  assert.ok(entry);
+  assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
+  assert.equal(adapter.setFeatureDestroyed(stableId, true), true);
+  assert.deepEqual(entry.mesh.matrices[entry.index].scale, { x: 0, y: 0, z: 0 });
+  destroyed.add(stableId);
+  adapter.refreshFeatureStates();
+  assert.deepEqual(entry.mesh.matrices[entry.index].scale, { x: 0, y: 0, z: 0 });
+  destroyed.delete(stableId);
+  adapter.refreshFeatureStates();
+  assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
+  await adapter.unloadChunk('0,0');
+  assert.equal(adapter.resourceSnapshot().trackedFeatureInstanceCount, 0);
+  await adapter.shutdown();
+});

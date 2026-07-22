@@ -181,7 +181,7 @@ function createEntryDocument(readyState) {
 
 function loadPreModuleBridge() {
   const html = readFileSync(resolve(repoRoot, 'infinite-world-sandbox.html'), 'utf8');
-  const match = html.match(/<script id="w5-entry-error-bridge">([\s\S]*?)<\/script>/);
+  const match = html.match(/<script id="w6-entry-error-bridge">([\s\S]*?)<\/script>/);
   assert.ok(match, 'pre-module error bridge is missing');
   const listeners = new Map();
   const hud = { textContent: '' };
@@ -232,6 +232,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.boot.initialRenderedChunkCount, 9);
     assert.equal(snapshot.boot.initialPrefetchedChunkCount, 25);
     assert.equal(snapshot.boot.initialSettlementCount, 1);
+    assert.equal(snapshot.boot.initialSimulationChunkCount, 9);
+    assert.ok(snapshot.boot.initialGameplayEntityCount > 0);
     assert.equal(snapshot.boot.macroRegionsEvaluated, 53);
     assert.equal(snapshot.boot.rawSettlementCandidateCount, 39);
     assert.equal(snapshot.boot.acceptedSettlementCandidateCount, 1);
@@ -239,6 +241,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.generator.templatesMaterialized, 1);
     assert.equal(snapshot.boot.startupSurveyExecuted, false);
     assert.equal(snapshot.boot.startupBenchmarkExecuted, false);
+    assert.equal(snapshot.gameplay.activeSimulationChunkCount, 9);
+    assert.equal(snapshot.gameplay.render.liveChunkGroups, 9);
+    assert.equal(snapshot.gameplay.state.activeScaleStageId, 'MAX');
     assert.ok(snapshot.boot.initialSceneObjectCount > 9);
     assert.ok(snapshot.boot.chunkGenerationMs > 0);
     assert.ok(snapshot.boot.settlementGenerationMs > 0);
@@ -256,6 +261,10 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.rafCallbacks[0](performance.now() + 100);
     environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
     assert.ok(outcome.sandbox.logicalPlayer.x > playerXBeforeInput);
+    environment.listeners.get('keydown')({ code: 'Digit1', preventDefault() {} });
+    assert.equal(outcome.sandbox.snapshot().gameplay.state.activeScaleStageId, 'TINY');
+    environment.listeners.get('keydown')({ code: 'Digit3', preventDefault() {} });
+    assert.equal(outcome.sandbox.snapshot().gameplay.state.activeScaleStageId, 'MAX');
     assert.equal(WebGLRenderer.instances[0].renderCount, 2);
     assert.deepEqual(environment.rafInitializationStates, [true, true]);
     await outcome.sandbox.shutdown();
@@ -264,6 +273,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(stopped.runtime.renderedCount, 0);
     assert.equal(stopped.resources.liveChunkGroups, 0);
     assert.equal(stopped.resources.liveChunkOwnedGeometryCount, 0);
+    assert.equal(stopped.gameplay.activeSimulationChunkCount, 0);
+    assert.equal(stopped.gameplay.render.liveChunkGroups, 0);
+    assert.equal(stopped.gameplay.render.sharedDisposed, true);
     assert.equal(WebGLRenderer.instances[0].disposed, true);
     assert.deepEqual(environment.cancelledFrames, [2]);
   } finally {
@@ -369,11 +381,11 @@ test('pre-module bridge reports the first module error and suppresses duplicates
 test('pre-module bridge reports the bootstrap URL for a non-bubbling module resource load failure', () => {
   const fixture = loadPreModuleBridge();
   fixture.listeners.get('error')({
-    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w5-http-entry-fix' },
+    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w6-official-runtime' },
   });
   assert.match(fixture.hud.textContent, /起動失敗: MODULE_LOAD/);
   assert.match(fixture.hud.textContent, /Error: Module script failed to load/);
-  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w5-http-entry-fix/);
+  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w6-official-runtime/);
 });
 
 test('pre-module bridge reports an unhandled rejection and disables itself after module start', () => {
@@ -424,7 +436,7 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
-  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w5-http-entry-fix"><\/script>/);
+  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w6-official-runtime"><\/script>/);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js')), true);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);

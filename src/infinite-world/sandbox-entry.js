@@ -1,4 +1,4 @@
-export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w5-http-entry-fix';
+export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w6-official-runtime';
 
 function describeEntryError(error) {
   const name = String(error?.name || 'Error');
@@ -9,14 +9,14 @@ function describeEntryError(error) {
 
 function renderModuleBoot(hud) {
   if (!hud) return;
-  hud.textContent = 'W5 / INFINITE SETTLEMENT DISTRIBUTION\n起動中: MODULE_BOOT';
+  hud.textContent = 'W6 / INFINITE WORLD GAMEPLAY\n起動中: MODULE_BOOT';
 }
 
 function renderModuleImportFailure({ hud, error, moduleUrl, entryBridge }) {
   const described = describeEntryError(error);
   if (!entryBridge?.snapshot?.().reported && hud) {
     hud.textContent = [
-      'W5 / INFINITE SETTLEMENT DISTRIBUTION',
+      'W6 / INFINITE WORLD GAMEPLAY',
       '起動失敗: MODULE_IMPORT',
       `${described.name}: ${described.message}`,
       `Stack: ${described.stackFirstLine}`,
@@ -32,7 +32,7 @@ export function createSandboxModuleEntry({
   hud = documentObject?.querySelector?.('#hud'),
   moduleSpecifier = SANDBOX_MAIN_MODULE_SPECIFIER,
   moduleUrl = new URL(moduleSpecifier, import.meta.url).href,
-  importModule = () => import('./sandbox-main.js?v=w5-http-entry-fix'),
+  importModule = () => import('./sandbox-main.js?v=w6-official-runtime'),
 } = {}) {
   let entryPromise = null;
   let importExecutionCount = 0;

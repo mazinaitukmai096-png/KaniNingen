@@ -95,7 +95,7 @@ function findImportCycle(records) {
 test('real HTTP entry and recursive local import graph resolve with JavaScript MIME and source bodies', async () => {
   const staticServer = await startStaticServer();
   try {
-    const htmlUrl = `${staticServer.origin}/infinite-world-sandbox.html?v=w5-http-entry-fix`;
+    const htmlUrl = `${staticServer.origin}/infinite-world-sandbox.html?v=w6-official-runtime`;
     const htmlResponse = await fetch(htmlUrl);
     const html = await htmlResponse.text();
     assert.equal(htmlResponse.status, 200);
@@ -126,8 +126,8 @@ test('real HTTP entry and recursive local import graph resolve with JavaScript M
     }
 
     assert.ok(visited.size >= 40, `expected complete W5 graph, received ${visited.size} modules`);
-    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-entry.js?v=w5-http-entry-fix')), true);
-    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-main.js?v=w5-http-entry-fix')), true);
+    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-entry.js?v=w6-official-runtime')), true);
+    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-main.js?v=w6-official-runtime')), true);
     assert.equal([...visited.keys()].some(url => url.endsWith('/src/infinite-world/runtime-timing.js')), true);
     assert.equal([...visited.values()].every(record => record.status === 200 && javascriptMime.test(record.contentType)), true);
     assert.equal(findImportCycle(visited), null, 'entry import graph must remain acyclic');
@@ -142,7 +142,7 @@ test('dynamic bootstrap imports main and invokes its named start export only onc
   let boots = 0;
   const entry = createSandboxModuleEntry({
     hud,
-    moduleUrl: 'http://127.0.0.1:8021/src/infinite-world/sandbox-main.js?v=w5-http-entry-fix',
+    moduleUrl: 'http://127.0.0.1:8021/src/infinite-world/sandbox-main.js?v=w6-official-runtime',
     importModule: async specifier => {
       imports += 1;
       assert.equal(specifier, SANDBOX_MAIN_MODULE_SPECIFIER);
@@ -172,7 +172,7 @@ test('nested dynamic import rejection becomes an actual MODULE_IMPORT HUD diagno
   importError.stack = 'SyntaxError: Unexpected token in nested-module.js\n    at nested-module.js:4:2';
   const entry = createSandboxModuleEntry({
     hud,
-    moduleUrl: 'http://127.0.0.1:8021/src/infinite-world/sandbox-main.js?v=w5-http-entry-fix',
+    moduleUrl: 'http://127.0.0.1:8021/src/infinite-world/sandbox-main.js?v=w6-official-runtime',
     importModule: async () => { throw importError; },
   });
   const outcome = await entry.startSandboxEntryOnce();
@@ -183,7 +183,7 @@ test('nested dynamic import rejection becomes an actual MODULE_IMPORT HUD diagno
   assert.match(hud.textContent, /起動失敗: MODULE_IMPORT/);
   assert.match(hud.textContent, /SyntaxError: Unexpected token in nested-module\.js/);
   assert.match(hud.textContent, /Stack: SyntaxError: Unexpected token in nested-module\.js/);
-  assert.match(hud.textContent, /Module: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-main\.js\?v=w5-http-entry-fix/);
+  assert.match(hud.textContent, /Module: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-main\.js\?v=w6-official-runtime/);
 });
 
 test('missing named start export is reported instead of silently stopping', async () => {
