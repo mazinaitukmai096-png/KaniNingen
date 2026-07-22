@@ -1,0 +1,60 @@
+{
+  "sourceRepository": "C:\\KaniGame(開発用)",
+  "sourceCommit": "4210c069314a084b528d97e3d5a5e1345d38ad94",
+  "files": [
+    {
+      "source": "src/world-generation/g0/canonical-json.js",
+      "destination": "src/infinite-world/legacy-core/g0/canonical-json.js",
+      "sha256": "d32ed724aa7e07f3a1796be7bfacad94ce5a57ac84de670cd8508e045ba0292f",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/sha256.js",
+      "destination": "src/infinite-world/legacy-core/g0/sha256.js",
+      "sha256": "e1925f39007ea40380d600800a583fdbdccbb7d5622ea1f1ad1900fe16f45efb",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/seed.js",
+      "destination": "src/infinite-world/legacy-core/g0/seed.js",
+      "sha256": "048e405323d86967a1b0963e5f5acd4dd73322cdcf84b1c1b4918aa2797d4804",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/deterministic-random.js",
+      "destination": "src/infinite-world/legacy-core/g0/deterministic-random.js",
+      "sha256": "b0a4473790aafae5a8719aded1b00433a5cd1aa41c0cd0e81b77da2214e035b9",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/generator-version.js",
+      "destination": "src/infinite-world/legacy-core/g0/generator-version.js",
+      "sha256": "1c815ba284070df8778dfb7ccae1ee9fdc11a66cbf8ede68d9c38fd7d7e00b56",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/stable-id.js",
+      "destination": "src/infinite-world/legacy-core/g0/stable-id.js",
+      "sha256": "998fb8f3dc087cec403620c52d6cc50c42755b975148fa13b19fb0256c0f6be2",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/chunk-id.js",
+      "destination": "src/infinite-world/legacy-core/g0/chunk-id.js",
+      "sha256": "26bdc18bf79cc68ef52561df8066bafaadc289a7fb77db6561310481da85720f",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g0/chunk-data-validator.js",
+      "destination": "src/infinite-world/legacy-core/g0/chunk-data-validator.js",
+      "sha256": "1966cca3ac722afd57f68b677645ee7c4007b9f9db8a86b9a3b68395853c9d2b",
+      "importsAdjusted": false
+    },
+    {
+      "source": "src/world-generation/g2/terrain-edge.js",
+      "destination": "src/infinite-world/legacy-core/g2/terrain-edge.js",
+      "sha256": "0a81ed8ec236a2a86cd98cc666686807b0f20f35142d8ec42663bc5d28964d65",
+      "importsAdjusted": false
+    }
+  ]
+}
