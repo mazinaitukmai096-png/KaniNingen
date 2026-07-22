@@ -86,11 +86,14 @@ test('parameter module is deterministic and does not use random or Seed systems'
   assert.doesNotMatch(source, /scene\.userData|console\.|HUD/);
 });
 
-test('current game and road runtime do not import or use settlement road parameters', () => {
-  for (const path of ['src/game.js', 'src/road-town-structure.js']) {
-    const source = readFileSync(resolve(repoRoot, path), 'utf8');
-    assert.doesNotMatch(source, /settlement-road-parameters|getSettlementRoadParameters|getRoadKindParameters|SETTLEMENT_ROAD_PARAMETERS/);
-  }
+test('Phase 3A-2A connects only CITY LOCAL and ALLEY generation to settlement road parameters', () => {
+  const game = readFileSync(resolve(repoRoot, 'src/game.js'), 'utf8');
+  const road = readFileSync(resolve(repoRoot, 'src/road-town-structure.js'), 'utf8');
+  assert.doesNotMatch(game, /settlement-road-parameters|getSettlementRoadParameters|getRoadKindParameters|SETTLEMENT_ROAD_PARAMETERS/);
+  assert.match(road, /import \{ getSettlementRoadParameters \} from '\.\/settlement-road-parameters\.js';/);
+  assert.match(road, /town\.type === 'capital' && town\.settlementType === SETTLEMENT_TYPES\.CITY/);
+  assert.match(road, /getSettlementRoadParameters\(SETTLEMENT_TYPES\.CITY\)/);
+  assert.doesNotMatch(road, /getSettlementRoadParameters\(SETTLEMENT_TYPES\.(?:TOWN|RURAL)\)/);
 });
 
 test('Phase 1 road kinds and fixed widths remain unchanged before Phase 3A-2 wiring', () => {

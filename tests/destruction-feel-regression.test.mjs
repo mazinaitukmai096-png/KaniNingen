@@ -110,6 +110,7 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
      'src/world-scale-rebalance.js',
      'tests/building-frontage.test.mjs',
      'tests/building-lot.test.mjs',
+     'tests/city-local-roads.test.mjs',
      'tests/settlement-type.test.mjs',
      'tests/settlement-road-parameters.test.mjs',
      'tests/destruction-feel-regression.test.mjs',
