@@ -457,13 +457,10 @@ test('game integration targets only normal town buildings and records bounded sh
     coreRadius => Math.round(coreRadius * coreRadius / 36000),
   ), [203, 123, 123, 106, 106, 90]);
   for (const ratioRule of [
-    "if (r < 0.45) spawnType = 'house';",
-    "else if (r < 0.60) spawnType = 'tower';",
-    "if (r < 0.50) spawnType = 'house';",
-    "if (r < 0.62) spawnType = 'house';",
-    "else if (r < 0.70) spawnType = 'tower';",
-    "else if (r < 0.74) spawnType = 'church';",
-    "else if (r < 0.78) spawnType = 'school';",
+    'if (r < 0.60) plannedBuildingType = selectSettlementBuildingType({',
+    'if (r < 0.50) plannedBuildingType = selectSettlementBuildingType({',
+    'if (r < 0.78) plannedBuildingType = selectSettlementBuildingType({',
+    'if (plannedBuildingType) spawnType = plannedBuildingType;',
   ]) assert.ok(game.includes(ratioRule));
   assert.doesNotMatch(game, /frontageBuildingTypes\.add/);
 

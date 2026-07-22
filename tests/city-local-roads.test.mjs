@@ -296,9 +296,8 @@ test('RURAL junction topology remains identical to the Phase 1 fixture', () => {
   );
 });
 
-test('building, Frontage, Lot, world detail, and Gameplay source remain at Phase 3A-1', () => {
+test('Frontage, Lot, world detail, and settlement metadata remain at Phase 3A-1', () => {
   for (const path of [
-    'src/game.js',
     'src/building-frontage.js',
     'src/building-lot.js',
     'src/world-scale-rebalance.js',

@@ -368,9 +368,8 @@ test('Capital, RURAL, MAJOR, START_APPROACH, and Bridge fixtures remain unchange
   assert.ok(hierarchy.roads.filter(road => road.kind === ROAD_KINDS.START_APPROACH).every(road => road.width === 56));
 });
 
-test('building goals, Frontage, Lot, world interaction, and Gameplay source stay at Phase 3A-2A', () => {
+test('Frontage, Lot, and world interaction modules stay at Phase 3A-2A', () => {
   for (const path of [
-    'src/game.js',
     'src/building-frontage.js',
     'src/building-lot.js',
     'src/world-scale-rebalance.js',

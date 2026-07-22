@@ -61,6 +61,12 @@ import {
 } from './building-lot.js';
 import { getSettlementTypeForTownType, SETTLEMENT_TYPES } from './settlement-type.js';
 import {
+  createSettlementBuildingVisual,
+  createSettlementBuildingVisualSummary,
+  isTowerPlacementAllowed,
+  selectSettlementBuildingType,
+} from './settlement-building-visuals.js';
+import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
   SCALE_STAGE_IDS,
@@ -958,7 +964,7 @@ let inputController, rendererController;
             entities.push(data);
         }
 
-        function spawnEntity(type, x, z, forceAngle = null, biome = null) {
+        function spawnEntity(type, x, z, forceAngle = null, biome = null, buildingVisual = null) {
             if (type === 'boss') {
                 const segments = [];
                 const segmentCount = BOSS_SEGMENT_COUNT;
@@ -1048,6 +1054,7 @@ let inputController, rendererController;
             let hp = 100, radius = 50, scoreVal = 200; 
             let baseCastShadow = false;
             let debrisMaterial = null; // 追加: 破壊時の破片色を種類ごとに保持（未設定ならデフォルト色を使用）
+            let buildingRoofMaterial = null;
             
             let customChassis = null;
             let customTurret = null;
@@ -1062,10 +1069,13 @@ let inputController, rendererController;
             let idleWaitTimer = 0; // 追加: 立ち止まり時間
 
             if (type === 'house') {
-                const roofColor = roofColorPalette[Math.floor(Math.random() * roofColorPalette.length)];
-                const wallColor = wallColorPalette[Math.floor(Math.random() * wallColorPalette.length)];
+                const roofColor = buildingVisual?.roofColor
+                    ?? roofColorPalette[Math.floor(Math.random() * roofColorPalette.length)];
+                const wallColor = buildingVisual?.wallColor
+                    ?? wallColorPalette[Math.floor(Math.random() * wallColorPalette.length)];
                 const customRoofMat = getRoofMaterial(roofColor);
                 const customWallMat = getWallMaterial(wallColor);
+                buildingRoofMaterial = customRoofMat;
 
                 const houseType = Math.random();
                 if (houseType < 0.27) {
@@ -1126,9 +1136,12 @@ let inputController, rendererController;
                 }
                 baseCastShadow = true;
             } else if (type === 'tower') {
-                const b = new THREE.Mesh(geometries.box, materials.towerBase); b.scale.set(80, 240, 80); b.position.y = 120; group.add(b);
-                const balcony = new THREE.Mesh(geometries.box, materials.towerBase); balcony.scale.set(100, 15, 100); balcony.position.y = 240; group.add(balcony);
-                const roof = new THREE.Mesh(geometries.pyramid, materials.churchRoof); roof.scale.set(110, 70, 110); roof.position.y = 282.5; group.add(roof);
+                const towerWallMaterial = buildingVisual ? getWallMaterial(buildingVisual.wallColor) : materials.towerBase;
+                const towerRoofMaterial = buildingVisual ? getRoofMaterial(buildingVisual.roofColor) : materials.churchRoof;
+                buildingRoofMaterial = towerRoofMaterial;
+                const b = new THREE.Mesh(geometries.box, towerWallMaterial); b.scale.set(80, 240, 80); b.position.y = 120; group.add(b);
+                const balcony = new THREE.Mesh(geometries.box, towerWallMaterial); balcony.scale.set(100, 15, 100); balcony.position.y = 240; group.add(balcony);
+                const roof = new THREE.Mesh(geometries.pyramid, towerRoofMaterial); roof.scale.set(110, 70, 110); roof.position.y = 282.5; group.add(roof);
                 
                 for (let h = 0; h < 3; h++) {
                     const slit = new THREE.Mesh(geometries.box, materials.charred);
@@ -1136,7 +1149,10 @@ let inputController, rendererController;
                 }
                 hp = 1200; radius = 65; scoreVal = 800; baseCastShadow = true; 
             } else if (type === 'church') {
-                const nave = new THREE.Mesh(geometries.box, materials.churchBase); nave.scale.set(150, 110, 240); nave.position.y = 55; group.add(nave);
+                const churchWallMaterial = buildingVisual ? getWallMaterial(buildingVisual.wallColor) : materials.churchBase;
+                const churchRoofMaterial = buildingVisual ? getRoofMaterial(buildingVisual.roofColor) : materials.churchRoof;
+                buildingRoofMaterial = churchRoofMaterial;
+                const nave = new THREE.Mesh(geometries.box, churchWallMaterial); nave.scale.set(150, 110, 240); nave.position.y = 55; group.add(nave);
                 
                 // 1. まず元の四角い箱（BoxGeometry）で屋根を作ります
                 const naveRoofGeometry = new THREE.BoxGeometry(1, 1, 1); 
@@ -1152,7 +1168,7 @@ let inputController, rendererController;
                 // 変形を確定させるための処理
                 naveRoofGeometry.computeVertexNormals();
 
-                const naveRoof = new THREE.Mesh(naveRoofGeometry, materials.churchRoof);
+                const naveRoof = new THREE.Mesh(naveRoofGeometry, churchRoofMaterial);
 
                 // 3. 回転は一切不要なので削除、または 0 にします
                 naveRoof.rotation.y = 0;
@@ -1171,8 +1187,8 @@ let inputController, rendererController;
 
 
                 
-                const tower = new THREE.Mesh(geometries.box, materials.churchBase); tower.scale.set(70, 250, 70); tower.position.set(0, 125, 155); group.add(tower);
-                const towerRoof = new THREE.Mesh(geometries.pyramid, materials.churchRoof); 
+                const tower = new THREE.Mesh(geometries.box, churchWallMaterial); tower.scale.set(70, 250, 70); tower.position.set(0, 125, 155); group.add(tower);
+                const towerRoof = new THREE.Mesh(geometries.pyramid, churchRoofMaterial);
                 towerRoof.scale.set(80, 60, 80); 
                 towerRoof.position.set(0, 280, 155); 
                 group.add(towerRoof);
@@ -1188,11 +1204,14 @@ let inputController, rendererController;
                 }
                 hp = 2200; radius = 115; scoreVal = 1500; baseCastShadow = true;
             } else if (type === 'school') {
-                const mainBuilding = new THREE.Mesh(geometries.box, materials.schoolBase); mainBuilding.scale.set(360, 120, 140); mainBuilding.position.y = 60; group.add(mainBuilding);
-                const mainRoof = new THREE.Mesh(geometries.box, materials.churchRoof); mainRoof.scale.set(380, 15, 160); mainRoof.position.y = 127.5; group.add(mainRoof);
+                const schoolWallMaterial = buildingVisual ? getWallMaterial(buildingVisual.wallColor) : materials.schoolBase;
+                const schoolRoofMaterial = buildingVisual ? getRoofMaterial(buildingVisual.roofColor) : materials.churchRoof;
+                buildingRoofMaterial = schoolRoofMaterial;
+                const mainBuilding = new THREE.Mesh(geometries.box, schoolWallMaterial); mainBuilding.scale.set(360, 120, 140); mainBuilding.position.y = 60; group.add(mainBuilding);
+                const mainRoof = new THREE.Mesh(geometries.box, schoolRoofMaterial); mainRoof.scale.set(380, 15, 160); mainRoof.position.y = 127.5; group.add(mainRoof);
 
-                const clockTower = new THREE.Mesh(geometries.box, materials.schoolBase); clockTower.scale.set(60, 100, 60); clockTower.position.set(0, 170, 0); clockTower.castShadow = true; group.add(clockTower);
-                const towerRoof = new THREE.Mesh(geometries.pyramid, materials.churchRoof); 
+                const clockTower = new THREE.Mesh(geometries.box, schoolWallMaterial); clockTower.scale.set(60, 100, 60); clockTower.position.set(0, 170, 0); clockTower.castShadow = true; group.add(clockTower);
+                const towerRoof = new THREE.Mesh(geometries.pyramid, schoolRoofMaterial);
                 towerRoof.scale.set(70, 40, 70); 
                 towerRoof.position.set(0, 240, 0); 
                 group.add(towerRoof);
@@ -1502,6 +1521,17 @@ let inputController, rendererController;
                 hp = TANK_HP; scoreVal = TANK_SCORE_VALUE; tankCount++; baseCastShadow = true;
             }
             
+            if (buildingVisual && FRONTAGE_BUILDING_TYPES.includes(type)) {
+                group.scale.y = buildingVisual.heightScale;
+                if (buildingRoofMaterial && buildingVisual.roofScale !== 1) {
+                    group.traverse(child => {
+                        if (child.isMesh && child.material === buildingRoofMaterial) {
+                            child.scale.y *= buildingVisual.roofScale;
+                        }
+                    });
+                }
+            }
+
             group.position.set(x, 0, z);
             if (type === 'human') group.scale.setScalar(humanVisualScale);
             if (type === 'tank') group.scale.setScalar(PRODUCTION_TANK_VISUAL_SCALE);
@@ -1533,6 +1563,7 @@ let inputController, rendererController;
             const data = {
                 type, hp, maxHp: hp, mesh: group,
                 debrisMaterial, // 追加: 破壊時の破片色（岩・小石のみ設定される）
+                buildingVisual,
                 velocity: new THREE.Vector3(), rotVel: new THREE.Vector3(), pushVel: new THREE.Vector3(),
                 radius, scoreVal, isDead: false, wanderAngle: Math.random() * Math.PI * 2, lastShot: 0,
                 baseCastShadow: baseCastShadow,
@@ -2327,11 +2358,18 @@ let inputController, rendererController;
 
             // --- 町中の公園エリア：各町に1箇所、建物を建てず木・芝生で緑化するゾーンを確保する ---
             const parkZones = [];
+            const settlementBuildingVisualRecords = [];
+            const settlementBuildingVisualTowns = [];
 
             townCenters.forEach((tc, townIndex) => {
                 const townPaths = pathTiles.filter(t => t.tc === tc);
-                if (townPaths.length === 0) return;
                 const frontageTownId = tc.id ?? `town-${townIndex}-${tc.type}`;
+                settlementBuildingVisualTowns.push(Object.freeze({
+                    townId: frontageTownId,
+                    townType: tc.type,
+                    settlementType: tc.settlementType,
+                }));
+                if (townPaths.length === 0) return;
                 const frontageRoads = roadHierarchy.roads.filter(road => road.townId === frontageTownId);
                 const frontageAnchorPlan = buildFrontageAnchorPlan({
                     samples: townPaths,
@@ -2355,6 +2393,8 @@ let inputController, rendererController;
                 const targetCount = Math.round((tc.coreRadius * tc.coreRadius) / 36000); // 密集度アップ：空き地を減らし賑やかな町並みにする
                 let placed = 0, attempts = 0;
                 let frontageCandidateIndex = 0;
+                let townBuildingIndex = 0;
+                const townBuildingVisualRecords = [];
                 const frontagePlacedCounts = Object.fromEntries(FRONTAGE_BUILDING_TYPES.map(type => [type, 0]));
                 const frontageRoadBuildingCounts = new Map();
                 const frontageAlongByRoute = new Map();
@@ -2401,25 +2441,36 @@ let inputController, rendererController;
                     // 先に建てる種類を決めてから、その概算サイズ込みで間隔をチェックする
                     const r = Math.random();
                     let spawnType;
+                    let plannedBuildingType = null;
                     if (tc.type === 'military') {
-                        if (r < 0.45) spawnType = 'house';
-                        else if (r < 0.60) spawnType = 'tower';
+                        if (r < 0.60) plannedBuildingType = selectSettlementBuildingType({
+                            settlementType: tc.settlementType,
+                            townId: frontageTownId,
+                            buildingIndex: townBuildingIndex + 1,
+                        });
                         else if (r < 0.72) spawnType = 'tank';
                         else spawnType = 'human';
                     } else if (tc.type === 'suburb') {
-                        if (r < 0.50) spawnType = 'house';
+                        if (r < 0.50) plannedBuildingType = selectSettlementBuildingType({
+                            settlementType: tc.settlementType,
+                            townId: frontageTownId,
+                            buildingIndex: townBuildingIndex + 1,
+                        });
                         else if (r < 0.75) spawnType = 'tree';
                         else spawnType = 'human';
                     } else {
-                        if (r < 0.62) spawnType = 'house';
-                        else if (r < 0.70) spawnType = 'tower';
-                        else if (r < 0.74) spawnType = 'church';
-                        else if (r < 0.78) spawnType = 'school';
+                        if (r < 0.78) plannedBuildingType = selectSettlementBuildingType({
+                            settlementType: tc.settlementType,
+                            townId: frontageTownId,
+                            buildingIndex: townBuildingIndex + 1,
+                        });
                         else if (r < 0.85) spawnType = 'tree';
                         else spawnType = 'human';
                     }
+                    if (plannedBuildingType) spawnType = plannedBuildingType;
 
-                    const newApproxRadius = APPROX_RADIUS[spawnType];
+                    let newApproxRadius = APPROX_RADIUS[spawnType];
+                    let towerReplacedByHouse = false;
                     let frontage = null;
                     if (frontageBuildingTypes.has(spawnType)) {
                         frontageCandidateIndex++;
@@ -2439,6 +2490,17 @@ let inputController, rendererController;
                             townId: frontageTownId,
                         });
                         if (!frontageRoad) continue;
+                        if (spawnType === 'tower' && !isTowerPlacementAllowed({
+                            settlementType: tc.settlementType,
+                            routeId: frontageRoad.routeId,
+                            x: frontageAnchor.x,
+                            z: frontageAnchor.z,
+                            records: townBuildingVisualRecords,
+                        })) {
+                            spawnType = 'house';
+                            newApproxRadius = APPROX_RADIUS.house;
+                            towerReplacedByHouse = true;
+                        }
                         const frontageCandidates = createFrontageCandidatePlacements({
                             type: spawnType,
                             road: frontageRoad,
@@ -2449,6 +2511,13 @@ let inputController, rendererController;
                         rejectedCandidateCounts.routeEnd += frontageCandidates.routeEndCount;
 
                         for (const candidate of frontageCandidates.placements) {
+                            if (spawnType === 'tower' && !isTowerPlacementAllowed({
+                                settlementType: tc.settlementType,
+                                routeId: candidate.frontageRouteId,
+                                x: candidate.x,
+                                z: candidate.z,
+                                records: townBuildingVisualRecords,
+                            })) continue;
                             const candidateFromCenterSq = (candidate.x - tc.x) ** 2 + (candidate.z - tc.z) ** 2;
                             if (candidateFromCenterSq < (220 + newApproxRadius) ** 2
                                 || candidateFromCenterSq > (tc.radius * 0.98 - newApproxRadius) ** 2) {
@@ -2566,11 +2635,47 @@ let inputController, rendererController;
                         continue;
                     }
 
+                    const buildingVisual = frontageBuildingTypes.has(spawnType)
+                        ? createSettlementBuildingVisual({
+                            settlementType: tc.settlementType,
+                            townId: frontageTownId,
+                            townType: tc.type,
+                            type: spawnType,
+                            buildingIndex: townBuildingIndex + 1,
+                            routeId: frontage.frontageRouteId,
+                            records: townBuildingVisualRecords,
+                        })
+                        : null;
+
                     const spawned = (spawnType === 'tank')
                         ? spawnEntity(spawnType, px, pz)
-                        : spawnEntity(spawnType, px, pz, forceAngle);
+                        : spawnEntity(spawnType, px, pz, forceAngle, null, buildingVisual);
 
                     if (frontage) Object.assign(spawned, frontage);
+                    if (buildingVisual) {
+                        townBuildingIndex++;
+                        const visualRecord = Object.freeze({
+                            townId: frontageTownId,
+                            townType: tc.type,
+                            settlementType: tc.settlementType,
+                            buildingIndex: townBuildingIndex,
+                            plannedType: plannedBuildingType,
+                            type: spawnType,
+                            towerReplacedByHouse,
+                            routeId: frontage.frontageRouteId,
+                            roadId: frontage.frontageRoadId,
+                            x: px,
+                            z: pz,
+                            rotationY: forceAngle,
+                            heightVariant: buildingVisual.heightVariant,
+                            heightVariantIndex: buildingVisual.heightVariantIndex,
+                            roofPaletteIndex: buildingVisual.roofPaletteIndex,
+                            wallPaletteIndex: buildingVisual.wallPaletteIndex,
+                            accent: buildingVisual.accent,
+                        });
+                        townBuildingVisualRecords.push(visualRecord);
+                        settlementBuildingVisualRecords.push(visualRecord);
+                    }
                     if (frontage) {
                         frontagePlacedCounts[spawnType]++;
                         frontageRoadBuildingCounts.set(
@@ -2714,6 +2819,11 @@ let inputController, rendererController;
                         }
                     }
                 }
+            });
+
+            scene.userData.settlementBuildingVisualSummary = createSettlementBuildingVisualSummary({
+                towns: settlementBuildingVisualTowns,
+                records: settlementBuildingVisualRecords,
             });
 
             const lotCollisionTypes = new Set([

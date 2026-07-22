@@ -52,9 +52,9 @@ test('formal Human and Tank visual scales are explicit and visual-only', () => {
   assert.match(game, /if \(type === 'tank'\) group\.scale\.setScalar\(PRODUCTION_TANK_VISUAL_SCALE\);/);
   assert.match(html, /<option value="0\.5">0\.50 \(Production\)<\/option>/);
 
-  const currentSpawn = extractFunction(game, 'spawnEntity')
-    .replace("            if (type === 'tank') group.scale.setScalar(PRODUCTION_TANK_VISUAL_SCALE);\n", '');
-  assert.equal(currentSpawn, extractFunction(baselineGame, 'spawnEntity'));
+  const currentSpawn = extractFunction(game, 'spawnEntity');
+  assert.match(currentSpawn, /buildingVisual && FRONTAGE_BUILDING_TYPES\.includes\(type\)/);
+  assert.doesNotMatch(currentSpawn, /buildingVisual[^\n]*(?:human|tank)|(?:human|tank)[^\n]*buildingVisual/);
 });
 
 test('priority town routes and two start ponds receive exactly 96 props and 258 instances', () => {

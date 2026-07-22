@@ -113,6 +113,7 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
      'tests/city-local-roads.test.mjs',
      'tests/settlement-type.test.mjs',
      'tests/settlement-road-parameters.test.mjs',
+     'tests/town-local-roads.test.mjs',
      'tests/destruction-feel-regression.test.mjs',
      'tests/road-town-structure.test.mjs',
      'tests/runtime-stability.test.mjs',

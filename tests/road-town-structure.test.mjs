@@ -421,8 +421,16 @@ test('game integration renders Segment and Junction rectangles through one share
   assert.doesNotMatch(roadBlock, /Math\.random/);
 });
 
-test('building models, Player start, and World Interaction Phase2 remain at baseline', () => {
-  assert.equal(extractFunction(game, 'spawnEntity'), extractFunction(baselineGame, 'spawnEntity'));
+test('Player start and World Interaction Phase2 remain at baseline while building visuals are isolated', () => {
+  const spawnEntity = extractFunction(game, 'spawnEntity');
+  for (const lockedSnippet of [
+    "if (type === 'human') group.scale.setScalar(humanVisualScale);",
+    "if (type === 'tank') group.scale.setScalar(PRODUCTION_TANK_VISUAL_SCALE);",
+    "const isStatic = ['house', 'tower', 'church', 'school', 'tree', 'rock', 'pebble', 'militaryBase', 'barn', 'factory', 'haystack', 'cow'].includes(type);",
+  ]) {
+    assert.ok(spawnEntity.includes(lockedSnippet));
+    assert.ok(extractFunction(baselineGame, 'spawnEntity').includes(lockedSnippet));
+  }
   assert.equal(extractFunction(game, 'populateWorldScaleDetails'), extractFunction(baselineGame, 'populateWorldScaleDetails'));
   assert.equal(extractFunction(game, 'findLandingSpot'), extractFunction(baselineGame, 'findLandingSpot'));
   assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((sum, count) => sum + count, 0), 96);
