@@ -1265,6 +1265,365 @@ export function buildRoadHierarchy({ townCenters, waterZones = [], exclusionZone
       continue;
     }
 
+    if (town.settlementType === SETTLEMENT_TYPES.RURAL
+        && (town.type === 'residential' || town.type === 'military' || town.type === 'suburb')) {
+      const parameters = getSettlementRoadParameters(SETTLEMENT_TYPES.RURAL);
+      const localWidth = parameters.localWidth;
+      const alleyWidth = parameters.alleyWidth;
+      if (parameters.localSpineCount !== 1) throw new RangeError('RURAL requires exactly one LOCAL spine');
+
+      const townProfile = Object.freeze({
+        residential: Object.freeze({ angle: 10, halfLength: 0.36, offset: 0.07, branchLength: 0.19 }),
+        military: Object.freeze({ angle: -13, halfLength: 0.34, offset: 0.11, branchLength: 0.17 }),
+        suburb: Object.freeze({ angle: 6, halfLength: 0.46, offset: 0.13, branchLength: 0.16 }),
+      })[town.type];
+      const angle = townProfile.angle * Math.PI / 180;
+      const ruralDirection = Object.freeze({
+        x: spineDirection.x * Math.cos(angle) + spineDirection.z * Math.sin(angle),
+        z: -spineDirection.x * Math.sin(angle) + spineDirection.z * Math.cos(angle),
+      });
+      const ruralNormal = Object.freeze({ x: -ruralDirection.z, z: ruralDirection.x });
+      const stableSign = (townIndex + town.type.length) % 2 === 0 ? 1 : -1;
+      const ruralSpineHalfLength = town.coreRadius
+        * townProfile.halfLength
+        * parameters.roadLengthMultiplier;
+      const makeSpinePoint = (origin, distance) => {
+        const ratio = Math.max(-1, Math.min(1, distance / ruralSpineHalfLength));
+        const arcOffset = Math.cos(ratio * Math.PI / 2)
+          * town.coreRadius * parameters.localCurvature * 0.18 * stableSign;
+        return Object.freeze({
+          x: origin.x + ruralDirection.x * distance + ruralNormal.x * arcOffset,
+          z: origin.z + ruralDirection.z * distance + ruralNormal.z * arcOffset,
+        });
+      };
+      const originOffsets = [
+        townProfile.offset * stableSign,
+        -townProfile.offset * stableSign,
+        0.2 * stableSign,
+        -0.2 * stableSign,
+        0.28 * stableSign,
+        -0.28 * stableSign,
+      ];
+      const ruralOrigin = originOffsets.map(offset => Object.freeze({
+        x: townHub.x + ruralNormal.x * town.coreRadius * offset,
+        z: townHub.z + ruralNormal.z * town.coreRadius * offset,
+      })).find(origin => {
+        const candidatePoints = [
+          makeSpinePoint(origin, -ruralSpineHalfLength),
+          makeSpinePoint(origin, 0),
+          makeSpinePoint(origin, ruralSpineHalfLength),
+        ];
+        return candidatePoints.slice(0, -1).every((start, pointIndex) => (
+          isFullCorridorClear(start, candidatePoints[pointIndex + 1], localWidth)
+        ));
+      });
+      if (!ruralOrigin) throw new RangeError(`no safe RURAL spine origin: ${townId}`);
+      const minimumJunctionGap = localWidth * 1.5 * parameters.junctionSpacingMultiplier;
+      const pointOnRuralSpine = distance => makeSpinePoint(ruralOrigin, distance);
+      const corridorIsClear = (points, width) => points.slice(0, -1).every((start, pointIndex) => (
+        isFullCorridorClear(start, points[pointIndex + 1], width)
+      ));
+      const reservedJunctions = [];
+      const connectorSpecs = [];
+      const orderedIncidents = [...incidentRoads].sort((first, second) => (
+        first.connectionIndex - second.connectionIndex || first.roadId.localeCompare(second.roadId)
+      ));
+
+      for (let connectorIndex = 0; connectorIndex < orderedIncidents.length; connectorIndex++) {
+        const incident = orderedIncidents[connectorIndex];
+        const projectedDistance = (incident.point.x - ruralOrigin.x) * ruralDirection.x
+          + (incident.point.z - ruralOrigin.z) * ruralDirection.z;
+        const candidateDistances = [
+          projectedDistance,
+          projectedDistance + minimumJunctionGap,
+          projectedDistance - minimumJunctionGap,
+          projectedDistance + minimumJunctionGap * 2,
+          projectedDistance - minimumJunctionGap * 2,
+        ];
+        let selected = null;
+        for (const rawDistance of candidateDistances) {
+          const distance = Math.max(
+            -ruralSpineHalfLength + localWidth * 2,
+            Math.min(ruralSpineHalfLength - localWidth * 2, rawDistance),
+          );
+          if (reservedJunctions.some(existing => Math.abs(existing.distance - distance) < minimumJunctionGap)) continue;
+          const target = pointOnRuralSpine(distance);
+          const connectorDirection = normalize(target.x - incident.point.x, target.z - incident.point.z);
+          const majorRoad = roadsById.get(incident.roadId);
+          if (!connectorDirection || connectorDirection.length < localWidth * 2 || !majorRoad) continue;
+          const dot = Math.abs(
+            connectorDirection.x * majorRoad.tangentX + connectorDirection.z * majorRoad.tangentZ,
+          );
+          const connectorAngle = Math.acos(Math.max(-1, Math.min(1, dot))) * 180 / Math.PI;
+          if (connectorAngle < parameters.hardBranchAngleMin
+              || connectorAngle > parameters.hardBranchAngleMax) continue;
+          if (!isSafeJunctionPoint(target, localWidth)) continue;
+          if (!corridorIsClear([incident.point, target], localWidth)) continue;
+          selected = Object.freeze({ distance, point: target, incident, connectorIndex });
+          break;
+        }
+        if (selected) {
+          connectorSpecs.push(selected);
+          reservedJunctions.push({ distance: selected.distance, width: localWidth });
+        } else {
+          omitRoute(
+            `local-${townId}-major-connector-${connectorIndex}`,
+            ROAD_KINDS.LOCAL,
+            'CONNECTOR_ANGLE_OR_CLEARANCE',
+          );
+        }
+      }
+
+      const desiredBranchFractions = town.type === 'suburb'
+        ? [-0.72, -0.08, 0.7]
+        : town.type === 'military' ? [-0.68, -0.12, 0.64] : [-0.7, -0.16, 0.62];
+      const branchSpecs = [];
+      for (let branchIndex = 0; branchIndex < parameters.localBranchCount; branchIndex++) {
+        const desiredDistance = ruralSpineHalfLength * desiredBranchFractions[branchIndex];
+        const candidateOffsets = [
+          0,
+          minimumJunctionGap,
+          -minimumJunctionGap,
+          minimumJunctionGap * 2,
+          -minimumJunctionGap * 2,
+        ];
+        let selected = null;
+        for (const offset of candidateOffsets) {
+          const distance = desiredDistance + offset;
+          if (Math.abs(distance) > ruralSpineHalfLength - localWidth * 2) continue;
+          if (reservedJunctions.some(existing => Math.abs(existing.distance - distance) < minimumJunctionGap)) continue;
+          const attach = pointOnRuralSpine(distance);
+          if (!isSafeJunctionPoint(attach, localWidth)) continue;
+          selected = Object.freeze({ branchIndex, distance, attach });
+          break;
+        }
+        if (selected) {
+          branchSpecs.push(selected);
+          reservedJunctions.push({ distance: selected.distance, width: localWidth });
+        } else {
+          omitRoute(`local-${townId}-branch-${branchIndex}`, ROAD_KINDS.LOCAL, 'JUNCTION_CLEARANCE');
+          omitRoute(`alley-${townId}-${branchIndex}`, ROAD_KINDS.ALLEY, 'PARENT_ROUTE_OMITTED');
+        }
+      }
+
+      const spineJunctionPoints = [
+        ...connectorSpecs.map(spec => ({ distance: spec.distance, point: spec.point })),
+        ...branchSpecs.map(spec => ({ distance: spec.distance, point: spec.attach })),
+      ].sort((first, second) => first.distance - second.distance);
+      const spinePoints = [
+        pointOnRuralSpine(-ruralSpineHalfLength),
+        ...spineJunctionPoints.map(spec => spec.point),
+        pointOnRuralSpine(ruralSpineHalfLength),
+      ];
+      if (!corridorIsClear(spinePoints, localWidth)) {
+        throw new RangeError(`RURAL spine enters water or an exclusion: ${townId}`);
+      }
+      const spineSegments = addPolyline({
+        kind: ROAD_KINDS.LOCAL,
+        routeId: `local-${townId}-spine-0`,
+        points: spinePoints,
+        townResolver: () => ({ town, townId }),
+        parentRoadId: connectorSpecs[0]?.incident.roadId ?? null,
+        isTownSpine: true,
+        width: localWidth,
+        sampleSpacing: parameters.sampleSpacing,
+        curvature: parameters.localCurvature,
+        roadPattern: parameters.roadPattern,
+        roadSurfaceOverlap: parameters.roadSurfaceOverlap,
+      });
+
+      for (const connector of connectorSpecs) {
+        const spineRoads = roadsAtPoint(spineSegments, connector.point);
+        if (spineRoads.length !== 2) throw new RangeError(`RURAL connector is not inside LOCAL spine: ${townId}`);
+        const connectorSegments = addPolyline({
+          kind: ROAD_KINDS.LOCAL,
+          routeId: `local-${townId}-major-connector-${connector.connectorIndex}`,
+          points: [connector.incident.point, connector.point],
+          preserveStartDirection: true,
+          townResolver: () => ({ town, townId }),
+          parentRoadId: connector.incident.roadId,
+          width: localWidth,
+          sampleSpacing: parameters.sampleSpacing,
+          curvature: parameters.localCurvature,
+          roadPattern: parameters.roadPattern,
+          roadSurfaceOverlap: parameters.roadSurfaceOverlap,
+        });
+        addJunction({
+          type: 'CONNECTOR',
+          x: connector.incident.point.x,
+          z: connector.incident.point.z,
+          roadIds: [connector.incident.roadId, connectorSegments[0].roadId],
+          parentRoadId: connector.incident.roadId,
+          childRoadId: connectorSegments[0].roadId,
+        });
+        addJunction({
+          type: 'T',
+          x: connector.point.x,
+          z: connector.point.z,
+          roadIds: [...spineRoads.map(road => road.roadId), connectorSegments.at(-1).roadId],
+          parentRoadId: spineRoads[0].roadId,
+          childRoadId: connectorSegments.at(-1).roadId,
+        });
+      }
+
+      const branchAngles = town.type === 'residential'
+        ? [72, 102, 112]
+        : town.type === 'military' ? [106, 76, 96] : [110, 70, 100];
+      const generatedBranches = [];
+      for (const spec of branchSpecs) {
+        const parentRoads = roadsAtPoint(spineSegments, spec.attach);
+        if (parentRoads.length !== 2) throw new RangeError(`RURAL branch is not inside LOCAL spine: ${townId}`);
+        const parentRoad = parentRoads.find(road => (
+          Math.hypot(road.end.x - spec.attach.x, road.end.z - spec.attach.z) <= EPSILON
+        )) ?? parentRoads[0];
+        const branchRadians = branchAngles[spec.branchIndex] * Math.PI / 180;
+        const preferredSide = (spec.branchIndex + townIndex) % 2 === 0 ? 1 : -1;
+        const branchLength = Math.max(
+          localWidth * 4,
+          town.coreRadius * townProfile.branchLength * parameters.roadLengthMultiplier,
+        );
+        const makeBranchPoints = directionSign => {
+          const branchDirection = Object.freeze({
+            x: parentRoad.tangentX * Math.cos(branchRadians)
+              + parentRoad.normalX * Math.sin(branchRadians) * directionSign,
+            z: parentRoad.tangentZ * Math.cos(branchRadians)
+              + parentRoad.normalZ * Math.sin(branchRadians) * directionSign,
+          });
+          const initial = Object.freeze({
+            x: spec.attach.x + branchDirection.x * localWidth * 2,
+            z: spec.attach.z + branchDirection.z * localWidth * 2,
+          });
+          const end = Object.freeze({
+            x: spec.attach.x + branchDirection.x * branchLength,
+            z: spec.attach.z + branchDirection.z * branchLength,
+          });
+          const curveSign = (spec.branchIndex + townIndex) % 2 === 0 ? 1 : -1;
+          const middle = Object.freeze({
+            x: spec.attach.x + (end.x - spec.attach.x) * 0.56
+              + parentRoad.tangentX * branchLength * parameters.localCurvature * 0.32 * curveSign,
+            z: spec.attach.z + (end.z - spec.attach.z) * 0.56
+              + parentRoad.tangentZ * branchLength * parameters.localCurvature * 0.32 * curveSign,
+          });
+          const alleyAttach = Object.freeze(lerp(middle, end, 0.58));
+          return { initial, middle, alleyAttach, end };
+        };
+        const ignoredRoadIds = new Set(parentRoads.map(road => road.roadId));
+        const candidateIsSafe = candidate => (
+          corridorIsClear([spec.attach, candidate.initial, candidate.middle, candidate.alleyAttach, candidate.end], localWidth)
+          && isSafeJunctionPoint(candidate.alleyAttach, localWidth)
+          && isSafeJunctionPoint(candidate.end, localWidth)
+          && isRoadEndClear(candidate.end, localWidth, ignoredRoadIds)
+        );
+        const candidates = [preferredSide, -preferredSide]
+          .map(makeBranchPoints)
+          .sort((first, second) => {
+            const firstOuter = Math.hypot(first.end.x - town.x, first.end.z - town.z);
+            const secondOuter = Math.hypot(second.end.x - town.x, second.end.z - town.z);
+            return secondOuter - firstOuter;
+          });
+        const selected = candidates.find(candidateIsSafe);
+        if (!selected) {
+          omitRoute(`local-${townId}-branch-${spec.branchIndex}`, ROAD_KINDS.LOCAL, 'END_OR_CORRIDOR_BLOCKED');
+          omitRoute(`alley-${townId}-${spec.branchIndex}`, ROAD_KINDS.ALLEY, 'PARENT_ROUTE_OMITTED');
+          continue;
+        }
+        const branchSegments = addPolyline({
+          kind: ROAD_KINDS.LOCAL,
+          routeId: `local-${townId}-branch-${spec.branchIndex}`,
+          points: [spec.attach, selected.initial, selected.middle, selected.alleyAttach, selected.end],
+          preserveStartDirection: true,
+          townResolver: () => ({ town, townId }),
+          parentRoadId: parentRoads[0].roadId,
+          width: localWidth,
+          sampleSpacing: parameters.sampleSpacing,
+          curvature: parameters.localCurvature,
+          roadPattern: parameters.roadPattern,
+          roadSurfaceOverlap: parameters.roadSurfaceOverlap,
+        });
+        addJunction({
+          type: 'T',
+          x: spec.attach.x,
+          z: spec.attach.z,
+          roadIds: [...parentRoads.map(road => road.roadId), branchSegments[0].roadId],
+          parentRoadId: parentRoads[0].roadId,
+          childRoadId: branchSegments[0].roadId,
+        });
+        generatedBranches.push({ spec, branchSegments, alleyAttach: selected.alleyAttach });
+      }
+
+      let generatedAlleyCount = 0;
+      for (const branch of generatedBranches) {
+        if (generatedAlleyCount >= parameters.alleyCount) break;
+        const parentRoads = roadsAtPoint(branch.branchSegments, branch.alleyAttach);
+        if (parentRoads.length !== 2) continue;
+        const parentRoad = parentRoads[1];
+        const alleyLength = Math.max(
+          alleyWidth * 3,
+          town.coreRadius * (town.type === 'suburb' ? 0.1 : 0.12) * parameters.roadLengthMultiplier,
+        );
+        const makeAlleyPoints = directionSign => {
+          const end = Object.freeze({
+            x: branch.alleyAttach.x + parentRoad.normalX * alleyLength * directionSign,
+            z: branch.alleyAttach.z + parentRoad.normalZ * alleyLength * directionSign,
+          });
+          const middle = Object.freeze({
+            x: branch.alleyAttach.x + (end.x - branch.alleyAttach.x) * 0.52
+              + parentRoad.tangentX * alleyLength * parameters.alleyCurvature * 0.25 * stableSign,
+            z: branch.alleyAttach.z + (end.z - branch.alleyAttach.z) * 0.52
+              + parentRoad.tangentZ * alleyLength * parameters.alleyCurvature * 0.25 * stableSign,
+          });
+          return { middle, end };
+        };
+        const ignoredRoadIds = new Set(parentRoads.map(road => road.roadId));
+        const candidateIsSafe = candidate => (
+          corridorIsClear([branch.alleyAttach, candidate.middle, candidate.end], alleyWidth)
+          && isSafeJunctionPoint(candidate.end, alleyWidth)
+          && isRoadEndClear(candidate.end, alleyWidth, ignoredRoadIds)
+        );
+        const candidates = [1, -1].map(makeAlleyPoints).sort((first, second) => (
+          Math.hypot(second.end.x - town.x, second.end.z - town.z)
+          - Math.hypot(first.end.x - town.x, first.end.z - town.z)
+        ));
+        const selected = candidates.find(candidateIsSafe);
+        if (!selected) {
+          omitRoute(`alley-${townId}-${branch.spec.branchIndex}`, ROAD_KINDS.ALLEY, 'END_OR_CORRIDOR_BLOCKED');
+          continue;
+        }
+        const alleySegments = addPolyline({
+          kind: ROAD_KINDS.ALLEY,
+          routeId: `alley-${townId}-${branch.spec.branchIndex}`,
+          points: [branch.alleyAttach, selected.middle, selected.end],
+          preserveStartDirection: true,
+          townResolver: () => ({ town, townId }),
+          parentRoadId: parentRoads[0].roadId,
+          width: alleyWidth,
+          sampleSpacing: parameters.sampleSpacing,
+          curvature: parameters.alleyCurvature,
+          roadPattern: parameters.roadPattern,
+          roadSurfaceOverlap: parameters.roadSurfaceOverlap,
+        });
+        addJunction({
+          type: 'T',
+          x: branch.alleyAttach.x,
+          z: branch.alleyAttach.z,
+          roadIds: [...parentRoads.map(road => road.roadId), alleySegments[0].roadId],
+          parentRoadId: parentRoads[0].roadId,
+          childRoadId: alleySegments[0].roadId,
+        });
+        generatedAlleyCount++;
+      }
+      const generatedAlleyRouteIds = new Set(generatedBranches.flatMap(branch => (
+        roads.some(road => road.routeId === `alley-${townId}-${branch.spec.branchIndex}`)
+          ? [`alley-${townId}-${branch.spec.branchIndex}`]
+          : []
+      )));
+      for (let alleyIndex = 0; alleyIndex < parameters.alleyCount; alleyIndex++) {
+        const routeId = `alley-${townId}-${alleyIndex}`;
+        if (!generatedAlleyRouteIds.has(routeId)) omitRoute(routeId, ROAD_KINDS.ALLEY, 'END_OR_CORRIDOR_BLOCKED');
+      }
+      continue;
+    }
+
     const reservedJunctions = incidentRoads.map(incident => ({
       distance: incident.point.distance,
       width: ROAD_WIDTHS[ROAD_KINDS.MAJOR],
@@ -1810,6 +2169,79 @@ export function buildRoadHierarchy({ townCenters, waterZones = [], exclusionZone
     }
   }
 
+  const ruralRoadSummary = Object.freeze(townCenters.filter(town => (
+    town.settlementType === SETTLEMENT_TYPES.RURAL
+  )).map(town => {
+    const townIndex = townCenters.indexOf(town);
+    const townId = getTownId(town, townIndex);
+    const townRoads = roads.filter(road => (
+      road.townId === townId
+      && (road.kind === ROAD_KINDS.LOCAL || road.kind === ROAD_KINDS.ALLEY)
+    ));
+    const townRoadIds = new Set(townRoads.map(road => road.roadId));
+    const townJunctions = junctions.filter(junction => (
+      junction.roadIds.some(roadId => townRoadIds.has(roadId))
+    ));
+    const townRoutes = new Map();
+    for (const road of townRoads) {
+      if (!townRoutes.has(road.routeId)) townRoutes.set(road.routeId, []);
+      townRoutes.get(road.routeId).push(road);
+    }
+    for (const route of townRoutes.values()) {
+      route.sort((first, second) => first.routeOrder - second.routeOrder);
+    }
+    const localRoutes = [...townRoutes.values()].filter(route => route[0].kind === ROAD_KINDS.LOCAL);
+    const alleyRoutes = [...townRoutes.values()].filter(route => route[0].kind === ROAD_KINDS.ALLEY);
+    let minimumJunctionSpacing = null;
+    for (let firstIndex = 0; firstIndex < townJunctions.length; firstIndex++) {
+      for (let secondIndex = firstIndex + 1; secondIndex < townJunctions.length; secondIndex++) {
+        const distance = Math.hypot(
+          townJunctions[firstIndex].x - townJunctions[secondIndex].x,
+          townJunctions[firstIndex].z - townJunctions[secondIndex].z,
+        );
+        minimumJunctionSpacing = minimumJunctionSpacing === null
+          ? distance
+          : Math.min(minimumJunctionSpacing, distance);
+      }
+    }
+    const outwardRoutes = [...townRoutes.entries()].filter(([routeId]) => (
+      routeId.includes('-branch-') || routeId.startsWith(`alley-${townId}-`)
+    ));
+    const outwardCount = outwardRoutes.filter(([, route]) => {
+      const start = route[0].start;
+      const end = route.at(-1).end;
+      return Math.hypot(end.x - town.x, end.z - town.z)
+        > Math.hypot(start.x - town.x, start.z - town.z);
+    }).length;
+    const townOmissions = omittedRoutes.filter(route => route.routeId.includes(townId));
+    const omissionReasons = Object.freeze(townOmissions.reduce((counts, route) => {
+      counts[route.reason] = (counts[route.reason] ?? 0) + 1;
+      return counts;
+    }, {}));
+    const summary = Object.freeze({
+      townType: town.type,
+      townId,
+      localRouteCount: localRoutes.length,
+      localSegmentCount: localRoutes.reduce((count, route) => count + route.length, 0),
+      alleyRouteCount: alleyRoutes.length,
+      alleySegmentCount: alleyRoutes.reduce((count, route) => count + route.length, 0),
+      junctionCount: townJunctions.length,
+      connectorCount: localRoutes.filter(route => route[0].routeId.includes('-major-connector-')).length,
+      omittedRouteCount: townOmissions.length,
+      omissionReasons,
+      minimumJunctionSpacing,
+      maximumRouteCurvature: townRoads.reduce((maximum, road) => (
+        Math.max(maximum, road.curvature ?? 0)
+      ), 0),
+      deadEndCount: roadEnds.filter(end => (
+        end.routeId.includes(townId)
+        && (end.kind === ROAD_KINDS.LOCAL || end.kind === ROAD_KINDS.ALLEY)
+      )).length,
+      outerDirectionRatio: outwardRoutes.length === 0 ? 0 : outwardCount / outwardRoutes.length,
+    });
+    return summary;
+  }));
+
   const capitalCivicCoreSummary = capitalCivicCore && capitalTopology
     ? (() => {
       const capitalRoads = roads.filter(road => road.townId === capitalTownId);
@@ -1886,5 +2318,6 @@ export function buildRoadHierarchy({ townCenters, waterZones = [], exclusionZone
     capitalCivicCore,
     capitalTopology,
     capitalCivicCoreSummary,
+    ruralRoadSummary,
   });
 }

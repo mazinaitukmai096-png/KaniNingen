@@ -33,7 +33,10 @@ import {
 } from './constants.js';
 import { createInputController } from './core/input.js';
 import { createRendererController } from './core/renderer.js';
-import { buildRoadHierarchy } from './road-town-structure.js';
+import {
+  ROAD_KINDS,
+  buildRoadHierarchy,
+} from './road-town-structure.js';
 import {
   circleIntersectsCapitalCivicCore,
   isPointInCapitalCivicCore,
@@ -2347,6 +2350,7 @@ let inputController, rendererController;
             scene.userData.capitalCivicCore = capitalCivicCore;
             scene.userData.capitalTopology = roadHierarchy.capitalTopology;
             scene.userData.capitalCivicCoreSummary = roadHierarchy.capitalCivicCoreSummary;
+            scene.userData.settlementRuralRoadSummary = roadHierarchy.ruralRoadSummary;
             const civicSpaces = createCivicSpaceReservations({
                 townCenters,
                 landmarks: fixedTownLandmarks,
@@ -2540,6 +2544,21 @@ let inputController, rendererController;
                         civicSpaceParkRetryCount++;
                         continue;
                     }
+                    if (tc.settlementType === SETTLEMENT_TYPES.RURAL
+                        && roadHierarchy.roadSurfaces.some(surface => {
+                            const road = roadHierarchy.roads.find(candidateRoad => (
+                                candidateRoad.roadId === surface.roadId
+                            ));
+                            return road?.townId === frontageTownId
+                                && (road.kind === ROAD_KINDS.LOCAL || road.kind === ROAD_KINDS.ALLEY)
+                                && circleIntersectsOrientedSurface(
+                                    candidate.x,
+                                    candidate.z,
+                                    candidate.radius,
+                                    surface,
+                                    18,
+                                );
+                        })) continue;
                     park = candidate;
                     break;
                 }

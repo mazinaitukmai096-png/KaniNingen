@@ -401,7 +401,7 @@ test('the same inputs produce an identical hierarchy without a Seed system', () 
 });
 
 test('game integration keeps rectangular roads instanced and isolates the Capital union surface', () => {
-  assert.match(game, /import \{ buildRoadHierarchy \} from '\.\/road-town-structure\.js';/);
+  assert.match(game, /import\s*\{[\s\S]*ROAD_KINDS,[\s\S]*buildRoadHierarchy,[\s\S]*\}\s*from\s*['"]\.\/road-town-structure\.js['"]/);
   const roadBlock = sliceBetween(
     game,
     '// --- 街道（道と橋）の生成（人間の営みロジック） ---',

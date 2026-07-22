@@ -63,6 +63,11 @@ const createHierarchy = townCenters => buildRoadHierarchy({
 });
 const hierarchy = createHierarchy(typedTownCenters);
 const legacyHierarchy = createHierarchy(legacyTownCenters);
+const preRuralHierarchy = createHierarchy(typedTownCenters.map(town => (
+  town.settlementType === 'RURAL'
+    ? Object.fromEntries(Object.entries(town).filter(([key]) => key !== 'settlementType'))
+    : town
+)));
 const roadsById = new Map(hierarchy.roads.map(road => [road.roadId, road]));
 
 function townRoads(hierarchyValue, townId) {
@@ -120,6 +125,7 @@ function signedUndirectedOffset(first, second) {
 
 test('only church_town and school_town consume the TOWN LOCAL and ALLEY contract', () => {
   const parameters = getSettlementRoadParameters('TOWN');
+  const ruralParameters = getSettlementRoadParameters('RURAL');
   for (const townId of townIds) {
     for (const road of townRoads(hierarchy, townId)) {
       assert.equal(road.width, road.kind === ROAD_KINDS.LOCAL ? 66 : 45);
@@ -129,8 +135,8 @@ test('only church_town and school_town consume the TOWN LOCAL and ALLEY contract
     }
   }
   for (const road of hierarchy.roads.filter(road => ruralTownIds.has(road.townId))) {
-    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, 64);
-    if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, 44);
+    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, ruralParameters.localWidth);
+    if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, ruralParameters.alleyWidth);
     assert.notEqual(road.roadPattern, 'SEMI_GRID');
   }
   for (const road of hierarchy.roads.filter(road => road.townId === capitalTownId)) {
@@ -335,19 +341,16 @@ test('TOWN frontage and Lot references resolve to real roads without placing the
   }
 });
 
-test('Capital Civic Core scope preserves RURAL, non-Capital MAJOR, START_APPROACH, and Bridge fixtures', () => {
+test('Capital Civic Core scope preserves non-Capital MAJOR, START_APPROACH, and Bridge fixtures', () => {
   const currentCapital = townRoads(hierarchy, capitalTownId);
   assert.equal(currentCapital.filter(road => road.kind === ROAD_KINDS.LOCAL).length, 36);
   assert.equal(currentCapital.filter(road => road.kind === ROAD_KINDS.ALLEY).length, 6);
   assert.equal(hierarchy.roadSurfaces.filter(surface => currentCapital.some(road => road.roadId === surface.roadId)).length, 42);
 
-  const fixedRoad = road => (
-    (ruralTownIds.has(road.townId) && road.kind !== ROAD_KINDS.MAJOR)
-    || (road.kind === ROAD_KINDS.MAJOR && !road.routeId.includes(capitalTownId))
-  );
+  const fixedRoad = road => road.kind === ROAD_KINDS.MAJOR || road.kind === ROAD_KINDS.START_APPROACH;
   assert.deepEqual(
     hierarchy.roads.filter(fixedRoad).map(semanticRoadShape),
-    legacyHierarchy.roads.filter(fixedRoad).map(semanticRoadShape),
+    preRuralHierarchy.roads.filter(fixedRoad).map(semanticRoadShape),
   );
   const bridgeShape = bridge => ({
     routeId: bridge.routeId,
@@ -358,7 +361,7 @@ test('Capital Civic Core scope preserves RURAL, non-Capital MAJOR, START_APPROAC
     tangentX: bridge.tangentX,
     tangentZ: bridge.tangentZ,
   });
-  assert.deepEqual(hierarchy.bridgeSpans.map(bridgeShape), legacyHierarchy.bridgeSpans.map(bridgeShape));
+  assert.deepEqual(hierarchy.bridgeSpans.map(bridgeShape), preRuralHierarchy.bridgeSpans.map(bridgeShape));
   assert.equal(hierarchy.majorConnections.length, 5);
   assert.equal(new Set(hierarchy.roads
     .filter(road => road.kind === ROAD_KINDS.START_APPROACH)
@@ -382,7 +385,7 @@ test('Frontage, Lot, and world interaction modules stay at Phase 3A-2A', () => {
   }
 });
 
-test('the same TOWN input produces the same road hierarchy without connecting RURAL parameters', () => {
+test('the same TOWN and RURAL input produces the same deterministic road hierarchy', () => {
   const repeated = createHierarchy(structuredClone(typedTownCenters));
   assert.deepEqual(repeated.roads.map(semanticRoadShape), hierarchy.roads.map(semanticRoadShape));
   assert.deepEqual(repeated.omittedRoutes, hierarchy.omittedRoutes);

@@ -28,6 +28,11 @@ const typedTownCenters = legacyTownCenters.map(town => ({
   ...town,
   settlementType: getSettlementTypeForTownType(town.type),
 }));
+const preRuralTownCenters = typedTownCenters.map(town => (
+  town.settlementType === 'RURAL'
+    ? Object.fromEntries(Object.entries(town).filter(([key]) => key !== 'settlementType'))
+    : town
+));
 const waterZones = [
   { x: 3800, z: 3800, radius: 360 },
   { x: 5200, z: -1200, radius: 320, isPond: true },
@@ -51,6 +56,11 @@ const hierarchy = buildRoadHierarchy({
 });
 const legacyHierarchy = buildRoadHierarchy({
   townCenters: legacyTownCenters,
+  waterZones,
+  exclusionZones,
+});
+const preRuralHierarchy = buildRoadHierarchy({
+  townCenters: preRuralTownCenters,
   waterZones,
   exclusionZones,
 });
@@ -108,9 +118,10 @@ function junctionShape(junction, roadIndex) {
   };
 }
 
-test('CITY, TOWN, and unchanged RURAL roads consume only their connected LOCAL and ALLEY widths', () => {
+test('CITY, TOWN, and RURAL roads consume only their connected LOCAL and ALLEY widths', () => {
   const city = getSettlementRoadParameters('CITY');
   const town = getSettlementRoadParameters('TOWN');
+  const rural = getSettlementRoadParameters('RURAL');
   assert.equal(typedTownCenters.filter(town => town.settlementType === 'CITY').length, 1);
   assert.equal(typedTownCenters[0].type, 'capital');
 
@@ -128,8 +139,8 @@ test('CITY, TOWN, and unchanged RURAL roads consume only their connected LOCAL a
     if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, town.alleyWidth);
   }
   for (const road of hierarchy.roads.filter(road => ruralTownIds.has(road.townId))) {
-    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, 64);
-    if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, 44);
+    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, rural.localWidth);
+    if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, rural.alleyWidth);
   }
 });
 
@@ -261,14 +272,11 @@ test('Capital LOCAL and ALLEY routes avoid water and protected exclusions', () =
   assert.ok(capitalSamples.every(sample => !sample.isWater && !sample.isBlocked));
 });
 
-test('non-Capital MAJOR links, START_APPROACH compatibility, Bridge, and RURAL roads remain stable', () => {
-  const fixedRoad = road => (
-    (ruralTownIds.has(road.townId) && road.kind !== ROAD_KINDS.MAJOR)
-    || (road.kind === ROAD_KINDS.MAJOR && !road.routeId.includes(capitalTownId))
-  );
+test('non-Capital MAJOR links, START_APPROACH compatibility, and Bridge remain stable', () => {
+  const fixedRoad = road => road.kind === ROAD_KINDS.MAJOR || road.kind === ROAD_KINDS.START_APPROACH;
   assert.deepEqual(
     hierarchy.roads.filter(fixedRoad).map(roadShape),
-    legacyHierarchy.roads.filter(fixedRoad).map(roadShape),
+    preRuralHierarchy.roads.filter(fixedRoad).map(roadShape),
   );
 
   const bridgeShape = bridge => ({
@@ -280,24 +288,22 @@ test('non-Capital MAJOR links, START_APPROACH compatibility, Bridge, and RURAL r
     tangentX: bridge.tangentX,
     tangentZ: bridge.tangentZ,
   });
-  assert.deepEqual(hierarchy.bridgeSpans.map(bridgeShape), legacyHierarchy.bridgeSpans.map(bridgeShape));
+  assert.deepEqual(hierarchy.bridgeSpans.map(bridgeShape), preRuralHierarchy.bridgeSpans.map(bridgeShape));
   assert.equal(hierarchy.majorConnections.length, 5);
   assert.equal(new Set(hierarchy.roads.filter(road => road.kind === ROAD_KINDS.MAJOR).map(road => road.routeId)).size, 5);
   assert.equal(getRoadKindCounts(hierarchy.roads).START_APPROACH, 6);
   assert.equal(new Set(hierarchy.roads.filter(road => road.kind === ROAD_KINDS.START_APPROACH).map(road => road.routeId)).size, 2);
 });
 
-test('RURAL junction topology remains identical to the Phase 1 fixture', () => {
-  const legacyRoadsById = new Map(legacyHierarchy.roads.map(road => [road.roadId, road]));
-  const fixedJunction = (junction, roadIndex) => junction.roadIds
-    .map(roadId => roadIndex.get(roadId))
-    .every(road => ruralTownIds.has(road.townId));
-  assert.deepEqual(
-    hierarchy.junctions.filter(junction => fixedJunction(junction, roadsById)).map(junction => junctionShape(junction, roadsById)),
-    legacyHierarchy.junctions
-      .filter(junction => fixedJunction(junction, legacyRoadsById))
-      .map(junction => junctionShape(junction, legacyRoadsById)),
-  );
+test('RURAL junction topology remains bounded without a degree-four hub', () => {
+  const ruralRoadIds = new Set(hierarchy.roads
+    .filter(road => ruralTownIds.has(road.townId) && road.kind !== ROAD_KINDS.MAJOR)
+    .map(road => road.roadId));
+  const ruralJunctions = hierarchy.junctions.filter(junction => (
+    junction.roadIds.some(roadId => ruralRoadIds.has(roadId))
+  ));
+  assert.ok(ruralJunctions.length > 0);
+  assert.ok(ruralJunctions.every(junction => junction.degree <= 3 && !junction.isHub));
 });
 
 test('Frontage, Lot, world detail, and settlement metadata remain at Phase 3A-1', () => {

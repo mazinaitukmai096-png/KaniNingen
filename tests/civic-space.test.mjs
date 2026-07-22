@@ -240,10 +240,9 @@ test('game integration reserves spaces before normal buildings and reuses shared
   assert.equal(getWorldDetailInstanceCount(6, 2), 258);
 });
 
-test('Road, Core, Frontage, Lot, visuals, and gameplay modules remain byte-identical to the Civic Core HEAD', () => {
+test('Core, Frontage, Lot, visuals, and gameplay modules remain byte-identical to the Civic Core HEAD', () => {
   for (const path of [
     'src/capital-civic-core.js',
-    'src/road-town-structure.js',
     'src/building-frontage.js',
     'src/building-lot.js',
     'src/settlement-building-visuals.js',

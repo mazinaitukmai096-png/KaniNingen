@@ -289,11 +289,10 @@ test('same input is deterministic without random, Seed, generic Zones, HUD, or c
   assert.doesNotMatch(source, /console\.|document\.|HUD/i);
 });
 
-test('locked road, Civic Space, building visual, Frontage, Lot, and gameplay modules are unchanged', () => {
+test('locked Civic Space, building visual, Frontage, Lot, and gameplay modules are unchanged', () => {
   for (const path of [
     'src/civic-space.js',
     'src/capital-civic-core.js',
-    'src/road-town-structure.js',
     'src/building-frontage.js',
     'src/building-lot.js',
     'src/settlement-building-visuals.js',
