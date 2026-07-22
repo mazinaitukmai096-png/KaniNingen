@@ -1,0 +1,51 @@
+{
+  "schemaVersion": "infinite-world-legacy-provenance-1",
+  "phase": "W3",
+  "sourceRepository": "C:\\KaniGame(開発用)",
+  "sourceCommit": "4210c069314a084b528d97e3d5a5e1345d38ad94",
+  "importsAdjusted": false,
+  "files": [
+    {
+      "source": "src/world-generation/g1/feature-bounds.js",
+      "destination": "src/infinite-world/legacy-core/g1/feature-bounds.js",
+      "gitBlob": "955df0ed07b7a6624b60b5cf817419932e583577",
+      "sha256": "0bbd53ed4e96ea9e7697017c30a72665a933eff4a1b33cb1a518b6be1d91e08e"
+    },
+    {
+      "source": "src/world-generation/g1/feature-port.js",
+      "destination": "src/infinite-world/legacy-core/g1/feature-port.js",
+      "gitBlob": "54f72739726c27fcb3a56b3dfc082d9b0a1b247a",
+      "sha256": "8c09058da956f02c0e4e72803fb5ff81e9b1e83fe4ec1a03f0c9708078063ef5"
+    },
+    {
+      "source": "src/world-generation/g2/world-chunk-generator.js",
+      "destination": "src/infinite-world/legacy-core/g2/world-chunk-generator.js",
+      "gitBlob": "733ac8f9fa1e19a59995e094332fe95524bd39e5",
+      "sha256": "798ce46b0b14fa9cde7aa0f22a8deba35d2cb3a2e0223e7654a981bcf75e7f12"
+    },
+    {
+      "source": "src/world-generation/g2/world-feature-geometry.js",
+      "destination": "src/infinite-world/legacy-core/g2/world-feature-geometry.js",
+      "gitBlob": "9f0d2cb229bd7ec73b32b86180269c1aff309929",
+      "sha256": "b6d8efa2cd70b0e2850fac34c54cea8c0189b27c000419229e7fa50d045d4e5b"
+    },
+    {
+      "source": "src/world-generation/g2/feature-projection.js",
+      "destination": "src/infinite-world/legacy-core/g2/feature-projection.js",
+      "gitBlob": "800097a31c830ad508be7f09841d9eb5d0da4e41",
+      "sha256": "c641a88f169fc97baafc341303bc58bfcc0143000d47a16da69b3c3ccf4e76a8"
+    },
+    {
+      "source": "src/world-generation/g3/detail-candidates.js",
+      "destination": "src/infinite-world/legacy-core/g3/detail-candidates.js",
+      "gitBlob": "4373e2a9bb5b52bfd4e9b9f4ec460c786ba56722",
+      "sha256": "e6d3273f753363982c7be996e4db61f44265a2347164cda98f0c8bdce2deedee"
+    },
+    {
+      "source": "src/world-generation/g6/rock-redistribution.js",
+      "destination": "src/infinite-world/legacy-core/g6/rock-redistribution.js",
+      "gitBlob": "a7ce257bb48b0a8aa6b216398231cb1357a8e244",
+      "sha256": "f8d19250867362d72370d0dca21d5bb29529c66959c4e8f96d840c55e641e210"
+    }
+  ]
+}

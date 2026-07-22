@@ -21,6 +21,7 @@ export class ChunkRuntimeManager {
     renderAdapter,
     cacheCapacity = 81,
     identityAuditCapacity = 4096,
+    chunkIndex = null,
     clock = defaultClock,
   } = {}) {
     if (typeof generator?.generateChunk !== 'function') throw new TypeError('generator.generateChunk is required');
@@ -33,11 +34,16 @@ export class ChunkRuntimeManager {
     if (!Number.isSafeInteger(identityAuditCapacity) || identityAuditCapacity < cacheCapacity) {
       throw new RangeError('identityAuditCapacity must be an integer at least as large as cacheCapacity');
     }
+    if (chunkIndex !== null && (typeof chunkIndex.registerChunk !== 'function'
+      || typeof chunkIndex.snapshot !== 'function')) {
+      throw new TypeError('chunkIndex must provide registerChunk and snapshot');
+    }
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
     this.generator = generator;
     this.renderAdapter = renderAdapter;
     this.cacheCapacity = cacheCapacity;
     this.identityAuditCapacity = identityAuditCapacity;
+    this.chunkIndex = chunkIndex;
     this.clock = clock;
     this.floatingOrigin = new FloatingOrigin();
     this.performance = new PerformanceLedger();
@@ -119,6 +125,7 @@ export class ChunkRuntimeManager {
         throw new Error(`same chunk key produced differing identity/content: ${coordinate.key}`);
       }
       this.#registerIdentity(coordinate.key, chunkData);
+      this.chunkIndex?.registerChunk(chunkData);
       if (!existing) {
         this.cache.set(coordinate.key, { data: chunkData, lastUsed: ++this.accessTick });
         this.counts.generated += 1;
@@ -214,9 +221,15 @@ export class ChunkRuntimeManager {
       const priorKey = chunkIds.get(chunkData.chunkId);
       if (priorKey && priorKey !== key) throw new Error(`duplicate chunkId across ${priorKey} and ${key}`);
       chunkIds.set(chunkData.chunkId, key);
-      for (const proxy of [...chunkData.vegetationProxies, ...chunkData.rockProxies]) {
-        if (featureIds.has(proxy.stableId)) throw new Error(`duplicate Stable ID in active set: ${proxy.stableId}`);
-        featureIds.add(proxy.stableId);
+      const features = [
+        ...(chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? []),
+        ...(chunkData.rockCandidates ?? chunkData.rockProxies ?? []),
+      ];
+      for (const feature of features) {
+        const stableId = feature.candidateId ?? feature.stableId;
+        if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid Stable ID in active set: ${key}`);
+        if (featureIds.has(stableId)) throw new Error(`duplicate Stable ID in active set: ${stableId}`);
+        featureIds.add(stableId);
       }
       for (const [edge, offsetX, offsetZ, opposite] of [
         ['east', 1, 0, 'west'],
@@ -272,6 +285,7 @@ export class ChunkRuntimeManager {
       cacheCapacity: this.cacheCapacity,
       identityAuditSize: this.identityAudit.size,
       identityAuditCapacity: this.identityAuditCapacity,
+      chunkIndex: this.chunkIndex?.snapshot() ?? null,
       activeDataKeys: Object.freeze(sortedKeys(this.activeDataKeys)),
       renderedKeys: Object.freeze(sortedKeys(this.renderedKeys)),
       counts: Object.freeze({ ...this.counts }),

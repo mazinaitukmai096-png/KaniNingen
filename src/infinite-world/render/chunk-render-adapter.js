@@ -142,6 +142,8 @@ export class ChunkRenderAdapter {
       requireConstructor(this.THREE, name);
     }
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
+    const vegetation = chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? [];
+    const rocks = chunkData.rockCandidates ?? chunkData.rockProxies ?? [];
     const group = new Group();
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
@@ -164,15 +166,26 @@ export class ChunkRenderAdapter {
     const treeMesh = new InstancedMesh(
       this.geometries.tree,
       this.materials.tree,
-      Math.max(1, chunkData.vegetationProxies.length),
+      Math.max(1, vegetation.length),
     );
-    treeMesh.name = 'w1a-tree-proxies';
-    treeMesh.count = chunkData.vegetationProxies.length;
+    treeMesh.name = chunkData.vegetationCandidates ? 'w3-formal-vegetation' : 'w1a-tree-proxies';
+    treeMesh.count = vegetation.length;
     const transform = new Object3D();
-    chunkData.vegetationProxies.forEach((proxy, index) => {
-      transform.position.set(proxy.logicalLocalX * this.unitsPerMeter, 260 * proxy.scale, proxy.logicalLocalZ * this.unitsPerMeter);
-      transform.rotation.set(0, proxy.yawRadians, 0);
-      transform.scale.set(proxy.scale, proxy.scale, proxy.scale);
+    vegetation.forEach((candidate, index) => {
+      const formal = candidate.candidateId !== undefined;
+      const scale = formal
+        ? (candidate.subtype === 'shrub' ? 0.38 : 0.72) * (0.82 + candidate.variationSeed * 0.36)
+        : candidate.scale;
+      const localX = formal
+        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalX;
+      const localZ = formal
+        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalZ;
+      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
+      transform.position.set(localX * this.unitsPerMeter, groundY + 260 * scale, localZ * this.unitsPerMeter);
+      transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
+      transform.scale.set(scale, scale, scale);
       transform.updateMatrix();
       treeMesh.setMatrixAt(index, transform.matrix);
     });
@@ -182,14 +195,25 @@ export class ChunkRenderAdapter {
     const rockMesh = new InstancedMesh(
       this.geometries.rock,
       this.materials.rock,
-      Math.max(1, chunkData.rockProxies.length),
+      Math.max(1, rocks.length),
     );
-    rockMesh.name = 'w1a-rock-proxies';
-    rockMesh.count = chunkData.rockProxies.length;
-    chunkData.rockProxies.forEach((proxy, index) => {
-      transform.position.set(proxy.logicalLocalX * this.unitsPerMeter, 85 * proxy.scale, proxy.logicalLocalZ * this.unitsPerMeter);
-      transform.rotation.set(0, proxy.yawRadians, 0);
-      transform.scale.set(proxy.scale, proxy.scale * 0.65, proxy.scale);
+    rockMesh.name = chunkData.rockCandidates ? 'w3-formal-rocks' : 'w1a-rock-proxies';
+    rockMesh.count = rocks.length;
+    rocks.forEach((candidate, index) => {
+      const formal = candidate.candidateId !== undefined;
+      const scale = formal
+        ? candidate.metadata.candidateRadiusMeters * this.unitsPerMeter / 135 * (0.9 + candidate.variationSeed * 0.2)
+        : candidate.scale;
+      const localX = formal
+        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalX;
+      const localZ = formal
+        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+        : candidate.logicalLocalZ;
+      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
+      transform.position.set(localX * this.unitsPerMeter, groundY + 85 * scale, localZ * this.unitsPerMeter);
+      transform.rotation.set(0, formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians, 0);
+      transform.scale.set(scale, scale * 0.65, scale);
       transform.updateMatrix();
       rockMesh.setMatrixAt(index, transform.matrix);
     });

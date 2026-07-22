@@ -6,7 +6,8 @@ import {
   logicalWorldToRenderLocal,
 } from './chunk-coordinates.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
-import { createNaturalChunkGenerator } from './natural-chunk-generator.js';
+import { createFormalNaturalChunkGenerator } from './formal-natural-chunk-generator.js';
+import { PersistentChunkIndex } from './persistent-chunk-index.js';
 
 const THREE = globalThis.THREE;
 const viewport = document.querySelector('#viewport');
@@ -16,7 +17,7 @@ if (!viewport || !hud) throw new Error('sandbox DOM is incomplete');
 
 const query = new URLSearchParams(globalThis.location.search);
 const requestedSeed = query.get('seed') ?? 'KaniNingen Infinite Natural World';
-const generator = await createNaturalChunkGenerator({ worldSeed: requestedSeed });
+const generator = await createFormalNaturalChunkGenerator({ worldSeed: requestedSeed });
 const chunkSizeBenchmark = runW1BChunkSizeBenchmark({ iterations: 25_000, rounds: 5 });
 const selectedRenderChunkSize = chunkSizeBenchmark.decision.selectedRenderChunkSize;
 
@@ -51,7 +52,8 @@ playerMarker.add(markerDirection);
 scene.add(playerMarker);
 
 const renderAdapter = new ChunkRenderAdapter({ THREE, scene, renderChunkSize: selectedRenderChunkSize });
-const runtime = new ChunkRuntimeManager({ generator, renderAdapter, cacheCapacity: 81 });
+const chunkIndex = new PersistentChunkIndex({ capacity: 65_536 });
+const runtime = new ChunkRuntimeManager({ generator, renderAdapter, cacheCapacity: 81, chunkIndex });
 const logicalPlayer = { x: 8, z: 8 };
 const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
 await runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ);
@@ -140,11 +142,12 @@ function updateHud(owner) {
   const transition = state.latestTransition;
   const warningText = state.warnings.length ? `\n警告: ${state.warnings.join(' / ')}` : '';
   const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
-  hud.innerHTML = `<span id="badge">W2 / INFINITE NATURAL WORLD SANDBOX</span>
+  hud.innerHTML = `<span id="badge">W3 / FORMAL NATURAL DETAILS</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
 Natural Biome: ${escapeHtml(currentChunk?.biomeField?.primaryBiomeId ?? 'loading')}  Height range: ${number(currentChunk?.terrain?.heightRangeMeters?.minimum)}..${number(currentChunk?.terrain?.heightRangeMeters?.maximum)}m
+Formal Vegetation: ${currentChunk?.vegetationCandidates?.length ?? 0}  Formal Rocks: ${currentChunk?.rockCandidates?.length ?? 0}  Persistent Index: ${state.chunkIndex?.size ?? 0}/${state.chunkIndex?.capacity ?? 0}
 Render Origin Chunk: (${state.renderOrigin.renderOriginChunkX}, ${state.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${chunkSizeBenchmark.decision.selectedUnitsPerMeter} units/m; 4096/2048 compared)
 Rendered: ${state.renderedCount}/9  Prefetched Data: ${state.activeDataCount}/25  Cache: ${state.cacheSize}/${state.cacheCapacity}
@@ -199,3 +202,4 @@ globalThis.__w1aSandbox = Object.freeze({
   shutdown,
   constants: Object.freeze({ unitsPerMeter: UNITS_PER_METER }),
 });
+globalThis.__infiniteWorldSandbox = globalThis.__w1aSandbox;
