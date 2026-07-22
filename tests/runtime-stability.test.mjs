@@ -201,7 +201,11 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
     /\n\s*\/\/ BUILDING LOT VEGETATION EXCLUSION START[\s\S]*?\/\/ BUILDING LOT VEGETATION EXCLUSION END\n/g,
     '\n',
   );
-  const currentMap = normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
+  const normalizeSettlementTypeFoundation = source => source.replace(
+    /\n\s*\/\/ SETTLEMENT TYPE FOUNDATION START[\s\S]*?\/\/ SETTLEMENT TYPE FOUNDATION END\n/g,
+    '\n',
+  );
+  const currentMap = normalizeSettlementTypeFoundation(normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
     .replace(
       /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
       '\n                    $1\n                    $2',
@@ -210,10 +214,10 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
       /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
       '\n',
     )
-    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n'))));
-  const baselineMap = normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(
+    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n')))));
+  const baselineMap = normalizeSettlementTypeFoundation(normalizeBuildingLotVegetation(normalizeBuildingFrontage(normalizeRoadHierarchy(
     sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
-  )));
+  ))));
   assert.equal(currentMap, baselineMap);
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');
@@ -228,7 +232,7 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
 });
 
 test('JavaScript syntax and local module imports resolve', () => {
-  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/building-lot.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/game.js', 'src/constants.js', 'src/scale-sandbox.js', 'src/building-lot.js', 'src/settlement-type.js', 'src/core/input.js', 'src/core/renderer.js']) {
     execFileSync(process.execPath, ['--check', resolve(repoRoot, path)], { cwd: repoRoot, stdio: 'pipe' });
   }
 

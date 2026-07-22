@@ -59,6 +59,7 @@ import {
   pointInOrientedRectangle,
   roadSurfaceToRectangle,
 } from './building-lot.js';
+import { getSettlementTypeForTownType, SETTLEMENT_TYPES } from './settlement-type.js';
 import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
@@ -2087,6 +2088,29 @@ let inputController, rendererController;
                 { x: -7500, z: -8250, radius: 3510, coreRadius: 1950, type: 'military' },    
                 { x: 0,     z: 11250, radius: 3240, coreRadius: 1800, type: 'suburb' }       
             ];
+
+            // SETTLEMENT TYPE FOUNDATION START
+            const settlementCounts = {
+                [SETTLEMENT_TYPES.CITY]: 0,
+                [SETTLEMENT_TYPES.TOWN]: 0,
+                [SETTLEMENT_TYPES.RURAL]: 0,
+            };
+            const townAssignments = townCenters.map(town => {
+                town.settlementType = getSettlementTypeForTownType(town.type);
+                if (town.settlementType !== null) settlementCounts[town.settlementType]++;
+                return Object.freeze({
+                    townType: town.type,
+                    settlementType: town.settlementType,
+                });
+            });
+            scene.userData.settlementTypeSummary = Object.freeze({
+                totalTownCount: townCenters.length,
+                cityCount: settlementCounts[SETTLEMENT_TYPES.CITY],
+                townCount: settlementCounts[SETTLEMENT_TYPES.TOWN],
+                ruralCount: settlementCounts[SETTLEMENT_TYPES.RURAL],
+                townAssignments: Object.freeze(townAssignments),
+            });
+            // SETTLEMENT TYPE FOUNDATION END
 
             townCenters.forEach(tc => {
                 // 町の少し外れ（町の半径の外側）に軍事施設を配置
