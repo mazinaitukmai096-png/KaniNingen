@@ -423,7 +423,7 @@ test('game integration keeps rectangular roads instanced and isolates the Capita
   assert.doesNotMatch(roadBlock, /Math\.random/);
 });
 
-test('Player start remains locked while World Interaction avoids only the Capital Civic Core', () => {
+test('Player start remains locked while Settlement Life Details use the dedicated placement plan', () => {
   const spawnEntity = extractFunction(game, 'spawnEntity');
   for (const lockedSnippet of [
     "if (type === 'human') group.scale.setScalar(humanVisualScale);",
@@ -434,8 +434,9 @@ test('Player start remains locked while World Interaction avoids only the Capita
     assert.ok(extractFunction(baselineGame, 'spawnEntity').includes(lockedSnippet));
   }
   const populateWorldScaleDetails = extractFunction(game, 'populateWorldScaleDetails');
-  assert.match(populateWorldScaleDetails, /tc\.type === 'capital' && circleIntersectsCapitalCivicCore/);
-  assert.match(populateWorldScaleDetails, /while \(selected\.length < WORLD_DETAILS_PER_TOWN\)/);
+  assert.match(populateWorldScaleDetails, /createSettlementLifeDetailPlacements\(\{/);
+  assert.match(populateWorldScaleDetails, /detailPlan\.placements\.forEach\(addProp\)/);
+  assert.match(populateWorldScaleDetails, /scene\.userData\.settlementLifeDetailSummary/);
   assert.match(populateWorldScaleDetails, /worldDetailInstancedMesh\.userData\.worldDetailPropCount = worldDetailProps\.length/);
   assert.equal(extractFunction(game, 'findLandingSpot'), extractFunction(baselineGame, 'findLandingSpot'));
   assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((sum, count) => sum + count, 0), 96);

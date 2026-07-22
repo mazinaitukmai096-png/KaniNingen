@@ -25,6 +25,7 @@ const PHASE1B_COMMIT = '1bc4b390e0aea512be51cf72050006d4dd17eeb7';
 const repoRoot = resolve(import.meta.dirname, '..');
 const game = readFileSync(resolve(repoRoot, 'src/game.js'), 'utf8').replace(/\r\n/g, '\n');
 const html = readFileSync(resolve(repoRoot, 'index.html'), 'utf8').replace(/\r\n/g, '\n');
+const lifeDetails = readFileSync(resolve(repoRoot, 'src/settlement-life-details.js'), 'utf8').replace(/\r\n/g, '\n');
 const baselineGame = execFileSync('git', ['show', `${PHASE1B_COMMIT}:src/game.js`], {
   cwd: repoRoot,
   encoding: 'utf8',
@@ -108,17 +109,21 @@ test('street interaction hides only hit instances and reuses existing feedback p
   assert.equal((game.match(/damageWorldDetailsAt\(/g) || []).length, 4);
 });
 
-test('street props prioritize centers, parks, building roads, intersections, and both start ponds', () => {
+test('street props use settlement, Civic Space, entrance, park, road, and intersection contexts', () => {
   const populate = extractFunction(game, 'populateWorldScaleDetails');
   for (const snippet of [
-    'distanceSq(a, tc.x, tc.z)',
-    'distanceSq(a, tc.park.x, tc.park.z)',
-    'buildingDistanceByTile.get(a)',
-    'pathDensityByTile.get(b)',
-    'worldWaterZones.filter(zone => zone.isPond)',
-    'WORLD_DETAILS_PER_START_POND',
-  ]) assert.ok(populate.includes(snippet), `missing priority placement: ${snippet}`);
-  assert.doesNotMatch(populate, /\(detailIndex \+ 0\.5\) \* townPaths\.length/);
+    'createSettlementLifeDetailPlacements({',
+    'buildingLots,',
+    'parkZones,',
+    'pathSamples: roadHierarchy.pathSamples',
+    'junctions: roadHierarchy.junctions',
+    'scene.userData.settlementLifeDetailSummary',
+  ]) assert.ok(populate.includes(snippet), `missing settlement placement integration: ${snippet}`);
+  for (const context of [
+    'CIVIC_SPACE', 'BUILDING_ENTRANCE', 'PARK_EDGE', 'MAJOR_ROAD',
+    'LOCAL_ROAD', 'INTERSECTION', 'RURAL_EDGE', 'MILITARY_EDGE',
+  ]) assert.match(lifeDetails, new RegExp(`${context}: '${context}'`));
+  assert.doesNotMatch(lifeDetails, /Math\.random/);
 });
 
 test('world detail templates use valid Three.js primitive part data and no external assets', () => {

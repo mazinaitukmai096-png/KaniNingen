@@ -273,7 +273,7 @@ test('special hub roads stop at the union boundary without long overlap or a gap
   }
 });
 
-test('building target, park, Lot, street object, and vegetation Core guards are integrated', () => {
+test('building target, park, Lot, settlement life detail, and vegetation guards are integrated', () => {
   const game = readFileSync(resolve(repoRoot, 'src/game.js'), 'utf8').replace(/\r\n/g, '\n');
   assert.match(game, /const targetCount = Math\.round\(\(tc\.coreRadius \* tc\.coreRadius\) \/ 36000\)/);
   assert.equal(Math.round((2700 * 2700) / 36000), 203);
@@ -281,7 +281,9 @@ test('building target, park, Lot, street object, and vegetation Core guards are 
   assert.match(game, /tc\.type === 'capital' && circleIntersectsCapitalCivicCore/);
   assert.match(game, /civicCoreCollision: 0/);
   assert.match(game, /orientedRectanglesOverlap\(lot, civicCoreRectangle, civicCore\.clearance\)/);
-  assert.match(game, /WORLD_DETAIL_INTERACTION_RADII\[detailType\]/);
+  assert.match(game, /WORLD_DETAIL_INTERACTION_RADII\[placement\.type\]/);
+  assert.match(game, /createSettlementLifeDetailPlacements\(\{/);
+  assert.match(game, /scene\.userData\.settlementLifeDetailSummary/);
   assert.match(game, /capitalCivicCoreVegetationRejectedCount\+\+/);
   assert.match(game, /scene\.userData\.capitalCivicCoreWorldDetailSummary/);
   assert.match(game, /scene\.userData\.capitalCivicCoreVegetationSummary/);

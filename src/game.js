@@ -92,16 +92,12 @@ import {
 import {
   PRODUCTION_HUMAN_VISUAL_SCALE,
   PRODUCTION_TANK_VISUAL_SCALE,
-  START_POND_WORLD_DETAIL_TYPES,
   WORLD_DETAIL_INSTANCE_CAPACITY,
   WORLD_DETAIL_INTERACTION_RADII,
   WORLD_DETAIL_PARTS,
-  WORLD_DETAIL_ROADSIDE_OFFSET,
-  WORLD_DETAIL_TYPES,
-  WORLD_DETAILS_PER_START_POND,
-  WORLD_DETAILS_PER_TOWN,
   canStageDestroyWorldDetail,
 } from './world-scale-rebalance.js';
+import { createSettlementLifeDetailPlacements } from './settlement-life-details.js';
 
 let bossHPDelay = 100;
 
@@ -1618,19 +1614,18 @@ let inputController, rendererController;
             return data;
         }
 
-        function populateWorldScaleDetails(
+        function populateWorldScaleDetails({
             townCenters,
-            pathTiles,
+            roadHierarchy,
             placedTownSpots,
             worldWaterZones,
-            civicCore,
+            parkZones,
             civicSpaces,
-        ) {
+            exclusionZones,
+        }) {
             const dummy = new THREE.Object3D();
             const colorCache = new Map();
             let instanceIndex = 0;
-            let civicCoreRejectedCount = 0;
-            let civicSpaceRejectedCount = 0;
             worldDetailProps.length = 0;
 
             const addPart = (baseX, baseZ, baseAngle, detailPart) => {
@@ -1656,127 +1651,58 @@ let inputController, rendererController;
                 return instanceIndex++;
             };
 
-            const addProp = (baseX, baseZ, baseAngle, type) => {
+            const addProp = placement => {
                 const instanceIndices = [];
-                for (const detailPart of WORLD_DETAIL_PARTS[type]) {
-                    const index = addPart(baseX, baseZ, baseAngle, detailPart);
+                for (const detailPart of WORLD_DETAIL_PARTS[placement.type]) {
+                    const index = addPart(placement.x, placement.z, placement.angle, detailPart);
                     if (index !== -1) instanceIndices.push(index);
                 }
                 if (instanceIndices.length === 0) return;
                 worldDetailProps.push({
-                    type,
-                    x: baseX,
-                    z: baseZ,
-                    radius: WORLD_DETAIL_INTERACTION_RADII[type] || 0,
+                    type: placement.type,
+                    x: placement.x,
+                    z: placement.z,
+                    radius: WORLD_DETAIL_INTERACTION_RADII[placement.type] || 0,
+                    placementRadius: placement.placementRadius,
+                    placementContext: placement.placementContext,
+                    relatedTownType: placement.relatedTownType,
+                    relatedRoadId: placement.relatedRoadId,
+                    relatedBuildingIndex: placement.relatedBuildingIndex,
+                    relatedCivicSpaceId: placement.relatedCivicSpaceId,
+                    orientationRule: placement.orientationRule,
+                    clusterId: placement.clusterId,
                     instanceIndices,
                     destroyed: false,
                 });
             };
-
-            const getPlacement = (tc, tile, detailIndex) => {
-                const radialAngle = Math.atan2(tile.x - tc.x, tile.z - tc.z);
-                const side = detailIndex % 2 === 0 ? 1 : -1;
-                const sideAngle = radialAngle + side * Math.PI / 2;
-                return {
-                    radialAngle,
-                    baseX: tile.x + Math.sin(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET,
-                    baseZ: tile.z + Math.cos(sideAngle) * WORLD_DETAIL_ROADSIDE_OFFSET,
-                };
-            };
-
-            const selectPriorityTiles = (tc, townPaths) => {
-                const distanceSq = (tile, x, z) => (tile.x - x) ** 2 + (tile.z - z) ** 2;
-                const townSpots = placedTownSpots.filter(
-                    spot => (spot.x - tc.x) ** 2 + (spot.z - tc.z) ** 2 < tc.radius ** 2
-                );
-                const buildingDistanceByTile = new Map(townPaths.map(tile => [
-                    tile,
-                    townSpots.reduce(
-                        (nearest, spot) => Math.min(nearest, distanceSq(tile, spot.x, spot.z)),
-                        Infinity
-                    ),
-                ]));
-                const pathDensityByTile = new Map(townPaths.map(tile => [
-                    tile,
-                    townPaths.reduce(
-                        (count, other) => count + (distanceSq(tile, other.x, other.z) < 130 ** 2 ? 1 : 0),
-                        0
-                    ),
-                ]));
-
-                const candidateGroups = [
-                    [...townPaths].sort((a, b) => distanceSq(a, tc.x, tc.z) - distanceSq(b, tc.x, tc.z)),
-                    [...townPaths].sort((a, b) => distanceSq(a, tc.park.x, tc.park.z) - distanceSq(b, tc.park.x, tc.park.z)),
-                    [...townPaths].sort((a, b) => buildingDistanceByTile.get(a) - buildingDistanceByTile.get(b)),
-                    [...townPaths].sort((a, b) => pathDensityByTile.get(b) - pathDensityByTile.get(a)),
-                ];
-                const cursors = candidateGroups.map(() => 0);
-                const selected = [];
-                const used = new Set();
-
-                while (selected.length < WORLD_DETAILS_PER_TOWN) {
-                    let added = false;
-                    candidateGroups.forEach((group, groupIndex) => {
-                        while (cursors[groupIndex] < group.length && used.has(group[cursors[groupIndex]])) {
-                            cursors[groupIndex]++;
-                        }
-                        if (selected.length >= WORLD_DETAILS_PER_TOWN || cursors[groupIndex] >= group.length) return;
-                        const tile = group[cursors[groupIndex]++];
-                        used.add(tile);
-                        const placement = getPlacement(tc, tile, selected.length);
-                        const detailType = WORLD_DETAIL_TYPES[selected.length % WORLD_DETAIL_TYPES.length];
-                        if (tc.type === 'capital' && circleIntersectsCapitalCivicCore(
-                            placement.baseX,
-                            placement.baseZ,
-                            WORLD_DETAIL_INTERACTION_RADII[detailType] || 0,
-                            civicCore,
-                            civicCore.clearance,
-                        )) {
-                            civicCoreRejectedCount++;
-                            return;
-                        }
-                        if (civicSpaces.some(civicSpace => circleIntersectsCivicSpaceReservation(
-                            placement.baseX,
-                            placement.baseZ,
-                            WORLD_DETAIL_INTERACTION_RADII[detailType] || 0,
-                            civicSpace,
-                            4,
-                        ))) {
-                            civicSpaceRejectedCount++;
-                            return;
-                        }
-                        selected.push(tile);
-                        added = true;
-                    });
-                    if (!added) break;
-                }
-                return selected;
-            };
-
-            townCenters.forEach(tc => {
-                const townPaths = pathTiles.filter(tile => tile.tc === tc);
-                if (townPaths.length === 0) return;
-                const priorityTiles = selectPriorityTiles(tc, townPaths);
-
-                priorityTiles.forEach((tile, detailIndex) => {
-                    const { radialAngle, baseX, baseZ } = getPlacement(tc, tile, detailIndex);
-                    const type = WORLD_DETAIL_TYPES[detailIndex % WORLD_DETAIL_TYPES.length];
-                    addProp(baseX, baseZ, radialAngle, type);
-                });
+            const militaryBaseZones = militaryBases
+                .filter(base => !base.isDead)
+                .map(base => ({
+                    x: base.mesh.position.x,
+                    z: base.mesh.position.z,
+                    radius: base.radius,
+                    type: 'militaryBase',
+                }));
+            const detailPlan = createSettlementLifeDetailPlacements({
+                towns: townCenters,
+                civicSpaces,
+                buildingLots,
+                parkZones,
+                roads: roadHierarchy.roads,
+                pathSamples: roadHierarchy.pathSamples,
+                junctions: roadHierarchy.junctions,
+                roadSurfaces: roadHierarchy.roadSurfaces,
+                junctionSurfaces: roadHierarchy.junctionSurfaces,
+                bridges,
+                waterZones: worldWaterZones,
+                exclusionZones,
+                buildingSpots: placedTownSpots.filter(spot => (
+                    ['house', 'tower', 'school', 'church', 'factory', 'militaryBase', 'barn']
+                        .includes(spot.type)
+                )),
+                militaryBaseZones,
             });
-
-            worldWaterZones.filter(zone => zone.isPond).forEach(pond => {
-                for (let detailIndex = 0; detailIndex < WORLD_DETAILS_PER_START_POND; detailIndex++) {
-                    const angle = detailIndex / WORLD_DETAILS_PER_START_POND * Math.PI * 2;
-                    const radius = pond.radius + 42;
-                    const baseX = pond.x + Math.cos(angle) * radius;
-                    const baseZ = pond.z + Math.sin(angle) * radius;
-                    const type = START_POND_WORLD_DETAIL_TYPES[
-                        detailIndex % START_POND_WORLD_DETAIL_TYPES.length
-                    ];
-                    addProp(baseX, baseZ, angle + Math.PI / 2, type);
-                }
-            });
+            detailPlan.placements.forEach(addProp);
 
             worldDetailInstancedMesh.count = instanceIndex;
             worldDetailInstancedMesh.instanceMatrix.needsUpdate = true;
@@ -1786,13 +1712,19 @@ let inputController, rendererController;
             worldDetailInstancedMesh.computeBoundingSphere();
             worldDetailInstancedMesh.userData.worldDetailPropCount = worldDetailProps.length;
             worldDetailInstancedMesh.userData.worldDetailInstanceCount = instanceIndex;
+            scene.userData.settlementLifeDetailSummary = Object.freeze({
+                ...detailPlan.summary,
+                totalInstanceCount: instanceIndex,
+            });
             scene.userData.capitalCivicCoreWorldDetailSummary = Object.freeze({
-                rejectedCount: civicCoreRejectedCount,
+                rejectedCount: 0,
                 propCount: worldDetailProps.length,
                 instanceCount: instanceIndex,
             });
             scene.userData.civicSpaceWorldDetailSummary = Object.freeze({
-                rejectedCount: civicSpaceRejectedCount,
+                rejectedCount:
+                    (detailPlan.summary.rejectedCandidateCounts.civicSpace || 0)
+                    + (detailPlan.summary.rejectedCandidateCounts.civicAccess || 0),
                 propCount: worldDetailProps.length,
                 instanceCount: instanceIndex,
             });
@@ -3118,14 +3050,15 @@ let inputController, rendererController;
                 civicSpaces,
                 surfaceY: PATH_Y + 0.03,
             });
-            populateWorldScaleDetails(
+            populateWorldScaleDetails({
                 townCenters,
-                pathTiles,
+                roadHierarchy,
                 placedTownSpots,
-                waterZones,
-                capitalCivicCore,
-                activeCivicSpaces,
-            );
+                worldWaterZones: waterZones,
+                parkZones,
+                civicSpaces: activeCivicSpaces,
+                exclusionZones: roadExclusionZones,
+            });
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
             // 木・岩の密度は下のメイン装飾配置ループで距離に応じたグラデーションをかけて
