@@ -188,7 +188,16 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
     assert.notEqual(end, -1, 'missing road hierarchy end');
     return `${source.slice(0, start)}            // ROAD HIERARCHY CHANGE ALLOWED\n${source.slice(end)}`;
   };
-  const currentMap = normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
+  const normalizeBuildingFrontage = source => {
+    const startMarker = '            const placedTownSpots = []';
+    const endMarker = '            const RURAL_OBJECTS = ';
+    const start = source.indexOf(startMarker);
+    const end = source.indexOf(endMarker, start);
+    assert.notEqual(start, -1, 'missing building frontage start');
+    assert.notEqual(end, -1, 'missing building frontage end');
+    return `${source.slice(0, start)}            // BUILDING FRONTAGE CHANGE ALLOWED\n${source.slice(end)}`;
+  };
+  const currentMap = normalizeBuildingFrontage(normalizeRoadHierarchy(sliceBetween(game, 'function initMap()', 'function createParticles(')
     .replace(
       /\s+if \(canSpawnTankForCurrentProgression\(\)\) \{\n\s+(spawnEntity\('tank', tc\.baseX - 150, tc\.baseZ \+ 120\);)\n\s+(spawnEntity\('tank', tc\.baseX \+ 150, tc\.baseZ - 120\);)\n\s+\}/,
       '\n                    $1\n                    $2',
@@ -197,10 +206,10 @@ test('Building feedback, non-road World generation, Input, Renderer, and locked 
       /\n\s+worldDetailInstancedMesh = new THREE\.InstancedMesh\([\s\S]*?scene\.add\(worldDetailInstancedMesh\);\n/,
       '\n',
     )
-    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n'));
-  const baselineMap = normalizeRoadHierarchy(
+    .replace(/\n\s+populateWorldScaleDetails\([^;]+\);\n/, '\n')));
+  const baselineMap = normalizeBuildingFrontage(normalizeRoadHierarchy(
     sliceBetween(baselineGame, 'function initMap()', 'function createParticles('),
-  );
+  ));
   assert.equal(currentMap, baselineMap);
   const currentHud = extractFunction(game, 'updateHUD');
   const baselineHud = extractFunction(baselineGame, 'updateHUD');

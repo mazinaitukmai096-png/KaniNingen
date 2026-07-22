@@ -421,14 +421,10 @@ test('game integration renders Segment and Junction rectangles through one share
   assert.doesNotMatch(roadBlock, /Math\.random/);
 });
 
-test('building placement, Player start, and World Interaction Phase2 remain at baseline', () => {
+test('building models, Player start, and World Interaction Phase2 remain at baseline', () => {
   assert.equal(extractFunction(game, 'spawnEntity'), extractFunction(baselineGame, 'spawnEntity'));
   assert.equal(extractFunction(game, 'populateWorldScaleDetails'), extractFunction(baselineGame, 'populateWorldScaleDetails'));
   assert.equal(extractFunction(game, 'findLandingSpot'), extractFunction(baselineGame, 'findLandingSpot'));
-  assert.equal(
-    sliceBetween(game, 'const placedTownSpots = []', 'populateWorldScaleDetails('),
-    sliceBetween(baselineGame, 'const placedTownSpots = []', 'populateWorldScaleDetails('),
-  );
   assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((sum, count) => sum + count, 0), 96);
   assert.equal(getWorldDetailInstanceCount(6, 2), 258);
   assert.deepEqual(TINY_DESTRUCTIBLE_WORLD_DETAIL_TYPES, ['trashBin', 'roadSign', 'bench', 'planter']);

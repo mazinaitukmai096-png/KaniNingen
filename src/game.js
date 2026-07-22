@@ -35,6 +35,18 @@ import { createInputController } from './core/input.js';
 import { createRendererController } from './core/renderer.js';
 import { buildRoadHierarchy } from './road-town-structure.js';
 import {
+  FRONTAGE_BUILDING_TYPES,
+  buildFrontageAnchorPlan,
+  circleIntersectsBridge,
+  circleIntersectsCircle,
+  circleIntersectsOrientedSurface,
+  createFrontageCandidatePlacements,
+  frontageSpotsConflict,
+  getMaximumAlongRoadGap,
+  selectFrontageAnchorSample,
+  selectFrontageRoad,
+} from './building-frontage.js';
+import {
   HUMAN_VISUAL_SCALES,
   INITIAL_SCALE_STAGE_ID,
   SCALE_STAGE_IDS,
@@ -1988,6 +2000,7 @@ let inputController, rendererController;
                     x: entity.mesh.position.x,
                     z: entity.mesh.position.z,
                     radius: entity.radius,
+                    type: entity.type,
                 }));
             const roadHierarchy = buildRoadHierarchy({
                 townCenters,
@@ -2052,16 +2065,23 @@ let inputController, rendererController;
             // 道からあまり離れない範囲にランダムに建物を寄せて建て、隙間の少ない密集した村にする。
             // ただし建物同士の隙間は、人間NPCが逃げ回れる幅を確保する。
             const placedTownSpots = []; // 重なり回避用 { x, z, radius }
-            const HUMAN_PASSAGE_GAP = 75; // 建物と建物の間に必ず残す隙間（人間の逃走路）
             // 実際のスポーン前に必要な最低間隔を見積もるための概算半径（各タイプの最大サイズ想定）
             const APPROX_RADIUS = { house: 90, tower: 65, church: 115, school: 145, tree: 25, human: 25, tank: 70 };
+            const frontageBuildingTypes = new Set(FRONTAGE_BUILDING_TYPES);
 
             // --- 町中の公園エリア：各町に1箇所、建物を建てず木・芝生で緑化するゾーンを確保する ---
             const parkZones = [];
 
-            townCenters.forEach(tc => {
+            townCenters.forEach((tc, townIndex) => {
                 const townPaths = pathTiles.filter(t => t.tc === tc);
                 if (townPaths.length === 0) return;
+                const frontageTownId = tc.id ?? `town-${townIndex}-${tc.type}`;
+                const frontageRoads = roadHierarchy.roads.filter(road => road.townId === frontageTownId);
+                const frontageAnchorPlan = buildFrontageAnchorPlan({
+                    samples: townPaths,
+                    roads: frontageRoads,
+                    town: tc,
+                });
 
                 // 中心のランドマーク広場（半径220）を避けつつ、コア範囲内にランダムで公園を1箇所確保
                 const parkAngle = Math.random() * Math.PI * 2;
@@ -2078,14 +2098,32 @@ let inputController, rendererController;
 
                 const targetCount = Math.round((tc.coreRadius * tc.coreRadius) / 36000); // 密集度アップ：空き地を減らし賑やかな町並みにする
                 let placed = 0, attempts = 0;
+                let frontageCandidateIndex = 0;
+                const frontagePlacedCounts = Object.fromEntries(FRONTAGE_BUILDING_TYPES.map(type => [type, 0]));
+                const frontageRoadBuildingCounts = new Map();
+                const frontageAlongByRoute = new Map();
+                const frontageRegionCounts = { CORE: 0, MIDDLE: 0, OUTER: 0 };
+                const rejectedCandidateCounts = {
+                    buildingCollision: 0,
+                    roadCollision: 0,
+                    junctionCollision: 0,
+                    bridgeCollision: 0,
+                    waterCollision: 0,
+                    parkCollision: 0,
+                    landmarkCollision: 0,
+                    militaryBaseCollision: 0,
+                    outOfTown: 0,
+                    routeEnd: 0,
+                    noValidSide: 0,
+                };
 
                 while (placed < targetCount && attempts < targetCount * 18) {
                     attempts++;
                     const tile = townPaths[Math.floor(Math.random() * townPaths.length)];
                     const ang = Math.random() * Math.PI * 2;
                     const dist = 90 + Math.random() * 150; // 道から少し離れた位置に建物を寄せる
-                    const px = tile.x + Math.sin(ang) * dist;
-                    const pz = tile.z + Math.cos(ang) * dist;
+                    let px = tile.x + Math.sin(ang) * dist;
+                    let pz = tile.z + Math.cos(ang) * dist;
 
                     const fromCenterSq = (px - tc.x) * (px - tc.x) + (pz - tc.z) * (pz - tc.z);
                     if (fromCenterSq < 220 * 220) continue; // 中心の広場（ランドマーク建築エリア）は避ける
@@ -2126,34 +2164,148 @@ let inputController, rendererController;
                     }
 
                     const newApproxRadius = APPROX_RADIUS[spawnType];
+                    let frontage = null;
+                    if (frontageBuildingTypes.has(spawnType)) {
+                        frontageCandidateIndex++;
+                        const frontageAnchor = (spawnType === 'house' || spawnType === 'tower')
+                            ? selectFrontageAnchorSample({
+                                plan: frontageAnchorPlan,
+                                buildingIndex: frontageCandidateIndex,
+                                type: spawnType,
+                                townId: frontageTownId,
+                            })
+                            : tile;
+                        if (!frontageAnchor) continue;
+                        const frontageRoad = selectFrontageRoad({
+                            x: frontageAnchor.x,
+                            z: frontageAnchor.z,
+                            roads: frontageRoads,
+                            townId: frontageTownId,
+                        });
+                        if (!frontageRoad) continue;
+                        const frontageCandidates = createFrontageCandidatePlacements({
+                            type: spawnType,
+                            road: frontageRoad,
+                            roads: frontageRoads,
+                            buildingIndex: frontageCandidateIndex,
+                            townId: frontageTownId,
+                        });
+                        rejectedCandidateCounts.routeEnd += frontageCandidates.routeEndCount;
+
+                        for (const candidate of frontageCandidates.placements) {
+                            const candidateFromCenterSq = (candidate.x - tc.x) ** 2 + (candidate.z - tc.z) ** 2;
+                            if (candidateFromCenterSq < (220 + newApproxRadius) ** 2
+                                || candidateFromCenterSq > (tc.radius * 0.98 - newApproxRadius) ** 2) {
+                                rejectedCandidateCounts.outOfTown++;
+                                continue;
+                            }
+                            if (circleIntersectsCircle(candidate.x, candidate.z, newApproxRadius, park, 20)) {
+                                rejectedCandidateCounts.parkCollision++;
+                                continue;
+                            }
+                            if (waterZones.some(water => (
+                                circleIntersectsCircle(candidate.x, candidate.z, newApproxRadius, water, 20)
+                            ))) {
+                                rejectedCandidateCounts.waterCollision++;
+                                continue;
+                            }
+                            const exclusionCollision = roadExclusionZones.find(zone => (
+                                circleIntersectsCircle(candidate.x, candidate.z, newApproxRadius, zone, 20)
+                            ));
+                            if (exclusionCollision) {
+                                if (exclusionCollision.type === 'militaryBase') {
+                                    rejectedCandidateCounts.militaryBaseCollision++;
+                                } else {
+                                    rejectedCandidateCounts.landmarkCollision++;
+                                }
+                                continue;
+                            }
+                            if (roadHierarchy.roadSurfaces.some(surface => (
+                                circleIntersectsOrientedSurface(candidate.x, candidate.z, newApproxRadius, surface, 8)
+                            ))) {
+                                rejectedCandidateCounts.roadCollision++;
+                                continue;
+                            }
+                            if (roadHierarchy.junctionSurfaces.some(surface => (
+                                circleIntersectsOrientedSurface(candidate.x, candidate.z, newApproxRadius, surface, 12)
+                            ))) {
+                                rejectedCandidateCounts.junctionCollision++;
+                                continue;
+                            }
+                            if (bridges.some(bridge => (
+                                circleIntersectsBridge(candidate.x, candidate.z, newApproxRadius, bridge, 20)
+                            ))) {
+                                rejectedCandidateCounts.bridgeCollision++;
+                                continue;
+                            }
+                            const candidateSpot = {
+                                x: candidate.x,
+                                z: candidate.z,
+                                radius: newApproxRadius,
+                                type: spawnType,
+                                frontageRoadId: candidate.frontageRoadId,
+                                frontageRouteId: candidate.frontageRouteId,
+                                frontageAlong: candidate.frontageAlong,
+                            };
+                            if (placedTownSpots.some(spot => frontageSpotsConflict(candidateSpot, spot))) {
+                                rejectedCandidateCounts.buildingCollision++;
+                                continue;
+                            }
+                            frontage = candidate;
+                            px = candidate.x;
+                            pz = candidate.z;
+                            break;
+                        }
+                        if (!frontage) {
+                            rejectedCandidateCounts.noValidSide++;
+                            continue;
+                        }
+                    }
+
                     let tooClose = false;
+                    const candidateSpot = {
+                        x: px,
+                        z: pz,
+                        radius: newApproxRadius,
+                        type: spawnType,
+                        frontageRoadId: frontage?.frontageRoadId ?? null,
+                        frontageRouteId: frontage?.frontageRouteId ?? null,
+                        frontageAlong: frontage?.frontageAlong ?? null,
+                    };
                     for (const spot of placedTownSpots) {
-                        const dx = px - spot.x, dz = pz - spot.z;
-                        const requiredDist = newApproxRadius + spot.radius + HUMAN_PASSAGE_GAP;
-                        if (dx * dx + dz * dz < requiredDist * requiredDist) { tooClose = true; break; }
+                        if (frontageSpotsConflict(candidateSpot, spot)) {
+                            tooClose = true;
+                            break;
+                        }
                     }
                     if (tooClose) continue;
 
-                    // 追加: 建物が「道」の上に被らないように厳密にチェックして避ける
-                    let onPath = false;
-                    for (const pt of pathTiles) {
-                        const dx = px - pt.x, dz = pz - pt.z;
-                        const safeDist = newApproxRadius + 35; // 建物半径 + 道の幅の余裕
-                        if (Math.abs(dx) > safeDist || Math.abs(dz) > safeDist) continue; // 計算の軽量化
-                        if (dx * dx + dz * dz < safeDist * safeDist) { onPath = true; break; }
+                    if (!frontage) {
+                        // 追加: 建物が「道」の上に被らないように厳密にチェックして避ける
+                        let onPath = false;
+                        for (const pt of pathTiles) {
+                            const dx = px - pt.x, dz = pz - pt.z;
+                            const safeDist = newApproxRadius + 35; // 建物半径 + 道の幅の余裕
+                            if (Math.abs(dx) > safeDist || Math.abs(dz) > safeDist) continue; // 計算の軽量化
+                            if (dx * dx + dz * dz < safeDist * safeDist) { onPath = true; break; }
+                        }
+                        if (onPath) continue;
                     }
-                    if (onPath) continue;
 
-                    // 最寄りの小道の方を向かせる（建物の正面が道に面するように東西南北へスナップ）
-                    const dxp = tile.x - px, dzp = tile.z - pz;
-                    const angleToPath = Math.atan2(dxp, dzp);
-                    const forceAngle = Math.round(angleToPath / (Math.PI / 2)) * (Math.PI / 2);
+                    let forceAngle;
+                    if (frontage) {
+                        forceAngle = frontage.rotationY;
+                    } else {
+                        const dxp = tile.x - px, dzp = tile.z - pz;
+                        const angleToPath = Math.atan2(dxp, dzp);
+                        forceAngle = Math.round(angleToPath / (Math.PI / 2)) * (Math.PI / 2);
+                    }
 
                     if (spawnType === 'human') {
                         // 人間は画質プリセットで数を調整できるよう、その場では作らずプールに座標だけ記録する。
                         // 実際の生成は町生成完了後に applyHumanDensity() でまとめて行う。
                         humanSpawnPool.push({ x: px, z: pz });
-                        placedTownSpots.push({ x: px, z: pz, radius: APPROX_RADIUS.human });
+                        placedTownSpots.push({ x: px, z: pz, radius: APPROX_RADIUS.human, type: 'human' });
                         placed++;
                         continue;
                     }
@@ -2162,9 +2314,65 @@ let inputController, rendererController;
                         ? spawnEntity(spawnType, px, pz)
                         : spawnEntity(spawnType, px, pz, forceAngle);
 
-                    placedTownSpots.push({ x: px, z: pz, radius: spawned.radius });
+                    if (frontage) Object.assign(spawned, frontage);
+                    if (frontage) {
+                        frontagePlacedCounts[spawnType]++;
+                        frontageRoadBuildingCounts.set(
+                            frontage.frontageRoadId,
+                            (frontageRoadBuildingCounts.get(frontage.frontageRoadId) ?? 0) + 1,
+                        );
+                        if (!frontageAlongByRoute.has(frontage.frontageRouteId)) {
+                            frontageAlongByRoute.set(frontage.frontageRouteId, []);
+                        }
+                        frontageAlongByRoute.get(frontage.frontageRouteId).push(frontage.frontageAlong);
+                        const townDistanceRatio = Math.hypot(px - tc.x, pz - tc.z) / tc.radius;
+                        const region = townDistanceRatio <= 0.35 ? 'CORE'
+                            : townDistanceRatio <= 0.70 ? 'MIDDLE' : 'OUTER';
+                        frontageRegionCounts[region]++;
+                    }
+                    placedTownSpots.push({
+                        x: px,
+                        z: pz,
+                        radius: spawned.radius,
+                        type: spawnType,
+                        frontageRoadId: frontage?.frontageRoadId ?? null,
+                        frontageRouteId: frontage?.frontageRouteId ?? null,
+                        frontageAlong: frontage?.frontageAlong ?? null,
+                    });
                     placed++;
                 }
+                let maximumAlongRoadGap = 0;
+                for (const [routeId, positions] of frontageAlongByRoute) {
+                    const routeLength = frontageRoads
+                        .filter(road => road.routeId === routeId)
+                        .reduce((sum, road) => (
+                            sum + Math.hypot(road.end.x - road.start.x, road.end.z - road.start.z)
+                        ), 0);
+                    maximumAlongRoadGap = Math.max(
+                        maximumAlongRoadGap,
+                        getMaximumAlongRoadGap(positions, routeLength),
+                    );
+                }
+                const usedRoadIds = new Set(frontageRoadBuildingCounts.keys());
+                tc.frontagePlacementSummary = Object.freeze({
+                    targetCount,
+                    placedCount: placed,
+                    shortageCount: Math.max(0, targetCount - placed),
+                    buildingCounts: Object.freeze({ ...frontagePlacedCounts }),
+                    usedRoadCount: usedRoadIds.size,
+                    unusedLocalCount: frontageRoads.filter(road => (
+                        road.kind === 'LOCAL' && !usedRoadIds.has(road.roadId)
+                    )).length,
+                    unusedAlleyCount: frontageRoads.filter(road => (
+                        road.kind === 'ALLEY' && !usedRoadIds.has(road.roadId)
+                    )).length,
+                    roadBuildingCounts: Object.freeze(Object.fromEntries(
+                        [...frontageRoadBuildingCounts.entries()].sort(([first], [second]) => first.localeCompare(second)),
+                    )),
+                    maximumAlongRoadGap,
+                    regionCounts: Object.freeze({ ...frontageRegionCounts }),
+                    rejectedCandidateCounts: Object.freeze({ ...rejectedCandidateCounts }),
+                });
 
                 // --- 公園エリアの緑化：建物を避けたゾーンに木と芝生を密に配置し、公園らしい緑地にする ---
                 {

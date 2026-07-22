@@ -101,9 +101,13 @@ test('Phase 4 changes do not include forbidden runtime or world-generation files
   assert.ok(changedFiles.every(path => [
      'index.html',
      'src/game.js',
+     'src/building-frontage.js',
+     'src/road-town-structure.js',
      'src/scale-sandbox.js',
      'src/world-scale-rebalance.js',
+     'tests/building-frontage.test.mjs',
      'tests/destruction-feel-regression.test.mjs',
+     'tests/road-town-structure.test.mjs',
      'tests/runtime-stability.test.mjs',
      'tests/scale-sandbox.test.mjs',
      'tests/world-scale-rebalance.test.mjs',
