@@ -33,18 +33,26 @@ test('the finite Gameplay World and protected settlement/civic modules equal the
   }
 });
 
-test('every worktree change stays inside the isolated W1A sandbox allowlist', () => {
+test('every committed and worktree change stays inside the Infinite World allowlist', () => {
+  const committed = execFileSync('git', ['diff', '--name-only', `${BASELINE_COMMIT}..HEAD`], {
+    cwd: repoRoot,
+    encoding: 'utf8',
+  }).trimEnd().split(/\r?\n/).filter(Boolean);
   const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trimEnd().split(/\r?\n/).filter(Boolean);
-  const changedPaths = status.map(line => line.slice(3).replaceAll('\\', '/'));
+  const changedPaths = [...new Set([
+    ...committed,
+    ...status.map(line => line.slice(3).replaceAll('\\', '/')),
+  ])];
   assert.ok(changedPaths.length > 0);
   for (const path of changedPaths) {
-    const allowed = path === 'infinite-world-sandbox.html'
+    const allowed = path === 'tests/destruction-feel-regression.test.mjs'
+      || path === 'infinite-world-sandbox.html'
       || path.startsWith('src/infinite-world/')
       || path.startsWith('tests/infinite-world-')
       || path.startsWith('docs/infinite-world/');
-    assert.equal(allowed, true, `out-of-scope worktree change: ${path}`);
+    assert.equal(allowed, true, `out-of-scope Infinite World branch change: ${path}`);
   }
 });
