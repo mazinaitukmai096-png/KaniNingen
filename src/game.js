@@ -39,6 +39,17 @@ import {
   isPointInCapitalCivicCore,
 } from './capital-civic-core.js';
 import {
+  CIVIC_SPACE_MATERIALS,
+  CIVIC_SPACE_STATUS,
+  CIVIC_SPACE_TYPES,
+  circleIntersectsCivicSpaceReservation,
+  civicSpaceToAccessRectangle,
+  civicSpaceToBodyRectangle,
+  createCivicSpaceReservations,
+  createCivicSpaceSurfaces,
+  orientedRectanglesOverlap as civicRectanglesOverlap,
+} from './civic-space.js';
+import {
   FRONTAGE_BUILDING_TYPES,
   buildFrontageAnchorPlan,
   circleIntersectsBridge,
@@ -265,6 +276,18 @@ let inputController, rendererController;
             dizzyStar: new THREE.MeshBasicMaterial({color: 0xffeb3b}), 
 
             road: new THREE.MeshPhongMaterial({color: 0xc2a878, shininess: 3}),
+            civicSpaceCity: new THREE.MeshPhongMaterial({
+                color: CIVIC_SPACE_MATERIALS[CIVIC_SPACE_TYPES.CITY_SQUARE].color,
+                shininess: 2
+            }),
+            civicSpaceChurch: new THREE.MeshPhongMaterial({
+                color: CIVIC_SPACE_MATERIALS[CIVIC_SPACE_TYPES.CHURCH_SQUARE].color,
+                shininess: 2
+            }),
+            civicSpaceSchool: new THREE.MeshPhongMaterial({
+                color: CIVIC_SPACE_MATERIALS[CIVIC_SPACE_TYPES.SCHOOL_SQUARE].color,
+                shininess: 2
+            }),
             lotResidential: new THREE.MeshPhongMaterial({color: 0xa58c68, shininess: 2}),
             lotCivic: new THREE.MeshPhongMaterial({color: 0x918d84, shininess: 4}),
 
@@ -1595,11 +1618,19 @@ let inputController, rendererController;
             return data;
         }
 
-        function populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, worldWaterZones, civicCore) {
+        function populateWorldScaleDetails(
+            townCenters,
+            pathTiles,
+            placedTownSpots,
+            worldWaterZones,
+            civicCore,
+            civicSpaces,
+        ) {
             const dummy = new THREE.Object3D();
             const colorCache = new Map();
             let instanceIndex = 0;
             let civicCoreRejectedCount = 0;
+            let civicSpaceRejectedCount = 0;
             worldDetailProps.length = 0;
 
             const addPart = (baseX, baseZ, baseAngle, detailPart) => {
@@ -1704,6 +1735,16 @@ let inputController, rendererController;
                             civicCoreRejectedCount++;
                             return;
                         }
+                        if (civicSpaces.some(civicSpace => circleIntersectsCivicSpaceReservation(
+                            placement.baseX,
+                            placement.baseZ,
+                            WORLD_DETAIL_INTERACTION_RADII[detailType] || 0,
+                            civicSpace,
+                            4,
+                        ))) {
+                            civicSpaceRejectedCount++;
+                            return;
+                        }
                         selected.push(tile);
                         added = true;
                     });
@@ -1750,6 +1791,11 @@ let inputController, rendererController;
                 propCount: worldDetailProps.length,
                 instanceCount: instanceIndex,
             });
+            scene.userData.civicSpaceWorldDetailSummary = Object.freeze({
+                rejectedCount: civicSpaceRejectedCount,
+                propCount: worldDetailProps.length,
+                instanceCount: instanceIndex,
+            });
         }
 
         function populateBuildingLots({
@@ -1763,6 +1809,7 @@ let inputController, rendererController;
             exclusionZones,
             collisionEntities,
             civicCore,
+            civicSpaces,
             surfaceY,
         }) {
             if (residentialLotSurfaceMesh) scene.remove(residentialLotSurfaceMesh);
@@ -1787,6 +1834,12 @@ let inputController, rendererController;
                 width: civicCore.halfWidth * 2,
                 depth: civicCore.halfDepth * 2,
             };
+            const civicSpaceRectangles = civicSpaces
+                .filter(civicSpace => civicSpace.status === CIVIC_SPACE_STATUS.ACTIVE)
+                .flatMap(civicSpace => [
+                    civicSpaceToBodyRectangle(civicSpace),
+                    civicSpaceToAccessRectangle(civicSpace),
+                ].filter(Boolean));
             const acceptedLotRectangles = [];
             const acceptedPathRectangles = [];
             const omissionReasonCounts = {
@@ -1803,6 +1856,7 @@ let inputController, rendererController;
                 invalidEntrance: 0,
                 noRoadAccess: 0,
                 civicCoreCollision: 0,
+                civicSpaceCollision: 0,
             };
             const typeLotCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
             const typeOmittedCounts = Object.fromEntries(LOT_BUILDING_TYPES.map(type => [type, 0]));
@@ -1826,6 +1880,10 @@ let inputController, rendererController;
                     || orientedRectanglesOverlap(lot.pathRectangle, civicCoreRectangle, civicCore.clearance)) {
                     return 'civicCoreCollision';
                 }
+                if (civicSpaceRectangles.some(rectangle => (
+                    orientedRectanglesOverlap(lot, rectangle, TINY_MINIMUM_LOT_PASSAGE)
+                    || orientedRectanglesOverlap(lot.pathRectangle, rectangle, 4)
+                ))) return 'civicSpaceCollision';
                 if (roadRectangles.some(item => orientedRectanglesOverlap(lot, item.rectangle))) {
                     return 'roadCollision';
                 }
@@ -2185,6 +2243,21 @@ let inputController, rendererController;
             });
             // SETTLEMENT TYPE FOUNDATION END
 
+            const fixedTownLandmarks = [];
+            const spawnFixedTownLandmark = (town, type, x, z, rotationY) => {
+                const entity = spawnEntity(type, x, z, rotationY);
+                fixedTownLandmarks.push(Object.freeze({
+                    townType: town.type,
+                    settlementType: town.settlementType,
+                    type,
+                    x,
+                    z,
+                    rotationY: entity.mesh.rotation.y,
+                    radius: entity.radius,
+                }));
+                return entity;
+            };
+
             townCenters.forEach(tc => {
                 // 町の少し外れ（町の半径の外側）に軍事施設を配置
                 const baseAngle = Math.random() * Math.PI * 2;
@@ -2197,22 +2270,22 @@ let inputController, rendererController;
                 militaryBases.push(mBase);
 
                 if (tc.type === 'capital') {
-                    spawnEntity('school', tc.x - 400, tc.z, 0);
-                    spawnEntity('church', tc.x + 500, tc.z, Math.PI / 2);
-                    spawnEntity('tower', tc.x, tc.z - 550, 0);
+                    spawnFixedTownLandmark(tc, 'school', tc.x - 400, tc.z, 0);
+                    spawnFixedTownLandmark(tc, 'church', tc.x + 500, tc.z, Math.PI / 2);
+                    spawnFixedTownLandmark(tc, 'tower', tc.x, tc.z - 550, 0);
                 } else if (tc.type === 'church_town') {
-                    spawnEntity('church', tc.x, tc.z, 0);
-                    spawnEntity('tower', tc.x - 400, tc.z + 300, Math.PI / 4);
+                    spawnFixedTownLandmark(tc, 'church', tc.x, tc.z, 0);
+                    spawnFixedTownLandmark(tc, 'tower', tc.x - 400, tc.z + 300, Math.PI / 4);
                 } else if (tc.type === 'school_town') {
-                    spawnEntity('school', tc.x, tc.z, 0);
+                    spawnFixedTownLandmark(tc, 'school', tc.x, tc.z, 0);
                 } else if (tc.type === 'military') {
-                    spawnEntity('tower', tc.x, tc.z, 0);
+                    spawnFixedTownLandmark(tc, 'tower', tc.x, tc.z, 0);
                     if (canSpawnTankForCurrentProgression()) {
                         spawnEntity('tank', tc.baseX - 150, tc.baseZ + 120);
                         spawnEntity('tank', tc.baseX + 150, tc.baseZ - 120);
                     }
                 } else if (tc.type === 'suburb') {
-                    spawnEntity('church', tc.x, tc.z, Math.PI);
+                    spawnFixedTownLandmark(tc, 'church', tc.x, tc.z, Math.PI);
                 }
             });
 
@@ -2342,6 +2415,25 @@ let inputController, rendererController;
             scene.userData.capitalCivicCore = capitalCivicCore;
             scene.userData.capitalTopology = roadHierarchy.capitalTopology;
             scene.userData.capitalCivicCoreSummary = roadHierarchy.capitalCivicCoreSummary;
+            const civicSpaces = createCivicSpaceReservations({
+                townCenters,
+                landmarks: fixedTownLandmarks,
+                roads: roadHierarchy.roads,
+                roadSurfaces: roadHierarchy.roadSurfaces,
+                junctionSurfaces: roadHierarchy.junctionSurfaces,
+                bridgeSpans: roadHierarchy.bridgeSpans,
+                capitalCivicCore,
+                waterZones,
+                exclusionZones: roadExclusionZones,
+            });
+            const activeCivicSpaces = civicSpaces.filter(civicSpace => (
+                civicSpace.status === CIVIC_SPACE_STATUS.ACTIVE
+            ));
+            const civicSpaceSurfaces = createCivicSpaceSurfaces(civicSpaces);
+            let civicSpaceBuildingCandidateRejectedCount = 0;
+            let civicSpaceParkRetryCount = 0;
+            let civicSpaceParkShortageCount = 0;
+            scene.userData.civicSpaces = civicSpaces;
 
             // 道路Segmentと最小矩形Junctionを、同じ共有Geometry/Materialの1 InstancedMeshで描画する。
             const roadDisplaySurfaces = [
@@ -2417,6 +2509,39 @@ let inputController, rendererController;
                 bridgeMesh.updateMatrix();
                 scene.add(bridgeMesh);
             }
+
+            const civicSpaceMaterialByType = Object.freeze({
+                [CIVIC_SPACE_TYPES.CITY_SQUARE]: materials.civicSpaceCity,
+                [CIVIC_SPACE_TYPES.CHURCH_SQUARE]: materials.civicSpaceChurch,
+                [CIVIC_SPACE_TYPES.SCHOOL_SQUARE]: materials.civicSpaceSchool,
+            });
+            const civicSpaceSurfaceMeshes = [];
+            for (const civicSpaceType of Object.values(CIVIC_SPACE_TYPES)) {
+                const surfaces = [
+                    ...civicSpaceSurfaces.bodySurfaces,
+                    ...civicSpaceSurfaces.accessSurfaces,
+                ].filter(surface => surface.civicSpaceType === civicSpaceType);
+                if (surfaces.length === 0) continue;
+                const mesh = new THREE.InstancedMesh(
+                    geometries.roadPlane,
+                    civicSpaceMaterialByType[civicSpaceType],
+                    surfaces.length,
+                );
+                const transform = new THREE.Object3D();
+                surfaces.forEach((surface, surfaceIndex) => {
+                    transform.position.set(surface.centerX, PATH_Y + 0.06, surface.centerZ);
+                    transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
+                    transform.scale.set(surface.width, surface.depth, 1);
+                    transform.updateMatrix();
+                    mesh.setMatrixAt(surfaceIndex, transform.matrix);
+                });
+                mesh.count = surfaces.length;
+                mesh.instanceMatrix.needsUpdate = true;
+                mesh.receiveShadow = true;
+                mesh.frustumCulled = false;
+                scene.add(mesh);
+                civicSpaceSurfaceMeshes.push(mesh);
+            }
             // --- 建物クラスターの生成 (マイクラ村風の密集配置) ---
             // 道からあまり離れない範囲にランダムに建物を寄せて建て、隙間の少ない密集した村にする。
             // ただし建物同士の隙間は、人間NPCが逃げ回れる幅を確保する。
@@ -2424,6 +2549,15 @@ let inputController, rendererController;
             // 実際のスポーン前に必要な最低間隔を見積もるための概算半径（各タイプの最大サイズ想定）
             const APPROX_RADIUS = { house: 90, tower: 65, church: 115, school: 145, tree: 25, human: 25, tank: 70 };
             const frontageBuildingTypes = new Set(FRONTAGE_BUILDING_TYPES);
+            const intersectsCivicSpace = (x, z, radius, clearance = 0) => activeCivicSpaces.some(
+                civicSpace => circleIntersectsCivicSpaceReservation(
+                    x,
+                    z,
+                    radius,
+                    civicSpace,
+                    clearance,
+                )
+            );
 
             // --- 町中の公園エリア：各町に1箇所、建物を建てず木・芝生で緑化するゾーンを確保する ---
             const parkZones = [];
@@ -2470,10 +2604,17 @@ let inputController, rendererController;
                         civicCoreParkRetryCount++;
                         continue;
                     }
+                    if (intersectsCivicSpace(candidate.x, candidate.z, candidate.radius, 18)) {
+                        civicSpaceParkRetryCount++;
+                        continue;
+                    }
                     park = candidate;
                     break;
                 }
-                if (!park) throw new RangeError(`no safe park outside Capital Civic Core: ${frontageTownId}`);
+                if (!park) {
+                    civicSpaceParkShortageCount++;
+                    throw new RangeError(`no safe park outside reserved Civic Space: ${frontageTownId}`);
+                }
                 parkZones.push(park);
                 tc.park = park;
 
@@ -2499,6 +2640,7 @@ let inputController, rendererController;
                     routeEnd: 0,
                     noValidSide: 0,
                     civicCoreCollision: 0,
+                    civicSpaceCollision: 0,
                 };
 
                 while (placed < targetCount && attempts < targetCount * 18) {
@@ -2632,6 +2774,16 @@ let inputController, rendererController;
                                 rejectedCandidateCounts.civicCoreCollision++;
                                 continue;
                             }
+                            if (intersectsCivicSpace(
+                                candidate.x,
+                                candidate.z,
+                                newApproxRadius,
+                                TINY_MINIMUM_LOT_PASSAGE,
+                            )) {
+                                rejectedCandidateCounts.civicSpaceCollision++;
+                                civicSpaceBuildingCandidateRejectedCount++;
+                                continue;
+                            }
                             if (circleIntersectsCircle(candidate.x, candidate.z, newApproxRadius, park, 20)) {
                                 rejectedCandidateCounts.parkCollision++;
                                 continue;
@@ -2705,6 +2857,12 @@ let inputController, rendererController;
                         frontageRouteId: frontage?.frontageRouteId ?? null,
                         frontageAlong: frontage?.frontageAlong ?? null,
                     };
+                    if (!frontage && spawnType !== 'human' && spawnType !== 'tank'
+                        && intersectsCivicSpace(px, pz, newApproxRadius, TINY_MINIMUM_LOT_PASSAGE)) {
+                        rejectedCandidateCounts.civicSpaceCollision++;
+                        civicSpaceBuildingCandidateRejectedCount++;
+                        continue;
+                    }
                     for (const spot of placedTownSpots) {
                         if (frontageSpotsConflict(candidateSpot, spot)) {
                             tooClose = true;
@@ -2874,6 +3032,9 @@ let inputController, rendererController;
                                 if (dx * dx + dz * dz < req * req) { blocked = true; break; }
                             }
                         }
+                        if (!blocked && intersectsCivicSpace(tx, tz, APPROX_RADIUS.tree, 8)) {
+                            blocked = true;
+                        }
                         if (blocked) continue;
 
                         const parkTree = spawnEntity('tree', tx, tz, null, 'meadow');
@@ -2899,6 +3060,7 @@ let inputController, rendererController;
                                 if (Math.abs(gx - pt.x) < 45 && Math.abs(gz - pt.z) < 45) { invalidSpot = true; break; }
                             }
                         }
+                        if (!invalidSpot && intersectsCivicSpace(gx, gz, 4, 2)) invalidSpot = true;
                         if (invalidSpot) continue;
 
                         const parkGrassColor = new THREE.Color(0x7cb342);
@@ -2953,9 +3115,17 @@ let inputController, rendererController;
                 exclusionZones: roadExclusionZones,
                 collisionEntities: entities.filter(entity => lotCollisionTypes.has(entity.type)),
                 civicCore: capitalCivicCore,
+                civicSpaces,
                 surfaceY: PATH_Y + 0.03,
             });
-            populateWorldScaleDetails(townCenters, pathTiles, placedTownSpots, waterZones, capitalCivicCore);
+            populateWorldScaleDetails(
+                townCenters,
+                pathTiles,
+                placedTownSpots,
+                waterZones,
+                capitalCivicCore,
+                activeCivicSpaces,
+            );
 
             // --- 町と田舎の境目の緩和 ＆ 田舎の集落・農場・工業地帯の生成 ---
             // 木・岩の密度は下のメイン装飾配置ループで距離に応じたグラデーションをかけて
@@ -3036,6 +3206,7 @@ let inputController, rendererController;
             };
             const dummyBush = new THREE.Object3D();
             let capitalCivicCoreVegetationRejectedCount = 0;
+            let civicSpaceVegetationRejectedCount = 0;
 
             for (let i = 0; i < TOTAL_OBJECTS + RURAL_OBJECTS; i++) {
                 const x = (Math.random() - 0.5) * MAP_SIZE;
@@ -3048,6 +3219,10 @@ let inputController, rendererController;
                     capitalCivicCore.clearance + 40,
                 )) {
                     capitalCivicCoreVegetationRejectedCount++;
+                    continue;
+                }
+                if (intersectsCivicSpace(x, z, 60, 4)) {
+                    civicSpaceVegetationRejectedCount++;
                     continue;
                 }
 
@@ -3159,6 +3334,10 @@ let inputController, rendererController;
                     capitalCivicCoreVegetationRejectedCount++;
                     continue;
                 }
+                if (intersectsCivicSpace(x, z, 8, 2)) {
+                    civicSpaceVegetationRejectedCount++;
+                    continue;
+                }
 
                 // タイトル画面のカメラ視野から排除
                 if (x > -900 && x < 900 && z > 3800 && z < 6000) continue;
@@ -3253,6 +3432,10 @@ let inputController, rendererController;
                     capitalCivicCoreVegetationRejectedCount++;
                     continue;
                 }
+                if (intersectsCivicSpace(x, z, 50, 2)) {
+                    civicSpaceVegetationRejectedCount++;
+                    continue;
+                }
 
                 if (x > -900 && x < 900 && z > 3800 && z < 6000) continue;
                 if (Math.sqrt(x*x + z*z) > 12150) continue;
@@ -3300,6 +3483,10 @@ let inputController, rendererController;
                             capitalCivicCoreVegetationRejectedCount++;
                             continue;
                         }
+                        if (intersectsCivicSpace(x + offsetX, z + offsetZ, 6, 2)) {
+                            civicSpaceVegetationRejectedCount++;
+                            continue;
+                        }
 
                         // BUILDING LOT VEGETATION EXCLUSION START
                         if (lotSurfaceVegetationExclusionSurfaces.some(surface => (
@@ -3327,6 +3514,90 @@ let inputController, rendererController;
             }
             scene.userData.capitalCivicCoreVegetationSummary = Object.freeze({
                 rejectedCount: capitalCivicCoreVegetationRejectedCount,
+            });
+            const civicSpaceOmissionReasons = {};
+            for (const civicSpace of civicSpaces) {
+                if (!civicSpace.omissionReason) continue;
+                civicSpaceOmissionReasons[civicSpace.omissionReason]
+                    = (civicSpaceOmissionReasons[civicSpace.omissionReason] ?? 0) + 1;
+            }
+            const landmarkAlignmentErrorDegrees = Object.freeze(Object.fromEntries(
+                civicSpaces.filter(civicSpace => civicSpace.townType !== 'capital').map(civicSpace => {
+                    const landmark = fixedTownLandmarks.find(candidate => (
+                        candidate.townType === civicSpace.townType
+                        && ((civicSpace.civicSpaceType === CIVIC_SPACE_TYPES.CHURCH_SQUARE
+                            && candidate.type === 'church')
+                            || (civicSpace.civicSpaceType === CIVIC_SPACE_TYPES.SCHOOL_SQUARE
+                                && candidate.type === 'school'))
+                    ));
+                    if (!landmark || civicSpace.status !== CIVIC_SPACE_STATUS.ACTIVE) {
+                        return [civicSpace.civicSpaceType, null];
+                    }
+                    const difference = Math.atan2(
+                        Math.sin(civicSpace.rotationY - landmark.rotationY),
+                        Math.cos(civicSpace.rotationY - landmark.rotationY),
+                    );
+                    return [civicSpace.civicSpaceType, Math.abs(difference) * 180 / Math.PI];
+                })
+            ));
+            const normalCivicBuildingTypes = new Set(FRONTAGE_BUILDING_TYPES);
+            const plazaBuildingIntrusionCount = entities.filter(entity => (
+                normalCivicBuildingTypes.has(entity.type)
+                && entity.frontageRoadId
+                && !entity.isDead
+                && intersectsCivicSpace(
+                    entity.mesh.position.x,
+                    entity.mesh.position.z,
+                    entity.radius,
+                )
+            )).length;
+            const plazaObjectIntrusionCount = worldDetailProps.filter(prop => (
+                !prop.destroyed && intersectsCivicSpace(prop.x, prop.z, prop.radius)
+            )).length;
+            const plazaRoadOverlapCount = activeCivicSpaces.reduce((count, civicSpace) => {
+                const body = civicSpaceToBodyRectangle(civicSpace);
+                const roadOverlap = roadHierarchy.roadSurfaces.some(surface => (
+                    civicRectanglesOverlap(body, roadSurfaceToRectangle(surface))
+                ));
+                const junctionOverlap = roadHierarchy.junctionSurfaces.some(surface => (
+                    civicRectanglesOverlap(body, roadSurfaceToRectangle(surface))
+                ));
+                const bridgeOverlap = bridges.some(bridge => (
+                    civicRectanglesOverlap(body, bridgeToRectangle(bridge))
+                ));
+                return count + Number(roadOverlap || junctionOverlap || bridgeOverlap);
+            }, 0);
+            scene.userData.civicSpaceSummary = Object.freeze({
+                targetCount: civicSpaces.length,
+                activeCount: activeCivicSpaces.length,
+                omittedCount: civicSpaces.length - activeCivicSpaces.length,
+                civicSpaces,
+                omissionReasons: Object.freeze(civicSpaceOmissionReasons),
+                plazaRoadOverlapCount,
+                plazaObjectIntrusionCount,
+                plazaVegetationIntrusionCount: 0,
+                plazaBuildingIntrusionCount,
+                accessWidthByType: Object.freeze(Object.fromEntries(civicSpaces.map(civicSpace => (
+                    [civicSpace.civicSpaceType, civicSpace.accessWidth]
+                )))),
+                surfaceMaterialByType: Object.freeze(Object.fromEntries(Object.entries(
+                    CIVIC_SPACE_MATERIALS,
+                ).map(([type, material]) => [type, material.label]))),
+                landmarkAlignmentErrorDegrees,
+                surfaceRotationByType: Object.freeze(Object.fromEntries(civicSpaces.map(civicSpace => (
+                    [civicSpace.civicSpaceType, civicSpace.rotationY]
+                )))),
+                displacedBuildingCandidateCount: civicSpaceBuildingCandidateRejectedCount,
+                buildingShortageByTown: Object.freeze(Object.fromEntries(townCenters.map(town => (
+                    [town.type, town.frontagePlacementSummary?.shortageCount ?? 0]
+                )))),
+                parkRetryCount: civicSpaceParkRetryCount,
+                parkShortageCount: civicSpaceParkShortageCount,
+                surfaceInstanceCount: civicSpaceSurfaces.surfaceInstanceCount,
+                surfaceMeshCount: civicSpaceSurfaceMeshes.length,
+                sharedGeometryCount: 1,
+                sharedMaterialCount: civicSpaceSurfaceMeshes.length,
+                vegetationRejectedCount: civicSpaceVegetationRejectedCount,
             });
 
             // プールに記録した人間の配置候補地点から、現在の画質プリセットに応じた人数だけ実体化する

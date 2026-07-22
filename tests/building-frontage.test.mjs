@@ -465,9 +465,9 @@ test('game integration targets only normal town buildings and records bounded sh
   assert.doesNotMatch(game, /frontageBuildingTypes\.add/);
 
   for (const fixedCall of [
-    "spawnEntity('school', tc.x - 400, tc.z, 0);",
-    "spawnEntity('church', tc.x + 500, tc.z, Math.PI / 2);",
-    "spawnEntity('tower', tc.x, tc.z - 550, 0);",
+    "spawnFixedTownLandmark(tc, 'school', tc.x - 400, tc.z, 0);",
+    "spawnFixedTownLandmark(tc, 'church', tc.x + 500, tc.z, Math.PI / 2);",
+    "spawnFixedTownLandmark(tc, 'tower', tc.x, tc.z - 550, 0);",
     "spawnEntity('militaryBase', tc.baseX, tc.baseZ, baseAngle);",
     "spawnEntity('factory', sx, sz, Math.random() * Math.PI * 2);",
   ]) assert.ok(game.includes(fixedCall));

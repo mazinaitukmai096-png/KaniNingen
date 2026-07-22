@@ -287,7 +287,7 @@ test('building target, park, Lot, street object, and vegetation Core guards are 
   assert.match(game, /scene\.userData\.capitalCivicCoreVegetationSummary/);
   assert.equal(Object.values(getWorldDetailCounts(6, 2)).reduce((total, count) => total + count, 0), 96);
   assert.equal(getWorldDetailInstanceCount(6, 2), 258);
-  assert.doesNotMatch(game, /from '\.\/civic-space\.js'/);
+  assert.match(game, /from '\.\/civic-space\.js'/);
 });
 
 test('Frontage, Lot, visuals, gameplay constants, and unrelated modules remain byte-identical to HEAD', () => {
