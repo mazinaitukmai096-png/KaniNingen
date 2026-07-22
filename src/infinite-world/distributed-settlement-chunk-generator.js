@@ -198,6 +198,8 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
   const reviewSettlement = await distributor.findNearestSettlement(0, 0);
   const templateCache = new Map();
   const templateCacheCapacity = 128;
+  let templatesMaterialized = 0;
+  let templateGenerationMs = 0;
 
   async function getTemplate(candidate) {
     if (templateCache.has(candidate.settlementId)) {
@@ -206,7 +208,10 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       templateCache.set(candidate.settlementId, cached);
       return cached;
     }
+    const startedAt = globalThis.performance?.now?.() ?? Date.now();
     const template = await createMigratedSettlementTemplate({ candidate });
+    templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+    templatesMaterialized += 1;
     return lruSet(templateCache, candidate.settlementId, template, templateCacheCapacity);
   }
 
@@ -286,6 +291,8 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     snapshot: () => Object.freeze({
       templateCacheSize: templateCache.size,
       templateCacheCapacity,
+      templatesMaterialized,
+      templateGenerationMs,
       distributor: distributor.snapshot(),
     }),
   });

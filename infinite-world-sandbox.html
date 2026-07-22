@@ -28,9 +28,61 @@
 <body>
   <div id="viewport" aria-label="Infinite World W5 sandbox"></div>
   <div id="hud"><span id="badge">W5 / INFINITE SETTLEMENT DISTRIBUTION</span>
-起動中…</div>
+起動中: DOMContentLoaded</div>
   <div id="help">WASD: 移動　Shift: 高速 Chunk 横断</div>
+  <script id="w5-entry-error-bridge">
+    (() => {
+      if (window.__infiniteWorldEntryBridge) return;
+      let reported = false;
+      let moduleStarted = false;
+      let firstError = null;
+      const describe = (value, details = {}) => {
+        const source = value && typeof value === 'object' ? value : {};
+        return {
+          name: String(source.name || 'Error'),
+          message: String(details.message || source.message || value || 'Module entry failed'),
+          sourceUrl: String(details.sourceUrl || source.sourceUrl || ''),
+          filename: String(details.filename || source.filename || ''),
+        };
+      };
+      const reportModuleLoadFailure = (value, details = {}) => {
+        if (reported || moduleStarted) return false;
+        reported = true;
+        firstError = describe(value, details);
+        const hud = document.querySelector('#hud');
+        if (hud) {
+          const diagnostics = [
+            `W5 / INFINITE SETTLEMENT DISTRIBUTION`,
+            `起動失敗: MODULE_LOAD`,
+            `${firstError.name}: ${firstError.message}`,
+          ];
+          if (firstError.sourceUrl) diagnostics.push(`Source: ${firstError.sourceUrl}`);
+          if (firstError.filename) diagnostics.push(`Filename: ${firstError.filename}`);
+          hud.textContent = diagnostics.join('\n');
+        }
+        return true;
+      };
+      window.addEventListener('error', event => {
+        reportModuleLoadFailure(
+          event.error || { name: 'Error', message: event.message || 'Module script failed to load' },
+          {
+            sourceUrl: event.target?.src || event.target?.href || '',
+            filename: event.filename || '',
+            message: event.message || '',
+          },
+        );
+      }, true);
+      window.addEventListener('unhandledrejection', event => {
+        reportModuleLoadFailure(event.reason || { name: 'PromiseRejection', message: 'Unhandled module rejection' });
+      });
+      window.__infiniteWorldEntryBridge = Object.freeze({
+        reportModuleLoadFailure,
+        markModuleStarted() { moduleStarted = true; },
+        snapshot: () => Object.freeze({ reported, moduleStarted, firstError: firstError && Object.freeze({ ...firstError }) }),
+      });
+    })();
+  </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
-  <script type="module" src="./src/infinite-world/sandbox-main.js"></script>
+  <script type="module" src="./src/infinite-world/sandbox-entry.js?v=w5-http-entry-fix"></script>
 </body>
 </html>

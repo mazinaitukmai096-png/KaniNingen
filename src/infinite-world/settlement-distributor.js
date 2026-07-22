@@ -241,7 +241,9 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     findNearestSettlement,
     snapshot: () => Object.freeze({
       rawCacheSize: rawCache.size,
+      rawCandidateCount: [...rawCache.values()].filter(Boolean).length,
       acceptedCacheSize: acceptedCache.size,
+      acceptedSettlementCount: [...acceptedCache.values()].filter(Boolean).length,
       rawCacheCapacity: 8192,
       acceptedCacheCapacity: 4096,
     }),

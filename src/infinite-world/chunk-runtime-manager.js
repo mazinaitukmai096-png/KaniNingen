@@ -5,7 +5,7 @@ import {
 } from './chunk-coordinates.js';
 import { FloatingOrigin } from './floating-origin.js';
 import { validateTerrainEdgePair } from './legacy-core/g2/terrain-edge.js';
-import { evaluateW1APerformanceWarnings, PerformanceLedger } from './performance-metrics.js';
+import { evaluateW1APerformanceWarnings, PerformanceLedger } from './runtime-timing.js';
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
