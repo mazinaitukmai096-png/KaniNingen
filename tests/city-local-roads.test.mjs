@@ -60,6 +60,14 @@ const capitalLocalRoads = hierarchy.roads.filter(road => (
   && (road.kind === ROAD_KINDS.LOCAL || road.kind === ROAD_KINDS.ALLEY)
 ));
 const capitalRoadIds = new Set(capitalLocalRoads.map(road => road.roadId));
+const townTownIds = new Set(typedTownCenters
+  .map((town, townIndex) => ({ town, townId: `town-${townIndex}-${town.type}` }))
+  .filter(({ town }) => town.settlementType === 'TOWN')
+  .map(({ townId }) => townId));
+const ruralTownIds = new Set(typedTownCenters
+  .map((town, townIndex) => ({ town, townId: `town-${townIndex}-${town.type}` }))
+  .filter(({ town }) => town.settlementType === 'RURAL')
+  .map(({ townId }) => townId));
 
 function routesFor(roads) {
   const routes = new Map();
@@ -100,8 +108,9 @@ function junctionShape(junction, roadIndex) {
   };
 }
 
-test('only the capital CITY consumes the Phase 3A-1 LOCAL and ALLEY parameters', () => {
+test('CITY, TOWN, and unchanged RURAL roads consume only their connected LOCAL and ALLEY widths', () => {
   const city = getSettlementRoadParameters('CITY');
+  const town = getSettlementRoadParameters('TOWN');
   assert.equal(typedTownCenters.filter(town => town.settlementType === 'CITY').length, 1);
   assert.equal(typedTownCenters[0].type, 'capital');
 
@@ -111,7 +120,11 @@ test('only the capital CITY consumes the Phase 3A-1 LOCAL and ALLEY parameters',
     assert.equal(road.roadPattern, city.roadPattern);
     assert.equal(road.roadSurfaceOverlap, city.roadSurfaceOverlap);
   }
-  for (const road of hierarchy.roads.filter(road => road.townId !== capitalTownId)) {
+  for (const road of hierarchy.roads.filter(road => townTownIds.has(road.townId))) {
+    if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, town.localWidth);
+    if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, town.alleyWidth);
+  }
+  for (const road of hierarchy.roads.filter(road => ruralTownIds.has(road.townId))) {
     if (road.kind === ROAD_KINDS.LOCAL) assert.equal(road.width, 64);
     if (road.kind === ROAD_KINDS.ALLEY) assert.equal(road.width, 44);
   }
@@ -245,11 +258,11 @@ test('Capital LOCAL and ALLEY routes avoid water and protected exclusions', () =
   assert.ok(capitalSamples.every(sample => !sample.isWater && !sample.isBlocked));
 });
 
-test('MAJOR, START_APPROACH, Bridge, and all non-Capital roads remain exact legacy fixtures', () => {
+test('MAJOR, START_APPROACH, Bridge, and RURAL roads remain exact legacy fixtures', () => {
   const fixedRoad = road => (
     road.kind === ROAD_KINDS.MAJOR
     || road.kind === ROAD_KINDS.START_APPROACH
-    || road.townId !== capitalTownId
+    || ruralTownIds.has(road.townId)
   );
   assert.deepEqual(
     hierarchy.roads.filter(fixedRoad).map(roadShape),
@@ -270,11 +283,11 @@ test('MAJOR, START_APPROACH, Bridge, and all non-Capital roads remain exact lega
   assert.equal(getRoadKindCounts(hierarchy.roads).START_APPROACH, 6);
 });
 
-test('TOWN and RURAL junction topology remains identical to the Phase 1 fixture', () => {
+test('RURAL junction topology remains identical to the Phase 1 fixture', () => {
   const legacyRoadsById = new Map(legacyHierarchy.roads.map(road => [road.roadId, road]));
   const fixedJunction = (junction, roadIndex) => junction.roadIds
     .map(roadId => roadIndex.get(roadId))
-    .every(road => road.townId !== capitalTownId);
+    .every(road => ruralTownIds.has(road.townId));
   assert.deepEqual(
     hierarchy.junctions.filter(junction => fixedJunction(junction, roadsById)).map(junction => junctionShape(junction, roadsById)),
     legacyHierarchy.junctions
