@@ -237,6 +237,12 @@ function distanceSquared3D(left, right) {
     + (left.z - right.z) ** 2;
 }
 
+function tankDistanceSquared3D(entity, tankY, player, playerY) {
+  return (entity.x - player.x) ** 2
+    + (tankY - playerY) ** 2
+    + (entity.z - player.z) ** 2;
+}
+
 function rotateVectorXYZ(vector, rotationX, rotationY, rotationZ) {
   // Match Three.js' default Euler order exactly: XYZ local rotations transform
   // a column vector through fixed Z, then Y, then X axes.
@@ -434,6 +440,7 @@ export class InfiniteGameplayRuntime {
     this.pendingBossSpawn = null;
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
+    this.tankSandboxSuppressed = state.activeScaleStageId !== 'MAX';
     this.tankSpawnEpoch = 0;
     this.tankSpawnFrameAccumulator = 0;
     this.tankSpawnFrame = 0;
@@ -865,6 +872,18 @@ export class InfiniteGameplayRuntime {
   }
 
   #tankPresentationState(entity) {
+    const sandboxSuppressed = this.state.activeScaleStageId !== 'MAX';
+    if (sandboxSuppressed) {
+      const occurrence = this.activeTankOccurrences.get(entity.stableId);
+      if (!occurrence) return null;
+      return {
+        ...entity,
+        groundY: occurrence.groundY,
+        groundPitch: occurrence.groundPitch,
+        groundRoll: occurrence.groundRoll,
+        sandboxSuppressed: true,
+      };
+    }
     const occurrence = this.#updateTankGroundPose(entity);
     if (!occurrence?.terrainReady) return null;
     return {
@@ -872,6 +891,7 @@ export class InfiniteGameplayRuntime {
       groundY: occurrence.groundY,
       groundPitch: occurrence.groundPitch,
       groundRoll: occurrence.groundRoll,
+      sandboxSuppressed: false,
     };
   }
 
@@ -935,22 +955,26 @@ export class InfiniteGameplayRuntime {
     }
   }
 
-  #tankHasLineOfSight(entity, player) {
+  #tankHasLineOfSight(entity, tankY, player, playerY) {
     const clearance = W8_TANK_LIFECYCLE_CONTRACT.lineOfSightClearanceMeters;
-    const playerDistanceSquared = distanceSquared(entity, player);
+    const playerDistanceSquared = tankDistanceSquared3D(entity, tankY, player, playerY);
     if (playerDistanceSquared <= 1e-12) return true;
     const segmentX = player.x - entity.x;
+    const segmentY = playerY - tankY;
     const segmentZ = player.z - entity.z;
     const blocksSegment = obstacle => {
       const obstacleX = obstacle.x - entity.x;
+      const obstacleY = (obstacle.y ?? 0) - tankY;
       const obstacleZ = obstacle.z - entity.z;
-      const projection = (obstacleX * segmentX + obstacleZ * segmentZ)
+      const projection = (obstacleX * segmentX + obstacleY * segmentY + obstacleZ * segmentZ)
         / playerDistanceSquared;
       if (projection <= 0 || projection >= 1) return false;
       const perpendicularX = obstacleX - segmentX * projection;
+      const perpendicularY = obstacleY - segmentY * projection;
       const perpendicularZ = obstacleZ - segmentZ * projection;
       const radius = finiteWorldUnitsToMeters(obstacle.radius) + clearance;
-      return perpendicularX * perpendicularX + perpendicularZ * perpendicularZ < radius ** 2;
+      return perpendicularX * perpendicularX + perpendicularY * perpendicularY
+        + perpendicularZ * perpendicularZ < radius ** 2;
     };
     const broadphasePadding = this.maximumSpatialTargetRadiusMeters + clearance;
     for (const model of this.#spatialModelsIntersectingAabb(
@@ -969,6 +993,7 @@ export class InfiniteGameplayRuntime {
       if (!obstacle || obstacle === entity || !obstacle.alive || obstacle.spawned !== true
         || !blocksSegment({
           x: obstacle.x,
+          y: occurrence.groundY,
           z: obstacle.z,
           radius: W6_ENTITY_CONTRACTS.tank.radius,
         })) continue;
@@ -1101,12 +1126,25 @@ export class InfiniteGameplayRuntime {
         if (entity) this.#removeTankOccurrence(entity, { destroyed: entity.alive === false });
         continue;
       }
-      if (distanceSquared(entity, this.state.player) > despawnDistance ** 2) {
+      if (this.state.activeScaleStageId !== 'MAX') {
+        readyStableIds.add(entity.stableId);
+        continue;
+      }
+      const playerY = this.#terrainHeightAt(this.state.player.x, this.state.player.z);
+      if (tankDistanceSquared3D(entity, occurrence.groundY, this.state.player, playerY)
+        > despawnDistance ** 2) {
         this.#removeTankOccurrence(entity);
         continue;
       }
       if (await this.#ensureTankTerrainAt(entity.x, entity.z, entity.rotationY)) {
-        readyStableIds.add(entity.stableId);
+        const prepared = this.#updateTankGroundPose(entity);
+        if (prepared?.terrainReady
+          && tankDistanceSquared3D(entity, prepared.groundY, this.state.player, playerY)
+            <= despawnDistance ** 2) {
+          readyStableIds.add(entity.stableId);
+        } else if (prepared?.terrainReady) {
+          this.#removeTankOccurrence(entity);
+        }
       }
     }
     return readyStableIds;
@@ -1132,25 +1170,72 @@ export class InfiniteGameplayRuntime {
     return false;
   }
 
+  #syncTankSandboxState() {
+    const sandboxSuppressed = this.state.activeScaleStageId !== 'MAX';
+    const changed = sandboxSuppressed !== this.tankSandboxSuppressed;
+    this.tankSandboxSuppressed = sandboxSuppressed;
+    if (sandboxSuppressed
+      && this.projectiles.some(projectile => projectile.type === 'tank-shell')) {
+      this.projectiles = this.projectiles.filter(projectile => projectile.type !== 'tank-shell');
+    }
+    if (changed) {
+      for (const occurrence of this.activeTankOccurrences.values()) {
+        this.#syncTank(this.state.entityStates.get(occurrence.slotStableId));
+      }
+    }
+    return sandboxSuppressed;
+  }
+
   #updateTank(entity, player, deltaSeconds) {
     if (!entity?.alive || entity.spawned !== true) {
       if (entity) this.#removeTankOccurrence(entity, { destroyed: entity.alive === false });
       return;
     }
+    if (this.state.activeScaleStageId !== 'MAX') return;
     const contract = W6_ENTITY_CONTRACTS.tank;
     const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
-    if (distanceSquared(entity, player) <= lifecycle.collisionActiveRangeMeters ** 2) {
-      this.#resolveTankObstacleCollisions(entity);
-    }
-    entity.aiClock += deltaSeconds;
-    const distance = Math.sqrt(distanceSquared(entity, player));
-    if (distance > finiteWorldUnitsToMeters(contract.despawnDistance)) {
+    const occurrenceBeforeUpdate = this.activeTankOccurrences.get(entity.stableId);
+    const playerY = Number.isFinite(player.y)
+      ? player.y
+      : this.#terrainHeightAt(player.x, player.z);
+    const despawnDistance = finiteWorldUnitsToMeters(contract.despawnDistance);
+    if (tankDistanceSquared3D(
+      entity,
+      occurrenceBeforeUpdate?.groundY ?? 0,
+      player,
+      playerY,
+    ) > despawnDistance ** 2) {
       this.#removeTankOccurrence(entity);
       return;
     }
-    const preparedGround = this.#updateTankGroundPose(entity);
+    let preparedGround = this.#updateTankGroundPose(entity);
     if (!preparedGround?.terrainReady) {
       this.counts.entityUpdates += 1;
+      return;
+    }
+    if (tankDistanceSquared3D(entity, preparedGround.groundY, player, playerY)
+      <= lifecycle.collisionActiveRangeMeters ** 2) {
+      const beforeCollisionX = entity.x;
+      const beforeCollisionZ = entity.z;
+      this.#resolveTankObstacleCollisions(entity);
+      preparedGround = this.#updateTankGroundPose(entity);
+      if (!preparedGround?.terrainReady) {
+        entity.x = beforeCollisionX;
+        entity.z = beforeCollisionZ;
+        this.#updateTankGroundPose(entity);
+        this.counts.entityUpdates += 1;
+        return;
+      }
+    }
+    entity.aiClock += deltaSeconds;
+    const distance = Math.sqrt(tankDistanceSquared3D(
+      entity,
+      preparedGround.groundY,
+      player,
+      playerY,
+    ));
+    if (distance > despawnDistance) {
+      this.#removeTankOccurrence(entity);
       return;
     }
     if (distance >= finiteWorldUnitsToMeters(contract.engageRange)) {
@@ -1179,7 +1264,12 @@ export class InfiniteGameplayRuntime {
     if (stuck) {
       entity.stuckRemainingSeconds = Math.max(0, entity.stuckRemainingSeconds - deltaSeconds);
     }
-    const hasLineOfSight = this.#tankHasLineOfSight(entity, player);
+    const hasLineOfSight = this.#tankHasLineOfSight(
+      entity,
+      preparedGround.groundY,
+      player,
+      playerY,
+    );
     const targetHeading = Math.atan2(player.x - entity.x, player.z - entity.z);
     const bodyTarget = stuck ? entity.avoidAngle
       : hasLineOfSight ? targetHeading : normalizedAngle(targetHeading + Math.PI / 3);
@@ -1228,10 +1318,7 @@ export class InfiniteGameplayRuntime {
     );
     entity.turretRotationY = normalizedAngle(entity.rotationY + turnedTurretRelativeYaw);
     const horizontalDistance = Math.max(0.025, postMoveDistance);
-    const playerAimY = (Number.isFinite(player.y)
-      ? player.y
-      : this.#terrainHeightAt(player.x, player.z))
-      + lifecycle.playerAimHeightMeters;
+    const playerAimY = playerY + lifecycle.playerAimHeightMeters;
     const gunPivotY = occurrence.groundY + lifecycle.turretPivotHeightMeters;
     const targetGunPitch = -Math.atan2(playerAimY - gunPivotY, horizontalDistance);
     entity.gunPitch = turnTowardAngle(
@@ -1327,7 +1414,16 @@ export class InfiniteGameplayRuntime {
       const z = player.z + Math.cos(angle) * distance;
       const rotationY = deterministicUnitFloat(`${key}:heading`) * Math.PI * 2;
       const terrainReady = await this.#ensureTankTerrainAt(x, z, rotationY);
-      if (!terrainReady || this.isShutdown || spawnEpoch !== this.tankSpawnEpoch) return;
+      if (!terrainReady || this.isShutdown || spawnEpoch !== this.tankSpawnEpoch
+        || this.state.activeScaleStageId !== 'MAX') return;
+      const activeBoss = this.state.manualBossStableId
+        ? this.state.entityStates.get(this.state.manualBossStableId)?.alive === true : false;
+      const allowed = activeBoss ? lifecycle.bossTankLimit : Math.min(
+        lifecycle.tankLimitMaximum,
+        lifecycle.normalTankBaseLimit
+          + Math.floor(this.state.player.score / lifecycle.tankLimitScoreDivisor),
+      );
+      if (this.activeTankOccurrences.size >= allowed) return;
       const ownerChunkKey = logicalWorldToOwnedChunk(x, z).key;
       this.#registerStableId(result.stableId, ownerChunkKey);
       const tank = this.state.ensureEntity({
@@ -1376,6 +1472,9 @@ export class InfiniteGameplayRuntime {
     if (deterministicUnitFloat(`${this.worldSeedHash}:tank-spawn:${this.tankSpawnFrame}`)
       >= adjustedChance) return;
     const loadedBaseBindings = [];
+    const playerY = Number.isFinite(player.y)
+      ? player.y
+      : this.#terrainHeightAt(player.x, player.z);
     for (const model of this.spatialChunks.values()) {
       for (const descriptor of model.entityDescriptors) {
         if (descriptor.type !== 'tank') continue;
@@ -1386,8 +1485,9 @@ export class InfiniteGameplayRuntime {
     const nearbyBases = loadedBaseBindings
       .filter(binding => binding.baseStableId
         && !this.state.isFeatureDestroyed(binding.baseStableId)
-        && distanceSquared({ x: binding.baseX, z: binding.baseZ }, player)
-          < lifecycle.baseSpawnRangeMeters ** 2)
+        && (binding.baseX - player.x) ** 2
+          + (binding.baseY - playerY) ** 2
+          + (binding.baseZ - player.z) ** 2 < lifecycle.baseSpawnRangeMeters ** 2)
       .map(binding => this.state.entityStates.get(binding.slotStableId))
       .filter(entity => entity && entity.spawned !== true)
       .sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -1767,6 +1867,7 @@ export class InfiniteGameplayRuntime {
     this.state.updatePlayer({ x: player.x, z: player.z });
     this.state.tickGameplayTime(boundedDelta * 1000);
     this.state.tickNuclearCooldown(boundedDelta * 1000);
+    this.#syncTankSandboxState();
     if (simulationEnabled !== true) {
       this.#syncTransientCombat();
       return;
@@ -1881,7 +1982,7 @@ export class InfiniteGameplayRuntime {
     for (const occurrence of [...this.activeTankOccurrences.values()]) {
       this.#updateTank(this.state.entityStates.get(occurrence.slotStableId), combatPlayer, boundedDelta);
     }
-    this.#maintainFiniteTankSpawns(player, boundedDelta);
+    this.#maintainFiniteTankSpawns(combatPlayer, boundedDelta);
     const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
     const bulletHitRadius = finiteWorldUnitsToMeters(W7_CORE_COMBAT_CONTRACT.tank.bulletHitRadius);
     for (let index = this.projectiles.length - 1; index >= 0; index -= 1) {
@@ -2547,6 +2648,7 @@ export class InfiniteGameplayRuntime {
       fallbackTankCount: this.reinforcementIds.size,
       tankOwnerRegistryCount: this.tankBindings.size,
       tankOccurrenceGenerationCount: this.tankOccurrenceGenerations.size,
+      tankSandboxSuppressed: this.state.activeScaleStageId !== 'MAX',
       tankTerrainCacheCapacity: TANK_TERRAIN_QUERY_CACHE_CAPACITY,
       tankTerrainCacheCount: this.tankTerrainChunks.size,
       tankTerrainPendingQueryCount: this.pendingTankTerrainChunks.size,

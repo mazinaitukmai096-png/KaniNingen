@@ -329,7 +329,17 @@ function validateEntityStates(records) {
 }
 
 function hydrateTankLifecycle(entityStates, tankReinforcementSequence) {
-  let highestActiveReinforcementSequence = 0;
+  let highestReinforcementSequence = 0;
+  for (const state of entityStates.values()) {
+    if (state.type !== 'tank' || state.reinforcementSequence === 0) continue;
+    highestReinforcementSequence = Math.max(
+      highestReinforcementSequence,
+      state.reinforcementSequence,
+    );
+  }
+  if (tankReinforcementSequence < highestReinforcementSequence) {
+    throw new Error('tankReinforcementSequence is lower than a fallback Tank sequence');
+  }
   for (const [stableId, state] of entityStates) {
     if (state.type !== 'tank') continue;
     if (state.reinforcementSequence === 0) {
@@ -338,15 +348,7 @@ function hydrateTankLifecycle(entityStates, tankReinforcementSequence) {
     }
     if (!state.alive || !state.spawned) {
       entityStates.delete(stableId);
-      continue;
     }
-    highestActiveReinforcementSequence = Math.max(
-      highestActiveReinforcementSequence,
-      state.reinforcementSequence,
-    );
-  }
-  if (tankReinforcementSequence < highestActiveReinforcementSequence) {
-    throw new Error('tankReinforcementSequence is lower than an active fallback Tank sequence');
   }
   return entityStates;
 }

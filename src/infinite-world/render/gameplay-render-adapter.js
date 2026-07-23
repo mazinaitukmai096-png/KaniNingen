@@ -123,7 +123,9 @@ export class GameplayRenderAdapter {
       localZ * this.unitsPerMeter,
     );
     mesh.rotation.y = state.rotationY;
-    mesh.visible = state.alive && (state.type !== 'tank' || state.spawned === true);
+    mesh.visible = state.alive
+      && (state.type !== 'tank'
+        || (state.spawned === true && state.sandboxSuppressed !== true));
     const parts = mesh.userData.presentationParts;
     if (state.type === 'human' && parts) {
       mesh.rotation.z = state.aiState === 'fallen' ? Math.PI / 2 : 0;
@@ -745,7 +747,8 @@ export class GameplayRenderAdapter {
       : 0;
     entry.mesh.rotation.y = entry.state.rotationY;
     entry.mesh.rotation.z = Number.isFinite(entry.state.groundRoll) ? entry.state.groundRoll : 0;
-    entry.mesh.visible = entry.state.alive && entry.state.spawned === true;
+    entry.mesh.visible = entry.state.alive && entry.state.spawned === true
+      && entry.state.sandboxSuppressed !== true;
     const parts = entry.mesh.userData.presentationParts;
     const relative = (entry.state.turretRotationY ?? entry.state.rotationY) - entry.state.rotationY;
     if (parts?.turret) parts.turret.rotation.y = relative;
