@@ -56,6 +56,10 @@ test('W8 wraps byte-identical W5 output and publishes sorted deterministic overl
     parity.sourceChunkData.vegetationCandidates.includes(candidate)), true);
   assert.equal((await hashW8ParityChunkContent(parity)), parity.contentHash);
   assert.deepEqual(validateW8ParityChunkData(parity), { valid: true, errors: [] });
+  const cacheSnapshot = w8.snapshot();
+  assert.equal(cacheSnapshot.warmSourceChunkCacheCapacity, 256);
+  assert.ok(cacheSnapshot.warmSourceChunkCacheSize <= 256);
+  assert.equal(cacheSnapshot.warmSourceChunkPendingCount, 0);
   for (const name of ['waterSurfaces', 'ambientDetails', 'settlementLandmarks', 'streetDetails']) {
     assert.deepEqual(parity[name].map(value => value.stableId),
       parity[name].map(value => value.stableId).toSorted());
@@ -152,6 +156,15 @@ test('W8 generation is invariant under reverse and parallel request order', asyn
   const coordinates = [[0, 0], [1, -1], [-2, 3], [4, 2], [-3, -4]];
   const first = await createW8ParityChunkGenerator({ worldSeed: seed });
   const second = await createW8ParityChunkGenerator({ worldSeed: seed });
+  const pendingA = first.generateChunk(17, -19);
+  const pendingB = first.generateChunk(17, -19);
+  const pendingSnapshot = first.snapshot();
+  assert.equal(pendingSnapshot.warmSourceChunkCacheCapacity, 256);
+  assert.equal(pendingSnapshot.warmSourceChunkPendingCount, 1);
+  const [duplicateA, duplicateB] = await Promise.all([pendingA, pendingB]);
+  assert.equal(duplicateA.sourceChunkData, duplicateB.sourceChunkData);
+  assert.equal(duplicateA.contentHash, duplicateB.contentHash);
+  assert.equal(first.snapshot().warmSourceChunkPendingCount, 0);
   const parallel = await Promise.all(coordinates.map(([x, z]) => first.generateChunk(x, z)));
   const reverse = [];
   for (const [x, z] of coordinates.toReversed()) reverse.push(await second.generateChunk(x, z));
@@ -163,6 +176,12 @@ test('W8 generation is invariant under reverse and parallel request order', asyn
     assert.deepEqual(other.ambientDetails, chunk.ambientDetails);
     assert.deepEqual(other.settlementLandmarks, chunk.settlementLandmarks);
     assert.deepEqual(other.streetDetails, chunk.streetDetails);
+  }
+  for (const generator of [first, second]) {
+    const snapshot = generator.snapshot();
+    assert.equal(snapshot.warmSourceChunkCacheCapacity, 256);
+    assert.ok(snapshot.warmSourceChunkCacheSize <= 256);
+    assert.equal(snapshot.warmSourceChunkPendingCount, 0);
   }
 });
 

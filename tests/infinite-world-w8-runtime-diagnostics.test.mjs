@@ -8,14 +8,224 @@ import {
   parseW8DiagnosticProfile,
 } from '../src/infinite-world/runtime-diagnostics.js';
 import {
+  W8_CANONICAL_VISIBILITY_METERS,
   W8_PRESENTATION_TERRAIN_PALETTE,
+  createW8DistantPresentation,
   createW8ClipmapTopology,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
+import { W6_STATIC_TARGET_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
+import {
+  InfiniteWorldState,
+  decodeInfiniteWorldSave,
+  encodeInfiniteWorldSave,
+} from '../src/infinite-world/world-state-store.js';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
+const CANONICAL_WORLD_SEED_HASH = `sha256:${'0'.repeat(64)}`;
+
+class DistantTestVector {
+  constructor() { this.set(0, 0, 0); }
+  set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; }
+}
+
+class DistantTestMatrix {
+  constructor(value = {}) { this.value = structuredClone(value); }
+  clone() { return new DistantTestMatrix(this.value); }
+}
+
+class DistantTestNode {
+  constructor() {
+    this.children = [];
+    this.position = new DistantTestVector();
+    this.rotation = new DistantTestVector();
+    this.scale = new DistantTestVector().set(1, 1, 1);
+    this.matrix = new DistantTestMatrix();
+    this.userData = {};
+  }
+  add(child) { this.children.push(child); child.parent = this; }
+  remove(child) {
+    this.children = this.children.filter(value => value !== child);
+    child.parent = null;
+  }
+  clear() {
+    for (const child of this.children) child.parent = null;
+    this.children = [];
+  }
+  updateMatrix() {
+    this.matrix = new DistantTestMatrix({
+      position: { ...this.position },
+      rotation: { ...this.rotation },
+      scale: { ...this.scale },
+    });
+  }
+}
+
+class DistantTestGroup extends DistantTestNode {}
+class DistantTestGeometry {
+  constructor() { this.attributes = {}; }
+  setAttribute(name, attribute) { this.attributes[name] = attribute; }
+  setIndex(index) { this.index = index; }
+  computeVertexNormals() {}
+  dispose() { this.disposed = true; }
+}
+class DistantTestBufferGeometry extends DistantTestGeometry {}
+class DistantTestPlaneGeometry extends DistantTestGeometry {}
+class DistantTestFloat32BufferAttribute {
+  constructor(values, itemSize) { this.values = values; this.itemSize = itemSize; }
+}
+class DistantTestMaterial {
+  constructor(options = {}) { Object.assign(this, options); }
+  dispose() { this.disposed = true; }
+}
+class DistantTestMesh extends DistantTestNode {
+  constructor(geometry, material) {
+    super();
+    this.geometry = geometry;
+    this.material = material;
+  }
+}
+class DistantTestInstancedMesh extends DistantTestMesh {
+  constructor(geometry, material, capacity) {
+    super(geometry, material);
+    this.capacity = capacity;
+    this.count = 0;
+    this.matrices = [];
+    this.instanceMatrix = {};
+  }
+  setMatrixAt(index, matrix) { this.matrices[index] = matrix.clone?.() ?? structuredClone(matrix); }
+}
+class DistantTestObject3D extends DistantTestNode {}
+
+const DISTANT_TEST_THREE = Object.freeze({
+  Group: DistantTestGroup,
+  Mesh: DistantTestMesh,
+  InstancedMesh: DistantTestInstancedMesh,
+  Object3D: DistantTestObject3D,
+  PlaneGeometry: DistantTestPlaneGeometry,
+  BufferGeometry: DistantTestBufferGeometry,
+  Float32BufferAttribute: DistantTestFloat32BufferAttribute,
+  MeshLambertMaterial: DistantTestMaterial,
+});
+
+const CANONICAL_HOUSE_PART = Object.freeze({
+  geometry: 'box',
+  material: 'houseWall',
+  position: Object.freeze([0, 0.5, 0]),
+  scale: Object.freeze([1, 1, 1]),
+  rotation: Object.freeze([0, 0, 0]),
+  materialRole: 'wall',
+});
+
+function createDistantTestVisualAssets() {
+  const geometry = new DistantTestGeometry();
+  const material = () => new DistantTestMaterial();
+  return {
+    geometries: { box: geometry },
+    materials: {
+      houseWall: material(),
+      road: material(),
+      lotResidential: material(),
+      lotCivic: material(),
+      water: material(),
+    },
+    featureParts: {
+      house: [CANONICAL_HOUSE_PART],
+      tree: [],
+      broadleafTree: [],
+      wetlandTree: [],
+      rock: [],
+    },
+    resolveBuildingParts: record =>
+      record.buildingType === 'house' ? [CANONICAL_HOUSE_PART] : null,
+  };
+}
+
+function flatDistantTerrain() {
+  return {
+    resolution: { x: 2, z: 2 },
+    heightUnitMeters: 0.001,
+    heights: new Int32Array(4),
+    materialWeights: new Float64Array([
+      1, 0, 0, 0, 0,
+      1, 0, 0, 0, 0,
+      1, 0, 0, 0, 0,
+      1, 0, 0, 0, 0,
+    ]),
+  };
+}
+
+const CANONICAL_SETTLEMENT_ID = 'settlement-v1:gate-a';
+const CANONICAL_BUILDING_ID = 'settlement-building-v1:gate-a-house';
+const CANONICAL_BUILDING = Object.freeze({
+  stableId: CANONICAL_BUILDING_ID,
+  settlementId: CANONICAL_SETTLEMENT_ID,
+  featureType: 'settlement-building',
+  buildingType: 'house',
+  worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+  rotationY: 0.375,
+  widthMeters: 6,
+  heightMeters: 4,
+  depthMeters: 5,
+  radiusMeters: 4,
+  visual: Object.freeze({ paletteIndex: 2, roofVariant: 'gable' }),
+  owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+});
+
+function canonicalChunk(chunkX = 5, chunkZ = 0, records = [CANONICAL_BUILDING]) {
+  return {
+    chunkX,
+    chunkZ,
+    chunkId: `w8-parity-chunk:${chunkX},${chunkZ}`,
+    contentHash: `sha256:${'1'.repeat(64)}`,
+    sourceW5ContentHash: `sha256:${'2'.repeat(64)}`,
+    terrain: flatDistantTerrain(),
+    vegetationCandidates: [],
+    rockCandidates: [],
+    settlementFeatures: records,
+    settlementLandmarks: [],
+    presentationLayers: {
+      natural: { vegetation: [], rocks: [] },
+      formal: { roadsAndBuildings: records },
+      landmarks: [],
+    },
+  };
+}
+
+const CANONICAL_CANDIDATE = Object.freeze({
+  settlementId: CANONICAL_SETTLEMENT_ID,
+  worldPosition: Object.freeze({ x: 88, z: 8 }),
+});
+
+const CANONICAL_TEMPLATE = Object.freeze({
+  settlementId: CANONICAL_SETTLEMENT_ID,
+  center: Object.freeze({ x: 88, z: 8 }),
+  buildings: Object.freeze([Object.freeze({ x: 88, z: 8 })]),
+  roads: Object.freeze([]),
+});
+
+function canonicalSyncInput({
+  centerChunkX,
+  activeDataKeys,
+  renderedKeys,
+  chunk = canonicalChunk(),
+  playerLogicalX = centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+} = {}) {
+  return {
+    activeDataKeys,
+    renderedKeys,
+    getChunkData: (chunkX, chunkZ) =>
+      chunkX === chunk.chunkX && chunkZ === chunk.chunkZ ? chunk : null,
+    renderOrigin: { renderOriginChunkX: centerChunkX, renderOriginChunkZ: 0 },
+    centerChunkX,
+    centerChunkZ: 0,
+    quality: 'medium',
+    playerLogicalX,
+    playerLogicalZ: 8,
+  };
+}
 
 function legacyClipmapAxis() {
   const values = [];
@@ -296,6 +506,271 @@ test('clipmap topology and terrain sampling remain Float32-identical to the pre-
     clipmapChecksum(actualPositions, actualColors),
     clipmapChecksum(legacyPositions, legacyColors),
   );
+});
+
+test('canonical settlement identity hands off exclusively and destruction survives distance and save/load', async () => {
+  const scene = new DistantTestGroup();
+  let activeState = new InfiniteWorldState({
+    worldSeed: 'gate-a-canonical',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  let holdNextQuery = false;
+  let releaseHeldQuery = null;
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => {
+      if (!holdNextQuery) return [CANONICAL_CANDIDATE];
+      return new Promise(resolve => {
+        releaseHeldQuery = () => resolve([CANONICAL_CANDIDATE]);
+      });
+    },
+    resolveTemplate: async () => CANONICAL_TEMPLATE,
+    getCanonicalChunkData: async (chunkX, chunkZ) =>
+      chunkX === 5 && chunkZ === 0 ? canonicalChunk() : null,
+    isFeatureDestroyed: stableId => activeState.isFeatureDestroyed(stableId),
+  });
+  const expectedIdentity = {
+    stableId: CANONICAL_BUILDING_ID,
+    settlementId: CANONICAL_SETTLEMENT_ID,
+    buildingType: 'house',
+    landmarkType: null,
+    featureType: 'settlement-building',
+    worldPosition: { x: 88, y: 0.4, z: 8 },
+    rotationY: 0.375,
+    dimensions: { widthMeters: 6, heightMeters: 4, depthMeters: 5 },
+    visual: { paletteIndex: 2, roofVariant: 'gable' },
+    parts: [{
+      geometry: 'box',
+      material: 'houseWall',
+      position: [0, 0.5, 0],
+      scale: [1, 1, 1],
+      rotation: [0, 0, 0],
+      materialRole: 'wall',
+    }],
+    owningChunkCoordinate: { x: 5, z: 0 },
+    chunkId: 'w8-parity-chunk:5,0',
+    contentHash: `sha256:${'1'.repeat(64)}`,
+    sourceW5ContentHash: `sha256:${'2'.repeat(64)}`,
+  };
+  const states = [
+    {
+      lod: 'far',
+      input: canonicalSyncInput({
+        centerChunkX: 0,
+        activeDataKeys: [],
+        renderedKeys: [],
+      }),
+    },
+    {
+      lod: 'mid',
+      input: canonicalSyncInput({
+        centerChunkX: 3,
+        activeDataKeys: ['5,0'],
+        renderedKeys: [],
+      }),
+    },
+    {
+      lod: 'near',
+      input: canonicalSyncInput({
+        centerChunkX: 4,
+        activeDataKeys: ['5,0'],
+        renderedKeys: ['5,0'],
+      }),
+    },
+    {
+      lod: 'mid',
+      input: canonicalSyncInput({
+        centerChunkX: 3,
+        activeDataKeys: ['5,0'],
+        renderedKeys: [],
+      }),
+    },
+    {
+      lod: 'far',
+      input: canonicalSyncInput({
+        centerChunkX: 0,
+        activeDataKeys: [],
+        renderedKeys: [],
+      }),
+    },
+  ];
+
+  for (const state of states) {
+    assert.equal(await presentation.sync(state.input), true);
+    const [object] = presentation.canonicalAuditSnapshot();
+    assert.deepEqual(object.identity, expectedIdentity);
+    assert.equal(object.visibleLod, state.lod);
+    assert.equal(object.instanceCount, 1);
+    const snapshot = presentation.snapshot();
+    const nearOwnerCount = state.lod === 'near' ? 1 : 0;
+    assert.equal(snapshot.visibleCanonicalObjectCount + nearOwnerCount, 1);
+    assert.equal(snapshot.duplicateVisibleStableIdCount, 0);
+    assert.equal(scene.children[0].children.length, 1);
+  }
+
+  presentation.update(1_000, 1_000, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'hidden');
+  presentation.update(8, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'far');
+  assert.equal(presentation.snapshot().visibilityMeters, W8_CANONICAL_VISIBILITY_METERS.medium);
+
+  holdNextQuery = true;
+  const staleSync = presentation.sync(canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+  }));
+  while (!releaseHeldQuery) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(scene.children[0].children.length, 1);
+  holdNextQuery = false;
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 3,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+  })), true);
+  const committedBeforeRelease = presentation.snapshot().committedEpoch;
+  releaseHeldQuery();
+  assert.equal(await staleSync, false);
+  const afterStale = presentation.snapshot();
+  assert.equal(afterStale.committedEpoch, committedBeforeRelease);
+  assert.ok(afterStale.staleEpochDiscardCount >= 1);
+  assert.equal(scene.children[0].children.length, 1);
+  assert.equal(
+    scene.children[0].children[0].userData.epoch,
+    afterStale.committedEpoch,
+  );
+
+  const conflictingBuilding = {
+    ...CANONICAL_BUILDING,
+    rotationY: CANONICAL_BUILDING.rotationY + 0.25,
+  };
+  const rootBeforeConflict = scene.children[0].children[0];
+  await assert.rejects(
+    presentation.sync(canonicalSyncInput({
+      centerChunkX: 3,
+      activeDataKeys: ['5,0'],
+      renderedKeys: [],
+      chunk: canonicalChunk(5, 0, [conflictingBuilding]),
+    })),
+    /canonical LOD identity mismatch/,
+  );
+  assert.equal(scene.children[0].children.length, 1);
+  assert.equal(scene.children[0].children[0], rootBeforeConflict);
+
+  activeState.damageFeature(
+    { stableId: CANONICAL_BUILDING_ID, maxHp: W6_STATIC_TARGET_CONTRACTS.house.maxHp },
+    W6_STATIC_TARGET_CONTRACTS.house.maxHp,
+  );
+  presentation.update(8, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'destroyed');
+  assert.equal(presentation.snapshot().visibleCanonicalObjectCount, 0);
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 4,
+    activeDataKeys: ['5,0'],
+    renderedKeys: ['5,0'],
+  })), true);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'destroyed');
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+  })), true);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'destroyed');
+
+  const serialized = await encodeInfiniteWorldSave(activeState.createSaveSnapshot());
+  const decoded = await decodeInfiniteWorldSave(serialized, {
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+  });
+  const restoredState = new InfiniteWorldState({
+    worldSeed: 'gate-a-canonical',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  restoredState.restoreSaveSnapshot(decoded);
+  activeState = restoredState;
+  presentation.update(8, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(activeState.isFeatureDestroyed(CANONICAL_BUILDING_ID), true);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'destroyed');
+  assert.equal(presentation.snapshot().visibleCanonicalObjectCount, 0);
+  presentation.dispose();
+});
+
+test('canonical query caches are strict LRU bounds and never exceed four concurrent loads', async () => {
+  const ownerPoints = [];
+  for (let chunkZ = -4; chunkZ < 4; chunkZ += 1) {
+    for (let chunkX = -5; chunkX < 5; chunkX += 1) {
+      ownerPoints.push({ x: chunkX * 16 + 8, z: chunkZ * 16 + 8 });
+    }
+  }
+  assert.equal(ownerPoints.length, 80);
+  const candidates = Array.from({ length: 8 }, (_, index) => ({
+    settlementId: `settlement-v1:cache-${index}`,
+    worldPosition: ownerPoints[index * 10],
+  }));
+  let providerConcurrency = 0;
+  let maximumProviderConcurrency = 0;
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => candidates,
+    resolveTemplate: async ({ candidate }) => {
+      await new Promise(resolve => setImmediate(resolve));
+      const index = Number(candidate.settlementId.split('-').at(-1));
+      return {
+        settlementId: candidate.settlementId,
+        center: candidate.worldPosition,
+        buildings: ownerPoints.slice(index * 10, index * 10 + 10),
+        roads: [],
+      };
+    },
+    getCanonicalChunkData: async (chunkX, chunkZ) => {
+      providerConcurrency += 1;
+      maximumProviderConcurrency = Math.max(maximumProviderConcurrency, providerConcurrency);
+      await new Promise(resolve => setImmediate(resolve));
+      providerConcurrency -= 1;
+      return canonicalChunk(chunkX, chunkZ, []);
+    },
+  });
+  assert.equal(await presentation.sync({
+    activeDataKeys: [],
+    renderedKeys: [],
+    getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    centerChunkX: 0,
+    centerChunkZ: 0,
+    quality: 'medium',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+  }), true);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.queryCandidateCount, 8);
+  assert.equal(snapshot.queryOwnerChunkCount, 80);
+  assert.equal(snapshot.templateCacheCapacity, 4);
+  assert.equal(snapshot.templateCacheSize, 4);
+  assert.equal(snapshot.farOwnerChunkCacheCapacity, 64);
+  assert.equal(snapshot.farOwnerChunkCacheSize, 64);
+  assert.equal(snapshot.queryConcurrencyLimit, 4);
+  assert.equal(snapshot.maximumObservedQueryConcurrency, 4);
+  assert.equal(maximumProviderConcurrency, 4);
+  presentation.dispose();
 });
 
 test('the absolute hitch ceiling and crossing regression remain explicit five-run gates', () => {

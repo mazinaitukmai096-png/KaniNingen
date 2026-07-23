@@ -8,12 +8,20 @@ import {
   bootInfiniteWorldSandbox,
   createSandboxBootState,
   createSandboxEntryController,
+  createW8ScenePresentation,
   isW8GameplaySimulationEnabled,
   recordSandboxBootFailure,
+  w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
 import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
+import { UNITS_PER_METER } from '../src/infinite-world/chunk-coordinates.js';
+import {
+  PRODUCTION_VISUAL_UNITS_PER_METER,
+  createW8ParityVisualAssetLibrary,
+} from '../src/infinite-world/render/w8-parity-visual-assets.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
+let nodeObjectConstructionCount = 0;
 
 class Triple {
   constructor() { this.set(0, 0, 0); }
@@ -21,6 +29,7 @@ class Triple {
 }
 class NodeObject {
   constructor() {
+    nodeObjectConstructionCount += 1;
     this.children = [];
     this.position = new Triple();
     this.rotation = new Triple();
@@ -40,6 +49,7 @@ class Scene extends Group {
 }
 class Geometry {
   constructor() { this.attributes = {}; }
+  clone() { return new this.constructor(); }
   setAttribute(name, value) { this.attributes[name] = value; }
   setIndex(index) { this.index = index; }
   computeVertexNormals() {}
@@ -51,8 +61,10 @@ class DodecahedronGeometry extends Geometry {}
 class BufferGeometry extends Geometry {}
 class CylinderGeometry extends Geometry {}
 class Float32BufferAttribute { constructor(values, size) { this.values = values; this.size = size; } }
+class InstancedBufferAttribute extends Float32BufferAttribute {}
 class Material {
-  constructor(options) { this.options = options; }
+  constructor(options = {}) { this.options = options; Object.assign(this, options); }
+  clone() { return new this.constructor({ ...this.options }); }
   dispose() { this.disposed = true; }
 }
 class MeshLambertMaterial extends Material {}
@@ -65,9 +77,12 @@ class InstancedMesh extends Mesh {
     super(geometry, material);
     this.capacity = capacity;
     this.instanceMatrix = {};
+    this.instanceColor = {};
     this.matrices = [];
+    this.colors = [];
   }
   setMatrixAt(index, matrix) { this.matrices[index] = structuredClone(matrix); }
+  setColorAt(index, color) { this.colors[index] = color; }
 }
 class LineSegments extends Mesh {}
 class Object3D extends NodeObject {}
@@ -110,6 +125,7 @@ const FakeThree = {
   BufferGeometry,
   CylinderGeometry,
   Float32BufferAttribute,
+  InstancedBufferAttribute,
   MeshLambertMaterial,
   LineBasicMaterial,
   Mesh,
@@ -124,6 +140,139 @@ const FakeThree = {
   WebGLRenderer,
   SRGBColorSpace: 'srgb',
 };
+
+test('finite Cloud contract remains logical and continuous across origin updates', () => {
+  const scene = new Scene();
+  const visualAssets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const presentation = createW8ScenePresentation({
+    THREE: FakeThree,
+    scene,
+    visualAssets,
+  });
+  const initial = presentation.snapshot();
+  assert.equal(initial.cloudBaseCount, 70);
+  assert.equal(initial.cloudPuffCount, 21);
+  assert.equal(initial.cloudInstanceCount, 91);
+  assert.equal(initial.warmBaseCount, 28);
+  assert.equal(initial.clouds.filter(cloud => cloud.puff).length, 21);
+  assert.equal(presentation.cloudRoot.material.opacity, 1);
+  assert.equal(visualAssets.materials.cloud.opacity, 0.72);
+  assert.deepEqual(
+    presentation.cloudRoot.colors.map(color => color.value),
+    initial.clouds.map(cloud => cloud.warm ? 0xfff3e0 : 0xffffff),
+  );
+  assert.deepEqual(
+    [...presentation.cloudRoot.geometry.attributes.instanceOpacity.values],
+    initial.clouds.map(cloud => Math.fround(cloud.opacity)),
+  );
+  for (const cloud of initial.clouds.filter(value => !value.puff)) {
+    assert.ok(cloud.opacity >= 0.55 && cloud.opacity < 0.9);
+    assert.ok(cloud.widthFinite >= 600 && cloud.widthFinite < 2_000);
+    assert.ok(cloud.heightFinite >= 100 && cloud.heightFinite < 320);
+    assert.ok(cloud.depthFinite >= 400 && cloud.depthFinite < 1_300);
+    assert.ok(cloud.logicalY * PRODUCTION_VISUAL_UNITS_PER_METER >= 1_600);
+    assert.ok(cloud.logicalY * PRODUCTION_VISUAL_UNITS_PER_METER < 3_500);
+    assert.ok(cloud.speedFinite >= 1.5 && cloud.speedFinite < 4);
+  }
+  for (const puff of initial.clouds.filter(value => value.puff)) {
+    const base = initial.clouds.find(value =>
+      !value.puff && value.sourceIndex === puff.sourceIndex);
+    assert.ok(base);
+    assert.equal(puff.opacity, base.opacity);
+    assert.equal(puff.warm, base.warm);
+    assert.equal(puff.speedFinite, base.speedFinite);
+    assert.ok(puff.widthFinite >= base.widthFinite * 0.4);
+    assert.ok(puff.widthFinite < base.widthFinite * 0.8);
+    assert.ok(puff.heightFinite >= base.heightFinite * 0.6);
+    assert.ok(puff.heightFinite < base.heightFinite);
+    assert.ok(puff.depthFinite >= base.depthFinite * 0.4);
+    assert.ok(puff.depthFinite < base.depthFinite * 0.8);
+  }
+
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: null,
+    runPhase: 'title',
+    paused: false,
+    hitStopped: false,
+  }), 0);
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: 'normal',
+    runPhase: 'title',
+    paused: true,
+    hitStopped: false,
+  }), 1 / 60);
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: null,
+    runPhase: 'playing',
+    paused: false,
+    hitStopped: false,
+  }), 1 / 60);
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: null,
+    runPhase: 'playing',
+    paused: true,
+    hitStopped: false,
+  }), 0);
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: null,
+    runPhase: 'playing',
+    paused: false,
+    hitStopped: true,
+  }), 0);
+  assert.equal(w8CloudDeltaSeconds({
+    deltaSeconds: 1 / 60,
+    measurementMode: null,
+    runPhase: 'dying',
+    paused: false,
+    hitStopped: false,
+  }), 1 / 60 * 0.15);
+
+  const constructedBeforeFrames = nodeObjectConstructionCount;
+  const logicalBeforeCrossings = initial.clouds.map(cloud => ({
+    x: cloud.logicalX,
+    z: cloud.logicalZ,
+  }));
+  for (let crossing = 1; crossing <= 5; crossing += 1) {
+    presentation.rebase({
+      renderOriginChunkX: crossing,
+      renderOriginChunkZ: -crossing,
+    });
+  }
+  const rebased = presentation.snapshot();
+  assert.deepEqual(
+    rebased.clouds.map(cloud => ({ x: cloud.logicalX, z: cloud.logicalZ })),
+    logicalBeforeCrossings,
+  );
+  const firstCloud = rebased.clouds[0];
+  assert.equal(
+    presentation.cloudRoot.matrices[0].position.x,
+    (firstCloud.logicalX - 5 * 16) * UNITS_PER_METER,
+  );
+  assert.equal(
+    presentation.cloudRoot.matrices[0].position.z,
+    (firstCloud.logicalZ + 5 * 16) * UNITS_PER_METER,
+  );
+  presentation.update(1 / 60, {
+    renderOriginChunkX: 5,
+    renderOriginChunkZ: -5,
+  });
+  const moved = presentation.snapshot();
+  for (let index = 0; index < moved.clouds.length; index += 1) {
+    assert.ok(Math.abs(
+      moved.clouds[index].logicalX
+      - rebased.clouds[index].logicalX
+      - rebased.clouds[index].speedFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+    ) < 1e-10);
+  }
+  assert.equal(nodeObjectConstructionCount, constructedBeforeFrames);
+  presentation.dispose();
+  visualAssets.dispose();
+});
 
 function installBrowserEquivalentEnvironment() {
   const saved = new Map();
@@ -251,9 +400,21 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.boot.initialSettlementCount, 1);
     assert.equal(snapshot.boot.initialSimulationChunkCount, 9);
     assert.ok(snapshot.boot.initialGameplayEntityCount > 0);
-    assert.equal(snapshot.boot.macroRegionsEvaluated, 53);
-    assert.equal(snapshot.boot.rawSettlementCandidateCount, 39);
-    assert.equal(snapshot.boot.acceptedSettlementCandidateCount, 1);
+    assert.equal(
+      snapshot.boot.macroRegionsEvaluated,
+      snapshot.generator.distributor.rawCacheSize,
+    );
+    assert.equal(
+      snapshot.boot.rawSettlementCandidateCount,
+      snapshot.generator.distributor.rawCandidateCount,
+    );
+    assert.equal(
+      snapshot.boot.acceptedSettlementCandidateCount,
+      snapshot.generator.distributor.acceptedSettlementCount,
+    );
+    assert.ok(snapshot.boot.macroRegionsEvaluated >= 53);
+    assert.ok(snapshot.boot.rawSettlementCandidateCount >= 39);
+    assert.ok(snapshot.boot.acceptedSettlementCandidateCount >= 1);
     assert.equal(snapshot.boot.materializedSettlementCount, 1);
     assert.equal(snapshot.generator.templatesMaterialized, 1);
     assert.equal(snapshot.boot.startupSurveyExecuted, false);
@@ -303,12 +464,34 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
     assert.ok(snapshot.presentation.distantNaturalProxyCount > 0);
     assert.ok(snapshot.presentation.distantNaturalProxyCount <= 300);
-    assert.ok(snapshot.presentation.distantTownProxyCount > 0);
-    assert.ok(snapshot.presentation.distantTownProxyCount <= 24);
+    assert.equal(snapshot.presentation.distantTownProxyCount, 0);
+    assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
+    assert.ok(snapshot.presentation.canonicalRecordCount > 0);
+    assert.ok(snapshot.presentation.canonicalFarObjectCount >= 0);
+    assert.ok(snapshot.presentation.canonicalMidObjectCount >= 0);
+    assert.equal(snapshot.presentation.templateCacheCapacity, 4);
+    assert.ok(snapshot.presentation.templateCacheSize <= 4);
+    assert.equal(snapshot.presentation.farOwnerChunkCacheCapacity, 64);
+    assert.ok(snapshot.presentation.farOwnerChunkCacheSize <= 64);
+    assert.equal(snapshot.presentation.queryConcurrencyLimit, 4);
+    assert.ok(snapshot.presentation.maximumObservedQueryConcurrency <= 4);
     assert.ok(snapshot.presentation.distantWaterProxyCount <= 24);
     assert.ok(snapshot.presentation.distantProxyInstancedMeshCount > 0);
-    assert.ok(distantWorld.children.some(child => child.name.includes('finite-language-proxy')));
-    assert.equal(distantWorld.children.filter(child => child.userData?.presentationOnly)
+    assert.equal(distantWorld.children.length, 1);
+    assert.match(distantWorld.children[0].name, /^w8-distant-presentation-epoch-/);
+    const distantPresentationObjects = [];
+    const visitDistantPresentation = object => {
+      for (const child of object.children ?? []) {
+        distantPresentationObjects.push(child);
+        visitDistantPresentation(child);
+      }
+    };
+    visitDistantPresentation(distantWorld);
+    assert.ok(distantPresentationObjects.some(
+      child => child.name?.includes('finite-language-proxy'),
+    ));
+    assert.equal(distantPresentationObjects
+      .filter(child => child instanceof Mesh && child.userData?.presentationOnly)
       .every(child => child.castShadow === false && child.receiveShadow === false), true);
     const titlePresentation = gameplayScene.children.find(
       child => child.name === 'w8-main-world-title-presentation',

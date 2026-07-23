@@ -94,6 +94,18 @@ export function isW8GameplaySimulationEnabled(measurementMode, runPhase) {
   return measurementMode !== null || runPhase === 'playing';
 }
 
+export function w8CloudDeltaSeconds({
+  deltaSeconds,
+  measurementMode,
+  runPhase,
+  paused,
+  hitStopped,
+}) {
+  const running = measurementMode || ['playing', 'dying'].includes(runPhase);
+  if (!running || (paused && !measurementMode) || hitStopped) return 0;
+  return deltaSeconds * (runPhase === 'dying' ? 0.15 : 1);
+}
+
 function parseDiagnosticRunNumber(value) {
   if (!value) return 1;
   const runNumber = Number(value);
@@ -1608,10 +1620,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const effectiveDeltaSeconds = (!experiencePhaseRunning
           || (experienceShell.isPaused() && !measurement.mode))
           || hitStopped ? 0 : deltaSeconds;
-        const cloudPhaseRunning = measurement.mode || ['playing', 'dying'].includes(runPhase);
-        const cloudDeltaSeconds = !cloudPhaseRunning
-          || (experienceShell.isPaused() && !measurement.mode)
-          || hitStopped ? 0 : deltaSeconds * (runPhase === 'dying' ? 0.15 : 1);
+        const cloudDeltaSeconds = w8CloudDeltaSeconds({
+          deltaSeconds,
+          measurementMode: measurement.mode,
+          runPhase,
+          paused: experienceShell.isPaused(),
+          hitStopped,
+        });
         const frameRenderOrigin = runtime.snapshot().renderOrigin;
         diagnostics.measure('scene-presentation', () => updateScenePresentation(
           deltaSeconds,
