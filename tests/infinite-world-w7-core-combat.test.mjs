@@ -88,6 +88,16 @@ function combatChunk() {
       settlementType: 'RURAL',
       center: { x: 8, z: 8 },
     }],
+    settlementLandmarks: [{
+      stableId: 'wf1:settlement-landmark:w7c-military-base',
+      parentSettlementId: 'settlement-v1:w7c-military',
+      landmarkType: 'militaryBase',
+      worldPosition: { x: 1, y: 0, z: 14 },
+      rotationY: 0,
+      widthMeters: 11,
+      depthMeters: 11,
+      owningChunkCoordinate: { x: 0, z: 0 },
+    }],
   };
 }
 
@@ -170,6 +180,12 @@ test('Tank requires spawn, LOS, bounded rotation, and cooldown before firing', a
 
 test('Tank AI damages the existing player state only inside an active Simulation Chunk', async () => {
   const { runtime, state, renderer } = await createRuntime({ playerSpawn: { x: 8, z: 4 } });
+  const tank = [...state.entityStates.values()].find(entity => entity.type === 'tank');
+  tank.spawned = true;
+  tank.x = 15;
+  tank.z = 8;
+  tank.rotationY = Math.atan2(state.player.x - tank.x, state.player.z - tank.z);
+  tank.turretRotationY = tank.rotationY;
   for (let index = 0; index < 60; index += 1) {
     runtime.update({ deltaSeconds: 0.05, player: state.player });
   }

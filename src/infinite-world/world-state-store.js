@@ -541,6 +541,24 @@ export class InfiniteWorldState {
     return Object.freeze({ ...state });
   }
 
+  reconcileFeatureDamage(descriptor) {
+    const stableId = requiredString(descriptor?.stableId, 'feature stableId');
+    const maxHp = nonNegative(descriptor.maxHp, 'feature maxHp');
+    const existing = this.featureDamage.get(stableId);
+    if (!existing || existing.maxHp === maxHp) return existing ? Object.freeze({ ...existing }) : null;
+    const isMilitaryBaseUpgrade = descriptor.type === 'militaryBase'
+      && existing.maxHp === W6_STATIC_TARGET_CONTRACTS.house.maxHp
+      && maxHp === W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp;
+    if (!isMilitaryBaseUpgrade) {
+      throw new Error(`Stable ID collision or feature contract mismatch: ${stableId}`);
+    }
+    const damage = existing.destroyed ? maxHp : Math.min(existing.damage, maxHp);
+    const record = { stableId, maxHp, damage, destroyed: damage >= maxHp };
+    this.featureDamage.set(stableId, record);
+    this.revision += 1;
+    return Object.freeze({ ...record });
+  }
+
   damageFeature(descriptor, amount) {
     const stableId = requiredString(descriptor?.stableId, 'feature stableId');
     if (this.entityStates.has(stableId)) {
@@ -549,10 +567,8 @@ export class InfiniteWorldState {
     const maxHp = nonNegative(descriptor.maxHp, 'feature maxHp');
     if (!FEATURE_MAX_HP_VALUES.has(maxHp)) throw new Error(`unknown feature maxHp: ${stableId}`);
     const damageAmount = nonNegative(amount, 'feature damage');
+    this.reconcileFeatureDamage(descriptor);
     const existing = this.featureDamage.get(stableId);
-    if (existing && existing.maxHp !== maxHp) {
-      throw new Error(`Stable ID collision or feature contract mismatch: ${stableId}`);
-    }
     const damage = Math.min(maxHp, (existing?.damage ?? 0) + damageAmount);
     const record = { stableId, maxHp, damage, destroyed: damage >= maxHp };
     if (damage > 0) this.featureDamage.set(stableId, record);

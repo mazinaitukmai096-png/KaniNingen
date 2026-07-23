@@ -163,8 +163,8 @@ async function humanDescriptor({ building, chunkData, worldSeedHash, generatorMa
 async function settlementEntityDescriptor({ reference, chunkData, worldSeedHash, generatorMajor }) {
   const isTank = reference.townType === 'military';
   if (!isTank) return null;
-  const owner = logicalWorldToOwnedChunk(reference.center.x, reference.center.z);
-  if (owner.chunkX !== chunkData.chunkX || owner.chunkZ !== chunkData.chunkZ) return null;
+  const settlementOwner = logicalWorldToOwnedChunk(reference.center.x, reference.center.z);
+  if (settlementOwner.chunkX !== chunkData.chunkX || settlementOwner.chunkZ !== chunkData.chunkZ) return null;
   const type = 'tank';
   const contract = W6_ENTITY_CONTRACTS[type];
   const result = await entityStableId({
@@ -174,19 +174,56 @@ async function settlementEntityDescriptor({ reference, chunkData, worldSeedHash,
     parentStableId: reference.settlementId,
     purposeKey: `w6-${type}-encounter`,
   });
+  const militaryBases = (chunkData.settlementLandmarks ?? []).filter(landmark =>
+    landmark.landmarkType === 'militaryBase'
+      && landmark.parentSettlementId === reference.settlementId);
+  if (militaryBases.length !== 1) {
+    throw new Error(
+      `invalid gameplay chunk ${createChunkKey(chunkData.chunkX, chunkData.chunkZ)}: `
+      + `Tank slot ${result.stableId} requires exactly one primary Military Base, got ${militaryBases.length}`
+      + ` [${militaryBases.map(value => value.stableId).join(', ')}]`,
+    );
+  }
+  const base = militaryBases[0];
+  if (typeof base.stableId !== 'string' || !base.stableId
+    || !Number.isFinite(base.worldPosition?.x)
+    || !Number.isFinite(base.worldPosition?.y)
+    || !Number.isFinite(base.worldPosition?.z)) {
+    throw new Error(
+      `invalid gameplay chunk ${createChunkKey(chunkData.chunkX, chunkData.chunkZ)}: `
+      + `Military Base ${base.stableId ?? '<missing Stable ID>'} has no canonical transform`,
+    );
+  }
+  const baseOwner = createChunkKey(
+    base.owningChunkCoordinate?.x
+      ?? logicalWorldToOwnedChunk(base.worldPosition.x, base.worldPosition.z).chunkX,
+    base.owningChunkCoordinate?.z
+      ?? logicalWorldToOwnedChunk(base.worldPosition.x, base.worldPosition.z).chunkZ,
+  );
+  if (baseOwner !== createChunkKey(chunkData.chunkX, chunkData.chunkZ)) {
+    throw new Error(
+      `invalid gameplay chunk ${createChunkKey(chunkData.chunkX, chunkData.chunkZ)}: `
+      + `Military Base ${base.stableId} owns ${baseOwner}`,
+    );
+  }
   return Object.freeze({
     stableId: result.stableId,
     canonicalInput: result.canonicalInput,
-    ownerChunkKey: owner.key,
+    ownerChunkKey: baseOwner,
     type,
     maxHp: contract.maxHp,
     radius: contract.radius,
     scoreValue: contract.scoreValue,
-    x: reference.center.x,
-    z: reference.center.z,
-    rotationY: 0,
+    x: base.worldPosition.x,
+    z: base.worldPosition.z,
+    rotationY: base.rotationY ?? 0,
     aiState: 'reserve',
     spawned: false,
+    baseStableId: base.stableId,
+    baseX: base.worldPosition.x,
+    baseY: base.worldPosition.y,
+    baseZ: base.worldPosition.z,
+    baseOwnerChunkKey: baseOwner,
   });
 }
 
@@ -202,6 +239,7 @@ function staticTarget(feature, type, contract, position, radius = contract.radiu
     radius,
     scoreValue: contract.scoreValue,
     x: position.x,
+    y: position.y ?? 0,
     z: position.z,
   });
 }
@@ -276,12 +314,16 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
     ));
   }
   for (const landmark of chunkData.settlementLandmarks ?? []) {
+    const type = landmark.landmarkType === 'militaryBase' ? 'militaryBase' : 'house';
+    const contract = W6_STATIC_TARGET_CONTRACTS[type];
     staticTargets.push(staticTarget(
       landmark,
-      'house',
-      W6_STATIC_TARGET_CONTRACTS.house,
+      type,
+      contract,
       landmark.worldPosition,
-      Math.hypot(landmark.widthMeters, landmark.depthMeters) * 20,
+      type === 'militaryBase'
+        ? contract.radius
+        : Math.hypot(landmark.widthMeters, landmark.depthMeters) * 20,
     ));
   }
   entityDescriptors.sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -776,7 +818,10 @@ export class InfiniteGameplayRuntime {
         worldSeedHash: this.worldSeedHash,
         generatorMajor: this.generatorMajor,
       });
-      for (const target of model.staticTargets) this.#registerStableId(target.stableId, key);
+      for (const target of model.staticTargets) {
+        this.#registerStableId(target.stableId, key);
+        if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
+      }
       const entityStates = model.entityDescriptors.map(descriptor => {
         this.#registerStableId(descriptor.stableId, key);
         const existed = this.state.entityStates.has(descriptor.stableId);

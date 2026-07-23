@@ -250,6 +250,9 @@ export const W6_STATIC_TARGET_CONTRACTS = Object.freeze({
   tower: Object.freeze({ type: 'tower', maxHp: 1200, radius: 65, scoreValue: 800 }),
   church: Object.freeze({ type: 'church', maxHp: 2200, radius: 115, scoreValue: 1500 }),
   school: Object.freeze({ type: 'school', maxHp: 3500, radius: 145, scoreValue: 2500 }),
+  militaryBase: Object.freeze({
+    type: 'militaryBase', maxHp: 3200, radius: 160, scoreValue: 2200,
+  }),
 });
 
 export function finiteWorldUnitsToMeters(value) {
