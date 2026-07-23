@@ -137,12 +137,12 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
   assert.equal(roof.scale[1], unscaledRoof.scale[1] * 1.1);
   assert.deepEqual(assets.materials.cloud.options, {
     color: 0xffffff,
-    flatShading: true,
     transparent: true,
-    opacity: 0.68,
+    opacity: 0.72,
     depthWrite: false,
+    shininess: 4,
   });
-  assert.equal(assets.materials.horizonTerrain.options.color, 0x668c54);
+  assert.equal('horizonTerrain' in assets.materials, false);
   assets.dispose();
   assert.equal(assets.snapshot().disposed, true);
 });

@@ -253,8 +253,9 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     water: phong(0x2f6fa8, { transparent: true, opacity: 0.82, shininess: 70, depthWrite: false }),
     scorch: material(0x241b18, { transparent: true, opacity: 0.72 }),
     blood: material(0x7e1019), acid: material(0x7cff31),
-    cloud: material(0xffffff, { transparent: true, opacity: 0.68, depthWrite: false }),
-    horizonTerrain: material(0x668c54),
+    cloud: phong(0xffffff, {
+      transparent: true, opacity: 0.72, depthWrite: false, shininess: 4,
+    }),
     ...settlementPaletteMaterials,
   };
   const geometries = Object.freeze({ ...base.geometries, ...supplementalGeometries });

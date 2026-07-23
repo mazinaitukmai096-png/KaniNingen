@@ -276,16 +276,18 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(gameplayCamera.near, 64);
     assert.equal(gameplayCamera.far, 224000);
     assert.deepEqual(gameplayFog.values, [0x5dade2, 19200, 76800]);
-    const cloudRoot = gameplayScene.children.find(child => child.name === 'w8-cyclic-scene-clouds');
-    assert.equal(cloudRoot.children.length, 14);
-    for (const cloud of cloudRoot.children) {
-      assert.ok(Math.hypot(cloud.position.x, cloud.position.z) >= 57599.99);
-      assert.ok(cloud.position.y >= 16640 && cloud.position.y <= 26880);
-      assert.equal(cloud.children.length, 3);
-      assert.equal(cloud.children[0].material.options.transparent, true);
-      assert.equal(cloud.children[0].material.options.opacity, 0.68);
-      assert.equal(cloud.children[0].material.options.depthWrite, false);
-    }
+    assert.equal(gameplayScene.children.some(child => child.name === 'w8-cyclic-scene-clouds'), false);
+    const cloudRoot = gameplayScene.children.find(
+      child => child.name === 'w8-finite-cloud-instance-pool',
+    );
+    assert.equal(cloudRoot.count, 91);
+    assert.equal(cloudRoot.capacity, 91);
+    assert.deepEqual(cloudRoot.userData, {
+      presentationOnly: true, cloudBaseCount: 70, cloudPuffCount: 21,
+    });
+    assert.equal(cloudRoot.material.options.transparent, true);
+    assert.equal(cloudRoot.material.options.opacity, 0.72);
+    assert.equal(cloudRoot.material.options.depthWrite, false);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-visual-horizon-apron'), false);
     const distantWorld = gameplayScene.children.find(child => child.name === 'w8-scene-owned-distant-world');
     assert.ok(distantWorld);
@@ -293,7 +295,17 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.midgroundChunkCount, 16);
     assert.equal(snapshot.presentation.clipmapMeshCount, 1);
     assert.ok(snapshot.presentation.maximumInnerBoundaryErrorMeters <= 0.001);
+    assert.ok(snapshot.presentation.maximumInnerBoundaryColorDifference <= 0.03);
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
+    assert.ok(snapshot.presentation.distantNaturalProxyCount > 0);
+    assert.ok(snapshot.presentation.distantNaturalProxyCount <= 300);
+    assert.ok(snapshot.presentation.distantTownProxyCount > 0);
+    assert.ok(snapshot.presentation.distantTownProxyCount <= 24);
+    assert.ok(snapshot.presentation.distantWaterProxyCount <= 24);
+    assert.ok(snapshot.presentation.distantProxyInstancedMeshCount > 0);
+    assert.ok(distantWorld.children.some(child => child.name.includes('finite-language-proxy')));
+    assert.equal(distantWorld.children.filter(child => child.userData?.presentationOnly)
+      .every(child => child.castShadow === false && child.receiveShadow === false), true);
 
     const renderedKeys = new Set(snapshot.runtime.renderedKeys);
     assert.equal(Object.keys(snapshot.resources.chunkRenderables).every(key => renderedKeys.has(key)), true);

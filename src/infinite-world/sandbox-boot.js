@@ -278,42 +278,63 @@ function createRuntimeRenderProfile() {
 }
 
 function createW8ScenePresentation({ THREE, scene, visualAssets, width, height }) {
-  const clouds = [];
-  const cloudRoot = new THREE.Group();
-  cloudRoot.name = 'w8-cyclic-scene-clouds';
-  for (let index = 0; index < 14; index += 1) {
-    const cloud = new THREE.Group();
-    cloud.name = `w8-cloud-${index}`;
-    const widthFinite = 420 + (index % 5) * 90;
-    const heightFinite = 70 + (index % 4) * 24;
-    const depthFinite = 260 + (index % 6) * 58;
-    for (let part = 0; part < 3; part += 1) {
-      const mesh = new THREE.Mesh(visualAssets.geometries.box, visualAssets.materials.cloud);
-      mesh.name = `w8-cloud-${index}-part-${part}`;
-      mesh.position.set(
-        finiteVisualToRender((part - 1) * widthFinite * 0.32),
-        finiteVisualToRender(-Math.abs(part - 1) * heightFinite * 0.12),
-        finiteVisualToRender(part * depthFinite * 0.08),
-      );
-      const partScale = part === 1 ? 1 : 0.58;
-      mesh.scale.set(
-        finiteVisualToRender(widthFinite * partScale),
-        finiteVisualToRender(heightFinite * (part === 1 ? 1 : 0.72)),
-        finiteVisualToRender(depthFinite * partScale),
-      );
-      mesh.castShadow = false;
-      mesh.receiveShadow = false;
-      cloud.add(mesh);
-    }
-    const angle = index / 14 * Math.PI * 2 + (index % 3) * 0.07;
-    const radiusFinite = 9_000 + (index % 6) * 1_000;
-    cloud.position.set(
-      Math.sin(angle) * finiteVisualToRender(radiusFinite),
-      finiteVisualToRender(2_600 + (index % 6) * 320),
-      Math.cos(angle) * finiteVisualToRender(radiusFinite),
+  const cloudBaseCount = 70;
+  const cloudPuffCount = 21;
+  const cloudRoot = new THREE.InstancedMesh(
+    visualAssets.geometries.box,
+    visualAssets.materials.cloud,
+    cloudBaseCount + cloudPuffCount,
+  );
+  cloudRoot.name = 'w8-finite-cloud-instance-pool';
+  cloudRoot.userData = { presentationOnly: true, cloudBaseCount, cloudPuffCount };
+  cloudRoot.castShadow = false;
+  cloudRoot.receiveShadow = false;
+  const cloudTransform = new THREE.Object3D();
+  let cloudInstanceIndex = 0;
+  const cloudRoll = (index, salt) => {
+    let value = Math.imul(index + 1, 0x45d9f3b) ^ Math.imul(salt + 1, 0x119de1f3);
+    value ^= value >>> 16; value = Math.imul(value, 0x45d9f3b); value ^= value >>> 16;
+    return (value >>> 0) / 0x1_0000_0000;
+  };
+  const appendCloudInstance = ({ x, y, z, widthFinite, heightFinite, depthFinite, warm }) => {
+    cloudTransform.position.set(
+      finiteVisualToRender(x), finiteVisualToRender(y), finiteVisualToRender(z),
     );
-    cloudRoot.add(cloud); clouds.push(cloud);
+    cloudTransform.rotation.set(0, 0, 0);
+    cloudTransform.scale.set(
+      finiteVisualToRender(widthFinite),
+      finiteVisualToRender(heightFinite),
+      finiteVisualToRender(depthFinite),
+    );
+    cloudTransform.updateMatrix();
+    cloudRoot.setMatrixAt(cloudInstanceIndex, cloudTransform.matrix);
+    cloudRoot.setColorAt?.(cloudInstanceIndex, new THREE.Color(warm ? 0xfff3e0 : 0xffffff));
+    cloudInstanceIndex += 1;
+  };
+  for (let index = 0; index < cloudBaseCount; index += 1) {
+    const angle = index / cloudBaseCount * Math.PI * 2 + cloudRoll(index, 0) * 0.08;
+    const radiusFinite = 9_000 + cloudRoll(index, 1) * 5_000;
+    const widthFinite = 600 + cloudRoll(index, 2) * 1_400;
+    const heightFinite = 100 + cloudRoll(index, 3) * 220;
+    const depthFinite = 400 + cloudRoll(index, 4) * 900;
+    const x = Math.sin(angle) * radiusFinite;
+    const y = 1_600 + cloudRoll(index, 5) * 1_900;
+    const z = Math.cos(angle) * radiusFinite;
+    const warm = cloudRoll(index, 6) < 0.4;
+    appendCloudInstance({ x, y, z, widthFinite, heightFinite, depthFinite, warm });
+    if (index % 10 < 3) appendCloudInstance({
+      x: x + (cloudRoll(index, 7) - 0.5) * widthFinite * 0.8,
+      y: y + (cloudRoll(index, 8) - 0.5) * heightFinite * 0.4,
+      z: z + (cloudRoll(index, 9) - 0.5) * depthFinite * 0.8,
+      widthFinite: widthFinite * (0.4 + cloudRoll(index, 10) * 0.4),
+      heightFinite: heightFinite * (0.6 + cloudRoll(index, 11) * 0.4),
+      depthFinite: depthFinite * (0.4 + cloudRoll(index, 12) * 0.4),
+      warm,
+    });
   }
+  cloudRoot.count = cloudInstanceIndex;
+  cloudRoot.instanceMatrix.needsUpdate = true;
+  if (cloudRoot.instanceColor) cloudRoot.instanceColor.needsUpdate = true;
   scene.add(cloudRoot);
 
   const titleScene = new THREE.Scene();
@@ -342,12 +363,11 @@ function createW8ScenePresentation({ THREE, scene, visualAssets, width, height }
   explosionRoot.position.set(1500, 760, -1500); titleScene.add(explosionRoot);
   let disposed = false;
   return Object.freeze({
-    titleScene, titleCamera, titleBoss, explosionRoot, cloudRoot, clouds,
+    titleScene, titleCamera, titleBoss, explosionRoot, cloudRoot,
     dispose() {
       if (disposed) return;
       scene.remove(cloudRoot);
       titleScene.clear?.();
-      clouds.length = 0;
       disposed = true;
     },
   });
@@ -1154,6 +1174,7 @@ export async function bootInfiniteWorldSandbox({
     function updateHud(owner) {
       const runtimeSnapshot = runtime.snapshot();
       const experienceSnapshot = experienceShell.snapshot();
+      const presentationSnapshot = distantPresentation.snapshot();
       const renderOrigin = runtimeSnapshot.renderOrigin;
       const cameraLogicalX = renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
         + camera.position.x / UNITS_PER_METER;
@@ -1175,7 +1196,7 @@ export async function bootInfiniteWorldSandbox({
         ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 60s`
         : '';
       const diagnosticText = diagnostics.enabled
-        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}`
+        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
         : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
@@ -1200,6 +1221,7 @@ Controls: WASD / Shift / Space / Left + Right Mouse / Wheel / H / Escape (develo
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
+Distant: mid ${presentationSnapshot.midgroundChunkCount}  natural ${presentationSnapshot.distantNaturalProxyCount}/${presentationSnapshot.distantNaturalProxyLimit}  town ${presentationSnapshot.distantTownProxyCount}/${presentationSnapshot.distantTownProxyLimit}  water ${presentationSnapshot.distantWaterProxyCount}  boundary RGB ${number(presentationSnapshot.maximumInnerBoundaryColorDifference)}
 Generated: ${runtimeSnapshot.counts.generated}  Loaded: ${runtimeSnapshot.counts.renderLoaded}  Unloaded: ${runtimeSnapshot.counts.renderUnloaded}  Rebase: ${runtimeSnapshot.renderOrigin.rebaseCount}
 Latest crossing: ${number(transition?.durationMs)}ms  generated Δ${transition?.generatedDelta ?? 0}  load Δ${transition?.renderLoadedDelta ?? 0}  unload Δ${transition?.renderUnloadedDelta ?? 0}
 Generation ms latest/p50/p95/max: ${number(metrics.generation.latest)} / ${number(metrics.generation.p50)} / ${number(metrics.generation.p95)} / ${number(metrics.generation.max)}
@@ -1213,7 +1235,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
         runtimeSnapshot,
-        presentationSnapshot: distantPresentation.snapshot(),
+        presentationSnapshot,
         saveStatus,
         renderInfo: {
           drawCalls: renderInfo?.render?.calls ?? null,
@@ -1233,9 +1255,6 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     }
 
     function updateScenePresentation(deltaSeconds, frameNow) {
-      scenePresentation.cloudRoot.rotation.y = (
-        scenePresentation.cloudRoot.rotation.y + deltaSeconds * 0.0025
-      ) % (Math.PI * 2);
       scenePresentation.titleBoss.rotation.y = -0.4 + Math.sin(frameNow * 0.00035) * 0.14;
       scenePresentation.explosionRoot.rotation.y += deltaSeconds * 0.18;
       gameplayRenderAdapter.updatePresentation?.(deltaSeconds);

@@ -10,8 +10,8 @@ import {
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
 import {
-  W8_PRESENTATION_TERRAIN_PALETTE,
   isW8NaturalCandidateVisible,
+  w8TerrainColorFromWeights,
 } from './w8-distant-presentation.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
@@ -69,6 +69,8 @@ export class ChunkRenderAdapter {
     const Group = requireConstructor(THREE, 'Group');
     const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
     const MeshLambertMaterial = requireConstructor(THREE, 'MeshLambertMaterial');
+    const TerrainMaterial = typeof THREE.MeshPhongMaterial === 'function'
+      ? THREE.MeshPhongMaterial : MeshLambertMaterial;
     const Object3D = requireConstructor(THREE, 'Object3D');
     this.worldRoot = new Group();
     this.worldRoot.name = 'w1a-render-root';
@@ -77,8 +79,8 @@ export class ChunkRenderAdapter {
       terrain: new PlaneGeometry(renderChunkSize, renderChunkSize),
     });
     this.materials = Object.freeze({
-      terrain: new MeshLambertMaterial({ color: 0x668c54, flatShading: true }),
-      naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: true }),
+      terrain: new TerrainMaterial({ color: 0x668c54, flatShading: true, shininess: 0 }),
+      naturalTerrain: new TerrainMaterial({ vertexColors: true, flatShading: true, shininess: 0 }),
     });
     const hiddenTransform = new Object3D();
     hiddenTransform.scale.set(0, 0, 0);
@@ -284,7 +286,6 @@ export class ChunkRenderAdapter {
     const positions = [];
     const colors = [];
     const indices = [];
-    const palette = W8_PRESENTATION_TERRAIN_PALETTE;
     for (let z = 0; z < depth; z += 1) {
       for (let x = 0; x < width; x += 1) {
         const index = z * width + x;
@@ -294,9 +295,7 @@ export class ChunkRenderAdapter {
           z / (depth - 1) * this.renderChunkSize,
         );
         const weights = terrain.materialWeights.slice(index * 5, index * 5 + 5);
-        for (let channel = 0; channel < 3; channel += 1) {
-          colors.push(weights.reduce((sum, weight, material) => sum + weight * palette[material][channel], 0));
-        }
+        colors.push(...w8TerrainColorFromWeights(weights));
       }
     }
     for (let z = 0; z < depth - 1; z += 1) {

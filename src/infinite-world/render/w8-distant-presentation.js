@@ -9,6 +9,9 @@ const FIVE_BY_FIVE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 2.5;
 const CLIPMAP_EXTENT_METERS = 352;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
+const DISTANT_NATURAL_PROXY_LIMIT = 300;
+const DISTANT_TOWN_PROXY_LIMIT = 24;
+const DISTANT_WATER_PROXY_LIMIT = 24;
 
 export const W8_PRESENTATION_TERRAIN_PALETTE = Object.freeze([
   Object.freeze([0x7d / 255, 0x8f / 255, 0x4f / 255]),
@@ -53,11 +56,31 @@ function requireConstructor(THREE, name) {
   return THREE[name];
 }
 
-function colorFromWeights(weights) {
+export function w8TerrainColorFromWeights(weights) {
   return [0, 1, 2].map(channel => weights.reduce(
     (sum, weight, index) => sum + weight * W8_PRESENTATION_TERRAIN_PALETTE[index][channel],
     0,
   ));
+}
+
+function textHash(value) {
+  let hash = 0x811c9dc5;
+  for (const character of String(value)) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return hash >>> 0;
+}
+
+function cellRoll(seed, x, z, salt = 0) {
+  let value = seed ^ Math.imul(x | 0, 0x1f123bb5)
+    ^ Math.imul(z | 0, 0x5f356495) ^ Math.imul(salt, 0x9e3779b9);
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x7feb352d);
+  value ^= value >>> 15;
+  value = Math.imul(value, 0x846ca68b);
+  value ^= value >>> 16;
+  return (value >>> 0) / 0x1_0000_0000;
 }
 
 function clipmapAxis() {
@@ -89,8 +112,17 @@ function terrainSampleAt(chunkData, worldX, worldZ) {
   const tx = fx - x0; const tz = fz - z0;
   const at = (x, z) => terrain.heights[z * terrain.resolution.x + x]
     * terrain.heightUnitMeters;
-  return (at(x0, z0) * (1 - tx) + at(x1, z0) * tx) * (1 - tz)
+  const height = (at(x0, z0) * (1 - tx) + at(x1, z0) * tx) * (1 - tz)
     + (at(x0, z1) * (1 - tx) + at(x1, z1) * tx) * tz;
+  const weights = [];
+  for (let material = 0; material < W8_PRESENTATION_TERRAIN_PALETTE.length; material += 1) {
+    const weightAt = (x, z) => terrain.materialWeights[
+      (z * terrain.resolution.x + x) * W8_PRESENTATION_TERRAIN_PALETTE.length + material
+    ];
+    weights.push((weightAt(x0, z0) * (1 - tx) + weightAt(x1, z0) * tx) * (1 - tz)
+      + (weightAt(x0, z1) * (1 - tx) + weightAt(x1, z1) * tx) * tz);
+  }
+  return Object.freeze({ height, color: Object.freeze(w8TerrainColorFromWeights(weights)) });
 }
 
 function sampleActiveTerrain(activeChunks, worldX, worldZ) {
@@ -116,10 +148,13 @@ function makeGeometry(THREE, positions, colors, indices) {
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
   geometry.setAttribute('color', new Float32BufferAttribute(colors, 3));
-  const normals = new Float32Array(positions.length);
-  for (let index = 1; index < normals.length; index += 3) normals[index] = 1;
-  geometry.setAttribute('normal', new Float32BufferAttribute(normals, 3));
   geometry.setIndex(indices);
+  if (typeof geometry.computeVertexNormals === 'function') geometry.computeVertexNormals();
+  else {
+    const normals = new Float32Array(positions.length);
+    for (let index = 1; index < normals.length; index += 3) normals[index] = 1;
+    geometry.setAttribute('normal', new Float32BufferAttribute(normals, 3));
+  }
   return geometry;
 }
 
@@ -137,21 +172,27 @@ export async function createW8DistantPresentation({
   const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
   const Object3D = requireConstructor(THREE, 'Object3D');
   const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
-  const Material = requireConstructor(THREE, 'MeshLambertMaterial');
+  const Material = typeof THREE.MeshPhongMaterial === 'function'
+    ? THREE.MeshPhongMaterial : requireConstructor(THREE, 'MeshLambertMaterial');
   const macroEvaluator = await createMacroTerrainEvaluator(worldSeedHash);
   const biomeEvaluator = await createNaturalBiomeEvaluator({ worldSeedHash });
   const root = new Group();
   root.name = 'w8-scene-owned-distant-world';
   root.userData = { presentationOnly: true };
   scene.add(root);
-  const terrainMaterial = new Material({ vertexColors: true, flatShading: true });
+  const terrainMaterial = new Material({ vertexColors: true, flatShading: true, shininess: 0 });
   const roadGeometry = new PlaneGeometry(1, 1);
   const ownedGeometries = new Set([roadGeometry]);
   const transform = new Object3D();
   let midgroundChunkCount = 0;
   let clipmapMeshCount = 0;
   let maximumInnerBoundaryErrorMeters = 0;
+  let maximumInnerBoundaryColorDifference = 0;
   let clipmapDeterministicChecksum = 0;
+  let distantNaturalProxyCount = 0;
+  let distantTownProxyCount = 0;
+  let distantWaterProxyCount = 0;
+  let distantProxyInstancedMeshCount = 0;
   const clipmapSampleCache = new Map();
   let clipmapSampleCacheHits = 0;
   let clipmapSampleCacheMisses = 0;
@@ -181,9 +222,11 @@ export async function createW8DistantPresentation({
       + clamp(slope / G5_MACRO_TERRAIN.maximumSlope, 0, 1) * 0.58, 0, 1);
     const value = Object.freeze({
       height: 0.4 + macro.offsetMm * 0.001,
-      color: Object.freeze(colorFromWeights(naturalMaterialWeights(
+      color: Object.freeze(w8TerrainColorFromWeights(naturalMaterialWeights(
         biome.memberships, moisture, rockiness, slope,
       ))),
+      moisture,
+      ridge,
     });
     clipmapSampleCache.set(key, value);
     clipmapSampleCacheMisses += 1;
@@ -204,7 +247,12 @@ export async function createW8DistantPresentation({
     midgroundChunkCount = 0;
     clipmapMeshCount = 0;
     maximumInnerBoundaryErrorMeters = 0;
+    maximumInnerBoundaryColorDifference = 0;
     clipmapDeterministicChecksum = 0;
+    distantNaturalProxyCount = 0;
+    distantTownProxyCount = 0;
+    distantWaterProxyCount = 0;
+    distantProxyInstancedMeshCount = 0;
   };
 
   const createMidgroundTerrain = (chunks, origin) => {
@@ -235,7 +283,9 @@ export async function createW8DistantPresentation({
             terrain.heights[index] * terrain.heightUnitMeters * UNITS_PER_METER,
             (worldZ - origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
           );
-          colors.push(...colorFromWeights(terrain.materialWeights.slice(index * 5, index * 5 + 5)));
+          colors.push(...w8TerrainColorFromWeights(
+            terrain.materialWeights.slice(index * 5, index * 5 + 5),
+          ));
         }
       }
       for (let z = 0; z < depth - 1; z += 1) for (let x = 0; x < width - 1; x += 1) {
@@ -418,6 +468,7 @@ export async function createW8DistantPresentation({
       const worldX = centerWorldX + x; const worldZ = centerWorldZ + z;
       const base = baseClipmapSample(worldX, worldZ);
       let height = base.height;
+      const color = [...base.color];
       const distanceOutside = Math.max(Math.abs(x), Math.abs(z)) - FIVE_BY_FIVE_HALF_EXTENT_METERS;
       if (distanceOutside <= CLIPMAP_BLEND_METERS) {
         const boundaryX = centerWorldX + clamp(x,
@@ -427,11 +478,19 @@ export async function createW8DistantPresentation({
         const actual = sampleActiveTerrain(activeChunks, boundaryX, boundaryZ);
         if (actual !== null) {
           const boundaryMacro = 0.4 + macroEvaluator.evaluate(boundaryX, boundaryZ).offsetMm * 0.001;
-          height += (actual - boundaryMacro) * (1 - smoothstep(distanceOutside / CLIPMAP_BLEND_METERS));
+          const activeWeight = 1 - smoothstep(distanceOutside / CLIPMAP_BLEND_METERS);
+          height += (actual.height - boundaryMacro) * activeWeight;
+          for (let channel = 0; channel < 3; channel += 1) {
+            color[channel] += (actual.color[channel] - color[channel]) * activeWeight;
+          }
           if (Math.abs(distanceOutside) < 1e-9) {
             maximumInnerBoundaryErrorMeters = Math.max(
               maximumInnerBoundaryErrorMeters,
-              Math.abs(height - actual),
+              Math.abs(height - actual.height),
+            );
+            maximumInnerBoundaryColorDifference = Math.max(
+              maximumInnerBoundaryColorDifference,
+              ...color.map((channel, index) => Math.abs(channel - actual.color[index])),
             );
           }
         }
@@ -439,7 +498,7 @@ export async function createW8DistantPresentation({
       const index = positions.length / 3;
       positions.push((worldX - originMetersX) * UNITS_PER_METER, height * UNITS_PER_METER,
         (worldZ - originMetersZ) * UNITS_PER_METER);
-      colors.push(...base.color);
+      colors.push(...color);
       vertex.set(key, index);
       return index;
     };
@@ -465,6 +524,137 @@ export async function createW8DistantPresentation({
     root.add(mesh); clipmapMeshCount = 1;
   };
 
+  const createDistantFeatureProxies = ({ centerChunkX, centerChunkZ, origin }) => {
+    const seed = textHash(worldSeedHash);
+    const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const buckets = new Map();
+    const push = (geometry, material, name) => {
+      const key = `${geometry}:${material}:${name}`;
+      if (!buckets.has(key)) buckets.set(key, { geometry, material, name, matrices: [] });
+      buckets.get(key).matrices.push(transform.matrix.clone?.() ?? structuredClone(transform.matrix));
+    };
+    const placePart = ({ worldX, worldZ, height, rotationY, dimensions, part, fade }) => {
+      const offsetX = part.position[0] * dimensions.width;
+      const offsetZ = part.position[2] * dimensions.depth;
+      const cosine = Math.cos(rotationY); const sine = Math.sin(rotationY);
+      transform.position.set(
+        (worldX - originMetersX) * UNITS_PER_METER + offsetX * cosine + offsetZ * sine,
+        height * UNITS_PER_METER + part.position[1] * dimensions.height,
+        (worldZ - originMetersZ) * UNITS_PER_METER - offsetX * sine + offsetZ * cosine,
+      );
+      transform.rotation.set(part.rotation[0], rotationY + part.rotation[1], part.rotation[2]);
+      transform.scale.set(
+        dimensions.width * part.scale[0] * fade,
+        dimensions.height * part.scale[1] * fade,
+        dimensions.depth * part.scale[2] * fade,
+      );
+      transform.updateMatrix();
+      push(part.geometry, part.material, 'finite-language-proxy');
+    };
+    const fadeAt = (worldX, worldZ) => smoothstep((
+      Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ))
+      - FIVE_BY_FIVE_HALF_EXTENT_METERS
+    ) / CLIPMAP_BLEND_METERS);
+    const forAnchoredGrid = (spacing, operation) => {
+      const minimumX = Math.floor((centerWorldX - CLIPMAP_EXTENT_METERS) / spacing);
+      const maximumX = Math.ceil((centerWorldX + CLIPMAP_EXTENT_METERS) / spacing);
+      const minimumZ = Math.floor((centerWorldZ - CLIPMAP_EXTENT_METERS) / spacing);
+      const maximumZ = Math.ceil((centerWorldZ + CLIPMAP_EXTENT_METERS) / spacing);
+      for (let cellZ = minimumZ; cellZ <= maximumZ; cellZ += 1) {
+        for (let cellX = minimumX; cellX <= maximumX; cellX += 1) operation(cellX, cellZ);
+      }
+    };
+
+    forAnchoredGrid(24, (cellX, cellZ) => {
+      if (distantNaturalProxyCount >= DISTANT_NATURAL_PROXY_LIMIT
+        || cellRoll(seed, cellX, cellZ, 1) > 0.31) return;
+      const worldX = (cellX + 0.18 + cellRoll(seed, cellX, cellZ, 2) * 0.64) * 24;
+      const worldZ = (cellZ + 0.18 + cellRoll(seed, cellX, cellZ, 3) * 0.64) * 24;
+      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
+      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS || distance >= CLIPMAP_EXTENT_METERS - 12) return;
+      const fade = fadeAt(worldX, worldZ);
+      if (fade <= 0) return;
+      const sample = baseClipmapSample(worldX, worldZ);
+      const roll = cellRoll(seed, cellX, cellZ, 4);
+      const kind = roll > 0.9 ? 'rock'
+        : sample.moisture > 0.68 ? 'wetlandTree'
+          : roll > 0.52 ? 'broadleafTree' : 'tree';
+      const size = 0.78 + cellRoll(seed, cellX, cellZ, 5) * 0.48;
+      const dimensions = kind === 'rock'
+        ? { width: 1.8 * size * UNITS_PER_METER, height: 1.1 * size * UNITS_PER_METER,
+          depth: 1.8 * size * UNITS_PER_METER }
+        : { width: 2 * size * UNITS_PER_METER, height: 3.625 * size * UNITS_PER_METER,
+          depth: 2 * size * UNITS_PER_METER };
+      for (const part of visualAssets.featureParts[kind] ?? []) placePart({
+        worldX, worldZ, height: sample.height,
+        rotationY: cellRoll(seed, cellX, cellZ, 6) * Math.PI * 2,
+        dimensions, part, fade,
+      });
+      distantNaturalProxyCount += 1;
+    });
+
+    forAnchoredGrid(64, (cellX, cellZ) => {
+      if (distantTownProxyCount >= DISTANT_TOWN_PROXY_LIMIT
+        || cellRoll(seed, cellX, cellZ, 11) > 0.18) return;
+      const worldX = (cellX + 0.25 + cellRoll(seed, cellX, cellZ, 12) * 0.5) * 64;
+      const worldZ = (cellZ + 0.25 + cellRoll(seed, cellX, cellZ, 13) * 0.5) * 64;
+      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
+      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 8 || distance >= CLIPMAP_EXTENT_METERS - 24) return;
+      const fade = fadeAt(worldX, worldZ);
+      const sample = baseClipmapSample(worldX, worldZ);
+      const typeRoll = cellRoll(seed, cellX, cellZ, 14);
+      const kind = typeRoll > 0.73 ? 'church' : typeRoll > 0.46 ? 'tower' : 'house';
+      const dimensions = kind === 'tower'
+        ? { width: 8 * UNITS_PER_METER, height: 17 * UNITS_PER_METER, depth: 8 * UNITS_PER_METER }
+        : kind === 'church'
+          ? { width: 12 * UNITS_PER_METER, height: 12 * UNITS_PER_METER, depth: 18 * UNITS_PER_METER }
+          : { width: 11 * UNITS_PER_METER, height: 7 * UNITS_PER_METER, depth: 10 * UNITS_PER_METER };
+      for (const part of visualAssets.featureParts[kind] ?? []) placePart({
+        worldX, worldZ, height: sample.height,
+        rotationY: Math.floor(cellRoll(seed, cellX, cellZ, 15) * 4) * Math.PI / 2,
+        dimensions, part, fade,
+      });
+      distantTownProxyCount += 1;
+    });
+
+    forAnchoredGrid(64, (cellX, cellZ) => {
+      if (distantWaterProxyCount >= DISTANT_WATER_PROXY_LIMIT
+        || cellRoll(seed, cellX, cellZ, 21) > 0.2) return;
+      const worldX = (cellX + 0.5) * 64; const worldZ = (cellZ + 0.5) * 64;
+      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
+      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 12 || distance >= CLIPMAP_EXTENT_METERS - 28) return;
+      const sample = baseClipmapSample(worldX, worldZ);
+      if (sample.moisture < 0.61) return;
+      const size = 18 + cellRoll(seed, cellX, cellZ, 22) * 26;
+      transform.position.set((worldX - originMetersX) * UNITS_PER_METER,
+        (sample.height + 0.02) * UNITS_PER_METER,
+        (worldZ - originMetersZ) * UNITS_PER_METER);
+      transform.rotation.set(-Math.PI / 2, 0, cellRoll(seed, cellX, cellZ, 23) * Math.PI);
+      transform.scale.set(size * UNITS_PER_METER * fadeAt(worldX, worldZ),
+        size * 0.58 * UNITS_PER_METER * fadeAt(worldX, worldZ), 1);
+      transform.updateMatrix();
+      push('__road__', 'water', 'water-proxy');
+      distantWaterProxyCount += 1;
+    });
+
+    for (const bucket of buckets.values()) {
+      const geometry = bucket.geometry === '__road__'
+        ? roadGeometry : visualAssets.geometries[bucket.geometry];
+      const material = visualAssets.materials[bucket.material];
+      const mesh = new InstancedMesh(geometry, material, Math.max(1, bucket.matrices.length));
+      mesh.name = `w8-distant-${bucket.name}-${bucket.geometry}-${bucket.material}`;
+      mesh.count = bucket.matrices.length;
+      bucket.matrices.forEach((matrix, index) => mesh.setMatrixAt(index, matrix));
+      mesh.instanceMatrix.needsUpdate = true;
+      mesh.castShadow = false; mesh.receiveShadow = false;
+      mesh.userData = { presentationOnly: true };
+      root.add(mesh); distantProxyInstancedMeshCount += 1;
+    }
+  };
+
   return Object.freeze({
     async sync({ activeDataKeys, renderedKeys, getChunkData, renderOrigin, centerChunkX, centerChunkZ }) {
       if (disposed) throw new Error('distant presentation is disposed');
@@ -488,6 +678,9 @@ export async function createW8DistantPresentation({
       measure('distant-clipmap', () => createClipmap({
         centerChunkX, centerChunkZ, activeChunks, origin: renderOrigin,
       }));
+      measure('distant-feature-proxies', () => createDistantFeatureProxies({
+        centerChunkX, centerChunkZ, origin: renderOrigin,
+      }));
     },
     snapshot() {
       return Object.freeze({
@@ -496,7 +689,14 @@ export async function createW8DistantPresentation({
         clipmapMeshCount,
         clipmapExtentMeters: CLIPMAP_EXTENT_METERS,
         maximumInnerBoundaryErrorMeters,
+        maximumInnerBoundaryColorDifference,
         clipmapDeterministicChecksum,
+        distantNaturalProxyCount,
+        distantTownProxyCount,
+        distantWaterProxyCount,
+        distantProxyInstancedMeshCount,
+        distantNaturalProxyLimit: DISTANT_NATURAL_PROXY_LIMIT,
+        distantTownProxyLimit: DISTANT_TOWN_PROXY_LIMIT,
         clipmapSampleCacheSize: clipmapSampleCache.size,
         clipmapSampleCacheCapacity: CLIPMAP_SAMPLE_CACHE_CAPACITY,
         clipmapSampleCacheHits,
