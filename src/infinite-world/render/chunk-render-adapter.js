@@ -44,8 +44,9 @@ export class ChunkRenderAdapter {
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
     this.occlusionMeshes = [];
-    this.cameraCollisionMeshes = [];
+    this.cameraCollisionBounds = [];
     this.occludedFeatureIds = new Set();
+    this.occlusionLastHitAt = new Map();
     this.fadedMaterials = new Map();
     this.transparentMeshes = new Set();
     this.transparencyEnabled = true;
@@ -151,49 +152,74 @@ export class ChunkRenderAdapter {
   }
 
   resolveCameraCollision({ camera, target, clearanceMeters = 0.6 } = {}) {
-    const Raycaster = this.THREE?.Raycaster;
-    const Vector3 = this.THREE?.Vector3;
-    if (typeof Raycaster !== 'function' || typeof Vector3 !== 'function'
-      || !camera?.position || !target || !this.cameraCollisionMeshes.length) {
+    if (!camera?.position || !target || !this.cameraCollisionBounds.length) {
       return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
     }
-    const origin = new Vector3(target.x, target.y, target.z);
-    const direction = new Vector3(
+    const desiredDistance = Math.hypot(
       camera.position.x - target.x,
       camera.position.y - target.y,
       camera.position.z - target.z,
     );
-    const desiredDistance = direction.length();
-    if (!Number.isFinite(desiredDistance) || desiredDistance <= 0) {
+    if (!Number.isFinite(desiredDistance)) {
       return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
     }
-    direction.normalize();
-    const raycaster = new Raycaster(origin, direction, 0, desiredDistance);
-    const hit = raycaster.intersectObjects(this.cameraCollisionMeshes, false)
-      .filter(value => Number.isFinite(value?.distance) && value.distance >= 0
-        && value.distance < desiredDistance)
-      .sort((left, right) => left.distance - right.distance)[0];
-    if (!hit) {
-      return Object.freeze({
-        collided: false, stableId: null, desiredDistance, resolvedDistance: desiredDistance,
-      });
-    }
     const clearanceRender = Math.max(0, clearanceMeters) * this.unitsPerMeter;
-    const resolvedDistance = Math.max(0, hit.distance - clearanceRender);
-    camera.position.set(
-      target.x + direction.x * resolvedDistance,
-      target.y + direction.y * resolvedDistance,
-      target.z + direction.z * resolvedDistance,
+    let collidedStableId = null;
+    let collisionCount = 0;
+    for (let pass = 0; pass < 4; pass += 1) {
+      let resolvedThisPass = false;
+      for (const bound of this.cameraCollisionBounds) {
+        if (this.isFeatureDestroyed(bound.stableId)) continue;
+        const centerX = (bound.worldX
+          - this.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter;
+        const centerZ = (bound.worldZ
+          - this.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter;
+        const dx = camera.position.x - centerX;
+        const dz = camera.position.z - centerZ;
+        const cosine = Math.cos(bound.rotationY);
+        const sine = Math.sin(bound.rotationY);
+        const localX = cosine * dx - sine * dz;
+        const localZ = sine * dx + cosine * dz;
+        const topY = bound.groundY + bound.height;
+        if (Math.abs(localX) >= bound.halfWidth || Math.abs(localZ) >= bound.halfDepth
+          || camera.position.y <= bound.groundY || camera.position.y >= topY) continue;
+
+        const sideX = bound.halfWidth - Math.abs(localX);
+        const sideZ = bound.halfDepth - Math.abs(localZ);
+        const top = topY - camera.position.y;
+        if (top <= sideX && top <= sideZ) {
+          camera.position.y = topY + clearanceRender;
+        } else {
+          let pushedLocalX = localX;
+          let pushedLocalZ = localZ;
+          if (sideX <= sideZ) {
+            pushedLocalX = (localX < 0 ? -1 : 1) * (bound.halfWidth + clearanceRender);
+          } else {
+            pushedLocalZ = (localZ < 0 ? -1 : 1) * (bound.halfDepth + clearanceRender);
+          }
+          camera.position.x = centerX + cosine * pushedLocalX + sine * pushedLocalZ;
+          camera.position.z = centerZ - sine * pushedLocalX + cosine * pushedLocalZ;
+        }
+        collidedStableId ??= bound.stableId;
+        collisionCount += 1;
+        resolvedThisPass = true;
+      }
+      if (!resolvedThisPass) break;
+    }
+    const resolvedDistance = Math.hypot(
+      camera.position.x - target.x,
+      camera.position.y - target.y,
+      camera.position.z - target.z,
     );
     return Object.freeze({
-      collided: true,
-      stableId: hit.object?.userData?.featureStableIds?.[hit.instanceId] ?? null,
+      collided: collisionCount > 0,
+      stableId: collidedStableId,
       desiredDistance,
       resolvedDistance,
     });
   }
 
-  updateCameraOcclusion({ camera, target } = {}) {
+  updateCameraOcclusion({ camera, target, nowMs = Date.now(), restoreDelayMs = 120 } = {}) {
     if (!this.transparencyEnabled) return 0;
     const Raycaster = this.THREE?.Raycaster;
     const Vector3 = this.THREE?.Vector3;
@@ -210,8 +236,13 @@ export class ChunkRenderAdapter {
       const stableId = hit.object?.userData?.featureStableIds?.[hit.instanceId];
       if (stableId) next.add(stableId);
     }
+    for (const stableId of next) this.occlusionLastHitAt.set(stableId, nowMs);
     for (const stableId of this.occludedFeatureIds) {
-      if (!next.has(stableId)) this.setFeatureOccluded(stableId, false);
+      const lastHitAt = this.occlusionLastHitAt.get(stableId) ?? -Infinity;
+      if (!next.has(stableId) && nowMs - lastHitAt >= restoreDelayMs) {
+        this.setFeatureOccluded(stableId, false);
+        this.occlusionLastHitAt.delete(stableId);
+      }
     }
     for (const stableId of next) this.setFeatureOccluded(stableId, true);
     return next.size;
@@ -371,7 +402,6 @@ export class ChunkRenderAdapter {
         this.transparentMeshes.add(fadeMesh);
         meshes.push(fadeMesh);
         this.occlusionMeshes.push(mesh, fadeMesh);
-        this.cameraCollisionMeshes.push(mesh, fadeMesh);
       }
     }
     return meshes;
@@ -570,6 +600,17 @@ export class ChunkRenderAdapter {
             }),
           });
         }
+        this.cameraCollisionBounds.push(Object.freeze({
+          chunkKey: key,
+          stableId: building.stableId,
+          worldX: building.worldPosition.x,
+          worldZ: building.worldPosition.z,
+          groundY: building.worldPosition.y * this.unitsPerMeter,
+          halfWidth: building.widthMeters * this.unitsPerMeter * 0.5,
+          halfDepth: building.depthMeters * this.unitsPerMeter * 0.5,
+          height: building.heightMeters * this.unitsPerMeter,
+          rotationY: building.rotationY,
+        }));
       });
       this.#createProductionPartMeshes({
         group,
@@ -680,6 +721,7 @@ export class ChunkRenderAdapter {
     for (const mesh of this.transparentMeshes) mesh.visible = this.transparencyEnabled;
     if (!this.transparencyEnabled) {
       for (const stableId of [...this.occludedFeatureIds]) this.setFeatureOccluded(stableId, false);
+      this.occlusionLastHitAt.clear();
     }
     return this.transparencyEnabled;
   }
@@ -694,13 +736,15 @@ export class ChunkRenderAdapter {
     }
     const occlusionMeshes = new Set(projected.group.children ?? []);
     this.occlusionMeshes = this.occlusionMeshes.filter(mesh => !occlusionMeshes.has(mesh));
-    this.cameraCollisionMeshes = this.cameraCollisionMeshes
-      .filter(mesh => !occlusionMeshes.has(mesh));
+    this.cameraCollisionBounds = this.cameraCollisionBounds.filter(bound => bound.chunkKey !== key);
     for (const mesh of occlusionMeshes) this.transparentMeshes.delete(mesh);
     for (const child of projected.group.children ?? []) child.dispose?.();
     projected.group.clear();
     for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.featureInstances.delete(stableId);
-    for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.occludedFeatureIds.delete(stableId);
+    for (const stableId of this.chunkFeatureIds.get(key) ?? []) {
+      this.occludedFeatureIds.delete(stableId);
+      this.occlusionLastHitAt.delete(stableId);
+    }
     this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
     this.counts.unloaded += 1;
@@ -727,6 +771,7 @@ export class ChunkRenderAdapter {
       chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
       trackedFeatureInstanceCount: this.featureInstances.size,
       cameraOccludableMeshCount: this.occlusionMeshes.length,
+      cameraCollisionBoundCount: this.cameraCollisionBounds.length,
       cameraOccludedFeatureCount: this.occludedFeatureIds.size,
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
@@ -748,8 +793,9 @@ export class ChunkRenderAdapter {
     this.featureInstances.clear();
     this.chunkFeatureIds.clear();
     this.occlusionMeshes.length = 0;
-    this.cameraCollisionMeshes.length = 0;
+    this.cameraCollisionBounds.length = 0;
     this.occludedFeatureIds.clear();
+    this.occlusionLastHitAt.clear();
     this.fadedMaterials.clear();
     this.transparentMeshes.clear();
     this.disposed = true;

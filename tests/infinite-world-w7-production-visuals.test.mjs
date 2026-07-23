@@ -61,7 +61,11 @@ test('W7A visual assets come only from the fixed finite baseline with verified p
     });
     assert.equal(sha256(content), expectedHash, path);
   }
-  assert.equal(sha256(readFileSync(destinationPath)), provenance.destination.sha256);
+  const canonicalDestination = execFileSync('git', ['show', `HEAD:${provenance.destination.path}`], {
+    cwd: repoRoot,
+    encoding: null,
+  });
+  assert.equal(sha256(canonicalDestination), provenance.destination.sha256);
   assert.match(provenance.extractionMethod, /git show/);
 });
 
@@ -140,7 +144,8 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   adapter.consumePresentationEvents([], { playerMarker: player });
   assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
   assert.notEqual(parts.legs[0].rotation.x, 0);
-  assert.ok(parts.visualRoot.position.y > 0);
+  assert.equal(parts.visualRoot.position.y, 0);
+  assert.ok(adapter.getPlayerPresentationOffsetUnits().y > 0);
   adapter.consumePresentationEvents([{
     type: 'both-claw-swish', logicalPosition: { x: 0, z: 0 }, intensity: 1,
     lifetimeSeconds: 0.28, soundCue: 'swish',
@@ -149,6 +154,31 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.notEqual(parts.leftClaw.position.z, 5);
   assert.notEqual(parts.rightClaw.position.z, 5);
   assert.notEqual(parts.visualRoot.rotation.x, 0);
+  adapter.consumePresentationEvents([{
+    type: 'charge-start', logicalPosition: { x: 0, z: 0 }, intensity: 1,
+    lifetimeSeconds: 0.25, soundCue: 'rumble',
+  }], { playerMarker: player });
+  adapter.updatePresentation(0.5);
+  assert.notEqual(adapter.getPlayerPresentationOffsetUnits().x, 0);
+  assert.equal(parts.visualRoot.position.y, 0);
+
+  adapter.syncManualBoss({
+    stableId: 'manual-boss-camera', alive: true, x: 0, z: 0, rotationY: 0,
+    bossBehavior: { verticalOffset: 0, segmentHp: new Array(14).fill(1) },
+  });
+  assert.equal(adapter.manualBossEntry.mesh.userData.segmentMeshes.length, 14);
+  const bossRoot = adapter.manualBossEntry.mesh;
+  const firstSegment = bossRoot.userData.segmentMeshes[0];
+  const bossCamera = { position: new Triple().set(
+    bossRoot.position.x + firstSegment.position.x * bossRoot.scale.x,
+    bossRoot.position.y + firstSegment.position.y * bossRoot.scale.y,
+    bossRoot.position.z + firstSegment.position.z * bossRoot.scale.z,
+  ) };
+  const bossCollision = adapter.resolveBossCameraCollision({
+    camera: bossCamera, target: { x: 0, y: 0, z: 0 },
+  });
+  assert.equal(bossCollision.collided, true);
+  assert.equal(bossCollision.stableId, 'manual-boss-camera');
   await adapter.shutdown();
   assets.dispose();
 });

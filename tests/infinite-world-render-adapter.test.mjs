@@ -135,7 +135,7 @@ test('render adapter applies Stable-ID destruction without allocating or leaking
   await adapter.shutdown();
 });
 
-test('Settlement instances between camera and Player fade to 0.25 and restore next frame', async () => {
+test('Settlement instances fade in one frame and restore after the bounded hysteresis', async () => {
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
   const stableId = 'building-camera-occlusion';
   const chunk = {
@@ -162,13 +162,18 @@ test('Settlement instances between camera and Player fade to 0.25 and restore ne
   assert.equal(first.fadeMesh.material.options.depthWrite, false);
   Raycaster.hits = [{ object: first.mesh, instanceId: first.index }];
   assert.equal(adapter.updateCameraOcclusion({
-    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_000,
   }), 1);
   assert.deepEqual(first.mesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
   assert.notEqual(first.fadeMesh.matrices[first.index].scale.x, 0);
   Raycaster.hits = [];
   assert.equal(adapter.updateCameraOcclusion({
-    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_100,
+  }), 0);
+  assert.deepEqual(first.mesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
+  assert.notEqual(first.fadeMesh.matrices[first.index].scale.x, 0);
+  assert.equal(adapter.updateCameraOcclusion({
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_120,
   }), 0);
   assert.notEqual(first.mesh.matrices[first.index].scale.x, 0);
   assert.deepEqual(first.fadeMesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
@@ -177,7 +182,7 @@ test('Settlement instances between camera and Player fade to 0.25 and restore ne
   assert.equal(fadeMaterial.disposed, true);
 });
 
-test('Camera collision resolves the desired camera position before the nearest Settlement wall', async () => {
+test('Camera collision ignores LOS obstruction and only pushes a camera penetrating a building', async () => {
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
   const stableId = 'building-camera-collision';
   const chunk = {
@@ -197,9 +202,19 @@ test('Camera collision resolves the desired camera position before the nearest S
   };
   const projected = await adapter.projectChunk(chunk);
   await adapter.loadProjected(projected);
-  const entry = adapter.featureInstances.get(stableId);
-  const camera = { position: new Triple().set(0, 0, 100) };
-  Raycaster.hits = [{ object: entry.parts[0].mesh, instanceId: entry.parts[0].index, distance: 60 }];
+  const clearCamera = { position: new Triple().set(0, 320, 100) };
+  Raycaster.hits = [{ object: adapter.featureInstances.get(stableId).parts[0].mesh, instanceId: 0, distance: 60 }];
+  const clearResult = adapter.resolveCameraCollision({
+    camera: clearCamera,
+    target: { x: 0, y: 0, z: 0 },
+    clearanceMeters: 0.1,
+  });
+  assert.equal(clearResult.collided, false);
+  assert.deepEqual({ x: clearCamera.position.x, y: clearCamera.position.y, z: clearCamera.position.z }, {
+    x: 0, y: 320, z: 100,
+  });
+
+  const camera = { position: new Triple().set(2_048, 320, 2_048) };
   const result = adapter.resolveCameraCollision({
     camera,
     target: { x: 0, y: 0, z: 0 },
@@ -207,10 +222,10 @@ test('Camera collision resolves the desired camera position before the nearest S
   });
   assert.equal(result.collided, true);
   assert.equal(result.stableId, stableId);
-  assert.equal(result.desiredDistance, 100);
-  assert.equal(result.resolvedDistance, 34.4);
+  assert.equal(result.desiredDistance, Math.hypot(2_048, 320, 2_048));
+  assert.equal(result.resolvedDistance, Math.hypot(2_048, 665.6, 2_048));
   assert.deepEqual({ x: camera.position.x, y: camera.position.y, z: camera.position.z }, {
-    x: 0, y: 0, z: 34.4,
+    x: 2_048, y: 665.6, z: 2_048,
   });
   Raycaster.hits = [];
   await adapter.shutdown();

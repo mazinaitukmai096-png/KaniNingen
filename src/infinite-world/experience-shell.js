@@ -496,8 +496,11 @@ export function createInfiniteExperienceShell({
     return Object.freeze({ moved: !state.paused, vertical });
   }
 
-  function updateCamera({ renderLocal, scaleProfile, unitsPerMeter }) {
-    const playerRootY = state.playerVertical.rootY ?? state.playerVertical.groundRootY ?? 0;
+  function updateCamera({
+    renderLocal, scaleProfile, unitsPerMeter, playerPresentationOffsetMeters = 0,
+  }) {
+    const playerRootY = (state.playerVertical.rootY ?? state.playerVertical.groundRootY ?? 0)
+      + playerPresentationOffsetMeters;
     const targetY = (scaleProfile.cameraTargetHeightMeters + playerRootY) * unitsPerMeter;
     const now = globalObject.performance?.now?.() ?? Date.now();
     const chargeRatio = state.nuclearChargeStartedAt === null ? 0 : clamp(

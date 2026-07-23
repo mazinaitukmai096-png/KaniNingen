@@ -29,11 +29,15 @@ test('W2 Legacy Macro Terrain dependencies match fixed-commit blobs and SHA-256 
   assert.equal(provenance.files.length, 2);
   for (const file of provenance.files) {
     assert.equal(file.importsAdjusted, false);
-    const destination = resolve(repoRoot, file.destination);
-    const bytes = readFileSync(destination);
+    const bytes = execFileSync('git', ['show', `HEAD:${file.destination}`], {
+      cwd: repoRoot,
+      encoding: null,
+    });
     assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256);
     assert.equal(
-      execFileSync('git', ['hash-object', destination], { cwd: repoRoot, encoding: 'utf8' }).trim(),
+      execFileSync('git', ['rev-parse', `HEAD:${file.destination}`], {
+        cwd: repoRoot, encoding: 'utf8',
+      }).trim(),
       file.gitBlob,
     );
     verifyOptionalLegacySource({ provenance, file, repoRoot });

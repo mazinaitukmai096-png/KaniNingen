@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -20,7 +21,10 @@ test('Legacy Core provenance records the fixed source commit and exact destinati
   assert.equal(provenance.files.length, 9);
   for (const file of provenance.files) {
     assert.equal(file.importsAdjusted, false);
-    const bytes = readFileSync(resolve(repoRoot, file.destination));
+    const bytes = execFileSync('git', ['show', `HEAD:${file.destination}`], {
+      cwd: repoRoot,
+      encoding: null,
+    });
     assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256, file.destination);
   }
 });

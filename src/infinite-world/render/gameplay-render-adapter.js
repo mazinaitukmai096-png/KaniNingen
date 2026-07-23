@@ -10,6 +10,7 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
+import { W7_NUCLEAR_CONTRACT } from '../gameplay-contract.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -45,6 +46,9 @@ export class GameplayRenderAdapter {
     this.playerPresentation = null;
     this.playerAttackPresentation = { left: null, right: null, charging: false };
     this.playerChargePhase = 0;
+    this.playerChargeElapsedSeconds = 0;
+    this.playerLocomotionY = 0;
+    this.playerPresentationOffsetUnits = { x: 0, y: 0, z: 0 };
     this.manualBossEntry = null;
     this.reinforcementMeshes = new Map();
     this.disposed = false;
@@ -230,8 +234,14 @@ export class GameplayRenderAdapter {
           elapsed: 0, duration: both ? 0.28 : 0.25, mode: both ? 'double' : 'single',
         };
       }
-      if (event.type === 'charge-start') this.playerAttackPresentation.charging = true;
-      if (event.type === 'charge-release') this.playerAttackPresentation.charging = false;
+      if (event.type === 'charge-start') {
+        this.playerAttackPresentation.charging = true;
+        this.playerChargeElapsedSeconds = 0;
+      }
+      if (event.type === 'charge-release') {
+        this.playerAttackPresentation.charging = false;
+        this.playerChargeElapsedSeconds = 0;
+      }
     }
     return events.length;
   }
@@ -248,9 +258,15 @@ export class GameplayRenderAdapter {
     });
     const locomotionY = moving && grounded
       ? Math.abs(Math.sin(walkPhase * 5 / 6)) * 20 : 0;
+    this.playerLocomotionY = locomotionY;
+    this.playerPresentationOffsetUnits.y = locomotionY;
     parts.visualRoot.userData.locomotionY = locomotionY;
-    parts.visualRoot.position.y = locomotionY;
+    parts.visualRoot.position.y = 0;
     return true;
+  }
+
+  getPlayerPresentationOffsetUnits() {
+    return this.playerPresentationOffsetUnits;
   }
 
   #animateFiniteClaw(side, state) {
@@ -322,9 +338,12 @@ export class GameplayRenderAdapter {
       }
     }
     if (parts) {
-      const charge = this.playerAttackPresentation.charging ? 1 : 0;
+      if (this.playerAttackPresentation.charging) this.playerChargeElapsedSeconds += deltaSeconds;
+      else this.playerChargeElapsedSeconds = 0;
+      const charge = Math.min(1, this.playerChargeElapsedSeconds * 1000
+        / W7_NUCLEAR_CONTRACT.chargeThresholdMs);
       this.playerChargePhase += deltaSeconds * 45;
-      parts.visualRoot.rotation.z = Math.sin(this.playerChargePhase) * 0.012 * charge;
+      parts.visualRoot.rotation.z = 0;
       const left = this.playerAttackPresentation.left;
       const right = this.playerAttackPresentation.right;
       const leftProgress = left ? Math.min(1, left.elapsed / left.duration) : 0;
@@ -336,9 +355,79 @@ export class GameplayRenderAdapter {
       parts.visualRoot.rotation.y = doubleProgress ? 0
         : 0.08 * Math.sin(leftProgress * Math.PI)
           - 0.08 * Math.sin(rightProgress * Math.PI);
-      parts.visualRoot.position.y = Number(parts.visualRoot.userData.locomotionY ?? 0)
+      parts.visualRoot.position.y = 0;
+      const chargeAmplitude = charge * 2.5;
+      this.playerPresentationOffsetUnits.x = Math.sin(this.playerChargePhase * 1.31)
+        * chargeAmplitude;
+      this.playerPresentationOffsetUnits.y = this.playerLocomotionY
+        + Math.sin(this.playerChargePhase * 1.73) * chargeAmplitude
         + (doubleProgress ? 8 * Math.sin(doubleProgress * Math.PI) : 0);
+      this.playerPresentationOffsetUnits.z = Math.cos(this.playerChargePhase * 1.57)
+        * chargeAmplitude;
+      const playerMaterial = parts.shell?.material;
+      if (charge > 0) {
+        playerMaterial?.color?.setRGB?.(1, (2 / 3) * (1 - charge), 0);
+        playerMaterial?.emissive?.setRGB?.(charge * 0.75, 0, 0);
+      } else {
+        playerMaterial?.color?.setHex?.(0xff4500);
+        playerMaterial?.emissive?.setRGB?.(0, 0, 0);
+      }
     }
+  }
+
+  resolveBossCameraCollision({ camera, target, clearanceFiniteUnits = 60 } = {}) {
+    const entry = this.manualBossEntry;
+    const segments = entry?.mesh?.userData?.segmentMeshes ?? [];
+    const desiredDistance = camera?.position && target ? Math.hypot(
+      camera.position.x - target.x,
+      camera.position.y - target.y,
+      camera.position.z - target.z,
+    ) : 0;
+    if (!camera?.position || !entry || !segments.length) {
+      return Object.freeze({ collided: false, stableId: null, desiredDistance, resolvedDistance: desiredDistance });
+    }
+    const root = entry.mesh;
+    const cosine = Math.cos(root.rotation.y);
+    const sine = Math.sin(root.rotation.y);
+    const rootScale = Math.abs(root.scale.x || 1);
+    let collided = false;
+    for (const segment of segments) {
+      if (segment.visible === false) continue;
+      const scaledX = segment.position.x * rootScale;
+      const scaledZ = segment.position.z * rootScale;
+      const centerX = root.position.x + cosine * scaledX + sine * scaledZ;
+      const centerY = root.position.y + segment.position.y * Math.abs(root.scale.y || rootScale);
+      const centerZ = root.position.z - sine * scaledX + cosine * scaledZ;
+      const radius = (Math.max(
+        Math.abs(segment.scale.x),
+        Math.abs(segment.scale.y),
+        Math.abs(segment.scale.z),
+      ) + clearanceFiniteUnits) * rootScale;
+      let dx = camera.position.x - centerX;
+      let dy = camera.position.y - centerY;
+      let dz = camera.position.z - centerZ;
+      const distance = Math.hypot(dx, dy, dz);
+      if (distance >= radius) continue;
+      if (distance <= 0.0001) { dx = 0; dy = 1; dz = 0; }
+      const scale = radius / Math.max(distance, 0.0001);
+      camera.position.set(
+        centerX + dx * scale,
+        centerY + dy * scale,
+        centerZ + dz * scale,
+      );
+      collided = true;
+    }
+    const resolvedDistance = target ? Math.hypot(
+      camera.position.x - target.x,
+      camera.position.y - target.y,
+      camera.position.z - target.z,
+    ) : desiredDistance;
+    return Object.freeze({
+      collided,
+      stableId: collided ? entry.state.stableId : null,
+      desiredDistance,
+      resolvedDistance,
+    });
   }
 
   #positionManualBoss() {
@@ -375,7 +464,9 @@ export class GameplayRenderAdapter {
       }
       const mesh = this.visualAssets.createEntityModel('boss');
       mesh.name = 'manual-production-boss';
-      mesh.userData = { stableId: state.stableId, type: 'boss', manual: true };
+      mesh.userData = {
+        ...(mesh.userData ?? {}), stableId: state.stableId, type: 'boss', manual: true,
+      };
       this.#scaleMesh(mesh, state);
       this.manualBossEntry = { mesh, state };
       this.combatRoot.add(mesh);

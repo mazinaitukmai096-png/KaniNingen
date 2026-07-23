@@ -1090,8 +1090,6 @@ export async function bootInfiniteWorldSandbox({
         origin.renderOriginChunkX,
         origin.renderOriginChunkZ,
       );
-      playerMarker.position.x = renderLocal.x;
-      playerMarker.position.z = renderLocal.z;
       playerMarker.rotation.y = logicalPlayer.facingY;
       const productionScale = scaleProfile.stage.visualScale
         * UNITS_PER_METER / PRODUCTION_VISUAL_UNITS_PER_METER;
@@ -1108,23 +1106,47 @@ export async function bootInfiniteWorldSandbox({
         walkPhase: playerWalkPhase,
         grounded: shellSnapshot.playerVertical.grounded,
       });
+      const presentationOffset = gameplayRenderAdapter.getPlayerPresentationOffsetUnits?.()
+        ?? { x: 0, y: 0, z: 0 };
+      const playerRootY = shellSnapshot.playerVertical.rootY
+        ?? shellSnapshot.playerVertical.groundRootY ?? 0;
+      const presentationOffsetMeters = presentationOffset.y * productionScale / UNITS_PER_METER;
+      const presentedRenderLocal = {
+        x: renderLocal.x + presentationOffset.x * productionScale,
+        z: renderLocal.z + presentationOffset.z * productionScale,
+      };
+      playerMarker.position.x = presentedRenderLocal.x;
+      playerMarker.position.y = playerRootY * UNITS_PER_METER
+        + presentationOffset.y * productionScale;
+      playerMarker.position.z = presentedRenderLocal.z;
       lastVisualPlayerX = logicalPlayer.x;
       lastVisualPlayerZ = logicalPlayer.z;
-      experienceShell.updateCamera({ renderLocal, scaleProfile, unitsPerMeter: UNITS_PER_METER });
+      experienceShell.updateCamera({
+        renderLocal: presentedRenderLocal,
+        scaleProfile,
+        unitsPerMeter: UNITS_PER_METER,
+        playerPresentationOffsetMeters: presentationOffsetMeters,
+      });
       const cameraTarget = {
-        x: renderLocal.x,
-        y: ((shellSnapshot.playerVertical.rootY ?? 0)
+        x: presentedRenderLocal.x,
+        y: (playerRootY + presentationOffsetMeters
           + scaleProfile.cameraTargetHeightMeters) * UNITS_PER_METER,
-        z: renderLocal.z,
+        z: presentedRenderLocal.z,
       };
-      lastCameraCollision = renderAdapter.resolveCameraCollision?.({
+      const buildingCollision = renderAdapter.resolveCameraCollision?.({
         camera,
         target: cameraTarget,
         clearanceMeters: 0.6,
       }) ?? lastCameraCollision;
+      const bossCollision = gameplayRenderAdapter.resolveBossCameraCollision?.({
+        camera,
+        target: cameraTarget,
+      });
+      lastCameraCollision = bossCollision?.collided ? bossCollision : buildingCollision;
       renderAdapter.updateCameraOcclusion?.({
         camera,
         target: cameraTarget,
+        nowMs: clock(),
       });
       return owner;
     }

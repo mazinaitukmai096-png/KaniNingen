@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -14,7 +15,11 @@ const sha256 = content => createHash('sha256').update(content).digest('hex');
 test('W8 finite parity manifest pins the protected baseline and every extracted source', () => {
   assert.equal(manifest.sourceCommit, 'f8bc9f80c2af417bb585bff26c99522c4229ab8e');
   for (const [path, expected] of Object.entries(manifest.sourceHashes)) {
-    assert.equal(sha256(readFileSync(resolve(repoRoot, path))), expected, path);
+    const canonicalSource = execFileSync('git', ['show', `${manifest.sourceCommit}:${path}`], {
+      cwd: repoRoot,
+      encoding: null,
+    });
+    assert.equal(sha256(canonicalSource), expected, path);
   }
   assert.ok(manifest.extractions.some(value => value.area === 'renderer'));
   assert.ok(manifest.extractions.some(value => value.area === 'input-and-combat'));

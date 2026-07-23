@@ -27,10 +27,12 @@ test('W3 Legacy formal-detail dependencies match the fixed source commit byte-fo
   assert.equal(provenance.importsAdjusted, false);
   assert.equal(provenance.files.length, 7);
   for (const file of provenance.files) {
-    const destination = resolve(repoRoot, file.destination);
-    const bytes = readFileSync(destination);
+    const bytes = execFileSync('git', ['show', `HEAD:${file.destination}`], {
+      cwd: repoRoot,
+      encoding: null,
+    });
     assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256);
-    assert.equal(execFileSync('git', ['hash-object', destination], {
+    assert.equal(execFileSync('git', ['rev-parse', `HEAD:${file.destination}`], {
       cwd: repoRoot,
       encoding: 'utf8',
     }).trim(), file.gitBlob);
