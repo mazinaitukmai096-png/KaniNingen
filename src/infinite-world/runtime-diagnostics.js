@@ -84,18 +84,36 @@ export function correlateW8HitchStages(reports, {
     .map(([stage, runCount]) => Object.freeze({ stage, runCount })));
 }
 
-export function evaluateW8PerformanceRuns({ finiteReports, w8Reports } = {}) {
-  if (!Array.isArray(finiteReports) || !Array.isArray(w8Reports)
-    || finiteReports.length !== 5 || w8Reports.length !== 5) {
-    throw new TypeError('exactly five finite and five W8 MeasurementReports are required');
+export function evaluateW8PerformanceRuns({
+  scenario = 'normal', finiteReports, beforeW8Reports, w8Reports,
+} = {}) {
+  if (!['normal', 'crossing', 'combat'].includes(scenario)) {
+    throw new RangeError('scenario must be normal, crossing, or combat');
+  }
+  if (!Array.isArray(finiteReports) || !Array.isArray(beforeW8Reports)
+    || !Array.isArray(w8Reports) || finiteReports.length !== 5
+    || beforeW8Reports.length !== 5 || w8Reports.length !== 5) {
+    throw new TypeError(
+      'exactly five finite, five before-W8, and five after-W8 MeasurementReports are required',
+    );
   }
   const finiteP95 = median(finiteReports.map(report => report.frame.p95));
   const finiteP99 = median(finiteReports.map(report => report.frame.p99));
+  const finiteOver50Ratio = median(finiteReports.map(report => report.hitchRatio));
+  const beforeW8P95 = median(beforeW8Reports.map(report => report.frame.p95));
+  const beforeW8P99 = median(beforeW8Reports.map(report => report.frame.p99));
+  const beforeW8Over50Ratio = median(beforeW8Reports.map(report => report.hitchRatio));
   const w8P95 = median(w8Reports.map(report => report.frame.p95));
   const w8P99 = median(w8Reports.map(report => report.frame.p99));
   const over50Ratio = median(w8Reports.map(report => report.hitchRatio));
   const p95Limit = Math.max(20, finiteP95 * 1.25);
   const p99Limit = Math.max(40, finiteP99 * 1.5);
+  const over50RatioLimit = finiteOver50Ratio > 0.005
+    ? finiteOver50Ratio + 0.001 : 0.005;
+  const beforeP95Limit = beforeW8P95 * (scenario === 'crossing' ? 1 : 1.1);
+  const beforeP99Limit = beforeW8P99 * (scenario === 'crossing' ? 1 : 1.1);
+  const beforeOver50RatioLimit = scenario === 'crossing'
+    ? beforeW8Over50Ratio : null;
   const recurringStops = new Map();
   for (const report of w8Reports) {
     const stagesInRun = new Set();
@@ -111,17 +129,35 @@ export function evaluateW8PerformanceRuns({ finiteReports, w8Reports } = {}) {
     .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
     .map(([stage, runCount]) => Object.freeze({ stage, runCount }));
   const criteria = Object.freeze({
-    p95: w8P95 <= p95Limit,
-    p99: w8P99 <= p99Limit,
-    over50Ratio: over50Ratio <= 0.005,
+    finiteP95: w8P95 <= p95Limit,
+    finiteP99: w8P99 <= p99Limit,
+    absoluteOver50Ratio: finiteOver50Ratio > 0.005 || over50Ratio <= 0.005,
+    finiteRelativeOver50Ratio: over50Ratio <= over50RatioLimit,
+    beforeW8P95: w8P95 <= beforeP95Limit,
+    beforeW8P99: w8P99 <= beforeP99Limit,
+    beforeW8Over50Ratio: beforeOver50RatioLimit === null
+      || over50Ratio <= beforeOver50RatioLimit,
     recurringStageStops: recurringStageStops.length === 0,
   });
   return Object.freeze({
     schemaVersion: 'w8-performance-acceptance-1',
+    scenario,
     pass: Object.values(criteria).every(Boolean),
     criteria,
-    medians: Object.freeze({ finiteP95, finiteP99, w8P95, w8P99, over50Ratio }),
-    limits: Object.freeze({ p95: p95Limit, p99: p99Limit, over50Ratio: 0.005 }),
+    medians: Object.freeze({
+      finiteP95, finiteP99, finiteOver50Ratio,
+      beforeW8P95, beforeW8P99, beforeW8Over50Ratio,
+      w8P95, w8P99, over50Ratio,
+    }),
+    limits: Object.freeze({
+      finiteP95: p95Limit,
+      finiteP99: p99Limit,
+      absoluteOver50Ratio: 0.005,
+      finiteRelativeOver50Ratio: over50RatioLimit,
+      beforeW8P95: beforeP95Limit,
+      beforeW8P99: beforeP99Limit,
+      beforeW8Over50Ratio: beforeOver50RatioLimit,
+    }),
     recurringStageStops: Object.freeze(recurringStageStops),
     diagnostics: Object.freeze({
       maximumFrameMs: Math.max(...w8Reports.map(report => report.frame.max)),

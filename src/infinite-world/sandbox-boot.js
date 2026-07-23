@@ -277,7 +277,7 @@ function createRuntimeRenderProfile() {
   });
 }
 
-function createW8ScenePresentation({ THREE, scene, visualAssets, width, height }) {
+function createW8ScenePresentation({ THREE, scene, visualAssets }) {
   const cloudBaseCount = 70;
   const cloudPuffCount = 21;
   const cloudRoot = new THREE.InstancedMesh(
@@ -337,37 +337,115 @@ function createW8ScenePresentation({ THREE, scene, visualAssets, width, height }
   if (cloudRoot.instanceColor) cloudRoot.instanceColor.needsUpdate = true;
   scene.add(cloudRoot);
 
-  const titleScene = new THREE.Scene();
-  titleScene.background = new THREE.Color(0x241914);
-  titleScene.fog = new THREE.Fog(0x241914, 2800, 10000);
-  const titleCamera = new THREE.PerspectiveCamera(70, width / height, 10, 35000);
-  titleCamera.position.set(0, 750, 3100);
-  titleCamera.lookAt?.(0, 340, 0);
-  titleScene.add(new THREE.HemisphereLight(0xffcfa0, 0x26180f, 1.1));
-  const titleSun = new THREE.DirectionalLight(0xff7b45, 2.1);
-  titleSun.position.set(-1200, 1800, 1000); titleScene.add(titleSun);
+  const titlePresentationRoot = new THREE.Group();
+  titlePresentationRoot.name = 'w8-main-world-title-presentation';
+  titlePresentationRoot.userData = { presentationOnly: true };
   const titleCrab = visualAssets.createPlayerModel();
-  titleCrab.position.set(-550, 0, 200); titleCrab.rotation.y = 0.25;
-  titleCrab.scale.set(4.4, 4.4, 4.4); titleScene.add(titleCrab);
-  const titleBoss = visualAssets.createEntityModel('boss');
-  titleBoss.position.set(1250, -170, -900); titleBoss.rotation.y = -0.4;
-  titleBoss.scale.set(3, 3, 3); titleScene.add(titleBoss);
+  titleCrab.position.set(0, 0, 0);
+  titleCrab.rotation.y = Math.atan2(220, 380);
+  titleCrab.scale.set(
+    finiteVisualToRender(1), finiteVisualToRender(1), finiteVisualToRender(1),
+  );
+  const titleCrabParts = titleCrab.userData?.presentationParts;
+  titlePresentationRoot.add(titleCrab);
   const explosionRoot = new THREE.Group();
-  explosionRoot.name = 'w8-title-explosion';
-  for (let index = 0; index < 8; index += 1) {
-    const blast = new THREE.Mesh(visualAssets.geometries.dodeca, visualAssets.materials.gold);
-    const angle = index / 8 * Math.PI * 2;
-    blast.position.set(Math.sin(angle) * 380, 450 + (index % 3) * 130, Math.cos(angle) * 380);
-    blast.scale.set(180, 180, 180); explosionRoot.add(blast);
+  explosionRoot.name = 'w8-title-atomic-presentation';
+  explosionRoot.userData = {
+    presentationOnly: true, finiteBaseCount: 50, finiteStemCount: 80, finiteCapCount: 200,
+  };
+  const titleParticleCapacity = 330;
+  const titleSmokePool = new THREE.InstancedMesh(
+    visualAssets.geometries.box, visualAssets.materials.lobbySmoke, titleParticleCapacity,
+  );
+  const titleFirePool = new THREE.InstancedMesh(
+    visualAssets.geometries.box, visualAssets.materials.lobbyFire, titleParticleCapacity,
+  );
+  titleSmokePool.name = 'w8-title-mushroom-smoke-pool';
+  titleFirePool.name = 'w8-title-mushroom-fire-pool';
+  titleSmokePool.castShadow = false; titleFirePool.castShadow = false;
+  titleSmokePool.receiveShadow = false; titleFirePool.receiveShadow = false;
+  const titleParticleTransform = new THREE.Object3D();
+  let titleSmokeCount = 0;
+  let titleFireCount = 0;
+  const titleParticleRoll = (index, salt) => cloudRoll(index + 400, salt + 50);
+  const appendTitleParticle = ({ index, isFire, x, y, z, scaleFinite }) => {
+    titleParticleTransform.position.set(
+      finiteVisualToRender(x), finiteVisualToRender(y), finiteVisualToRender(z),
+    );
+    titleParticleTransform.rotation.set(
+      titleParticleRoll(index, 7) * Math.PI,
+      titleParticleRoll(index, 8) * Math.PI,
+      titleParticleRoll(index, 9) * Math.PI,
+    );
+    const scale = finiteVisualToRender(scaleFinite);
+    titleParticleTransform.scale.set(scale, scale, scale);
+    titleParticleTransform.updateMatrix();
+    const pool = isFire ? titleFirePool : titleSmokePool;
+    const poolIndex = isFire ? titleFireCount : titleSmokeCount;
+    pool.setMatrixAt(poolIndex, titleParticleTransform.matrix);
+    if (isFire) titleFireCount += 1; else titleSmokeCount += 1;
+  };
+  for (let index = 0; index < 50; index += 1) {
+    const angle = titleParticleRoll(index, 0) * Math.PI * 2;
+    const distance = 200 + titleParticleRoll(index, 1) * 700;
+    appendTitleParticle({
+      index,
+      isFire: titleParticleRoll(index, 2) < 0.2,
+      x: Math.cos(angle) * distance,
+      y: titleParticleRoll(index, 3) * 250,
+      z: Math.sin(angle) * distance,
+      scaleFinite: 150 + titleParticleRoll(index, 4) * 200,
+    });
   }
-  explosionRoot.position.set(1500, 760, -1500); titleScene.add(explosionRoot);
+  for (let index = 0; index < 80; index += 1) {
+    const particleIndex = index + 50;
+    const height = 100 + titleParticleRoll(particleIndex, 0) * 1_000;
+    const radius = (40 + titleParticleRoll(particleIndex, 1) * 120) * (1 + height / 1_000);
+    const angle = titleParticleRoll(particleIndex, 2) * Math.PI * 2;
+    appendTitleParticle({
+      index: particleIndex,
+      isFire: titleParticleRoll(particleIndex, 3) < 0.4,
+      x: Math.cos(angle) * radius,
+      y: height,
+      z: Math.sin(angle) * radius,
+      scaleFinite: 150 + titleParticleRoll(particleIndex, 4) * 200,
+    });
+  }
+  for (let index = 0; index < 200; index += 1) {
+    const particleIndex = index + 130;
+    const angle = titleParticleRoll(particleIndex, 0) * Math.PI * 2;
+    const distance = titleParticleRoll(particleIndex, 1) ** 0.6 * 1_000;
+    const height = 1_100 + Math.cos(distance / 1_000 * Math.PI / 2) * 400
+      + (titleParticleRoll(particleIndex, 2) - 0.5) * 350;
+    appendTitleParticle({
+      index: particleIndex,
+      isFire: titleParticleRoll(particleIndex, 3) < 0.5,
+      x: Math.cos(angle) * distance,
+      y: height,
+      z: Math.sin(angle) * distance,
+      scaleFinite: 200 + distance / 1_000 * 150 + titleParticleRoll(particleIndex, 4) * 200,
+    });
+  }
+  titleSmokePool.count = titleSmokeCount;
+  titleFirePool.count = titleFireCount;
+  titleSmokePool.instanceMatrix.needsUpdate = true;
+  titleFirePool.instanceMatrix.needsUpdate = true;
+  titleSmokePool.userData = { presentationOnly: true, role: 'lobby-smoke', count: titleSmokeCount };
+  titleFirePool.userData = { presentationOnly: true, role: 'lobby-fire', count: titleFireCount };
+  explosionRoot.add(titleSmokePool);
+  explosionRoot.add(titleFirePool);
+  explosionRoot.position.set(0, 0, finiteVisualToRender(-5_700));
+  explosionRoot.scale.set(1.3, 1.3, 1.3);
+  titlePresentationRoot.add(explosionRoot);
+  scene.add(titlePresentationRoot);
   let disposed = false;
   return Object.freeze({
-    titleScene, titleCamera, titleBoss, explosionRoot, cloudRoot,
+    titlePresentationRoot, titleCrab, titleCrabParts, explosionRoot, cloudRoot,
     dispose() {
       if (disposed) return;
       scene.remove(cloudRoot);
-      titleScene.clear?.();
+      scene.remove(titlePresentationRoot);
+      titlePresentationRoot.clear?.();
       disposed = true;
     },
   });
@@ -467,7 +545,7 @@ export async function bootInfiniteWorldSandbox({
       runNumber: diagnosticRunNumber,
       environment: {
         viewport: `${measurementViewport?.width ?? globalObject.innerWidth}x${measurementViewport?.height ?? globalObject.innerHeight}`,
-        devicePixelRatio: globalObject.devicePixelRatio ?? 1,
+        devicePixelRatio: measurementMode ? 1 : (globalObject.devicePixelRatio ?? 1),
         userAgent: globalObject.navigator?.userAgent ?? 'unknown',
         worldSeed: requestedSeed,
       },
@@ -501,6 +579,11 @@ export async function bootInfiniteWorldSandbox({
         state.saveAvailable = false;
         state.saveError = { name: error?.name ?? 'Error', message: error?.message ?? String(error) };
       }
+      if (measurementMode) {
+        worldState.updateExperience({
+          settings: { quality: 'medium', showFps: false, fpsCap: 0 },
+        });
+      }
     });
     const renderProfile = createRuntimeRenderProfile();
     const selectedRenderChunkSize = renderProfile.selectedRenderChunkSize;
@@ -524,7 +607,8 @@ export async function bootInfiniteWorldSandbox({
       const nextRenderer = new THREE.WebGLRenderer({
         antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true,
       });
-      nextRenderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, 1.5));
+      nextRenderer.setPixelRatio(measurementMode
+        ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, 1.5));
       nextRenderer.setSize(viewportWidth, viewportHeight);
       nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
       nextRenderer.shadowMap ??= {};
@@ -548,7 +632,7 @@ export async function bootInfiniteWorldSandbox({
       for (const child of playerMarker.children ?? []) child.castShadow = true;
       nextScene.add(playerMarker);
       scenePresentation = createW8ScenePresentation({
-        THREE, scene: nextScene, visualAssets, width: viewportWidth, height: viewportHeight,
+        THREE, scene: nextScene, visualAssets,
       });
       return { nextScene, nextCamera, nextRenderer, playerMarker };
     });
@@ -862,7 +946,8 @@ export async function bootInfiniteWorldSandbox({
     });
     const applyRuntimeSettings = settings => {
       const qualityRatio = { low: 1, medium: 1.2, high: 1.5 }[settings.quality] ?? 1.5;
-      renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
+      renderer.setPixelRatio(measurementMode
+        ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
       renderer.shadowMap.enabled = diagnosticProfile.shadows && settings.quality !== 'low';
       scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
       scene.fog.far = W8_GAMEPLAY_FOG_FAR_BY_QUALITY[settings.quality]
@@ -1017,8 +1102,6 @@ export async function bootInfiniteWorldSandbox({
       const height = measurementViewport?.height ?? globalObject.innerHeight;
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      scenePresentation.titleCamera.aspect = width / height;
-      scenePresentation.titleCamera.updateProjectionMatrix();
       renderer.setSize(width, height);
     }
     const handlePageHide = () => scheduleSave({ immediate: true });
@@ -1028,8 +1111,6 @@ export async function bootInfiniteWorldSandbox({
       }
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      scenePresentation.titleCamera.aspect = width / height;
-      scenePresentation.titleCamera.updateProjectionMatrix();
       renderer.setSize(width, height, false);
       return Object.freeze({ width, height });
     }
@@ -1187,16 +1268,20 @@ export async function bootInfiniteWorldSandbox({
       const renderInfo = renderer.info;
       const measurementReport = diagnostics.snapshot({
         drawCalls: renderInfo?.render?.calls ?? null,
+        triangles: renderInfo?.render?.triangles ?? null,
         geometries: renderInfo?.memory?.geometries ?? null,
         materials: renderAdapter.resourceSnapshot().sharedMaterialCount,
         sceneObjects: countSceneObjects(scene),
       });
       const stageP95 = stage => number(measurementReport.stages[stage]?.p95);
+      const longTaskMaximum = measurementReport.longTasks.reduce(
+        (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
+      );
       const measurementText = measurement.mode
         ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 60s`
         : '';
       const diagnosticText = diagnostics.enabled
-        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
+        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nMeasurement frame count/p50/p95/p99/max: ${measurementReport.frame.count} / ${number(measurementReport.frame.p50)} / ${number(measurementReport.frame.p95)} / ${number(measurementReport.frame.p99)} / ${number(measurementReport.frame.max)} ms\nLong Tasks count/max: ${measurementReport.longTasks.length} / ${number(longTaskMaximum)} ms  Resources draw/triangles/geometry/material/scene: ${measurementReport.resources.drawCalls ?? 'n/a'} / ${measurementReport.resources.triangles ?? 'n/a'} / ${measurementReport.resources.geometries ?? 'n/a'} / ${measurementReport.resources.materials ?? 'n/a'} / ${measurementReport.resources.sceneObjects ?? 'n/a'}\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
         : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
@@ -1255,16 +1340,49 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     }
 
     function updateScenePresentation(deltaSeconds, frameNow) {
-      scenePresentation.titleBoss.rotation.y = -0.4 + Math.sin(frameNow * 0.00035) * 0.14;
-      scenePresentation.explosionRoot.rotation.y += deltaSeconds * 0.18;
+      if (!measurement.mode && experienceShell.getMode?.() === 'menu') {
+        const lobbyPulse = Math.sin(frameNow * 0.0035);
+        scenePresentation.titleCrab.position.y = finiteVisualToRender(lobbyPulse * 5);
+        if (scenePresentation.titleCrabParts?.leftClaw) {
+          scenePresentation.titleCrabParts.leftClaw.position.y = 30 + lobbyPulse * 8;
+          scenePresentation.titleCrabParts.leftClaw.rotation.z = 0.12 + lobbyPulse * 0.08;
+        }
+        if (scenePresentation.titleCrabParts?.rightClaw) {
+          scenePresentation.titleCrabParts.rightClaw.position.y = 30 - lobbyPulse * 8;
+          scenePresentation.titleCrabParts.rightClaw.rotation.z = -0.12 - lobbyPulse * 0.08;
+        }
+        for (let index = 0; index < (scenePresentation.titleCrabParts?.legs?.length ?? 0); index += 1) {
+          scenePresentation.titleCrabParts.legs[index].rotation.x = Math.sin(
+            frameNow * 0.003 + index,
+          ) * 0.12;
+        }
+        scenePresentation.explosionRoot.rotation.y += deltaSeconds * 0.03;
+      }
       gameplayRenderAdapter.updatePresentation?.(deltaSeconds);
     }
 
     function renderActiveScene() {
       diagnostics.measure('render', () => {
-        if (!measurement.mode && experienceShell.getMode?.() === 'menu') {
-          renderer.render(scenePresentation.titleScene, scenePresentation.titleCamera);
-        } else renderer.render(scene, camera);
+        const titleActive = !measurement.mode && experienceShell.getMode?.() === 'menu';
+        scenePresentation.titlePresentationRoot.visible = titleActive;
+        playerMarker.visible = !titleActive;
+        if (titleActive) {
+          scenePresentation.titlePresentationRoot.position.set(
+            playerMarker.position.x, playerMarker.position.y, playerMarker.position.z,
+          );
+          scenePresentation.titlePresentationRoot.rotation.y = 0;
+          camera.position.set(
+            playerMarker.position.x + finiteVisualToRender(220),
+            playerMarker.position.y + finiteVisualToRender(80),
+            playerMarker.position.z + finiteVisualToRender(380),
+          );
+          camera.lookAt(
+            playerMarker.position.x + finiteVisualToRender(-40),
+            playerMarker.position.y + finiteVisualToRender(50),
+            playerMarker.position.z,
+          );
+        }
+        renderer.render(scene, camera);
       });
     }
 

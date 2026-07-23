@@ -11,6 +11,10 @@ import {
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
 import { W7_NUCLEAR_CONTRACT } from '../gameplay-contract.js';
+import { PRODUCTION_TANK_VISUAL_SCALE } from '../../world-scale-rebalance.js';
+
+const FINITE_TANK_MUZZLE_FORWARD_METERS = 112 * PRODUCTION_TANK_VISUAL_SCALE
+  / PRODUCTION_VISUAL_UNITS_PER_METER;
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -43,6 +47,33 @@ export class GameplayRenderAdapter {
     this.presentationPool = [];
     this.activePresentationEffects = [];
     this.presentationPoolLimit = 96;
+    const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
+    const Object3D = requireConstructor(THREE, 'Object3D');
+    this.effectTransform = new Object3D();
+    this.effectInstancePools = new Map();
+    const effectPoolSpecs = Object.freeze({
+      flash: Object.freeze({ geometry: 'sphere', material: 'atomicFlash', capacity: 96 }),
+      debris: Object.freeze({ geometry: 'box', material: 'charred', capacity: 384 }),
+      blood: Object.freeze({ geometry: 'box', material: 'blood', capacity: 192 }),
+      wind: Object.freeze({ geometry: 'windArc', material: 'wind', capacity: 96 }),
+      shockwave: Object.freeze({ geometry: 'torus', material: 'shockwave', capacity: 288 }),
+      smoke: Object.freeze({ geometry: 'sphere', material: 'smoke', capacity: 384 }),
+      scorch: Object.freeze({ geometry: 'sphere', material: 'scorch', capacity: 96 }),
+    });
+    for (const [role, spec] of Object.entries(effectPoolSpecs)) {
+      const mesh = new InstancedMesh(
+        this.visualAssets.geometries[spec.geometry],
+        this.visualAssets.materials[spec.material],
+        spec.capacity,
+      );
+      mesh.name = `w8-fixed-effect-pool-${role}`;
+      mesh.count = 0;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.userData = { presentationOnly: true, role, capacity: spec.capacity };
+      this.combatRoot.add(mesh);
+      this.effectInstancePools.set(role, { mesh, capacity: spec.capacity, count: 0 });
+    }
     this.playerPresentation = null;
     this.playerAttackPresentation = { left: null, right: null, charging: false };
     this.playerChargePhase = 0;
@@ -92,17 +123,12 @@ export class GameplayRenderAdapter {
     const parts = mesh.userData.presentationParts;
     if (state.type === 'human' && parts) {
       mesh.rotation.z = state.aiState === 'fallen' ? Math.PI / 2 : 0;
-      const stride = Math.sin(state.aiClock * (state.aiState === 'flee' ? 13 : 6)) * 0.48;
-      parts.leftArm.rotation.x = stride;
-      parts.rightArm.rotation.x = -stride;
-      parts.leftLeg.rotation.x = -stride;
-      parts.rightLeg.rotation.x = stride;
     }
     if (state.type === 'tank' && parts) {
       const relativeTurret = (state.turretRotationY ?? state.rotationY) - state.rotationY;
       if (parts.turret) parts.turret.rotation.y = relativeTurret;
       if (parts.gun) {
-        parts.gun.rotation.y = relativeTurret;
+        parts.gun.rotation.y = 0;
         parts.gun.rotation.x = state.gunPitch ?? 0;
       }
     }
@@ -119,6 +145,7 @@ export class GameplayRenderAdapter {
     for (const entry of this.effectMeshes.values()) this.#positionTransient(entry);
     if (this.manualBossEntry) this.#positionManualBoss();
     for (const entry of this.reinforcementMeshes.values()) this.#positionReinforcement(entry);
+    this.#syncEffectInstances();
     this.counts.rebased += 1;
   }
 
@@ -130,7 +157,12 @@ export class GameplayRenderAdapter {
       this.origin.renderOriginChunkZ,
       this.renderChunkSize,
     );
-    entry.mesh.position.set(local.x, entry.height, local.z);
+    const forward = entry.visualForwardMeters ?? 0;
+    entry.mesh.position.set(
+      local.x + (entry.state.directionX ?? 0) * forward * this.unitsPerMeter,
+      entry.height,
+      local.z + (entry.state.directionZ ?? 0) * forward * this.unitsPerMeter,
+    );
   }
 
   #syncTransientSet(map, states, createMesh) {
@@ -166,62 +198,159 @@ export class GameplayRenderAdapter {
       );
       mesh.name = state.type === 'acid' ? 'boss-acid-projectile' : 'tank-projectile';
       mesh.castShadow = true;
-      mesh.scale.setScalar(0.5 * this.unitsPerMeter);
-      return { mesh, state, height: 0.55 * this.unitsPerMeter };
+      mesh.scale.setScalar((state.type === 'acid' ? 0.32 : 0.22) * this.unitsPerMeter);
+      return {
+        mesh,
+        state,
+        height: (state.type === 'acid' ? 2.4 : 2.05) * this.unitsPerMeter,
+        visualForwardMeters: state.type === 'tank-shell' ? FINITE_TANK_MUZZLE_FORWARD_METERS : 0,
+      };
     });
-    this.#syncTransientSet(this.effectMeshes, effects, state => {
-      const destructive = state.type.includes('destruction');
-      const nuclear = state.type.startsWith('nuclear');
-      const mesh = new Mesh(
-        this.visualAssets.geometries.dodeca,
-        this.visualAssets.materials[destructive ? 'gold' : 'charred'],
-      );
-      mesh.name = `combat-${state.type}`;
-      mesh.scale.setScalar((nuclear ? 9 : destructive ? 1.35 : 0.45) * this.unitsPerMeter);
-      return { mesh, state, height: (nuclear ? 5 : destructive ? 0.8 : 0.3) * this.unitsPerMeter };
-    });
+    this.#syncTransientSet(this.effectMeshes, [], () => null);
     return true;
   }
 
-  #acquirePresentationMesh(event) {
+  #acquirePresentationEffect(event) {
     let entry = this.presentationPool.find(value => !value.active);
     if (!entry && this.presentationPool.length < this.presentationPoolLimit) {
-      const Mesh = requireConstructor(this.THREE, 'Mesh');
-      const mesh = new Mesh(
-        this.visualAssets.geometries.dodeca,
-        this.visualAssets.materials.scorch ?? this.visualAssets.materials.charred,
-      );
-      mesh.visible = false;
-      mesh.castShadow = true;
-      this.combatRoot.add(mesh);
-      entry = { mesh, active: false, remainingSeconds: 0, event: null };
+      entry = { active: false, remainingSeconds: 0, durationSeconds: 0, event: null };
       this.presentationPool.push(entry);
     }
-    if (!entry) entry = this.activePresentationEffects.shift();
+    if (!entry) {
+      entry = this.activePresentationEffects.shift();
+      entry.active = false;
+    }
     entry.active = true;
     entry.event = event;
     entry.remainingSeconds = event.lifetimeSeconds;
-    entry.mesh.visible = true;
-    entry.mesh.name = `w8-presentation-${event.type}`;
-    const local = logicalWorldToRenderLocal(
-      event.logicalPosition.x,
-      event.logicalPosition.z,
-      this.origin.renderOriginChunkX,
-      this.origin.renderOriginChunkZ,
-      this.renderChunkSize,
-    );
-    entry.mesh.position.set(local.x, 0.35 * this.unitsPerMeter, local.z);
-    const scale = Math.max(0.15, event.intensity) * this.unitsPerMeter;
-    entry.mesh.scale.set(scale, scale * 0.45, scale);
+    entry.durationSeconds = event.lifetimeSeconds;
     this.activePresentationEffects.push(entry);
     return entry;
+  }
+
+  #appendEffectInstance(role, { x, y, z, scaleX, scaleY, scaleZ, rotationX = 0,
+    rotationY = 0, rotationZ = 0 }) {
+    const pool = this.effectInstancePools.get(role);
+    if (!pool || pool.count >= pool.capacity) return false;
+    this.effectTransform.position.set(x, y, z);
+    this.effectTransform.rotation.set(rotationX, rotationY, rotationZ);
+    this.effectTransform.scale.set(scaleX, scaleY, scaleZ);
+    this.effectTransform.updateMatrix();
+    pool.mesh.setMatrixAt(pool.count, this.effectTransform.matrix);
+    pool.count += 1;
+    return true;
+  }
+
+  #syncEffectInstances() {
+    for (const pool of this.effectInstancePools.values()) pool.count = 0;
+    for (const entry of this.activePresentationEffects) {
+      const event = entry.event;
+      if (!event) continue;
+      const local = logicalWorldToRenderLocal(
+        event.logicalPosition.x,
+        event.logicalPosition.z,
+        this.origin.renderOriginChunkX,
+        this.origin.renderOriginChunkZ,
+        this.renderChunkSize,
+      );
+      const progress = 1 - entry.remainingSeconds / Math.max(entry.durationSeconds, 0.001);
+      const intensity = Math.max(0.15, event.intensity);
+      const directionHeading = Math.atan2(event.direction?.x ?? 0, event.direction?.z ?? 1);
+      const unit = this.unitsPerMeter;
+      const base = { x: local.x, z: local.z };
+      if (event.type.includes('claw-swish') || event.type === 'boss-sweep') {
+        this.#appendEffectInstance('wind', {
+          ...base, y: 1.2 * unit,
+          scaleX: intensity * 2.4 * unit, scaleY: intensity * 1.2 * unit,
+          scaleZ: intensity * 2.4 * unit, rotationY: directionHeading,
+        });
+        continue;
+      }
+      if (event.type.startsWith('nuclear')) {
+        this.#appendEffectInstance('flash', {
+          ...base, y: (2 + progress * 9) * unit,
+          scaleX: (2 + progress * 12) * unit,
+          scaleY: (2 + progress * 15) * unit,
+          scaleZ: (2 + progress * 12) * unit,
+        });
+        for (let index = 0; index < 8; index += 1) {
+          const angle = index * 2.399963 + progress * 0.3;
+          const radius = (0.5 + index * 0.22) * unit;
+          const puffScale = (1.2 + index * 0.18 + progress * 1.6) * unit;
+          this.#appendEffectInstance('smoke', {
+            x: base.x + Math.cos(angle) * radius,
+            y: (2 + index * 1.8 + progress * 7) * unit,
+            z: base.z + Math.sin(angle) * radius,
+            scaleX: puffScale * 1.25, scaleY: puffScale, scaleZ: puffScale * 1.25,
+          });
+        }
+        for (let index = 0; index < 3; index += 1) {
+          const ringScale = (5 + index * 4 + progress * 18) * unit;
+          this.#appendEffectInstance('shockwave', {
+            ...base, y: (0.12 + index * 0.06) * unit,
+            scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
+            rotationX: Math.PI / 2,
+          });
+        }
+        this.#appendEffectInstance('scorch', {
+          ...base, y: 0.05 * unit,
+          scaleX: 8 * unit, scaleY: 0.08 * unit, scaleZ: 8 * unit,
+        });
+        continue;
+      }
+      const destructive = event.type.includes('destruction')
+        || event.type.includes('landing') || event.type.includes('breach');
+      const impact = event.type.includes('impact') || event.type.includes('fire')
+        || event.type.includes('spit') || destructive;
+      if (impact) this.#appendEffectInstance('flash', {
+        ...base, y: (0.45 + progress * 0.8) * unit,
+        scaleX: intensity * (0.35 + progress * 1.2) * unit,
+        scaleY: intensity * (0.35 + progress * 1.2) * unit,
+        scaleZ: intensity * (0.35 + progress * 1.2) * unit,
+      });
+      if (destructive) for (let index = 0; index < 4; index += 1) {
+        const angle = index / 4 * Math.PI * 2 + event.sequence * 0.37;
+        const travel = progress * intensity * 2.4 * unit;
+        this.#appendEffectInstance('debris', {
+          x: base.x + Math.cos(angle) * travel,
+          y: (0.3 + Math.sin(progress * Math.PI) * (1.2 + index * 0.25)) * unit,
+          z: base.z + Math.sin(angle) * travel,
+          scaleX: 0.32 * intensity * unit,
+          scaleY: 0.24 * intensity * unit,
+          scaleZ: 0.32 * intensity * unit,
+          rotationX: progress * 4 + index, rotationY: progress * 5 - index,
+        });
+      }
+      if (event.type.includes('entity-')) for (let index = 0; index < 2; index += 1) {
+        const angle = index * Math.PI + event.sequence * 0.19;
+        this.#appendEffectInstance('blood', {
+          x: base.x + Math.cos(angle) * progress * unit,
+          y: (0.25 + Math.sin(progress * Math.PI) * 0.9) * unit,
+          z: base.z + Math.sin(angle) * progress * unit,
+          scaleX: 0.28 * unit, scaleY: 0.12 * unit, scaleZ: 0.28 * unit,
+          rotationY: angle,
+        });
+      }
+      if (event.type.includes('warning') || event.type.includes('breach')) {
+        const ringScale = (1 + progress * 5) * intensity * unit;
+        this.#appendEffectInstance('shockwave', {
+          ...base, y: 0.08 * unit,
+          scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
+          rotationX: Math.PI / 2,
+        });
+      }
+    }
+    for (const pool of this.effectInstancePools.values()) {
+      pool.mesh.count = pool.count;
+      pool.mesh.instanceMatrix.needsUpdate = true;
+    }
   }
 
   consumePresentationEvents(events, { playerMarker = null } = {}) {
     if (this.disposed) return 0;
     this.playerPresentation = playerMarker ?? this.playerPresentation;
     for (const event of events) {
-      this.#acquirePresentationMesh(event);
+      this.#acquirePresentationEffect(event);
       const parts = this.playerPresentation?.userData?.presentationParts;
       if (parts && event.type.includes('claw')) {
         const left = event.type.includes('left') || event.type.includes('both');
@@ -314,12 +443,11 @@ export class GameplayRenderAdapter {
       const entry = this.activePresentationEffects[index];
       entry.remainingSeconds -= deltaSeconds;
       if (entry.remainingSeconds <= 0) {
-        entry.active = false; entry.mesh.visible = false; entry.event = null;
+        entry.active = false; entry.event = null;
         this.activePresentationEffects.splice(index, 1);
-      } else {
-        entry.mesh.rotation.y += deltaSeconds * 5;
       }
     }
+    this.#syncEffectInstances();
     const player = this.playerPresentation;
     const parts = player?.userData?.presentationParts;
     for (const side of ['left', 'right']) {
@@ -398,11 +526,11 @@ export class GameplayRenderAdapter {
       const centerX = root.position.x + cosine * scaledX + sine * scaledZ;
       const centerY = root.position.y + segment.position.y * Math.abs(root.scale.y || rootScale);
       const centerZ = root.position.z - sine * scaledX + cosine * scaledZ;
-      const radius = (Math.max(
+      const radius = ((segment.userData?.radius ?? Math.max(
         Math.abs(segment.scale.x),
         Math.abs(segment.scale.y),
         Math.abs(segment.scale.z),
-      ) + clearanceFiniteUnits) * rootScale;
+      )) + clearanceFiniteUnits) * rootScale;
       let dx = camera.position.x - centerX;
       let dy = camera.position.y - centerY;
       let dz = camera.position.z - centerZ;
@@ -443,7 +571,13 @@ export class GameplayRenderAdapter {
     mesh.position.set(local.x, (state.bossBehavior?.verticalOffset ?? 0) * this.unitsPerMeter, local.z);
     mesh.rotation.y = state.rotationY;
     for (let index = 0; index < (mesh.userData.segmentMeshes?.length ?? 0); index += 1) {
-      mesh.userData.segmentMeshes[index].visible = (state.bossBehavior?.segmentHp?.[index] ?? 1) > 0;
+      const segment = mesh.userData.segmentMeshes[index];
+      const slither = (state.aiClock ?? 0) * 2.2 - index * 0.58;
+      segment.position.x = Math.sin(slither) * (18 + index * 1.6);
+      segment.position.y = 80 + Math.sin(slither * 1.35) * 8;
+      segment.position.z = -index * 110;
+      segment.rotation.y = Math.sin(slither) * 0.12;
+      segment.visible = (state.bossBehavior?.segmentHp?.[index] ?? 1) > 0;
     }
   }
 
@@ -491,7 +625,7 @@ export class GameplayRenderAdapter {
     const relative = (entry.state.turretRotationY ?? entry.state.rotationY) - entry.state.rotationY;
     if (parts?.turret) parts.turret.rotation.y = relative;
     if (parts?.gun) {
-      parts.gun.rotation.y = relative;
+      parts.gun.rotation.y = 0;
       parts.gun.rotation.x = entry.state.gunPitch ?? 0;
     }
   }
@@ -533,7 +667,9 @@ export class GameplayRenderAdapter {
       if (this.entityMeshes.has(state.stableId)) throw new Error(`duplicate live gameplay Stable ID: ${state.stableId}`);
       const mesh = this.visualAssets.createEntityModel(state.type);
       mesh.name = `production-${state.type}`;
-      mesh.userData = { stableId: state.stableId, ownerChunkKey: key, type: state.type };
+      mesh.userData = {
+        ...(mesh.userData ?? {}), stableId: state.stableId, ownerChunkKey: key, type: state.type,
+      };
       this.#scaleMesh(mesh, state);
       this.#positionMesh(mesh, state, entry);
       group.add(mesh);
@@ -578,6 +714,11 @@ export class GameplayRenderAdapter {
       presentationPoolCapacity: this.presentationPool.length,
       activePresentationEffectCount: this.activePresentationEffects.length,
       presentationPoolLimit: this.presentationPoolLimit,
+      effectInstancePools: Object.freeze(Object.fromEntries(
+        [...this.effectInstancePools].map(([role, pool]) => [role, Object.freeze({
+          count: pool.count, capacity: pool.capacity,
+        })]),
+      )),
       sharedGeometryCount: this.visualAssets.snapshot().sharedGeometryCount,
       sharedMaterialCount: this.visualAssets.snapshot().sharedMaterialCount,
       sharedDisposed: this.disposed
@@ -593,7 +734,8 @@ export class GameplayRenderAdapter {
     this.syncTransientCombat([], []);
     this.syncManualBoss(null);
     this.clearReinforcements();
-    for (const entry of this.presentationPool) this.combatRoot.remove(entry.mesh);
+    for (const pool of this.effectInstancePools.values()) this.combatRoot.remove(pool.mesh);
+    this.effectInstancePools.clear();
     this.presentationPool.length = 0;
     this.activePresentationEffects.length = 0;
     this.scene.remove(this.root);

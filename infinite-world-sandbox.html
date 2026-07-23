@@ -46,17 +46,20 @@
     #crosshair::before, #crosshair::after { content:""; position:absolute; background:rgba(255,255,255,.85); box-shadow:0 0 3px rgba(0,0,0,.8); }
     #crosshair::before { left:0; top:50%; width:100%; height:2px; transform:translateY(-50%); } #crosshair::after { left:50%; top:0; width:2px; height:100%; transform:translateX(-50%); }
     #compass { position: fixed; right: 20px; top: 20px; width: 90px; height: 90px; overflow:hidden; border: 3px solid rgba(255,255,255,.5); border-radius: 50%; background: rgba(0,0,0,.35); z-index: 100; display: none; }
-    #compass-arrow { position: absolute; left: 42px; top: 10px; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-bottom: 56px solid #ff3b1f; transform-origin: 9px 36px; }
+    #compass-arrow { position:absolute; top:50%; left:50%; width:0; height:0; border-left:9px solid transparent; border-right:9px solid transparent; border-bottom:26px solid #ff3300; transform-origin:50% 60%; transform:translate(-50%,-60%) rotate(0deg); }
     #fps-counter { position: fixed; top: 18px; left: 18px; padding: 5px 10px; z-index: 100; display: none; color: #39ff14; background: #0008; font: 13px Consolas, monospace; }
-    #boss-ui { position: fixed; top: 48px; left: 50%; width: min(520px, 80vw); transform: translateX(-50%); z-index: 150; display: none; padding: 10px 16px; text-align: center; background: #000d; border: 2px solid #ff3300; }
-    .boss-bar { position: relative; height: 20px; margin-top: 7px; overflow: hidden; background: #141414; border: 2px solid #000; }
-    #boss-hp-fill { width: 100%; height: 100%; background: #ff2d3f; }
+    #boss-ui { position:fixed; top:20px; left:50%; width:min(500px,80vw); transform:translateX(-50%); z-index:150; display:none; padding:8px 16px; color:#fff; text-align:center; background:rgba(0,0,0,.85); border:2px solid #ff3300; border-radius:6px; box-shadow:0 0 15px rgba(255,0,0,.5); }
+    #boss-title { color:#ff5533; font-size:14px; font-weight:bold; letter-spacing:1px; }
+    .boss-bar { position:relative; height:20px; margin-top:6px; overflow:hidden; background:#141414; border:2px solid #000; image-rendering:pixelated; }
+    #boss-hp-fill { position:relative; z-index:3; width:100%; height:100%; background:#ff2d3f; transition:width .1s linear; }
+    #boss-hp-damage { position:absolute; z-index:1; width:100%; height:100%; background:#ffb020; transition:width .4s linear; }
+    .boss-bar-tick { position:absolute; z-index:4; top:0; bottom:0; width:2px; background:#000; }
     #charge-ui { position: fixed; top: 74%; left: 50%; width: 340px; transform: translate(-50%,-50%); z-index: 150; display: none; text-align: center; }
     #charge-bar { height: 24px; overflow: hidden; background: #0009; border: 3px solid #fffb; border-radius: 7px; }
     #charge-bar-fill { width: 0; height: 100%; background: linear-gradient(90deg,#ffaa00,#ff3300); }
     #news-ticker { position: fixed; top: 0; left: 0; right: 0; height: 32px; z-index: 1800; display: none; overflow: hidden; color: white; background: #c00; line-height: 32px; }
     #news-ticker-text { white-space: nowrap; padding-left: 100%; animation: ticker 25s linear infinite; } @keyframes ticker { to { transform: translateX(-140%); } }
-    #nuclear-flash { position:fixed; inset:0; z-index:1900; pointer-events:none; opacity:0; background:#fff8d8; transition:opacity .3s ease-out; }
+    #nuclear-flash { position:fixed; inset:0; z-index:1900; pointer-events:none; opacity:0; background:#fff; transition:opacity .15s ease-out; }
     .overlay { position: fixed; inset: 0; z-index: 3000; display: none; align-items: center; justify-content: center; background: #080a0ddd; backdrop-filter: blur(7px); }
     .panel { width: min(680px, 92vw); max-height: 90vh; overflow: auto; padding: 26px; color: #ece8e1; background: #16181a; border: 1px solid #ff465566; }
     .panel h2 { margin-top: 0; color: #ff4655; letter-spacing: .08em; }
@@ -65,7 +68,9 @@
     .panel-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
     .panel-btn { min-width: 150px; }
     #resume-overlay { cursor: pointer; color: #00e5ff; font-size: 28px; }
-    #game-over { flex-direction: column; color: #fff; text-align: center; } #game-over h1 { color:#ff3b1f; font-size:72px; }
+    #game-over { flex-direction:column; color:#fff; text-align:center; background:rgba(10,0,0,.92); backdrop-filter:none; }
+    #game-over h1 { margin-bottom:10px; color:#ff3300; font-size:60px; text-shadow:3px 3px 0 #000; }
+    #restart-button { margin-top:25px; min-width:0; padding:16px 36px; color:#fff; background:#ff4500; border:4px solid #fff; border-radius:15px; font-size:26px; text-align:center; }
     #debug-modal { z-index:4500; align-items: flex-start; justify-content: flex-start; padding: 14px; background: #12000de8; }
     #debug-modal .panel { width: min(720px, 94vw); border-color:#ff3fa477; }
     .debug-stats { color:#7dffb2; font: 12px/1.5 Consolas,monospace; white-space:pre-wrap; }
@@ -81,7 +86,7 @@
   <div id="crosshair"></div><div id="fps-counter">FPS: --</div>
   <div id="compass"><div id="compass-arrow"></div></div>
   <div id="ui"><div id="score-line">被害総額: <span id="score">$0</span></div><div id="scale-line">SCALE: <span id="scale-label">MAX</span></div><div id="hp-bar"><div id="hp-bar-lag"></div><div id="hp-bar-fill"></div><div id="hp-text">HP <span id="hp-number">100</span></div></div><div id="atomic-status" class="inactive">ATOMIC: INITIALIZING</div></div>
-  <div id="boss-ui"><div id="boss-title">ギガ・ミミズ</div><div class="boss-bar"><div id="boss-hp-fill"></div></div></div>
+  <div id="boss-ui"><div id="boss-title">ギガ・ミミズ</div><div class="boss-bar"><div id="boss-hp-damage"></div><div id="boss-hp-fill"></div><div class="boss-bar-tick" style="left:25%"></div><div class="boss-bar-tick" style="left:50%"></div><div class="boss-bar-tick" style="left:75%"></div></div></div>
   <div id="charge-ui"><div id="charge-bar"><div id="charge-bar-fill"></div></div><div id="charge-label">ATOMIC CHARGING...</div></div>
   <div id="news-ticker"><div id="news-ticker-text">【緊急特撮ニュース】超巨大地底蟲が出現――防衛軍は警戒レベルを最大へ引き上げました。</div></div>
   <div id="nuclear-flash"></div>

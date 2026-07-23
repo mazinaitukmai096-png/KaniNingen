@@ -36,8 +36,9 @@ function createElement() {
 function createFixture({ exposeDeveloperTools = false, runConfiguration = true } = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
-    'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill',
-    'atomic-status', 'boss-ui', 'charge-ui', 'news-ticker', 'settings-modal',
+    'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill', 'hp-bar-lag',
+    'atomic-status', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
+    'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
     'debug-close-btn', 'debug-summary', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
@@ -320,6 +321,39 @@ test('normal HUD is a read-only adapter and no Boss UI appears without a manual 
   assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
   assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
   assert.equal(fixture.elements.get('atomic-status').textContent, 'ATOMIC: MAX SCALE ONLY');
+  fixture.shell.dispose();
+});
+
+test('Boss HP keeps the finite immediate fill, 500ms damage lag, and tick-ready overlay', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
+  const renderBoss = hp => fixture.shell.renderHud({
+    fps: 60,
+    gameplaySnapshot: {
+      state: {
+        player: { hp: 100, maxHp: 100, score: 0 }, activeScaleStageId: 'MAX',
+        manualBoss: { alive: true, hp, maxHp: 100 }, nuclearCooldownMs: 0,
+        destroyedFeatureCount: 0, destroyedEntityCount: 0,
+      },
+      activeTankCount: 0, activeSimulationChunkCount: 9,
+      simulatedEntityCount: 1, simulatedStaticTargetCount: 0,
+    },
+    runtimeSnapshot: {
+      centerChunkX: 0, centerChunkZ: 0, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 15 } },
+    },
+    saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
+  });
+  fixture.setNow(0); renderBoss(100);
+  fixture.setNow(100); renderBoss(50);
+  assert.equal(fixture.elements.get('boss-hp-fill').style.width, '50%');
+  assert.equal(fixture.elements.get('boss-hp-damage').style.width, '100%');
+  fixture.setNow(599); renderBoss(50);
+  assert.equal(fixture.elements.get('boss-hp-damage').style.width, '100%');
+  fixture.setNow(601); renderBoss(50);
+  assert.equal(fixture.elements.get('boss-hp-damage').style.width, '50%');
+  assert.equal(fixture.elements.get('boss-ui').style.display, 'flex');
   fixture.shell.dispose();
 });
 

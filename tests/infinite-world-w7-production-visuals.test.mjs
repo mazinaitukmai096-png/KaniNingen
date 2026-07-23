@@ -26,6 +26,7 @@ const sha256 = value => createHash('sha256').update(value).digest('hex');
 class Triple {
   constructor() { this.set(0, 0, 0); }
   set(x, y, z) { this.x = x; this.y = y; this.z = z; return this; }
+  setScalar(value) { return this.set(value, value, value); }
 }
 class NodeObject {
   constructor() {
@@ -35,6 +36,9 @@ class NodeObject {
   add(child) { this.children.push(child); child.parent = this; }
   remove(child) { this.children = this.children.filter(value => value !== child); child.parent = null; }
   clear() { for (const child of this.children) child.parent = null; this.children = []; }
+  updateMatrix() {
+    this.matrix = { position: { ...this.position }, rotation: { ...this.rotation }, scale: { ...this.scale } };
+  }
 }
 class Group extends NodeObject {}
 class Geometry { dispose() { this.disposed = true; } }
@@ -49,9 +53,17 @@ class MeshPhongMaterial extends Material {}
 class Mesh extends NodeObject {
   constructor(geometry, material) { super(); this.geometry = geometry; this.material = material; }
 }
+class InstancedMesh extends Mesh {
+  constructor(geometry, material, capacity) {
+    super(geometry, material); this.capacity = capacity; this.count = 0;
+    this.matrices = []; this.instanceMatrix = {};
+  }
+  setMatrixAt(index, matrix) { this.matrices[index] = structuredClone(matrix); }
+}
 const FakeThree = {
   Group, BoxGeometry, ConeGeometry, CylinderGeometry, SphereGeometry,
-  DodecahedronGeometry, MeshLambertMaterial, MeshPhongMaterial, Mesh,
+  DodecahedronGeometry, MeshLambertMaterial, MeshPhongMaterial, Mesh, InstancedMesh,
+  Object3D: NodeObject,
 };
 
 test('W7A visual assets come only from the fixed finite baseline with verified provenance', () => {
@@ -167,6 +179,24 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(parts.rightClaw.children.length, 3);
   assert.equal(parts.legs.length, 8);
 
+  const finiteHuman = assets.createEntityModel('human');
+  assert.equal(countMeshes(finiteHuman), 2);
+  assert.equal(finiteHuman.userData.finiteMeshCount, 2);
+  assert.deepEqual(Object.keys(finiteHuman.userData.presentationParts).sort(), ['body', 'head']);
+  const finiteTank = assets.createEntityModel('tank');
+  assert.equal(countMeshes(finiteTank), 8);
+  assert.equal(finiteTank.userData.finiteMeshCount, 8);
+  assert.equal(finiteTank.userData.presentationParts.gun.parent,
+    finiteTank.userData.presentationParts.turret);
+  assert.equal(finiteTank.userData.presentationParts.muzzle.parent,
+    finiteTank.userData.presentationParts.gun);
+  const finiteBoss = assets.createEntityModel('boss');
+  assert.equal(finiteBoss.userData.segmentMeshes.length, 14);
+  assert.equal(finiteBoss.userData.finiteToothCount, 10);
+  assert.equal(finiteBoss.userData.finiteEyeCount, 4);
+  assert.equal(countMeshes(finiteBoss), 28);
+  assert.equal(finiteBoss.userData.segmentMeshes[0].children.length, 15);
+
   const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
   adapter.consumePresentationEvents([], { playerMarker: player });
   assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
@@ -188,6 +218,24 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   adapter.updatePresentation(0.5);
   assert.notEqual(adapter.getPlayerPresentationOffsetUnits().x, 0);
   assert.equal(parts.visualRoot.position.y, 0);
+
+  adapter.syncTransientCombat([{
+    id: 'tank-shot', ownerStableId: 'tank', type: 'tank-shell', x: 0, z: 0,
+    directionX: 0, directionZ: 1, remainingSeconds: 1,
+  }], []);
+  assert.ok(adapter.projectileMeshes.get('tank-shot').mesh.position.z > 0);
+
+  adapter.consumePresentationEvents([{
+    sequence: 41, type: 'nuclear-destruction', logicalPosition: { x: 0, z: 0 },
+    direction: { x: 0, z: 1 }, intensity: 4, lifetimeSeconds: 2.2, soundCue: 'atomic',
+  }], { playerMarker: player });
+  adapter.updatePresentation(0.1);
+  const nuclearPools = adapter.snapshot().effectInstancePools;
+  assert.equal(nuclearPools.flash.count, 1);
+  assert.equal(nuclearPools.smoke.count, 8);
+  assert.equal(nuclearPools.shockwave.count, 3);
+  assert.equal(nuclearPools.scorch.count, 1);
+  assert.equal(Object.values(nuclearPools).every(pool => pool.count <= pool.capacity), true);
 
   adapter.syncManualBoss({
     stableId: 'manual-boss-camera', alive: true, x: 0, z: 0, rotationY: 0,

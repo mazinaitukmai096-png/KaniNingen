@@ -218,6 +218,10 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
   const supplementalGeometries = Object.freeze({
     cylinder: new CylinderGeometry(0.5, 0.5, 1, 8),
     halfCylinder: new CylinderGeometry(0.5, 0.5, 1, 16, 1, false, Math.PI / 2, Math.PI),
+    torus: new (requireType(THREE, 'TorusGeometry', 'CylinderGeometry'))(0.5, 0.055, 6, 24),
+    windArc: new (requireType(THREE, 'TorusGeometry', 'CylinderGeometry'))(
+      0.5, 0.045, 6, 20, Math.PI * 1.35,
+    ),
   });
   const settlementPaletteMaterials = {};
   for (const palette of Object.values(SETTLEMENT_BUILDING_PALETTES)) {
@@ -226,6 +230,10 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     }
   }
   const supplementalMaterials = {
+    humanBody: phong(0x3366ff),
+    skin: phong(0xffccaa),
+    tank: phong(0x4a6523, { shininess: 40 }),
+    charred: phong(0x333333),
     playerCrab: phong(0xff4500),
     playerWhiteEye: phong(0xffffff, { shininess: 60 }),
     playerBlackEye: phong(0x111111, { shininess: 100 }),
@@ -253,6 +261,17 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     water: phong(0x2f6fa8, { transparent: true, opacity: 0.82, shininess: 70, depthWrite: false }),
     scorch: material(0x241b18, { transparent: true, opacity: 0.72 }),
     blood: material(0x7e1019), acid: material(0x7cff31),
+    bossSegmentDark: phong(0x4a1c2c, { shininess: 40 }),
+    bossSegmentMid: phong(0x63263a, { shininess: 40 }),
+    bossSegmentLight: phong(0x7b354b, { shininess: 40 }),
+    bossTeeth: phong(0xeeeedd, { shininess: 80 }),
+    bossEyeCyan: phong(0x00ffcc, { shininess: 100, emissive: 0x004c3d }),
+    atomicFlash: phong(0xfff2b0, { transparent: true, opacity: 0.82, depthWrite: false }),
+    shockwave: phong(0xffb020, { transparent: true, opacity: 0.72, depthWrite: false }),
+    wind: phong(0xd8f7ff, { transparent: true, opacity: 0.5, depthWrite: false }),
+    smoke: phong(0x4a413d, { transparent: true, opacity: 0.68, depthWrite: false }),
+    lobbyFire: phong(0xff5500, { emissive: 0x662200, shininess: 0 }),
+    lobbySmoke: phong(0x1a1a1a, { shininess: 0 }),
     cloud: phong(0xffffff, {
       transparent: true, opacity: 0.72, depthWrite: false, shininess: 4,
     }),
@@ -322,35 +341,86 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
 
   function createHumanModel() {
     const group = base.createEntityModel('human');
-    const leftArm = appendPart(group, 'box', 'humanBody', [-24, 42, 0], [12, 62, 12], 'left-arm');
-    const rightArm = appendPart(group, 'box', 'humanBody', [24, 42, 0], [12, 62, 12], 'right-arm');
-    const leftLeg = appendPart(group, 'box', 'charred', [-13, -4, 0], [15, 62, 16], 'left-leg');
-    const rightLeg = appendPart(group, 'box', 'charred', [13, -4, 0], [15, 62, 16], 'right-leg');
-    group.userData.presentationParts = { leftArm, rightArm, leftLeg, rightLeg };
+    group.userData = {
+      ...(group.userData ?? {}),
+      presentationParts: { body: group.children[0] ?? null, head: group.children[1] ?? null },
+      finiteMeshCount: 2,
+    };
     return group;
   }
 
   function createTankModel() {
     const group = base.createEntityModel('tank');
-    group.userData.presentationParts = {
-      turret: group.children[3] ?? null,
-      gun: group.children[5] ?? null,
+    group.clear?.();
+    const chassis = appendPart(group, 'box', 'tank', [0, 30, 0], [100, 35, 140], 'chassis');
+    appendPart(group, 'box', 'charred', [-61, 20, 0], [22, 40, 160], 'left-track');
+    appendPart(group, 'box', 'charred', [61, 20, 0], [22, 40, 160], 'right-track');
+    const turret = new Group();
+    turret.name = 'finite-tank-turret-pivot';
+    turret.position.set(0, 60, -10);
+    const turretBody = appendPart(turret, 'box', 'tank', [0, 0, 0], [65, 26, 75], 'turret-body');
+    appendPart(turret, 'box', 'charred', [16, 14, -10], [24, 5, 24], 'hatch');
+    const gun = new Group();
+    gun.name = 'finite-tank-gun-pivot';
+    gun.position.set(0, 0, 32);
+    appendPart(gun, 'box', 'tank', [0, 0, 45], [8, 8, 90], 'barrel');
+    const muzzle = appendPart(gun, 'box', 'charred', [0, 0, 90], [14, 14, 16], 'muzzle');
+    turret.add(gun);
+    group.add(turret);
+    const exhaust = appendPart(group, 'box', 'charred', [-35, 35, -70], [8, 22, 8], 'exhaust');
+    group.userData = {
+      ...(group.userData ?? {}),
+      presentationParts: { chassis, turret, turretBody, gun, muzzle, exhaust },
+      finiteMeshCount: 8,
     };
     return group;
   }
 
   function createBossModel() {
     const group = base.createEntityModel('boss');
+    group.clear?.();
     const segments = [];
     for (let index = 0; index < 14; index += 1) {
-      const taper = 1 - index * 0.035;
-      segments.push(appendPart(
-        group, 'dodeca', index > 10 ? 'charred' : 'boss',
-        [0, 205 - index * 5, -270 - index * 210],
-        [255 * taper, 205 * taper, 245 * taper], `boss-segment-${index}`,
-      ));
+      const radius = 140 - index * 7.5;
+      const segment = new Group();
+      segment.name = `finite-boss-segment-${index}`;
+      segment.position.set(0, 80, -index * 110);
+      segment.userData = { radius, segmentIndex: index };
+      const segmentMaterial = index < 5 ? 'bossSegmentDark'
+        : index < 10 ? 'bossSegmentMid' : 'bossSegmentLight';
+      appendPart(segment, 'sphere', segmentMaterial, [0, 0, 0], [radius, radius * 0.9, radius],
+        `boss-segment-body-${index}`);
+      if (index === 0) {
+        for (let toothIndex = 0; toothIndex < 10; toothIndex += 1) {
+          const angle = toothIndex / 10 * Math.PI * 2;
+          const toothScale = radius * 0.12;
+          appendPart(segment, 'cone', 'bossTeeth', [
+            Math.cos(angle) * radius * 0.35,
+            Math.sin(angle) * radius * 0.35,
+            radius * 0.42,
+          ], [toothScale, toothScale * 2.8, toothScale],
+          `boss-tooth-${toothIndex}`).rotation.set(Math.PI / 2, 0, -angle);
+        }
+        for (let eyeIndex = 0; eyeIndex < 4; eyeIndex += 1) {
+          const angle = eyeIndex / 4 * Math.PI * 2 + 0.3;
+          const eyeScale = radius * 0.08;
+          appendPart(segment, 'sphere', 'bossEyeCyan', [
+            Math.cos(angle) * radius * 0.42,
+            Math.sin(angle) * radius * 0.42,
+            radius * 0.2,
+          ], [eyeScale, eyeScale, eyeScale], `boss-eye-${eyeIndex}`);
+        }
+      }
+      group.add(segment);
+      segments.push(segment);
     }
-    group.userData.segmentMeshes = segments;
+    group.userData = {
+      ...(group.userData ?? {}),
+      segmentMeshes: segments,
+      finiteSegmentCount: 14,
+      finiteToothCount: 10,
+      finiteEyeCount: 4,
+    };
     return group;
   }
 

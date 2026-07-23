@@ -270,6 +270,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.doesNotMatch(environment.hud.innerHTML, /起動中/);
 
     const gameplayScene = Scene.instances[0];
+    assert.equal(Scene.instances.length, 1);
+    assert.equal(PerspectiveCamera.instances.length, 1);
     const gameplayCamera = PerspectiveCamera.instances[0];
     const gameplayFog = Fog.instances[0];
     assert.equal(gameplayCamera.fov, 70);
@@ -306,6 +308,21 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(distantWorld.children.some(child => child.name.includes('finite-language-proxy')));
     assert.equal(distantWorld.children.filter(child => child.userData?.presentationOnly)
       .every(child => child.castShadow === false && child.receiveShadow === false), true);
+    const titlePresentation = gameplayScene.children.find(
+      child => child.name === 'w8-main-world-title-presentation',
+    );
+    assert.ok(titlePresentation);
+    assert.equal(titlePresentation.userData.presentationOnly, true);
+    assert.ok(titlePresentation.children.some(child => child.name === 'w8-finite-parity-player-crab'));
+    const titleAtomic = titlePresentation.children.find(
+      child => child.name === 'w8-title-atomic-presentation',
+    );
+    assert.ok(titleAtomic);
+    assert.equal(titleAtomic.userData.finiteBaseCount, 50);
+    assert.equal(titleAtomic.userData.finiteStemCount, 80);
+    assert.equal(titleAtomic.userData.finiteCapCount, 200);
+    assert.equal(titleAtomic.children.length, 2);
+    assert.equal(titleAtomic.children.reduce((sum, child) => sum + child.count, 0), 330);
 
     const renderedKeys = new Set(snapshot.runtime.renderedKeys);
     assert.equal(Object.keys(snapshot.resources.chunkRenderables).every(key => renderedKeys.has(key)), true);
