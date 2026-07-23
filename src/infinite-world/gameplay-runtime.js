@@ -390,11 +390,10 @@ export class InfiniteGameplayRuntime {
     this.pendingTankReinforcement = null;
     this.tankSpawnFrameAccumulator = 0;
     this.tankSpawnFrame = 0;
-    this.reinforcementIds = new Set(
-      [...this.state.entityStates.values()]
-        .filter(entity => entity.type === 'tank' && (entity.reinforcementSequence ?? 0) > 0)
-        .map(entity => entity.stableId),
-    );
+    this.tankBindings = new Map();
+    this.activeTankOccurrences = new Map();
+    this.tankOccurrenceGenerations = new Map();
+    this.reinforcementIds = new Set();
     this.isShutdown = false;
     this.counts = {
       chunksLoaded: 0,
@@ -416,6 +415,7 @@ export class InfiniteGameplayRuntime {
       nuclearTargetsHit: 0,
       manualBossSpawns: 0,
     };
+    this.#rebuildTankOccurrences({ sync: false });
   }
 
   #emitPresentationEvent({
@@ -582,24 +582,148 @@ export class InfiniteGameplayRuntime {
     return true;
   }
 
+  #bindTank(entity, descriptor = null) {
+    if (entity?.type !== 'tank') return null;
+    const reinforcement = (entity.reinforcementSequence ?? 0) > 0;
+    const existing = this.tankBindings.get(entity.stableId);
+    const baseStableId = descriptor?.baseStableId ?? existing?.baseStableId ?? null;
+    const baseX = descriptor?.baseX ?? existing?.baseX ?? entity.baseX;
+    const baseY = descriptor?.baseY ?? existing?.baseY ?? 0;
+    const baseZ = descriptor?.baseZ ?? existing?.baseZ ?? entity.baseZ;
+    const baseOwnerChunkKey = descriptor?.baseOwnerChunkKey
+      ?? existing?.baseOwnerChunkKey
+      ?? entity.ownerChunkKey;
+    if (!reinforcement && descriptor) {
+      if (typeof baseStableId !== 'string' || !baseStableId) {
+        throw new Error(`Tank slot ${entity.stableId} has no canonical Military Base binding`);
+      }
+      if (existing?.baseStableId && existing.baseStableId !== baseStableId) {
+        throw new Error(
+          `Tank slot ${entity.stableId} changed Military Base binding `
+          + `${existing.baseStableId} -> ${baseStableId}`,
+        );
+      }
+      if (baseOwnerChunkKey !== entity.ownerChunkKey) {
+        throw new Error(
+          `Tank slot ${entity.stableId} owner ${entity.ownerChunkKey} `
+          + `does not match Military Base owner ${baseOwnerChunkKey}`,
+        );
+      }
+    }
+    const binding = Object.freeze({
+      slotStableId: entity.stableId,
+      kind: reinforcement ? 'fallback' : 'base',
+      baseStableId,
+      baseX,
+      baseY,
+      baseZ,
+      baseOwnerChunkKey,
+    });
+    this.tankBindings.set(entity.stableId, binding);
+    return binding;
+  }
+
+  #startTankOccurrence(entity, { sync = true } = {}) {
+    if (!entity?.alive || entity.spawned !== true) return null;
+    const existing = this.activeTankOccurrences.get(entity.stableId);
+    if (existing) {
+      existing.currentOwnerChunkKey = logicalWorldToOwnedChunk(entity.x, entity.z).key;
+      if (sync) this.#syncTank(entity);
+      return existing;
+    }
+    const binding = this.#bindTank(entity);
+    const runtimeGeneration = (this.tankOccurrenceGenerations.get(entity.stableId) ?? 0) + 1;
+    this.tankOccurrenceGenerations.set(entity.stableId, runtimeGeneration);
+    const occurrence = {
+      slotStableId: entity.stableId,
+      kind: binding.kind,
+      runtimeGeneration,
+      currentOwnerChunkKey: logicalWorldToOwnedChunk(entity.x, entity.z).key,
+    };
+    this.activeTankOccurrences.set(entity.stableId, occurrence);
+    if (binding.kind === 'fallback') this.reinforcementIds.add(entity.stableId);
+    if (sync) this.#syncTank(entity);
+    return occurrence;
+  }
+
+  #removeTankOccurrence(entity, { destroyed = false } = {}) {
+    if (!entity?.stableId) return false;
+    const stableId = entity.stableId;
+    const occurrence = this.activeTankOccurrences.get(stableId);
+    if (destroyed) {
+      entity.hp = 0;
+      entity.alive = false;
+    }
+    entity.spawned = false;
+    entity.aiState = destroyed ? 'destroyed' : 'reserve';
+    this.projectiles = this.projectiles.filter(projectile =>
+      projectile.ownerStableId !== stableId
+      || (projectile.ownerRuntimeGeneration !== undefined
+        && occurrence
+        && projectile.ownerRuntimeGeneration !== occurrence.runtimeGeneration));
+    this.activeTankOccurrences.delete(stableId);
+    this.renderAdapter.removeReinforcement?.(stableId);
+    if ((entity.reinforcementSequence ?? 0) > 0) {
+      this.state.removeEntity?.(stableId);
+      this.reinforcementIds.delete(stableId);
+      this.stableIdOwners.delete(stableId);
+      this.tankBindings.delete(stableId);
+    } else {
+      this.renderAdapter.syncEntity(entity);
+    }
+    return occurrence !== undefined;
+  }
+
+  #rebuildTankOccurrences({ sync = true } = {}) {
+    for (const stableId of this.reinforcementIds) {
+      this.stableIdOwners.delete(stableId);
+      this.tankBindings.delete(stableId);
+    }
+    for (const stableId of [...this.tankBindings.keys()]) {
+      if (!this.state.entityStates.has(stableId)) this.tankBindings.delete(stableId);
+    }
+    this.activeTankOccurrences.clear();
+    this.reinforcementIds.clear();
+    if (sync) this.renderAdapter.clearReinforcements?.();
+    for (const entity of this.state.entityStates.values()) {
+      if (entity.type !== 'tank') continue;
+      this.#bindTank(entity);
+      this.#registerStableId(entity.stableId, entity.ownerChunkKey);
+      if ((entity.reinforcementSequence ?? 0) > 0) this.reinforcementIds.add(entity.stableId);
+      if (entity.alive && entity.spawned === true) this.#startTankOccurrence(entity, { sync });
+      else if (sync) this.#syncTank(entity);
+    }
+  }
+
   #syncTank(entity) {
-    if ((entity.reinforcementSequence ?? 0) > 0) this.renderAdapter.syncReinforcement?.(entity);
-    else this.renderAdapter.syncEntity(entity);
+    if (!entity?.stableId) return false;
+    if (entity.alive && entity.spawned === true
+      && this.activeTankOccurrences.has(entity.stableId)) {
+      const binding = this.tankBindings.get(entity.stableId) ?? this.#bindTank(entity);
+      const usesOccurrenceRenderer = binding.kind === 'fallback'
+        || !this.activeChunks.has(binding.baseOwnerChunkKey);
+      if (usesOccurrenceRenderer) {
+        return this.renderAdapter.syncReinforcement?.(entity) ?? false;
+      }
+      this.renderAdapter.removeReinforcement?.(entity.stableId);
+      return this.renderAdapter.syncEntity(entity);
+    }
+    this.renderAdapter.removeReinforcement?.(entity.stableId);
+    if ((entity.reinforcementSequence ?? 0) === 0) return this.renderAdapter.syncEntity(entity);
+    return false;
   }
 
   #updateTank(entity, player, deltaSeconds) {
     if (!entity?.alive || entity.spawned !== true) {
-      if (entity) this.#syncTank(entity);
+      if (entity) this.#removeTankOccurrence(entity, { destroyed: entity.alive === false });
       return;
     }
+    entity.aiClock += deltaSeconds;
     const contract = W6_ENTITY_CONTRACTS.tank;
     const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
     const distance = Math.sqrt(distanceSquared(entity, player));
     if (distance >= finiteWorldUnitsToMeters(contract.despawnDistance)) {
-      entity.spawned = false;
-      entity.aiState = 'reserve';
-      this.projectiles = this.projectiles.filter(projectile => projectile.ownerStableId !== entity.stableId);
-      this.#syncTank(entity);
+      this.#removeTankOccurrence(entity);
       return;
     }
     if (distance > finiteWorldUnitsToMeters(contract.engageRange)) {
@@ -640,6 +764,10 @@ export class InfiniteGameplayRuntime {
       const speed = finiteWorldFrameSpeedToMetersPerSecond(contract.moveSpeed);
       entity.x += Math.sin(entity.rotationY) * speed * deltaSeconds;
       entity.z += Math.cos(entity.rotationY) * speed * deltaSeconds;
+      const occurrence = this.activeTankOccurrences.get(entity.stableId);
+      if (occurrence) {
+        occurrence.currentOwnerChunkKey = logicalWorldToOwnedChunk(entity.x, entity.z).key;
+      }
       if ((entity.reinforcementSequence ?? 0) > 0) {
         const owner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
         if (owner !== entity.ownerChunkKey) {
@@ -694,21 +822,28 @@ export class InfiniteGameplayRuntime {
   }
 
   #activateBaseTank(entity, spawnFrame) {
+    const binding = this.tankBindings.get(entity.stableId) ?? this.#bindTank(entity);
     const scatter = W8_TANK_LIFECYCLE_CONTRACT.baseSpawnScatterMeters;
     const key = `${this.worldSeedHash}:${entity.stableId}:${spawnFrame}`;
-    entity.x = entity.baseX + (deterministicUnitFloat(`${key}:x`) - 0.5) * scatter;
-    entity.z = entity.baseZ + (deterministicUnitFloat(`${key}:z`) - 0.5) * scatter;
+    entity.x = binding.baseX + (deterministicUnitFloat(`${key}:x`) - 0.5) * scatter;
+    entity.z = binding.baseZ + (deterministicUnitFloat(`${key}:z`) - 0.5) * scatter;
     entity.rotationY = deterministicUnitFloat(`${key}:heading`) * Math.PI * 2;
     entity.turretRotationY = entity.rotationY;
     entity.gunPitch = 0;
+    entity.hp = entity.maxHp;
+    entity.alive = true;
     entity.spawned = true;
     entity.aiState = 'acquire';
-    entity.lastShotAtMs = this.state.gameplayTimeMs;
+    entity.aiClock = 0;
+    entity.fireSequence = 0;
+    entity.lastShotAtMs = 0;
     entity.stuckCheckClock = 0;
     entity.stuckRemainingSeconds = 0;
+    entity.avoidAngle = entity.rotationY;
     entity.lastX = entity.x;
     entity.lastZ = entity.z;
-    this.#syncTank(entity);
+    this.projectiles = this.projectiles.filter(projectile => projectile.ownerStableId !== entity.stableId);
+    this.#startTankOccurrence(entity);
   }
 
   #spawnFallbackTank(player, spawnFrame) {
@@ -738,10 +873,10 @@ export class InfiniteGameplayRuntime {
         maxHp: W6_ENTITY_CONTRACTS.tank.maxHp,
         x, z, rotationY: normalizedAngle(angle + Math.PI), aiState: 'acquire',
         reinforcementSequence: sequence, spawned: true,
-        lastShotAtMs: this.state.gameplayTimeMs,
+        lastShotAtMs: 0,
       });
-      this.reinforcementIds.add(tank.stableId);
-      this.renderAdapter.syncReinforcement(tank);
+      this.#bindTank(tank);
+      this.#startTankOccurrence(tank);
     })();
     this.pendingTankReinforcement = pending;
     void pending.finally(() => {
@@ -762,19 +897,22 @@ export class InfiniteGameplayRuntime {
         lifecycle.tankLimitMaximum,
         lifecycle.normalTankBaseLimit + Math.floor(this.state.player.score / lifecycle.tankLimitScoreDivisor),
       );
-      const active = [...this.state.entityStates.values()]
-        .filter(entity => entity.type === 'tank' && entity.alive && entity.spawned === true).length;
+      const active = this.activeTankOccurrences.size;
       if (active >= allowed) continue;
       const chance = lifecycle.spawnChanceBasePerFrame + Math.min(
         lifecycle.spawnChanceMaximumBonusPerFrame,
         this.state.player.score * lifecycle.spawnChanceScoreFactor,
       );
       if (deterministicUnitFloat(`${this.worldSeedHash}:tank-spawn:${this.tankSpawnFrame}`) >= chance) continue;
-      const nearbyBases = [...this.state.entityStates.values()]
-        .filter(entity => entity.type === 'tank' && entity.alive && entity.spawned !== true
-          && (entity.reinforcementSequence ?? 0) === 0
-          && this.activeChunks.has(entity.ownerChunkKey)
-          && distanceSquared(entity, player) < lifecycle.baseSpawnRangeMeters ** 2)
+      const nearbyBases = [...this.tankBindings.values()]
+        .filter(binding => binding.kind === 'base'
+          && binding.baseStableId
+          && !this.state.isFeatureDestroyed(binding.baseStableId)
+          && this.activeChunks.has(binding.baseOwnerChunkKey)
+          && distanceSquared({ x: binding.baseX, z: binding.baseZ }, player)
+            < lifecycle.baseSpawnRangeMeters ** 2)
+        .map(binding => this.state.entityStates.get(binding.slotStableId))
+        .filter(entity => entity && entity.spawned !== true)
         .sort((a, b) => a.stableId.localeCompare(b.stableId));
       if (nearbyBases.length > 0) {
         const selection = Math.floor(
@@ -805,7 +943,10 @@ export class InfiniteGameplayRuntime {
       if (desired.has(key)) continue;
       await this.renderAdapter.unloadChunk(key);
       this.activeChunks.delete(key);
-      this.projectiles = this.projectiles.filter(projectile => projectile.ownerChunkKey !== key);
+      this.projectiles = this.projectiles.filter(projectile =>
+        projectile.ownerChunkKey !== key
+        || (projectile.ownerStableId
+          && this.activeTankOccurrences.has(projectile.ownerStableId)));
       this.counts.chunksUnloaded += 1;
     }
     for (const key of sorted(desired)) {
@@ -826,14 +967,26 @@ export class InfiniteGameplayRuntime {
         this.#registerStableId(descriptor.stableId, key);
         const existed = this.state.entityStates.has(descriptor.stableId);
         const entityState = this.state.ensureEntity(descriptor);
+        if (entityState.type === 'tank') {
+          this.#bindTank(entityState, descriptor);
+          if (entityState.alive && entityState.spawned === true) {
+            this.#startTankOccurrence(entityState, { sync: false });
+          }
+        }
         if (existed) this.counts.revisits += 1;
         return entityState;
       });
       this.activeChunks.set(key, model);
       await this.renderAdapter.loadChunk(key, entityStates);
+      for (const entityState of entityStates) {
+        if (entityState.type === 'tank') this.#syncTank(entityState);
+      }
       this.counts.chunksLoaded += 1;
     }
     if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
+    for (const occurrence of this.activeTankOccurrences.values()) {
+      this.#syncTank(this.state.entityStates.get(occurrence.slotStableId));
+    }
     await this.renderAdapter.rebase(renderOrigin);
     this.renderAdapter.syncManualBoss?.(
       this.state.manualBossStableId
@@ -885,6 +1038,12 @@ export class InfiniteGameplayRuntime {
       for (const descriptor of model.entityDescriptors) {
         const entity = this.state.entityStates.get(descriptor.stableId);
         if (!entity?.alive) continue;
+        if (entity.type === 'tank') {
+          if (entity.spawned === true && !this.activeTankOccurrences.has(entity.stableId)) {
+            this.#startTankOccurrence(entity);
+          }
+          continue;
+        }
         const distance = Math.sqrt(distanceSquared(entity, player));
         if (entity.type === 'human') {
           const contract = W6_ENTITY_CONTRACTS.human;
@@ -909,8 +1068,6 @@ export class InfiniteGameplayRuntime {
             entity.z += Math.cos(entity.rotationY) * finiteWorldFrameSpeedToMetersPerSecond(contract.idleSpeed) * boundedDelta;
             clampToOwner(entity);
           }
-        } else if (entity.type === 'tank') {
-          this.#updateTank(entity, player, boundedDelta);
         } else if (entity.type === 'boss') {
           const contract = W6_ENTITY_CONTRACTS.boss;
           if (distance > finiteWorldUnitsToMeters(contract.approachDistance)) {
@@ -920,10 +1077,8 @@ export class InfiniteGameplayRuntime {
           }
         }
         entity.aiClock += boundedDelta;
-        if (entity.type !== 'tank') {
-          this.renderAdapter.syncEntity(entity);
-          this.counts.entityUpdates += 1;
-        }
+        this.renderAdapter.syncEntity(entity);
+        this.counts.entityUpdates += 1;
       }
     }
     const manualBoss = this.state.manualBossStableId
@@ -986,8 +1141,8 @@ export class InfiniteGameplayRuntime {
     } else {
       this.renderAdapter.syncManualBoss?.(manualBoss);
     }
-    for (const stableId of this.reinforcementIds) {
-      this.#updateTank(this.state.entityStates.get(stableId), player, boundedDelta);
+    for (const occurrence of [...this.activeTankOccurrences.values()]) {
+      this.#updateTank(this.state.entityStates.get(occurrence.slotStableId), player, boundedDelta);
     }
     this.#maintainFiniteTankSpawns(player, boundedDelta);
     const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
@@ -1411,14 +1566,7 @@ export class InfiniteGameplayRuntime {
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.lastAttackAt = -Infinity;
-    for (const entity of this.state.entityStates.values()) {
-      if (entity.type !== 'tank' || entity.spawned !== true || !entity.alive) continue;
-      entity.aiState = 'acquire';
-      entity.lastShotAtMs = this.state.gameplayTimeMs;
-      entity.stuckCheckClock = 0;
-      entity.stuckRemainingSeconds = 0;
-      this.#syncTank(entity);
-    }
+    this.#rebuildTankOccurrences();
     this.#syncTransientCombat();
     return this.snapshot();
   }
@@ -1431,7 +1579,11 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.activeTankOccurrences.clear();
+    this.tankBindings.clear();
+    this.tankOccurrenceGenerations.clear();
     this.reinforcementIds.clear();
+    this.stableIdOwners.clear();
     this.tankSpawnFrameAccumulator = 0;
     this.tankSpawnFrame = 0;
     this.renderAdapter.clearReinforcements?.();
@@ -1463,10 +1615,25 @@ export class InfiniteGameplayRuntime {
   async refreshFromState({ renderOrigin } = {}) {
     const activeModels = [...this.activeChunks.entries()];
     for (const [key] of activeModels) await this.renderAdapter.unloadChunk(key);
+    this.renderAdapter.clearReinforcements?.();
+    this.activeTankOccurrences.clear();
+    this.reinforcementIds.clear();
+    this.tankBindings.clear();
+    this.stableIdOwners.clear();
+    for (const entity of this.state.entityStates.values()) {
+      this.#registerStableId(entity.stableId, entity.ownerChunkKey);
+    }
     for (const [key, model] of activeModels) {
-      const states = model.entityDescriptors.map(descriptor => this.state.ensureEntity(descriptor));
+      for (const target of model.staticTargets) this.#registerStableId(target.stableId, key);
+      const states = model.entityDescriptors.map(descriptor => {
+        this.#registerStableId(descriptor.stableId, key);
+        const entity = this.state.ensureEntity(descriptor);
+        if (entity.type === 'tank') this.#bindTank(entity, descriptor);
+        return entity;
+      });
       await this.renderAdapter.loadChunk(key, states);
     }
+    this.#rebuildTankOccurrences();
     await this.renderAdapter.rebase(renderOrigin);
     this.renderAdapter.syncManualBoss?.(
       this.state.manualBossStableId
@@ -1483,9 +1650,7 @@ export class InfiniteGameplayRuntime {
     const simulatedStaticTargetCount = [...this.activeChunks.values()].reduce(
       (sum, model) => sum + model.staticTargets.length, 0,
     );
-    const activeTankCount = [...this.state.entityStates.values()]
-      .filter(entity => entity.type === 'tank' && entity.alive && entity.spawned === true
-        && this.activeChunks.has(entity.ownerChunkKey)).length;
+    const activeTankCount = this.activeTankOccurrences.size;
     return Object.freeze({
       schemaVersion: 'w6-infinite-gameplay-runtime-1',
       activeSimulationChunkCount: this.activeChunks.size,
@@ -1507,6 +1672,10 @@ export class InfiniteGameplayRuntime {
     await this.renderAdapter.shutdown();
     this.activeChunks.clear();
     this.stableIdOwners.clear();
+    this.activeTankOccurrences.clear();
+    this.tankBindings.clear();
+    this.tankOccurrenceGenerations.clear();
+    this.reinforcementIds.clear();
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
     this.renderAdapter.syncManualBoss?.(null);

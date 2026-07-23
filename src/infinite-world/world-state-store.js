@@ -328,6 +328,29 @@ function validateEntityStates(records) {
   return result;
 }
 
+function hydrateTankLifecycle(entityStates, tankReinforcementSequence) {
+  let highestActiveReinforcementSequence = 0;
+  for (const [stableId, state] of entityStates) {
+    if (state.type !== 'tank') continue;
+    if (state.reinforcementSequence === 0) {
+      if (!state.alive && state.spawned) state.spawned = false;
+      continue;
+    }
+    if (!state.alive || !state.spawned) {
+      entityStates.delete(stableId);
+      continue;
+    }
+    highestActiveReinforcementSequence = Math.max(
+      highestActiveReinforcementSequence,
+      state.reinforcementSequence,
+    );
+  }
+  if (tankReinforcementSequence < highestActiveReinforcementSequence) {
+    throw new Error('tankReinforcementSequence is lower than an active fallback Tank sequence');
+  }
+  return entityStates;
+}
+
 export class InfiniteWorldState {
   constructor({ worldSeedHash, worldSeed = worldSeedHash, playerSpawn } = {}) {
     this.worldSeedHash = requiredString(worldSeedHash, 'worldSeedHash');
@@ -506,6 +529,17 @@ export class InfiniteWorldState {
     return state;
   }
 
+  removeEntity(stableId) {
+    const entityStableId = requiredString(stableId, 'entity stableId');
+    if (!this.entityStates.delete(entityStableId)) return false;
+    if (this.manualBossStableId === entityStableId) {
+      this.manualBossStableId = null;
+      this.manualBossSequence = 0;
+    }
+    this.revision += 1;
+    return true;
+  }
+
   setManualBoss(stableId, sequence) {
     const entity = this.entityStates.get(requiredString(stableId, 'manual Boss Stable ID'));
     if (!entity || entity.type !== 'boss') throw new Error('manual Boss must exist in the entity registry');
@@ -643,6 +677,7 @@ export class InfiniteWorldState {
       candidate.tankReinforcementSequence,
       'tankReinforcementSequence',
     );
+    hydrateTankLifecycle(entityStates, tankReinforcementSequence);
     const gameplayTimeMs = nonNegative(candidate.gameplayTimeMs ?? 0, 'gameplayTimeMs');
     if (!Number.isSafeInteger(manualBossSequence) || manualBossSequence < 0) {
       throw new TypeError('manualBossSequence must be a non-negative integer');
@@ -681,7 +716,10 @@ export class InfiniteWorldState {
       featureDamageCount: this.featureDamage.size,
       destroyedFeatureCount: [...this.featureDamage.values()].filter(value => value.destroyed).length,
       entityStateCount: this.entityStates.size,
-      destroyedEntityCount: [...this.entityStates.values()].filter(value => !value.alive).length,
+      destroyedEntityCount: [...this.entityStates.values()].filter(value => !value.alive
+        && !(value.type === 'tank'
+          && value.reinforcementSequence === 0
+          && value.spawned === false)).length,
       manualBoss: this.manualBossStableId === null ? null : Object.freeze({
         stableId: this.manualBossStableId,
         sequence: this.manualBossSequence,

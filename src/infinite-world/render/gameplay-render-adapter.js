@@ -632,6 +632,9 @@ export class GameplayRenderAdapter {
 
   syncReinforcement(state) {
     if (this.disposed) return false;
+    if (!state?.alive || state.spawned !== true) return this.removeReinforcement(state?.stableId);
+    const loadedEntity = this.entityMeshes.get(state.stableId);
+    if (loadedEntity) loadedEntity.mesh.visible = false;
     let entry = this.reinforcementMeshes.get(state.stableId);
     if (!entry) {
       const mesh = this.visualAssets.createEntityModel('tank');
@@ -648,9 +651,20 @@ export class GameplayRenderAdapter {
     return true;
   }
 
+  removeReinforcement(stableId) {
+    if (typeof stableId !== 'string' || !stableId) return false;
+    const entry = this.reinforcementMeshes.get(stableId);
+    if (!entry) return false;
+    this.combatRoot.remove(entry.mesh);
+    this.reinforcementMeshes.delete(stableId);
+    const loadedEntity = this.entityMeshes.get(stableId);
+    if (loadedEntity) this.#positionMesh(loadedEntity.mesh, entry.state, loadedEntity.entry);
+    this.counts.transientRemoved += 1;
+    return true;
+  }
+
   clearReinforcements() {
-    for (const entry of this.reinforcementMeshes.values()) this.combatRoot.remove(entry.mesh);
-    this.reinforcementMeshes.clear();
+    for (const stableId of [...this.reinforcementMeshes.keys()]) this.removeReinforcement(stableId);
   }
 
   async loadChunk(key, entityStates) {
