@@ -107,6 +107,30 @@ test('W8 selects a deterministic pond start and every surface consumer retains t
         rotationY: landmark.rotationY,
       }) >= W8_SPAWN_SAFETY_CONTRACT.playerClearanceMeters);
     }
+    for (const candidate of prepared.presentationLayers.natural.vegetation) {
+      const radius = candidate.metadata?.candidateRadiusMeters ?? 0.625;
+      for (const feature of prepared.settlementFeatures ?? []) {
+        if (feature.featureType === 'settlement-road') {
+          assert.ok(distanceToSegment(candidate.worldPosition, feature.start, feature.end)
+            > feature.widthMeters / 2 + radius);
+          continue;
+        }
+        if (feature.featureType !== 'settlement-building') continue;
+        assert.ok(pointToRotatedRectangleDistance(candidate.worldPosition, {
+          x: feature.worldPosition.x, z: feature.worldPosition.z,
+          width: feature.widthMeters, depth: feature.depthMeters,
+          rotationY: feature.rotationY,
+        }) > radius);
+        for (const surface of [feature.lot?.path, feature.lot?.forecourt]) {
+          if (!surface) continue;
+          assert.ok(pointToRotatedRectangleDistance(candidate.worldPosition, {
+            x: surface.centerX, z: surface.centerZ,
+            width: surface.width, depth: surface.depth,
+            rotationY: surface.rotationY,
+          }) > radius);
+        }
+      }
+    }
   }
   const height = sampleW8SurfaceHeightMeters(
     chunk,

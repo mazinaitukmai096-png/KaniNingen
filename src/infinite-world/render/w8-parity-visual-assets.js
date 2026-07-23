@@ -4,13 +4,125 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
+import { SETTLEMENT_BUILDING_PALETTES } from '../../settlement-building-visuals.js';
 
-const descriptor = (geometry, material, position, scale, rotation = [0, 0, 0]) => Object.freeze({
-  geometry, material, position, scale, rotation,
+const descriptor = (
+  geometry, material, position, scale, rotation = [0, 0, 0], materialRole = null,
+) => Object.freeze({
+  geometry, material, position, scale, rotation, materialRole,
 });
+
+const house = (...parts) => Object.freeze(parts);
+export const W8_FINITE_HOUSE_VARIANTS = Object.freeze([
+  house(
+    descriptor('box', 'houseWall', [0, 0.278, 0], [0.615, 0.556, 0.762], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'houseRoof', [0, 0.722, 0], [0.692, 0.333, 0.857], [0, 0, 0], 'roof'),
+    descriptor('box', 'charred', [0, 0.18, 0.386], [0.115, 0.28, 0.03]),
+    descriptor('box', 'window', [-0.23, 0.34, 0.386], [0.12, 0.16, 0.025]),
+    descriptor('box', 'window', [0.23, 0.34, 0.386], [0.12, 0.16, 0.025]),
+    descriptor('box', 'factoryTrim', [-0.22, 0.81, -0.18], [0.07, 0.30, 0.08]),
+  ),
+  house(
+    descriptor('box', 'houseWall', [0, 0.25, 0], [0.923, 0.5, 0.619], [0, 0, 0], 'wall'),
+    descriptor('box', 'houseRoof', [0, 0.542, 0], [1, 0.083, 0.714], [0, 0, 0], 'roof'),
+    descriptor('box', 'charred', [-0.23, 0.139, 0.324], [0.115, 0.278, 0.03]),
+    descriptor('box', 'charred', [0.23, 0.139, 0.324], [0.115, 0.278, 0.03]),
+    descriptor('box', 'window', [-0.12, 0.34, 0.324], [0.12, 0.15, 0.025]),
+    descriptor('box', 'window', [0.12, 0.34, 0.324], [0.12, 0.15, 0.025]),
+  ),
+  house(
+    descriptor('box', 'houseWall', [0, 0.528, 0], [0.5, 1.056, 0.619], [0, 0, 0], 'wall'),
+    descriptor('box', 'houseRoof', [0, 1.097, 0], [0.538, 0.083, 0.667], [0, 0, 0], 'roof'),
+    ...[0.194, 0.5, 0.806].flatMap(y => [
+      descriptor('box', 'window', [-0.12, y, 0.324], [0.115, 0.194, 0.025]),
+      descriptor('box', 'window', [0.12, y, 0.324], [0.115, 0.194, 0.025]),
+    ]),
+  ),
+  house(
+    descriptor('box', 'houseWall', [0, 0.222, 0], [0.577, 0.444, 0.571], [0, 0, 0], 'wall'),
+    descriptor('box', 'houseRoof', [0, 0.5, 0], [0.654, 0.111, 0.667], [0, 0, 0], 'roof'),
+    descriptor('box', 'houseRoof', [0, 0.333, 0.371], [0.346, 0.056, 0.19], [-0.15, 0, 0], 'roof'),
+    descriptor('box', 'charred', [-0.135, 0.15, 0.438], [0.031, 0.306, 0.038]),
+    descriptor('box', 'charred', [0.135, 0.15, 0.438], [0.031, 0.306, 0.038]),
+    descriptor('box', 'window', [-0.2, 0.28, 0.291], [0.11, 0.16, 0.025]),
+    descriptor('box', 'window', [0.2, 0.28, 0.291], [0.11, 0.16, 0.025]),
+  ),
+  house(
+    descriptor('box', 'houseWall', [0, 0.236, 0], [0.462, 0.472, 0.571], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'houseRoof', [0, 0.625, 0], [0.538, 0.306, 0.667], [0, 0, 0], 'roof'),
+    descriptor('box', 'charred', [0, 0.16, 0.291], [0.12, 0.31, 0.025]),
+    descriptor('box', 'charred', [0.327, 0.125, 0], [0.212, 0.25, 0.286]),
+    descriptor('box', 'houseRoof', [0.327, 0.272, 0], [0.25, 0.044, 0.333], [0, 0, 0.2], 'roof'),
+  ),
+]);
+
+function stableVariantIndex(value, count) {
+  let hash = 2166136261;
+  for (const character of String(value ?? '')) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % count;
+}
+
+function settlementMaterialKey(color) {
+  return `settlement-${Number(color).toString(16).padStart(6, '0')}`;
+}
+
+export function resolveW8BuildingParts(building) {
+  const source = building?.buildingType === 'house'
+    ? W8_FINITE_HOUSE_VARIANTS[stableVariantIndex(building.stableId, W8_FINITE_HOUSE_VARIANTS.length)]
+    : W8_PARITY_FEATURE_PARTS[building?.buildingType] ?? [];
+  const visual = building?.visual;
+  if (!visual) return source;
+  return source.map(part => {
+    const color = part.materialRole === 'wall' ? visual.wallColor
+      : part.materialRole === 'roof' ? visual.roofColor : null;
+    const roofScale = part.materialRole === 'roof' ? visual.roofScale ?? 1 : 1;
+    if (!Number.isFinite(color) && roofScale === 1) return part;
+    return Object.freeze({
+      ...part,
+      material: Number.isFinite(color) ? settlementMaterialKey(color) : part.material,
+      scale: roofScale === 1
+        ? part.scale : Object.freeze([part.scale[0], part.scale[1] * roofScale, part.scale[2]]),
+    });
+  });
+}
 
 export const W8_PARITY_FEATURE_PARTS = Object.freeze({
   ...PRODUCTION_FEATURE_PARTS,
+  house: W8_FINITE_HOUSE_VARIANTS[0],
+  tower: Object.freeze([
+    descriptor('box', 'towerWall', [0, 0.286, 0], [0.727, 0.571, 0.727], [0, 0, 0], 'wall'),
+    descriptor('box', 'towerWall', [0, 0.571, 0], [0.909, 0.036, 0.909], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'towerRoof', [0, 0.673, 0], [1, 0.167, 1], [0, 0, 0], 'roof'),
+    descriptor('box', 'charred', [0, 0.19, 0], [0.109, 0.083, 0.745]),
+    descriptor('box', 'charred', [0, 0.31, 0], [0.109, 0.083, 0.745]),
+    descriptor('box', 'charred', [0, 0.429, 0], [0.109, 0.083, 0.745]),
+  ]),
+  church: Object.freeze([
+    descriptor('box', 'churchWall', [0, 0.164, 0], [0.909, 0.328, 0.632], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'churchRoof', [0, 0.5, 0], [1, 0.299, 0.684], [0, 0, Math.PI / 4], 'roof'),
+    descriptor('box', 'churchWall', [0, 0.373, 0.408], [0.424, 0.746, 0.184], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'churchRoof', [0, 0.836, 0.408], [0.485, 0.179, 0.211], [0, 0, 0], 'roof'),
+    descriptor('box', 'gold', [0, 1, 0.408], [0.048, 0.149, 0.021]),
+    descriptor('box', 'gold', [0, 1.015, 0.408], [0.182, 0.024, 0.021]),
+    ...[-0.289, -0.171, -0.053].flatMap((z, index) => [
+      descriptor('box', index % 2 ? 'stainedGlassYellow' : 'stainedGlassBlue', [0.461, 0.164, z], [0.024, 0.134, 0.047]),
+      descriptor('box', index % 2 ? 'stainedGlassBlue' : 'stainedGlassYellow', [-0.461, 0.164, z], [0.024, 0.134, 0.047]),
+    ]),
+  ]),
+  school: Object.freeze([
+    descriptor('box', 'schoolWall', [0, 0.316, 0], [0.947, 0.632, 0.737], [0, 0, 0], 'wall'),
+    descriptor('box', 'schoolRoof', [0, 0.671, 0], [1, 0.079, 0.842], [0, 0, 0], 'roof'),
+    descriptor('box', 'schoolWall', [0, 0.895, 0], [0.158, 0.526, 0.316], [0, 0, 0], 'wall'),
+    descriptor('pyramid', 'schoolRoof', [0, 1.263, 0], [0.184, 0.211, 0.368], [0, 0, 0], 'roof'),
+    descriptor('box', 'gold', [0, 0.947, 0.166], [0.079, 0.158, 0.026]),
+    descriptor('box', 'charred', [0, 0.184, 0.382], [0.105, 0.368, 0.026]),
+    ...[-0.316, -0.105, 0.105, 0.316].map(x => (
+      descriptor('box', 'window', [x, 0.368, 0.382], [0.105, 0.184, 0.026])
+    )),
+  ]),
   tree: Object.freeze([
     descriptor('box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]),
     descriptor('cone', 'treeLeaves', [0, 0.621, 0], [0.5, 0.759, 0.5]),
@@ -34,31 +146,49 @@ export const W8_PARITY_FEATURE_PARTS = Object.freeze({
     descriptor('sphere', 'flower', [0, 0.5, 0], [0.2, 0.16, 0.2]),
   ]),
   factory: Object.freeze([
-    descriptor('box', 'factoryWall', [0, 0.34, 0], [1, 0.68, 1]),
-    descriptor('box', 'factoryRoof', [0, 0.72, 0], [1.04, 0.08, 1.04]),
-    descriptor('box', 'factoryTrim', [0.3, 0.95, -0.24], [0.16, 0.62, 0.16]),
-    descriptor('box', 'window', [-0.28, 0.42, 0.51], [0.22, 0.18, 0.03]),
+    descriptor('box', 'factoryWall', [0, 0.219, 0], [0.722, 0.438, 0.625]),
+    descriptor('box', 'factoryRoof', [0, 0.459, 0], [0.778, 0.044, 0.688]),
+    descriptor('cylinder', 'factoryTrim', [-0.25, 0.688, -0.188], [0.122, 0.688, 0.138]),
+    descriptor('box', 'charred', [-0.25, 1.038, -0.188], [0.139, 0.031, 0.156]),
+    descriptor('box', 'window', [-0.222, 0.281, 0.316], [0.097, 0.109, 0.025]),
+    descriptor('box', 'window', [0, 0.281, 0.316], [0.097, 0.109, 0.025]),
+    descriptor('box', 'window', [0.222, 0.281, 0.316], [0.097, 0.109, 0.025]),
   ]),
   militaryBase: Object.freeze([
-    descriptor('box', 'military', [0, 0.2, 0], [1, 0.4, 1]),
-    descriptor('pyramid', 'militaryRoof', [0, 0.48, 0], [1.08, 0.24, 1.08]),
-    descriptor('box', 'charred', [0, 0.42, 0.51], [0.34, 0.32, 0.03]),
-    descriptor('box', 'gold', [0, 0.82, 0], [0.04, 0.52, 0.04]),
+    descriptor('box', 'towerWall', [0, 0.042, 0], [0.591, 0.083, 0.591]),
+    descriptor('halfCylinder', 'military', [0, 0.083, -0.023], [0.455, 0.833, 0.455], [Math.PI / 2, 0, 0]),
+    ...[-0.2, -0.15, -0.1, -0.05, 0, 0.05, 0.1, 0.15, 0.2].map(z => (
+      descriptor('halfCylinder', 'charred', [0, 0.083, z], [0.468, 0.033, 0.468], [Math.PI / 2, 0, 0])
+    )),
+    descriptor('box', 'towerWall', [0, 0.167, 0.205], [0.318, 0.25, 0.045]),
+    descriptor('box', 'charred', [0, 0.146, 0.205], [0.227, 0.208, 0.05]),
+    descriptor('box', 'towerWall', [-0.227, 0.25, 0.227], [0.045, 0.417, 0.045]),
+    descriptor('box', 'towerWall', [0.227, 0.25, 0.227], [0.045, 0.417, 0.045]),
+    descriptor('box', 'charred', [-0.227, 0.5, 0.227], [0.068, 0.083, 0.068]),
+    descriptor('box', 'charred', [0.227, 0.5, 0.227], [0.068, 0.083, 0.068]),
+    descriptor('cylinder', 'playerWhiteEye', [-0.227, 0.604, 0.227], [0.01, 0.125, 0.01]),
+    descriptor('cylinder', 'playerWhiteEye', [0.227, 0.604, 0.227], [0.01, 0.125, 0.01]),
   ]),
   barn: Object.freeze([
-    descriptor('box', 'barn', [0, 0.35, 0], [1, 0.7, 1]),
-    descriptor('pyramid', 'barnRoof', [0, 0.8, 0], [1.1, 0.34, 1.1]),
-    descriptor('box', 'barnDoor', [0, 0.33, 0.51], [0.34, 0.58, 0.03]),
+    descriptor('box', 'barn', [0, 0.325, 0], [0.786, 0.65, 0.536]),
+    descriptor('box', 'barnRoof', [0, 0.65, 0], [0.857, 0.6, 0.429], [Math.PI / 4, 0, 0]),
+    descriptor('box', 'barnTrim', [0, 0.54, 0.271], [0.5, 0.05, 0.025]),
+    descriptor('box', 'barnDoor', [-0.107, 0.225, 0.271], [0.179, 0.45, 0.025]),
+    descriptor('box', 'barnDoor', [0.107, 0.225, 0.271], [0.179, 0.45, 0.025]),
+    descriptor('cylinder', 'towerWall', [0.554, 0.4, 0], [0.25, 0.8, 0.25]),
+    descriptor('cone', 'barnRoof', [0.554, 0.913, 0], [0.286, 0.225, 0.286]),
   ]),
   haystack: Object.freeze([
     descriptor('dodeca', 'hay', [0, 0.35, 0], [0.72, 0.7, 0.72]),
     descriptor('cone', 'hay', [0, 0.88, 0], [0.72, 0.48, 0.72]),
   ]),
   cow: Object.freeze([
-    descriptor('box', 'cow', [0, 0.42, 0], [0.9, 0.48, 0.42]),
-    descriptor('box', 'cowDark', [0, 0.5, 0.38], [0.34, 0.34, 0.28]),
-    descriptor('box', 'cowDark', [-0.3, 0.16, -0.22], [0.1, 0.46, 0.1]),
-    descriptor('box', 'cowDark', [0.3, 0.16, 0.22], [0.1, 0.46, 0.1]),
+    descriptor('box', 'cow', [0, 0.3, 0], [0.972, 0.3, 1.111]),
+    descriptor('box', 'cowDark', [-0.208, 0.3, 0], [0.306, 0.307, 1.139]),
+    descriptor('box', 'cow', [0.583, 0.32, 0], [0.389, 0.187, 0.889]),
+    ...[-1, 1].flatMap(x => [-1, 1].map(z => descriptor(
+      'box', 'cowDark', [x * 0.306, 0.087, z * 0.389], [0.139, 0.173, 0.278],
+    ))),
   ]),
   streetLamp: Object.freeze([
     descriptor('box', 'charred', [0, 0.5, 0], [0.08, 1, 0.08]),
@@ -80,10 +210,21 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
   const base = createProductionVisualAssetLibrary({ THREE });
   const Group = requireType(THREE, 'Group');
   const Mesh = requireType(THREE, 'Mesh');
+  const CylinderGeometry = requireType(THREE, 'CylinderGeometry');
   const Material = requireType(THREE, 'MeshLambertMaterial');
   const PhongMaterial = requireType(THREE, 'MeshPhongMaterial', 'MeshLambertMaterial');
   const material = (color, extra = {}) => new Material({ color, flatShading: true, ...extra });
   const phong = (color, extra = {}) => new PhongMaterial({ color, ...extra });
+  const supplementalGeometries = Object.freeze({
+    cylinder: new CylinderGeometry(0.5, 0.5, 1, 8),
+    halfCylinder: new CylinderGeometry(0.5, 0.5, 1, 16, 1, false, Math.PI / 2, Math.PI),
+  });
+  const settlementPaletteMaterials = {};
+  for (const palette of Object.values(SETTLEMENT_BUILDING_PALETTES)) {
+    for (const color of [...palette.wall, ...palette.roof]) {
+      settlementPaletteMaterials[settlementMaterialKey(color)] ??= phong(color);
+    }
+  }
   const supplementalMaterials = {
     playerCrab: phong(0xff4500),
     playerWhiteEye: phong(0xffffff, { shininess: 60 }),
@@ -93,29 +234,35 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     treeLeavesForest: phong(0x1b5e20, { shininess: 3 }),
     treeLeavesMeadow: phong(0x7cb342, { shininess: 3 }),
     road: phong(0xc2a878, { shininess: 3 }),
+    lotResidential: phong(0xa58c68, { shininess: 2 }),
+    lotCivic: phong(0x918d84, { shininess: 4 }),
     houseWall: phong(0xeeeeee), houseRoof: phong(0xaa2222),
     towerWall: phong(0x78909c), towerRoof: phong(0x37474f),
     churchWall: phong(0xe0e0e0), churchRoof: phong(0x37474f),
     schoolWall: phong(0xdfbca0), schoolRoof: phong(0x37474f),
     window: phong(0x29b6f6, { transparent: true, opacity: 0.75, shininess: 100 }),
+    stainedGlassBlue: phong(0x1565c0, { shininess: 80 }),
+    stainedGlassYellow: phong(0xfbc02d, { shininess: 80 }),
     gold: phong(0xffd700, { shininess: 80 }),
     grass: material(0x376b22), grassLight: material(0x75a83a), flower: material(0xffd54f),
     factoryWall: phong(0x707878), factoryRoof: phong(0x4a4a4a), factoryTrim: phong(0xb5651d),
     brick: phong(0xb5651d), military: phong(0x4a6523, { shininess: 40 }),
     militaryRoof: phong(0x333333), barn: phong(0x8b3a2f), barnRoof: phong(0x3a3a3a),
-    barnDoor: phong(0x333333), hay: phong(0xd4a017), cow: phong(0xf5f5f0),
+    barnTrim: phong(0xf5f5f0), barnDoor: phong(0x333333), hay: phong(0xd4a017), cow: phong(0xf5f5f0),
     cowDark: phong(0x2b2b2b), streetLight: material(0xffe28a), roadSign: material(0x244b59),
     water: phong(0x2f6fa8, { transparent: true, opacity: 0.82, shininess: 70, depthWrite: false }),
     scorch: material(0x241b18, { transparent: true, opacity: 0.72 }),
     blood: material(0x7e1019), acid: material(0x7cff31),
     cloud: material(0xffffff, { transparent: true, opacity: 0.68, depthWrite: false }),
     horizonTerrain: material(0x668c54),
+    ...settlementPaletteMaterials,
   };
+  const geometries = Object.freeze({ ...base.geometries, ...supplementalGeometries });
   const materials = Object.freeze({ ...base.materials, ...supplementalMaterials });
   let disposed = false;
 
   function appendPart(group, geometry, materialName, position, scale, role) {
-    const mesh = new Mesh(base.geometries[geometry], materials[materialName]);
+    const mesh = new Mesh(geometries[geometry], materials[materialName]);
     mesh.position.set(...position); mesh.scale.set(...scale);
     mesh.castShadow = true; mesh.receiveShadow = true;
     mesh.userData = { ...(mesh.userData ?? {}), presentationRole: role };
@@ -209,9 +356,10 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
   return Object.freeze({
     schemaVersion: 'w8-finite-parity-visual-assets-1',
     sourceCommit: FINITE_VISUAL_SOURCE_COMMIT,
-    geometries: base.geometries,
+    geometries,
     materials,
     featureParts: W8_PARITY_FEATURE_PARTS,
+    resolveBuildingParts: resolveW8BuildingParts,
     createPlayerModel,
     createEntityModel(type) {
       if (type === 'human') return createHumanModel();
@@ -224,12 +372,14 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
       return Object.freeze({
         ...source,
         schemaVersion: 'w8-finite-parity-visual-resource-snapshot-1',
+        sharedGeometryCount: source.sharedGeometryCount + Object.keys(supplementalGeometries).length,
         sharedMaterialCount: source.sharedMaterialCount + Object.keys(supplementalMaterials).length,
         disposed,
       });
     },
     dispose() {
       if (disposed) return;
+      for (const geometry of Object.values(supplementalGeometries)) geometry.dispose();
       for (const value of Object.values(supplementalMaterials)) value.dispose();
       base.dispose();
       disposed = true;

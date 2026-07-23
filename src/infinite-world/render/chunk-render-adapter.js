@@ -9,7 +9,10 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
-import { W8_PRESENTATION_TERRAIN_PALETTE } from './w8-distant-presentation.js';
+import {
+  W8_PRESENTATION_TERRAIN_PALETTE,
+  isW8NaturalCandidateVisible,
+} from './w8-distant-presentation.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
@@ -321,6 +324,8 @@ export class ChunkRenderAdapter {
       geometries: Object.freeze({ road: new PlaneGeometry(1, 1) }),
       materials: Object.freeze({
         road: this.visualAssets.materials.road,
+        lotResidential: this.visualAssets.materials.lotResidential ?? this.visualAssets.materials.road,
+        lotCivic: this.visualAssets.materials.lotCivic ?? this.visualAssets.materials.road,
       }),
     });
     return this.settlementResources;
@@ -343,6 +348,7 @@ export class ChunkRenderAdapter {
 
   #createProductionPartMeshes({
     group, chunkKey, name, items, castShadow = true, cameraOccludable = false,
+    attach = true,
   }) {
     if (!items.length) return [];
     const InstancedMesh = requireConstructor(this.THREE, 'InstancedMesh');
@@ -393,11 +399,11 @@ export class ChunkRenderAdapter {
         });
       });
       mesh.instanceMatrix.needsUpdate = true;
-      group.add(mesh);
+      if (attach) group.add(mesh);
       meshes.push(mesh);
       if (fadeMesh) {
         fadeMesh.instanceMatrix.needsUpdate = true;
-        group.add(fadeMesh);
+        if (attach) group.add(fadeMesh);
         fadeMesh.visible = this.transparencyEnabled;
         this.transparentMeshes.add(fadeMesh);
         meshes.push(fadeMesh);
@@ -427,6 +433,10 @@ export class ChunkRenderAdapter {
     const group = new Group();
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
+    const layerMeshes = {
+      roads: [], lots: [], buildings: [], water: [], formalDetails: [],
+      vegetation: [], rocks: [], ambientDetails: [],
+    };
 
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
     const terrainGeometry = naturalTerrain
@@ -472,6 +482,8 @@ export class ChunkRenderAdapter {
     const vegetationParts = [];
     vegetation.forEach(candidate => {
       const formal = candidate.candidateId !== undefined;
+      if (formal && chunkData.generatorVersion?.major >= 800
+        && !isW8NaturalCandidateVisible(candidate)) return;
       const localX = formal
         ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalX;
@@ -500,13 +512,14 @@ export class ChunkRenderAdapter {
         });
       }
     });
-    this.#createProductionPartMeshes({
+    layerMeshes.vegetation.push(...this.#createProductionPartMeshes({
       group,
       chunkKey: key,
       name: 'production-vegetation',
       items: vegetationParts,
       castShadow: false,
-    });
+      attach: false,
+    }));
 
     const rockParts = [];
     rocks.forEach(candidate => {
@@ -532,12 +545,13 @@ export class ChunkRenderAdapter {
         }),
       });
     });
-    this.#createProductionPartMeshes({
+    layerMeshes.rocks.push(...this.#createProductionPartMeshes({
       group,
       chunkKey: key,
       name: 'production-rock',
       items: rockParts,
-    });
+      attach: false,
+    }));
 
     if (settlementFeatures.length) {
       const resources = this.#ensureSettlementResources();
@@ -574,7 +588,94 @@ export class ChunkRenderAdapter {
         roadMesh.setMatrixAt(index, transform.matrix);
       });
       roadMesh.instanceMatrix.needsUpdate = true;
-      group.add(roadMesh);
+      if (roads.length) layerMeshes.roads.push(roadMesh);
+
+      const junctions = new Map();
+      for (const road of roads) {
+        for (const point of [road.start, road.end]) {
+          const junctionKey = `${Math.round(point.x * 100)},${Math.round(point.z * 100)}`;
+          const entry = junctions.get(junctionKey) ?? {
+            x: point.x, z: point.z, y: 0, sampleCount: 0, roadCount: 0, widthMeters: 0,
+          };
+          entry.y += road.worldPosition.y;
+          entry.sampleCount += 1;
+          entry.roadCount += 1;
+          entry.widthMeters = Math.max(entry.widthMeters, road.widthMeters);
+          junctions.set(junctionKey, entry);
+        }
+      }
+      const visibleJunctions = [...junctions.values()].filter(junction => junction.roadCount >= 2);
+      if (visibleJunctions.length) {
+        const junctionMesh = new InstancedMesh(
+          resources.geometries.road,
+          resources.materials.road,
+          visibleJunctions.length,
+        );
+        junctionMesh.name = 'infinite-settlement-junctions';
+        junctionMesh.receiveShadow = true;
+        junctionMesh.count = visibleJunctions.length;
+        visibleJunctions.forEach((junction, index) => {
+          transform.position.set(
+            (junction.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+            (junction.y / junction.sampleCount + FINITE_ROAD_SURFACE_HEIGHT_METERS + 0.0005)
+              * this.unitsPerMeter,
+            (junction.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+          );
+          transform.rotation.set(-Math.PI / 2, 0, 0);
+          transform.scale.set(
+            junction.widthMeters * 1.08 * this.unitsPerMeter,
+            junction.widthMeters * 1.08 * this.unitsPerMeter,
+            1,
+          );
+          transform.updateMatrix();
+          junctionMesh.setMatrixAt(index, transform.matrix);
+        });
+        junctionMesh.instanceMatrix.needsUpdate = true;
+        layerMeshes.roads.push(junctionMesh);
+      }
+
+      const residentialLotSurfaces = [];
+      const civicLotSurfaces = [];
+      for (const building of buildings) {
+        const lot = building.lot;
+        if (!lot || lot.lotStatus !== 'ACTIVE') continue;
+        const target = ['school', 'church'].includes(building.buildingType)
+          ? civicLotSurfaces : residentialLotSurfaces;
+        for (const [surfaceKind, surface] of [['entrance-path', lot.path], ['forecourt', lot.forecourt]]) {
+          if (!surface || !(surface.width > 0) || !(surface.depth > 0)) continue;
+          target.push({ building, surface, surfaceKind });
+        }
+      }
+      for (const [surfaceClass, surfaces, material] of [
+        ['residential', residentialLotSurfaces, resources.materials.lotResidential],
+        ['civic', civicLotSurfaces, resources.materials.lotCivic],
+      ]) {
+        if (!surfaces.length) continue;
+        const lotMesh = new InstancedMesh(resources.geometries.road, material, surfaces.length);
+        lotMesh.name = `infinite-settlement-${surfaceClass}-lot-paths-and-forecourts`;
+        lotMesh.receiveShadow = true;
+        lotMesh.count = surfaces.length;
+        lotMesh.userData.surfaceKinds = [];
+        surfaces.forEach(({ building, surface, surfaceKind }, index) => {
+          transform.position.set(
+            (surface.centerX - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+            (building.worldPosition.y + FINITE_ROAD_SURFACE_HEIGHT_METERS + 0.00075)
+              * this.unitsPerMeter,
+            (surface.centerZ - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+          );
+          transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
+          transform.scale.set(
+            surface.width * this.unitsPerMeter,
+            surface.depth * this.unitsPerMeter,
+            1,
+          );
+          transform.updateMatrix();
+          lotMesh.setMatrixAt(index, transform.matrix);
+          lotMesh.userData.surfaceKinds[index] = surfaceKind;
+        });
+        lotMesh.instanceMatrix.needsUpdate = true;
+        layerMeshes.lots.push(lotMesh);
+      }
 
       const buildingParts = [];
       buildings.forEach(building => {
@@ -582,7 +683,8 @@ export class ChunkRenderAdapter {
           - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
         const localZ = building.worldPosition.z
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-        const descriptors = this.visualAssets.featureParts[building.buildingType];
+        const descriptors = this.visualAssets.resolveBuildingParts?.(building)
+          ?? this.visualAssets.featureParts[building.buildingType];
         if (!descriptors) throw new Error(`unsupported production building visual: ${building.buildingType}`);
         for (const descriptor of descriptors) {
           buildingParts.push({
@@ -600,26 +702,36 @@ export class ChunkRenderAdapter {
             }),
           });
         }
+        const visualHeightScale = Math.max(1, ...descriptors.map(descriptor => (
+          descriptor.position[1] + descriptor.scale[1] * 0.5
+        )));
+        const visualHalfWidthScale = Math.max(...descriptors.map(descriptor => (
+          Math.abs(descriptor.position[0]) + descriptor.scale[0] * 0.5
+        )));
+        const visualHalfDepthScale = Math.max(...descriptors.map(descriptor => (
+          Math.abs(descriptor.position[2]) + descriptor.scale[2] * 0.5
+        )));
         this.cameraCollisionBounds.push(Object.freeze({
           chunkKey: key,
           stableId: building.stableId,
           worldX: building.worldPosition.x,
           worldZ: building.worldPosition.z,
           groundY: building.worldPosition.y * this.unitsPerMeter,
-          halfWidth: building.widthMeters * this.unitsPerMeter * 0.5,
-          halfDepth: building.depthMeters * this.unitsPerMeter * 0.5,
-          height: building.heightMeters * this.unitsPerMeter,
+          halfWidth: building.widthMeters * visualHalfWidthScale * this.unitsPerMeter,
+          halfDepth: building.depthMeters * visualHalfDepthScale * this.unitsPerMeter,
+          height: building.heightMeters * visualHeightScale * this.unitsPerMeter,
           rotationY: building.rotationY,
         }));
       });
-      this.#createProductionPartMeshes({
+      layerMeshes.buildings.push(...this.#createProductionPartMeshes({
         group,
         chunkKey: key,
         name: chunkData.generatorVersion?.major >= 500
           ? 'production-infinite-settlement-building' : 'production-rural-building',
         items: buildingParts,
         cameraOccludable: true,
-      });
+        attach: false,
+      }));
     }
 
     if (waterSurfaces.length) {
@@ -650,17 +762,20 @@ export class ChunkRenderAdapter {
         waterMesh.setMatrixAt(index, transform.matrix);
       });
       waterMesh.instanceMatrix.needsUpdate = true;
-      group.add(waterMesh);
+      layerMeshes.water.push(waterMesh);
     }
 
-    const detailParts = [];
-    const addDetail = ({ stableId, worldPosition, rotationY = 0, detailType, variation = 1 }, dimensions) => {
+    const formalDetailParts = [];
+    const ambientDetailParts = [];
+    const addDetail = (
+      target, { stableId, worldPosition, rotationY = 0, detailType, variation = 1 }, dimensions,
+    ) => {
       const parts = this.visualAssets.featureParts[detailType];
       if (!parts) return;
       const localX = worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
       const localZ = worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
       for (const part of parts) {
-        detailParts.push({
+        target.push({
           stableId,
           part,
           matrix: createPartMatrix({
@@ -675,26 +790,45 @@ export class ChunkRenderAdapter {
       }
     };
     for (const detail of ambientDetails) {
-      addDetail(detail, detail.detailType === 'shrub'
+      addDetail(ambientDetailParts, detail, detail.detailType === 'shrub'
         ? { width: 0.75, height: 0.7, depth: 0.75 }
         : { width: 0.45, height: 0.65, depth: 0.45 });
     }
     for (const detail of streetDetails) {
-      addDetail(detail, detail.detailType === 'streetLamp'
+      addDetail(formalDetailParts, detail, detail.detailType === 'streetLamp'
         ? { width: 0.45, height: 3.4, depth: 0.45 }
         : { width: 1.2, height: 2.1, depth: 0.25 });
     }
     for (const landmark of settlementLandmarks) {
-      addDetail({ ...landmark, detailType: landmark.landmarkType }, {
+      addDetail(formalDetailParts, { ...landmark, detailType: landmark.landmarkType }, {
         width: landmark.widthMeters,
         height: landmark.heightMeters,
         depth: landmark.depthMeters,
       });
     }
-    this.#createProductionPartMeshes({
-      group, chunkKey: key, name: 'w8-parity-world-details', items: detailParts,
+    layerMeshes.formalDetails.push(...this.#createProductionPartMeshes({
+      group, chunkKey: key, name: 'w8-parity-formal-world-details', items: formalDetailParts,
       castShadow: false,
-    });
+      attach: false,
+    }));
+    layerMeshes.ambientDetails.push(...this.#createProductionPartMeshes({
+      group, chunkKey: key, name: 'w8-parity-ambient-world-details', items: ambientDetailParts,
+      castShadow: false,
+      attach: false,
+    }));
+
+    for (const layer of [
+      layerMeshes.roads,
+      layerMeshes.lots,
+      layerMeshes.buildings,
+      layerMeshes.water,
+      layerMeshes.formalDetails,
+      layerMeshes.vegetation,
+      layerMeshes.rocks,
+      layerMeshes.ambientDetails,
+    ]) {
+      for (const mesh of layer) group.add(mesh);
+    }
 
     const projected = {
       key,

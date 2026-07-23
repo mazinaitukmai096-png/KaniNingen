@@ -230,3 +230,59 @@ test('Camera collision ignores LOS obstruction and only pushes a camera penetrat
   Raycaster.hits = [];
   await adapter.shutdown();
 });
+
+test('Settlement projection preserves finite layer order and renders junction, entrance, and forecourt surfaces', async () => {
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const roads = [
+    {
+      stableId: 'road-a', featureType: 'settlement-road', widthMeters: 2,
+      start: { x: 2, z: 8 }, end: { x: 8, z: 8 }, worldPosition: { x: 5, y: 0, z: 8 },
+    },
+    {
+      stableId: 'road-b', featureType: 'settlement-road', widthMeters: 2,
+      start: { x: 8, z: 8 }, end: { x: 8, z: 14 }, worldPosition: { x: 8, y: 0, z: 11 },
+    },
+  ];
+  const building = {
+    stableId: 'house-with-lot', featureType: 'settlement-building', buildingType: 'house',
+    worldPosition: { x: 11, y: 0, z: 8 }, rotationY: 0,
+    widthMeters: 6.5, heightMeters: 4.5, depthMeters: 5.25,
+    lot: {
+      lotStatus: 'ACTIVE',
+      path: { centerX: 9.5, centerZ: 8, rotationY: 0, width: 0.35, depth: 3 },
+      forecourt: { centerX: 10.2, centerZ: 8, rotationY: 0, width: 2.25, depth: 0.625 },
+    },
+  };
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'settlement-order-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [{
+      candidateId: 'tree-after-town', subtype: 'broadleaf-tree', variationSeed: 0.99,
+      orientationSeed: 0.25, worldPosition: { x: 14, y: 0, z: 14 },
+      metadata: { candidateRadiusMeters: 0.625 },
+    }],
+    rockCandidates: [], waterSurfaces: [], ambientDetails: [], settlementLandmarks: [], streetDetails: [],
+    settlementFeatures: [...roads, building],
+  };
+  const projected = await adapter.projectChunk(chunk);
+  const names = projected.group.children.map(child => child.name);
+  const indexOf = pattern => names.findIndex(name => pattern.test(name));
+  const roadIndex = indexOf(/infinite-settlement-roads/);
+  const junctionIndex = indexOf(/infinite-settlement-junctions/);
+  const lotIndex = indexOf(/infinite-settlement-residential-lot-paths-and-forecourts/);
+  const buildingIndex = indexOf(/production-infinite-settlement-building/);
+  const vegetationIndex = indexOf(/production-vegetation/);
+  assert.ok(roadIndex > 0);
+  assert.ok(junctionIndex > roadIndex);
+  assert.ok(lotIndex > junctionIndex);
+  assert.ok(buildingIndex > lotIndex);
+  assert.ok(vegetationIndex > buildingIndex);
+  const lotMesh = projected.group.children[lotIndex];
+  assert.deepEqual(lotMesh.userData.surfaceKinds.sort(), ['entrance-path', 'forecourt']);
+  assert.equal(lotMesh.count, 2);
+  await adapter.shutdown();
+});

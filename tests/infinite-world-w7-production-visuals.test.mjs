@@ -11,7 +11,11 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from '../src/infinite-world/render/production-visual-assets.js';
-import { createW8ParityVisualAssetLibrary } from '../src/infinite-world/render/w8-parity-visual-assets.js';
+import {
+  W8_FINITE_HOUSE_VARIANTS,
+  W8_PARITY_FEATURE_PARTS,
+  createW8ParityVisualAssetLibrary,
+} from '../src/infinite-world/render/w8-parity-visual-assets.js';
 import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
@@ -108,6 +112,29 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
   assert.equal(assets.materials.houseRoof.options.color, 0xaa2222);
   assert.equal(assets.materials.factoryWall.options.color, 0x707878);
   assert.equal(assets.materials.barn.options.color, 0x8b3a2f);
+  assert.equal(assets.materials.lotResidential.options.color, 0xa58c68);
+  assert.equal(assets.materials.lotCivic.options.color, 0x918d84);
+  assert.equal(W8_FINITE_HOUSE_VARIANTS.length, 5);
+  assert.ok(W8_PARITY_FEATURE_PARTS.tower.length >= 6);
+  assert.ok(W8_PARITY_FEATURE_PARTS.church.length >= 12);
+  assert.ok(W8_PARITY_FEATURE_PARTS.school.length >= 10);
+  assert.ok(W8_PARITY_FEATURE_PARTS.factory.length >= 7);
+  assert.ok(W8_PARITY_FEATURE_PARTS.militaryBase.length >= 18);
+  assert.ok(W8_PARITY_FEATURE_PARTS.barn.length >= 7);
+  const visualBuilding = {
+    stableId: 'palette-building',
+    buildingType: 'house',
+    visual: { wallColor: 0x80634c, roofColor: 0x536247, roofScale: 1.1 },
+  };
+  const resolved = assets.resolveBuildingParts(visualBuilding);
+  const wall = resolved.find(part => part.materialRole === 'wall');
+  const roof = resolved.find(part => part.materialRole === 'roof');
+  assert.equal(assets.materials[wall.material].options.color, visualBuilding.visual.wallColor);
+  assert.equal(assets.materials[roof.material].options.color, visualBuilding.visual.roofColor);
+  const unscaledRoof = assets.resolveBuildingParts({
+    ...visualBuilding, visual: { ...visualBuilding.visual, roofScale: 1 },
+  }).find(part => part.materialRole === 'roof');
+  assert.equal(roof.scale[1], unscaledRoof.scale[1] * 1.1);
   assert.deepEqual(assets.materials.cloud.options, {
     color: 0xffffff,
     flatShading: true,

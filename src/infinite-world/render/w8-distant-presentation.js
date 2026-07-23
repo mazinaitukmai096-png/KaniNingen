@@ -24,6 +24,30 @@ const smoothstep = value => {
   return t * t * (3 - 2 * t);
 };
 
+function presentationClusterRoll(candidate) {
+  const x = Math.floor((candidate?.worldPosition?.x ?? 0) / 12);
+  const z = Math.floor((candidate?.worldPosition?.z ?? 0) / 12);
+  let value = Math.imul(x ^ 0x51ed270b, 0x85ebca6b)
+    ^ Math.imul(z ^ 0x68bc21eb, 0xc2b2ae35);
+  value ^= value >>> 16;
+  value = Math.imul(value, 0x7feb352d);
+  value ^= value >>> 15;
+  return (value >>> 0) / 0x1_0000_0000;
+}
+
+export function isW8NaturalCandidateVisible(candidate, distanceChunks = 0) {
+  if (candidate?.candidateId === undefined) return true;
+  const cluster = presentationClusterRoll(candidate);
+  const clusteredThreshold = cluster < 0.28 ? 0.22 : cluster < 0.65 ? 0.48 : 0.68;
+  const subtypeAdjustment = candidate.subtype === 'shrub' ? -0.08 : 0;
+  const distanceAdjustment = Math.max(0, distanceChunks - 1.25) * 0.1;
+  return candidate.variationSeed >= clamp(
+    clusteredThreshold + subtypeAdjustment + distanceAdjustment,
+    0.12,
+    0.82,
+  );
+}
+
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
   return THREE[name];
@@ -229,7 +253,7 @@ export async function createW8DistantPresentation({
     root.add(mesh);
   };
 
-  const createMidgroundFeatures = (chunks, origin) => {
+  const createMidgroundFeatures = (chunks, origin, centerChunkX, centerChunkZ) => {
     const buckets = new Map();
     const push = (geometry, material, matrix, name) => {
       const key = `${geometry}:${material}:${name}`;
@@ -261,10 +285,20 @@ export async function createW8DistantPresentation({
     };
     const addParts = (feature, kind, dimensions, name) => {
       if (isFeatureDestroyed(feature.stableId ?? feature.candidateId)) return;
-      for (const part of visualAssets.featureParts[kind] ?? []) {
+      const parts = feature.featureType === 'settlement-building'
+        ? visualAssets.resolveBuildingParts?.(feature) ?? visualAssets.featureParts[kind]
+        : visualAssets.featureParts[kind];
+      for (const part of parts ?? []) {
         push(part.geometry, part.material, matrixForPart(feature, part, dimensions), name);
       }
     };
+    const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const presentationDistanceChunks = candidate => Math.hypot(
+        candidate.worldPosition.x - centerWorldX,
+        candidate.worldPosition.z - centerWorldZ,
+      ) / LOGICAL_CHUNK_SIZE_METERS;
+    const junctions = new Map();
     for (const chunk of chunks) {
       const layers = chunk.presentationLayers;
       for (const feature of layers?.formal?.roadsAndBuildings ?? chunk.settlementFeatures ?? []) {
@@ -280,7 +314,31 @@ export async function createW8DistantPresentation({
             feature.widthMeters * UNITS_PER_METER, 1);
           transform.updateMatrix();
           push('__road__', 'road', transform.matrix, 'roads');
+          for (const point of [feature.start, feature.end]) {
+            const key = `${Math.round(point.x * 100)},${Math.round(point.z * 100)}`;
+            const junction = junctions.get(key) ?? {
+              x: point.x, z: point.z, y: 0, count: 0, widthMeters: 0,
+            };
+            junction.y += feature.worldPosition.y;
+            junction.count += 1;
+            junction.widthMeters = Math.max(junction.widthMeters, feature.widthMeters);
+            junctions.set(key, junction);
+          }
         } else if (feature.featureType === 'settlement-building') {
+          const civic = ['school', 'church'].includes(feature.buildingType);
+          for (const surface of [feature.lot?.path, feature.lot?.forecourt]) {
+            if (!surface || !(surface.width > 0) || !(surface.depth > 0)) continue;
+            transform.position.set(
+              (surface.centerX - originMetersX) * UNITS_PER_METER,
+              (feature.worldPosition.y + 0.07575) * UNITS_PER_METER,
+              (surface.centerZ - originMetersZ) * UNITS_PER_METER,
+            );
+            transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
+            transform.scale.set(surface.width * UNITS_PER_METER,
+              surface.depth * UNITS_PER_METER, 1);
+            transform.updateMatrix();
+            push('__road__', civic ? 'lotCivic' : 'lotResidential', transform.matrix, 'lots');
+          }
           addParts(feature, feature.buildingType, {
             width: feature.widthMeters * UNITS_PER_METER,
             height: feature.heightMeters * UNITS_PER_METER,
@@ -296,7 +354,7 @@ export async function createW8DistantPresentation({
         }, 'landmark');
       }
       for (const candidate of layers?.natural?.vegetation ?? chunk.vegetationCandidates ?? []) {
-        if (candidate.subtype === 'shrub' || candidate.variationSeed < 0.28) continue;
+        if (!isW8NaturalCandidateVisible(candidate, presentationDistanceChunks(candidate))) continue;
         const kind = candidate.subtype === 'wetland-tree' ? 'wetlandTree'
           : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree';
         const variation = 0.84 + candidate.variationSeed * 0.32;
@@ -307,7 +365,11 @@ export async function createW8DistantPresentation({
         }, 'major-natural');
       }
       for (const candidate of layers?.natural?.rocks ?? chunk.rockCandidates ?? []) {
-        if (candidate.variationSeed < 0.45) continue;
+        if (candidate.variationSeed < clamp(
+          0.42 + Math.max(0, presentationDistanceChunks(candidate) - 1.5) * 0.12,
+          0.42,
+          0.68,
+        )) continue;
         const radius = candidate.metadata.candidateRadiusMeters * (0.9 + candidate.variationSeed * 0.2);
         addParts(candidate, 'rock', {
           width: radius * 2 * UNITS_PER_METER,
@@ -315,6 +377,19 @@ export async function createW8DistantPresentation({
           depth: radius * 2 * UNITS_PER_METER,
         }, 'major-natural');
       }
+    }
+    for (const junction of junctions.values()) {
+      if (junction.count < 2) continue;
+      transform.position.set(
+        (junction.x - originMetersX) * UNITS_PER_METER,
+        (junction.y / junction.count + 0.0755) * UNITS_PER_METER,
+        (junction.z - originMetersZ) * UNITS_PER_METER,
+      );
+      transform.rotation.set(-Math.PI / 2, 0, 0);
+      transform.scale.set(junction.widthMeters * 1.08 * UNITS_PER_METER,
+        junction.widthMeters * 1.08 * UNITS_PER_METER, 1);
+      transform.updateMatrix();
+      push('__road__', 'road', transform.matrix, 'junctions');
     }
     for (const bucket of buckets.values()) {
       const geometry = bucket.geometry === '__road__'
@@ -407,7 +482,9 @@ export async function createW8DistantPresentation({
       midground.sort((a, b) => a.chunkZ - b.chunkZ || a.chunkX - b.chunkX);
       midgroundChunkCount = midground.length;
       measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
-      measure('distant-midground-features', () => createMidgroundFeatures(midground, renderOrigin));
+      measure('distant-midground-features', () => createMidgroundFeatures(
+        midground, renderOrigin, centerChunkX, centerChunkZ,
+      ));
       measure('distant-clipmap', () => createClipmap({
         centerChunkX, centerChunkZ, activeChunks, origin: renderOrigin,
       }));
