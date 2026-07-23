@@ -15,6 +15,7 @@ import {
   createW8ParityChunkGenerator,
   sampleW8SurfaceHeightMeters,
 } from './w8-parity-chunk-generator.js';
+import { createMigratedSettlementTemplate } from './single-rural-settlement.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import { getW6ScaleProfile } from './gameplay-contract.js';
@@ -867,6 +868,10 @@ export async function bootInfiniteWorldSandbox({
       scene,
       worldSeedHash: generator.worldSeedHash,
       visualAssets,
+      findSettlementsNear: generator.distributor.findSettlementsNear,
+      resolveTemplate: createMigratedSettlementTemplate,
+      getCanonicalChunkData: async (chunkX, chunkZ) =>
+        runtime.getChunkData(chunkX, chunkZ) ?? generator.generateChunk(chunkX, chunkZ),
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
       measure: (stage, operation) => diagnostics.measure(stage, operation),
     });
@@ -876,10 +881,13 @@ export async function bootInfiniteWorldSandbox({
           activeDataKeys: runtimeSnapshot.activeDataKeys,
           renderedKeys: runtimeSnapshot.renderedKeys,
           getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-          renderOrigin: runtimeSnapshot.renderOrigin,
-          centerChunkX: runtimeSnapshot.centerChunkX,
-          centerChunkZ: runtimeSnapshot.centerChunkZ,
-        }));
+           renderOrigin: runtimeSnapshot.renderOrigin,
+           centerChunkX: runtimeSnapshot.centerChunkX,
+           centerChunkZ: runtimeSnapshot.centerChunkZ,
+           quality: worldState.experience.settings.quality,
+           playerLogicalX: logicalPlayer.x,
+           playerLogicalZ: logicalPlayer.z,
+         }));
     }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
@@ -963,7 +971,20 @@ export async function bootInfiniteWorldSandbox({
       completedAt: null,
       status: measurementMode ? 'warmup' : 'disabled',
     };
+    let distantQuality = worldState.experience.settings.quality;
     running = true;
+
+    const synchronizeDistantPresentation = runtimeSnapshot => distantPresentation.sync({
+      activeDataKeys: runtimeSnapshot.activeDataKeys,
+      renderedKeys: runtimeSnapshot.renderedKeys,
+      getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+      renderOrigin: runtimeSnapshot.renderOrigin,
+      centerChunkX: runtimeSnapshot.centerChunkX,
+      centerChunkZ: runtimeSnapshot.centerChunkZ,
+      quality: distantQuality,
+      playerLogicalX: logicalPlayer.x,
+      playerLogicalZ: logicalPlayer.z,
+    });
 
     function getPlayerTerrainHeightMeters(logicalWorldX, logicalWorldZ) {
       const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
@@ -1004,15 +1025,12 @@ export async function bootInfiniteWorldSandbox({
       );
       const runtimeSnapshot = runtime.snapshot();
       scenePresentation.rebase(runtimeSnapshot.renderOrigin);
+      distantPresentation.rebase(runtimeSnapshot.renderOrigin);
       if (diagnosticProfile.distant) {
-        await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
-          activeDataKeys: runtimeSnapshot.activeDataKeys,
-          renderedKeys: runtimeSnapshot.renderedKeys,
-          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-          renderOrigin: runtimeSnapshot.renderOrigin,
-          centerChunkX: runtimeSnapshot.centerChunkX,
-          centerChunkZ: runtimeSnapshot.centerChunkZ,
-        }));
+        await diagnostics.measureAsync(
+          'distant-sync',
+          () => synchronizeDistantPresentation(runtimeSnapshot),
+        );
       }
       if (diagnosticProfile.gameplaySync) {
         await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
@@ -1251,7 +1269,18 @@ export async function bootInfiniteWorldSandbox({
         }
       },
       onSettingsChanged: settings => {
+        const qualityChanged = settings.quality !== distantQuality;
+        distantQuality = settings.quality;
         applyRuntimeSettings(settings);
+        if (qualityChanged && diagnosticProfile.distant) {
+          const runtimeSnapshot = runtime.snapshot();
+          scenePresentation.rebase(runtimeSnapshot.renderOrigin);
+          distantPresentation.rebase(runtimeSnapshot.renderOrigin);
+          void diagnostics.measureAsync(
+            'distant-sync',
+            () => synchronizeDistantPresentation(runtimeSnapshot),
+          ).catch(error => { transitionError = error; });
+        }
         scheduleSave();
       },
     });
@@ -1290,15 +1319,12 @@ export async function bootInfiniteWorldSandbox({
         .then(async () => {
           const nextSnapshot = runtime.snapshot();
           scenePresentation.rebase(nextSnapshot.renderOrigin);
+          distantPresentation.rebase(nextSnapshot.renderOrigin);
           if (diagnosticProfile.distant) {
-            await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
-              activeDataKeys: nextSnapshot.activeDataKeys,
-              renderedKeys: nextSnapshot.renderedKeys,
-              getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-              renderOrigin: nextSnapshot.renderOrigin,
-              centerChunkX: nextSnapshot.centerChunkX,
-              centerChunkZ: nextSnapshot.centerChunkZ,
-            }));
+            await diagnostics.measureAsync(
+              'distant-sync',
+              () => synchronizeDistantPresentation(nextSnapshot),
+            );
           }
           if (!diagnosticProfile.gameplaySync) return null;
           return diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
@@ -1602,6 +1628,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           'player-update',
           () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin),
         );
+        diagnostics.measure('distant-update', () => distantPresentation.update(
+          logicalPlayer.x,
+          logicalPlayer.z,
+          frameRenderOrigin,
+        ));
         diagnostics.measure('gameplay-update', () => gameplay.update({
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,

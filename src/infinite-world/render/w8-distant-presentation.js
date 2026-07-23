@@ -2,6 +2,7 @@ import {
   LOGICAL_CHUNK_SIZE_METERS,
   UNITS_PER_METER,
 } from '../chunk-coordinates.js';
+import { determineDetailCandidateOwner } from '../legacy-core/g3/detail-candidates.js';
 import { createMacroTerrainEvaluator, G5_MACRO_TERRAIN } from '../legacy-core/g5/macro-terrain.js';
 import { createNaturalBiomeEvaluator, naturalMaterialWeights } from '../natural-biome-field.js';
 
@@ -10,8 +11,16 @@ const CLIPMAP_EXTENT_METERS = 352;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
 const DISTANT_NATURAL_PROXY_LIMIT = 300;
-const DISTANT_TOWN_PROXY_LIMIT = 24;
 const DISTANT_WATER_PROXY_LIMIT = 24;
+const TEMPLATE_CACHE_CAPACITY = 4;
+const FAR_OWNER_CHUNK_CACHE_CAPACITY = 64;
+const CANONICAL_QUERY_CONCURRENCY = 4;
+const CANONICAL_QUERY_MARGIN_METERS = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS;
+export const W8_CANONICAL_VISIBILITY_METERS = Object.freeze({
+  high: 187.5,
+  medium: 150,
+  low: 112.5,
+});
 
 export const W8_PRESENTATION_TERRAIN_PALETTE = Object.freeze([
   Object.freeze([0x7d / 255, 0x8f / 255, 0x4f / 255]),
@@ -222,10 +231,18 @@ export async function createW8DistantPresentation({
   scene,
   worldSeedHash,
   visualAssets,
+  findSettlementsNear,
+  resolveTemplate,
+  getCanonicalChunkData,
   isFeatureDestroyed = () => false,
   measure = (_stage, operation) => operation(),
 } = {}) {
   if (!scene?.add || !scene?.remove) throw new TypeError('a Three.js scene is required');
+  if (typeof findSettlementsNear !== 'function'
+    || typeof resolveTemplate !== 'function'
+    || typeof getCanonicalChunkData !== 'function') {
+    throw new TypeError('canonical Settlement query, template, and ChunkData providers are required');
+  }
   const Group = requireConstructor(THREE, 'Group');
   const Mesh = requireConstructor(THREE, 'Mesh');
   const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
@@ -241,22 +258,84 @@ export async function createW8DistantPresentation({
   scene.add(root);
   const terrainMaterial = new Material({ vertexColors: true, flatShading: true, shininess: 0 });
   const roadGeometry = new PlaneGeometry(1, 1);
-  const ownedGeometries = new Set([roadGeometry]);
   const transform = new Object3D();
-  let midgroundChunkCount = 0;
-  let clipmapMeshCount = 0;
-  let maximumInnerBoundaryErrorMeters = 0;
-  let maximumInnerBoundaryColorDifference = 0;
-  let clipmapDeterministicChecksum = 0;
-  let distantNaturalProxyCount = 0;
-  let distantTownProxyCount = 0;
-  let distantWaterProxyCount = 0;
-  let distantProxyInstancedMeshCount = 0;
+  const hiddenTransform = new Object3D();
+  hiddenTransform.position.set(0, 0, 0);
+  hiddenTransform.rotation.set(0, 0, 0);
+  hiddenTransform.scale.set(0, 0, 0);
+  hiddenTransform.updateMatrix();
+  const hiddenMatrix = hiddenTransform.matrix.clone?.() ?? structuredClone(hiddenTransform.matrix);
+  const createStats = () => ({
+    midgroundChunkCount: 0,
+    clipmapMeshCount: 0,
+    maximumInnerBoundaryErrorMeters: 0,
+    maximumInnerBoundaryColorDifference: 0,
+    clipmapDeterministicChecksum: 0,
+    distantNaturalProxyCount: 0,
+    distantWaterProxyCount: 0,
+    distantProxyInstancedMeshCount: 0,
+    canonicalRecordCount: 0,
+    canonicalFarObjectCount: 0,
+    canonicalMidObjectCount: 0,
+    visibleCanonicalObjectCount: 0,
+    duplicateVisibleStableIdCount: 0,
+    identityAuditErrorCount: 0,
+  });
+  const emptyStats = createStats();
+  let activeGeneration = null;
+  let buildTarget = null;
+  let buildOwnedGeometries = null;
+  let buildStats = null;
+  let buildGeneration = null;
+  let syncEpoch = 0;
+  let committedEpoch = 0;
+  let staleEpochDiscardCount = 0;
+  let activeQueryCount = 0;
+  let maximumObservedQueryConcurrency = 0;
+  const queryWaiters = [];
+  const templateCache = new Map();
+  const farOwnerChunkCache = new Map();
   const clipmapSampleCache = new Map();
   let clipmapSampleCacheHits = 0;
   let clipmapSampleCacheMisses = 0;
   let clipmapSampleCacheEvictions = 0;
   let disposed = false;
+
+  const disposeGeneration = generation => {
+    if (!generation) return;
+    root.remove(generation.root);
+    for (const child of generation.root.children ?? []) child.dispose?.();
+    generation.root.clear?.();
+    for (const geometry of generation.ownedGeometries) geometry.dispose?.();
+    generation.ownedGeometries.clear();
+  };
+
+  const readThroughLru = async (cache, key, capacity, load) => {
+    if (cache.has(key)) {
+      const entry = cache.get(key);
+      cache.delete(key);
+      cache.set(key, entry);
+      return entry.promise;
+    }
+    const entry = { pending: true, promise: null };
+    entry.promise = Promise.resolve().then(load).then(
+      value => {
+        entry.pending = false;
+        return value;
+      },
+      error => {
+        if (cache.get(key) === entry) cache.delete(key);
+        throw error;
+      },
+    );
+    cache.set(key, entry);
+    while (cache.size > capacity) {
+      const eviction = [...cache].find(([entryKey, value]) => entryKey !== key && !value.pending);
+      if (!eviction) break;
+      cache.delete(eviction[0]);
+    }
+    return entry.promise;
+  };
 
   const baseClipmapSample = (worldX, worldZ) => {
     const key = `${worldX},${worldZ}`;
@@ -294,24 +373,6 @@ export async function createW8DistantPresentation({
       clipmapSampleCacheEvictions += 1;
     }
     return value;
-  };
-
-  const clear = () => {
-    for (const child of root.children ?? []) child.dispose?.();
-    root.clear?.();
-    for (const geometry of ownedGeometries) {
-      if (geometry !== roadGeometry) geometry.dispose?.();
-    }
-    for (const geometry of [...ownedGeometries]) if (geometry !== roadGeometry) ownedGeometries.delete(geometry);
-    midgroundChunkCount = 0;
-    clipmapMeshCount = 0;
-    maximumInnerBoundaryErrorMeters = 0;
-    maximumInnerBoundaryColorDifference = 0;
-    clipmapDeterministicChecksum = 0;
-    distantNaturalProxyCount = 0;
-    distantTownProxyCount = 0;
-    distantWaterProxyCount = 0;
-    distantProxyInstancedMeshCount = 0;
   };
 
   const createMidgroundTerrain = (chunks, origin) => {
@@ -355,14 +416,14 @@ export async function createW8DistantPresentation({
     }
     if (!positions.length) return;
     const geometry = makeGeometry(THREE, positions, colors, indices);
-    ownedGeometries.add(geometry);
+    buildOwnedGeometries.add(geometry);
     const mesh = new Mesh(geometry, terrainMaterial);
     mesh.name = 'w8-midground-outer-sixteen-terrain';
     mesh.castShadow = false; mesh.receiveShadow = false;
-    root.add(mesh);
+    buildTarget.add(mesh);
   };
 
-  const createMidgroundFeatures = (chunks, origin, centerChunkX, centerChunkZ) => {
+  const createMidgroundNaturalFeatures = (chunks, origin, centerChunkX, centerChunkZ) => {
     const buckets = new Map();
     const push = (geometry, material, matrix, name) => {
       const key = `${geometry}:${material}:${name}`;
@@ -407,61 +468,8 @@ export async function createW8DistantPresentation({
         candidate.worldPosition.x - centerWorldX,
         candidate.worldPosition.z - centerWorldZ,
       ) / LOGICAL_CHUNK_SIZE_METERS;
-    const junctions = new Map();
     for (const chunk of chunks) {
       const layers = chunk.presentationLayers;
-      for (const feature of layers?.formal?.roadsAndBuildings ?? chunk.settlementFeatures ?? []) {
-        if (feature.featureType === 'settlement-road') {
-          const dx = feature.end.x - feature.start.x; const dz = feature.end.z - feature.start.z;
-          transform.position.set(
-            ((feature.start.x + feature.end.x) / 2 - originMetersX) * UNITS_PER_METER,
-            (feature.worldPosition.y + 0.075) * UNITS_PER_METER,
-            ((feature.start.z + feature.end.z) / 2 - originMetersZ) * UNITS_PER_METER,
-          );
-          transform.rotation.set(-Math.PI / 2, 0, Math.atan2(dz, dx));
-          transform.scale.set(Math.hypot(dx, dz) * UNITS_PER_METER,
-            feature.widthMeters * UNITS_PER_METER, 1);
-          transform.updateMatrix();
-          push('__road__', 'road', transform.matrix, 'roads');
-          for (const point of [feature.start, feature.end]) {
-            const key = `${Math.round(point.x * 100)},${Math.round(point.z * 100)}`;
-            const junction = junctions.get(key) ?? {
-              x: point.x, z: point.z, y: 0, count: 0, widthMeters: 0,
-            };
-            junction.y += feature.worldPosition.y;
-            junction.count += 1;
-            junction.widthMeters = Math.max(junction.widthMeters, feature.widthMeters);
-            junctions.set(key, junction);
-          }
-        } else if (feature.featureType === 'settlement-building') {
-          const civic = ['school', 'church'].includes(feature.buildingType);
-          for (const surface of [feature.lot?.path, feature.lot?.forecourt]) {
-            if (!surface || !(surface.width > 0) || !(surface.depth > 0)) continue;
-            transform.position.set(
-              (surface.centerX - originMetersX) * UNITS_PER_METER,
-              (feature.worldPosition.y + 0.07575) * UNITS_PER_METER,
-              (surface.centerZ - originMetersZ) * UNITS_PER_METER,
-            );
-            transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
-            transform.scale.set(surface.width * UNITS_PER_METER,
-              surface.depth * UNITS_PER_METER, 1);
-            transform.updateMatrix();
-            push('__road__', civic ? 'lotCivic' : 'lotResidential', transform.matrix, 'lots');
-          }
-          addParts(feature, feature.buildingType, {
-            width: feature.widthMeters * UNITS_PER_METER,
-            height: feature.heightMeters * UNITS_PER_METER,
-            depth: feature.depthMeters * UNITS_PER_METER,
-          }, 'settlement');
-        }
-      }
-      for (const landmark of layers?.landmarks ?? chunk.settlementLandmarks ?? []) {
-        addParts(landmark, landmark.landmarkType, {
-          width: landmark.widthMeters * UNITS_PER_METER,
-          height: landmark.heightMeters * UNITS_PER_METER,
-          depth: landmark.depthMeters * UNITS_PER_METER,
-        }, 'landmark');
-      }
       for (const candidate of layers?.natural?.vegetation ?? chunk.vegetationCandidates ?? []) {
         if (!isW8NaturalCandidateVisible(candidate, presentationDistanceChunks(candidate))) continue;
         const kind = candidate.subtype === 'wetland-tree' ? 'wetlandTree'
@@ -487,19 +495,6 @@ export async function createW8DistantPresentation({
         }, 'major-natural');
       }
     }
-    for (const junction of junctions.values()) {
-      if (junction.count < 2) continue;
-      transform.position.set(
-        (junction.x - originMetersX) * UNITS_PER_METER,
-        (junction.y / junction.count + 0.0755) * UNITS_PER_METER,
-        (junction.z - originMetersZ) * UNITS_PER_METER,
-      );
-      transform.rotation.set(-Math.PI / 2, 0, 0);
-      transform.scale.set(junction.widthMeters * 1.08 * UNITS_PER_METER,
-        junction.widthMeters * 1.08 * UNITS_PER_METER, 1);
-      transform.updateMatrix();
-      push('__road__', 'road', transform.matrix, 'junctions');
-    }
     for (const bucket of buckets.values()) {
       const geometry = bucket.geometry === '__road__'
         ? roadGeometry : visualAssets.geometries[bucket.geometry];
@@ -510,8 +505,320 @@ export async function createW8DistantPresentation({
       bucket.matrices.forEach((matrix, index) => mesh.setMatrixAt(index, matrix));
       mesh.instanceMatrix.needsUpdate = true;
       mesh.castShadow = false; mesh.receiveShadow = false;
-      root.add(mesh);
+      buildTarget.add(mesh);
     }
+  };
+
+  const canonicalPartsFor = record => {
+    if (record.featureType === 'settlement-building') {
+      return visualAssets.resolveBuildingParts?.(record)
+        ?? visualAssets.featureParts[record.buildingType] ?? null;
+    }
+    if (record.landmarkType) return visualAssets.featureParts[record.landmarkType] ?? null;
+    return null;
+  };
+
+  const canonicalIdentity = (record, chunk, parts) => ({
+    stableId: record.stableId,
+    settlementId: record.settlementId ?? record.parentSettlementId ?? null,
+    buildingType: record.buildingType ?? null,
+    landmarkType: record.landmarkType ?? null,
+    featureType: record.featureType ?? (record.landmarkType ? 'settlement-landmark' : null),
+    worldPosition: {
+      x: record.worldPosition.x,
+      y: record.worldPosition.y,
+      z: record.worldPosition.z,
+    },
+    rotationY: record.rotationY ?? 0,
+    dimensions: {
+      widthMeters: record.widthMeters ?? null,
+      heightMeters: record.heightMeters ?? null,
+      depthMeters: record.depthMeters ?? null,
+    },
+    visual: record.visual ?? null,
+    parts: parts?.map(part => ({
+      geometry: part.geometry,
+      material: part.material,
+      position: [...part.position],
+      scale: [...part.scale],
+      rotation: [...part.rotation],
+      materialRole: part.materialRole ?? null,
+    })) ?? null,
+    owningChunkCoordinate: {
+      x: record.owningChunkCoordinate.x,
+      z: record.owningChunkCoordinate.z,
+    },
+    chunkId: chunk.chunkId,
+    contentHash: chunk.contentHash,
+    sourceW5ContentHash: chunk.sourceW5ContentHash ?? chunk.sourceChunkData?.contentHash ?? null,
+  });
+
+  const addCanonicalMatrix = (object, geometry, material, name, matrix) => {
+    const key = `${geometry}:${material}:${name}`;
+    if (!buildGeneration.canonicalBuckets.has(key)) {
+      buildGeneration.canonicalBuckets.set(key, {
+        geometry,
+        material,
+        name,
+        items: [],
+      });
+    }
+    buildGeneration.canonicalBuckets.get(key).items.push({
+      object,
+      matrix: matrix.clone?.() ?? structuredClone(matrix),
+    });
+  };
+
+  const registerCanonicalRecord = ({
+    record,
+    chunk,
+    parts,
+    farEligible,
+  }) => {
+    if (typeof record?.stableId !== 'string'
+      || !Number.isFinite(record?.worldPosition?.x)
+      || !Number.isFinite(record?.worldPosition?.y)
+      || !Number.isFinite(record?.worldPosition?.z)
+      || !Number.isInteger(record?.owningChunkCoordinate?.x)
+      || !Number.isInteger(record?.owningChunkCoordinate?.z)) {
+      throw new Error('canonical distant record is missing identity or ownership');
+    }
+    const identity = canonicalIdentity(record, chunk, parts);
+    const identityKey = JSON.stringify(identity);
+    const existing = buildGeneration.canonicalObjects.get(record.stableId);
+    if (existing) {
+      if (existing.identityKey !== identityKey) {
+        buildStats.identityAuditErrorCount += 1;
+        throw new Error(`canonical LOD identity mismatch: ${record.stableId}`);
+      }
+      existing.farEligible ||= farEligible;
+      return { object: existing, isNew: false };
+    }
+    const object = {
+      stableId: record.stableId,
+      settlementId: identity.settlementId,
+      record,
+      identity,
+      identityKey,
+      ownerKey: `${record.owningChunkCoordinate.x},${record.owningChunkCoordinate.z}`,
+      worldX: record.worldPosition.x,
+      worldZ: record.worldPosition.z,
+      destructible: record.featureType === 'settlement-building' || record.destructible === true,
+      farEligible,
+      visibleLod: null,
+      instances: [],
+    };
+    buildGeneration.canonicalObjects.set(record.stableId, object);
+    buildStats.canonicalRecordCount += 1;
+    return { object, isNew: true };
+  };
+
+  const canonicalPartMatrix = (record, part, dimensions, origin) => {
+    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const rotationY = Number.isFinite(record.rotationY) ? record.rotationY : 0;
+    const offsetX = part.position[0] * dimensions.width;
+    const offsetZ = part.position[2] * dimensions.depth;
+    const cosine = Math.cos(rotationY); const sine = Math.sin(rotationY);
+    transform.position.set(
+      (record.worldPosition.x - originMetersX) * UNITS_PER_METER
+        + offsetX * cosine + offsetZ * sine,
+      record.worldPosition.y * UNITS_PER_METER + part.position[1] * dimensions.height,
+      (record.worldPosition.z - originMetersZ) * UNITS_PER_METER
+        - offsetX * sine + offsetZ * cosine,
+    );
+    transform.rotation.set(part.rotation[0], rotationY + part.rotation[1], part.rotation[2]);
+    transform.scale.set(
+      dimensions.width * part.scale[0],
+      dimensions.height * part.scale[1],
+      dimensions.depth * part.scale[2],
+    );
+    transform.updateMatrix();
+    return transform.matrix;
+  };
+
+  const addCanonicalRecord = ({ record, chunk, origin, farEligible }) => {
+    if (record.featureType === 'settlement-road') {
+      const registration = registerCanonicalRecord({
+        record,
+        chunk,
+        parts: [{
+          geometry: '__road__',
+          material: 'road',
+          position: [0, 0, 0],
+          scale: [1, 1, 1],
+          rotation: [-Math.PI / 2, 0, 0],
+        }],
+        farEligible,
+      });
+      if (!registration.isNew) return;
+      const dx = record.end.x - record.start.x;
+      const dz = record.end.z - record.start.z;
+      const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+      const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+      transform.position.set(
+        ((record.start.x + record.end.x) / 2 - originMetersX) * UNITS_PER_METER,
+        (record.worldPosition.y + 0.075) * UNITS_PER_METER,
+        ((record.start.z + record.end.z) / 2 - originMetersZ) * UNITS_PER_METER,
+      );
+      transform.rotation.set(-Math.PI / 2, 0, Math.atan2(dz, dx));
+      transform.scale.set(
+        Math.hypot(dx, dz) * UNITS_PER_METER,
+        record.widthMeters * UNITS_PER_METER,
+        1,
+      );
+      transform.updateMatrix();
+      addCanonicalMatrix(registration.object, '__road__', 'road', 'road', transform.matrix);
+      return;
+    }
+
+    const parts = canonicalPartsFor(record);
+    if (!parts?.length) {
+      throw new Error(`canonical record has no finite visual parts: ${record.stableId}`);
+    }
+    const registration = registerCanonicalRecord({ record, chunk, parts, farEligible });
+    if (!registration.isNew) return;
+    const dimensions = {
+      width: record.widthMeters * UNITS_PER_METER,
+      height: record.heightMeters * UNITS_PER_METER,
+      depth: record.depthMeters * UNITS_PER_METER,
+    };
+    if (record.featureType === 'settlement-building') {
+      const civic = ['school', 'church'].includes(record.buildingType);
+      for (const surface of [record.lot?.path, record.lot?.forecourt]) {
+        if (!surface || !(surface.width > 0) || !(surface.depth > 0)) continue;
+        const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+        const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+        transform.position.set(
+          (surface.centerX - originMetersX) * UNITS_PER_METER,
+          (record.worldPosition.y + 0.07575) * UNITS_PER_METER,
+          (surface.centerZ - originMetersZ) * UNITS_PER_METER,
+        );
+        transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
+        transform.scale.set(surface.width * UNITS_PER_METER, surface.depth * UNITS_PER_METER, 1);
+        transform.updateMatrix();
+        addCanonicalMatrix(
+          registration.object,
+          '__road__',
+          civic ? 'lotCivic' : 'lotResidential',
+          'lot',
+          transform.matrix,
+        );
+      }
+    }
+    for (const part of parts) {
+      addCanonicalMatrix(
+        registration.object,
+        part.geometry,
+        part.material,
+        record.landmarkType ? 'landmark' : 'building',
+        canonicalPartMatrix(record, part, dimensions, origin),
+      );
+    }
+  };
+
+  const addCanonicalChunk = ({
+    chunk,
+    origin,
+    farEligibleSettlementIds = null,
+    coveredSettlementIds = null,
+    queryCenter = null,
+    queryRadius = Infinity,
+  }) => {
+    const layers = chunk.presentationLayers;
+    const records = [
+      ...(layers?.formal?.roadsAndBuildings ?? chunk.settlementFeatures ?? []),
+      ...(layers?.landmarks ?? chunk.settlementLandmarks ?? []),
+    ];
+    for (const record of records) {
+      const settlementId = record.settlementId ?? record.parentSettlementId;
+      const queriedOwner = farEligibleSettlementIds?.has(settlementId) === true;
+      const farEligible = queriedOwner || coveredSettlementIds?.has(settlementId) === true;
+      if (farEligibleSettlementIds && !queriedOwner) continue;
+      if (queryCenter && Math.hypot(
+        record.worldPosition.x - queryCenter.x,
+        record.worldPosition.z - queryCenter.z,
+      ) > queryRadius) continue;
+      addCanonicalRecord({ record, chunk, origin, farEligible });
+    }
+  };
+
+  const finalizeCanonicalMeshes = () => {
+    for (const bucket of buildGeneration.canonicalBuckets.values()) {
+      if (!bucket.items.length) continue;
+      const geometry = bucket.geometry === '__road__'
+        ? roadGeometry : visualAssets.geometries[bucket.geometry];
+      const material = visualAssets.materials[bucket.material];
+      if (!geometry || !material) {
+        throw new Error(`canonical finite visual resource is missing: ${bucket.geometry}/${bucket.material}`);
+      }
+      const mesh = new InstancedMesh(geometry, material, bucket.items.length);
+      mesh.name = `w8-canonical-lod-${bucket.name}-${bucket.geometry}-${bucket.material}`;
+      mesh.count = bucket.items.length;
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      mesh.userData = { presentationOnly: true, canonicalStableIds: [] };
+      bucket.items.forEach((item, index) => {
+        mesh.setMatrixAt(index, hiddenMatrix);
+        mesh.userData.canonicalStableIds[index] = item.object.stableId;
+        item.object.instances.push({ mesh, index, matrix: item.matrix });
+      });
+      mesh.instanceMatrix.needsUpdate = true;
+      buildTarget.add(mesh);
+    }
+  };
+
+  const positionGenerationForOrigin = (generation, renderOrigin) => {
+    if (!generation || !renderOrigin) return;
+    generation.currentOriginChunkX = renderOrigin.renderOriginChunkX;
+    generation.currentOriginChunkZ = renderOrigin.renderOriginChunkZ;
+    generation.root.position.set(
+      (generation.buildOriginChunkX - renderOrigin.renderOriginChunkX)
+        * LOGICAL_CHUNK_SIZE_METERS * UNITS_PER_METER,
+      0,
+      (generation.buildOriginChunkZ - renderOrigin.renderOriginChunkZ)
+        * LOGICAL_CHUNK_SIZE_METERS * UNITS_PER_METER,
+    );
+  };
+
+  const updateCanonicalVisibility = (generation, playerX, playerZ) => {
+    if (!generation) return;
+    const visibility = W8_CANONICAL_VISIBILITY_METERS[generation.quality]
+      ?? W8_CANONICAL_VISIBILITY_METERS.high;
+    let farCount = 0;
+    let midCount = 0;
+    let visibleCount = 0;
+    for (const object of generation.canonicalObjects.values()) {
+      let nextLod = 'hidden';
+      if (object.destructible && isFeatureDestroyed(object.stableId)) {
+        nextLod = 'destroyed';
+      } else if (generation.renderedKeys.has(object.ownerKey)) {
+        nextLod = 'near';
+      } else if (generation.activeKeys.has(object.ownerKey)) {
+        nextLod = 'mid';
+      } else if (object.farEligible && Math.hypot(
+        object.worldX - playerX,
+        object.worldZ - playerZ,
+      ) <= visibility) {
+        nextLod = 'far';
+      }
+      if (nextLod === 'far') farCount += 1;
+      if (nextLod === 'mid') midCount += 1;
+      if (nextLod === 'far' || nextLod === 'mid') visibleCount += 1;
+      if (object.visibleLod === nextLod) continue;
+      const visible = nextLod === 'far' || nextLod === 'mid';
+      for (const instance of object.instances) {
+        instance.mesh.setMatrixAt(instance.index, visible ? instance.matrix : hiddenMatrix);
+        instance.mesh.instanceMatrix.needsUpdate = true;
+      }
+      object.visibleLod = nextLod;
+    }
+    generation.stats.canonicalFarObjectCount = farCount;
+    generation.stats.canonicalMidObjectCount = midCount;
+    generation.stats.visibleCanonicalObjectCount = visibleCount;
+    generation.stats.duplicateVisibleStableIdCount = 0;
+    generation.playerX = playerX;
+    generation.playerZ = playerZ;
   };
 
   const createClipmap = ({ centerChunkX, centerChunkZ, activeChunks, origin }) => {
@@ -540,12 +847,12 @@ export async function createW8DistantPresentation({
             color[channel] += (actual.color[channel] - color[channel]) * activeWeight;
           }
           if (Math.abs(distanceOutside) < 1e-9) {
-            maximumInnerBoundaryErrorMeters = Math.max(
-              maximumInnerBoundaryErrorMeters,
+            buildStats.maximumInnerBoundaryErrorMeters = Math.max(
+              buildStats.maximumInnerBoundaryErrorMeters,
               Math.abs(height - actual.height),
             );
-            maximumInnerBoundaryColorDifference = Math.max(
-              maximumInnerBoundaryColorDifference,
+            buildStats.maximumInnerBoundaryColorDifference = Math.max(
+              buildStats.maximumInnerBoundaryColorDifference,
               ...color.map((channel, index) => Math.abs(channel - actual.color[index])),
             );
           }
@@ -561,15 +868,15 @@ export async function createW8DistantPresentation({
       checksum ^= Math.round(value * 1000);
       checksum = Math.imul(checksum, 0x01000193) >>> 0;
     }
-    clipmapDeterministicChecksum = checksum;
-    ownedGeometries.add(geometry);
+    buildStats.clipmapDeterministicChecksum = checksum;
+    buildOwnedGeometries.add(geometry);
     const mesh = new Mesh(geometry, terrainMaterial);
     mesh.name = 'w8-seeded-macro-terrain-clipmap';
     mesh.castShadow = false; mesh.receiveShadow = false;
-    root.add(mesh); clipmapMeshCount = 1;
+    buildTarget.add(mesh); buildStats.clipmapMeshCount = 1;
   };
 
-  const createDistantFeatureProxies = ({ centerChunkX, centerChunkZ, origin }) => {
+  const createDistantNaturalAndWaterProxies = ({ centerChunkX, centerChunkZ, origin }) => {
     const seed = textHash(worldSeedHash);
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
@@ -614,7 +921,7 @@ export async function createW8DistantPresentation({
     };
 
     forAnchoredGrid(24, (cellX, cellZ) => {
-      if (distantNaturalProxyCount >= DISTANT_NATURAL_PROXY_LIMIT
+      if (buildStats.distantNaturalProxyCount >= DISTANT_NATURAL_PROXY_LIMIT
         || cellRoll(seed, cellX, cellZ, 1) > 0.31) return;
       const worldX = (cellX + 0.18 + cellRoll(seed, cellX, cellZ, 2) * 0.64) * 24;
       const worldZ = (cellZ + 0.18 + cellRoll(seed, cellX, cellZ, 3) * 0.64) * 24;
@@ -638,35 +945,11 @@ export async function createW8DistantPresentation({
         rotationY: cellRoll(seed, cellX, cellZ, 6) * Math.PI * 2,
         dimensions, part, fade,
       });
-      distantNaturalProxyCount += 1;
+      buildStats.distantNaturalProxyCount += 1;
     });
 
     forAnchoredGrid(64, (cellX, cellZ) => {
-      if (distantTownProxyCount >= DISTANT_TOWN_PROXY_LIMIT
-        || cellRoll(seed, cellX, cellZ, 11) > 0.18) return;
-      const worldX = (cellX + 0.25 + cellRoll(seed, cellX, cellZ, 12) * 0.5) * 64;
-      const worldZ = (cellZ + 0.25 + cellRoll(seed, cellX, cellZ, 13) * 0.5) * 64;
-      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
-      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 8 || distance >= CLIPMAP_EXTENT_METERS - 24) return;
-      const fade = fadeAt(worldX, worldZ);
-      const sample = baseClipmapSample(worldX, worldZ);
-      const typeRoll = cellRoll(seed, cellX, cellZ, 14);
-      const kind = typeRoll > 0.73 ? 'church' : typeRoll > 0.46 ? 'tower' : 'house';
-      const dimensions = kind === 'tower'
-        ? { width: 8 * UNITS_PER_METER, height: 17 * UNITS_PER_METER, depth: 8 * UNITS_PER_METER }
-        : kind === 'church'
-          ? { width: 12 * UNITS_PER_METER, height: 12 * UNITS_PER_METER, depth: 18 * UNITS_PER_METER }
-          : { width: 11 * UNITS_PER_METER, height: 7 * UNITS_PER_METER, depth: 10 * UNITS_PER_METER };
-      for (const part of visualAssets.featureParts[kind] ?? []) placePart({
-        worldX, worldZ, height: sample.height,
-        rotationY: Math.floor(cellRoll(seed, cellX, cellZ, 15) * 4) * Math.PI / 2,
-        dimensions, part, fade,
-      });
-      distantTownProxyCount += 1;
-    });
-
-    forAnchoredGrid(64, (cellX, cellZ) => {
-      if (distantWaterProxyCount >= DISTANT_WATER_PROXY_LIMIT
+      if (buildStats.distantWaterProxyCount >= DISTANT_WATER_PROXY_LIMIT
         || cellRoll(seed, cellX, cellZ, 21) > 0.2) return;
       const worldX = (cellX + 0.5) * 64; const worldZ = (cellZ + 0.5) * 64;
       const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
@@ -682,7 +965,7 @@ export async function createW8DistantPresentation({
         size * 0.58 * UNITS_PER_METER * fadeAt(worldX, worldZ), 1);
       transform.updateMatrix();
       push('__road__', 'water', 'water-proxy');
-      distantWaterProxyCount += 1;
+      buildStats.distantWaterProxyCount += 1;
     });
 
     for (const bucket of buckets.values()) {
@@ -696,15 +979,170 @@ export async function createW8DistantPresentation({
       mesh.instanceMatrix.needsUpdate = true;
       mesh.castShadow = false; mesh.receiveShadow = false;
       mesh.userData = { presentationOnly: true };
-      root.add(mesh); distantProxyInstancedMeshCount += 1;
+      buildTarget.add(mesh); buildStats.distantProxyInstancedMeshCount += 1;
     }
   };
 
+  const mapWithQueryConcurrency = async (values, operation) => {
+    const results = new Array(values.length);
+    let cursor = 0;
+    const acquireQuerySlot = () => {
+      if (activeQueryCount < CANONICAL_QUERY_CONCURRENCY) {
+        activeQueryCount += 1;
+        maximumObservedQueryConcurrency = Math.max(
+          maximumObservedQueryConcurrency,
+          activeQueryCount,
+        );
+        return Promise.resolve();
+      }
+      return new Promise(resolve => queryWaiters.push(resolve));
+    };
+    const releaseQuerySlot = () => {
+      activeQueryCount -= 1;
+      const next = queryWaiters.shift();
+      if (next) {
+        activeQueryCount += 1;
+        maximumObservedQueryConcurrency = Math.max(
+          maximumObservedQueryConcurrency,
+          activeQueryCount,
+        );
+        next();
+      }
+    };
+    const worker = async () => {
+      while (cursor < values.length) {
+        const index = cursor;
+        cursor += 1;
+        await acquireQuerySlot();
+        try {
+          results[index] = await operation(values[index], index);
+        } finally {
+          releaseQuerySlot();
+        }
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(CANONICAL_QUERY_CONCURRENCY, values.length) },
+      () => worker(),
+    ));
+    return results;
+  };
+
+  const prepareCanonicalFarChunks = async ({
+    centerWorldX,
+    centerWorldZ,
+    quality,
+  }) => {
+    const visibilityMeters = W8_CANONICAL_VISIBILITY_METERS[quality]
+      ?? W8_CANONICAL_VISIBILITY_METERS.high;
+    const queryRadius = visibilityMeters + CANONICAL_QUERY_MARGIN_METERS;
+    const [candidateResult] = await mapWithQueryConcurrency(
+      [{ centerWorldX, centerWorldZ, queryRadius }],
+      query => findSettlementsNear(
+        query.centerWorldX,
+        query.centerWorldZ,
+        query.queryRadius,
+      ),
+    );
+    const candidates = [...candidateResult]
+      .sort((left, right) => left.settlementId.localeCompare(right.settlementId));
+    const templates = await mapWithQueryConcurrency(candidates, candidate => readThroughLru(
+      templateCache,
+      candidate.settlementId,
+      TEMPLATE_CACHE_CAPACITY,
+      () => resolveTemplate({ candidate }),
+    ));
+    const ownerSettlements = new Map();
+    const addOwner = (point, settlementId) => {
+      const owner = determineDetailCandidateOwner(point);
+      const key = `${owner.x},${owner.z}`;
+      if (!ownerSettlements.has(key)) {
+        ownerSettlements.set(key, {
+          key,
+          chunkX: owner.x,
+          chunkZ: owner.z,
+          settlementIds: new Set(),
+        });
+      }
+      ownerSettlements.get(key).settlementIds.add(settlementId);
+    };
+    for (const template of templates) {
+      for (const building of template.buildings) {
+        if (Math.hypot(
+          building.x - centerWorldX,
+          building.z - centerWorldZ,
+        ) <= queryRadius) addOwner(building, template.settlementId);
+      }
+      for (const road of template.roads) {
+        const dx = road.end.x - road.start.x;
+        const dz = road.end.z - road.start.z;
+        const sampleCount = Math.max(1, Math.ceil(Math.hypot(dx, dz) / 8));
+        for (let sample = 0; sample <= sampleCount; sample += 1) {
+          const t = sample / sampleCount;
+          const point = {
+            x: road.start.x + dx * t,
+            z: road.start.z + dz * t,
+          };
+          if (Math.hypot(
+            point.x - centerWorldX,
+            point.z - centerWorldZ,
+          ) <= queryRadius) addOwner(point, template.settlementId);
+        }
+      }
+      if (Math.hypot(
+        template.center.x - centerWorldX,
+        template.center.z - centerWorldZ,
+      ) <= queryRadius + 32) addOwner(template.center, template.settlementId);
+    }
+    const owners = [...ownerSettlements.values()].sort((left, right) => (
+      left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
+    ));
+    const chunks = await mapWithQueryConcurrency(owners, async owner => ({
+      ...owner,
+      chunk: await readThroughLru(
+        farOwnerChunkCache,
+        owner.key,
+        FAR_OWNER_CHUNK_CACHE_CAPACITY,
+        () => getCanonicalChunkData(owner.chunkX, owner.chunkZ),
+      ),
+    }));
+    return {
+      queryCenter: { x: centerWorldX, z: centerWorldZ },
+      queryRadius,
+      visibilityMeters,
+      candidateCount: candidates.length,
+      settlementIds: new Set(candidates.map(candidate => candidate.settlementId)),
+      chunks: chunks.filter(value => value.chunk),
+    };
+  };
+
   return Object.freeze({
-    async sync({ activeDataKeys, renderedKeys, getChunkData, renderOrigin, centerChunkX, centerChunkZ }) {
+    async sync({
+      activeDataKeys,
+      renderedKeys,
+      getChunkData,
+      renderOrigin,
+      centerChunkX,
+      centerChunkZ,
+      quality = 'high',
+      playerLogicalX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
+      playerLogicalZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
+    }) {
       if (disposed) throw new Error('distant presentation is disposed');
-      measure('distant-clear', clear);
+      const epoch = ++syncEpoch;
       const rendered = new Set(renderedKeys);
+      const activeKeys = new Set(activeDataKeys);
+      if (activeGeneration) {
+        activeGeneration.renderedKeys = rendered;
+        activeGeneration.activeKeys = activeKeys;
+        activeGeneration.quality = quality;
+        positionGenerationForOrigin(activeGeneration, renderOrigin);
+        updateCanonicalVisibility(
+          activeGeneration,
+          playerLogicalX,
+          playerLogicalZ,
+        );
+      }
       const activeChunks = new Map();
       measure('distant-collect', () => {
         for (const key of activeDataKeys) {
@@ -713,52 +1151,182 @@ export async function createW8DistantPresentation({
           if (chunk) activeChunks.set(key, chunk);
         }
       });
+      const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      const far = await prepareCanonicalFarChunks({
+        centerWorldX,
+        centerWorldZ,
+        quality,
+      });
+      if (disposed || epoch !== syncEpoch) {
+        staleEpochDiscardCount += 1;
+        return false;
+      }
+
       const midground = [...activeChunks].filter(([key]) => !rendered.has(key)).map(([, value]) => value);
       midground.sort((a, b) => a.chunkZ - b.chunkZ || a.chunkX - b.chunkX);
-      midgroundChunkCount = midground.length;
-      measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
-      measure('distant-midground-features', () => createMidgroundFeatures(
-        midground, renderOrigin, centerChunkX, centerChunkZ,
-      ));
-      measure('distant-clipmap', () => createClipmap({
-        centerChunkX, centerChunkZ, activeChunks, origin: renderOrigin,
-      }));
-      measure('distant-feature-proxies', () => createDistantFeatureProxies({
-        centerChunkX, centerChunkZ, origin: renderOrigin,
-      }));
+      const stagingRoot = new Group();
+      stagingRoot.name = `w8-distant-presentation-epoch-${epoch}`;
+      stagingRoot.userData = { presentationOnly: true, epoch };
+      const generation = {
+        epoch,
+        root: stagingRoot,
+        ownedGeometries: new Set(),
+        stats: createStats(),
+        canonicalBuckets: new Map(),
+        canonicalObjects: new Map(),
+        activeKeys,
+        renderedKeys: rendered,
+        quality,
+        buildOriginChunkX: renderOrigin.renderOriginChunkX,
+        buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
+        currentOriginChunkX: renderOrigin.renderOriginChunkX,
+        currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
+        playerX: playerLogicalX,
+        playerZ: playerLogicalZ,
+        queryCandidateCount: far.candidateCount,
+        queryOwnerChunkCount: far.chunks.length,
+        queryRadius: far.queryRadius,
+        visibilityMeters: far.visibilityMeters,
+      };
+      buildTarget = stagingRoot;
+      buildOwnedGeometries = generation.ownedGeometries;
+      buildStats = generation.stats;
+      buildGeneration = generation;
+      try {
+        buildStats.midgroundChunkCount = midground.length;
+        measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
+        measure('distant-midground-features', () => createMidgroundNaturalFeatures(
+          midground,
+          renderOrigin,
+          centerChunkX,
+          centerChunkZ,
+        ));
+        measure('distant-canonical-active', () => {
+          const chunks = [...activeChunks.values()].sort((left, right) => (
+            left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
+          ));
+          for (const chunk of chunks) addCanonicalChunk({
+            chunk,
+            origin: renderOrigin,
+            coveredSettlementIds: far.settlementIds,
+          });
+        });
+        measure('distant-canonical-far', () => {
+          for (const source of far.chunks) {
+            addCanonicalChunk({
+              chunk: source.chunk,
+              origin: renderOrigin,
+              farEligibleSettlementIds: source.settlementIds,
+              queryCenter: far.queryCenter,
+              queryRadius: far.queryRadius,
+            });
+          }
+          finalizeCanonicalMeshes();
+        });
+        measure('distant-clipmap', () => createClipmap({
+          centerChunkX,
+          centerChunkZ,
+          activeChunks,
+          origin: renderOrigin,
+        }));
+        measure('distant-feature-proxies', () => createDistantNaturalAndWaterProxies({
+          centerChunkX,
+          centerChunkZ,
+          origin: renderOrigin,
+        }));
+        positionGenerationForOrigin(generation, renderOrigin);
+        updateCanonicalVisibility(generation, playerLogicalX, playerLogicalZ);
+      } catch (error) {
+        disposeGeneration(generation);
+        throw error;
+      } finally {
+        buildTarget = null;
+        buildOwnedGeometries = null;
+        buildStats = null;
+        buildGeneration = null;
+      }
+      if (disposed || epoch !== syncEpoch) {
+        disposeGeneration(generation);
+        staleEpochDiscardCount += 1;
+        return false;
+      }
+      const previous = activeGeneration;
+      root.add(generation.root);
+      activeGeneration = generation;
+      committedEpoch = epoch;
+      disposeGeneration(previous);
+      return true;
+    },
+    update(playerLogicalX, playerLogicalZ, renderOrigin) {
+      if (disposed || !activeGeneration) return;
+      positionGenerationForOrigin(activeGeneration, renderOrigin);
+      updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
+    },
+    rebase(renderOrigin) {
+      if (disposed || !activeGeneration) return;
+      positionGenerationForOrigin(activeGeneration, renderOrigin);
     },
     snapshot() {
+      const stats = activeGeneration?.stats ?? emptyStats;
       return Object.freeze({
         schemaVersion: 'w8-distant-presentation-snapshot-1',
-        midgroundChunkCount,
-        clipmapMeshCount,
+        ...stats,
         clipmapExtentMeters: CLIPMAP_EXTENT_METERS,
-        maximumInnerBoundaryErrorMeters,
-        maximumInnerBoundaryColorDifference,
-        clipmapDeterministicChecksum,
-        distantNaturalProxyCount,
-        distantTownProxyCount,
-        distantWaterProxyCount,
-        distantProxyInstancedMeshCount,
+        distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_NATURAL_PROXY_LIMIT,
-        distantTownProxyLimit: DISTANT_TOWN_PROXY_LIMIT,
+        distantTownProxyLimit: 0,
+        visibilityMeters: activeGeneration?.visibilityMeters ?? null,
+        queryRadius: activeGeneration?.queryRadius ?? null,
+        queryCandidateCount: activeGeneration?.queryCandidateCount ?? 0,
+        queryOwnerChunkCount: activeGeneration?.queryOwnerChunkCount ?? 0,
+        templateCacheSize: templateCache.size,
+        templateCacheCapacity: TEMPLATE_CACHE_CAPACITY,
+        farOwnerChunkCacheSize: farOwnerChunkCache.size,
+        farOwnerChunkCacheCapacity: FAR_OWNER_CHUNK_CACHE_CAPACITY,
+        queryConcurrencyLimit: CANONICAL_QUERY_CONCURRENCY,
+        maximumObservedQueryConcurrency,
+        syncEpoch,
+        committedEpoch,
+        staleEpochDiscardCount,
+        buildOrigin: activeGeneration ? Object.freeze({
+          renderOriginChunkX: activeGeneration.buildOriginChunkX,
+          renderOriginChunkZ: activeGeneration.buildOriginChunkZ,
+        }) : null,
+        currentOrigin: activeGeneration ? Object.freeze({
+          renderOriginChunkX: activeGeneration.currentOriginChunkX,
+          renderOriginChunkZ: activeGeneration.currentOriginChunkZ,
+        }) : null,
         clipmapSampleCacheSize: clipmapSampleCache.size,
         clipmapSampleCacheCapacity: CLIPMAP_SAMPLE_CACHE_CAPACITY,
         clipmapSampleCacheHits,
         clipmapSampleCacheMisses,
         clipmapSampleCacheEvictions,
-        rootObjectCount: root.children?.length ?? 0,
+        rootObjectCount: activeGeneration?.root.children?.length ?? 0,
         disposed,
       });
     },
+    canonicalAuditSnapshot() {
+      const objects = activeGeneration ? [...activeGeneration.canonicalObjects.values()] : [];
+      objects.sort((left, right) => left.stableId.localeCompare(right.stableId));
+      return Object.freeze(objects.map(object => Object.freeze({
+        identity: Object.freeze(structuredClone(object.identity)),
+        visibleLod: object.visibleLod,
+        farEligible: object.farEligible,
+        instanceCount: object.instances.length,
+      })));
+    },
     dispose() {
       if (disposed) return;
-      clear();
+      syncEpoch += 1;
+      disposeGeneration(activeGeneration);
+      activeGeneration = null;
       scene.remove(root);
       roadGeometry.dispose?.();
       terrainMaterial.dispose?.();
-      ownedGeometries.clear();
       clipmapSampleCache.clear();
+      templateCache.clear();
+      farOwnerChunkCache.clear();
       disposed = true;
     },
   });

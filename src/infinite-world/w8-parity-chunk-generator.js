@@ -767,15 +767,36 @@ export async function createW8ParityChunkGenerator({
   const base = await baseGeneratorFactory({ worldSeed });
   const seed = textSeed(`${base.worldSeedHash}:${W8_PARITY_CONTENT.schemaVersion}`);
   const warmSourceChunks = new Map();
+  const pendingSourceChunks = new Map();
+  const warmSourceChunkCapacity = 256;
+  const trimWarmSourceChunks = () => {
+    while (warmSourceChunks.size > warmSourceChunkCapacity) {
+      warmSourceChunks.delete(warmSourceChunks.keys().next().value);
+    }
+  };
   const getSourceChunk = async (chunkX, chunkZ) => {
     const key = createChunkKey(chunkX, chunkZ);
-    if (!warmSourceChunks.has(key)) {
-      const pending = Promise.resolve(base.generateChunk(chunkX, chunkZ));
-      warmSourceChunks.set(key, pending);
-      try { warmSourceChunks.set(key, await pending); }
-      catch (error) { warmSourceChunks.delete(key); throw error; }
+    if (warmSourceChunks.has(key)) {
+      const cached = warmSourceChunks.get(key);
+      warmSourceChunks.delete(key);
+      warmSourceChunks.set(key, cached);
+      return cached;
     }
-    return warmSourceChunks.get(key);
+    if (pendingSourceChunks.has(key)) return pendingSourceChunks.get(key);
+    const pending = Promise.resolve(base.generateChunk(chunkX, chunkZ)).then(
+      chunk => {
+        pendingSourceChunks.delete(key);
+        warmSourceChunks.set(key, chunk);
+        trimWarmSourceChunks();
+        return chunk;
+      },
+      error => {
+        pendingSourceChunks.delete(key);
+        throw error;
+      },
+    );
+    pendingSourceChunks.set(key, pending);
+    return pending;
   };
   const prepareSourceSquare = async (centerChunkX, centerChunkZ, radius) => {
     // Materialize the owning Settlement template once before parallel edge projection.
@@ -913,6 +934,9 @@ export async function createW8ParityChunkGenerator({
         source,
         safeSpawnPreparedChunkCount: experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0,
         safeSpawn: experienceSpawn.spawnSafety ?? null,
+        warmSourceChunkCacheSize: warmSourceChunks.size,
+        warmSourceChunkCacheCapacity: warmSourceChunkCapacity,
+        warmSourceChunkPendingCount: pendingSourceChunks.size,
       });
     },
   });
