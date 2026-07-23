@@ -57,10 +57,15 @@ function requireConstructor(THREE, name) {
 }
 
 export function w8TerrainColorFromWeights(weights) {
-  return [0, 1, 2].map(channel => weights.reduce(
-    (sum, weight, index) => sum + weight * W8_PRESENTATION_TERRAIN_PALETTE[index][channel],
-    0,
-  ));
+  const color = [0, 0, 0];
+  for (let material = 0; material < W8_PRESENTATION_TERRAIN_PALETTE.length; material += 1) {
+    const weight = weights[material];
+    const palette = W8_PRESENTATION_TERRAIN_PALETTE[material];
+    color[0] += weight * palette[0];
+    color[1] += weight * palette[1];
+    color[2] += weight * palette[2];
+  }
+  return color;
 }
 
 function textHash(value) {
@@ -97,7 +102,44 @@ function clipmapAxis() {
   return values;
 }
 
-function terrainSampleAt(chunkData, worldX, worldZ) {
+export function createW8ClipmapTopology() {
+  const axis = clipmapAxis();
+  const vertices = [];
+  const indices = [];
+  const vertexByCoordinate = new Map();
+  const vertexIndex = (x, z) => {
+    const key = `${x},${z}`;
+    if (vertexByCoordinate.has(key)) return vertexByCoordinate.get(key);
+    const index = vertices.length;
+    vertices.push(Object.freeze({ x, z }));
+    vertexByCoordinate.set(key, index);
+    return index;
+  };
+  for (let z = 0; z < axis.length - 1; z += 1) {
+    for (let x = 0; x < axis.length - 1; x += 1) {
+      const x0 = axis[x]; const x1 = axis[x + 1];
+      const z0 = axis[z]; const z1 = axis[z + 1];
+      const centerX = (x0 + x1) / 2;
+      const centerZ = (z0 + z1) / 2;
+      if (Math.max(Math.abs(centerX), Math.abs(centerZ)) < FIVE_BY_FIVE_HALF_EXTENT_METERS) {
+        continue;
+      }
+      const northwest = vertexIndex(x0, z0);
+      const northeast = vertexIndex(x1, z0);
+      const southwest = vertexIndex(x0, z1);
+      const southeast = vertexIndex(x1, z1);
+      indices.push(northwest, southwest, northeast, northeast, southwest, southeast);
+    }
+  }
+  return Object.freeze({
+    vertices: Object.freeze(vertices),
+    indices: Object.freeze(indices),
+  });
+}
+
+const CLIPMAP_TOPOLOGY = createW8ClipmapTopology();
+
+export function sampleW8DistantTerrainAt(chunkData, worldX, worldZ) {
   const terrain = chunkData?.terrain;
   if (!terrain) return null;
   const originX = chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
@@ -110,19 +152,36 @@ function terrainSampleAt(chunkData, worldX, worldZ) {
   const x1 = Math.min(x0 + 1, terrain.resolution.x - 1);
   const z1 = Math.min(z0 + 1, terrain.resolution.z - 1);
   const tx = fx - x0; const tz = fz - z0;
-  const at = (x, z) => terrain.heights[z * terrain.resolution.x + x]
+  const northwest = z0 * terrain.resolution.x + x0;
+  const northeast = z0 * terrain.resolution.x + x1;
+  const southwest = z1 * terrain.resolution.x + x0;
+  const southeast = z1 * terrain.resolution.x + x1;
+  const northWeight = 1 - tz;
+  const southWeight = tz;
+  const westWeight = 1 - tx;
+  const eastWeight = tx;
+  const height = ((terrain.heights[northwest] * westWeight
+    + terrain.heights[northeast] * eastWeight) * northWeight
+    + (terrain.heights[southwest] * westWeight
+      + terrain.heights[southeast] * eastWeight) * southWeight)
     * terrain.heightUnitMeters;
-  const height = (at(x0, z0) * (1 - tx) + at(x1, z0) * tx) * (1 - tz)
-    + (at(x0, z1) * (1 - tx) + at(x1, z1) * tx) * tz;
-  const weights = [];
+  const color = [0, 0, 0];
   for (let material = 0; material < W8_PRESENTATION_TERRAIN_PALETTE.length; material += 1) {
-    const weightAt = (x, z) => terrain.materialWeights[
-      (z * terrain.resolution.x + x) * W8_PRESENTATION_TERRAIN_PALETTE.length + material
-    ];
-    weights.push((weightAt(x0, z0) * (1 - tx) + weightAt(x1, z0) * tx) * (1 - tz)
-      + (weightAt(x0, z1) * (1 - tx) + weightAt(x1, z1) * tx) * tz);
+    const weight = ((terrain.materialWeights[
+      northwest * W8_PRESENTATION_TERRAIN_PALETTE.length + material
+    ] * westWeight + terrain.materialWeights[
+      northeast * W8_PRESENTATION_TERRAIN_PALETTE.length + material
+    ] * eastWeight) * northWeight + (terrain.materialWeights[
+      southwest * W8_PRESENTATION_TERRAIN_PALETTE.length + material
+    ] * westWeight + terrain.materialWeights[
+      southeast * W8_PRESENTATION_TERRAIN_PALETTE.length + material
+    ] * eastWeight) * southWeight);
+    const palette = W8_PRESENTATION_TERRAIN_PALETTE[material];
+    color[0] += weight * palette[0];
+    color[1] += weight * palette[1];
+    color[2] += weight * palette[2];
   }
-  return Object.freeze({ height, color: Object.freeze(w8TerrainColorFromWeights(weights)) });
+  return { height, color };
 }
 
 function sampleActiveTerrain(activeChunks, worldX, worldZ) {
@@ -130,13 +189,13 @@ function sampleActiveTerrain(activeChunks, worldX, worldZ) {
   const chunkX = Math.floor((worldX - epsilon) / LOGICAL_CHUNK_SIZE_METERS);
   const chunkZ = Math.floor((worldZ - epsilon) / LOGICAL_CHUNK_SIZE_METERS);
   const direct = activeChunks.get(`${chunkX},${chunkZ}`);
-  if (direct) return terrainSampleAt(direct, worldX, worldZ);
+  if (direct) return sampleW8DistantTerrainAt(direct, worldX, worldZ);
   for (const chunk of activeChunks.values()) {
     const minimumX = chunk.chunkX * LOGICAL_CHUNK_SIZE_METERS - epsilon;
     const minimumZ = chunk.chunkZ * LOGICAL_CHUNK_SIZE_METERS - epsilon;
     if (worldX >= minimumX && worldX <= minimumX + LOGICAL_CHUNK_SIZE_METERS + epsilon
       && worldZ >= minimumZ && worldZ <= minimumZ + LOGICAL_CHUNK_SIZE_METERS + epsilon) {
-      return terrainSampleAt(chunk, worldX, worldZ);
+      return sampleW8DistantTerrainAt(chunk, worldX, worldZ);
     }
   }
   return null;
@@ -460,11 +519,8 @@ export async function createW8DistantPresentation({
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
     const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const axis = clipmapAxis(); const positions = []; const colors = []; const indices = [];
-    const vertex = new Map();
-    const sample = (x, z) => {
-      const key = `${x},${z}`;
-      if (vertex.has(key)) return vertex.get(key);
+    const positions = []; const colors = [];
+    for (const { x, z } of CLIPMAP_TOPOLOGY.vertices) {
       const worldX = centerWorldX + x; const worldZ = centerWorldZ + z;
       const base = baseClipmapSample(worldX, worldZ);
       let height = base.height;
@@ -495,22 +551,11 @@ export async function createW8DistantPresentation({
           }
         }
       }
-      const index = positions.length / 3;
       positions.push((worldX - originMetersX) * UNITS_PER_METER, height * UNITS_PER_METER,
         (worldZ - originMetersZ) * UNITS_PER_METER);
       colors.push(...color);
-      vertex.set(key, index);
-      return index;
-    };
-    for (let z = 0; z < axis.length - 1; z += 1) for (let x = 0; x < axis.length - 1; x += 1) {
-      const x0 = axis[x]; const x1 = axis[x + 1]; const z0 = axis[z]; const z1 = axis[z + 1];
-      const centerX = (x0 + x1) / 2; const centerZ = (z0 + z1) / 2;
-      if (Math.max(Math.abs(centerX), Math.abs(centerZ)) < FIVE_BY_FIVE_HALF_EXTENT_METERS) continue;
-      const northwest = sample(x0, z0); const northeast = sample(x1, z0);
-      const southwest = sample(x0, z1); const southeast = sample(x1, z1);
-      indices.push(northwest, southwest, northeast, northeast, southwest, southeast);
     }
-    const geometry = makeGeometry(THREE, positions, colors, indices);
+    const geometry = makeGeometry(THREE, positions, colors, CLIPMAP_TOPOLOGY.indices);
     let checksum = 0x811c9dc5;
     for (const value of [...positions, ...colors]) {
       checksum ^= Math.round(value * 1000);

@@ -108,8 +108,7 @@ export function evaluateW8PerformanceRuns({
   const over50Ratio = median(w8Reports.map(report => report.hitchRatio));
   const p95Limit = Math.max(20, finiteP95 * 1.25);
   const p99Limit = Math.max(40, finiteP99 * 1.5);
-  const over50RatioLimit = finiteOver50Ratio > 0.005
-    ? finiteOver50Ratio + 0.001 : 0.005;
+  const over50RatioLimit = 0.005;
   const beforeP95Limit = beforeW8P95 * (scenario === 'crossing' ? 1 : 1.1);
   const beforeP99Limit = beforeW8P99 * (scenario === 'crossing' ? 1 : 1.1);
   const beforeOver50RatioLimit = scenario === 'crossing'
@@ -131,7 +130,7 @@ export function evaluateW8PerformanceRuns({
   const criteria = Object.freeze({
     finiteP95: w8P95 <= p95Limit,
     finiteP99: w8P99 <= p99Limit,
-    absoluteOver50Ratio: finiteOver50Ratio > 0.005 || over50Ratio <= 0.005,
+    absoluteOver50Ratio: over50Ratio <= 0.005,
     finiteRelativeOver50Ratio: over50Ratio <= over50RatioLimit,
     beforeW8P95: w8P95 <= beforeP95Limit,
     beforeW8P99: w8P99 <= beforeP99Limit,
