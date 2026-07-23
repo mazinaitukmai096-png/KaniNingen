@@ -26,6 +26,10 @@ import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 
 const EPSILON_METERS = 0.05;
 const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school']);
+const TANK_COLLISION_OBSTACLE_TYPES = new Set([
+  'house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory',
+]);
+const TANK_TERRAIN_QUERY_CACHE_CAPACITY = 128;
 
 function sorted(values) {
   return [...values].sort((a, b) => a.localeCompare(b));
@@ -227,6 +231,38 @@ async function settlementEntityDescriptor({ reference, chunkData, worldSeedHash,
   });
 }
 
+function distanceSquared3D(left, right) {
+  return (left.x - right.x) ** 2
+    + (left.y - right.y) ** 2
+    + (left.z - right.z) ** 2;
+}
+
+function rotateVectorXYZ(vector, rotationX, rotationY, rotationZ) {
+  // Match Three.js' default Euler order exactly: XYZ local rotations transform
+  // a column vector through fixed Z, then Y, then X axes.
+  const cosZ = Math.cos(rotationZ);
+  const sinZ = Math.sin(rotationZ);
+  const afterZ = {
+    x: vector.x * cosZ - vector.y * sinZ,
+    y: vector.x * sinZ + vector.y * cosZ,
+    z: vector.z,
+  };
+  const cosY = Math.cos(rotationY);
+  const sinY = Math.sin(rotationY);
+  const afterY = {
+    x: afterZ.x * cosY + afterZ.z * sinY,
+    y: afterZ.y,
+    z: -afterZ.x * sinY + afterZ.z * cosY,
+  };
+  const cosX = Math.cos(rotationX);
+  const sinX = Math.sin(rotationX);
+  return {
+    x: afterY.x,
+    y: afterY.y * cosX - afterY.z * sinX,
+    z: afterY.y * sinX + afterY.z * cosX,
+  };
+}
+
 function staticTarget(feature, type, contract, position, radius = contract.radius) {
   return Object.freeze({
     stableId: feature.candidateId ?? feature.stableId,
@@ -358,6 +394,7 @@ export class InfiniteGameplayRuntime {
     renderAdapter,
     featureRenderAdapter = null,
     getChunkDataForQuery = null,
+    sampleTerrainHeight = null,
     clock = () => globalThis.performance?.now?.() ?? Date.now(),
   } = {}) {
     if (typeof worldSeedHash !== 'string' || !worldSeedHash) throw new TypeError('worldSeedHash is required');
@@ -369,14 +406,22 @@ export class InfiniteGameplayRuntime {
     if (getChunkDataForQuery !== null && typeof getChunkDataForQuery !== 'function') {
       throw new TypeError('getChunkDataForQuery must be a function when provided');
     }
+    if (sampleTerrainHeight !== null && typeof sampleTerrainHeight !== 'function') {
+      throw new TypeError('sampleTerrainHeight must be a function when provided');
+    }
     this.worldSeedHash = worldSeedHash;
     this.generatorMajor = generatorMajor;
     this.state = state;
     this.renderAdapter = renderAdapter;
     this.featureRenderAdapter = featureRenderAdapter;
     this.getChunkDataForQuery = getChunkDataForQuery;
+    this.sampleTerrainHeight = sampleTerrainHeight;
     this.clock = clock;
     this.activeChunks = new Map();
+    this.spatialChunks = new Map();
+    this.maximumSpatialTargetRadiusMeters = finiteWorldUnitsToMeters(
+      W6_ENTITY_CONTRACTS.human.radius,
+    );
     this.stableIdOwners = new Map();
     this.lastAttackAt = -Infinity;
     this.projectiles = [];
@@ -388,12 +433,17 @@ export class InfiniteGameplayRuntime {
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.pendingBossSpawn = null;
     this.pendingTankReinforcement = null;
+    this.pendingTankRuntimeError = null;
+    this.tankSpawnEpoch = 0;
     this.tankSpawnFrameAccumulator = 0;
     this.tankSpawnFrame = 0;
     this.tankBindings = new Map();
     this.activeTankOccurrences = new Map();
     this.tankOccurrenceGenerations = new Map();
     this.reinforcementIds = new Set();
+    this.tankTerrainChunks = new Map();
+    this.pendingTankTerrainChunks = new Map();
+    this.tankTerrainQueryErrors = new Map();
     this.isShutdown = false;
     this.counts = {
       chunksLoaded: 0,
@@ -419,15 +469,15 @@ export class InfiniteGameplayRuntime {
   }
 
   #emitPresentationEvent({
-    type, x, z, directionX = 0, directionZ = 0, intensity = 1,
+    type, x, y = 0, z, directionX = 0, directionY = 0, directionZ = 0, intensity = 1,
     lifetimeSeconds = 0.25, soundCue = null,
   }) {
     const event = Object.freeze({
       schemaVersion: W8_PRESENTATION_EVENT_SCHEMA,
       sequence: ++this.combatSequence,
       type,
-      logicalPosition: Object.freeze({ x: q6(x), y: 0, z: q6(z) }),
-      direction: Object.freeze({ x: q6(directionX), y: 0, z: q6(directionZ) }),
+      logicalPosition: Object.freeze({ x: q6(x), y: q6(y), z: q6(z) }),
+      direction: Object.freeze({ x: q6(directionX), y: q6(directionY), z: q6(directionZ) }),
       scaleStageId: this.state.activeScaleStageId,
       intensity: q6(intensity),
       lifetimeSeconds: q6(lifetimeSeconds),
@@ -439,8 +489,8 @@ export class InfiniteGameplayRuntime {
   }
 
   #emitCombatEffect({
-    type, x, z, durationSeconds, cameraShake = 0, hitStopMs = 0,
-    directionX = 0, directionZ = 0, intensity = 1, soundCue = null,
+    type, x, y = 0, z, durationSeconds, cameraShake = 0, hitStopMs = 0,
+    directionX = 0, directionY = 0, directionZ = 0, intensity = 1, soundCue = null,
   }) {
     const effect = {
       id: `combat-effect:${this.combatSequence + 1}`,
@@ -450,8 +500,9 @@ export class InfiniteGameplayRuntime {
       remainingSeconds: durationSeconds,
     };
     this.combatEffects.push(effect);
+    if (this.combatEffects.length > 256) this.combatEffects.shift();
     this.#emitPresentationEvent({
-      type, x, z, directionX, directionZ, intensity,
+      type, x, y, z, directionX, directionY, directionZ, intensity,
       lifetimeSeconds: durationSeconds, soundCue,
     });
     this.pendingCameraShake = Math.max(this.pendingCameraShake, cameraShake);
@@ -562,22 +613,366 @@ export class InfiniteGameplayRuntime {
     }
   }
 
+  *#spatialStaticTargets() {
+    const seen = new Set();
+    for (const model of this.spatialChunks.values()) {
+      for (const target of model.staticTargets) {
+        if (seen.has(target.stableId)) continue;
+        seen.add(target.stableId);
+        yield target;
+      }
+    }
+  }
+
+  *#spatialModelsIntersectingAabb(minimumX, minimumZ, maximumX, maximumZ) {
+    const minimumOwner = logicalWorldToOwnedChunk(
+      Math.min(minimumX, maximumX),
+      Math.min(minimumZ, maximumZ),
+    );
+    const maximumOwner = logicalWorldToOwnedChunk(
+      Math.max(minimumX, maximumX),
+      Math.max(minimumZ, maximumZ),
+    );
+    for (let chunkZ = minimumOwner.chunkZ; chunkZ <= maximumOwner.chunkZ; chunkZ += 1) {
+      for (let chunkX = minimumOwner.chunkX; chunkX <= maximumOwner.chunkX; chunkX += 1) {
+        const model = this.spatialChunks.get(createChunkKey(chunkX, chunkZ));
+        if (model) yield model;
+      }
+    }
+  }
+
+  #refreshSpatialBroadphaseBounds() {
+    let maximumRadius = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius);
+    for (const model of this.spatialChunks.values()) {
+      for (const target of model.staticTargets) {
+        maximumRadius = Math.max(maximumRadius, finiteWorldUnitsToMeters(target.radius));
+      }
+    }
+    this.maximumSpatialTargetRadiusMeters = maximumRadius;
+  }
+
+  *#tankShellWorldCandidates(start, end) {
+    const padding = this.maximumSpatialTargetRadiusMeters
+      + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters;
+    for (const model of this.#spatialModelsIntersectingAabb(
+      Math.min(start.x, end.x) - padding,
+      Math.min(start.z, end.z) - padding,
+      Math.max(start.x, end.x) + padding,
+      Math.max(start.z, end.z) + padding,
+    )) {
+      yield* model.staticTargets;
+      for (const descriptor of model.entityDescriptors) {
+        if (descriptor.type !== 'human') continue;
+        yield descriptor;
+      }
+    }
+  }
+
+  #registerSpatialGameplayModel(key, model, { startOccurrences = true } = {}) {
+    for (const target of model.staticTargets) {
+      this.#registerStableId(target.stableId, target.ownerChunkKey ?? key);
+      if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
+    }
+    for (const descriptor of model.entityDescriptors) {
+      if (descriptor.type !== 'tank') continue;
+      this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+      const entity = this.state.ensureEntity(descriptor);
+      this.#bindTank(entity, descriptor);
+      if (startOccurrences && entity.alive && entity.spawned === true
+        && !this.activeTankOccurrences.has(entity.stableId)) {
+        this.#startTankOccurrence(entity, { sync: false });
+      }
+    }
+  }
+
+  #rememberTankTerrainChunk(key, chunkData) {
+    if (!chunkData) return null;
+    const source = chunkData.sourceChunkData;
+    const cachedChunkData = source?.terrain
+      ? Object.freeze({
+        chunkX: chunkData.chunkX,
+        chunkZ: chunkData.chunkZ,
+        sourceChunkData: Object.freeze({
+          chunkX: source.chunkX,
+          chunkZ: source.chunkZ,
+          terrain: source.terrain,
+        }),
+      })
+      : chunkData;
+    this.tankTerrainQueryErrors.delete(key);
+    this.tankTerrainChunks.delete(key);
+    this.tankTerrainChunks.set(key, cachedChunkData);
+    while (this.tankTerrainChunks.size > TANK_TERRAIN_QUERY_CACHE_CAPACITY) {
+      this.tankTerrainChunks.delete(this.tankTerrainChunks.keys().next().value);
+    }
+    return cachedChunkData;
+  }
+
+  #rememberTankTerrainQueryError(key, error) {
+    this.tankTerrainQueryErrors.delete(key);
+    this.tankTerrainQueryErrors.set(key, error);
+    while (this.tankTerrainQueryErrors.size > TANK_TERRAIN_QUERY_CACHE_CAPACITY) {
+      this.tankTerrainQueryErrors.delete(this.tankTerrainQueryErrors.keys().next().value);
+    }
+  }
+
+  #requestTankTerrainChunk(x, z) {
+    if (this.sampleTerrainHeight === null || this.getChunkDataForQuery === null) {
+      return Promise.resolve(null);
+    }
+    const owner = logicalWorldToOwnedChunk(x, z);
+    const cached = this.tankTerrainChunks.get(owner.key);
+    if (cached) return Promise.resolve(cached);
+    const queryError = this.tankTerrainQueryErrors.get(owner.key);
+    if (queryError) return Promise.reject(queryError);
+    const existing = this.pendingTankTerrainChunks.get(owner.key);
+    if (existing) return existing;
+    if (this.pendingTankTerrainChunks.size >= TANK_TERRAIN_QUERY_CACHE_CAPACITY) {
+      return Promise.resolve(null);
+    }
+    const requestEpoch = this.tankSpawnEpoch;
+    const pending = Promise.resolve()
+      .then(() => this.getChunkDataForQuery(owner.chunkX, owner.chunkZ))
+      .then(chunkData => {
+        if (this.isShutdown || requestEpoch !== this.tankSpawnEpoch) return null;
+        const source = chunkData?.sourceChunkData ?? chunkData;
+        if (!Number.isSafeInteger(chunkData?.chunkX)
+          || !Number.isSafeInteger(chunkData?.chunkZ)
+          || createChunkKey(chunkData.chunkX, chunkData.chunkZ) !== owner.key
+          || (chunkData?.sourceChunkData
+            && (!Number.isSafeInteger(source?.chunkX)
+              || !Number.isSafeInteger(source?.chunkZ)
+              || createChunkKey(source.chunkX, source.chunkZ) !== owner.key))) {
+          const error = new Error(`Tank terrain query returned malformed or wrong ChunkData for ${owner.key}`);
+          error.code = 'ERR_TANK_TERRAIN_INTEGRITY';
+          throw error;
+        }
+        return this.#rememberTankTerrainChunk(owner.key, chunkData);
+      })
+      .catch(error => {
+        if (error?.code !== 'ERR_TANK_TERRAIN_INTEGRITY') return null;
+        this.#rememberTankTerrainQueryError(owner.key, error);
+        throw error;
+      })
+      .finally(() => {
+        if (this.pendingTankTerrainChunks.get(owner.key) === pending) {
+          this.pendingTankTerrainChunks.delete(owner.key);
+        }
+      });
+    this.pendingTankTerrainChunks.set(owner.key, pending);
+    return pending;
+  }
+
+  #tryTerrainHeightAt(x, z) {
+    if (this.sampleTerrainHeight === null) return 0;
+    const owner = logicalWorldToOwnedChunk(x, z);
+    const height = this.sampleTerrainHeight(
+      x,
+      z,
+      this.tankTerrainChunks.get(owner.key) ?? null,
+    );
+    if (height === null || height === undefined) {
+      const queryError = this.tankTerrainQueryErrors.get(owner.key);
+      if (queryError) throw queryError;
+      void this.#requestTankTerrainChunk(x, z).catch(() => {});
+      return null;
+    }
+    if (!Number.isFinite(height)) {
+      throw new Error(`canonical terrain sampler returned a non-finite height at (${x}, ${z})`);
+    }
+    return height;
+  }
+
+  #terrainHeightAt(x, z) {
+    const height = this.#tryTerrainHeightAt(x, z);
+    if (height === null) {
+      const owner = logicalWorldToOwnedChunk(x, z);
+      throw new Error(`canonical terrain is not prepared for Tank query Chunk ${owner.key}`);
+    }
+    return height;
+  }
+
+  async #ensureTankTerrainAt(x, z, rotationY = 0) {
+    if (this.sampleTerrainHeight === null) return true;
+    const terrainEpoch = this.tankSpawnEpoch;
+    const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
+    const forwardX = Math.sin(rotationY);
+    const forwardZ = Math.cos(rotationY);
+    const rightX = Math.cos(rotationY);
+    const rightZ = -Math.sin(rotationY);
+    const points = [
+      { x, z },
+      {
+        x: x + forwardX * lifecycle.trackHalfLengthMeters,
+        z: z + forwardZ * lifecycle.trackHalfLengthMeters,
+      },
+      {
+        x: x - forwardX * lifecycle.trackHalfLengthMeters,
+        z: z - forwardZ * lifecycle.trackHalfLengthMeters,
+      },
+      {
+        x: x + rightX * lifecycle.trackHalfWidthMeters,
+        z: z + rightZ * lifecycle.trackHalfWidthMeters,
+      },
+      {
+        x: x - rightX * lifecycle.trackHalfWidthMeters,
+        z: z - rightZ * lifecycle.trackHalfWidthMeters,
+      },
+    ];
+    const missing = points.filter(point => this.#tryTerrainHeightAt(point.x, point.z) === null);
+    if (missing.length === 0) return true;
+    await Promise.all(missing.map(point => this.#requestTankTerrainChunk(point.x, point.z)));
+    if (this.isShutdown || terrainEpoch !== this.tankSpawnEpoch) return false;
+    return points.every(point => this.#tryTerrainHeightAt(point.x, point.z) !== null);
+  }
+
+  #updateTankGroundPose(entity) {
+    const occurrence = this.activeTankOccurrences.get(entity.stableId);
+    if (!occurrence) return null;
+    const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
+    const forwardX = Math.sin(entity.rotationY);
+    const forwardZ = Math.cos(entity.rotationY);
+    const rightX = Math.cos(entity.rotationY);
+    const rightZ = -Math.sin(entity.rotationY);
+    const halfLength = lifecycle.trackHalfLengthMeters;
+    const halfWidth = lifecycle.trackHalfWidthMeters;
+    const front = this.#tryTerrainHeightAt(
+      entity.x + forwardX * halfLength,
+      entity.z + forwardZ * halfLength,
+    );
+    const back = this.#tryTerrainHeightAt(
+      entity.x - forwardX * halfLength,
+      entity.z - forwardZ * halfLength,
+    );
+    const right = this.#tryTerrainHeightAt(
+      entity.x + rightX * halfWidth,
+      entity.z + rightZ * halfWidth,
+    );
+    const left = this.#tryTerrainHeightAt(
+      entity.x - rightX * halfWidth,
+      entity.z - rightZ * halfWidth,
+    );
+    const groundY = this.#tryTerrainHeightAt(entity.x, entity.z);
+    if (front === null || back === null || right === null || left === null || groundY === null) {
+      occurrence.terrainReady = false;
+      return occurrence;
+    }
+    occurrence.terrainReady = true;
+    occurrence.groundY = groundY;
+    occurrence.groundPitch = -Math.atan2(front - back, halfLength * 2);
+    occurrence.groundRoll = Math.atan2(right - left, halfWidth * 2);
+    return occurrence;
+  }
+
+  #tankPresentationState(entity) {
+    const occurrence = this.#updateTankGroundPose(entity);
+    if (!occurrence?.terrainReady) return null;
+    return {
+      ...entity,
+      groundY: occurrence.groundY,
+      groundPitch: occurrence.groundPitch,
+      groundRoll: occurrence.groundRoll,
+    };
+  }
+
+  #tankMuzzlePosition(entity) {
+    const occurrence = this.#updateTankGroundPose(entity);
+    if (!occurrence?.terrainReady) {
+      throw new Error(`Tank occurrence terrain is not prepared: ${entity.stableId}`);
+    }
+    const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
+    const pitchedMuzzle = rotateVectorXYZ(
+      { x: 0, y: 0, z: lifecycle.muzzleForwardFromGunMeters },
+      entity.gunPitch ?? 0,
+      0,
+      0,
+    );
+    pitchedMuzzle.z += lifecycle.gunPivotForwardMeters;
+    const turretLocal = rotateVectorXYZ(
+      pitchedMuzzle,
+      0,
+      normalizedAngle((entity.turretRotationY ?? entity.rotationY) - entity.rotationY),
+      0,
+    );
+    turretLocal.y += lifecycle.turretPivotHeightMeters;
+    turretLocal.z += lifecycle.turretPivotForwardMeters;
+    const worldOffset = rotateVectorXYZ(
+      turretLocal,
+      occurrence.groundPitch,
+      entity.rotationY,
+      occurrence.groundRoll,
+    );
+    return Object.freeze({
+      x: entity.x + worldOffset.x,
+      y: occurrence.groundY + worldOffset.y,
+      z: entity.z + worldOffset.z,
+    });
+  }
+
+  #resolveTankObstacleCollisions(entity) {
+    const tankRadius = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.tank.radius);
+    const broadphaseRadius = tankRadius + this.maximumSpatialTargetRadiusMeters;
+    for (const model of this.#spatialModelsIntersectingAabb(
+      entity.x - broadphaseRadius,
+      entity.z - broadphaseRadius,
+      entity.x + broadphaseRadius,
+      entity.z + broadphaseRadius,
+    )) {
+      for (const obstacle of model.staticTargets) {
+        if (!TANK_COLLISION_OBSTACLE_TYPES.has(obstacle.type)
+          || this.state.isFeatureDestroyed(obstacle.stableId)) continue;
+        const obstacleRadius = finiteWorldUnitsToMeters(obstacle.radius);
+        const minimumDistance = tankRadius + obstacleRadius;
+        let dx = entity.x - obstacle.x;
+        let dz = entity.z - obstacle.z;
+        const squared = dx * dx + dz * dz;
+        if (squared >= minimumDistance ** 2) continue;
+        const distance = Math.sqrt(squared) || 0.001;
+        const overlap = minimumDistance - distance;
+        entity.x += dx / distance * overlap;
+        entity.z += dz / distance * overlap;
+      }
+    }
+  }
+
   #tankHasLineOfSight(entity, player) {
     const clearance = W8_TANK_LIFECYCLE_CONTRACT.lineOfSightClearanceMeters;
     const playerDistanceSquared = distanceSquared(entity, player);
-    for (const model of this.activeChunks.values()) {
+    if (playerDistanceSquared <= 1e-12) return true;
+    const segmentX = player.x - entity.x;
+    const segmentZ = player.z - entity.z;
+    const blocksSegment = obstacle => {
+      const obstacleX = obstacle.x - entity.x;
+      const obstacleZ = obstacle.z - entity.z;
+      const projection = (obstacleX * segmentX + obstacleZ * segmentZ)
+        / playerDistanceSquared;
+      if (projection <= 0 || projection >= 1) return false;
+      const perpendicularX = obstacleX - segmentX * projection;
+      const perpendicularZ = obstacleZ - segmentZ * projection;
+      const radius = finiteWorldUnitsToMeters(obstacle.radius) + clearance;
+      return perpendicularX * perpendicularX + perpendicularZ * perpendicularZ < radius ** 2;
+    };
+    const broadphasePadding = this.maximumSpatialTargetRadiusMeters + clearance;
+    for (const model of this.#spatialModelsIntersectingAabb(
+      Math.min(entity.x, player.x) - broadphasePadding,
+      Math.min(entity.z, player.z) - broadphasePadding,
+      Math.max(entity.x, player.x) + broadphasePadding,
+      Math.max(entity.z, player.z) + broadphasePadding,
+    )) {
       for (const obstacle of model.staticTargets) {
         if (obstacle.type === 'pebble' || this.state.isFeatureDestroyed(obstacle.stableId)) continue;
-        if (distanceSquared(entity, obstacle) >= playerDistanceSquared) continue;
-        const radius = finiteWorldUnitsToMeters(obstacle.radius) + clearance;
-        if (pointSegmentDistanceSquared(obstacle, entity, player) < radius ** 2) return false;
+        if (blocksSegment(obstacle)) return false;
       }
     }
-    for (const obstacle of this.state.entityStates.values()) {
-      if (obstacle === entity || !obstacle.alive || obstacle.spawned !== true
-        || obstacle.type !== 'tank' || distanceSquared(entity, obstacle) >= playerDistanceSquared) continue;
-      const radius = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.tank.radius) + clearance;
-      if (pointSegmentDistanceSquared(obstacle, entity, player) < radius ** 2) return false;
+    for (const occurrence of this.activeTankOccurrences.values()) {
+      const obstacle = this.state.entityStates.get(occurrence.slotStableId);
+      if (!obstacle || obstacle === entity || !obstacle.alive || obstacle.spawned !== true
+        || !blocksSegment({
+          x: obstacle.x,
+          z: obstacle.z,
+          radius: W6_ENTITY_CONTRACTS.tank.radius,
+        })) continue;
+      return false;
     }
     return true;
   }
@@ -639,6 +1034,10 @@ export class InfiniteGameplayRuntime {
       kind: binding.kind,
       runtimeGeneration,
       currentOwnerChunkKey: logicalWorldToOwnedChunk(entity.x, entity.z).key,
+      terrainReady: false,
+      groundY: binding.baseY,
+      groundPitch: 0,
+      groundRoll: 0,
     };
     this.activeTankOccurrences.set(entity.stableId, occurrence);
     if (binding.kind === 'fallback') this.reinforcementIds.add(entity.stableId);
@@ -656,11 +1055,7 @@ export class InfiniteGameplayRuntime {
     }
     entity.spawned = false;
     entity.aiState = destroyed ? 'destroyed' : 'reserve';
-    this.projectiles = this.projectiles.filter(projectile =>
-      projectile.ownerStableId !== stableId
-      || (projectile.ownerRuntimeGeneration !== undefined
-        && occurrence
-        && projectile.ownerRuntimeGeneration !== occurrence.runtimeGeneration));
+    this.projectiles = this.projectiles.filter(projectile => projectile.ownerStableId !== stableId);
     this.activeTankOccurrences.delete(stableId);
     this.renderAdapter.removeReinforcement?.(stableId);
     if ((entity.reinforcementSequence ?? 0) > 0) {
@@ -668,9 +1063,11 @@ export class InfiniteGameplayRuntime {
       this.reinforcementIds.delete(stableId);
       this.stableIdOwners.delete(stableId);
       this.tankBindings.delete(stableId);
+      this.tankOccurrenceGenerations.delete(stableId);
     } else {
       this.renderAdapter.syncEntity(entity);
     }
+    this.#syncTransientCombat();
     return occurrence !== undefined;
   }
 
@@ -695,18 +1092,40 @@ export class InfiniteGameplayRuntime {
     }
   }
 
+  async #prepareActiveTankTerrainForPresentation() {
+    const readyStableIds = new Set();
+    const despawnDistance = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.tank.despawnDistance);
+    for (const occurrence of [...this.activeTankOccurrences.values()]) {
+      const entity = this.state.entityStates.get(occurrence.slotStableId);
+      if (!entity?.alive || entity.spawned !== true) {
+        if (entity) this.#removeTankOccurrence(entity, { destroyed: entity.alive === false });
+        continue;
+      }
+      if (distanceSquared(entity, this.state.player) > despawnDistance ** 2) {
+        this.#removeTankOccurrence(entity);
+        continue;
+      }
+      if (await this.#ensureTankTerrainAt(entity.x, entity.z, entity.rotationY)) {
+        readyStableIds.add(entity.stableId);
+      }
+    }
+    return readyStableIds;
+  }
+
   #syncTank(entity) {
     if (!entity?.stableId) return false;
     if (entity.alive && entity.spawned === true
       && this.activeTankOccurrences.has(entity.stableId)) {
+      const presentationState = this.#tankPresentationState(entity);
+      if (!presentationState) return false;
       const binding = this.tankBindings.get(entity.stableId) ?? this.#bindTank(entity);
       const usesOccurrenceRenderer = binding.kind === 'fallback'
         || !this.activeChunks.has(binding.baseOwnerChunkKey);
       if (usesOccurrenceRenderer) {
-        return this.renderAdapter.syncReinforcement?.(entity) ?? false;
+        return this.renderAdapter.syncReinforcement?.(presentationState) ?? false;
       }
       this.renderAdapter.removeReinforcement?.(entity.stableId);
-      return this.renderAdapter.syncEntity(entity);
+      return this.renderAdapter.syncEntity(presentationState);
     }
     this.renderAdapter.removeReinforcement?.(entity.stableId);
     if ((entity.reinforcementSequence ?? 0) === 0) return this.renderAdapter.syncEntity(entity);
@@ -718,15 +1137,23 @@ export class InfiniteGameplayRuntime {
       if (entity) this.#removeTankOccurrence(entity, { destroyed: entity.alive === false });
       return;
     }
-    entity.aiClock += deltaSeconds;
     const contract = W6_ENTITY_CONTRACTS.tank;
     const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
+    if (distanceSquared(entity, player) <= lifecycle.collisionActiveRangeMeters ** 2) {
+      this.#resolveTankObstacleCollisions(entity);
+    }
+    entity.aiClock += deltaSeconds;
     const distance = Math.sqrt(distanceSquared(entity, player));
-    if (distance >= finiteWorldUnitsToMeters(contract.despawnDistance)) {
+    if (distance > finiteWorldUnitsToMeters(contract.despawnDistance)) {
       this.#removeTankOccurrence(entity);
       return;
     }
-    if (distance > finiteWorldUnitsToMeters(contract.engageRange)) {
+    const preparedGround = this.#updateTankGroundPose(entity);
+    if (!preparedGround?.terrainReady) {
+      this.counts.entityUpdates += 1;
+      return;
+    }
+    if (distance >= finiteWorldUnitsToMeters(contract.engageRange)) {
       entity.aiState = 'search';
       this.#syncTank(entity);
       return;
@@ -736,22 +1163,30 @@ export class InfiniteGameplayRuntime {
     if (entity.stuckCheckClock <= 0) {
       const movedSquared = (entity.x - (entity.lastX ?? entity.x)) ** 2
         + (entity.z - (entity.lastZ ?? entity.z)) ** 2;
-      if (entity.aiState === 'engage' && movedSquared < lifecycle.stuckDistanceThresholdMetersSquared) {
+      if (movedSquared < lifecycle.stuckDistanceThresholdMetersSquared) {
         entity.stuckRemainingSeconds = lifecycle.stuckAvoidSeconds;
-        const side = deterministicUnitFloat(`${this.worldSeedHash}:${entity.stableId}:${entity.fireSequence}:avoid`) >= 0.5 ? 1 : -1;
+        const recoveryOrdinal = Math.floor(entity.aiClock / lifecycle.stuckCheckSeconds);
+        const side = deterministicUnitFloat(
+          `${this.worldSeedHash}:${entity.stableId}:${recoveryOrdinal}:avoid`,
+        ) >= 0.5 ? 1 : -1;
         entity.avoidAngle = normalizedAngle(entity.rotationY + side * Math.PI / 2);
       }
       entity.lastX = entity.x;
       entity.lastZ = entity.z;
       entity.stuckCheckClock = lifecycle.stuckCheckSeconds;
     }
-    entity.stuckRemainingSeconds = Math.max(0, (entity.stuckRemainingSeconds ?? 0) - deltaSeconds);
-    const stuck = entity.stuckRemainingSeconds > 0;
+    const stuck = (entity.stuckRemainingSeconds ?? 0) > 0;
+    if (stuck) {
+      entity.stuckRemainingSeconds = Math.max(0, entity.stuckRemainingSeconds - deltaSeconds);
+    }
     const hasLineOfSight = this.#tankHasLineOfSight(entity, player);
     const targetHeading = Math.atan2(player.x - entity.x, player.z - entity.z);
     const bodyTarget = stuck ? entity.avoidAngle
       : hasLineOfSight ? targetHeading : normalizedAngle(targetHeading + Math.PI / 3);
     const frameScale = deltaSeconds * 60;
+    const turretRelativeYaw = normalizedAngle(
+      (entity.turretRotationY ?? entity.rotationY) - entity.rotationY,
+    );
     entity.rotationY = turnTowardAngle(
       entity.rotationY,
       bodyTarget,
@@ -759,31 +1194,46 @@ export class InfiniteGameplayRuntime {
     );
     const shouldMove = distance > finiteWorldUnitsToMeters(contract.approachDistance)
       || !hasLineOfSight || stuck;
+    const priorX = entity.x;
+    const priorZ = entity.z;
     if (shouldMove) {
       entity.aiState = stuck ? 'avoid' : hasLineOfSight ? 'engage' : 'flank';
       const speed = finiteWorldFrameSpeedToMetersPerSecond(contract.moveSpeed);
       entity.x += Math.sin(entity.rotationY) * speed * deltaSeconds;
       entity.z += Math.cos(entity.rotationY) * speed * deltaSeconds;
-      const occurrence = this.activeTankOccurrences.get(entity.stableId);
-      if (occurrence) {
-        occurrence.currentOwnerChunkKey = logicalWorldToOwnedChunk(entity.x, entity.z).key;
-      }
-      if ((entity.reinforcementSequence ?? 0) > 0) {
-        const owner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
-        if (owner !== entity.ownerChunkKey) {
-          this.state.moveEntityOwner(entity.stableId, owner);
-          this.stableIdOwners.set(entity.stableId, owner);
-        }
-      }
     } else entity.aiState = 'hold';
+    let occurrence = this.#updateTankGroundPose(entity);
+    if (!occurrence?.terrainReady) {
+      entity.x = priorX;
+      entity.z = priorZ;
+      occurrence = this.#updateTankGroundPose(entity);
+      if (occurrence?.terrainReady) this.#syncTank(entity);
+      this.counts.entityUpdates += 1;
+      return;
+    }
+    const currentOwner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
+    const activeOccurrence = this.activeTankOccurrences.get(entity.stableId);
+    if (activeOccurrence) activeOccurrence.currentOwnerChunkKey = currentOwner;
+    if ((entity.reinforcementSequence ?? 0) > 0 && currentOwner !== entity.ownerChunkKey) {
+      this.state.moveEntityOwner(entity.stableId, currentOwner);
+      this.stableIdOwners.set(entity.stableId, currentOwner);
+    }
 
-    entity.turretRotationY = turnTowardAngle(
-      entity.turretRotationY ?? entity.rotationY,
-      targetHeading,
+    const postMoveTargetHeading = Math.atan2(player.x - entity.x, player.z - entity.z);
+    const postMoveDistance = Math.sqrt(distanceSquared(entity, player));
+    const turnedTurretRelativeYaw = turnTowardAngle(
+      turretRelativeYaw,
+      normalizedAngle(postMoveTargetHeading - entity.rotationY),
       lifecycle.turretTurnRadiansPerFrame * frameScale,
     );
-    const horizontalDistance = Math.max(0.025, distance);
-    const targetGunPitch = -Math.atan2(finiteWorldUnitsToMeters(-30), horizontalDistance);
+    entity.turretRotationY = normalizedAngle(entity.rotationY + turnedTurretRelativeYaw);
+    const horizontalDistance = Math.max(0.025, postMoveDistance);
+    const playerAimY = (Number.isFinite(player.y)
+      ? player.y
+      : this.#terrainHeightAt(player.x, player.z))
+      + lifecycle.playerAimHeightMeters;
+    const gunPivotY = occurrence.groundY + lifecycle.turretPivotHeightMeters;
+    const targetGunPitch = -Math.atan2(playerAimY - gunPivotY, horizontalDistance);
     entity.gunPitch = turnTowardAngle(
       entity.gunPitch ?? 0,
       targetGunPitch,
@@ -795,24 +1245,32 @@ export class InfiniteGameplayRuntime {
       combat.fireIntervalMinimumMs,
       combat.fireIntervalBaseMs - this.state.player.score * combat.fireIntervalScoreDivisor,
     );
-    const aimComplete = Math.abs(normalizedAngle(targetHeading - entity.turretRotationY)) <= 0.06;
-    if (hasLineOfSight && !stuck && aimComplete
-      && this.state.gameplayTimeMs - entity.lastShotAtMs >= fireIntervalMs) {
-      const dx = player.x - entity.x;
-      const dz = player.z - entity.z;
-      const length = Math.hypot(dx, dz) || 1;
+    if (hasLineOfSight && !stuck
+      && this.state.gameplayTimeMs - entity.lastShotAtMs > fireIntervalMs) {
+      const muzzle = this.#tankMuzzlePosition(entity);
+      const dx = player.x - muzzle.x;
+      const dy = playerAimY - muzzle.y;
+      const dz = player.z - muzzle.z;
+      const length = Math.hypot(dx, dy, dz) || 1;
+      const firingOccurrence = this.activeTankOccurrences.get(entity.stableId);
       entity.fireSequence = (entity.fireSequence ?? 0) + 1;
       entity.lastShotAtMs = this.state.gameplayTimeMs;
       this.projectiles.push({
         id: `${entity.stableId}:shot:${entity.fireSequence}`,
         ownerStableId: entity.stableId,
         ownerChunkKey: entity.ownerChunkKey,
-        x: entity.x, z: entity.z, directionX: dx / length, directionZ: dz / length,
+        ownerRuntimeGeneration: firingOccurrence.runtimeGeneration,
+        x: muzzle.x,
+        y: muzzle.y,
+        z: muzzle.z,
+        directionX: dx / length,
+        directionY: dy / length,
+        directionZ: dz / length,
         remainingSeconds: combat.bulletLifeFrames / 60, type: 'tank-shell',
       });
       this.#emitPresentationEvent({
-        type: 'tank-fire', x: entity.x, z: entity.z,
-        directionX: dx / length, directionZ: dz / length,
+        type: 'tank-fire', x: muzzle.x, y: muzzle.y, z: muzzle.z,
+        directionX: dx / length, directionY: dy / length, directionZ: dz / length,
         intensity: 1.2, lifetimeSeconds: 0.2, soundCue: 'tank-fire',
       });
       this.counts.tankShots += 1;
@@ -848,6 +1306,7 @@ export class InfiniteGameplayRuntime {
 
   #spawnFallbackTank(player, spawnFrame) {
     if (this.pendingTankReinforcement || typeof this.renderAdapter.syncReinforcement !== 'function') return;
+    const spawnEpoch = this.tankSpawnEpoch;
     const sequence = this.state.nextTankReinforcementSequence();
     const pending = (async () => {
       const result = await entityStableId({
@@ -857,7 +1316,7 @@ export class InfiniteGameplayRuntime {
         parentStableId: `infinite-world:${this.worldSeedHash}`,
         purposeKey: `w8-tank-reinforcement:${sequence}`,
       });
-      if (this.isShutdown) return;
+      if (this.isShutdown || spawnEpoch !== this.tankSpawnEpoch) return;
       const key = `${this.worldSeedHash}:fallback:${spawnFrame}:${sequence}`;
       const angle = deterministicUnitFloat(`${key}:angle`) * Math.PI * 2;
       const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
@@ -866,12 +1325,15 @@ export class InfiniteGameplayRuntime {
           * (lifecycle.fallbackMaximumDistanceMeters - lifecycle.fallbackMinimumDistanceMeters);
       const x = player.x + Math.sin(angle) * distance;
       const z = player.z + Math.cos(angle) * distance;
+      const rotationY = deterministicUnitFloat(`${key}:heading`) * Math.PI * 2;
+      const terrainReady = await this.#ensureTankTerrainAt(x, z, rotationY);
+      if (!terrainReady || this.isShutdown || spawnEpoch !== this.tankSpawnEpoch) return;
       const ownerChunkKey = logicalWorldToOwnedChunk(x, z).key;
       this.#registerStableId(result.stableId, ownerChunkKey);
       const tank = this.state.ensureEntity({
         stableId: result.stableId, ownerChunkKey, type: 'tank',
         maxHp: W6_ENTITY_CONTRACTS.tank.maxHp,
-        x, z, rotationY: normalizedAngle(angle + Math.PI), aiState: 'acquire',
+        x, z, rotationY, aiState: 'acquire',
         reinforcementSequence: sequence, spawned: true,
         lastShotAtMs: 0,
       });
@@ -879,49 +1341,63 @@ export class InfiniteGameplayRuntime {
       this.#startTankOccurrence(tank);
     })();
     this.pendingTankReinforcement = pending;
-    void pending.finally(() => {
-      if (this.pendingTankReinforcement === pending) this.pendingTankReinforcement = null;
-    });
+    void pending.then(
+      () => {
+        if (this.pendingTankReinforcement === pending) this.pendingTankReinforcement = null;
+      },
+      error => {
+        if (this.pendingTankReinforcement === pending) this.pendingTankReinforcement = null;
+        if (!this.isShutdown && spawnEpoch === this.tankSpawnEpoch) {
+          this.pendingTankRuntimeError ??= error;
+        }
+      },
+    );
   }
 
   #maintainFiniteTankSpawns(player, deltaSeconds) {
     const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
     if (this.isShutdown || this.state.activeScaleStageId !== 'MAX' || deltaSeconds <= 0) return;
-    this.tankSpawnFrameAccumulator += deltaSeconds * 60;
-    while (this.tankSpawnFrameAccumulator >= 1) {
-      this.tankSpawnFrameAccumulator -= 1;
-      this.tankSpawnFrame += 1;
-      const activeBoss = this.state.manualBossStableId
-        ? this.state.entityStates.get(this.state.manualBossStableId)?.alive === true : false;
-      const allowed = activeBoss ? lifecycle.bossTankLimit : Math.min(
-        lifecycle.tankLimitMaximum,
-        lifecycle.normalTankBaseLimit + Math.floor(this.state.player.score / lifecycle.tankLimitScoreDivisor),
-      );
-      const active = this.activeTankOccurrences.size;
-      if (active >= allowed) continue;
-      const chance = lifecycle.spawnChanceBasePerFrame + Math.min(
-        lifecycle.spawnChanceMaximumBonusPerFrame,
-        this.state.player.score * lifecycle.spawnChanceScoreFactor,
-      );
-      if (deterministicUnitFloat(`${this.worldSeedHash}:tank-spawn:${this.tankSpawnFrame}`) >= chance) continue;
-      const nearbyBases = [...this.tankBindings.values()]
-        .filter(binding => binding.kind === 'base'
-          && binding.baseStableId
-          && !this.state.isFeatureDestroyed(binding.baseStableId)
-          && this.activeChunks.has(binding.baseOwnerChunkKey)
-          && distanceSquared({ x: binding.baseX, z: binding.baseZ }, player)
-            < lifecycle.baseSpawnRangeMeters ** 2)
-        .map(binding => this.state.entityStates.get(binding.slotStableId))
-        .filter(entity => entity && entity.spawned !== true)
-        .sort((a, b) => a.stableId.localeCompare(b.stableId));
-      if (nearbyBases.length > 0) {
-        const selection = Math.floor(
-          deterministicUnitFloat(`${this.worldSeedHash}:tank-base:${this.tankSpawnFrame}`) * nearbyBases.length,
-        );
-        this.#activateBaseTank(nearbyBases[Math.min(selection, nearbyBases.length - 1)], this.tankSpawnFrame);
-      } else if (this.state.player.score > lifecycle.fallbackMinimumScore) {
-        this.#spawnFallbackTank(player, this.tankSpawnFrame);
+    const frameScale = deltaSeconds * 60;
+    this.tankSpawnFrameAccumulator = (this.tankSpawnFrameAccumulator + frameScale) % 1;
+    this.tankSpawnFrame += 1;
+    const activeBoss = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)?.alive === true : false;
+    const allowed = activeBoss ? lifecycle.bossTankLimit : Math.min(
+      lifecycle.tankLimitMaximum,
+      lifecycle.normalTankBaseLimit + Math.floor(this.state.player.score / lifecycle.tankLimitScoreDivisor),
+    );
+    const active = this.activeTankOccurrences.size;
+    if (active >= allowed) return;
+    const chancePerFrame = lifecycle.spawnChanceBasePerFrame + Math.min(
+      lifecycle.spawnChanceMaximumBonusPerFrame,
+      this.state.player.score * lifecycle.spawnChanceScoreFactor,
+    );
+    const adjustedChance = 1 - Math.pow(1 - chancePerFrame, frameScale);
+    if (deterministicUnitFloat(`${this.worldSeedHash}:tank-spawn:${this.tankSpawnFrame}`)
+      >= adjustedChance) return;
+    const loadedBaseBindings = [];
+    for (const model of this.spatialChunks.values()) {
+      for (const descriptor of model.entityDescriptors) {
+        if (descriptor.type !== 'tank') continue;
+        const binding = this.tankBindings.get(descriptor.stableId);
+        if (binding?.kind === 'base') loadedBaseBindings.push(binding);
       }
+    }
+    const nearbyBases = loadedBaseBindings
+      .filter(binding => binding.baseStableId
+        && !this.state.isFeatureDestroyed(binding.baseStableId)
+        && distanceSquared({ x: binding.baseX, z: binding.baseZ }, player)
+          < lifecycle.baseSpawnRangeMeters ** 2)
+      .map(binding => this.state.entityStates.get(binding.slotStableId))
+      .filter(entity => entity && entity.spawned !== true)
+      .sort((a, b) => a.stableId.localeCompare(b.stableId));
+    if (nearbyBases.length > 0) {
+      const selection = Math.floor(
+        deterministicUnitFloat(`${this.worldSeedHash}:tank-base:${this.tankSpawnFrame}`) * nearbyBases.length,
+      );
+      this.#activateBaseTank(nearbyBases[Math.min(selection, nearbyBases.length - 1)], this.tankSpawnFrame);
+    } else if (this.state.player.score > lifecycle.fallbackMinimumScore) {
+      this.#spawnFallbackTank(player, this.tankSpawnFrame);
     }
   }
 
@@ -933,12 +1409,250 @@ export class InfiniteGameplayRuntime {
     this.stableIdOwners.set(stableId, ownerChunkKey);
   }
 
-  async syncActiveChunks({ renderedKeys, getChunkData, renderOrigin } = {}) {
+  #collectCombatTargets() {
+    const targets = new Map();
+    for (const target of this.#spatialStaticTargets()) {
+      targets.set(target.stableId, {
+        kind: 'feature',
+        stableId: target.stableId,
+        type: target.type,
+        target,
+      });
+    }
+    for (const model of this.spatialChunks.values()) {
+      for (const descriptor of model.entityDescriptors) {
+        if (descriptor.type !== 'human') continue;
+        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+        const entity = this.state.ensureEntity(descriptor);
+        if (!entity.alive) continue;
+        targets.set(entity.stableId, {
+          kind: 'entity',
+          stableId: entity.stableId,
+          type: entity.type,
+          entity,
+          descriptor,
+        });
+      }
+    }
+    for (const model of this.activeChunks.values()) {
+      for (const descriptor of model.entityDescriptors) {
+        if (descriptor.type === 'human') continue;
+        const entity = this.state.entityStates.get(descriptor.stableId);
+        if (!entity?.alive || (entity.type === 'tank' && entity.spawned !== true)) continue;
+        targets.set(entity.stableId, {
+          kind: entity.type === 'boss' ? 'boss' : 'entity',
+          stableId: entity.stableId,
+          type: entity.type,
+          entity,
+          descriptor,
+        });
+      }
+    }
+    for (const occurrence of this.activeTankOccurrences.values()) {
+      const entity = this.state.entityStates.get(occurrence.slotStableId);
+      if (!entity?.alive || entity.spawned !== true) continue;
+      targets.set(entity.stableId, {
+        kind: 'entity',
+        stableId: entity.stableId,
+        type: 'tank',
+        entity,
+        occurrence,
+      });
+    }
+    const manualBoss = this.state.manualBossStableId
+      ? this.state.entityStates.get(this.state.manualBossStableId)
+      : null;
+    if (manualBoss?.alive) {
+      targets.set(manualBoss.stableId, {
+        kind: 'boss',
+        stableId: manualBoss.stableId,
+        type: 'boss',
+        entity: manualBoss,
+      });
+    }
+    return targets;
+  }
+
+  resolveCombatTarget(stableId) {
+    if (typeof stableId !== 'string' || !stableId) {
+      throw new TypeError('combat target Stable ID is required');
+    }
+    const resolved = this.#collectCombatTargets().get(stableId);
+    return resolved ? Object.freeze({ ...resolved }) : null;
+  }
+
+  applyCombatDamage(targetOrStableId, amount, {
+    awardPlayerCredit = false,
+    cameraShake = 0,
+  } = {}) {
+    if (!Number.isFinite(amount) || amount < 0) {
+      throw new TypeError('combat damage must be finite and non-negative');
+    }
+    const resolved = typeof targetOrStableId === 'string'
+      ? this.resolveCombatTarget(targetOrStableId)
+      : targetOrStableId;
+    if (!resolved?.stableId || !['feature', 'entity', 'boss'].includes(resolved.kind)) {
+      throw new Error(`Stable ID is not active: ${
+        typeof targetOrStableId === 'string' ? targetOrStableId : targetOrStableId?.stableId
+      }`);
+    }
+    if (resolved.kind === 'feature') {
+      const target = resolved.target;
+      if (!target) throw new Error(`Stable ID is not active: ${resolved.stableId}`);
+      this.#registerStableId(target.stableId, target.ownerChunkKey);
+      if (this.state.isFeatureDestroyed(target.stableId)) {
+        return Object.freeze({
+          stableId: resolved.stableId,
+          type: resolved.type,
+          kind: 'feature',
+          destroyed: true,
+          justDestroyed: false,
+          hp: 0,
+        });
+      }
+      if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
+      const beforeDestroyed = this.state.isFeatureDestroyed(target.stableId);
+      const result = this.state.damageFeature(target, amount);
+      const justDestroyed = !beforeDestroyed && result.destroyed;
+      if (justDestroyed) {
+        this.counts.destroyedFeatures += 1;
+        if (awardPlayerCredit) {
+          this.state.player.score += target.scoreValue;
+          this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[target.type] ?? 0);
+        }
+        this.featureRenderAdapter?.setFeatureDestroyed?.(target.stableId, true);
+      }
+      return Object.freeze({
+        ...result,
+        stableId: target.stableId,
+        type: target.type,
+        kind: 'feature',
+        hp: Math.max(0, target.maxHp - result.damage),
+        justDestroyed,
+      });
+    }
+
+    const entity = resolved.entity ?? this.state.entityStates.get(resolved.stableId);
+    if (!entity?.alive || (entity.type === 'tank' && entity.spawned !== true)) {
+      return Object.freeze({
+        stableId: resolved.stableId,
+        type: resolved.type,
+        kind: resolved.kind,
+        alive: false,
+        destroyed: true,
+        justDestroyed: false,
+        hp: 0,
+      });
+    }
+    const beforeAlive = entity.alive;
+    const result = this.state.damageEntity(entity.stableId, amount);
+    const justDestroyed = beforeAlive && !result.alive;
+    if (entity.type === 'tank') {
+      if (justDestroyed) {
+        const destroyedX = entity.x;
+        const destroyedZ = entity.z;
+        const destroyedY = this.activeTankOccurrences.get(entity.stableId)?.groundY
+          ?? this.#terrainHeightAt(entity.x, entity.z);
+        const finalized = this.#removeTankOccurrence(entity, { destroyed: true });
+        if (finalized) {
+          this.counts.destroyedEntities += 1;
+          this.#emitCombatEffect({
+            type: 'tank-destruction',
+            x: destroyedX,
+            y: destroyedY,
+            z: destroyedZ,
+            durationSeconds: 4,
+            cameraShake,
+            intensity: 1.8,
+            soundCue: 'hit',
+          });
+          this.#emitPresentationEvent({
+            type: 'tank-ruin',
+            x: destroyedX,
+            y: destroyedY,
+            z: destroyedZ,
+            intensity: 0.85,
+            lifetimeSeconds: 15,
+          });
+          this.#emitPresentationEvent({
+            type: 'tank-scar',
+            x: destroyedX,
+            y: destroyedY,
+            z: destroyedZ,
+            intensity: finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.tank.radius),
+            lifetimeSeconds: 0,
+          });
+          this.#syncTransientCombat();
+        }
+      } else if (amount > 0) {
+        this.#emitCombatEffect({
+          type: 'tank-impact',
+          x: entity.x,
+          y: this.activeTankOccurrences.get(entity.stableId)?.groundY
+            ?? this.#terrainHeightAt(entity.x, entity.z),
+          z: entity.z,
+          durationSeconds: 0.16,
+          cameraShake,
+          soundCue: 'hit',
+        });
+        this.#syncTank(entity);
+      }
+      return Object.freeze({
+        ...result,
+        spawned: justDestroyed ? false : entity.spawned,
+        type: 'tank',
+        kind: 'entity',
+        destroyed: !result.alive,
+        justDestroyed,
+      });
+    }
+
+    if (justDestroyed) {
+      this.counts.destroyedEntities += 1;
+      if (awardPlayerCredit) {
+        const contract = W6_ENTITY_CONTRACTS[entity.type];
+        this.state.player.score += contract?.scoreValue ?? 0;
+        this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[entity.type] ?? 0);
+        if (entity.type === 'boss') {
+          this.state.updateCombatProgress({
+            bossesDefeated: this.state.combatProgress.bossesDefeated + 1,
+            nextBossScore: this.state.player.score + W8_BOSS_CONTRACT.nextSpawnScoreDelta,
+          });
+        }
+      }
+    }
+    if (entity.type === 'boss') {
+      this.renderAdapter.syncManualBoss?.(entity);
+    } else {
+      this.renderAdapter.syncEntity(entity);
+    }
+    return Object.freeze({
+      ...result,
+      type: entity.type,
+      kind: resolved.kind,
+      destroyed: !result.alive,
+      justDestroyed,
+    });
+  }
+
+  async syncActiveChunks({
+    renderedKeys,
+    activeDataKeys = renderedKeys,
+    getChunkData,
+    renderOrigin,
+  } = {}) {
     if (this.isShutdown) throw new Error('gameplay runtime is shut down');
-    if (!Array.isArray(renderedKeys) || typeof getChunkData !== 'function') {
-      throw new TypeError('renderedKeys and getChunkData are required');
+    if (!Array.isArray(renderedKeys) || !Array.isArray(activeDataKeys)
+      || typeof getChunkData !== 'function') {
+      throw new TypeError('activeDataKeys, renderedKeys and getChunkData are required');
     }
     const desired = new Set(renderedKeys);
+    const desiredSpatial = new Set(activeDataKeys);
+    for (const key of desired) {
+      if (!desiredSpatial.has(key)) {
+        throw new Error(`rendered gameplay Chunk ${key} is outside Active Data`);
+      }
+    }
     for (const key of sorted(this.activeChunks.keys())) {
       if (desired.has(key)) continue;
       await this.renderAdapter.unloadChunk(key);
@@ -949,16 +1663,27 @@ export class InfiniteGameplayRuntime {
           && this.activeTankOccurrences.has(projectile.ownerStableId)));
       this.counts.chunksUnloaded += 1;
     }
-    for (const key of sorted(desired)) {
-      if (this.activeChunks.has(key)) continue;
+    for (const key of sorted(this.spatialChunks.keys())) {
+      if (!desiredSpatial.has(key)) this.spatialChunks.delete(key);
+    }
+    for (const key of sorted(desiredSpatial)) {
+      if (this.spatialChunks.has(key)) continue;
       const { chunkX, chunkZ } = parseChunkKey(key);
-      const chunkData = getChunkData(chunkX, chunkZ);
-      if (!chunkData) throw new Error(`missing W6 simulation ChunkData: ${key}`);
+      const chunkData = await getChunkData(chunkX, chunkZ);
+      if (!chunkData) throw new Error(`missing W6 Active Data ChunkData: ${key}`);
       const model = await createW6ChunkGameplay({
         chunkData,
         worldSeedHash: this.worldSeedHash,
         generatorMajor: this.generatorMajor,
       });
+      this.spatialChunks.set(key, model);
+      this.#registerSpatialGameplayModel(key, model);
+    }
+    this.#refreshSpatialBroadphaseBounds();
+    for (const key of sorted(desired)) {
+      if (this.activeChunks.has(key)) continue;
+      const model = this.spatialChunks.get(key);
+      if (!model) throw new Error(`missing W6 spatial gameplay model: ${key}`);
       for (const target of model.staticTargets) {
         this.#registerStableId(target.stableId, key);
         if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
@@ -984,8 +1709,12 @@ export class InfiniteGameplayRuntime {
       this.counts.chunksLoaded += 1;
     }
     if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
-    for (const occurrence of this.activeTankOccurrences.values()) {
-      this.#syncTank(this.state.entityStates.get(occurrence.slotStableId));
+    if (this.spatialChunks.size !== desiredSpatial.size) {
+      throw new Error('gameplay Active Data Chunk set mismatch');
+    }
+    const terrainReadyTankIds = await this.#prepareActiveTankTerrainForPresentation();
+    for (const stableId of terrainReadyTankIds) {
+      this.#syncTank(this.state.entityStates.get(stableId));
     }
     await this.renderAdapter.rebase(renderOrigin);
     this.renderAdapter.syncManualBoss?.(
@@ -1012,10 +1741,18 @@ export class InfiniteGameplayRuntime {
     clampToOwner(state);
   }
 
-  update({ deltaSeconds, player, simulationEnabled = true } = {}) {
+  update({ deltaSeconds, player, playerY = null, simulationEnabled = true } = {}) {
     if (this.isShutdown) return;
+    if (this.pendingTankRuntimeError) {
+      const error = this.pendingTankRuntimeError;
+      this.pendingTankRuntimeError = null;
+      throw error;
+    }
     if (!Number.isFinite(deltaSeconds) || deltaSeconds < 0) throw new TypeError('deltaSeconds must be non-negative');
     const boundedDelta = Math.min(deltaSeconds, 0.05);
+    const combatPlayer = Number.isFinite(playerY)
+      ? { x: player.x, y: playerY, z: player.z }
+      : player;
     if (boundedDelta > 0 && (this.playerKnockback.x !== 0 || this.playerKnockback.z !== 0)) {
       player.x += this.playerKnockback.x * boundedDelta;
       player.z += this.playerKnockback.z * boundedDelta;
@@ -1142,54 +1879,168 @@ export class InfiniteGameplayRuntime {
       this.renderAdapter.syncManualBoss?.(manualBoss);
     }
     for (const occurrence of [...this.activeTankOccurrences.values()]) {
-      this.#updateTank(this.state.entityStates.get(occurrence.slotStableId), player, boundedDelta);
+      this.#updateTank(this.state.entityStates.get(occurrence.slotStableId), combatPlayer, boundedDelta);
     }
     this.#maintainFiniteTankSpawns(player, boundedDelta);
     const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
     const bulletHitRadius = finiteWorldUnitsToMeters(W7_CORE_COMBAT_CONTRACT.tank.bulletHitRadius);
     for (let index = this.projectiles.length - 1; index >= 0; index -= 1) {
       const projectile = this.projectiles[index];
+      if (projectile.type === 'tank-shell') {
+        const occurrence = this.activeTankOccurrences.get(projectile.ownerStableId);
+        if (!occurrence
+          || occurrence.runtimeGeneration !== projectile.ownerRuntimeGeneration) {
+          this.projectiles.splice(index, 1);
+          continue;
+        }
+        const speedMultiplier = Math.min(
+          W7_CORE_COMBAT_CONTRACT.tank.difficultySpeedMaximum,
+          1 + this.state.player.score
+            * W7_CORE_COMBAT_CONTRACT.tank.difficultySpeedScoreFactor,
+        );
+        const projectileSpeed = bulletSpeed * speedMultiplier;
+        const nextX = projectile.x + projectile.directionX * projectileSpeed * boundedDelta;
+        const nextY = projectile.y + projectile.directionY * projectileSpeed * boundedDelta;
+        const nextZ = projectile.z + projectile.directionZ * projectileSpeed * boundedDelta;
+        const terrainHeight = this.#tryTerrainHeightAt(nextX, nextZ);
+        if (terrainHeight === null) {
+          projectile.terrainWaitSeconds = (projectile.terrainWaitSeconds ?? 0) + boundedDelta;
+          if (projectile.terrainWaitSeconds >= combat.bulletLifeFrames / 60) {
+            this.projectiles.splice(index, 1);
+          }
+          continue;
+        }
+        projectile.terrainWaitSeconds = 0;
+        projectile.x = nextX;
+        projectile.y = nextY;
+        projectile.z = nextZ;
+        projectile.remainingSeconds -= boundedDelta;
+        let hitSomething = false;
+        const playerCenter = {
+          x: this.state.player.x,
+          y: (Number.isFinite(combatPlayer.y)
+            ? combatPlayer.y
+            : this.#terrainHeightAt(this.state.player.x, this.state.player.z)),
+          z: this.state.player.z,
+        };
+        if (this.state.player.hp > 0
+          && distanceSquared3D(playerCenter, projectile)
+            < bulletHitRadius ** 2) {
+          const wasAlive = this.state.player.hp > 0;
+          this.state.damagePlayer(W7_CORE_COMBAT_CONTRACT.tank.bulletDamage);
+          this.#emitCombatEffect({
+            type: 'tank-impact',
+            x: projectile.x,
+            y: projectile.y,
+            z: projectile.z,
+            durationSeconds: 0.18,
+            cameraShake: W7_CORE_COMBAT_CONTRACT.tank.bulletCameraShake,
+            soundCue: 'hit',
+          });
+          this.counts.playerHits += 1;
+          if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
+          hitSomething = true;
+        }
+        if (!hitSomething) {
+          for (const candidate of this.#tankShellWorldCandidates(projectile, projectile)) {
+            let resolved;
+            let sphere;
+            if (candidate.type === 'human') {
+              this.#registerStableId(candidate.stableId, candidate.ownerChunkKey);
+              const entity = this.state.ensureEntity(candidate);
+              if (!entity.alive) continue;
+              resolved = {
+                kind: 'entity',
+                stableId: entity.stableId,
+                type: entity.type,
+                entity,
+                descriptor: candidate,
+              };
+              sphere = {
+                x: entity.x,
+                y: this.#terrainHeightAt(entity.x, entity.z),
+                z: entity.z,
+                radius: finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius)
+                  + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters,
+              };
+            } else {
+              if (this.state.isFeatureDestroyed(candidate.stableId)) continue;
+              resolved = {
+                kind: 'feature',
+                stableId: candidate.stableId,
+                type: candidate.type,
+                target: candidate,
+              };
+              sphere = {
+                x: candidate.x,
+                y: candidate.y ?? this.#terrainHeightAt(candidate.x, candidate.z),
+                z: candidate.z,
+                radius: finiteWorldUnitsToMeters(candidate.radius)
+                  + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters,
+              };
+            }
+            if (distanceSquared3D(sphere, projectile) >= sphere.radius ** 2) continue;
+            const result = this.applyCombatDamage(
+              resolved,
+              W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+              { awardPlayerCredit: true },
+            );
+            this.#emitCombatEffect({
+              type: result.justDestroyed
+                ? (resolved.kind === 'feature' ? 'destruction' : 'entity-destruction')
+                : 'tank-impact',
+              x: projectile.x,
+              y: projectile.y,
+              z: projectile.z,
+              durationSeconds: result.justDestroyed ? 0.45 : 0.18,
+              soundCue: result.justDestroyed && resolved.kind !== 'feature' ? 'splat' : 'hit',
+            });
+            hitSomething = true;
+            break;
+          }
+        }
+        if (!hitSomething
+          && projectile.y <= terrainHeight
+            + W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters) {
+          this.#emitCombatEffect({
+            type: 'tank-impact',
+            x: projectile.x,
+            y: projectile.y,
+            z: projectile.z,
+            durationSeconds: 0.18,
+            soundCue: 'hit',
+          });
+          hitSomething = true;
+        }
+        if (hitSomething || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
+        continue;
+      }
+
       const start = { x: projectile.x, z: projectile.z };
-      const projectileSpeed = projectile.type === 'acid' ? bulletSpeed * (50 / 60) : bulletSpeed;
+      const projectileSpeed = bulletSpeed * (50 / 60);
       projectile.x += projectile.directionX * projectileSpeed * boundedDelta;
       projectile.z += projectile.directionZ * projectileSpeed * boundedDelta;
       projectile.remainingSeconds -= boundedDelta;
-      let blocked = false;
-      if (projectile.type === 'tank-shell') {
-        for (const model of this.activeChunks.values()) {
-          const obstacle = model.staticTargets.find(target => target.type !== 'pebble'
-            && !this.state.isFeatureDestroyed(target.stableId)
-            && pointSegmentDistanceSquared(target, start, projectile)
-              <= finiteWorldUnitsToMeters(target.radius) ** 2);
-          if (!obstacle) continue;
-          const damage = this.state.damageFeature(obstacle, W7_CORE_COMBAT_CONTRACT.tank.bulletDamage);
-          if (damage.destroyed) this.featureRenderAdapter?.setFeatureDestroyed?.(obstacle.stableId, true);
-          this.#emitCombatEffect({
-            type: 'tank-impact', x: projectile.x, z: projectile.z,
-            durationSeconds: 0.18, soundCue: 'hit',
-          });
-          blocked = true;
-          break;
-        }
-      }
-      const hit = !blocked && this.state.player.hp > 0 && pointSegmentDistanceSquared(
+      const hit = this.state.player.hp > 0 && pointSegmentDistanceSquared(
         this.state.player,
         start,
         projectile,
       ) <= bulletHitRadius ** 2;
       if (hit) {
         const wasAlive = this.state.player.hp > 0;
-        this.state.damagePlayer(projectile.type === 'acid' ? 6 : W7_CORE_COMBAT_CONTRACT.tank.bulletDamage);
+        this.state.damagePlayer(6);
         this.#emitCombatEffect({
-          type: projectile.type === 'acid' ? 'acid-impact' : 'tank-impact',
-          x: projectile.x, z: projectile.z, durationSeconds: 0.18,
+          type: 'acid-impact',
+          x: projectile.x,
+          z: projectile.z,
+          durationSeconds: 0.18,
           cameraShake: W7_CORE_COMBAT_CONTRACT.tank.bulletCameraShake,
-          soundCue: projectile.type === 'acid' ? 'acid' : 'hit',
+          soundCue: 'acid',
         });
         this.counts.playerHits += 1;
         if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
       }
-      if (blocked || hit || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
+      if (hit || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
     }
     for (let index = this.combatEffects.length - 1; index >= 0; index -= 1) {
       this.combatEffects[index].remainingSeconds -= boundedDelta;
@@ -1254,21 +2105,18 @@ export class InfiniteGameplayRuntime {
       directionX: Math.sin(facingY), directionZ: Math.cos(facingY),
       intensity: mode === 'double' ? 1.35 : 1, lifetimeSeconds: 0.24, soundCue: 'swish',
     });
-    for (const model of this.activeChunks.values()) {
-      for (const target of model.staticTargets) {
+    const combatTargets = [...this.#collectCombatTargets().values()]
+      .sort((a, b) => a.stableId.localeCompare(b.stableId));
+    for (const resolved of combatTargets) {
+      if (resolved.kind === 'boss') continue;
+      if (resolved.kind === 'feature') {
+        const target = resolved.target;
         if (this.state.isFeatureDestroyed(target.stableId)
           || !canW6StageDamageTarget(this.state.activeScaleStageId, target)
           || !insideAttack(target)) continue;
-        const beforeDestroyed = this.state.isFeatureDestroyed(target.stableId);
-        const result = this.state.damageFeature(target, damage);
-        if (!beforeDestroyed && result.destroyed) {
-          this.counts.destroyedFeatures += 1;
-          this.state.player.score += target.scoreValue;
-          this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[target.type] ?? 0);
-          this.featureRenderAdapter?.setFeatureDestroyed?.(target.stableId, true);
-        }
+        const result = this.applyCombatDamage(resolved, damage, { awardPlayerCredit: true });
         const building = W7_CORE_COMBAT_CONTRACT.building;
-        const destroyedNow = !beforeDestroyed && result.destroyed;
+        const destroyedNow = result.justDestroyed;
         const buildingHitStopMs = BUILDING_TYPES.has(target.type)
           ? (destroyedNow ? building.destroyedHitStopMs : building.damagedHitStopMs) : 0;
         const buildingShake = destroyedNow && BUILDING_TYPES.has(target.type)
@@ -1285,31 +2133,29 @@ export class InfiniteGameplayRuntime {
           soundCue: destroyedNow ? 'splat' : 'hit',
         });
         hits.push(Object.freeze({ stableId: target.stableId, type: target.type, destroyed: result.destroyed }));
+        continue;
       }
-      for (const descriptor of model.entityDescriptors) {
-        const entity = this.state.entityStates.get(descriptor.stableId);
-        if (!entity?.alive
-          || (entity.type === 'tank' && entity.spawned !== true)
-          || !canW6StageDamageTarget(this.state.activeScaleStageId, entity)
-          || !insideAttack(entity)) continue;
-        const result = this.state.damageEntity(entity.stableId, damage);
-        if (entity.type === 'human' && result.alive) entity.knockdownSeconds = 1.15;
-        if (!result.alive) {
-          this.counts.destroyedEntities += 1;
-          this.state.player.score += descriptor.scoreValue;
-          this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[entity.type] ?? 0);
-        }
+      const entity = resolved.entity;
+      if (!entity?.alive || (entity.type === 'tank' && entity.spawned !== true)
+        || !canW6StageDamageTarget(this.state.activeScaleStageId, entity)
+        || !insideAttack(entity)) continue;
+      const entityShake = damage / 7 * profile.stage.playerShakeMultiplier;
+      const result = this.applyCombatDamage(resolved, damage, {
+        awardPlayerCredit: true,
+        cameraShake: entityShake,
+      });
+      if (entity.type === 'human' && result.alive) entity.knockdownSeconds = 1.15;
+      if (entity.type !== 'tank') {
         this.#emitCombatEffect({
           type: result.alive ? 'entity-impact' : 'entity-destruction',
           x: entity.x,
           z: entity.z,
           durationSeconds: result.alive ? 0.16 : 0.45,
-          cameraShake: damage / 7 * profile.stage.playerShakeMultiplier,
+          cameraShake: entityShake,
           soundCue: result.alive ? 'hit' : 'splat',
         });
-        this.renderAdapter.syncEntity(this.state.entityStates.get(entity.stableId));
-        hits.push(Object.freeze({ stableId: entity.stableId, type: entity.type, destroyed: !result.alive }));
       }
+      hits.push(Object.freeze({ stableId: entity.stableId, type: entity.type, destroyed: !result.alive }));
     }
     const manualBoss = this.state.manualBossStableId
       ? this.state.entityStates.get(this.state.manualBossStableId)
@@ -1317,16 +2163,17 @@ export class InfiniteGameplayRuntime {
     if (manualBoss?.alive
       && canW6StageDamageTarget(this.state.activeScaleStageId, manualBoss)
       && insideAttack(manualBoss)) {
-      const result = this.state.damageEntity(manualBoss.stableId, damage);
+      const result = this.applyCombatDamage(
+        {
+          kind: 'boss',
+          stableId: manualBoss.stableId,
+          type: 'boss',
+          entity: manualBoss,
+        },
+        damage,
+        { awardPlayerCredit: true },
+      );
       this.#syncBossDamageStage(manualBoss);
-      if (!result.alive) {
-        this.counts.destroyedEntities += 1;
-        this.state.player.score += W6_ENTITY_CONTRACTS.boss.scoreValue;
-        this.state.updateCombatProgress({
-          bossesDefeated: this.state.combatProgress.bossesDefeated + 1,
-          nextBossScore: this.state.player.score + W8_BOSS_CONTRACT.nextSpawnScoreDelta,
-        });
-      }
       this.#emitCombatEffect({
         type: result.alive ? 'entity-impact' : 'entity-destruction',
         x: manualBoss.x,
@@ -1335,11 +2182,10 @@ export class InfiniteGameplayRuntime {
         cameraShake: damage / 7 * profile.stage.playerShakeMultiplier,
         soundCue: result.alive ? 'hit' : 'roar',
       });
-      this.renderAdapter.syncManualBoss?.(manualBoss);
       hits.push(Object.freeze({
         stableId: manualBoss.stableId,
         type: 'boss',
-        destroyed: !result.alive,
+        destroyed: result.destroyed,
       }));
     }
     const damageDealt = hits.length * damage;
@@ -1473,41 +2319,67 @@ export class InfiniteGameplayRuntime {
     const hitStableIds = [];
     for (const target of [...staticTargets.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
       if (!inside(target) || this.state.isFeatureDestroyed(target.stableId)) continue;
-      const wasDestroyed = this.state.isFeatureDestroyed(target.stableId);
-      const damaged = this.state.damageFeature(target, W7_NUCLEAR_CONTRACT.damageAmount);
-      if (!wasDestroyed && damaged.destroyed) {
-        this.state.player.score += target.scoreValue;
-        this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[target.type] ?? 0);
-        this.counts.destroyedFeatures += 1;
-      }
+      this.applyCombatDamage(
+        {
+          kind: 'feature',
+          stableId: target.stableId,
+          type: target.type,
+          target,
+        },
+        W7_NUCLEAR_CONTRACT.damageAmount,
+        { awardPlayerCredit: true },
+      );
       hitStableIds.push(target.stableId);
     }
     for (const descriptor of [...entityDescriptors.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
       const entity = this.state.ensureEntity(descriptor);
+      if (entity.type === 'tank') this.#bindTank(entity, descriptor);
       if (!entity.alive || (entity.type === 'tank' && entity.spawned !== true) || !inside(entity)) continue;
-      const damaged = this.state.damageEntity(entity.stableId, W7_NUCLEAR_CONTRACT.damageAmount);
-      if (!damaged.alive) {
-        this.state.player.score += descriptor.scoreValue;
-        this.state.healPlayer(W7_CORE_COMBAT_CONTRACT.healing[entity.type] ?? 0);
-        this.counts.destroyedEntities += 1;
-      }
-      this.renderAdapter.syncEntity(entity);
+      this.applyCombatDamage(
+        {
+          kind: entity.type === 'boss' ? 'boss' : 'entity',
+          stableId: entity.stableId,
+          type: entity.type,
+          entity,
+          descriptor,
+        },
+        W7_NUCLEAR_CONTRACT.damageAmount,
+        { awardPlayerCredit: true },
+      );
       hitStableIds.push(entity.stableId);
+    }
+    for (const occurrence of [...this.activeTankOccurrences.values()]
+      .sort((a, b) => a.slotStableId.localeCompare(b.slotStableId))) {
+      const tank = this.state.entityStates.get(occurrence.slotStableId);
+      if (!tank?.alive || tank.spawned !== true || !inside(tank)
+        || hitStableIds.includes(tank.stableId)) continue;
+      this.applyCombatDamage(
+        {
+          kind: 'entity',
+          stableId: tank.stableId,
+          type: 'tank',
+          entity: tank,
+          occurrence,
+        },
+        W7_NUCLEAR_CONTRACT.damageAmount,
+        { awardPlayerCredit: true },
+      );
+      hitStableIds.push(tank.stableId);
     }
     const manualBoss = this.state.manualBossStableId
       ? this.state.entityStates.get(this.state.manualBossStableId)
       : null;
     if (manualBoss?.alive && inside(manualBoss) && !hitStableIds.includes(manualBoss.stableId)) {
-      const damaged = this.state.damageEntity(manualBoss.stableId, W7_NUCLEAR_CONTRACT.damageAmount);
-      if (!damaged.alive) {
-        this.state.player.score += W6_ENTITY_CONTRACTS.boss.scoreValue;
-        this.counts.destroyedEntities += 1;
-        this.state.updateCombatProgress({
-          bossesDefeated: this.state.combatProgress.bossesDefeated + 1,
-          nextBossScore: this.state.player.score + W8_BOSS_CONTRACT.nextSpawnScoreDelta,
-        });
-      }
-      this.renderAdapter.syncManualBoss?.(manualBoss);
+      this.applyCombatDamage(
+        {
+          kind: 'boss',
+          stableId: manualBoss.stableId,
+          type: 'boss',
+          entity: manualBoss,
+        },
+        W7_NUCLEAR_CONTRACT.damageAmount,
+        { awardPlayerCredit: true },
+      );
       hitStableIds.push(manualBoss.stableId);
     }
     hitStableIds.sort((a, b) => a.localeCompare(b));
@@ -1559,6 +2431,11 @@ export class InfiniteGameplayRuntime {
   }
 
   clearTransientCombat() {
+    this.tankSpawnEpoch += 1;
+    this.pendingTankReinforcement = null;
+    this.pendingTankRuntimeError = null;
+    this.pendingTankTerrainChunks.clear();
+    this.tankTerrainQueryErrors.clear();
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
     this.presentationEvents.length = 0;
@@ -1566,12 +2443,19 @@ export class InfiniteGameplayRuntime {
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.lastAttackAt = -Infinity;
-    this.#rebuildTankOccurrences();
+    this.renderAdapter.clearReinforcements?.();
+    this.renderAdapter.clearCombatPresentation?.();
+    this.#rebuildTankOccurrences({ sync: false });
     this.#syncTransientCombat();
     return this.snapshot();
   }
 
   async restart({ playerSpawn, renderOrigin } = {}) {
+    this.tankSpawnEpoch += 1;
+    this.pendingTankReinforcement = null;
+    this.pendingTankRuntimeError = null;
+    this.pendingTankTerrainChunks.clear();
+    this.tankTerrainQueryErrors.clear();
     this.state.restartRun({ playerSpawn });
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
@@ -1587,6 +2471,7 @@ export class InfiniteGameplayRuntime {
     this.tankSpawnFrameAccumulator = 0;
     this.tankSpawnFrame = 0;
     this.renderAdapter.clearReinforcements?.();
+    this.renderAdapter.clearCombatPresentation?.();
     this.lastAttackAt = -Infinity;
     this.counts.restarts += 1;
     await this.refreshFromState({ renderOrigin });
@@ -1595,24 +2480,15 @@ export class InfiniteGameplayRuntime {
   }
 
   damageStableId(stableId, amount) {
-    for (const model of this.activeChunks.values()) {
-      const target = model.staticTargets.find(value => value.stableId === stableId);
-      if (target) {
-        const result = this.state.damageFeature(target, amount);
-        if (result.destroyed) this.featureRenderAdapter?.setFeatureDestroyed?.(stableId, true);
-        return result;
-      }
-      const descriptor = model.entityDescriptors.find(value => value.stableId === stableId);
-      if (descriptor) {
-        const result = this.state.damageEntity(stableId, amount);
-        this.renderAdapter.syncEntity(this.state.entityStates.get(stableId));
-        return result;
-      }
-    }
-    throw new Error(`Stable ID is not active: ${stableId}`);
+    return this.applyCombatDamage(stableId, amount);
   }
 
   async refreshFromState({ renderOrigin } = {}) {
+    this.tankSpawnEpoch += 1;
+    this.pendingTankReinforcement = null;
+    this.pendingTankRuntimeError = null;
+    this.pendingTankTerrainChunks.clear();
+    this.tankTerrainQueryErrors.clear();
     const activeModels = [...this.activeChunks.entries()];
     for (const [key] of activeModels) await this.renderAdapter.unloadChunk(key);
     this.renderAdapter.clearReinforcements?.();
@@ -1622,6 +2498,9 @@ export class InfiniteGameplayRuntime {
     this.stableIdOwners.clear();
     for (const entity of this.state.entityStates.values()) {
       this.#registerStableId(entity.stableId, entity.ownerChunkKey);
+    }
+    for (const [key, model] of this.spatialChunks) {
+      this.#registerSpatialGameplayModel(key, model, { startOccurrences: false });
     }
     for (const [key, model] of activeModels) {
       for (const target of model.staticTargets) this.#registerStableId(target.stableId, key);
@@ -1633,7 +2512,11 @@ export class InfiniteGameplayRuntime {
       });
       await this.renderAdapter.loadChunk(key, states);
     }
-    this.#rebuildTankOccurrences();
+    this.#rebuildTankOccurrences({ sync: false });
+    const terrainReadyTankIds = await this.#prepareActiveTankTerrainForPresentation();
+    for (const stableId of terrainReadyTankIds) {
+      this.#syncTank(this.state.entityStates.get(stableId));
+    }
     await this.renderAdapter.rebase(renderOrigin);
     this.renderAdapter.syncManualBoss?.(
       this.state.manualBossStableId
@@ -1655,9 +2538,18 @@ export class InfiniteGameplayRuntime {
       schemaVersion: 'w6-infinite-gameplay-runtime-1',
       activeSimulationChunkCount: this.activeChunks.size,
       activeSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
+      activeDataChunkCount: this.spatialChunks.size,
+      activeDataChunkKeys: Object.freeze(sorted(this.spatialChunks.keys())),
       simulatedEntityCount,
       simulatedStaticTargetCount,
       activeTankCount,
+      tankSlotCount: this.tankBindings.size - this.reinforcementIds.size,
+      fallbackTankCount: this.reinforcementIds.size,
+      tankOwnerRegistryCount: this.tankBindings.size,
+      tankOccurrenceGenerationCount: this.tankOccurrenceGenerations.size,
+      tankTerrainCacheCapacity: TANK_TERRAIN_QUERY_CACHE_CAPACITY,
+      tankTerrainCacheCount: this.tankTerrainChunks.size,
+      tankTerrainPendingQueryCount: this.pendingTankTerrainChunks.size,
       activeProjectileCount: this.projectiles.length,
       activeCombatEffectCount: this.combatEffects.length,
       hitStopped: this.isHitStopped(),
@@ -1669,17 +2561,24 @@ export class InfiniteGameplayRuntime {
 
   async shutdown() {
     if (this.isShutdown) return;
+    this.isShutdown = true;
+    this.tankSpawnEpoch += 1;
+    this.pendingTankReinforcement = null;
+    this.pendingTankRuntimeError = null;
     await this.renderAdapter.shutdown();
     this.activeChunks.clear();
+    this.spatialChunks.clear();
     this.stableIdOwners.clear();
     this.activeTankOccurrences.clear();
     this.tankBindings.clear();
     this.tankOccurrenceGenerations.clear();
     this.reinforcementIds.clear();
+    this.tankTerrainChunks.clear();
+    this.pendingTankTerrainChunks.clear();
+    this.tankTerrainQueryErrors.clear();
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
     this.renderAdapter.syncManualBoss?.(null);
     this.#syncTransientCombat();
-    this.isShutdown = true;
   }
 }

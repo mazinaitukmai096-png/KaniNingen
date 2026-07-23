@@ -977,11 +977,13 @@ export async function bootInfiniteWorldSandbox({
         renderAdapter: gameplayRenderAdapter,
         featureRenderAdapter: renderAdapter,
         getChunkDataForQuery: (chunkX, chunkZ) => generator.generateChunk(chunkX, chunkZ),
+        sampleTerrainHeight: sampleCanonicalTerrainHeightMeters,
         clock,
       });
       const runtimeSnapshot = runtime.snapshot();
       if (diagnosticProfile.gameplaySync) {
         await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
           renderedKeys: runtimeSnapshot.renderedKeys,
           getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
           renderOrigin: runtimeSnapshot.renderOrigin,
@@ -1035,11 +1037,27 @@ export async function bootInfiniteWorldSandbox({
       playerLogicalZ: logicalPlayer.z,
     });
 
+    function sampleCanonicalTerrainHeightMeters(
+      logicalWorldX,
+      logicalWorldZ,
+      queriedChunkData = null,
+    ) {
+      const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
+      const chunkData = queriedChunkData ?? runtime.getChunkData(owner.chunkX, owner.chunkZ);
+      if (!chunkData) return null;
+      return sampleW8SurfaceHeightMeters(chunkData, logicalWorldX, logicalWorldZ);
+    }
+
     function getPlayerTerrainHeightMeters(logicalWorldX, logicalWorldZ) {
       const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
-      const chunkData = runtime.getChunkData(owner.chunkX, owner.chunkZ);
-      if (!chunkData) throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
-      return sampleW8SurfaceHeightMeters(chunkData, logicalWorldX, logicalWorldZ);
+      if (!runtime.getChunkData(owner.chunkX, owner.chunkZ)) {
+        throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
+      }
+      const height = sampleCanonicalTerrainHeightMeters(logicalWorldX, logicalWorldZ);
+      if (!Number.isFinite(height)) {
+        throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
+      }
+      return height;
     }
 
     function assertRuntimePreparedForPlayer(owner) {
@@ -1083,6 +1101,7 @@ export async function bootInfiniteWorldSandbox({
       }
       if (diagnosticProfile.gameplaySync) {
         await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
           renderedKeys: runtimeSnapshot.renderedKeys,
           getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
           renderOrigin: runtimeSnapshot.renderOrigin,
@@ -1377,6 +1396,7 @@ export async function bootInfiniteWorldSandbox({
           }
           if (!diagnosticProfile.gameplaySync) return null;
           return diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+              activeDataKeys: nextSnapshot.activeDataKeys,
               renderedKeys: nextSnapshot.renderedKeys,
               getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
               renderOrigin: nextSnapshot.renderOrigin,
@@ -1696,6 +1716,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         diagnostics.measure('gameplay-update', () => gameplay.update({
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,
+            playerY: playerMarker.position.y / UNITS_PER_METER,
             renderOrigin: frameRenderOrigin,
             simulationEnabled: isW8GameplaySimulationEnabled(measurement.mode, runPhase),
           }));

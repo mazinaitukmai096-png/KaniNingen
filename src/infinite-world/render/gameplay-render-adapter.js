@@ -11,10 +11,6 @@ import {
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
 import { W7_NUCLEAR_CONTRACT } from '../gameplay-contract.js';
-import { PRODUCTION_TANK_VISUAL_SCALE } from '../../world-scale-rebalance.js';
-
-const FINITE_TANK_MUZZLE_FORWARD_METERS = 112 * PRODUCTION_TANK_VISUAL_SCALE
-  / PRODUCTION_VISUAL_UNITS_PER_METER;
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -47,6 +43,9 @@ export class GameplayRenderAdapter {
     this.presentationPool = [];
     this.activePresentationEffects = [];
     this.presentationPoolLimit = 96;
+    this.persistentTankScars = [];
+    this.tankScarLimit = 50;
+    this.tankRuinLimit = 30;
     const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
     const Object3D = requireConstructor(THREE, 'Object3D');
     this.effectTransform = new Object3D();
@@ -59,6 +58,8 @@ export class GameplayRenderAdapter {
       shockwave: Object.freeze({ geometry: 'torus', material: 'shockwave', capacity: 288 }),
       smoke: Object.freeze({ geometry: 'sphere', material: 'smoke', capacity: 384 }),
       scorch: Object.freeze({ geometry: 'sphere', material: 'scorch', capacity: 96 }),
+      spark: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 192 }),
+      ruin: Object.freeze({ geometry: 'box', material: 'charred', capacity: 90 }),
     });
     for (const [role, spec] of Object.entries(effectPoolSpecs)) {
       const mesh = new InstancedMesh(
@@ -113,9 +114,12 @@ export class GameplayRenderAdapter {
   #positionMesh(mesh, state, entry) {
     const localX = state.x - entry.chunkX * LOGICAL_CHUNK_SIZE_METERS;
     const localZ = state.z - entry.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const tankGroundY = state.type === 'tank' && Number.isFinite(state.groundY)
+      ? state.groundY
+      : 0;
     mesh.position.set(
       localX * this.unitsPerMeter,
-      0,
+      tankGroundY * this.unitsPerMeter,
       localZ * this.unitsPerMeter,
     );
     mesh.rotation.y = state.rotationY;
@@ -125,6 +129,8 @@ export class GameplayRenderAdapter {
       mesh.rotation.z = state.aiState === 'fallen' ? Math.PI / 2 : 0;
     }
     if (state.type === 'tank' && parts) {
+      mesh.rotation.x = Number.isFinite(state.groundPitch) ? state.groundPitch : 0;
+      mesh.rotation.z = Number.isFinite(state.groundRoll) ? state.groundRoll : 0;
       const relativeTurret = (state.turretRotationY ?? state.rotationY) - state.rotationY;
       if (parts.turret) parts.turret.rotation.y = relativeTurret;
       if (parts.gun) {
@@ -157,11 +163,10 @@ export class GameplayRenderAdapter {
       this.origin.renderOriginChunkZ,
       this.renderChunkSize,
     );
-    const forward = entry.visualForwardMeters ?? 0;
     entry.mesh.position.set(
-      local.x + (entry.state.directionX ?? 0) * forward * this.unitsPerMeter,
-      entry.height,
-      local.z + (entry.state.directionZ ?? 0) * forward * this.unitsPerMeter,
+      local.x,
+      Number.isFinite(entry.state.y) ? entry.state.y * this.unitsPerMeter : entry.height,
+      local.z,
     );
   }
 
@@ -194,16 +199,15 @@ export class GameplayRenderAdapter {
         this.visualAssets.geometries.sphere,
         state.type === 'acid'
           ? (this.visualAssets.materials.acid ?? this.visualAssets.materials.gold)
-          : this.visualAssets.materials.gold,
+          : (this.visualAssets.materials.blood ?? this.visualAssets.materials.gold),
       );
       mesh.name = state.type === 'acid' ? 'boss-acid-projectile' : 'tank-projectile';
       mesh.castShadow = true;
-      mesh.scale.setScalar((state.type === 'acid' ? 0.32 : 0.22) * this.unitsPerMeter);
+      mesh.scale.setScalar((state.type === 'acid' ? 0.32 : 0.5) * this.unitsPerMeter);
       return {
         mesh,
         state,
         height: (state.type === 'acid' ? 2.4 : 2.05) * this.unitsPerMeter,
-        visualForwardMeters: state.type === 'tank-shell' ? FINITE_TANK_MUZZLE_FORWARD_METERS : 0,
       };
     });
     this.#syncTransientSet(this.effectMeshes, [], () => null);
@@ -257,10 +261,11 @@ export class GameplayRenderAdapter {
       const intensity = Math.max(0.15, event.intensity);
       const directionHeading = Math.atan2(event.direction?.x ?? 0, event.direction?.z ?? 1);
       const unit = this.unitsPerMeter;
+      const baseY = (event.logicalPosition.y ?? 0) * unit;
       const base = { x: local.x, z: local.z };
       if (event.type.includes('claw-swish') || event.type === 'boss-sweep') {
         this.#appendEffectInstance('wind', {
-          ...base, y: 1.2 * unit,
+          ...base, y: baseY + 1.2 * unit,
           scaleX: intensity * 2.4 * unit, scaleY: intensity * 1.2 * unit,
           scaleZ: intensity * 2.4 * unit, rotationY: directionHeading,
         });
@@ -268,7 +273,7 @@ export class GameplayRenderAdapter {
       }
       if (event.type.startsWith('nuclear')) {
         this.#appendEffectInstance('flash', {
-          ...base, y: (2 + progress * 9) * unit,
+          ...base, y: baseY + (2 + progress * 9) * unit,
           scaleX: (2 + progress * 12) * unit,
           scaleY: (2 + progress * 15) * unit,
           scaleZ: (2 + progress * 12) * unit,
@@ -279,7 +284,7 @@ export class GameplayRenderAdapter {
           const puffScale = (1.2 + index * 0.18 + progress * 1.6) * unit;
           this.#appendEffectInstance('smoke', {
             x: base.x + Math.cos(angle) * radius,
-            y: (2 + index * 1.8 + progress * 7) * unit,
+            y: baseY + (2 + index * 1.8 + progress * 7) * unit,
             z: base.z + Math.sin(angle) * radius,
             scaleX: puffScale * 1.25, scaleY: puffScale, scaleZ: puffScale * 1.25,
           });
@@ -287,23 +292,52 @@ export class GameplayRenderAdapter {
         for (let index = 0; index < 3; index += 1) {
           const ringScale = (5 + index * 4 + progress * 18) * unit;
           this.#appendEffectInstance('shockwave', {
-            ...base, y: (0.12 + index * 0.06) * unit,
+            ...base, y: baseY + (0.12 + index * 0.06) * unit,
             scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
             rotationX: Math.PI / 2,
           });
         }
         this.#appendEffectInstance('scorch', {
-          ...base, y: 0.05 * unit,
+          ...base, y: baseY + 0.05 * unit,
           scaleX: 8 * unit, scaleY: 0.08 * unit, scaleZ: 8 * unit,
+        });
+        continue;
+      }
+      if (event.type === 'tank-ruin') {
+        for (let index = 0; index < 3; index += 1) {
+          const angle = index / 3 * Math.PI * 2 + event.sequence * 0.37;
+          const width = intensity * (1.5 + index * 0.35) * unit;
+          const height = intensity * (0.38 + index * 0.12) * unit;
+          const depth = intensity * (1.1 + (2 - index) * 0.3) * unit;
+          this.#appendEffectInstance('ruin', {
+            x: base.x + Math.cos(angle) * intensity * 0.55 * unit,
+            y: baseY + height * 0.4,
+            z: base.z + Math.sin(angle) * intensity * 0.55 * unit,
+            scaleX: width,
+            scaleY: height,
+            scaleZ: depth,
+            rotationX: (index - 1) * 0.18,
+            rotationY: angle,
+            rotationZ: (1 - index) * 0.14,
+          });
+        }
+        const smokeScale = intensity * (0.55 + progress * 0.65) * unit;
+        this.#appendEffectInstance('smoke', {
+          ...base,
+          y: baseY + (0.8 + progress * 1.5) * unit,
+          scaleX: smokeScale * 1.2,
+          scaleY: smokeScale,
+          scaleZ: smokeScale * 1.2,
         });
         continue;
       }
       const destructive = event.type.includes('destruction')
         || event.type.includes('landing') || event.type.includes('breach');
+      const tankDestruction = event.type === 'tank-destruction';
       const impact = event.type.includes('impact') || event.type.includes('fire')
         || event.type.includes('spit') || destructive;
       if (impact) this.#appendEffectInstance('flash', {
-        ...base, y: (0.45 + progress * 0.8) * unit,
+        ...base, y: baseY + (0.45 + progress * 0.8) * unit,
         scaleX: intensity * (0.35 + progress * 1.2) * unit,
         scaleY: intensity * (0.35 + progress * 1.2) * unit,
         scaleZ: intensity * (0.35 + progress * 1.2) * unit,
@@ -313,7 +347,7 @@ export class GameplayRenderAdapter {
         const travel = progress * intensity * 2.4 * unit;
         this.#appendEffectInstance('debris', {
           x: base.x + Math.cos(angle) * travel,
-          y: (0.3 + Math.sin(progress * Math.PI) * (1.2 + index * 0.25)) * unit,
+          y: baseY + (0.3 + Math.sin(progress * Math.PI) * (1.2 + index * 0.25)) * unit,
           z: base.z + Math.sin(angle) * travel,
           scaleX: 0.32 * intensity * unit,
           scaleY: 0.24 * intensity * unit,
@@ -321,11 +355,44 @@ export class GameplayRenderAdapter {
           rotationX: progress * 4 + index, rotationY: progress * 5 - index,
         });
       }
-      if (event.type.includes('entity-')) for (let index = 0; index < 2; index += 1) {
+      if (tankDestruction) {
+        for (let index = 0; index < 6; index += 1) {
+          const angle = index / 6 * Math.PI * 2 + (event.sequence ?? 0) * 0.41;
+          const travel = (0.4 + progress * 2.8) * intensity * unit;
+          const sparkScale = (0.06 + (1 - progress) * 0.12) * intensity * unit;
+          this.#appendEffectInstance('spark', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.45 + Math.sin(progress * Math.PI) * (1 + index * 0.12)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: sparkScale,
+            scaleY: sparkScale * 2.4,
+            scaleZ: sparkScale,
+            rotationX: progress * 7 + index,
+            rotationY: angle,
+          });
+        }
+        for (let index = 0; index < 3; index += 1) {
+          const angle = index / 3 * Math.PI * 2 + (event.sequence ?? 0) * 0.23;
+          const puffScale = intensity * (0.45 + index * 0.12 + progress * 0.7) * unit;
+          this.#appendEffectInstance('smoke', {
+            x: base.x + Math.cos(angle) * intensity * 0.35 * unit,
+            y: baseY + (0.55 + index * 0.38 + progress * 1.1) * unit,
+            z: base.z + Math.sin(angle) * intensity * 0.35 * unit,
+            scaleX: puffScale * 1.15, scaleY: puffScale, scaleZ: puffScale * 1.15,
+          });
+        }
+        this.#appendEffectInstance('scorch', {
+          ...base, y: baseY + 0.04 * unit,
+          scaleX: intensity * 1.8 * unit,
+          scaleY: 0.04 * unit,
+          scaleZ: intensity * 1.8 * unit,
+        });
+      }
+      if (!tankDestruction && event.type.includes('entity-')) for (let index = 0; index < 2; index += 1) {
         const angle = index * Math.PI + event.sequence * 0.19;
         this.#appendEffectInstance('blood', {
           x: base.x + Math.cos(angle) * progress * unit,
-          y: (0.25 + Math.sin(progress * Math.PI) * 0.9) * unit,
+          y: baseY + (0.25 + Math.sin(progress * Math.PI) * 0.9) * unit,
           z: base.z + Math.sin(angle) * progress * unit,
           scaleX: 0.28 * unit, scaleY: 0.12 * unit, scaleZ: 0.28 * unit,
           rotationY: angle,
@@ -334,11 +401,29 @@ export class GameplayRenderAdapter {
       if (event.type.includes('warning') || event.type.includes('breach')) {
         const ringScale = (1 + progress * 5) * intensity * unit;
         this.#appendEffectInstance('shockwave', {
-          ...base, y: 0.08 * unit,
+          ...base, y: baseY + 0.08 * unit,
           scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
           rotationX: Math.PI / 2,
         });
       }
+    }
+    for (const event of this.persistentTankScars) {
+      const local = logicalWorldToRenderLocal(
+        event.logicalPosition.x,
+        event.logicalPosition.z,
+        this.origin.renderOriginChunkX,
+        this.origin.renderOriginChunkZ,
+        this.renderChunkSize,
+      );
+      const radius = Math.max(0.15, event.intensity) * 1.5 * this.unitsPerMeter;
+      this.#appendEffectInstance('scorch', {
+        x: local.x,
+        y: ((event.logicalPosition.y ?? 0) + 0.0375) * this.unitsPerMeter,
+        z: local.z,
+        scaleX: radius,
+        scaleY: 0.04 * this.unitsPerMeter,
+        scaleZ: radius,
+      });
     }
     for (const pool of this.effectInstancePools.values()) {
       pool.mesh.count = pool.count;
@@ -350,6 +435,27 @@ export class GameplayRenderAdapter {
     if (this.disposed) return 0;
     this.playerPresentation = playerMarker ?? this.playerPresentation;
     for (const event of events) {
+      if (event.type === 'tank-scar') {
+        this.persistentTankScars.push(event);
+        if (this.persistentTankScars.length > this.tankScarLimit) {
+          this.persistentTankScars.shift();
+        }
+        continue;
+      }
+      if (event.type === 'tank-ruin') {
+        let ruinCount = 0;
+        let oldestRuinIndex = -1;
+        for (let index = 0; index < this.activePresentationEffects.length; index += 1) {
+          if (this.activePresentationEffects[index].event?.type !== 'tank-ruin') continue;
+          ruinCount += 1;
+          if (oldestRuinIndex < 0) oldestRuinIndex = index;
+        }
+        if (ruinCount >= this.tankRuinLimit && oldestRuinIndex >= 0) {
+          const [oldest] = this.activePresentationEffects.splice(oldestRuinIndex, 1);
+          oldest.active = false;
+          oldest.event = null;
+        }
+      }
       this.#acquirePresentationEffect(event);
       const parts = this.playerPresentation?.userData?.presentationParts;
       if (parts && event.type.includes('claw')) {
@@ -373,6 +479,17 @@ export class GameplayRenderAdapter {
       }
     }
     return events.length;
+  }
+
+  clearCombatPresentation() {
+    for (const entry of this.activePresentationEffects) {
+      entry.active = false;
+      entry.event = null;
+    }
+    this.activePresentationEffects.length = 0;
+    this.persistentTankScars.length = 0;
+    this.#syncEffectInstances();
+    return true;
   }
 
   setPlayerLocomotion({ movedMeters = 0, walkPhase = 0, grounded = true } = {}) {
@@ -618,8 +735,16 @@ export class GameplayRenderAdapter {
       this.origin.renderOriginChunkX, this.origin.renderOriginChunkZ,
       this.renderChunkSize,
     );
-    entry.mesh.position.set(local.x, 0, local.z);
+    entry.mesh.position.set(
+      local.x,
+      (Number.isFinite(entry.state.groundY) ? entry.state.groundY : 0) * this.unitsPerMeter,
+      local.z,
+    );
+    entry.mesh.rotation.x = Number.isFinite(entry.state.groundPitch)
+      ? entry.state.groundPitch
+      : 0;
     entry.mesh.rotation.y = entry.state.rotationY;
+    entry.mesh.rotation.z = Number.isFinite(entry.state.groundRoll) ? entry.state.groundRoll : 0;
     entry.mesh.visible = entry.state.alive && entry.state.spawned === true;
     const parts = entry.mesh.userData.presentationParts;
     const relative = (entry.state.turretRotationY ?? entry.state.rotationY) - entry.state.rotationY;
@@ -728,6 +853,9 @@ export class GameplayRenderAdapter {
       presentationPoolCapacity: this.presentationPool.length,
       activePresentationEffectCount: this.activePresentationEffects.length,
       presentationPoolLimit: this.presentationPoolLimit,
+      persistentTankScarCount: this.persistentTankScars.length,
+      tankScarLimit: this.tankScarLimit,
+      tankRuinLimit: this.tankRuinLimit,
       effectInstancePools: Object.freeze(Object.fromEntries(
         [...this.effectInstancePools].map(([role, pool]) => [role, Object.freeze({
           count: pool.count, capacity: pool.capacity,
@@ -752,6 +880,7 @@ export class GameplayRenderAdapter {
     this.effectInstancePools.clear();
     this.presentationPool.length = 0;
     this.activePresentationEffects.length = 0;
+    this.persistentTankScars.length = 0;
     this.scene.remove(this.root);
     this.scene.remove(this.combatRoot);
     if (this.ownsVisualAssets) this.visualAssets.dispose();

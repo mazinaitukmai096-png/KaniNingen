@@ -102,6 +102,10 @@ export const W7_CORE_COMBAT_CONTRACT = Object.freeze({
     bulletHitRadius: TANK_BULLET_HIT_RADIUS,
     bulletDamage: TANK_BULLET_DAMAGE,
     bulletCameraShake: 35,
+    worldCollisionDamage: 150,
+    worldCollisionPaddingMeters: finiteWorldUnitsToMeters(15),
+    difficultySpeedScoreFactor: 0.000005,
+    difficultySpeedMaximum: 1.5,
   }),
   building: Object.freeze({
     damagedHitStopMs: 32,
@@ -128,6 +132,7 @@ export const W8_TANK_LIFECYCLE_CONTRACT = Object.freeze({
   stuckCheckSeconds: TANK_STUCK_CHECK_INTERVAL,
   stuckDistanceThresholdMetersSquared: TANK_STUCK_DIST_THRESHOLD_SQ / (FINITE_WORLD_UNITS_PER_METER ** 2),
   stuckAvoidSeconds: TANK_STUCK_AVOID_TIMER,
+  collisionActiveRangeMeters: finiteWorldUnitsToMeters(3_000),
   lineOfSightClearanceMeters: finiteWorldUnitsToMeters(20),
   baseSpawnRangeMeters: finiteWorldUnitsToMeters(5_800),
   baseSpawnScatterMeters: finiteWorldUnitsToMeters(400),
@@ -141,6 +146,14 @@ export const W8_TANK_LIFECYCLE_CONTRACT = Object.freeze({
   bossTankLimit: 2,
   tankLimitMaximum: 10,
   tankLimitScoreDivisor: 6_000,
+  playerAimHeightMeters: finiteWorldUnitsToMeters(35),
+  terrainHitClearanceMeters: finiteWorldUnitsToMeters(10),
+  trackHalfLengthMeters: finiteWorldUnitsToMeters(80 * PRODUCTION_TANK_VISUAL_SCALE),
+  trackHalfWidthMeters: finiteWorldUnitsToMeters(72 * PRODUCTION_TANK_VISUAL_SCALE),
+  turretPivotHeightMeters: finiteWorldUnitsToMeters(60 * PRODUCTION_TANK_VISUAL_SCALE),
+  turretPivotForwardMeters: finiteWorldUnitsToMeters(-10 * PRODUCTION_TANK_VISUAL_SCALE),
+  gunPivotForwardMeters: finiteWorldUnitsToMeters(32 * PRODUCTION_TANK_VISUAL_SCALE),
+  muzzleForwardFromGunMeters: finiteWorldUnitsToMeters(90 * PRODUCTION_TANK_VISUAL_SCALE),
 });
 
 export const W7_NUCLEAR_CONTRACT = Object.freeze({
