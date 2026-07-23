@@ -208,6 +208,23 @@ function multiSlotChunk(count) {
   return chunk;
 }
 
+function tankSpawnBurstChunk({ slotCount = 12, worldObjectCount = 10 } = {}) {
+  const chunk = multiSlotChunk(slotCount);
+  for (let index = 0; index < slotCount; index += 1) {
+    const x = 1 + (index % 4) * 3.5;
+    const z = 2 + Math.floor(index / 4) * 5.5;
+    chunk.settlementReferences[index].center = { x, z };
+    chunk.settlementLandmarks[index].worldPosition = { x, y: 0, z };
+  }
+  chunk.rockCandidates = Array.from({ length: worldObjectCount }, (_, index) => ({
+    candidateId: `wf1:rock:w8-tank-burst-target-${index}`,
+    worldPosition: { x: -12 + index * 1.5, y: 0, z: 4 },
+    metadata: { candidateRadiusMeters: 0.8 },
+    owningChunkCoordinate: { x: 0, z: 0 },
+  }));
+  return chunk;
+}
+
 function findBaseTank(state) {
   return [...state.entityStates.values()].find(entity =>
     entity.type === 'tank' && entity.reinforcementSequence === 0);
@@ -906,6 +923,155 @@ test('reserve Tank slots do not inflate the bounded active occurrence count', as
   assert.equal(runtime.snapshot().tankSlotCount, 6);
   assert.equal(runtime.snapshot().activeTankCount, 1);
   assert.equal(tanks.filter(tank => tank.spawned).length, 1);
+  await runtime.shutdown();
+});
+
+test('World Object destruction cannot burst duplicate Tank spawn reservations or commits', async () => {
+  const chunk = tankSpawnBurstChunk();
+  const terrainRequests = [];
+  const sampleTerrainHeight = (x, z, queriedChunkData) =>
+    (x === 8 && z === 8) || queriedChunkData ? 0 : null;
+  const { runtime, state, renderer } = await createRuntime({
+    playerSpawn: { x: 8, z: 8 },
+    chunk,
+    sampleTerrainHeight,
+    getChunkDataForQuery(chunkX, chunkZ) {
+      return new Promise(resolveTerrain => {
+        terrainRequests.push({ chunkX, chunkZ, resolveTerrain });
+      });
+    },
+    configureState(candidate) {
+      candidate.player.score = 36_000;
+    },
+  });
+  const worldObjectStableIds = chunk.rockCandidates.map(candidate => candidate.candidateId);
+  let snapshot = runtime.snapshot();
+  assert.equal(snapshot.activeTankCount, 0);
+  assert.equal(snapshot.pendingTankSpawnCount, 0);
+  assert.equal(snapshot.allowedTankCount, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+
+  for (const [index, stableId] of worldObjectStableIds.entries()) {
+    const resolved = runtime.resolveCombatTarget(stableId);
+    const result = runtime.applyCombatDamage(resolved, 600, { awardPlayerCredit: true });
+    assert.equal(result.justDestroyed, true);
+    snapshot = runtime.snapshot();
+    assert.equal(snapshot.activeTankCount, 0,
+      `World Object destroy event ${index + 1} does not directly spawn a Tank`);
+    assert.equal(snapshot.pendingTankSpawnCount, 0,
+      `World Object destroy event ${index + 1} does not directly reserve a Tank`);
+  }
+
+  assert.doesNotThrow(() => runtime.update({ deltaSeconds: 0.05, player: state.player }));
+  snapshot = runtime.snapshot();
+  assert.ok(snapshot.pendingTankSpawnCount <= 1,
+    'one gameplay frame performs at most one spawn evaluation after same-frame destroy events');
+
+  for (let tick = 0;
+    tick < 1_200 && runtime.snapshot().reservedTankCapacityCount < W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum;
+    tick += 1) {
+    assert.doesNotThrow(() => runtime.update({ deltaSeconds: 0.05, player: state.player }));
+    snapshot = runtime.snapshot();
+    assert.equal(
+      new Set(snapshot.pendingTankSlotStableIds).size,
+      snapshot.pendingTankSlotStableIds.length,
+      'one slotStableId owns at most one pending spawn',
+    );
+    assert.ok(snapshot.reservedTankCapacityCount <= snapshot.allowedTankCount);
+    assert.ok(snapshot.reservedTankCapacityCount <= W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  }
+  snapshot = runtime.snapshot();
+  assert.equal(snapshot.activeTankCount, 0);
+  assert.equal(snapshot.pendingTankSpawnCount, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  assert.equal(snapshot.reservedTankCapacityCount, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+
+  await waitForAsync(() => terrainRequests.length > 0);
+  for (const request of terrainRequests) {
+    request.resolveTerrain(emptyChunk(request.chunkX, request.chunkZ, { terrainHeight: 0 }));
+  }
+  await waitForAsync(() => runtime.snapshot().pendingTankSpawnCount === 0);
+  await drainAsyncWork(4);
+
+  snapshot = runtime.snapshot();
+  assert.equal(snapshot.activeTankCount, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  assert.equal(snapshot.reservedTankCapacityCount, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  assert.ok(snapshot.activeTankCount <= snapshot.allowedTankCount);
+  const activeTanks = [...state.entityStates.values()]
+    .filter(entity => entity.type === 'tank' && entity.spawned === true);
+  assert.equal(activeTanks.length, W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  for (const tank of activeTanks) {
+    const resolved = runtime.resolveCombatTarget(tank.stableId);
+    assert.equal(resolved.occurrence.runtimeGeneration, 1,
+      'one reservation commits its slotStableId/runtimeGeneration exactly once');
+    assert.equal(
+      Number(renderer.entities.has(tank.stableId)) + Number(renderer.occurrences.has(tank.stableId)),
+      1,
+      'one Stable ID owns at most one renderer entry',
+    );
+  }
+  assert.equal(renderer.occurrences.size, 0,
+    'active canonical owner Chunk Tanks stay on their one canonical renderer entry');
+  assert.ok(snapshot.activeProjectileCount <= W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  assert.ok(snapshot.activeCombatEffectCount <= 256);
+  assert.ok(snapshot.tankOwnerRegistryCount <= chunk.settlementReferences.length);
+  assert.doesNotThrow(() => runtime.update({ deltaSeconds: 0, player: state.player }),
+    'update completes after consecutive World Object destruction and simultaneous terrain resolution');
+  await runtime.shutdown();
+});
+
+test('destroying a Military Base cancels its pending slot and later destroy events cannot rearm it', async () => {
+  const chunk = tankOnlyChunk({
+    rocks: Array.from({ length: 3 }, (_, index) => ({
+      candidateId: `wf1:rock:w8-destroyed-base-followup-${index}`,
+      worldPosition: { x: 8 + index, y: 0, z: 8 },
+      metadata: { candidateRadiusMeters: 0.8 },
+      owningChunkCoordinate: { x: 0, z: 0 },
+    })),
+  });
+  const terrainRequests = [];
+  const { runtime, state, renderer } = await createRuntime({
+    playerSpawn: { x: 14, z: 8 },
+    chunk,
+    sampleTerrainHeight: (x, z, queriedChunkData) =>
+      (x === 14 && z === 8) || queriedChunkData ? 0 : null,
+    getChunkDataForQuery(chunkX, chunkZ) {
+      return new Promise(resolveTerrain => {
+        terrainRequests.push({ chunkX, chunkZ, resolveTerrain });
+      });
+    },
+  });
+  await advanceUntil(runtime, state, () => runtime.snapshot().pendingTankSpawnCount === 1);
+  const tank = findBaseTank(state);
+  const reservedGenerationCount = runtime.snapshot().tankOccurrenceGenerationCount;
+  assert.equal(tank.spawned, false);
+
+  const baseResult = runtime.applyCombatDamage(
+    runtime.resolveCombatTarget(chunk.settlementLandmarks[0].stableId),
+    3_200,
+    { awardPlayerCredit: true },
+  );
+  assert.equal(baseResult.justDestroyed, true);
+  assert.equal(runtime.snapshot().pendingTankSpawnCount, 0);
+  for (const rock of chunk.rockCandidates) {
+    runtime.applyCombatDamage(runtime.resolveCombatTarget(rock.candidateId), 600, {
+      awardPlayerCredit: true,
+    });
+  }
+  for (let tick = 0; tick < 600; tick += 1) {
+    assert.doesNotThrow(() => runtime.update({ deltaSeconds: 0.05, player: state.player }));
+  }
+
+  await waitForAsync(() => terrainRequests.length > 0);
+  for (const request of terrainRequests) {
+    request.resolveTerrain(emptyChunk(request.chunkX, request.chunkZ, { terrainHeight: 0 }));
+  }
+  await drainAsyncWork(8);
+  const snapshot = runtime.snapshot();
+  assert.equal(tank.spawned, false);
+  assert.equal(snapshot.activeTankCount, 0);
+  assert.equal(snapshot.pendingTankSpawnCount, 0);
+  assert.equal(snapshot.tankOccurrenceGenerationCount, reservedGenerationCount);
+  assert.equal(renderer.occurrences.has(tank.stableId), false);
+  assert.equal(renderer.entities.get(tank.stableId).spawned, false);
   await runtime.shutdown();
 });
 

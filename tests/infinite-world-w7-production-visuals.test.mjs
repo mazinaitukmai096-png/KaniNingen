@@ -221,6 +221,10 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(loadedTankMesh.visible, false);
   adapter.syncEntity({ ...tankState, sandboxSuppressed: false });
   assert.equal(loadedTankMesh.visible, true);
+  adapter.syncReinforcement(tankState);
+  assert.equal(adapter.entityMeshes.has(tankState.stableId), true);
+  assert.equal(adapter.reinforcementMeshes.has(tankState.stableId), false,
+    'a loaded canonical Tank Stable ID cannot create a second occurrence renderer entry');
   adapter.syncReinforcement({
     ...tankState,
     stableId: 'wf1:tank:w8-scale-suppression-fallback',
@@ -236,6 +240,14 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   });
   assert.equal(fallbackTankMesh.visible, true);
   adapter.removeReinforcement('wf1:tank:w8-scale-suppression-fallback');
+  await adapter.unloadChunk('0,0');
+  adapter.syncReinforcement(tankState);
+  assert.equal(adapter.entityMeshes.has(tankState.stableId), false);
+  assert.equal(adapter.reinforcementMeshes.has(tankState.stableId), true);
+  await adapter.loadChunk('0,0', [tankState]);
+  assert.equal(adapter.entityMeshes.has(tankState.stableId), true);
+  assert.equal(adapter.reinforcementMeshes.has(tankState.stableId), false,
+    'canonical owner reload atomically replaces the occurrence renderer entry');
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
   assert.notEqual(parts.legs[0].rotation.x, 0);
