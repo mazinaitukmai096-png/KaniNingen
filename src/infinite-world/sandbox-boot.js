@@ -294,7 +294,14 @@ function createRuntimeRenderProfile() {
   });
 }
 
-export function createW8ScenePresentation({ THREE, scene, visualAssets }) {
+export function createW8ScenePresentation({
+  THREE,
+  scene,
+  visualAssets,
+  cloudAnchor = { x: 0, z: 0 },
+}) {
+  const cloudAnchorX = Number.isFinite(cloudAnchor?.x) ? cloudAnchor.x : 0;
+  const cloudAnchorZ = Number.isFinite(cloudAnchor?.z) ? cloudAnchor.z : 0;
   const cloudBaseCount = 70;
   const cloudInstances = [];
   const cloudRoll = (index, salt) => {
@@ -317,9 +324,9 @@ export function createW8ScenePresentation({ THREE, scene, visualAssets }) {
   }) => {
     cloudInstances.push({
       sourceIndex,
-      logicalX: xFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+      logicalX: cloudAnchorX + xFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
       logicalY: yFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
-      logicalZ: zFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+      logicalZ: cloudAnchorZ + zFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
       widthFinite,
       heightFinite,
       depthFinite,
@@ -409,6 +416,7 @@ ${shader.fragmentShader}`.replace(
   );
   cloudRoot.name = 'w8-finite-cloud-instance-pool';
   cloudRoot.userData = { presentationOnly: true, cloudBaseCount, cloudPuffCount };
+  cloudRoot.visible = true;
   cloudRoot.castShadow = false;
   cloudRoot.receiveShadow = false;
   cloudRoot.frustumCulled = false;
@@ -457,10 +465,11 @@ ${shader.fragmentShader}`.replace(
       for (let index = 0; index < cloudInstances.length; index += 1) {
         const cloud = cloudInstances[index];
         cloud.logicalX += cloud.speedFinite * dtScale / PRODUCTION_VISUAL_UNITS_PER_METER;
-        if (cloud.logicalX * PRODUCTION_VISUAL_UNITS_PER_METER > 14_000) {
-          cloud.logicalX = -14_000 / PRODUCTION_VISUAL_UNITS_PER_METER;
+        if ((cloud.logicalX - cloudAnchorX) * PRODUCTION_VISUAL_UNITS_PER_METER
+          > 14_000) {
+          cloud.logicalX = cloudAnchorX - 14_000 / PRODUCTION_VISUAL_UNITS_PER_METER;
           cloud.wrapCount += 1;
-          cloud.logicalZ = (cloudRoll(
+          cloud.logicalZ = cloudAnchorZ + (cloudRoll(
             cloud.sourceIndex,
             1_000 + cloud.wrapCount * 2 + (cloud.puff ? 1 : 0),
           ) - 0.5) * 28_000 / PRODUCTION_VISUAL_UNITS_PER_METER;
@@ -584,15 +593,40 @@ ${shader.fragmentShader}`.replace(
     },
     snapshot() {
       let warmBaseCount = 0;
+      let minimumCloudY = Infinity;
+      let maximumCloudY = -Infinity;
       for (let index = 0; index < cloudInstances.length; index += 1) {
         if (!cloudInstances[index].puff && cloudInstances[index].warm) warmBaseCount += 1;
+        minimumCloudY = Math.min(minimumCloudY, cloudInstances[index].logicalY);
+        maximumCloudY = Math.max(maximumCloudY, cloudInstances[index].logicalY);
       }
+      const instanceOpacity = cloudGeometry.getAttribute?.('instanceOpacity')
+        ?? cloudGeometry.attributes?.instanceOpacity;
       return Object.freeze({
         cloudBaseCount,
         cloudPuffCount,
         cloudInstanceCount: cloudInstances.length,
+        cloudCapacity: cloudRoot.instanceMatrix?.count ?? cloudInstances.length,
         warmBaseCount,
         cloudMatrixWriteCount,
+        cloudAnchorX,
+        cloudAnchorZ,
+        minimumCloudY,
+        maximumCloudY,
+        rootAttached: cloudRoot.parent === scene,
+        rootVisible: cloudRoot.visible !== false,
+        frustumCulled: cloudRoot.frustumCulled,
+        renderOrder: cloudRoot.renderOrder ?? 0,
+        materialTransparent: cloudMaterial.transparent === true,
+        materialOpacity: cloudMaterial.opacity,
+        materialDepthWrite: cloudMaterial.depthWrite,
+        instanceOpacityAttributeCount:
+          instanceOpacity?.count ?? instanceOpacity?.values?.length ?? 0,
+        instanceOpacityShaderEnabled:
+          typeof cloudMaterial.onBeforeCompile === 'function'
+          && cloudMaterial.customProgramCacheKey?.()
+            === 'w8-finite-cloud-instance-opacity-v1',
+        instanceMatrixVersion: cloudRoot.instanceMatrix?.version ?? null,
         renderOriginChunkX,
         renderOriginChunkZ,
         clouds: Object.freeze(cloudInstances.map(cloud => Object.freeze({
@@ -804,7 +838,10 @@ export async function bootInfiniteWorldSandbox({
       for (const child of playerMarker.children ?? []) child.castShadow = true;
       nextScene.add(playerMarker);
       scenePresentation = createW8ScenePresentation({
-        THREE, scene: nextScene, visualAssets,
+        THREE,
+        scene: nextScene,
+        visualAssets,
+        cloudAnchor: experienceSpawn,
       });
       return { nextScene, nextCamera, nextRenderer, playerMarker };
     });
@@ -1455,6 +1492,7 @@ export async function bootInfiniteWorldSandbox({
       const runtimeSnapshot = runtime.snapshot();
       const experienceSnapshot = experienceShell.snapshot();
       const presentationSnapshot = distantPresentation.snapshot();
+      const scenePresentationSnapshot = scenePresentation.snapshot();
       const renderOrigin = runtimeSnapshot.renderOrigin;
       const cameraLogicalX = renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
         + camera.position.x / UNITS_PER_METER;
@@ -1485,6 +1523,11 @@ export async function bootInfiniteWorldSandbox({
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
+      const fogFarMeters = scene.fog.far / UNITS_PER_METER;
+      const cloudWithinFogCount = scenePresentationSnapshot.clouds.filter(cloud => Math.hypot(
+        cloud.logicalX - logicalPlayer.x,
+        cloud.logicalZ - logicalPlayer.z,
+      ) <= fogFarMeters).length;
       hud.innerHTML = `<span id="badge">W8 / FINITE EXPERIENCE PARITY</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
@@ -1497,6 +1540,7 @@ Distribution: Seed + 768m Macro Region + minimum distance + urbanization + terra
 Scale: ${escapeHtml(worldState.activeScaleStageId)}  Player HP: ${number(worldState.player.hp)}/${number(worldState.player.maxHp)}  Score: ${number(worldState.player.score)}
 Run Phase: ${escapeHtml(experienceSnapshot.runPhase)}  Phase clock: ${number(experienceSnapshot.gameplayTimeMs)}ms  Gameplay clock: ${number(worldState.gameplayTimeMs)}ms
 Safe Spawn: (${number(experienceSpawn.x)}m, ${number(experienceSpawn.z)}m)  Pond: ${escapeHtml(experienceSpawn.pondStableId ?? 'none')}  Prepared: ${experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0}/25
+Cloud: root ${scenePresentationSnapshot.rootAttached && scenePresentationSnapshot.rootVisible ? 'visible' : 'hidden'}  instances ${scenePresentationSnapshot.cloudInstanceCount}/${scenePresentationSnapshot.cloudCapacity}  within Fog ${cloudWithinFogCount}  altitude ${number(scenePresentationSnapshot.minimumCloudY)}..${number(scenePresentationSnapshot.maximumCloudY)}m  matrix v${scenePresentationSnapshot.instanceMatrixVersion ?? 'n/a'}  opacity attr ${scenePresentationSnapshot.instanceOpacityAttributeCount} shader ${scenePresentationSnapshot.instanceOpacityShaderEnabled ? 'on' : 'off'}
 Player Render: (${number(playerMarker.position.x)}, ${number(playerMarker.position.y)}, ${number(playerMarker.position.z)})  Camera Logical: (${number(cameraLogicalX)}m, ${number(camera.position.y / UNITS_PER_METER)}m, ${number(cameraLogicalZ)}m)
 Camera Collision: ${lastCameraCollision?.collided ? escapeHtml(lastCameraCollision.stableId ?? 'obstacle') : 'clear'}
 Gameplay Simulation: ${gameplaySnapshot.activeSimulationChunkCount}/9 nearby Chunk only  Entities: ${gameplaySnapshot.simulatedEntityCount}  Targets: ${gameplaySnapshot.simulatedStaticTargetCount}
@@ -1506,6 +1550,7 @@ Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runt
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
 Distant: mid ${presentationSnapshot.midgroundChunkCount}  natural ${presentationSnapshot.distantNaturalProxyCount}/${presentationSnapshot.distantNaturalProxyLimit}  town ${presentationSnapshot.distantTownProxyCount}/${presentationSnapshot.distantTownProxyLimit}  water ${presentationSnapshot.distantWaterProxyCount}  boundary RGB ${number(presentationSnapshot.maximumInnerBoundaryColorDifference)}
+Canonical: settlements ${presentationSnapshot.queryCandidateCount}/${presentationSnapshot.queryTemplateSuccessCount} resolved  owner Chunks ${presentationSnapshot.queryCanonicalChunkSuccessCount}/${presentationSnapshot.queryOwnerChunkCount}  records ${presentationSnapshot.canonicalRecordCount} (building ${presentationSnapshot.canonicalBuildingRecordCount}, landmark ${presentationSnapshot.canonicalLandmarkRecordCount}, road ${presentationSnapshot.canonicalRoadRecordCount})  visible Far ${presentationSnapshot.canonicalFarObjectCount} / Mid ${presentationSnapshot.canonicalMidObjectCount} / Near handoff ${presentationSnapshot.canonicalNearObjectCount}
 Generated: ${runtimeSnapshot.counts.generated}  Loaded: ${runtimeSnapshot.counts.renderLoaded}  Unloaded: ${runtimeSnapshot.counts.renderUnloaded}  Rebase: ${runtimeSnapshot.renderOrigin.rebaseCount}
 Latest crossing: ${number(transition?.durationMs)}ms  generated Δ${transition?.generatedDelta ?? 0}  load Δ${transition?.renderLoadedDelta ?? 0}  unload Δ${transition?.renderUnloadedDelta ?? 0}
 Generation ms latest/p50/p95/max: ${number(metrics.generation.latest)} / ${number(metrics.generation.p50)} / ${number(metrics.generation.p95)} / ${number(metrics.generation.max)}
@@ -1760,6 +1805,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           save: saveStore.snapshot(),
           audio: audioDirector.snapshot(),
           presentation: distantPresentation.snapshot(),
+          scenePresentation: scenePresentation.snapshot(),
           measurement: Object.freeze({ ...measurement }),
           diagnostics: diagnostics.snapshot({
             drawCalls: renderer.info?.render?.calls ?? null,

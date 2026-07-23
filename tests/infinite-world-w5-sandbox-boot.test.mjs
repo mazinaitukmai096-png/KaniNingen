@@ -153,7 +153,21 @@ test('finite Cloud contract remains logical and continuous across origin updates
   assert.equal(initial.cloudBaseCount, 70);
   assert.equal(initial.cloudPuffCount, 21);
   assert.equal(initial.cloudInstanceCount, 91);
+  assert.equal(initial.cloudCapacity, 91);
   assert.equal(initial.warmBaseCount, 28);
+  assert.equal(initial.cloudAnchorX, 0);
+  assert.equal(initial.cloudAnchorZ, 0);
+  assert.equal(initial.rootAttached, true);
+  assert.equal(initial.rootVisible, true);
+  assert.equal(initial.frustumCulled, false);
+  assert.equal(initial.renderOrder, 0);
+  assert.equal(initial.materialTransparent, true);
+  assert.equal(initial.materialOpacity, 1);
+  assert.equal(initial.materialDepthWrite, false);
+  assert.equal(initial.instanceOpacityAttributeCount, 91);
+  assert.equal(initial.instanceOpacityShaderEnabled, true);
+  assert.ok(initial.minimumCloudY >= 1_600 / PRODUCTION_VISUAL_UNITS_PER_METER);
+  assert.ok(initial.maximumCloudY < 3_500 / PRODUCTION_VISUAL_UNITS_PER_METER);
   assert.equal(initial.clouds.filter(cloud => cloud.puff).length, 21);
   assert.equal(presentation.cloudRoot.material.opacity, 1);
   assert.equal(visualAssets.materials.cloud.opacity, 0.72);
@@ -447,15 +461,31 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     );
     assert.equal(cloudRoot.count, 91);
     assert.equal(cloudRoot.capacity, 91);
+    assert.equal(cloudRoot.visible, true);
     assert.deepEqual(cloudRoot.userData, {
       presentationOnly: true, cloudBaseCount: 70, cloudPuffCount: 21,
     });
     assert.equal(cloudRoot.material.options.transparent, true);
     assert.equal(cloudRoot.material.options.opacity, 0.72);
     assert.equal(cloudRoot.material.options.depthWrite, false);
+    assert.equal(snapshot.scenePresentation.cloudAnchorX, snapshot.spatial.spawn.x);
+    assert.equal(snapshot.scenePresentation.cloudAnchorZ, snapshot.spatial.spawn.z);
+    assert.equal(snapshot.scenePresentation.rootAttached, true);
+    assert.equal(snapshot.scenePresentation.rootVisible, true);
+    assert.equal(snapshot.scenePresentation.frustumCulled, false);
+    assert.equal(snapshot.scenePresentation.materialTransparent, true);
+    assert.equal(snapshot.scenePresentation.materialOpacity, 1);
+    assert.equal(snapshot.scenePresentation.materialDepthWrite, false);
+    assert.equal(snapshot.scenePresentation.instanceOpacityAttributeCount, 91);
+    assert.equal(snapshot.scenePresentation.instanceOpacityShaderEnabled, true);
+    assert.ok(snapshot.scenePresentation.clouds.filter(cloud => Math.hypot(
+      cloud.logicalX - snapshot.spatial.spawn.x,
+      cloud.logicalZ - snapshot.spatial.spawn.z,
+    ) <= 300).length > 0);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-visual-horizon-apron'), false);
     const distantWorld = gameplayScene.children.find(child => child.name === 'w8-scene-owned-distant-world');
     assert.ok(distantWorld);
+    assert.equal(distantWorld.visible, true);
     assert.equal(distantWorld.userData.presentationOnly, true);
     assert.equal(snapshot.presentation.midgroundChunkCount, 16);
     assert.equal(snapshot.presentation.clipmapMeshCount, 1);
@@ -467,8 +497,31 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
+    assert.equal(
+      snapshot.presentation.canonicalBuildingRecordCount
+        + snapshot.presentation.canonicalLandmarkRecordCount
+        + snapshot.presentation.canonicalRoadRecordCount,
+      snapshot.presentation.canonicalRecordCount,
+    );
     assert.ok(snapshot.presentation.canonicalFarObjectCount >= 0);
     assert.ok(snapshot.presentation.canonicalMidObjectCount >= 0);
+    assert.ok(snapshot.presentation.canonicalNearObjectCount >= 0);
+    assert.equal(
+      snapshot.presentation.canonicalFarObjectCount
+        + snapshot.presentation.canonicalMidObjectCount
+        + snapshot.presentation.canonicalNearObjectCount,
+      snapshot.presentation.canonicalRecordCount,
+    );
+    assert.equal(
+      snapshot.presentation.queryTemplateSuccessCount,
+      snapshot.presentation.queryCandidateCount,
+    );
+    assert.equal(
+      snapshot.presentation.queryCanonicalChunkSuccessCount,
+      snapshot.presentation.queryOwnerChunkCount,
+    );
+    assert.equal(snapshot.presentation.queryOwnerChunkKeys.length, 5);
+    assert.equal(snapshot.presentation.rootAttached, true);
     assert.equal(snapshot.presentation.templateCacheCapacity, 4);
     assert.ok(snapshot.presentation.templateCacheSize <= 4);
     assert.equal(snapshot.presentation.farOwnerChunkCacheCapacity, 64);

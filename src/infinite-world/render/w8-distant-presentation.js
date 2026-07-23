@@ -255,6 +255,7 @@ export async function createW8DistantPresentation({
   const root = new Group();
   root.name = 'w8-scene-owned-distant-world';
   root.userData = { presentationOnly: true };
+  root.visible = true;
   scene.add(root);
   const terrainMaterial = new Material({ vertexColors: true, flatShading: true, shininess: 0 });
   const roadGeometry = new PlaneGeometry(1, 1);
@@ -275,8 +276,16 @@ export async function createW8DistantPresentation({
     distantWaterProxyCount: 0,
     distantProxyInstancedMeshCount: 0,
     canonicalRecordCount: 0,
+    canonicalBuildingRecordCount: 0,
+    canonicalLandmarkRecordCount: 0,
+    canonicalRoadRecordCount: 0,
+    canonicalMeshCount: 0,
+    canonicalVisibleMeshCount: 0,
     canonicalFarObjectCount: 0,
     canonicalMidObjectCount: 0,
+    canonicalNearObjectCount: 0,
+    canonicalActiveOwnerCount: 0,
+    canonicalRenderedOwnerCount: 0,
     visibleCanonicalObjectCount: 0,
     duplicateVisibleStableIdCount: 0,
     identityAuditErrorCount: 0,
@@ -610,6 +619,13 @@ export async function createW8DistantPresentation({
     };
     buildGeneration.canonicalObjects.set(record.stableId, object);
     buildStats.canonicalRecordCount += 1;
+    if (record.featureType === 'settlement-building') {
+      buildStats.canonicalBuildingRecordCount += 1;
+    } else if (record.featureType === 'settlement-road') {
+      buildStats.canonicalRoadRecordCount += 1;
+    } else if (record.landmarkType) {
+      buildStats.canonicalLandmarkRecordCount += 1;
+    }
     return { object, isNew: true };
   };
 
@@ -755,6 +771,7 @@ export async function createW8DistantPresentation({
       const mesh = new InstancedMesh(geometry, material, bucket.items.length);
       mesh.name = `w8-canonical-lod-${bucket.name}-${bucket.geometry}-${bucket.material}`;
       mesh.count = bucket.items.length;
+      mesh.visible = true;
       mesh.castShadow = false;
       mesh.receiveShadow = false;
       mesh.userData = { presentationOnly: true, canonicalStableIds: [] };
@@ -765,6 +782,8 @@ export async function createW8DistantPresentation({
       });
       mesh.instanceMatrix.needsUpdate = true;
       buildTarget.add(mesh);
+      buildStats.canonicalMeshCount += 1;
+      if (mesh.visible !== false) buildStats.canonicalVisibleMeshCount += 1;
     }
   };
 
@@ -787,7 +806,10 @@ export async function createW8DistantPresentation({
       ?? W8_CANONICAL_VISIBILITY_METERS.high;
     let farCount = 0;
     let midCount = 0;
+    let nearCount = 0;
     let visibleCount = 0;
+    const activeOwners = new Set();
+    const renderedOwners = new Set();
     for (const object of generation.canonicalObjects.values()) {
       let nextLod = 'hidden';
       if (object.destructible && isFeatureDestroyed(object.stableId)) {
@@ -804,6 +826,9 @@ export async function createW8DistantPresentation({
       }
       if (nextLod === 'far') farCount += 1;
       if (nextLod === 'mid') midCount += 1;
+      if (nextLod === 'near') nearCount += 1;
+      if (generation.activeKeys.has(object.ownerKey)) activeOwners.add(object.ownerKey);
+      if (generation.renderedKeys.has(object.ownerKey)) renderedOwners.add(object.ownerKey);
       if (nextLod === 'far' || nextLod === 'mid') visibleCount += 1;
       if (object.visibleLod === nextLod) continue;
       const visible = nextLod === 'far' || nextLod === 'mid';
@@ -815,6 +840,9 @@ export async function createW8DistantPresentation({
     }
     generation.stats.canonicalFarObjectCount = farCount;
     generation.stats.canonicalMidObjectCount = midCount;
+    generation.stats.canonicalNearObjectCount = nearCount;
+    generation.stats.canonicalActiveOwnerCount = activeOwners.size;
+    generation.stats.canonicalRenderedOwnerCount = renderedOwners.size;
     generation.stats.visibleCanonicalObjectCount = visibleCount;
     generation.stats.duplicateVisibleStableIdCount = 0;
     generation.playerX = playerX;
@@ -1111,6 +1139,18 @@ export async function createW8DistantPresentation({
       queryRadius,
       visibilityMeters,
       candidateCount: candidates.length,
+      templateSuccessCount: templates.length,
+      ownerChunkCount: owners.length,
+      ownerChunkKeys: owners.map(owner => owner.key),
+      canonicalChunkSuccessCount: chunks.filter(value => value.chunk).length,
+      settlementFeatureCount: chunks.reduce(
+        (sum, value) => sum + (value.chunk?.settlementFeatures?.length ?? 0),
+        0,
+      ),
+      landmarkCount: chunks.reduce(
+        (sum, value) => sum + (value.chunk?.settlementLandmarks?.length ?? 0),
+        0,
+      ),
       settlementIds: new Set(candidates.map(candidate => candidate.settlementId)),
       chunks: chunks.filter(value => value.chunk),
     };
@@ -1185,7 +1225,12 @@ export async function createW8DistantPresentation({
         playerX: playerLogicalX,
         playerZ: playerLogicalZ,
         queryCandidateCount: far.candidateCount,
-        queryOwnerChunkCount: far.chunks.length,
+        queryTemplateSuccessCount: far.templateSuccessCount,
+        queryOwnerChunkCount: far.ownerChunkCount,
+        queryOwnerChunkKeys: far.ownerChunkKeys,
+        queryCanonicalChunkSuccessCount: far.canonicalChunkSuccessCount,
+        querySettlementFeatureCount: far.settlementFeatureCount,
+        queryLandmarkCount: far.landmarkCount,
         queryRadius: far.queryRadius,
         visibilityMeters: far.visibilityMeters,
       };
@@ -1279,7 +1324,15 @@ export async function createW8DistantPresentation({
         visibilityMeters: activeGeneration?.visibilityMeters ?? null,
         queryRadius: activeGeneration?.queryRadius ?? null,
         queryCandidateCount: activeGeneration?.queryCandidateCount ?? 0,
+        queryTemplateSuccessCount: activeGeneration?.queryTemplateSuccessCount ?? 0,
         queryOwnerChunkCount: activeGeneration?.queryOwnerChunkCount ?? 0,
+        queryOwnerChunkKeys: Object.freeze([
+          ...(activeGeneration?.queryOwnerChunkKeys ?? []),
+        ]),
+        queryCanonicalChunkSuccessCount:
+          activeGeneration?.queryCanonicalChunkSuccessCount ?? 0,
+        querySettlementFeatureCount: activeGeneration?.querySettlementFeatureCount ?? 0,
+        queryLandmarkCount: activeGeneration?.queryLandmarkCount ?? 0,
         templateCacheSize: templateCache.size,
         templateCacheCapacity: TEMPLATE_CACHE_CAPACITY,
         farOwnerChunkCacheSize: farOwnerChunkCache.size,
@@ -1297,6 +1350,13 @@ export async function createW8DistantPresentation({
           renderOriginChunkX: activeGeneration.currentOriginChunkX,
           renderOriginChunkZ: activeGeneration.currentOriginChunkZ,
         }) : null,
+        playerLogical: activeGeneration ? Object.freeze({
+          x: activeGeneration.playerX,
+          z: activeGeneration.playerZ,
+        }) : null,
+        rootAttached: Boolean(
+          root.parent === scene && activeGeneration?.root?.parent === root,
+        ),
         clipmapSampleCacheSize: clipmapSampleCache.size,
         clipmapSampleCacheCapacity: CLIPMAP_SAMPLE_CACHE_CAPACITY,
         clipmapSampleCacheHits,
@@ -1314,6 +1374,14 @@ export async function createW8DistantPresentation({
         visibleLod: object.visibleLod,
         farEligible: object.farEligible,
         instanceCount: object.instances.length,
+        ownerKey: object.ownerKey,
+        ownerActive: activeGeneration.activeKeys.has(object.ownerKey),
+        ownerRendered: activeGeneration.renderedKeys.has(object.ownerKey),
+        distanceMeters: Math.hypot(
+          object.worldX - activeGeneration.playerX,
+          object.worldZ - activeGeneration.playerZ,
+        ),
+        meshVisible: object.instances.every(instance => instance.mesh.visible !== false),
       })));
     },
     dispose() {
