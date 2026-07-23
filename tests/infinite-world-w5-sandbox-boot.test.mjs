@@ -8,8 +8,10 @@ import {
   bootInfiniteWorldSandbox,
   createSandboxBootState,
   createSandboxEntryController,
+  isW8GameplaySimulationEnabled,
   recordSandboxBootFailure,
 } from '../src/infinite-world/sandbox-boot.js';
+import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
@@ -353,6 +355,43 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.deepEqual(environment.cancelledFrames, [2]);
   } finally {
     environment.restore();
+  }
+});
+
+test('measurement frames pass strict boolean simulation state into Gameplay Runtime', async () => {
+  assert.equal(isW8GameplaySimulationEnabled('steady', 'menu'), true);
+  assert.equal(isW8GameplaySimulationEnabled('crossing', 'intro'), true);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'playing'), true);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'menu'), false);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'intro'), false);
+
+  for (const measurementMode of ['steady', 'crossing']) {
+    const environment = installBrowserEquivalentEnvironment();
+    const simulationEnabledValues = [];
+    try {
+      const sandbox = await bootInfiniteWorldSandbox({
+        globalObject: globalThis,
+        THREE: FakeThree,
+        viewport: environment.viewport,
+        hud: environment.hud,
+        requestedSeed: 'KaniNingen Infinite Natural World',
+        measurementMode,
+        gameplayRuntimeFactory(options) {
+          const runtime = new InfiniteGameplayRuntime(options);
+          const update = runtime.update.bind(runtime);
+          runtime.update = input => {
+            simulationEnabledValues.push(input.simulationEnabled);
+            return update(input);
+          };
+          return runtime;
+        },
+      });
+      environment.rafCallbacks[0](performance.now() + 100);
+      assert.deepEqual(simulationEnabledValues, [true], measurementMode);
+      await sandbox.shutdown();
+    } finally {
+      environment.restore();
+    }
   }
 });
 

@@ -89,6 +89,10 @@ function parseMeasurementMode(value) {
   return value;
 }
 
+export function isW8GameplaySimulationEnabled(measurementMode, runPhase) {
+  return measurementMode !== null || runPhase === 'playing';
+}
+
 function parseDiagnosticRunNumber(value) {
   if (!value) return 1;
   const runNumber = Number(value);
@@ -1430,7 +1434,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,
             renderOrigin: runtime.snapshot().renderOrigin,
-            simulationEnabled: measurement.mode || runPhase === 'playing',
+            simulationEnabled: isW8GameplaySimulationEnabled(measurement.mode, runPhase),
           }));
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
         const presentation = diagnostics.measure(
