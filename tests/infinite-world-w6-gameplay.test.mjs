@@ -308,6 +308,7 @@ test('Tiny/Mid/Max damage gates and legacy attack values drive active W6 gamepla
   assert.equal(mid.hits.some(value => value.type === 'human' && value.destroyed), true);
   assert.equal(mid.hits.some(value => value.type === 'house' && value.destroyed), true);
   assert.equal(state.entityStates.get(byType.tank.stableId).hp, TANK_HP);
+  state.entityStates.get(byType.tank.stableId).spawned = true;
   state.setScaleStage('MAX');
   const max = runtime.attack('single', ATTACK_COOLDOWN * 2);
   assert.equal(max.hits.some(value => value.type === 'tank' && value.destroyed), true);
@@ -348,8 +349,8 @@ test('Infinite World is the documented official runtime while the finite entry r
   const infiniteEntry = readFileSync(resolve(repoRoot, 'infinite-world-sandbox.html'), 'utf8');
   const finiteEntry = readFileSync(resolve(repoRoot, 'index.html'), 'utf8');
   const runtimeDocument = readFileSync(resolve(repoRoot, 'docs/infinite-world/RUNTIME-ENTRY.md'), 'utf8');
-  assert.match(infiniteEntry, /W7 \/ FULL EXPERIENCE/);
-  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w7-full-experience/);
+  assert.match(infiniteEntry, /W8 \/ FINITE EXPERIENCE PARITY/);
+  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w8-finite-parity/);
   assert.doesNotMatch(infiniteEntry, /src\/game\.js/);
   assert.match(finiteEntry, /src\/game\.js/);
   assert.match(runtimeDocument, /official KaniNingen full-experience runtime is `infinite-world-sandbox\.html`/);

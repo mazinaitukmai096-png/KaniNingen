@@ -1,4 +1,4 @@
-export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w7-full-experience';
+export const SANDBOX_MAIN_MODULE_SPECIFIER = './sandbox-main.js?v=w8-finite-parity';
 
 function describeEntryError(error) {
   const name = String(error?.name || 'Error');
@@ -9,14 +9,14 @@ function describeEntryError(error) {
 
 function renderModuleBoot(hud) {
   if (!hud) return;
-  hud.textContent = 'W7 / FULL EXPERIENCE\n起動中: MODULE_BOOT';
+  hud.textContent = 'W8 / FINITE EXPERIENCE PARITY\n起動中: MODULE_BOOT';
 }
 
 function renderModuleImportFailure({ hud, error, moduleUrl, entryBridge }) {
   const described = describeEntryError(error);
   if (!entryBridge?.snapshot?.().reported && hud) {
     hud.textContent = [
-      'W7 / FULL EXPERIENCE',
+      'W8 / FINITE EXPERIENCE PARITY',
       '起動失敗: MODULE_IMPORT',
       `${described.name}: ${described.message}`,
       `Stack: ${described.stackFirstLine}`,
@@ -32,7 +32,7 @@ export function createSandboxModuleEntry({
   hud = documentObject?.querySelector?.('#hud'),
   moduleSpecifier = SANDBOX_MAIN_MODULE_SPECIFIER,
   moduleUrl = new URL(moduleSpecifier, import.meta.url).href,
-  importModule = () => import('./sandbox-main.js?v=w7-full-experience'),
+  importModule = () => import('./sandbox-main.js?v=w8-finite-parity'),
 } = {}) {
   let entryPromise = null;
   let importExecutionCount = 0;

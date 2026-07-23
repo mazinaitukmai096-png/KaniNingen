@@ -33,9 +33,9 @@ function createElement() {
   });
 }
 
-function createFixture() {
+function createFixture({ exposeDeveloperTools = false, runConfiguration = true } = {}) {
   const ids = [
-    'start-screen', 'start-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
+    'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
     'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill',
     'atomic-status', 'boss-ui', 'charge-ui', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
@@ -44,6 +44,7 @@ function createFixture() {
     'game-over', 'restart-button',
     'nuclear-flash',
   ];
+  if (exposeDeveloperTools) ids.push('set-developer-tools', 'developer-tools-section');
   const elements = new Map(ids.map(id => [id, createElement()]));
   elements.get('set-quality').value = 'high';
   const bodyClasses = new Set();
@@ -73,6 +74,7 @@ function createFixture() {
   const playerMarker = { position: { y: 0 } };
   const worldState = {
     activeScaleStageId: 'MAX',
+    developerTools: false,
     experience: {
       hudHidden: false,
       settings: {
@@ -81,6 +83,7 @@ function createFixture() {
       },
     },
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
+    setDeveloperTools(enabled) { this.developerTools = enabled; },
     updateExperience(patch) {
       this.experience = {
         ...this.experience,
@@ -91,7 +94,7 @@ function createFixture() {
   };
   const calls = {
     attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
-    nuclear: [], bossSpawns: 0,
+    nuclear: [], bossSpawns: 0, starts: [],
   };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
@@ -102,6 +105,7 @@ function createFixture() {
     onLoad: () => { calls.loads += 1; },
     onHome: () => { calls.homes += 1; },
     onRestart: () => { calls.restarts += 1; },
+    onStartRun: mode => { calls.starts.push(mode); return runConfiguration; },
     onNuclearRelease: input => { calls.nuclear.push(input); },
     onSpawnManualBoss: () => { calls.bossSpawns += 1; },
   });
@@ -109,6 +113,12 @@ function createFixture() {
     shell, globalObject, documentObject, canvas, camera, playerMarker, worldState,
     calls, elements, bodyClasses, setNow(value) { now = value; },
   };
+}
+
+function finishIntro(fixture, player = { x: 0, z: 0, facingY: 0 }, profile = getW6ScaleProfile('MAX')) {
+  fixture.shell.updatePlayer({ deltaSeconds: 6, player, scaleProfile: profile });
+  assert.equal(fixture.shell.getRunPhase(), 'playing');
+  return player;
 }
 
 test('W7 camera state is sourced from the protected scale profile', () => {
@@ -121,6 +131,100 @@ test('W7 camera state is sourced from the protected scale profile', () => {
   }
 });
 
+test('New Game and Continue are explicit start modes and Continue remains unavailable without a valid save', () => {
+  const newFixture = createFixture();
+  assert.equal(newFixture.elements.get('continue-button').disabled, true);
+  newFixture.elements.get('continue-button').dispatch('click');
+  assert.deepEqual(newFixture.calls.starts, []);
+  newFixture.elements.get('start-button').dispatch('click');
+  assert.deepEqual(newFixture.calls.starts, ['new']);
+  assert.equal(newFixture.shell.snapshot().runStartMode, 'new');
+  assert.equal(newFixture.shell.getRunPhase(), 'intro');
+  newFixture.shell.dispose();
+
+  const continueFixture = createFixture();
+  continueFixture.shell.setContinueAvailable(true);
+  assert.equal(continueFixture.elements.get('continue-button').disabled, false);
+  continueFixture.elements.get('continue-button').dispatch('click');
+  assert.deepEqual(continueFixture.calls.starts, ['continue']);
+  assert.equal(continueFixture.shell.snapshot().runStartMode, 'continue');
+  assert.equal(continueFixture.shell.getRunPhase(), 'intro');
+  continueFixture.shell.dispose();
+});
+
+test('New Game enters intro only after start preparation and clears the previous Camera yaw', async () => {
+  let releasePreparation;
+  const preparation = new Promise(resolve => { releasePreparation = resolve; });
+  const fixture = createFixture({
+    runConfiguration: preparation.then(() => ({ cameraYaw: 1.25 })),
+  });
+  fixture.elements.get('start-button').dispatch('click');
+  assert.equal(fixture.shell.getRunPhase(), 'menu');
+  assert.equal(fixture.elements.get('start-button').disabled, true);
+  releasePreparation();
+  await preparation;
+  await Promise.resolve();
+  assert.equal(fixture.shell.getRunPhase(), 'intro');
+  assert.equal(fixture.shell.snapshot().camera.yaw, 1.25);
+  const player = { x: 0, z: 0, facingY: 0 };
+  fixture.shell.updatePlayer({
+    deltaSeconds: 1,
+    player,
+    scaleProfile: getW6ScaleProfile('MAX'),
+  });
+  assert.equal(fixture.shell.snapshot().gameplayTimeMs, 1_000);
+  fixture.shell.dispose();
+});
+
+test('W8 finite camera projection keeps target height out of camera Y and resets every Scale', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 0, z: 0, facingY: 0 };
+  finishIntro(fixture, player);
+  const unitsPerMeter = 256;
+  const renderLocal = { x: 400, z: -250 };
+
+  for (const [stageIndex, stageId] of ['MAX', 'TINY', 'MID', 'MAX'].entries()) {
+    const profile = getW6ScaleProfile(stageId);
+    fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: profile });
+    fixture.shell.updateCamera({ renderLocal, scaleProfile: profile, unitsPerMeter });
+    const state = fixture.shell.snapshot();
+    const rootY = state.playerVertical.rootY;
+    const expectedPitch = stageIndex === 0 ? 0.45 : profile.stage.cameraPitch;
+    const horizontal = Math.cos(expectedPitch)
+      * profile.cameraDistanceMeters * unitsPerMeter;
+    const vertical = (Math.sin(expectedPitch) * profile.cameraDistanceMeters
+      + profile.cameraHeightMeters) * unitsPerMeter;
+    assert.equal(state.camera.pitch, expectedPitch, stageId);
+    assert.equal(state.camera.distanceMeters, profile.cameraDistanceMeters, stageId);
+    assert.ok(Math.abs(fixture.camera.position.x - renderLocal.x) < 1e-9, stageId);
+    assert.ok(Math.abs(fixture.camera.position.y - (rootY * unitsPerMeter + vertical)) < 1e-9, stageId);
+    assert.ok(Math.abs(fixture.camera.position.z - (renderLocal.z + horizontal)) < 1e-9, stageId);
+    assert.equal(
+      fixture.camera.near,
+      profile.stage.cameraNear / 40 * unitsPerMeter,
+      stageId,
+    );
+    assert.deepEqual(fixture.camera.lookTarget, {
+      x: renderLocal.x,
+      y: (rootY + profile.cameraTargetHeightMeters) * unitsPerMeter,
+      z: renderLocal.z,
+    });
+  }
+
+  const maxProfile = getW6ScaleProfile('MAX');
+  fixture.globalObject.dispatch('wheel', { deltaY: 1_000_000 });
+  assert.equal(fixture.shell.snapshot().camera.distanceMeters, maxProfile.stage.cameraMaxDistance / 40);
+  fixture.globalObject.dispatch('wheel', { deltaY: -1_000_000 });
+  assert.equal(fixture.shell.snapshot().camera.distanceMeters, maxProfile.stage.cameraMinDistance / 40);
+  fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: getW6ScaleProfile('TINY') });
+  assert.equal(
+    fixture.shell.snapshot().camera.distanceMeters,
+    getW6ScaleProfile('TINY').cameraDistanceMeters,
+  );
+  fixture.shell.dispose();
+});
+
 test('W7 experience shell restores movement, jump, camera, scale, attacks, save and load controls', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
@@ -129,6 +233,7 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
 
   const player = { x: 0, z: 0, facingY: 0 };
   const profile = getW6ScaleProfile('MAX');
+  finishIntro(fixture, player, profile);
   fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
   fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
   fixture.globalObject.dispatch('keyup', { code: 'KeyD' });
@@ -142,6 +247,7 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   assert.ok(airborne.rootY > airborne.groundRootY);
   fixture.globalObject.dispatch('keydown', { code: 'KeyQ' });
   fixture.globalObject.dispatch('keydown', { code: 'KeyF' });
+  fixture.globalObject.dispatch('keydown', { code: 'Tab' });
   fixture.globalObject.dispatch('keydown', { code: 'Digit1' });
   fixture.globalObject.dispatch('keydown', { code: 'KeyP' });
   fixture.globalObject.dispatch('keydown', { code: 'KeyL' });
@@ -149,6 +255,7 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   assert.equal(fixture.worldState.activeScaleStageId, 'TINY');
   assert.equal(fixture.calls.saves, 1);
   assert.equal(fixture.calls.loads, 1);
+  fixture.globalObject.dispatch('keydown', { code: 'Tab' });
 
   fixture.globalObject.dispatch('mousemove', { movementX: 10, movementY: 5 });
   fixture.globalObject.dispatch('wheel', { deltaY: 20 });
@@ -157,6 +264,31 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   assert.ok(Number.isFinite(fixture.camera.position.x));
   assert.ok(Number.isFinite(fixture.camera.position.y));
   assert.ok(Number.isFinite(fixture.camera.position.z));
+  fixture.shell.dispose();
+});
+
+test('Tab and Scale remain available while advanced Developer commands stay isolated when OFF', () => {
+  const fixture = createFixture({ exposeDeveloperTools: true });
+  fixture.elements.get('start-button').dispatch('click');
+  fixture.globalObject.dispatch('keydown', { code: 'Digit1' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyQ' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyF' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyP' });
+  fixture.globalObject.dispatch('keydown', { code: 'KeyL' });
+  fixture.elements.get('debug-spawn-boss-btn').dispatch('click');
+  assert.equal(fixture.worldState.activeScaleStageId, 'MAX');
+  assert.deepEqual(fixture.calls.attacks, []);
+  assert.equal(fixture.calls.saves, 0);
+  assert.equal(fixture.calls.loads, 0);
+  assert.equal(fixture.calls.bossSpawns, 0);
+
+  fixture.globalObject.dispatch('keydown', { code: 'Tab' });
+  assert.equal(fixture.shell.snapshot().debugOpen, true);
+  fixture.globalObject.dispatch('keydown', { code: 'Digit1' });
+  assert.equal(fixture.worldState.activeScaleStageId, 'TINY');
+  fixture.globalObject.dispatch('keydown', { code: 'Tab' });
+  assert.equal(fixture.shell.snapshot().debugOpen, false);
+  assert.equal(fixture.shell.isPaused(), false);
   fixture.shell.dispose();
 });
 
@@ -215,11 +347,11 @@ test('zero HP enters Game Over and Retry delegates to the existing runtime resta
   fixture.elements.get('start-button').dispatch('click');
   const player = { x: 0, z: 0, facingY: 0 };
   const profile = getW6ScaleProfile('MAX');
-  fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: profile });
+  finishIntro(fixture, player, profile);
   fixture.globalObject.dispatch('keydown', { code: 'Space' });
   fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
   assert.equal(fixture.shell.snapshot().playerVertical.grounded, false);
-  fixture.shell.renderHud({
+  const deadHud = {
     fps: 60,
     gameplaySnapshot: {
       state: {
@@ -233,7 +365,12 @@ test('zero HP enters Game Over and Retry delegates to the existing runtime resta
       performance: { frame: { p50: 6, p95: 10, max: 20 } },
     },
     saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
-  });
+  };
+  fixture.shell.renderHud(deadHud);
+  assert.equal(fixture.shell.getRunPhase(), 'dying');
+  assert.equal(fixture.elements.get('game-over').style.display, 'none');
+  fixture.shell.updatePlayer({ deltaSeconds: 3, player, scaleProfile: profile });
+  fixture.shell.renderHud(deadHud);
   assert.equal(fixture.shell.snapshot().mode, 'gameover');
   assert.equal(fixture.elements.get('game-over').style.display, 'flex');
   assert.equal(fixture.elements.get('final-score').textContent, '$4,500,000');
@@ -251,7 +388,7 @@ test('Space is edge-triggered and held or repeated keydown cannot add another ju
   fixture.elements.get('start-button').dispatch('click');
   const player = { x: 0, z: 0, facingY: 0 };
   const profile = getW6ScaleProfile('MAX');
-  fixture.shell.updatePlayer({ deltaSeconds: 0, player, scaleProfile: profile });
+  finishIntro(fixture, player, profile);
   fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
   const initialVelocity = fixture.shell.snapshot().playerVertical.velocityMetersPerSecond;
   fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
@@ -276,6 +413,7 @@ test('Space is edge-triggered and held or repeated keydown cannot add another ju
 test('W7D mouse charge releases nuclear input only after the protected threshold and exposes manual Boss debug', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
   fixture.globalObject.dispatch('keydown', { code: 'Space' });
   fixture.globalObject.dispatch('mousedown', { button: 0 });
   fixture.globalObject.dispatch('mousedown', { button: 2 });

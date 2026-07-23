@@ -11,6 +11,8 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from '../src/infinite-world/render/production-visual-assets.js';
+import { createW8ParityVisualAssetLibrary } from '../src/infinite-world/render/w8-parity-visual-assets.js';
+import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const provenancePath = resolve(repoRoot, 'docs/infinite-world/W7-VISUAL-PROVENANCE.json');
@@ -27,6 +29,8 @@ class NodeObject {
     this.scale = new Triple().set(1, 1, 1); this.userData = {};
   }
   add(child) { this.children.push(child); child.parent = this; }
+  remove(child) { this.children = this.children.filter(value => value !== child); child.parent = null; }
+  clear() { for (const child of this.children) child.parent = null; this.children = []; }
 }
 class Group extends NodeObject {}
 class Geometry { dispose() { this.disposed = true; } }
@@ -37,12 +41,13 @@ class SphereGeometry extends Geometry {}
 class DodecahedronGeometry extends Geometry {}
 class Material { constructor(options) { this.options = options; } dispose() { this.disposed = true; } }
 class MeshLambertMaterial extends Material {}
+class MeshPhongMaterial extends Material {}
 class Mesh extends NodeObject {
   constructor(geometry, material) { super(); this.geometry = geometry; this.material = material; }
 }
 const FakeThree = {
   Group, BoxGeometry, ConeGeometry, CylinderGeometry, SphereGeometry,
-  DodecahedronGeometry, MeshLambertMaterial, Mesh,
+  DodecahedronGeometry, MeshLambertMaterial, MeshPhongMaterial, Mesh,
 };
 
 test('W7A visual assets come only from the fixed finite baseline with verified provenance', () => {
@@ -89,6 +94,63 @@ test('W7A production Player, Human, and Tank share bounded resources and dispose
   assets.dispose();
   assets.dispose();
   assert.equal(assets.snapshot().disposed, true);
+});
+
+test('W8 settlement and atmosphere materials use the finite visual baseline', () => {
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  assert.ok(assets.materials.road instanceof MeshPhongMaterial);
+  assert.deepEqual(assets.materials.road.options, { color: 0xc2a878, shininess: 3 });
+  assert.equal(assets.materials.houseWall.options.color, 0xeeeeee);
+  assert.equal(assets.materials.houseRoof.options.color, 0xaa2222);
+  assert.equal(assets.materials.factoryWall.options.color, 0x707878);
+  assert.equal(assets.materials.barn.options.color, 0x8b3a2f);
+  assert.deepEqual(assets.materials.cloud.options, {
+    color: 0xffffff,
+    flatShading: true,
+    transparent: true,
+    opacity: 0.68,
+    depthWrite: false,
+  });
+  assert.equal(assets.materials.horizonTerrain.options.color, 0x668c54);
+  assets.dispose();
+  assert.equal(assets.snapshot().disposed, true);
+});
+
+test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentation only', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const player = assets.createPlayerModel();
+  const parts = player.userData.presentationParts;
+  const countMeshes = node => (node instanceof Mesh ? 1 : 0)
+    + node.children.reduce((sum, child) => sum + countMeshes(child), 0);
+  assert.equal(countMeshes(player), 21);
+  assert.deepEqual(
+    { x: parts.leftClaw.position.x, y: parts.leftClaw.position.y, z: parts.leftClaw.position.z },
+    { x: 85, y: 30, z: 5 },
+  );
+  assert.deepEqual(
+    { x: parts.rightClaw.position.x, y: parts.rightClaw.position.y, z: parts.rightClaw.position.z },
+    { x: -85, y: 30, z: 5 },
+  );
+  assert.equal(parts.leftClaw.children.length, 3);
+  assert.equal(parts.rightClaw.children.length, 3);
+  assert.equal(parts.legs.length, 8);
+
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  adapter.consumePresentationEvents([], { playerMarker: player });
+  assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
+  assert.notEqual(parts.legs[0].rotation.x, 0);
+  assert.ok(parts.visualRoot.position.y > 0);
+  adapter.consumePresentationEvents([{
+    type: 'both-claw-swish', logicalPosition: { x: 0, z: 0 }, intensity: 1,
+    lifetimeSeconds: 0.28, soundCue: 'swish',
+  }], { playerMarker: player });
+  adapter.updatePresentation(0.1);
+  assert.notEqual(parts.leftClaw.position.z, 5);
+  assert.notEqual(parts.rightClaw.position.z, 5);
+  assert.notEqual(parts.visualRoot.rotation.x, 0);
+  await adapter.shutdown();
+  assets.dispose();
 });
 
 test('W7A normal render paths no longer name Proxy geometry', () => {

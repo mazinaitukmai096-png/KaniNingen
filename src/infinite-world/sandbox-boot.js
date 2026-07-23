@@ -4,25 +4,49 @@ import {
   describeRenderChunkCandidate,
 } from './chunk-size-benchmark.js';
 import {
+  LOGICAL_CHUNK_SIZE_METERS,
   UNITS_PER_METER,
   decomposeLogicalWorldPosition,
   logicalWorldToRenderLocal,
+  squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
-import { createDistributedSettlementChunkGenerator } from './distributed-settlement-chunk-generator.js';
+import {
+  createW8ParityChunkGenerator,
+  sampleW8SurfaceHeightMeters,
+} from './w8-parity-chunk-generator.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import { getW6ScaleProfile } from './gameplay-contract.js';
 import { GameplayRenderAdapter } from './render/gameplay-render-adapter.js';
 import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
-  createProductionVisualAssetLibrary,
-} from './render/production-visual-assets.js';
-import { InfiniteWorldSaveStore, InfiniteWorldState } from './world-state-store.js';
+  createW8ParityVisualAssetLibrary,
+} from './render/w8-parity-visual-assets.js';
+import {
+  InfiniteWorldSaveStore,
+  InfiniteWorldState,
+  createBrowserSaveStorage,
+} from './world-state-store.js';
 import { createInfiniteExperienceShell } from './experience-shell.js';
-import { sampleFormalTerrainHeightMeters } from './player-vertical-movement.js';
+import { createW8AudioDirector } from './w8-audio.js';
+import { createW8DistantPresentation } from './render/w8-distant-presentation.js';
+import {
+  createW8RuntimeDiagnostics,
+  parseW8DiagnosticProfile,
+} from './runtime-diagnostics.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
+
+const FINITE_TO_INFINITE_RENDER_SCALE = UNITS_PER_METER / PRODUCTION_VISUAL_UNITS_PER_METER;
+const finiteVisualToRender = value => value * FINITE_TO_INFINITE_RENDER_SCALE;
+const W8_GAMEPLAY_CAMERA_FAR = finiteVisualToRender(35_000);
+const W8_GAMEPLAY_FOG_NEAR = finiteVisualToRender(3_000);
+const W8_GAMEPLAY_FOG_FAR_BY_QUALITY = Object.freeze({
+  high: finiteVisualToRender(12_000),
+  medium: finiteVisualToRender(9_000),
+  low: finiteVisualToRender(6_500),
+});
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -36,6 +60,13 @@ function escapeHtml(value) {
 
 function number(value) {
   return Number(value ?? 0).toFixed(2);
+}
+
+function normalizeAngle(value) {
+  let result = value % (Math.PI * 2);
+  if (result <= -Math.PI) result += Math.PI * 2;
+  if (result > Math.PI) result -= Math.PI * 2;
+  return result;
 }
 
 function parseMeasurementViewport(value) {
@@ -56,6 +87,15 @@ function parseMeasurementMode(value) {
     throw new RangeError('measurementMode must be steady or crossing');
   }
   return value;
+}
+
+function parseDiagnosticRunNumber(value) {
+  if (!value) return 1;
+  const runNumber = Number(value);
+  if (!Number.isSafeInteger(runNumber) || runNumber < 1 || runNumber > 999) {
+    throw new RangeError('diagnosticRun must be an integer from 1 to 999');
+  }
+  return runNumber;
 }
 
 function appendElement(parent, child) {
@@ -119,6 +159,8 @@ export function createSandboxBootState({ clock = defaultClock } = {}) {
     initialSimulationChunkCount: 0,
     initialGameplayEntityCount: 0,
     saveLoaded: false,
+    saveAvailable: false,
+    saveError: null,
   };
 }
 
@@ -132,7 +174,7 @@ export function snapshotSandboxBootState(state) {
 
 export function renderSandboxBootStatus(hud, state) {
   if (!hud) return;
-  const badge = '<span id="badge">W7 / FULL EXPERIENCE</span>';
+  const badge = '<span id="badge">W8 / FINITE EXPERIENCE PARITY</span>';
   if (state.status === 'failed') {
     hud.innerHTML = `${badge}\n<span id="error">起動失敗: ${escapeHtml(state.stage)}</span>\n${escapeHtml(state.bootError?.message ?? 'unknown error')}`;
     return;
@@ -235,6 +277,82 @@ function createRuntimeRenderProfile() {
   });
 }
 
+function createW8ScenePresentation({ THREE, scene, visualAssets, width, height }) {
+  const clouds = [];
+  const cloudRoot = new THREE.Group();
+  cloudRoot.name = 'w8-cyclic-scene-clouds';
+  for (let index = 0; index < 14; index += 1) {
+    const cloud = new THREE.Group();
+    cloud.name = `w8-cloud-${index}`;
+    const widthFinite = 420 + (index % 5) * 90;
+    const heightFinite = 70 + (index % 4) * 24;
+    const depthFinite = 260 + (index % 6) * 58;
+    for (let part = 0; part < 3; part += 1) {
+      const mesh = new THREE.Mesh(visualAssets.geometries.box, visualAssets.materials.cloud);
+      mesh.name = `w8-cloud-${index}-part-${part}`;
+      mesh.position.set(
+        finiteVisualToRender((part - 1) * widthFinite * 0.32),
+        finiteVisualToRender(-Math.abs(part - 1) * heightFinite * 0.12),
+        finiteVisualToRender(part * depthFinite * 0.08),
+      );
+      const partScale = part === 1 ? 1 : 0.58;
+      mesh.scale.set(
+        finiteVisualToRender(widthFinite * partScale),
+        finiteVisualToRender(heightFinite * (part === 1 ? 1 : 0.72)),
+        finiteVisualToRender(depthFinite * partScale),
+      );
+      mesh.castShadow = false;
+      mesh.receiveShadow = false;
+      cloud.add(mesh);
+    }
+    const angle = index / 14 * Math.PI * 2 + (index % 3) * 0.07;
+    const radiusFinite = 9_000 + (index % 6) * 1_000;
+    cloud.position.set(
+      Math.sin(angle) * finiteVisualToRender(radiusFinite),
+      finiteVisualToRender(2_600 + (index % 6) * 320),
+      Math.cos(angle) * finiteVisualToRender(radiusFinite),
+    );
+    cloudRoot.add(cloud); clouds.push(cloud);
+  }
+  scene.add(cloudRoot);
+
+  const titleScene = new THREE.Scene();
+  titleScene.background = new THREE.Color(0x241914);
+  titleScene.fog = new THREE.Fog(0x241914, 2800, 10000);
+  const titleCamera = new THREE.PerspectiveCamera(70, width / height, 10, 35000);
+  titleCamera.position.set(0, 750, 3100);
+  titleCamera.lookAt?.(0, 340, 0);
+  titleScene.add(new THREE.HemisphereLight(0xffcfa0, 0x26180f, 1.1));
+  const titleSun = new THREE.DirectionalLight(0xff7b45, 2.1);
+  titleSun.position.set(-1200, 1800, 1000); titleScene.add(titleSun);
+  const titleCrab = visualAssets.createPlayerModel();
+  titleCrab.position.set(-550, 0, 200); titleCrab.rotation.y = 0.25;
+  titleCrab.scale.set(4.4, 4.4, 4.4); titleScene.add(titleCrab);
+  const titleBoss = visualAssets.createEntityModel('boss');
+  titleBoss.position.set(1250, -170, -900); titleBoss.rotation.y = -0.4;
+  titleBoss.scale.set(3, 3, 3); titleScene.add(titleBoss);
+  const explosionRoot = new THREE.Group();
+  explosionRoot.name = 'w8-title-explosion';
+  for (let index = 0; index < 8; index += 1) {
+    const blast = new THREE.Mesh(visualAssets.geometries.dodeca, visualAssets.materials.gold);
+    const angle = index / 8 * Math.PI * 2;
+    blast.position.set(Math.sin(angle) * 380, 450 + (index % 3) * 130, Math.cos(angle) * 380);
+    blast.scale.set(180, 180, 180); explosionRoot.add(blast);
+  }
+  explosionRoot.position.set(1500, 760, -1500); titleScene.add(explosionRoot);
+  let disposed = false;
+  return Object.freeze({
+    titleScene, titleCamera, titleBoss, explosionRoot, cloudRoot, clouds,
+    dispose() {
+      if (disposed) return;
+      scene.remove(cloudRoot);
+      titleScene.clear?.();
+      clouds.length = 0;
+      disposed = true;
+    },
+  });
+}
+
 export async function bootInfiniteWorldSandbox({
   globalObject = globalThis,
   THREE = globalObject.THREE,
@@ -248,8 +366,17 @@ export async function bootInfiniteWorldSandbox({
   measurementMode = parseMeasurementMode(
     new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('measurementMode'),
   ),
+  diagnosticProfile = parseW8DiagnosticProfile(
+    new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnosticProfile'),
+  ),
+  diagnosticRunNumber = parseDiagnosticRunNumber(
+    new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnosticRun'),
+  ),
+  diagnosticsEnabled = measurementMode !== null
+    || new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnostics') === '1'
+    || diagnosticProfile.profileId !== 'baseline',
   state = createSandboxBootState(),
-  generatorFactory = createDistributedSettlementChunkGenerator,
+  generatorFactory = createW8ParityChunkGenerator,
   renderAdapterFactory = options => new ChunkRenderAdapter(options),
   runtimeFactory = options => new ChunkRuntimeManager(options),
   chunkIndexFactory = options => new PersistentChunkIndex(options),
@@ -281,6 +408,12 @@ export async function bootInfiniteWorldSandbox({
   let renderer = null;
   let visualAssets = null;
   let scene = null;
+  let scenePresentation = null;
+  let distantPresentation = null;
+  let audioDirector = null;
+  let diagnostics = null;
+  let availableSaveSnapshot = null;
+  let experienceSpawn = null;
   let running = false;
   let animationFrameId = null;
   let currentStageStartedAt = null;
@@ -306,19 +439,48 @@ export async function bootInfiniteWorldSandbox({
   };
 
   try {
+    diagnostics = createW8RuntimeDiagnostics({
+      globalObject,
+      clock,
+      profile: diagnosticProfile,
+      enabled: diagnosticsEnabled,
+      runNumber: diagnosticRunNumber,
+      environment: {
+        viewport: `${measurementViewport?.width ?? globalObject.innerWidth}x${measurementViewport?.height ?? globalObject.innerHeight}`,
+        devicePixelRatio: globalObject.devicePixelRatio ?? 1,
+        userAgent: globalObject.navigator?.userAgent ?? 'unknown',
+        worldSeed: requestedSeed,
+      },
+    });
     generator = await runStage('Legacy Core', () => generatorFactory({ worldSeed: requestedSeed }));
+    experienceSpawn = generator.experienceSpawn ?? generator.reviewSpawn;
     await runStage('Save State', async () => {
       worldState = worldStateFactory({
         worldSeed: generator.worldSeed,
         worldSeedHash: generator.worldSeedHash,
-        playerSpawn: generator.reviewSpawn,
+        playerSpawn: experienceSpawn,
       });
       let storage = null;
       try {
-        if (globalObject.window === globalObject) storage = globalObject.localStorage ?? null;
+        if (globalObject.window === globalObject) {
+          storage = createBrowserSaveStorage({
+            indexedDB: globalObject.indexedDB,
+            legacyStorage: globalObject.localStorage ?? null,
+          });
+        }
       } catch { storage = null; }
-      saveStore = saveStoreFactory({ storage, worldSeedHash: generator.worldSeedHash });
-      state.saveLoaded = (await saveStore.loadInto(worldState)) !== null;
+      saveStore = saveStoreFactory({
+        storage,
+        worldSeedHash: generator.worldSeedHash,
+        measure: (stage, operation) => diagnostics.measureAsync(stage, operation),
+      });
+      try {
+        availableSaveSnapshot = await saveStore.loadSnapshot();
+        state.saveAvailable = availableSaveSnapshot !== null;
+      } catch (error) {
+        state.saveAvailable = false;
+        state.saveError = { name: error?.name ?? 'Error', message: error?.message ?? String(error) };
+      }
     });
     const renderProfile = createRuntimeRenderProfile();
     const selectedRenderChunkSize = renderProfile.selectedRenderChunkSize;
@@ -327,28 +489,47 @@ export async function bootInfiniteWorldSandbox({
       const viewportWidth = measurementViewport?.width ?? globalObject.innerWidth;
       const viewportHeight = measurementViewport?.height ?? globalObject.innerHeight;
       const nextScene = new THREE.Scene();
-      nextScene.background = new THREE.Color(0x9bb6c5);
-      nextScene.fog = new THREE.Fog(0x9bb6c5, 9000, 26000);
-      const nextCamera = new THREE.PerspectiveCamera(
-        52,
-        viewportWidth / viewportHeight,
-        8,
-        42000,
+      nextScene.background = new THREE.Color(0x5dade2);
+      nextScene.fog = new THREE.Fog(
+        0x5dade2,
+        W8_GAMEPLAY_FOG_NEAR,
+        W8_GAMEPLAY_FOG_FAR_BY_QUALITY.high,
       );
-      const nextRenderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-      nextRenderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, 2));
+      const nextCamera = new THREE.PerspectiveCamera(
+        70,
+        viewportWidth / viewportHeight,
+        finiteVisualToRender(10),
+        W8_GAMEPLAY_CAMERA_FAR,
+      );
+      const nextRenderer = new THREE.WebGLRenderer({
+        antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true,
+      });
+      nextRenderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, 1.5));
       nextRenderer.setSize(viewportWidth, viewportHeight);
       nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
+      nextRenderer.shadowMap ??= {};
+      nextRenderer.shadowMap.enabled = true;
+      nextRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
       appendElement(viewport, nextRenderer.domElement);
 
-      nextScene.add(new THREE.HemisphereLight(0xd8edff, 0x34412e, 2.15));
-      const sun = new THREE.DirectionalLight(0xfff0cf, 2.2);
-      sun.position.set(-5000, 9000, 3000);
+      nextScene.add(new THREE.HemisphereLight(0xffcfa0, 0x4a5c2e, 1.3));
+      const sun = new THREE.DirectionalLight(0xffeb3b, 1.2);
+      sun.position.set(1500, 2500, 1000);
+      sun.castShadow = true;
+      sun.shadow ??= { camera: {}, mapSize: {} };
+      sun.shadow.camera ??= {};
+      Object.assign(sun.shadow.camera, { left: -5000, right: 5000, top: 5000, bottom: -5000 });
+      sun.shadow.mapSize ??= {};
+      Object.assign(sun.shadow.mapSize, { width: 1024, height: 1024 });
       nextScene.add(sun);
 
-      visualAssets = createProductionVisualAssetLibrary({ THREE });
+      visualAssets = createW8ParityVisualAssetLibrary({ THREE });
       const playerMarker = visualAssets.createPlayerModel();
+      for (const child of playerMarker.children ?? []) child.castShadow = true;
       nextScene.add(playerMarker);
+      scenePresentation = createW8ScenePresentation({
+        THREE, scene: nextScene, visualAssets, width: viewportWidth, height: viewportHeight,
+      });
       return { nextScene, nextCamera, nextRenderer, playerMarker };
     });
     scene = rendererContext.nextScene;
@@ -372,19 +553,33 @@ export async function bootInfiniteWorldSandbox({
       const measuredGenerator = {
         async generateChunk(chunkX, chunkZ) {
           const startedAt = clock();
-          try { return await generator.generateChunk(chunkX, chunkZ); }
+          try {
+            return await diagnostics.measureAsync(
+              'chunk-generation',
+              () => generator.generateChunk(chunkX, chunkZ),
+            );
+          }
           finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
         },
       };
       const measuredRenderAdapter = {
-        rebase: origin => renderAdapter.rebase(origin),
+        rebase: origin => diagnostics.measure('chunk-rebase', () => renderAdapter.rebase(origin)),
         async projectChunk(chunkData, origin) {
           const startedAt = clock();
-          try { return await renderAdapter.projectChunk(chunkData, origin); }
+          try {
+            return await diagnostics.measureAsync(
+              'chunk-projection',
+              () => renderAdapter.projectChunk(chunkData, origin),
+            );
+          }
           finally { renderProjectionMs += Math.max(0, clock() - startedAt); }
         },
-        loadProjected: projected => renderAdapter.loadProjected(projected),
-        unloadChunk: key => renderAdapter.unloadChunk(key),
+        loadProjected: projected => diagnostics.measure(
+          'chunk-load', () => renderAdapter.loadProjected(projected),
+        ),
+        unloadChunk: key => diagnostics.measure(
+          'chunk-unload', () => renderAdapter.unloadChunk(key),
+        ),
         shutdown: () => renderAdapter.shutdown(),
       };
       runtime = runtimeFactory({
@@ -403,6 +598,25 @@ export async function bootInfiniteWorldSandbox({
     const { logicalPlayer, initialOwner } = runtimeContext;
 
     await runStage('Terrain', () => runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ));
+    distantPresentation = await createW8DistantPresentation({
+      THREE,
+      scene,
+      worldSeedHash: generator.worldSeedHash,
+      visualAssets,
+      isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
+      measure: (stage, operation) => diagnostics.measure(stage, operation),
+    });
+    if (diagnosticProfile.distant) {
+      const runtimeSnapshot = runtime.snapshot();
+      await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+          centerChunkX: runtimeSnapshot.centerChunkX,
+          centerChunkZ: runtimeSnapshot.centerChunkZ,
+        }));
+    }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
 
@@ -434,6 +648,7 @@ export async function bootInfiniteWorldSandbox({
         renderChunkSize: selectedRenderChunkSize,
         visualAssets,
       });
+      gameplayRenderAdapter.consumePresentationEvents?.([], { playerMarker });
       gameplay = gameplayRuntimeFactory({
         worldSeedHash: generator.worldSeedHash,
         generatorMajor: generator.generatorVersion.major,
@@ -444,26 +659,41 @@ export async function bootInfiniteWorldSandbox({
         clock,
       });
       const runtimeSnapshot = runtime.snapshot();
-      await gameplay.syncActiveChunks({
-        renderedKeys: runtimeSnapshot.renderedKeys,
-        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-        renderOrigin: runtimeSnapshot.renderOrigin,
-      });
+      if (diagnosticProfile.gameplaySync) {
+        await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+        }));
+      }
       const gameplaySnapshot = gameplay.snapshot();
       state.initialSimulationChunkCount = gameplaySnapshot.activeSimulationChunkCount;
       state.initialGameplayEntityCount = gameplaySnapshot.simulatedEntityCount;
     });
 
     let transitionTargetKey = null;
+    const directionalPrefetchPending = new Set();
     let transitionError = null;
     let playerRelocationInProgress = false;
-    let saveStatus = state.saveLoaded ? 'loaded' : 'new';
+    let saveStatus = state.saveAvailable ? 'available' : state.saveError ? 'invalid' : 'new';
     let lastFrameAt = clock();
     let lastHudAt = 0;
+    let playerWalkPhase = 0;
+    let lastVisualPlayerX = logicalPlayer.x;
+    let lastVisualPlayerZ = logicalPlayer.z;
+    let diagnosticFrameStarted = false;
+    let saveTimer = null;
+    let saveIdleCallback = null;
+    let lastSavedRevision = -1;
+    let runStarted = false;
+    let lastRunStartDiagnostics = null;
+    let lastCameraCollision = Object.freeze({
+      collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0,
+    });
     const measurement = {
       mode: measurementMode,
       warmupMs: 10_000,
-      sampleMs: 30_000,
+      sampleMs: 60_000,
       protocolStartedAt: null,
       samplingStartedAt: null,
       completedAt: null,
@@ -475,32 +705,109 @@ export async function bootInfiniteWorldSandbox({
       const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
       const chunkData = runtime.getChunkData(owner.chunkX, owner.chunkZ);
       if (!chunkData) throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
-      return sampleFormalTerrainHeightMeters(chunkData, logicalWorldX, logicalWorldZ);
+      return sampleW8SurfaceHeightMeters(chunkData, logicalWorldX, logicalWorldZ);
+    }
+
+    function assertRuntimePreparedForPlayer(owner) {
+      const runtimeSnapshot = runtime.snapshot();
+      const activeDataKeys = new Set(runtimeSnapshot.activeDataKeys);
+      const renderedKeys = new Set(runtimeSnapshot.renderedKeys);
+      const missingDataKeys = squareChunkCoordinates(owner.chunkX, owner.chunkZ, 2)
+        .map(coordinate => coordinate.key).filter(key => !activeDataKeys.has(key));
+      const missingRenderKeys = squareChunkCoordinates(owner.chunkX, owner.chunkZ, 1)
+        .map(coordinate => coordinate.key).filter(key => !renderedKeys.has(key));
+      if (runtimeSnapshot.centerChunkX !== owner.chunkX
+        || runtimeSnapshot.centerChunkZ !== owner.chunkZ
+        || missingDataKeys.length || missingRenderKeys.length) {
+        throw new Error(`intro runtime preparation incomplete for ${owner.key}`);
+      }
+      return Object.freeze({
+        prepared: true,
+        ownerKey: owner.key,
+        activeDataCount: runtimeSnapshot.activeDataCount,
+        renderedCount: runtimeSnapshot.renderedCount,
+        missingDataKeys: Object.freeze(missingDataKeys),
+        missingRenderKeys: Object.freeze(missingRenderKeys),
+        renderOrigin: Object.freeze({ ...runtimeSnapshot.renderOrigin }),
+      });
     }
 
     async function synchronizeRuntimeToLogicalPlayer({ refreshGameplay = false } = {}) {
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-      await runtime.transitionToChunk(owner.chunkX, owner.chunkZ);
+      await diagnostics.measureAsync(
+        'chunk-transition',
+        () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
+      );
       const runtimeSnapshot = runtime.snapshot();
-      await gameplay.syncActiveChunks({
-        renderedKeys: runtimeSnapshot.renderedKeys,
-        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-        renderOrigin: runtimeSnapshot.renderOrigin,
-      });
-      if (refreshGameplay) {
-        await gameplay.refreshFromState({ renderOrigin: runtimeSnapshot.renderOrigin });
+      if (diagnosticProfile.distant) {
+        await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+          centerChunkX: runtimeSnapshot.centerChunkX,
+          centerChunkZ: runtimeSnapshot.centerChunkZ,
+        }));
       }
-      return owner;
+      if (diagnosticProfile.gameplaySync) {
+        await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+        }));
+      }
+      if (refreshGameplay) {
+        await diagnostics.measureAsync(
+          'gameplay-refresh',
+          () => gameplay.refreshFromState({ renderOrigin: runtimeSnapshot.renderOrigin }),
+        );
+      }
+      return Object.freeze({ owner, preparation: assertRuntimePreparedForPlayer(owner) });
     }
 
-    async function saveWorld() {
+    async function saveWorld({ force = false } = {}) {
+      if (!diagnosticProfile.save) {
+        saveStatus = 'diagnostic-disabled';
+        return;
+      }
+      if (!runStarted && !force) return;
+      if (!force && lastSavedRevision === worldState.revision) return;
       try {
-        await saveStore.save(worldState);
+        await diagnostics.measureAsync('save-total', () => saveStore.save(worldState));
+        lastSavedRevision = worldState.revision;
+        state.saveAvailable = true;
+        experienceShell?.setContinueAvailable?.(true);
         saveStatus = 'saved';
       } catch (error) {
         transitionError = error;
         saveStatus = 'failed';
       }
+    }
+    function scheduleSave({ immediate = false } = {}) {
+      if (!runStarted || !diagnosticProfile.save) return false;
+      if (saveTimer !== null) {
+        if (!immediate) return true;
+        clearTimeoutFn(saveTimer);
+        saveTimer = null;
+      }
+      if (saveIdleCallback !== null) {
+        globalObject.cancelIdleCallback?.(saveIdleCallback);
+        saveIdleCallback = null;
+      }
+      if (immediate) {
+        void saveWorld({ force: true });
+        return true;
+      }
+      saveTimer = setTimeoutFn(() => {
+        saveTimer = null;
+        if (typeof globalObject.requestIdleCallback === 'function') {
+          saveIdleCallback = globalObject.requestIdleCallback(() => {
+            saveIdleCallback = null;
+            void saveWorld();
+          }, { timeout: 2_000 });
+        } else void saveWorld();
+      }, 5_000);
+      return true;
     }
     async function loadWorld() {
       playerRelocationInProgress = true;
@@ -508,17 +815,21 @@ export async function bootInfiniteWorldSandbox({
         const loaded = await saveStore.loadInto(worldState);
         if (!loaded) {
           saveStatus = 'missing';
-          return;
+          return false;
         }
+        gameplay.clearTransientCombat?.();
         await synchronizeRuntimeToLogicalPlayer({ refreshGameplay: true });
         experienceShell?.resetPlayerVerticalMovement({
           player: logicalPlayer,
           scaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
         });
         saveStatus = 'loaded';
+        state.saveLoaded = true;
+        return true;
       } catch (error) {
         transitionError = error;
         saveStatus = 'failed';
+        return false;
       } finally {
         playerRelocationInProgress = false;
       }
@@ -526,10 +837,21 @@ export async function bootInfiniteWorldSandbox({
     const addWindowListener = (type, listener) => globalObject.addEventListener?.(type, listener);
     const removeWindowListener = (type, listener) => globalObject.removeEventListener?.(type, listener);
 
+    audioDirector = createW8AudioDirector({
+      globalObject, volume: worldState.experience.settings.volume,
+    });
     const applyRuntimeSettings = settings => {
-      const qualityRatio = { low: 0.75, medium: 1, high: 2 }[settings.quality] ?? 1;
+      const qualityRatio = { low: 1, medium: 1.2, high: 1.5 }[settings.quality] ?? 1.5;
       renderer.setPixelRatio(Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
+      renderer.shadowMap.enabled = diagnosticProfile.shadows && settings.quality !== 'low';
+      scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
+      scene.fog.far = W8_GAMEPLAY_FOG_FAR_BY_QUALITY[settings.quality]
+        ?? W8_GAMEPLAY_FOG_FAR_BY_QUALITY.high;
+      audioDirector.setVolume(settings.volume);
     };
+    scenePresentation.cloudRoot.visible = diagnosticProfile.transparency;
+    renderAdapter.setDiagnosticTransparencyEnabled?.(diagnosticProfile.transparency);
+    gameplayRenderAdapter.setDiagnosticTransparencyEnabled?.(diagnosticProfile.transparency);
     experienceShell = createInfiniteExperienceShell({
       globalObject,
       documentObject: globalObject.document,
@@ -540,14 +862,82 @@ export async function bootInfiniteWorldSandbox({
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
       onAttack: mode => gameplay.attack(mode),
-      onSave: () => { void saveWorld(); },
+      onCombatCommand: command => gameplay.executeCombatCommand(command),
+      onSave: () => { void saveWorld({ force: true }); },
       onLoad: () => { void loadWorld(); },
+      continueAvailable: state.saveAvailable,
+      onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
+        playerRelocationInProgress = true;
+        const phaseBefore = experienceShell?.getRunPhase?.() ?? 'menu';
+        const gameplayTimeBeforeMs = worldState.gameplayTimeMs;
+        const playerBefore = Object.freeze({ ...logicalPlayer });
+        const cameraBefore = Object.freeze({
+          x: camera.position.x, y: camera.position.y, z: camera.position.z,
+        });
+        try {
+          let synchronized;
+          if (startMode === 'continue') {
+            const loaded = await loadWorld();
+            if (!loaded) return false;
+            const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+            synchronized = Object.freeze({
+              owner,
+              preparation: assertRuntimePreparedForPlayer(owner),
+            });
+          } else {
+            if (state.saveAvailable && !skipConfirmation
+              && typeof globalObject.confirm === 'function'
+              && !globalObject.confirm('既存のセーブを上書きしてNew Gameを開始しますか？')) return false;
+            await gameplay.restart({
+              playerSpawn: experienceSpawn,
+              renderOrigin: runtime.snapshot().renderOrigin,
+            });
+            worldState.updatePlayer({ facingY: experienceSpawn.facingY });
+            synchronized = await synchronizeRuntimeToLogicalPlayer();
+            state.saveLoaded = false;
+            runStarted = true;
+            await saveWorld({ force: true });
+          }
+          runStarted = true;
+          lastSavedRevision = worldState.revision;
+          const cameraYaw = startMode === 'new'
+            ? experienceSpawn.cameraYaw
+            : normalizeAngle(logicalPlayer.facingY - Math.PI);
+          lastRunStartDiagnostics = Object.freeze({
+            schemaVersion: 'w8-run-start-diagnostics-1',
+            startMode,
+            phaseBefore,
+            phaseEnteredAfterPreparation: 'intro',
+            gameplayTimeBeforeMs,
+            persistentGameplayTimeMs: worldState.gameplayTimeMs,
+            playerBefore,
+            playerLogical: Object.freeze({
+              x: logicalPlayer.x, z: logicalPlayer.z, facingY: logicalPlayer.facingY,
+            }),
+            cameraBefore,
+            cameraYaw,
+            pondStableId: experienceSpawn.pondStableId,
+            spawnPoint: Object.freeze({
+              x: experienceSpawn.x, y: experienceSpawn.y, z: experienceSpawn.z,
+            }),
+            spawnSafety: experienceSpawn.spawnSafety,
+            runtimePreparation: synchronized.preparation,
+            oldPlayerStateCleared: startMode !== 'new' || (
+              logicalPlayer.hp === 100 && logicalPlayer.score === 0
+            ),
+            oldCameraStateCleared: Number.isFinite(cameraYaw),
+          });
+          return Object.freeze({ cameraYaw });
+        } finally {
+          playerRelocationInProgress = false;
+        }
+      },
       onHome: async () => {
         playerRelocationInProgress = true;
         try {
-          logicalPlayer.x = generator.reviewSpawn.x;
-          logicalPlayer.z = generator.reviewSpawn.z;
-          logicalPlayer.facingY = 0;
+          logicalPlayer.x = experienceSpawn.x;
+          logicalPlayer.z = experienceSpawn.z;
+          logicalPlayer.facingY = experienceSpawn.facingY;
           await synchronizeRuntimeToLogicalPlayer();
         } catch (error) {
           transitionError = error;
@@ -559,11 +949,14 @@ export async function bootInfiniteWorldSandbox({
         playerRelocationInProgress = true;
         try {
           await gameplay.restart({
-            playerSpawn: generator.reviewSpawn,
+            playerSpawn: experienceSpawn,
             renderOrigin: runtime.snapshot().renderOrigin,
           });
+          worldState.updatePlayer({ facingY: experienceSpawn.facingY });
           await synchronizeRuntimeToLogicalPlayer();
-          await saveWorld();
+          runStarted = true;
+          await saveWorld({ force: true });
+          return Object.freeze({ cameraYaw: experienceSpawn.cameraYaw });
         } finally {
           playerRelocationInProgress = false;
         }
@@ -573,7 +966,7 @@ export async function bootInfiniteWorldSandbox({
           const result = await gameplay.nuclearAttack({ airborne });
           if (result.accepted) {
             experienceShell.triggerNuclearEffect();
-            await saveWorld();
+            scheduleSave({ immediate: true });
           }
           return result;
         } catch (error) {
@@ -584,53 +977,99 @@ export async function bootInfiniteWorldSandbox({
       onSpawnManualBoss: async () => {
         try {
           const result = await gameplay.spawnManualBoss();
-          if (result.accepted) await saveWorld();
+          if (result.accepted) scheduleSave({ immediate: true });
           return result;
         } catch (error) {
           transitionError = error;
           return Object.freeze({ accepted: false, reason: 'runtime-error', error });
         }
       },
-      onSettingsChanged: applyRuntimeSettings,
+      onSettingsChanged: settings => {
+        applyRuntimeSettings(settings);
+        scheduleSave();
+      },
     });
     applyRuntimeSettings(worldState.experience.settings);
-    if (measurement.mode) experienceShell.start();
+    if (measurement.mode) await experienceShell.start('new', { skipConfirmation: true });
 
     function resize() {
       const width = measurementViewport?.width ?? globalObject.innerWidth;
       const height = measurementViewport?.height ?? globalObject.innerHeight;
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
+      scenePresentation.titleCamera.aspect = width / height;
+      scenePresentation.titleCamera.updateProjectionMatrix();
       renderer.setSize(width, height);
     }
+    const handlePageHide = () => scheduleSave({ immediate: true });
     function setMeasurementViewport(width, height) {
       if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
         throw new RangeError('measurement viewport dimensions must be positive finite numbers');
       }
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
+      scenePresentation.titleCamera.aspect = width / height;
+      scenePresentation.titleCamera.updateProjectionMatrix();
       renderer.setSize(width, height, false);
       return Object.freeze({ width, height });
     }
     addWindowListener('resize', resize);
+    addWindowListener('pagehide', handlePageHide);
 
     function requestTransition(owner) {
       const runtimeSnapshot = runtime.snapshot();
       if (transitionTargetKey
         || (runtimeSnapshot.centerChunkX === owner.chunkX && runtimeSnapshot.centerChunkZ === owner.chunkZ)) return;
       transitionTargetKey = owner.key;
-      runtime.transitionToChunk(owner.chunkX, owner.chunkZ)
-        .then(() => {
+      diagnostics.measureAsync(
+        'chunk-transition',
+        () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
+      )
+        .then(async () => {
           const nextSnapshot = runtime.snapshot();
-          return gameplay.syncActiveChunks({
-            renderedKeys: nextSnapshot.renderedKeys,
-            getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-            renderOrigin: nextSnapshot.renderOrigin,
-          });
+          if (diagnosticProfile.distant) {
+            await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
+              activeDataKeys: nextSnapshot.activeDataKeys,
+              renderedKeys: nextSnapshot.renderedKeys,
+              getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+              renderOrigin: nextSnapshot.renderOrigin,
+              centerChunkX: nextSnapshot.centerChunkX,
+              centerChunkZ: nextSnapshot.centerChunkZ,
+            }));
+          }
+          if (!diagnosticProfile.gameplaySync) return null;
+          return diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+              renderedKeys: nextSnapshot.renderedKeys,
+              getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+              renderOrigin: nextSnapshot.renderOrigin,
+            }));
         })
-        .then(() => saveWorld())
         .catch(error => { transitionError = error; })
         .finally(() => { transitionTargetKey = null; });
+    }
+
+    function requestDirectionalPrefetch(owner) {
+      const runtimeSnapshot = runtime.snapshot();
+      if (runtimeSnapshot.centerChunkX === null || transitionTargetKey) return;
+      const directionX = Math.sin(logicalPlayer.facingY);
+      const directionZ = Math.cos(logicalPlayer.facingY);
+      let targetChunkX = runtimeSnapshot.centerChunkX;
+      let targetChunkZ = runtimeSnapshot.centerChunkZ;
+      if (directionX > 0.35 && owner.logicalLocalX >= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkX += 1;
+      else if (directionX < -0.35 && owner.logicalLocalX <= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkX -= 1;
+      if (directionZ > 0.35 && owner.logicalLocalZ >= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkZ += 1;
+      else if (directionZ < -0.35 && owner.logicalLocalZ <= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkZ -= 1;
+      if (targetChunkX === runtimeSnapshot.centerChunkX && targetChunkZ === runtimeSnapshot.centerChunkZ) return;
+      const missing = squareChunkCoordinates(targetChunkX, targetChunkZ, 2)
+        .find(coordinate => runtime.getChunkData(coordinate.chunkX, coordinate.chunkZ) === null
+          && !directionalPrefetchPending.has(coordinate.key));
+      if (!missing) return;
+      directionalPrefetchPending.add(missing.key);
+      void diagnostics.measureAsync(
+        'chunk-prefetch',
+        () => runtime.prefetchChunk(missing.chunkX, missing.chunkZ),
+      ).catch(error => { transitionError = error; })
+        .finally(() => directionalPrefetchPending.delete(missing.key));
     }
 
     function updatePlayer(deltaSeconds) {
@@ -642,6 +1081,7 @@ export async function bootInfiniteWorldSandbox({
         experienceShell.updatePlayer({ deltaSeconds, player: logicalPlayer, scaleProfile });
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      requestDirectionalPrefetch(owner);
       requestTransition(owner);
       const origin = runtime.snapshot().renderOrigin;
       const renderLocal = logicalWorldToRenderLocal(
@@ -660,24 +1100,65 @@ export async function bootInfiniteWorldSandbox({
         productionScale,
         productionScale,
       );
+      const movedMeters = Math.hypot(logicalPlayer.x - lastVisualPlayerX, logicalPlayer.z - lastVisualPlayerZ);
+      playerWalkPhase += movedMeters * 2.4;
+      const shellSnapshot = experienceShell.snapshot();
+      gameplayRenderAdapter.setPlayerLocomotion?.({
+        movedMeters,
+        walkPhase: playerWalkPhase,
+        grounded: shellSnapshot.playerVertical.grounded,
+      });
+      lastVisualPlayerX = logicalPlayer.x;
+      lastVisualPlayerZ = logicalPlayer.z;
       experienceShell.updateCamera({ renderLocal, scaleProfile, unitsPerMeter: UNITS_PER_METER });
+      const cameraTarget = {
+        x: renderLocal.x,
+        y: ((shellSnapshot.playerVertical.rootY ?? 0)
+          + scaleProfile.cameraTargetHeightMeters) * UNITS_PER_METER,
+        z: renderLocal.z,
+      };
+      lastCameraCollision = renderAdapter.resolveCameraCollision?.({
+        camera,
+        target: cameraTarget,
+        clearanceMeters: 0.6,
+      }) ?? lastCameraCollision;
+      renderAdapter.updateCameraOcclusion?.({
+        camera,
+        target: cameraTarget,
+      });
       return owner;
     }
 
     function updateHud(owner) {
       const runtimeSnapshot = runtime.snapshot();
+      const experienceSnapshot = experienceShell.snapshot();
+      const renderOrigin = runtimeSnapshot.renderOrigin;
+      const cameraLogicalX = renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
+        + camera.position.x / UNITS_PER_METER;
+      const cameraLogicalZ = renderOrigin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS
+        + camera.position.z / UNITS_PER_METER;
       const currentChunk = runtime.getChunkData(owner.chunkX, owner.chunkZ);
       const metrics = runtimeSnapshot.performance;
       const transition = runtimeSnapshot.latestTransition;
       const gameplaySnapshot = gameplay.snapshot();
       const renderInfo = renderer.info;
+      const measurementReport = diagnostics.snapshot({
+        drawCalls: renderInfo?.render?.calls ?? null,
+        geometries: renderInfo?.memory?.geometries ?? null,
+        materials: renderAdapter.resourceSnapshot().sharedMaterialCount,
+        sceneObjects: countSceneObjects(scene),
+      });
+      const stageP95 = stage => number(measurementReport.stages[stage]?.p95);
       const measurementText = measurement.mode
-        ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 30s`
+        ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 60s`
+        : '';
+      const diagnosticText = diagnostics.enabled
+        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}`
         : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
-      hud.innerHTML = `<span id="badge">W7 / FULL EXPERIENCE</span>
+      hud.innerHTML = `<span id="badge">W8 / FINITE EXPERIENCE PARITY</span>
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
@@ -687,9 +1168,13 @@ Settlement: ${escapeHtml(settlementReference?.settlementType ?? 'NATURAL')} / ${
 Current Chunk Settlement features: ${currentChunk?.settlementFeatures?.length ?? 0}  Buildings: ${settlementReference?.buildingCount ?? 0}/${settlementReference?.requestedBuildingCount ?? 0}
 Distribution: Seed + 768m Macro Region + minimum distance + urbanization + terrain suitability (fixed total: none)
 Scale: ${escapeHtml(worldState.activeScaleStageId)}  Player HP: ${number(worldState.player.hp)}/${number(worldState.player.maxHp)}  Score: ${number(worldState.player.score)}
+Run Phase: ${escapeHtml(experienceSnapshot.runPhase)}  Phase clock: ${number(experienceSnapshot.gameplayTimeMs)}ms  Gameplay clock: ${number(worldState.gameplayTimeMs)}ms
+Safe Spawn: (${number(experienceSpawn.x)}m, ${number(experienceSpawn.z)}m)  Pond: ${escapeHtml(experienceSpawn.pondStableId ?? 'none')}  Prepared: ${experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0}/25
+Player Render: (${number(playerMarker.position.x)}, ${number(playerMarker.position.y)}, ${number(playerMarker.position.z)})  Camera Logical: (${number(cameraLogicalX)}m, ${number(camera.position.y / UNITS_PER_METER)}m, ${number(cameraLogicalZ)}m)
+Camera Collision: ${lastCameraCollision?.collided ? escapeHtml(lastCameraCollision.stableId ?? 'obstacle') : 'clear'}
 Gameplay Simulation: ${gameplaySnapshot.activeSimulationChunkCount}/9 nearby Chunk only  Entities: ${gameplaySnapshot.simulatedEntityCount}  Targets: ${gameplaySnapshot.simulatedStaticTargetCount}
 Destroyed Stable IDs: ${gameplaySnapshot.state.destroyedFeatureCount + gameplaySnapshot.state.destroyedEntityCount}  Save: ${escapeHtml(saveStatus)} (P save / L load)
-Controls: WASD move / Shift sprint / 1 Tiny / 2 Mid / 3 Max / Space single / F double
+Controls: WASD / Shift / Space / Left + Right Mouse / Wheel / H / Escape (developer keys isolated)
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
@@ -701,17 +1186,19 @@ Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.lo
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
-Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderAdapter.resourceSnapshot().sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderAdapter.resourceSnapshot().sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
       experienceShell.renderHud({
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
         runtimeSnapshot,
+        presentationSnapshot: distantPresentation.snapshot(),
         saveStatus,
         renderInfo: {
           drawCalls: renderInfo?.render?.calls ?? null,
           geometries: renderInfo?.memory?.geometries ?? null,
         },
         resources: renderAdapter.resourceSnapshot(),
+        measurementReport,
       });
     }
 
@@ -723,11 +1210,31 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       renderSandboxBootStatus(hud, state);
     }
 
+    function updateScenePresentation(deltaSeconds, frameNow) {
+      scenePresentation.cloudRoot.rotation.y = (
+        scenePresentation.cloudRoot.rotation.y + deltaSeconds * 0.0025
+      ) % (Math.PI * 2);
+      scenePresentation.titleBoss.rotation.y = -0.4 + Math.sin(frameNow * 0.00035) * 0.14;
+      scenePresentation.explosionRoot.rotation.y += deltaSeconds * 0.18;
+      gameplayRenderAdapter.updatePresentation?.(deltaSeconds);
+    }
+
+    function renderActiveScene() {
+      diagnostics.measure('render', () => {
+        if (!measurement.mode && experienceShell.getMode?.() === 'menu') {
+          renderer.render(scenePresentation.titleScene, scenePresentation.titleCamera);
+        } else renderer.render(scene, camera);
+      });
+    }
+
     function frame(now) {
       if (!running) return;
       try {
         const frameNow = Number.isFinite(now) ? now : clock();
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
+        if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
+        diagnostics.startFrame(frameNow);
+        diagnosticFrameStarted = diagnostics.enabled;
         const deltaSeconds = Math.min(rawFrameMs / 1000, 0.05);
         lastFrameAt = frameNow;
         if (measurement.protocolStartedAt === null) measurement.protocolStartedAt = frameNow;
@@ -735,6 +1242,9 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         if (measurement.mode && measurement.status === 'warmup'
           && measurementElapsed >= measurement.warmupMs) {
           runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
+          diagnostics.reset();
+          diagnostics.startFrame(frameNow);
+          diagnosticFrameStarted = diagnostics.enabled;
           measurement.samplingStartedAt = frameNow;
           measurement.status = 'sampling';
         }
@@ -744,26 +1254,37 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           measurement.completedAt = frameNow;
           measurement.status = 'complete';
         }
-        const effectiveDeltaSeconds = (experienceShell.isPaused() && !measurement.mode)
+        const runPhase = experienceShell.getRunPhase?.();
+        const experiencePhaseRunning = measurement.mode
+          || ['intro', 'playing', 'dying'].includes(runPhase);
+        const effectiveDeltaSeconds = (!experiencePhaseRunning
+          || (experienceShell.isPaused() && !measurement.mode))
           || gameplay.isHitStopped(frameNow) ? 0 : deltaSeconds;
+        diagnostics.measure('scene-presentation', () => updateScenePresentation(deltaSeconds, frameNow));
         if (playerRelocationInProgress) {
-          renderer.render(scene, camera);
+          renderActiveScene();
           animationFrameId = requestAnimationFrameFn(frame);
           return;
         }
-        const owner = updatePlayer(effectiveDeltaSeconds);
-        gameplay.update({
-          deltaSeconds: effectiveDeltaSeconds,
-          player: logicalPlayer,
-          renderOrigin: runtime.snapshot().renderOrigin,
-        });
-        const presentation = gameplay.consumePresentationEffects();
+        const owner = diagnostics.measure('player-update', () => updatePlayer(effectiveDeltaSeconds));
+        diagnostics.measure('gameplay-update', () => gameplay.update({
+            deltaSeconds: effectiveDeltaSeconds,
+            player: logicalPlayer,
+            renderOrigin: runtime.snapshot().renderOrigin,
+            simulationEnabled: measurement.mode || runPhase === 'playing',
+          }));
+        if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
+        const presentation = diagnostics.measure(
+          'presentation-effects', () => gameplay.consumePresentationEffects(),
+        );
         if (presentation.cameraShake > 0) {
           experienceShell.applyCameraShake(presentation.cameraShake);
         }
-        renderer.render(scene, camera);
+        gameplayRenderAdapter.consumePresentationEvents?.(presentation.events, { playerMarker });
+        audioDirector.consume(presentation.events);
+        renderActiveScene();
         if (frameNow - lastHudAt > 120) {
-          updateHud(owner);
+          diagnostics.measure('hud', () => updateHud(owner));
           lastHudAt = frameNow;
         }
         animationFrameId = requestAnimationFrameFn(frame);
@@ -774,7 +1295,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
 
     await runStage('Renderer', () => {
       const owner = updatePlayer(0);
-      renderer.render(scene, camera);
+      renderActiveScene();
       state.initialSceneObjectCount = countSceneObjects(scene);
       state.initializationComplete = true;
       state.status = 'ready';
@@ -791,11 +1312,21 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (!running && runtime?.snapshot().activeDataCount === 0) return;
       running = false;
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
+      if (saveTimer !== null) { clearTimeoutFn(saveTimer); saveTimer = null; }
+      if (saveIdleCallback !== null) {
+        globalObject.cancelIdleCallback?.(saveIdleCallback);
+        saveIdleCallback = null;
+      }
       removeWindowListener('resize', resize);
+      removeWindowListener('pagehide', handlePageHide);
       experienceShell.dispose();
-      await saveWorld();
+      if (runStarted) await saveWorld({ force: true });
+      diagnostics.dispose();
+      await audioDirector.dispose();
       await gameplay.shutdown();
       await runtime.shutdown();
+      distantPresentation.dispose();
+      scenePresentation.dispose();
       visualAssets.dispose();
       renderer.dispose();
       renderer.domElement.remove();
@@ -808,25 +1339,64 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       renderProfile,
       logicalPlayer,
       bootState: state,
-      snapshot: () => ({
-        boot: snapshotSandboxBootState(state),
-        runtime: runtime.snapshot(),
-        resources: renderAdapter.resourceSnapshot(),
-        generator: generator.snapshot(),
-        gameplay: gameplay.snapshot(),
-        experience: experienceShell.snapshot(),
-        save: saveStore.snapshot(),
-        measurement: Object.freeze({ ...measurement }),
-        sceneObjectCount: countSceneObjects(scene),
-        renderInfo: Object.freeze({
-          drawCalls: renderer.info?.render?.calls ?? null,
-          triangles: renderer.info?.render?.triangles ?? null,
-          geometries: renderer.info?.memory?.geometries ?? null,
-          textures: renderer.info?.memory?.textures ?? null,
-          canvasWidth: renderer.domElement?.width ?? null,
-          canvasHeight: renderer.domElement?.height ?? null,
-        }),
-      }),
+      snapshot: () => {
+        const runtimeSnapshot = runtime.snapshot();
+        const renderOrigin = runtimeSnapshot.renderOrigin;
+        const experienceSnapshot = experienceShell.snapshot();
+        return {
+          boot: snapshotSandboxBootState(state),
+          runtime: runtimeSnapshot,
+          resources: renderAdapter.resourceSnapshot(),
+          generator: generator.snapshot(),
+          gameplay: gameplay.snapshot(),
+          experience: experienceSnapshot,
+          runStart: lastRunStartDiagnostics ? Object.freeze({
+            ...lastRunStartDiagnostics,
+            phaseNow: experienceSnapshot.runPhase,
+            phaseElapsedMs: experienceSnapshot.gameplayTimeMs,
+            persistentGameplayTimeMs: worldState.gameplayTimeMs,
+          }) : null,
+          spatial: Object.freeze({
+            playerLogical: Object.freeze({
+              x: logicalPlayer.x, z: logicalPlayer.z, facingY: logicalPlayer.facingY,
+            }),
+            playerRender: Object.freeze({
+              x: playerMarker.position.x, y: playerMarker.position.y, z: playerMarker.position.z,
+            }),
+            cameraLogical: Object.freeze({
+              x: renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
+                + camera.position.x / UNITS_PER_METER,
+              y: camera.position.y / UNITS_PER_METER,
+              z: renderOrigin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS
+                + camera.position.z / UNITS_PER_METER,
+            }),
+            cameraRender: Object.freeze({
+              x: camera.position.x, y: camera.position.y, z: camera.position.z,
+            }),
+            cameraCollision: lastCameraCollision,
+            spawn: experienceSpawn,
+          }),
+          save: saveStore.snapshot(),
+          audio: audioDirector.snapshot(),
+          presentation: distantPresentation.snapshot(),
+          measurement: Object.freeze({ ...measurement }),
+          diagnostics: diagnostics.snapshot({
+            drawCalls: renderer.info?.render?.calls ?? null,
+            geometries: renderer.info?.memory?.geometries ?? null,
+            materials: renderAdapter.resourceSnapshot().sharedMaterialCount,
+            sceneObjects: countSceneObjects(scene),
+          }),
+          sceneObjectCount: countSceneObjects(scene),
+          renderInfo: Object.freeze({
+            drawCalls: renderer.info?.render?.calls ?? null,
+            triangles: renderer.info?.render?.triangles ?? null,
+            geometries: renderer.info?.memory?.geometries ?? null,
+            textures: renderer.info?.memory?.textures ?? null,
+            canvasWidth: renderer.domElement?.width ?? null,
+            canvasHeight: renderer.domElement?.height ?? null,
+          }),
+        };
+      },
       setMeasurementViewport,
       shutdown,
       constants: Object.freeze({ unitsPerMeter: UNITS_PER_METER }),
@@ -838,7 +1408,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       experienceShell?.dispose?.();
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
+      distantPresentation?.dispose?.();
+      scenePresentation?.dispose?.();
       visualAssets?.dispose?.();
+      await audioDirector?.dispose?.();
+      diagnostics?.dispose?.();
       renderer?.dispose?.();
       renderer?.domElement?.remove?.();
     } catch {

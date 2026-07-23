@@ -5,7 +5,13 @@ import {
   chunkRenderPosition,
   createChunkKey,
 } from '../chunk-coordinates.js';
-import { createProductionVisualAssetLibrary } from './production-visual-assets.js';
+import {
+  PRODUCTION_VISUAL_UNITS_PER_METER,
+  createProductionVisualAssetLibrary,
+} from './production-visual-assets.js';
+import { W8_PRESENTATION_TERRAIN_PALETTE } from './w8-distant-presentation.js';
+
+const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -37,6 +43,12 @@ export class ChunkRenderAdapter {
     this.isFeatureDestroyed = isFeatureDestroyed;
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
+    this.occlusionMeshes = [];
+    this.cameraCollisionMeshes = [];
+    this.occludedFeatureIds = new Set();
+    this.fadedMaterials = new Map();
+    this.transparentMeshes = new Set();
+    this.transparencyEnabled = true;
     this.disposed = false;
     this.visualAssets = visualAssets ?? createProductionVisualAssetLibrary({ THREE });
     this.ownsVisualAssets = visualAssets === null;
@@ -62,7 +74,7 @@ export class ChunkRenderAdapter {
     });
     this.materials = Object.freeze({
       terrain: new MeshLambertMaterial({ color: 0x668c54, flatShading: true }),
-      naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: false }),
+      naturalTerrain: new MeshLambertMaterial({ vertexColors: true, flatShading: true }),
     });
     const hiddenTransform = new Object3D();
     hiddenTransform.scale.set(0, 0, 0);
@@ -74,41 +86,140 @@ export class ChunkRenderAdapter {
     return matrix.clone?.() ?? structuredClone(matrix);
   }
 
-  #registerFeatureInstance({ stableId, chunkKey, mesh, index, matrix }) {
+  #registerFeatureInstance({ stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group }) {
     if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
     let existing = this.featureInstances.get(stableId);
     if (existing && existing.chunkKey !== chunkKey) {
       throw new Error(`Stable ID collision in render adapter: ${stableId}`);
     }
-    const part = { mesh, index, originalMatrix: this.#cloneMatrix(matrix) };
+    const part = { mesh, fadeMesh, index, originalMatrix: this.#cloneMatrix(matrix) };
     if (!existing) {
-      existing = { stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix, parts: [] };
+      existing = {
+        stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix,
+        parts: [], group, rubbleMesh: null,
+      };
       this.featureInstances.set(stableId, existing);
     }
     existing.parts.push(part);
     if (!this.chunkFeatureIds.has(chunkKey)) this.chunkFeatureIds.set(chunkKey, new Set());
     this.chunkFeatureIds.get(chunkKey).add(stableId);
-    mesh.setMatrixAt(index, this.isFeatureDestroyed(stableId)
-      ? this.hiddenFeatureMatrix : part.originalMatrix);
+    const destroyed = this.isFeatureDestroyed(stableId);
+    mesh.setMatrixAt(index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
+    fadeMesh?.setMatrixAt(index, this.hiddenFeatureMatrix);
   }
 
   setFeatureDestroyed(stableId, destroyed = true) {
     const entry = this.featureInstances.get(stableId);
     if (!entry) return false;
+    const occluded = this.occludedFeatureIds.has(stableId);
     for (const part of entry.parts) {
-      part.mesh.setMatrixAt(part.index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
+      part.mesh.setMatrixAt(part.index, destroyed || occluded
+        ? this.hiddenFeatureMatrix : part.originalMatrix);
       part.mesh.instanceMatrix.needsUpdate = true;
+      if (part.fadeMesh) {
+        part.fadeMesh.setMatrixAt(part.index, !destroyed && occluded
+          ? part.originalMatrix : this.hiddenFeatureMatrix);
+        part.fadeMesh.instanceMatrix.needsUpdate = true;
+      }
+    }
+    if (destroyed && !entry.rubbleMesh) {
+      const Mesh = requireConstructor(this.THREE, 'Mesh');
+      const rubble = new Mesh(
+        this.visualAssets.geometries.dodeca,
+        this.visualAssets.materials.scorch ?? this.visualAssets.materials.charred,
+      );
+      rubble.name = 'w8-persistent-destruction-rubble';
+      rubble.matrixAutoUpdate = false;
+      if (rubble.matrix?.copy) rubble.matrix.copy(entry.originalMatrix);
+      else rubble.matrix = this.#cloneMatrix(entry.originalMatrix);
+      rubble.castShadow = true; rubble.receiveShadow = true;
+      entry.group?.add?.(rubble);
+      entry.rubbleMesh = rubble;
+    } else if (!destroyed && entry.rubbleMesh) {
+      entry.group?.remove?.(entry.rubbleMesh);
+      entry.rubbleMesh = null;
     }
     return true;
   }
 
+  setFeatureOccluded(stableId, occluded = true) {
+    const entry = this.featureInstances.get(stableId);
+    if (!entry || !entry.parts.some(part => part.fadeMesh)) return false;
+    if (occluded) this.occludedFeatureIds.add(stableId);
+    else this.occludedFeatureIds.delete(stableId);
+    return this.setFeatureDestroyed(stableId, this.isFeatureDestroyed(stableId));
+  }
+
+  resolveCameraCollision({ camera, target, clearanceMeters = 0.6 } = {}) {
+    const Raycaster = this.THREE?.Raycaster;
+    const Vector3 = this.THREE?.Vector3;
+    if (typeof Raycaster !== 'function' || typeof Vector3 !== 'function'
+      || !camera?.position || !target || !this.cameraCollisionMeshes.length) {
+      return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
+    }
+    const origin = new Vector3(target.x, target.y, target.z);
+    const direction = new Vector3(
+      camera.position.x - target.x,
+      camera.position.y - target.y,
+      camera.position.z - target.z,
+    );
+    const desiredDistance = direction.length();
+    if (!Number.isFinite(desiredDistance) || desiredDistance <= 0) {
+      return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
+    }
+    direction.normalize();
+    const raycaster = new Raycaster(origin, direction, 0, desiredDistance);
+    const hit = raycaster.intersectObjects(this.cameraCollisionMeshes, false)
+      .filter(value => Number.isFinite(value?.distance) && value.distance >= 0
+        && value.distance < desiredDistance)
+      .sort((left, right) => left.distance - right.distance)[0];
+    if (!hit) {
+      return Object.freeze({
+        collided: false, stableId: null, desiredDistance, resolvedDistance: desiredDistance,
+      });
+    }
+    const clearanceRender = Math.max(0, clearanceMeters) * this.unitsPerMeter;
+    const resolvedDistance = Math.max(0, hit.distance - clearanceRender);
+    camera.position.set(
+      target.x + direction.x * resolvedDistance,
+      target.y + direction.y * resolvedDistance,
+      target.z + direction.z * resolvedDistance,
+    );
+    return Object.freeze({
+      collided: true,
+      stableId: hit.object?.userData?.featureStableIds?.[hit.instanceId] ?? null,
+      desiredDistance,
+      resolvedDistance,
+    });
+  }
+
+  updateCameraOcclusion({ camera, target } = {}) {
+    if (!this.transparencyEnabled) return 0;
+    const Raycaster = this.THREE?.Raycaster;
+    const Vector3 = this.THREE?.Vector3;
+    if (typeof Raycaster !== 'function' || typeof Vector3 !== 'function'
+      || !camera?.position || !target || !this.occlusionMeshes.length) return 0;
+    const origin = new Vector3(camera.position.x, camera.position.y, camera.position.z);
+    const direction = new Vector3(target.x - origin.x, target.y - origin.y, target.z - origin.z);
+    const distance = direction.length();
+    if (!Number.isFinite(distance) || distance <= 0) return 0;
+    direction.normalize();
+    const raycaster = new Raycaster(origin, direction, 0, distance);
+    const next = new Set();
+    for (const hit of raycaster.intersectObjects(this.occlusionMeshes, false)) {
+      const stableId = hit.object?.userData?.featureStableIds?.[hit.instanceId];
+      if (stableId) next.add(stableId);
+    }
+    for (const stableId of this.occludedFeatureIds) {
+      if (!next.has(stableId)) this.setFeatureOccluded(stableId, false);
+    }
+    for (const stableId of next) this.setFeatureOccluded(stableId, true);
+    return next.size;
+  }
+
   refreshFeatureStates() {
-    for (const [stableId, entry] of this.featureInstances) {
-      for (const part of entry.parts) {
-        part.mesh.setMatrixAt(part.index, this.isFeatureDestroyed(stableId)
-          ? this.hiddenFeatureMatrix : part.originalMatrix);
-        part.mesh.instanceMatrix.needsUpdate = true;
-      }
+    for (const stableId of this.featureInstances.keys()) {
+      this.setFeatureDestroyed(stableId, this.isFeatureDestroyed(stableId));
     }
   }
 
@@ -139,13 +250,7 @@ export class ChunkRenderAdapter {
     const positions = [];
     const colors = [];
     const indices = [];
-    const palette = [
-      [0.34, 0.53, 0.22],
-      [0.45, 0.35, 0.22],
-      [0.24, 0.31, 0.2],
-      [0.58, 0.52, 0.34],
-      [0.43, 0.44, 0.42],
-    ];
+    const palette = W8_PRESENTATION_TERRAIN_PALETTE;
     for (let z = 0; z < depth; z += 1) {
       for (let x = 0; x < width; x += 1) {
         const index = z * width + x;
@@ -190,7 +295,24 @@ export class ChunkRenderAdapter {
     return this.settlementResources;
   }
 
-  #createProductionPartMeshes({ group, chunkKey, name, items }) {
+  #fadeMaterialFor(materialKey) {
+    if (this.fadedMaterials.has(materialKey)) return this.fadedMaterials.get(materialKey);
+    const source = this.visualAssets.materials[materialKey];
+    const faded = typeof source.clone === 'function'
+      ? source.clone()
+      : new source.constructor({ ...(source.options ?? {}) });
+    faded.transparent = true;
+    faded.opacity = 0.25;
+    faded.depthWrite = false;
+    if (faded.options) Object.assign(faded.options, { transparent: true, opacity: 0.25, depthWrite: false });
+    faded.needsUpdate = true;
+    this.fadedMaterials.set(materialKey, faded);
+    return faded;
+  }
+
+  #createProductionPartMeshes({
+    group, chunkKey, name, items, castShadow = true, cameraOccludable = false,
+  }) {
     if (!items.length) return [];
     const InstancedMesh = requireConstructor(this.THREE, 'InstancedMesh');
     const byResource = new Map();
@@ -208,20 +330,49 @@ export class ChunkRenderAdapter {
         Math.max(1, resourceItems.length),
       );
       mesh.name = `${name}-${resourceKey.replace(':', '-')}`;
+      mesh.castShadow = castShadow;
+      mesh.receiveShadow = true;
       mesh.count = resourceItems.length;
+      mesh.userData.featureStableIds = [];
+      let fadeMesh = null;
+      if (cameraOccludable) {
+        fadeMesh = new InstancedMesh(
+          this.visualAssets.geometries[descriptor.geometry],
+          this.#fadeMaterialFor(descriptor.material),
+          Math.max(1, resourceItems.length),
+        );
+        fadeMesh.name = `${mesh.name}-camera-faded`;
+        fadeMesh.castShadow = false;
+        fadeMesh.receiveShadow = false;
+        fadeMesh.count = resourceItems.length;
+        fadeMesh.userData.featureStableIds = [];
+      }
       resourceItems.forEach((item, index) => {
         mesh.setMatrixAt(index, item.matrix);
+        mesh.userData.featureStableIds[index] = item.stableId;
+        if (fadeMesh) fadeMesh.userData.featureStableIds[index] = item.stableId;
         this.#registerFeatureInstance({
           stableId: item.stableId,
           chunkKey,
           mesh,
+          fadeMesh,
           index,
           matrix: item.matrix,
+          group,
         });
       });
       mesh.instanceMatrix.needsUpdate = true;
       group.add(mesh);
       meshes.push(mesh);
+      if (fadeMesh) {
+        fadeMesh.instanceMatrix.needsUpdate = true;
+        group.add(fadeMesh);
+        fadeMesh.visible = this.transparencyEnabled;
+        this.transparentMeshes.add(fadeMesh);
+        meshes.push(fadeMesh);
+        this.occlusionMeshes.push(mesh, fadeMesh);
+        this.cameraCollisionMeshes.push(mesh, fadeMesh);
+      }
     }
     return meshes;
   }
@@ -234,9 +385,15 @@ export class ChunkRenderAdapter {
       requireConstructor(this.THREE, name);
     }
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
-    const vegetation = chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? [];
-    const rocks = chunkData.rockCandidates ?? chunkData.rockProxies ?? [];
-    const settlementFeatures = chunkData.settlementFeatures ?? [];
+    const layers = chunkData.presentationLayers;
+    const vegetation = layers?.natural?.vegetation
+      ?? chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? [];
+    const rocks = layers?.natural?.rocks ?? chunkData.rockCandidates ?? chunkData.rockProxies ?? [];
+    const settlementFeatures = layers?.formal?.roadsAndBuildings ?? chunkData.settlementFeatures ?? [];
+    const waterSurfaces = layers?.water ?? chunkData.waterSurfaces ?? [];
+    const ambientDetails = layers?.ambientDetails ?? chunkData.ambientDetails ?? [];
+    const settlementLandmarks = layers?.landmarks ?? chunkData.settlementLandmarks ?? [];
+    const streetDetails = layers?.streetDetails ?? chunkData.streetDetails ?? [];
     const group = new Group();
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
@@ -250,6 +407,7 @@ export class ChunkRenderAdapter {
       naturalTerrain ? this.materials.naturalTerrain : this.materials.terrain,
     );
     terrain.name = naturalTerrain ? 'w2-natural-terrain' : 'w1a-terrain';
+    terrain.receiveShadow = true;
     if (!naturalTerrain) {
       terrain.rotation.x = -Math.PI / 2;
       terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
@@ -294,13 +452,15 @@ export class ChunkRenderAdapter {
       const variation = formal ? 0.84 + candidate.variationSeed * 0.32 : 1;
       const shrub = formal && candidate.subtype === 'shrub';
       const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.32;
-      const width = radiusMeters * 2.2 * variation * this.unitsPerMeter;
-      const height = (shrub ? 0.85 : 3.5) * variation * this.unitsPerMeter;
+      const width = (shrub ? radiusMeters * 2.2 : 2) * variation * this.unitsPerMeter;
+      const height = (shrub ? 0.85 : 3.625) * variation * this.unitsPerMeter;
       const rotationY = formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians;
       const visualKind = shrub ? 'shrub'
-        : formal && ['broadleaf-tree', 'wetland-tree'].includes(candidate.subtype)
-          ? 'broadleafTree' : 'tree';
-      for (const descriptor of this.visualAssets.featureParts[visualKind]) {
+        : candidate.subtype === 'wetland-tree' ? 'wetlandTree'
+          : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree';
+      const descriptors = this.visualAssets.featureParts[visualKind]
+        ?? this.visualAssets.featureParts.broadleafTree;
+      for (const descriptor of descriptors) {
         vegetationParts.push({
           stableId: candidate.candidateId ?? candidate.stableId,
           part: descriptor,
@@ -315,6 +475,7 @@ export class ChunkRenderAdapter {
       chunkKey: key,
       name: 'production-vegetation',
       items: vegetationParts,
+      castShadow: false,
     });
 
     const rockParts = [];
@@ -359,6 +520,7 @@ export class ChunkRenderAdapter {
       );
       roadMesh.name = chunkData.generatorVersion?.major >= 500
         ? 'infinite-settlement-roads' : 'w4-rural-roads';
+      roadMesh.receiveShadow = true;
       roadMesh.count = roads.length;
       roads.forEach((road, index) => {
         const dx = road.end.x - road.start.x;
@@ -369,7 +531,7 @@ export class ChunkRenderAdapter {
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
         transform.position.set(
           localX * this.unitsPerMeter,
-          road.worldPosition.y * this.unitsPerMeter + 3,
+          (road.worldPosition.y + FINITE_ROAD_SURFACE_HEIGHT_METERS) * this.unitsPerMeter,
           localZ * this.unitsPerMeter,
         );
         transform.rotation.set(-Math.PI / 2, 0, Math.atan2(dz, dx));
@@ -415,8 +577,83 @@ export class ChunkRenderAdapter {
         name: chunkData.generatorVersion?.major >= 500
           ? 'production-infinite-settlement-building' : 'production-rural-building',
         items: buildingParts,
+        cameraOccludable: true,
       });
     }
+
+    if (waterSurfaces.length) {
+      const resources = this.#ensureSettlementResources();
+      const waterMesh = new InstancedMesh(
+        resources.geometries.road,
+        this.visualAssets.materials.water ?? this.visualAssets.materials.window,
+        waterSurfaces.length,
+      );
+      waterMesh.name = 'w8-continuous-wetland-water';
+      waterMesh.visible = this.transparencyEnabled;
+      this.transparentMeshes.add(waterMesh);
+      waterMesh.count = waterSurfaces.length;
+      waterMesh.receiveShadow = true;
+      waterSurfaces.forEach((surface, index) => {
+        transform.position.set(
+          (surface.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+          surface.worldPosition.y * this.unitsPerMeter + 1.5,
+          (surface.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+        );
+        transform.rotation.set(-Math.PI / 2, 0, 0);
+        transform.scale.set(
+          surface.widthMeters * this.unitsPerMeter,
+          surface.depthMeters * this.unitsPerMeter,
+          1,
+        );
+        transform.updateMatrix();
+        waterMesh.setMatrixAt(index, transform.matrix);
+      });
+      waterMesh.instanceMatrix.needsUpdate = true;
+      group.add(waterMesh);
+    }
+
+    const detailParts = [];
+    const addDetail = ({ stableId, worldPosition, rotationY = 0, detailType, variation = 1 }, dimensions) => {
+      const parts = this.visualAssets.featureParts[detailType];
+      if (!parts) return;
+      const localX = worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+      const localZ = worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+      for (const part of parts) {
+        detailParts.push({
+          stableId,
+          part,
+          matrix: createPartMatrix({
+            localX, localZ, groundY: worldPosition.y * this.unitsPerMeter,
+            rotationY,
+            width: dimensions.width * variation * this.unitsPerMeter,
+            height: dimensions.height * variation * this.unitsPerMeter,
+            depth: dimensions.depth * variation * this.unitsPerMeter,
+            part,
+          }),
+        });
+      }
+    };
+    for (const detail of ambientDetails) {
+      addDetail(detail, detail.detailType === 'shrub'
+        ? { width: 0.75, height: 0.7, depth: 0.75 }
+        : { width: 0.45, height: 0.65, depth: 0.45 });
+    }
+    for (const detail of streetDetails) {
+      addDetail(detail, detail.detailType === 'streetLamp'
+        ? { width: 0.45, height: 3.4, depth: 0.45 }
+        : { width: 1.2, height: 2.1, depth: 0.25 });
+    }
+    for (const landmark of settlementLandmarks) {
+      addDetail({ ...landmark, detailType: landmark.landmarkType }, {
+        width: landmark.widthMeters,
+        height: landmark.heightMeters,
+        depth: landmark.depthMeters,
+      });
+    }
+    this.#createProductionPartMeshes({
+      group, chunkKey: key, name: 'w8-parity-world-details', items: detailParts,
+      castShadow: false,
+    });
 
     const projected = {
       key,
@@ -438,6 +675,15 @@ export class ChunkRenderAdapter {
     this.counts.loaded += 1;
   }
 
+  setDiagnosticTransparencyEnabled(enabled = true) {
+    this.transparencyEnabled = enabled === true;
+    for (const mesh of this.transparentMeshes) mesh.visible = this.transparencyEnabled;
+    if (!this.transparencyEnabled) {
+      for (const stableId of [...this.occludedFeatureIds]) this.setFeatureOccluded(stableId, false);
+    }
+    return this.transparencyEnabled;
+  }
+
   async unloadChunk(key) {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
@@ -446,8 +692,15 @@ export class ChunkRenderAdapter {
       geometry.dispose();
       this.counts.chunkOwnedGeometriesDisposed += 1;
     }
+    const occlusionMeshes = new Set(projected.group.children ?? []);
+    this.occlusionMeshes = this.occlusionMeshes.filter(mesh => !occlusionMeshes.has(mesh));
+    this.cameraCollisionMeshes = this.cameraCollisionMeshes
+      .filter(mesh => !occlusionMeshes.has(mesh));
+    for (const mesh of occlusionMeshes) this.transparentMeshes.delete(mesh);
+    for (const child of projected.group.children ?? []) child.dispose?.();
     projected.group.clear();
     for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.featureInstances.delete(stableId);
+    for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.occludedFeatureIds.delete(stableId);
     this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
     this.counts.unloaded += 1;
@@ -473,6 +726,8 @@ export class ChunkRenderAdapter {
       chunkOwnedGeometriesCreated: this.counts.chunkOwnedGeometriesCreated,
       chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
       trackedFeatureInstanceCount: this.featureInstances.size,
+      cameraOccludableMeshCount: this.occlusionMeshes.length,
+      cameraOccludedFeatureCount: this.occludedFeatureIds.size,
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
       )),
@@ -488,9 +743,15 @@ export class ChunkRenderAdapter {
     if (this.settlementResources) {
       for (const geometry of Object.values(this.settlementResources.geometries)) geometry.dispose();
     }
+    for (const material of this.fadedMaterials.values()) material.dispose();
     if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.featureInstances.clear();
     this.chunkFeatureIds.clear();
+    this.occlusionMeshes.length = 0;
+    this.cameraCollisionMeshes.length = 0;
+    this.occludedFeatureIds.clear();
+    this.fadedMaterials.clear();
+    this.transparentMeshes.clear();
     this.disposed = true;
   }
 }

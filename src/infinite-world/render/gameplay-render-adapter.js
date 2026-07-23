@@ -39,7 +39,14 @@ export class GameplayRenderAdapter {
     this.entityMeshes = new Map();
     this.projectileMeshes = new Map();
     this.effectMeshes = new Map();
+    this.presentationPool = [];
+    this.activePresentationEffects = [];
+    this.presentationPoolLimit = 96;
+    this.playerPresentation = null;
+    this.playerAttackPresentation = { left: null, right: null, charging: false };
+    this.playerChargePhase = 0;
     this.manualBossEntry = null;
+    this.reinforcementMeshes = new Map();
     this.disposed = false;
     this.counts = {
       loaded: 0, unloaded: 0, created: 0, removed: 0, rebased: 0,
@@ -77,7 +84,24 @@ export class GameplayRenderAdapter {
       localZ * this.unitsPerMeter,
     );
     mesh.rotation.y = state.rotationY;
-    mesh.visible = state.alive;
+    mesh.visible = state.alive && (state.type !== 'tank' || state.spawned === true);
+    const parts = mesh.userData.presentationParts;
+    if (state.type === 'human' && parts) {
+      mesh.rotation.z = state.aiState === 'fallen' ? Math.PI / 2 : 0;
+      const stride = Math.sin(state.aiClock * (state.aiState === 'flee' ? 13 : 6)) * 0.48;
+      parts.leftArm.rotation.x = stride;
+      parts.rightArm.rotation.x = -stride;
+      parts.leftLeg.rotation.x = -stride;
+      parts.rightLeg.rotation.x = stride;
+    }
+    if (state.type === 'tank' && parts) {
+      const relativeTurret = (state.turretRotationY ?? state.rotationY) - state.rotationY;
+      if (parts.turret) parts.turret.rotation.y = relativeTurret;
+      if (parts.gun) {
+        parts.gun.rotation.y = relativeTurret;
+        parts.gun.rotation.x = state.gunPitch ?? 0;
+      }
+    }
   }
 
   async rebase(origin) {
@@ -90,6 +114,7 @@ export class GameplayRenderAdapter {
     for (const entry of this.projectileMeshes.values()) this.#positionTransient(entry);
     for (const entry of this.effectMeshes.values()) this.#positionTransient(entry);
     if (this.manualBossEntry) this.#positionManualBoss();
+    for (const entry of this.reinforcementMeshes.values()) this.#positionReinforcement(entry);
     this.counts.rebased += 1;
   }
 
@@ -129,8 +154,14 @@ export class GameplayRenderAdapter {
     if (this.disposed) return false;
     const Mesh = requireConstructor(this.THREE, 'Mesh');
     this.#syncTransientSet(this.projectileMeshes, projectiles, state => {
-      const mesh = new Mesh(this.visualAssets.geometries.sphere, this.visualAssets.materials.gold);
-      mesh.name = 'tank-projectile';
+      const mesh = new Mesh(
+        this.visualAssets.geometries.sphere,
+        state.type === 'acid'
+          ? (this.visualAssets.materials.acid ?? this.visualAssets.materials.gold)
+          : this.visualAssets.materials.gold,
+      );
+      mesh.name = state.type === 'acid' ? 'boss-acid-projectile' : 'tank-projectile';
+      mesh.castShadow = true;
       mesh.scale.setScalar(0.5 * this.unitsPerMeter);
       return { mesh, state, height: 0.55 * this.unitsPerMeter };
     });
@@ -148,6 +179,168 @@ export class GameplayRenderAdapter {
     return true;
   }
 
+  #acquirePresentationMesh(event) {
+    let entry = this.presentationPool.find(value => !value.active);
+    if (!entry && this.presentationPool.length < this.presentationPoolLimit) {
+      const Mesh = requireConstructor(this.THREE, 'Mesh');
+      const mesh = new Mesh(
+        this.visualAssets.geometries.dodeca,
+        this.visualAssets.materials.scorch ?? this.visualAssets.materials.charred,
+      );
+      mesh.visible = false;
+      mesh.castShadow = true;
+      this.combatRoot.add(mesh);
+      entry = { mesh, active: false, remainingSeconds: 0, event: null };
+      this.presentationPool.push(entry);
+    }
+    if (!entry) entry = this.activePresentationEffects.shift();
+    entry.active = true;
+    entry.event = event;
+    entry.remainingSeconds = event.lifetimeSeconds;
+    entry.mesh.visible = true;
+    entry.mesh.name = `w8-presentation-${event.type}`;
+    const local = logicalWorldToRenderLocal(
+      event.logicalPosition.x,
+      event.logicalPosition.z,
+      this.origin.renderOriginChunkX,
+      this.origin.renderOriginChunkZ,
+      this.renderChunkSize,
+    );
+    entry.mesh.position.set(local.x, 0.35 * this.unitsPerMeter, local.z);
+    const scale = Math.max(0.15, event.intensity) * this.unitsPerMeter;
+    entry.mesh.scale.set(scale, scale * 0.45, scale);
+    this.activePresentationEffects.push(entry);
+    return entry;
+  }
+
+  consumePresentationEvents(events, { playerMarker = null } = {}) {
+    if (this.disposed) return 0;
+    this.playerPresentation = playerMarker ?? this.playerPresentation;
+    for (const event of events) {
+      this.#acquirePresentationMesh(event);
+      const parts = this.playerPresentation?.userData?.presentationParts;
+      if (parts && event.type.includes('claw')) {
+        const left = event.type.includes('left') || event.type.includes('both');
+        const right = event.type.includes('right') || event.type.includes('both');
+        const both = event.type.includes('both');
+        if (left) this.playerAttackPresentation.left = {
+          elapsed: 0, duration: both ? 0.28 : 0.25, mode: both ? 'double' : 'single',
+        };
+        if (right) this.playerAttackPresentation.right = {
+          elapsed: 0, duration: both ? 0.28 : 0.25, mode: both ? 'double' : 'single',
+        };
+      }
+      if (event.type === 'charge-start') this.playerAttackPresentation.charging = true;
+      if (event.type === 'charge-release') this.playerAttackPresentation.charging = false;
+    }
+    return events.length;
+  }
+
+  setPlayerLocomotion({ movedMeters = 0, walkPhase = 0, grounded = true } = {}) {
+    const parts = this.playerPresentation?.userData?.presentationParts;
+    if (!parts) return false;
+    const moving = movedMeters > 0.0001;
+    parts.legs.forEach((leg, index) => {
+      const offset = index * 0.5;
+      leg.rotation.x = moving ? Math.sin(walkPhase + offset) * 0.8 : 0;
+      leg.position.y = moving && grounded
+        ? Math.max(0, Math.sin(walkPhase * 2 + offset) * 10) : 0;
+    });
+    const locomotionY = moving && grounded
+      ? Math.abs(Math.sin(walkPhase * 5 / 6)) * 20 : 0;
+    parts.visualRoot.userData.locomotionY = locomotionY;
+    parts.visualRoot.position.y = locomotionY;
+    return true;
+  }
+
+  #animateFiniteClaw(side, state) {
+    const parts = this.playerPresentation?.userData?.presentationParts;
+    const claw = side === 'left' ? parts?.leftClaw : parts?.rightClaw;
+    if (!claw || !state) return;
+    const sign = side === 'left' ? 1 : -1;
+    const progress = Math.min(1, state.elapsed / state.duration);
+    let x = sign * 85; let z = 5; let rotationY = 0;
+    if (state.mode === 'double') {
+      if (progress < 0.4) {
+        const t = progress / 0.4;
+        z = 5 + 130 * Math.sin(t * Math.PI / 2);
+        x = sign * (85 - 35 * Math.sin(t * Math.PI / 2));
+        rotationY = -sign * 0.6 * Math.sin(t * Math.PI / 2);
+      } else {
+        const t = (progress - 0.4) / 0.6;
+        z = 135 - 130 * Math.sin(t * Math.PI / 2);
+        x = sign * (50 + 35 * Math.sin(t * Math.PI / 2));
+        rotationY = -sign * (0.6 - 0.6 * Math.sin(t * Math.PI / 2));
+      }
+    } else if (progress < 0.35) {
+      const t = progress / 0.35;
+      x = sign * (85 + 30 * Math.sin(t * Math.PI / 2));
+      z = 5 - 15 * Math.sin(t * Math.PI / 2);
+      rotationY = sign * 0.4 * Math.sin(t * Math.PI / 2);
+    } else {
+      const t = (progress - 0.35) / 0.65;
+      x = sign * (115 - 65 * Math.sin(t * Math.PI / 2));
+      z = -10 + 125 * Math.sin(t * Math.PI / 2);
+      rotationY = sign * (0.4 - 1.2 * Math.sin(t * Math.PI / 2));
+      if (t > 0.5) {
+        const restore = (t - 0.5) / 0.5;
+        x += (sign * 85 - x) * restore;
+        z += (5 - z) * restore;
+        rotationY *= 1 - restore;
+      }
+    }
+    claw.position.set(x, 30, z);
+    claw.rotation.y = rotationY;
+  }
+
+  updatePresentation(deltaSeconds) {
+    for (let index = this.activePresentationEffects.length - 1; index >= 0; index -= 1) {
+      const entry = this.activePresentationEffects[index];
+      entry.remainingSeconds -= deltaSeconds;
+      if (entry.remainingSeconds <= 0) {
+        entry.active = false; entry.mesh.visible = false; entry.event = null;
+        this.activePresentationEffects.splice(index, 1);
+      } else {
+        entry.mesh.rotation.y += deltaSeconds * 5;
+      }
+    }
+    const player = this.playerPresentation;
+    const parts = player?.userData?.presentationParts;
+    for (const side of ['left', 'right']) {
+      const state = this.playerAttackPresentation[side];
+      if (state) {
+        state.elapsed += deltaSeconds;
+        this.#animateFiniteClaw(side, state);
+        if (state.elapsed >= state.duration) this.playerAttackPresentation[side] = null;
+      } else if (parts) {
+        const claw = side === 'left' ? parts.leftClaw : parts.rightClaw;
+        const targetX = side === 'left' ? 85 : -85;
+        claw.position.x += (targetX - claw.position.x) * Math.min(1, deltaSeconds * 15);
+        claw.position.y += (30 - claw.position.y) * Math.min(1, deltaSeconds * 15);
+        claw.position.z += (5 - claw.position.z) * Math.min(1, deltaSeconds * 15);
+        claw.rotation.y += (0 - claw.rotation.y) * Math.min(1, deltaSeconds * 15);
+      }
+    }
+    if (parts) {
+      const charge = this.playerAttackPresentation.charging ? 1 : 0;
+      this.playerChargePhase += deltaSeconds * 45;
+      parts.visualRoot.rotation.z = Math.sin(this.playerChargePhase) * 0.012 * charge;
+      const left = this.playerAttackPresentation.left;
+      const right = this.playerAttackPresentation.right;
+      const leftProgress = left ? Math.min(1, left.elapsed / left.duration) : 0;
+      const rightProgress = right ? Math.min(1, right.elapsed / right.duration) : 0;
+      const doubleProgress = left?.mode === 'double' && right?.mode === 'double'
+        ? Math.max(leftProgress, rightProgress) : 0;
+      parts.visualRoot.rotation.x = doubleProgress
+        ? 0.15 * Math.sin(doubleProgress * Math.PI) : 0;
+      parts.visualRoot.rotation.y = doubleProgress ? 0
+        : 0.08 * Math.sin(leftProgress * Math.PI)
+          - 0.08 * Math.sin(rightProgress * Math.PI);
+      parts.visualRoot.position.y = Number(parts.visualRoot.userData.locomotionY ?? 0)
+        + (doubleProgress ? 8 * Math.sin(doubleProgress * Math.PI) : 0);
+    }
+  }
+
   #positionManualBoss() {
     if (!this.manualBossEntry) return;
     const { state, mesh } = this.manualBossEntry;
@@ -158,8 +351,11 @@ export class GameplayRenderAdapter {
       this.origin.renderOriginChunkZ,
       this.renderChunkSize,
     );
-    mesh.position.set(local.x, 0, local.z);
+    mesh.position.set(local.x, (state.bossBehavior?.verticalOffset ?? 0) * this.unitsPerMeter, local.z);
     mesh.rotation.y = state.rotationY;
+    for (let index = 0; index < (mesh.userData.segmentMeshes?.length ?? 0); index += 1) {
+      mesh.userData.segmentMeshes[index].visible = (state.bossBehavior?.segmentHp?.[index] ?? 1) > 0;
+    }
   }
 
   syncManualBoss(state) {
@@ -189,6 +385,47 @@ export class GameplayRenderAdapter {
     }
     this.#positionManualBoss();
     return true;
+  }
+
+  #positionReinforcement(entry) {
+    const local = logicalWorldToRenderLocal(
+      entry.state.x, entry.state.z,
+      this.origin.renderOriginChunkX, this.origin.renderOriginChunkZ,
+      this.renderChunkSize,
+    );
+    entry.mesh.position.set(local.x, 0, local.z);
+    entry.mesh.rotation.y = entry.state.rotationY;
+    entry.mesh.visible = entry.state.alive && entry.state.spawned === true;
+    const parts = entry.mesh.userData.presentationParts;
+    const relative = (entry.state.turretRotationY ?? entry.state.rotationY) - entry.state.rotationY;
+    if (parts?.turret) parts.turret.rotation.y = relative;
+    if (parts?.gun) {
+      parts.gun.rotation.y = relative;
+      parts.gun.rotation.x = entry.state.gunPitch ?? 0;
+    }
+  }
+
+  syncReinforcement(state) {
+    if (this.disposed) return false;
+    let entry = this.reinforcementMeshes.get(state.stableId);
+    if (!entry) {
+      const mesh = this.visualAssets.createEntityModel('tank');
+      mesh.name = 'w8-score-reinforcement-tank';
+      mesh.userData = { ...mesh.userData, stableId: state.stableId, reinforcement: true };
+      this.#scaleMesh(mesh, state);
+      entry = { mesh, state };
+      this.reinforcementMeshes.set(state.stableId, entry);
+      this.combatRoot.add(mesh);
+      this.counts.transientCreated += 1;
+    }
+    entry.state = state;
+    this.#positionReinforcement(entry);
+    return true;
+  }
+
+  clearReinforcements() {
+    for (const entry of this.reinforcementMeshes.values()) this.combatRoot.remove(entry.mesh);
+    this.reinforcementMeshes.clear();
   }
 
   async loadChunk(key, entityStates) {
@@ -246,6 +483,10 @@ export class GameplayRenderAdapter {
       liveProjectileMeshes: this.projectileMeshes.size,
       liveCombatEffectMeshes: this.effectMeshes.size,
       liveManualBossMeshes: this.manualBossEntry ? 1 : 0,
+      liveReinforcementMeshes: this.reinforcementMeshes.size,
+      presentationPoolCapacity: this.presentationPool.length,
+      activePresentationEffectCount: this.activePresentationEffects.length,
+      presentationPoolLimit: this.presentationPoolLimit,
       sharedGeometryCount: this.visualAssets.snapshot().sharedGeometryCount,
       sharedMaterialCount: this.visualAssets.snapshot().sharedMaterialCount,
       sharedDisposed: this.disposed
@@ -260,6 +501,10 @@ export class GameplayRenderAdapter {
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
     this.syncTransientCombat([], []);
     this.syncManualBoss(null);
+    this.clearReinforcements();
+    for (const entry of this.presentationPool) this.combatRoot.remove(entry.mesh);
+    this.presentationPool.length = 0;
+    this.activePresentationEffects.length = 0;
     this.scene.remove(this.root);
     this.scene.remove(this.combatRoot);
     if (this.ownsVisualAssets) this.visualAssets.dispose();

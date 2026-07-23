@@ -209,7 +209,7 @@ test('official Infinite entry and protected finite regression entry remain disti
   const infiniteEntry = readFileSync(resolve(repoRoot, 'infinite-world-sandbox.html'), 'utf8');
   const finiteEntry = readFileSync(resolve(repoRoot, 'index.html'), 'utf8');
   const runtimeDoc = readFileSync(resolve(repoRoot, 'docs/infinite-world/RUNTIME-ENTRY.md'), 'utf8');
-  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w7-full-experience/);
+  assert.match(infiniteEntry, /sandbox-entry\.js\?v=w8-finite-parity/);
   assert.doesNotMatch(infiniteEntry, /src\/game\.js/);
   assert.match(finiteEntry, /src\/game\.js/);
   assert.match(runtimeDoc, /schema version 2/);

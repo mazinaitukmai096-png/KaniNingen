@@ -57,6 +57,7 @@ export class ChunkRuntimeManager {
     this.transitionChain = Promise.resolve();
     this.isShutdown = false;
     this.latestTransition = null;
+    this.pendingPrefetchKeys = new Set();
     this.counts = {
       generated: 0,
       cacheHits: 0,
@@ -69,6 +70,7 @@ export class ChunkRuntimeManager {
       transitionsPerformed: 0,
       transitionsCoalesced: 0,
       identityAuditEvicted: 0,
+      prefetched: 0,
       maxCacheSize: 0,
       maxActiveDataCount: 0,
       maxRenderedCount: 0,
@@ -84,6 +86,34 @@ export class ChunkRuntimeManager {
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'centerChunkZ');
     this.counts.transitionsRequested += 1;
     const operation = this.transitionChain.then(() => this.#performTransition(chunkX, chunkZ));
+    this.transitionChain = operation.catch(() => {});
+    return operation;
+  }
+
+  prefetchChunk(chunkXInput, chunkZInput) {
+    const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'prefetchChunkX');
+    const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'prefetchChunkZ');
+    const key = createChunkKey(chunkX, chunkZ);
+    if (this.isShutdown) return Promise.reject(new Error('chunk runtime manager is shut down'));
+    if (this.cache.has(key) || this.pendingPrefetchKeys.has(key)) return Promise.resolve(false);
+    this.pendingPrefetchKeys.add(key);
+    const operation = this.transitionChain.then(async () => {
+      if (this.cache.has(key)) return false;
+      const generationStartedAt = this.clock();
+      const chunkData = await this.generator.generateChunk(chunkX, chunkZ);
+      this.performance.record('generation', this.clock() - generationStartedAt);
+      if (!chunkData || chunkData.chunkX !== chunkX || chunkData.chunkZ !== chunkZ) {
+        throw new Error(`generator returned invalid prefetched ChunkData for ${key}`);
+      }
+      this.#registerIdentity(key, chunkData);
+      this.chunkIndex?.registerChunk(chunkData);
+      this.cache.set(key, { data: chunkData, lastUsed: ++this.accessTick });
+      this.counts.generated += 1;
+      this.counts.prefetched += 1;
+      this.counts.maxCacheSize = Math.max(this.counts.maxCacheSize, this.cache.size);
+      this.#evictInactiveCacheEntries();
+      return true;
+    }).finally(() => this.pendingPrefetchKeys.delete(key));
     this.transitionChain = operation.catch(() => {});
     return operation;
   }
@@ -292,6 +322,7 @@ export class ChunkRuntimeManager {
       identityAuditCapacity: this.identityAuditCapacity,
       chunkIndex: this.chunkIndex?.snapshot() ?? null,
       activeDataKeys: Object.freeze(sortedKeys(this.activeDataKeys)),
+      pendingPrefetchKeys: Object.freeze(sortedKeys(this.pendingPrefetchKeys)),
       renderedKeys: Object.freeze(sortedKeys(this.renderedKeys)),
       counts: Object.freeze({ ...this.counts }),
       latestTransition: this.latestTransition,
@@ -313,6 +344,7 @@ export class ChunkRuntimeManager {
     this.activeDataKeys.clear();
     this.cache.clear();
     this.identityAudit.clear();
+    this.pendingPrefetchKeys.clear();
     await this.renderAdapter.shutdown();
     this.isShutdown = true;
   }

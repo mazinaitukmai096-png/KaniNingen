@@ -1,0 +1,53 @@
+{
+  "schemaVersion": "w8-finite-parity-provenance-1",
+  "sourceCommit": "f8bc9f80c2af417bb585bff26c99522c4229ab8e",
+  "sourceHashes": {
+    "index.html": "38dce6f301e5fcbc743b52b7aa9088ae88d12a337094dcf8a4e5fd7abee3eadb",
+    "src/game.js": "a69f03c549117bb848d8baab03adf5b412756f5bd5577dc73399d2648e92ccee",
+    "src/constants.js": "a63dcd4cc04348a52e29c59620f1be46bf94bfdd4fda5fcd066bbfbdca1e8450",
+    "src/scale-sandbox.js": "2720cfce173926b365a508a1849c1c9b7592d0fb3bbed958314123307a3fc02a",
+    "src/core/renderer.js": "22b818356bba7e337e488f5551de39a345e02023e80ac5201d97d06cf19a0b29",
+    "src/core/input.js": "746813abab103ebb90bfd1b2f3db38e520013dc89b86c2453f3dcb8bb63a0567",
+    "src/settlement-life-details.js": "a8506901fe8cd094af0faefc099759140268cd95c8a9895d49e0f0de2d5bd4a5",
+    "src/settlement-building-visuals.js": "dac59d9d3c15a281206c4aada7a6d2f986c3db6b13c8fe524830c9e7f3efec84"
+  },
+  "extractions": [
+    {
+      "area": "renderer",
+      "source": ["src/core/renderer.js"],
+      "destination": ["src/infinite-world/sandbox-boot.js", "src/infinite-world/render/w8-distant-presentation.js"],
+      "items": ["FOV", "camera distance, pitch, height and target", "sky", "fog", "Cloud", "HemisphereLight", "Sun", "PCFSoftShadowMap", "logarithmicDepthBuffer", "pixel ratio", "far terrain visual language"]
+    },
+    {
+      "area": "input-and-combat",
+      "source": ["src/core/input.js", "src/game.js", "src/constants.js", "src/scale-sandbox.js"],
+      "destination": ["src/infinite-world/experience-shell.js", "src/infinite-world/gameplay-contract.js", "src/infinite-world/gameplay-runtime.js"],
+      "items": ["pointer lock", "camera-relative movement", "left/right/both claws", "charge", "Atomic", "hit stop", "camera shake", "Boss state machine"]
+    },
+    {
+      "area": "models-and-world-language",
+      "source": ["src/game.js", "src/settlement-life-details.js", "src/settlement-building-visuals.js"],
+      "destination": ["src/infinite-world/render/w8-parity-visual-assets.js", "src/infinite-world/render/chunk-render-adapter.js", "src/infinite-world/w8-parity-chunk-generator.js"],
+      "items": ["21 Mesh Crab hierarchy and pivots", "Claw and leg presentation", "Human", "Tank", "segmented Boss", "House", "Tower", "Church", "School", "Factory", "Military Base", "Barn", "Haystack", "Cow", "conifer and two-sphere trees", "vegetation shadow policy", "building camera fade", "grass", "flower", "street props", "water", "rubble and scorch vocabulary"]
+    },
+    {
+      "area": "hud",
+      "source": ["index.html", "src/game.js"],
+      "destination": ["infinite-world-sandbox.html", "src/infinite-world/experience-shell.js"],
+      "items": ["bottom-center layout", "290x21 HP bar", "Atomic typography", "18px crosshair", "conditional compass"]
+    },
+    {
+      "area": "audio",
+      "source": ["src/game.js"],
+      "destination": ["src/infinite-world/w8-audio.js"],
+      "items": ["Attack", "Swish", "Hit", "Splat", "Tank fire", "Roar", "Rumble", "Acid", "Atomic"]
+    }
+  ],
+  "infiniteInvariants": [
+    "W5 output and content hash are not changed",
+    "3x3 rendering and the 5x5 active data window remain unchanged; directional prefetch is incremental",
+    "Floating Origin remains active",
+    "Stable IDs remain the persistence key",
+    "W8 v3, W7 v2, and W6 saves migrate to v4 through a validated temporary candidate"
+  ]
+}

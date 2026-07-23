@@ -91,7 +91,9 @@ function combatChunk() {
   };
 }
 
-async function createRuntime({ playerSpawn = { x: 4, z: 4 }, clock = () => 0 } = {}) {
+async function createRuntime({
+  playerSpawn = { x: 4, z: 4 }, clock = () => 0, chunk = combatChunk(),
+} = {}) {
   const state = new InfiniteWorldState({ worldSeedHash, playerSpawn });
   const renderer = new FakeGameplayRenderer();
   const features = featureRenderer();
@@ -103,7 +105,6 @@ async function createRuntime({ playerSpawn = { x: 4, z: 4 }, clock = () => 0 } =
     featureRenderAdapter: features,
     clock,
   });
-  const chunk = combatChunk();
   await runtime.syncActiveChunks({
     renderedKeys: ['0,0'],
     getChunkData: () => chunk,
@@ -130,6 +131,41 @@ test('W7C Tank combat uses only the protected finite constants', () => {
     destroyedShakeRadiusFactor: 0.21,
     destroyedShakeMaximum: 88,
   });
+});
+
+test('Tank requires spawn, LOS, bounded rotation, and cooldown before firing', async () => {
+  const chunk = combatChunk();
+  chunk.settlementFeatures[0].worldPosition = { x: 8, y: 0, z: 6 };
+  const { runtime, state } = await createRuntime({ playerSpawn: { x: 8, z: 4 }, chunk });
+  const tank = [...state.entityStates.values()].find(entity => entity.type === 'tank');
+  assert.equal(tank.spawned, false);
+  tank.spawned = true;
+  tank.aiState = 'acquire';
+  tank.x = 8;
+  tank.z = 8;
+  tank.rotationY = Math.PI;
+  tank.turretRotationY = Math.PI;
+  tank.lastShotAtMs = state.gameplayTimeMs;
+  runtime.update({ deltaSeconds: 0.05, player: state.player });
+  assert.ok(Math.abs(Math.atan2(
+    Math.sin(tank.rotationY - Math.PI),
+    Math.cos(tank.rotationY - Math.PI),
+  )) <= 0.04 * 3 + 1e-9);
+  assert.equal(runtime.snapshot().counts.tankShots, 0);
+  for (let index = 0; index < 80; index += 1) {
+    runtime.update({ deltaSeconds: 0.05, player: state.player });
+    tank.x = 8;
+    tank.z = 8;
+  }
+  assert.equal(runtime.snapshot().counts.tankShots, 0, 'the building must block LOS');
+  state.damageFeature({
+    stableId: 'settlement-building-v1:w7c-house', maxHp: 300,
+  }, 300);
+  for (let index = 0; index < 80 && runtime.snapshot().counts.tankShots === 0; index += 1) {
+    runtime.update({ deltaSeconds: 0.05, player: state.player });
+  }
+  assert.equal(runtime.snapshot().counts.tankShots, 1);
+  await runtime.shutdown();
 });
 
 test('Tank AI damages the existing player state only inside an active Simulation Chunk', async () => {
@@ -166,7 +202,7 @@ test('building destruction, score, healing, hit stop and effects share the W6 Wo
   assert.deepEqual(houseHit, {
     stableId: 'settlement-building-v1:w7c-house', type: 'house', destroyed: true,
   });
-  assert.equal(state.player.score, 1800);
+  assert.equal(state.player.score, 300, 'a reserve Tank is not an invisible attack target');
   assert.equal(state.player.hp, 54);
   assert.equal(state.isFeatureDestroyed(houseHit.stableId), true);
   assert.equal(features.destroyed.has(houseHit.stableId), true);

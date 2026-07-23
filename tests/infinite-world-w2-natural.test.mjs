@@ -16,6 +16,7 @@ import {
 } from '../src/infinite-world/natural-chunk-generator.js';
 import { ChunkRenderAdapter } from '../src/infinite-world/render/chunk-render-adapter.js';
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
+import { verifyOptionalLegacySource } from './infinite-world-provenance-helper.mjs';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
@@ -35,13 +36,7 @@ test('W2 Legacy Macro Terrain dependencies match fixed-commit blobs and SHA-256 
       execFileSync('git', ['hash-object', destination], { cwd: repoRoot, encoding: 'utf8' }).trim(),
       file.gitBlob,
     );
-    assert.equal(
-      execFileSync('git', ['-C', 'C:\\KaniGame(開発用)', 'rev-parse', `${provenance.sourceCommit}:${file.source}`], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-      }).trim(),
-      file.gitBlob,
-    );
+    verifyOptionalLegacySource({ provenance, file, repoRoot });
   }
 });
 

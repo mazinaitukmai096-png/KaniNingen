@@ -25,24 +25,27 @@
       background: linear-gradient(180deg, rgba(10,7,5,.62), transparent 30%, transparent 68%, rgba(10,7,5,.82));
     }
     #start-screen h1 { margin: 0; font-size: clamp(64px, 9vw, 150px); line-height: 1; letter-spacing: .06em; text-shadow: 0 8px #0008, 0 20px 40px #000d; }
+    #start-screen h1 small { display:block; margin-top:14px; color:#ffb020; font:700 clamp(14px,1.5vw,24px) Consolas,monospace; letter-spacing:.24em; }
     .menu-buttons { display: grid; gap: 14px; }
     .menu-btn, .panel-btn {
       min-width: 300px; padding: 15px 22px; color: #f3ede2; background: transparent;
       border: 2px solid #f3ede266; text-align: left; letter-spacing: .08em; cursor: pointer;
     }
     .menu-btn:hover, .panel-btn:hover { color: #ffb020; border-color: #ffb020; transform: translateX(6px); }
+    .menu-btn:disabled, .panel-btn:disabled { opacity: .38; cursor: not-allowed; transform: none; }
     #start-button { background: #ff3b1f; border-color: #ff3b1f; }
-    #ui { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 100; display: none; min-width: 330px; text-align: center; pointer-events: none; }
-    #score-line { color: #ffd700; font: 30px Impact, sans-serif; letter-spacing: .05em; text-shadow: 2px 2px #000, -1px -1px #000; }
-    #scale-line { margin: 4px 0; color: #00e5ff; font-size: 13px; text-shadow: 1px 1px #000; }
-    #hp-bar { position: relative; width: 300px; height: 24px; margin: auto; overflow: hidden; background: #000a; border: 2px solid #fffc; transform: skewX(-15deg); }
-    #hp-bar-fill { width: 100%; height: 100%; background: linear-gradient(90deg,#39ff14,#00e5ff); transition: width .15s; }
-    #hp-text { position: absolute; inset: 3px 16px; text-align: left; transform: skewX(15deg); font-size: 11px; text-shadow: 1px 1px #000; }
-    #atomic-status { margin-top: 7px; font: 11px Consolas, monospace; color: #888; }
-    #crosshair { position: fixed; left: 50%; top: 50%; width: 20px; height: 20px; transform: translate(-50%,-50%); z-index: 90; display: none; pointer-events: none; }
-    #crosshair::before, #crosshair::after { content:""; position:absolute; background:#fffddd; box-shadow:0 0 3px #000; }
-    #crosshair::before { left:0; top:9px; width:20px; height:2px; } #crosshair::after { left:9px; top:0; width:2px; height:20px; }
-    #compass { position: fixed; right: 26px; top: 22px; width: 92px; height: 92px; border: 3px solid #fff8; border-radius: 50%; background: #0006; z-index: 100; display: none; }
+    #ui { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); z-index: 100; display: none; min-width: 290px; color:#fff; font-family:"Arial Black",Arial,sans-serif; text-align: center; pointer-events: none; }
+    #score-line { margin-bottom:3px; color: #ffd700; font: 28px Impact, sans-serif; letter-spacing: 1.5px; text-shadow: 2px 2px #000, -1px -1px #000, 1px -1px #000, -1px 1px #000; }
+    #scale-line { display:none; }
+    #hp-bar { position: relative; width: 290px; height: 21px; margin: auto; overflow: hidden; background: rgba(0,0,0,.65); border: 2px solid rgba(255,255,255,.7); box-shadow:0 0 10px rgba(0,0,0,.5); transform: skewX(-15deg); }
+    #hp-bar-lag { position:absolute; inset:0 auto 0 0; width:100%; background:#ff324b; transition:width .8s ease-out; }
+    #hp-bar-fill { position:absolute; inset:0 auto 0 0; width: 100%; height: 100%; background: linear-gradient(90deg,#39ff14,#00e5ff); transition: width .15s; }
+    #hp-text { position: absolute; top:50%; left:18px; transform: translateY(-50%) skewX(15deg); text-align:left; font-size: 11px; font-weight:bold; letter-spacing:1.5px; text-shadow: 1px 1px 2px #000; }
+    #atomic-status { margin-top: 7px; color:#fff; font: bold 11px "Arial Black",Arial,sans-serif; letter-spacing:1.5px; text-shadow:1px 1px 2px #000; }
+    #crosshair { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; transform: translate(-50%,-50%); z-index: 90; display: none; pointer-events: none; }
+    #crosshair::before, #crosshair::after { content:""; position:absolute; background:rgba(255,255,255,.85); box-shadow:0 0 3px rgba(0,0,0,.8); }
+    #crosshair::before { left:0; top:50%; width:100%; height:2px; transform:translateY(-50%); } #crosshair::after { left:50%; top:0; width:2px; height:100%; transform:translateX(-50%); }
+    #compass { position: fixed; right: 20px; top: 20px; width: 90px; height: 90px; overflow:hidden; border: 3px solid rgba(255,255,255,.5); border-radius: 50%; background: rgba(0,0,0,.35); z-index: 100; display: none; }
     #compass-arrow { position: absolute; left: 42px; top: 10px; width: 0; height: 0; border-left: 9px solid transparent; border-right: 9px solid transparent; border-bottom: 56px solid #ff3b1f; transform-origin: 9px 36px; }
     #fps-counter { position: fixed; top: 18px; left: 18px; padding: 5px 10px; z-index: 100; display: none; color: #39ff14; background: #0008; font: 13px Consolas, monospace; }
     #boss-ui { position: fixed; top: 48px; left: 50%; width: min(520px, 80vw); transform: translateX(-50%); z-index: 150; display: none; padding: 10px 16px; text-align: center; background: #000d; border: 2px solid #ff3300; }
@@ -67,39 +70,39 @@
     #debug-modal .panel { width: min(720px, 94vw); border-color:#ff3fa477; }
     .debug-stats { color:#7dffb2; font: 12px/1.5 Consolas,monospace; white-space:pre-wrap; }
     .inactive { color:#888 !important; }
-    #help { position: fixed; right: 14px; bottom: 14px; z-index: 80; padding: 8px 11px; border-radius: 7px; background: #0b1419c7; color: #d8e6d1; font: 12px Arial,sans-serif; pointer-events:none; }
+    [data-scale-stage].debug-on { color:#1a0010; background:#ff3fa4; border-color:#ff3fa4; }
     body.hud-hidden #ui, body.hud-hidden #compass, body.hud-hidden #crosshair, body.hud-hidden #boss-ui, body.hud-hidden #charge-ui, body.hud-hidden #news-ticker { visibility: hidden !important; }
   </style>
 </head>
 <body>
   <div id="viewport" aria-label="KaniNingen Infinite World official runtime"></div>
-  <div id="start-screen"><h1>カニ人間</h1><div class="menu-buttons"><button id="start-button" class="menu-btn">DROP INTO THE INFINITE WORLD!</button><button id="lobby-settings-btn" class="menu-btn">⚙ SETTINGS</button></div></div>
+  <!-- W8 / FINITE EXPERIENCE PARITY -->
+  <div id="start-screen"><h1>カニ人間<small>INFINITE CARNAGE</small></h1><div class="menu-buttons"><button id="start-button" class="menu-btn">NEW GAME</button><button id="continue-button" class="menu-btn" disabled>CONTINUE</button><button id="lobby-settings-btn" class="menu-btn">⚙ SETTINGS</button></div></div>
   <div id="crosshair"></div><div id="fps-counter">FPS: --</div>
   <div id="compass"><div id="compass-arrow"></div></div>
-  <div id="ui"><div id="score-line">被害総額: <span id="score">$0</span></div><div id="scale-line">SCALE: <span id="scale-label">MAX</span></div><div id="hp-bar"><div id="hp-bar-fill"></div><div id="hp-text">HP <span id="hp-number">100</span></div></div><div id="atomic-status" class="inactive">ATOMIC: INITIALIZING</div></div>
+  <div id="ui"><div id="score-line">被害総額: <span id="score">$0</span></div><div id="scale-line">SCALE: <span id="scale-label">MAX</span></div><div id="hp-bar"><div id="hp-bar-lag"></div><div id="hp-bar-fill"></div><div id="hp-text">HP <span id="hp-number">100</span></div></div><div id="atomic-status" class="inactive">ATOMIC: INITIALIZING</div></div>
   <div id="boss-ui"><div id="boss-title">ギガ・ミミズ</div><div class="boss-bar"><div id="boss-hp-fill"></div></div></div>
   <div id="charge-ui"><div id="charge-bar"><div id="charge-bar-fill"></div></div><div id="charge-label">ATOMIC CHARGING...</div></div>
   <div id="news-ticker"><div id="news-ticker-text">【緊急特撮ニュース】超巨大地底蟲が出現――防衛軍は警戒レベルを最大へ引き上げました。</div></div>
   <div id="nuclear-flash"></div>
   <div id="resume-overlay" class="overlay"><div>▶ 画面をクリックしてゲームに戻る</div></div>
-  <div id="settings-modal" class="overlay"><div class="panel"><h2>設定</h2><div class="setting-row"><label>マウス感度 <span id="val-mouse">1.0</span></label><input id="set-mouse" type="range" min="0.1" max="3" step="0.1" value="1"></div><div class="setting-row"><label>マスター音量 <span id="val-vol">50%</span></label><input id="set-vol" type="range" min="0" max="1" step="0.05" value="0.5"></div><div class="setting-row"><label>グラフィック品質</label><select id="set-quality"><option value="high">高品質</option><option value="medium">標準</option><option value="low">低品質</option></select></div><div class="setting-row"><label>FPS表示</label><input id="set-fps-counter" type="checkbox"></div><div class="setting-row"><label>FPS上限</label><select id="set-fps-cap"><option value="0">無制限</option><option value="30">30 FPS</option><option value="60">60 FPS</option><option value="120">120 FPS</option></select></div><div class="setting-row"><label>Camera Shake <span id="val-shake">1.0</span></label><input id="set-shake" type="range" min="0" max="2" step="0.1" value="1"></div><div class="panel-actions"><button id="set-home-btn" class="panel-btn">タイトルへ</button><button id="set-reset-btn" class="panel-btn">ホーム位置へ</button><button id="settings-close-btn" class="panel-btn">閉じる</button></div></div></div>
-  <div id="debug-modal" class="overlay"><div class="panel"><h2>DEBUG OVERLAY</h2><div id="debug-summary" class="debug-stats">Runtime loading...</div><div class="debug-row"><span>Scale Stage</span><span><button class="panel-btn" data-scale-stage="TINY">Tiny</button><button class="panel-btn" data-scale-stage="MID">Mid</button><button class="panel-btn" data-scale-stage="MAX">Max</button></span></div><div class="debug-row"><span>Manual Boss</span><button id="debug-spawn-boss-btn" class="panel-btn" disabled>INITIALIZING</button></div><button id="debug-close-btn" class="panel-btn">閉じる (Tab)</button></div></div>
+  <div id="settings-modal" class="overlay"><div class="panel"><h2>設定</h2><div class="setting-row"><label>マウス感度 <span id="val-mouse">1.0</span></label><input id="set-mouse" type="range" min="0.1" max="3" step="0.1" value="1"></div><div class="setting-row"><label>マスター音量 <span id="val-vol">50%</span></label><input id="set-vol" type="range" min="0" max="1" step="0.05" value="0.5"></div><div class="setting-row"><label>グラフィック品質</label><select id="set-quality"><option value="high">高品質</option><option value="medium">標準</option><option value="low">低品質</option></select></div><div class="setting-row"><label>FPS表示</label><input id="set-fps-counter" type="checkbox"></div><div class="setting-row"><label>FPS上限</label><select id="set-fps-cap"><option value="0">無制限</option><option value="30">30 FPS</option><option value="60">60 FPS</option><option value="120">120 FPS</option></select></div><div class="setting-row"><label>Camera Shake <span id="val-shake">1.0</span></label><input id="set-shake" type="range" min="0" max="2" step="0.1" value="1"></div><div class="setting-row"><label>Developer Tools</label><input id="set-developer-tools" type="checkbox"></div><div class="panel-actions"><button id="set-home-btn" class="panel-btn">タイトルへ</button><button id="set-reset-btn" class="panel-btn">ホーム位置へ</button><button id="settings-close-btn" class="panel-btn">閉じる</button></div></div></div>
+  <div id="debug-modal" class="overlay"><div class="panel"><h2>DEVELOPER TOOLS</h2><div id="developer-tools-section"><div id="debug-summary" class="debug-stats">Runtime loading...</div><div class="debug-row"><span>Scale Stage</span><span><button class="panel-btn" data-scale-stage="TINY">Tiny</button><button class="panel-btn" data-scale-stage="MID">Mid</button><button class="panel-btn" data-scale-stage="MAX">Max</button></span></div><div class="debug-row"><span>Manual Boss</span><button id="debug-spawn-boss-btn" class="panel-btn" disabled>INITIALIZING</button></div></div><button id="debug-close-btn" class="panel-btn">閉じる (Tab)</button></div></div>
   <div id="game-over" class="overlay"><h1>CRUSHED...</h1><p>最終スコア: <span id="final-score">$0</span></p><button id="restart-button" class="menu-btn">RETRY</button></div>
-  <div id="help">WASD: 移動　Space: Jump　Mouse L/R: 攻撃　Both Hold + Air Release: Atomic　1/2/3: Scale　H: HUD　Tab: Debug　P/L: 保存/読込</div>
-  <div id="hud"><span id="badge">W7 / FULL EXPERIENCE</span>
+  <div id="hud"><span id="badge">W8 / FINITE EXPERIENCE PARITY</span>
 起動中: DOMContentLoaded</div>
   <script id="w6-entry-error-bridge">
     (() => {
       if (window.__infiniteWorldEntryBridge) return;
       let reported = false; let moduleStarted = false; let firstError = null;
       const describe = (value, details = {}) => { const source = value && typeof value === 'object' ? value : {}; return { name: String(source.name || 'Error'), message: String(details.message || source.message || value || 'Module entry failed'), sourceUrl: String(details.sourceUrl || source.sourceUrl || ''), filename: String(details.filename || source.filename || '') }; };
-      const reportModuleLoadFailure = (value, details = {}) => { if (reported || moduleStarted) return false; reported = true; firstError = describe(value, details); const hud = document.querySelector('#hud'); if (hud) { const diagnostics = ['W7 / FULL EXPERIENCE','起動失敗: MODULE_LOAD',`${firstError.name}: ${firstError.message}`]; if (firstError.sourceUrl) diagnostics.push(`Source: ${firstError.sourceUrl}`); if (firstError.filename) diagnostics.push(`Filename: ${firstError.filename}`); hud.textContent = diagnostics.join('\n'); } return true; };
+      const reportModuleLoadFailure = (value, details = {}) => { if (reported || moduleStarted) return false; reported = true; firstError = describe(value, details); const hud = document.querySelector('#hud'); if (hud) { const diagnostics = ['W8 / FINITE EXPERIENCE PARITY','起動失敗: MODULE_LOAD',`${firstError.name}: ${firstError.message}`]; if (firstError.sourceUrl) diagnostics.push(`Source: ${firstError.sourceUrl}`); if (firstError.filename) diagnostics.push(`Filename: ${firstError.filename}`); hud.textContent = diagnostics.join('\n'); } return true; };
       window.addEventListener('error', event => reportModuleLoadFailure(event.error || { name:'Error', message:event.message || 'Module script failed to load' }, { sourceUrl:event.target?.src || event.target?.href || '', filename:event.filename || '', message:event.message || '' }), true);
       window.addEventListener('unhandledrejection', event => reportModuleLoadFailure(event.reason || { name:'PromiseRejection', message:'Unhandled module rejection' }));
       window.__infiniteWorldEntryBridge = Object.freeze({ reportModuleLoadFailure, markModuleStarted(){ moduleStarted = true; }, snapshot:()=>Object.freeze({ reported, moduleStarted, firstError:firstError && Object.freeze({...firstError}) }) });
     })();
   </script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.min.js"></script>
-  <script type="module" src="./src/infinite-world/sandbox-entry.js?v=w7-full-experience"></script>
+  <script type="module" src="./src/infinite-world/sandbox-entry.js?v=w8-finite-parity"></script>
 </body>
 </html>

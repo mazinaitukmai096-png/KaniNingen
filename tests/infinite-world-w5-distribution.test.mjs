@@ -280,6 +280,16 @@ test('W5 renderer shows distributed Settlement resources and disposes them witho
   assert.ok([...adapter.loaded.values()].some(projected => projected.group.children.some(child => (
     child.name === 'infinite-settlement-roads' || child.name === 'infinite-settlement-buildings'
   ))));
+  const roadProjection = [...adapter.loaded.values()].find(projected => (
+    projected.group.children.some(child => child.name === 'infinite-settlement-roads')
+  ));
+  const roadMesh = roadProjection.group.children.find(child => child.name === 'infinite-settlement-roads');
+  const roadChunk = runtime.getChunkData(roadProjection.chunkX, roadProjection.chunkZ);
+  const firstRoad = roadChunk.settlementFeatures.find(feature => feature.featureType === 'settlement-road');
+  assert.equal(
+    roadMesh.matrices[0].position.y,
+    (firstRoad.worldPosition.y + 0.075) * adapter.unitsPerMeter,
+  );
   for (let step = 1; step <= 6; step += 1) {
     await runtime.transitionToChunk(startX + step, startZ);
     resources = adapter.resourceSnapshot();

@@ -1,6 +1,6 @@
 {
   "phase": "W2",
-  "sourceRepository": "C:\\KaniGame(開発用)",
+  "sourceRepository": "local extraction; optionally verified with KANI_LEGACY_SOURCE_REPO",
   "sourceCommit": "4210c069314a084b528d97e3d5a5e1345d38ad94",
   "acquisition": "git show from the fixed commit; dirty working-tree content was not read",
   "files": [

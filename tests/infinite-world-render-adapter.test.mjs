@@ -56,11 +56,20 @@ class InstancedMesh extends Mesh {
 }
 class LineSegments extends Mesh {}
 class Object3D extends NodeObject {}
+class Vector3 {
+  constructor(x = 0, y = 0, z = 0) { Object.assign(this, { x, y, z }); }
+  length() { return Math.hypot(this.x, this.y, this.z); }
+  normalize() { const length = this.length() || 1; this.x /= length; this.y /= length; this.z /= length; return this; }
+}
+class Raycaster {
+  static hits = [];
+  intersectObjects() { return Raycaster.hits; }
+}
 
 const FakeThree = {
   Group, PlaneGeometry, ConeGeometry, DodecahedronGeometry, BufferGeometry,
   Float32BufferAttribute, MeshLambertMaterial, LineBasicMaterial,
-  Mesh, InstancedMesh, LineSegments, Object3D,
+  Mesh, InstancedMesh, LineSegments, Object3D, Vector3, Raycaster,
 };
 
 test('render adapter shares geometry/materials, releases chunk objects, and disposes shared resources only at shutdown', async () => {
@@ -123,5 +132,86 @@ test('render adapter applies Stable-ID destruction without allocating or leaking
   assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.resourceSnapshot().trackedFeatureInstanceCount, 0);
+  await adapter.shutdown();
+});
+
+test('Settlement instances between camera and Player fade to 0.25 and restore next frame', async () => {
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const stableId = 'building-camera-occlusion';
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'occlusion-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementLandmarks: [], streetDetails: [],
+    settlementFeatures: [{
+      stableId, featureType: 'settlement-building', buildingType: 'house',
+      worldPosition: { x: 8, y: 0, z: 8 }, rotationY: 0,
+      widthMeters: 3, heightMeters: 2.5, depthMeters: 3,
+    }],
+  };
+  const projected = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(projected);
+  const entry = adapter.featureInstances.get(stableId);
+  assert.ok(entry.parts.every(part => part.fadeMesh));
+  const first = entry.parts[0];
+  assert.equal(first.fadeMesh.material.options.opacity, 0.25);
+  assert.equal(first.fadeMesh.material.options.depthWrite, false);
+  Raycaster.hits = [{ object: first.mesh, instanceId: first.index }];
+  assert.equal(adapter.updateCameraOcclusion({
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+  }), 1);
+  assert.deepEqual(first.mesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
+  assert.notEqual(first.fadeMesh.matrices[first.index].scale.x, 0);
+  Raycaster.hits = [];
+  assert.equal(adapter.updateCameraOcclusion({
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+  }), 0);
+  assert.notEqual(first.mesh.matrices[first.index].scale.x, 0);
+  assert.deepEqual(first.fadeMesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
+  const fadeMaterial = first.fadeMesh.material;
+  await adapter.shutdown();
+  assert.equal(fadeMaterial.disposed, true);
+});
+
+test('Camera collision resolves the desired camera position before the nearest Settlement wall', async () => {
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const stableId = 'building-camera-collision';
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'camera-collision-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementLandmarks: [], streetDetails: [],
+    settlementFeatures: [{
+      stableId, featureType: 'settlement-building', buildingType: 'house',
+      worldPosition: { x: 8, y: 0, z: 8 }, rotationY: 0,
+      widthMeters: 3, heightMeters: 2.5, depthMeters: 3,
+    }],
+  };
+  const projected = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(projected);
+  const entry = adapter.featureInstances.get(stableId);
+  const camera = { position: new Triple().set(0, 0, 100) };
+  Raycaster.hits = [{ object: entry.parts[0].mesh, instanceId: entry.parts[0].index, distance: 60 }];
+  const result = adapter.resolveCameraCollision({
+    camera,
+    target: { x: 0, y: 0, z: 0 },
+    clearanceMeters: 0.1,
+  });
+  assert.equal(result.collided, true);
+  assert.equal(result.stableId, stableId);
+  assert.equal(result.desiredDistance, 100);
+  assert.equal(result.resolvedDistance, 34.4);
+  assert.deepEqual({ x: camera.position.x, y: camera.position.y, z: camera.position.z }, {
+    x: 0, y: 0, z: 34.4,
+  });
+  Raycaster.hits = [];
   await adapter.shutdown();
 });

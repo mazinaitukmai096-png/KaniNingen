@@ -95,7 +95,7 @@ function findImportCycle(records) {
 test('real HTTP entry and recursive local import graph resolve with JavaScript MIME and source bodies', async () => {
   const staticServer = await startStaticServer();
   try {
-    const htmlUrl = `${staticServer.origin}/infinite-world-sandbox.html?v=w7-full-experience`;
+    const htmlUrl = `${staticServer.origin}/infinite-world-sandbox.html?v=w8-finite-parity`;
     const htmlResponse = await fetch(htmlUrl);
     const html = await htmlResponse.text();
     assert.equal(htmlResponse.status, 200);
@@ -126,8 +126,8 @@ test('real HTTP entry and recursive local import graph resolve with JavaScript M
     }
 
     assert.ok(visited.size >= 40, `expected complete W5 graph, received ${visited.size} modules`);
-    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-entry.js?v=w7-full-experience')), true);
-    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-main.js?v=w7-full-experience')), true);
+    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-entry.js?v=w8-finite-parity')), true);
+    assert.equal([...visited.keys()].some(url => url.includes('/sandbox-main.js?v=w8-finite-parity')), true);
     assert.equal([...visited.keys()].some(url => url.endsWith('/src/infinite-world/runtime-timing.js')), true);
     assert.equal([...visited.values()].every(record => record.status === 200 && javascriptMime.test(record.contentType)), true);
     assert.equal(findImportCycle(visited), null, 'entry import graph must remain acyclic');

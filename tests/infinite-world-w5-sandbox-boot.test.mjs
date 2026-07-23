@@ -32,7 +32,10 @@ class NodeObject {
   updateMatrix() { this.matrix = { position: { ...this.position }, scale: { ...this.scale } }; }
 }
 class Group extends NodeObject {}
-class Scene extends Group {}
+class Scene extends Group {
+  static instances = [];
+  constructor() { super(); Scene.instances.push(this); }
+}
 class Geometry {
   constructor() { this.attributes = {}; }
   setAttribute(name, value) { this.attributes[name] = value; }
@@ -67,13 +70,22 @@ class InstancedMesh extends Mesh {
 class LineSegments extends Mesh {}
 class Object3D extends NodeObject {}
 class PerspectiveCamera extends NodeObject {
+  static instances = [];
+  constructor(fov, aspect, near, far) {
+    super();
+    Object.assign(this, { fov, aspect, near, far });
+    PerspectiveCamera.instances.push(this);
+  }
   updateProjectionMatrix() {}
   lookAt() {}
 }
 class HemisphereLight extends NodeObject {}
 class DirectionalLight extends NodeObject {}
 class Color { constructor(value) { this.value = value; } }
-class Fog { constructor(...values) { this.values = values; } }
+class Fog {
+  static instances = [];
+  constructor(...values) { this.values = values; Fog.instances.push(this); }
+}
 class WebGLRenderer {
   static instances = [];
   constructor() {
@@ -197,6 +209,9 @@ function loadPreModuleBridge() {
 
 test('browser-equivalent W5 entry resolves every import and completes the real main boot path', async () => {
   WebGLRenderer.instances.length = 0;
+  Scene.instances.length = 0;
+  PerspectiveCamera.instances.length = 0;
+  Fog.instances.length = 0;
   const environment = installBrowserEquivalentEnvironment();
   try {
     const startedAt = performance.now();
@@ -254,6 +269,32 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.match(environment.hud.innerHTML, /World Seed:/);
     assert.doesNotMatch(environment.hud.innerHTML, /起動中/);
 
+    const gameplayScene = Scene.instances[0];
+    const gameplayCamera = PerspectiveCamera.instances[0];
+    const gameplayFog = Fog.instances[0];
+    assert.equal(gameplayCamera.fov, 70);
+    assert.equal(gameplayCamera.near, 64);
+    assert.equal(gameplayCamera.far, 224000);
+    assert.deepEqual(gameplayFog.values, [0x5dade2, 19200, 76800]);
+    const cloudRoot = gameplayScene.children.find(child => child.name === 'w8-cyclic-scene-clouds');
+    assert.equal(cloudRoot.children.length, 14);
+    for (const cloud of cloudRoot.children) {
+      assert.ok(Math.hypot(cloud.position.x, cloud.position.z) >= 57599.99);
+      assert.ok(cloud.position.y >= 16640 && cloud.position.y <= 26880);
+      assert.equal(cloud.children.length, 3);
+      assert.equal(cloud.children[0].material.options.transparent, true);
+      assert.equal(cloud.children[0].material.options.opacity, 0.68);
+      assert.equal(cloud.children[0].material.options.depthWrite, false);
+    }
+    assert.equal(gameplayScene.children.some(child => child.name === 'w8-visual-horizon-apron'), false);
+    const distantWorld = gameplayScene.children.find(child => child.name === 'w8-scene-owned-distant-world');
+    assert.ok(distantWorld);
+    assert.equal(distantWorld.userData.presentationOnly, true);
+    assert.equal(snapshot.presentation.midgroundChunkCount, 16);
+    assert.equal(snapshot.presentation.clipmapMeshCount, 1);
+    assert.ok(snapshot.presentation.maximumInnerBoundaryErrorMeters <= 0.001);
+    assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
+
     const renderedKeys = new Set(snapshot.runtime.renderedKeys);
     assert.equal(Object.keys(snapshot.resources.chunkRenderables).every(key => renderedKeys.has(key)), true);
     const playerXBeforeInput = outcome.sandbox.logicalPlayer.x;
@@ -261,6 +302,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.rafCallbacks[0](performance.now() + 100);
     environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
     assert.ok(outcome.sandbox.logicalPlayer.x > playerXBeforeInput);
+    environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
     environment.listeners.get('keydown')({ code: 'Digit1', preventDefault() {} });
     assert.equal(outcome.sandbox.snapshot().gameplay.state.activeScaleStageId, 'TINY');
     environment.listeners.get('keydown')({ code: 'Digit3', preventDefault() {} });
@@ -276,6 +318,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(stopped.gameplay.activeSimulationChunkCount, 0);
     assert.equal(stopped.gameplay.render.liveChunkGroups, 0);
     assert.equal(stopped.gameplay.render.sharedDisposed, true);
+    assert.equal(cloudRoot.parent, null);
+    assert.equal(distantWorld.parent, null);
     assert.equal(WebGLRenderer.instances[0].disposed, true);
     assert.deepEqual(environment.cancelledFrames, [2]);
   } finally {
@@ -381,11 +425,11 @@ test('pre-module bridge reports the first module error and suppresses duplicates
 test('pre-module bridge reports the bootstrap URL for a non-bubbling module resource load failure', () => {
   const fixture = loadPreModuleBridge();
   fixture.listeners.get('error')({
-    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w7-full-experience' },
+    target: { src: 'http://127.0.0.1:8021/src/infinite-world/sandbox-entry.js?v=w8-finite-parity' },
   });
   assert.match(fixture.hud.textContent, /起動失敗: MODULE_LOAD/);
   assert.match(fixture.hud.textContent, /Error: Module script failed to load/);
-  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w7-full-experience/);
+  assert.match(fixture.hud.textContent, /Source: http:\/\/127\.0\.0\.1:8021\/src\/infinite-world\/sandbox-entry\.js\?v=w8-finite-parity/);
 });
 
 test('pre-module bridge reports an unhandled rejection and disables itself after module start', () => {
@@ -436,7 +480,7 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
-  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w7-full-experience"><\/script>/);
+  assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w8-finite-parity"><\/script>/);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js')), true);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);

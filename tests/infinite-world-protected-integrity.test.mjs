@@ -34,11 +34,11 @@ test('the finite Gameplay World and protected settlement/civic modules equal the
 });
 
 test('every committed and worktree change stays inside the Infinite World allowlist', () => {
-  const committed = execFileSync('git', ['diff', '--name-only', `${BASELINE_COMMIT}..HEAD`], {
+  const committed = execFileSync('git', ['-c', 'core.quotepath=false', 'diff', '--name-only', `${BASELINE_COMMIT}..HEAD`], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trimEnd().split(/\r?\n/).filter(Boolean);
-  const status = execFileSync('git', ['status', '--porcelain=v1', '--untracked-files=all'], {
+  const status = execFileSync('git', ['-c', 'core.quotepath=false', 'status', '--porcelain=v1', '--untracked-files=all'], {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trimEnd().split(/\r?\n/).filter(Boolean);
@@ -49,6 +49,7 @@ test('every committed and worktree change stays inside the Infinite World allowl
   assert.ok(changedPaths.length > 0);
   for (const path of changedPaths) {
     const allowed = path === 'tests/destruction-feel-regression.test.mjs'
+      || path === 'ゲーム起動.bat'
       || path === 'infinite-world-sandbox.html'
       || path.startsWith('src/infinite-world/')
       || path.startsWith('tests/infinite-world-')

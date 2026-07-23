@@ -5,6 +5,9 @@ import {
   BOMB_DAMAGE_RADIUS,
   BOMB_PUSH_RADIUS,
   BOSS_HP,
+  BOSS_SEGMENT_COUNT,
+  BOSS_RAGE_HP_RATIO,
+  BOSS_HYPERRAGE_HP_RATIO,
   BOSS_BODY_CONTACT_DAMAGE,
   BOSS_BODY_CONTACT_RANGE,
   BOSS_CHARGE_DAMAGE,
@@ -26,6 +29,7 @@ import {
   PLAYER_MAX_HP,
   SAVE_VERSION,
   TANK_APPROACH_DIST,
+  TANK_BODY_TURN_SPEED,
   TANK_BULLET_DAMAGE,
   TANK_BULLET_HIT_RADIUS,
   TANK_BULLET_LIFE,
@@ -35,10 +39,15 @@ import {
   TANK_FIRE_INTERVAL_BASE,
   TANK_FIRE_INTERVAL_MIN,
   TANK_FIRE_INTERVAL_SCORE_DIVISOR,
+  TANK_GUN_PITCH_SPEED,
   TANK_HP,
   TANK_MOVE_SPEED,
   TANK_RADIUS,
   TANK_SCORE_VALUE,
+  TANK_STUCK_AVOID_TIMER,
+  TANK_STUCK_CHECK_INTERVAL,
+  TANK_STUCK_DIST_THRESHOLD_SQ,
+  TANK_TURRET_TURN_SPEED,
 } from '../constants.js';
 import {
   INITIAL_SCALE_STAGE_ID,
@@ -57,10 +66,23 @@ export const W6_GAMEPLAY_SCHEMA = 'w6-infinite-gameplay-1';
 export const W6_SAVE_SCHEMA = 'w6-infinite-world-save-1';
 export const W6_SAVE_ENVELOPE_SCHEMA = 'w6-infinite-world-save-envelope-1';
 export const W6_SAVE_VERSION = SAVE_VERSION;
-export const W7_GAMEPLAY_SCHEMA = 'w7-infinite-full-experience-1';
-export const W7_SAVE_SCHEMA = 'w7-infinite-world-save-2';
-export const W7_SAVE_ENVELOPE_SCHEMA = 'w7-infinite-world-save-envelope-2';
-export const W7_SAVE_SCHEMA_VERSION = 2;
+export const W7_LEGACY_GAMEPLAY_SCHEMA = 'w7-infinite-full-experience-1';
+export const W7_LEGACY_SAVE_SCHEMA = 'w7-infinite-world-save-2';
+export const W7_LEGACY_SAVE_ENVELOPE_SCHEMA = 'w7-infinite-world-save-envelope-2';
+export const W7_LEGACY_SAVE_SCHEMA_VERSION = 2;
+export const W8_LEGACY_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-1';
+export const W8_LEGACY_SAVE_SCHEMA = 'w8-infinite-world-save-3';
+export const W8_LEGACY_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-3';
+export const W8_LEGACY_SAVE_SCHEMA_VERSION = 3;
+export const W8_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-2';
+export const W8_SAVE_SCHEMA = 'w8-infinite-world-save-4';
+export const W8_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-4';
+export const W8_SAVE_SCHEMA_VERSION = 4;
+// Kept as source-compatible aliases for W7 callers. The formal output is W8/schema v4.
+export const W7_GAMEPLAY_SCHEMA = W8_GAMEPLAY_SCHEMA;
+export const W7_SAVE_SCHEMA = W8_SAVE_SCHEMA;
+export const W7_SAVE_ENVELOPE_SCHEMA = W8_SAVE_ENVELOPE_SCHEMA;
+export const W7_SAVE_SCHEMA_VERSION = W8_SAVE_SCHEMA_VERSION;
 export const W6_INITIAL_SCALE_STAGE_ID = INITIAL_SCALE_STAGE_ID;
 export const W6_PLAYER_MAX_HP = PLAYER_MAX_HP;
 
@@ -99,6 +121,28 @@ export const W7_CORE_COMBAT_CONTRACT = Object.freeze({
   }),
 });
 
+export const W8_TANK_LIFECYCLE_CONTRACT = Object.freeze({
+  bodyTurnRadiansPerFrame: TANK_BODY_TURN_SPEED,
+  turretTurnRadiansPerFrame: TANK_TURRET_TURN_SPEED,
+  gunPitchRadiansPerFrame: TANK_GUN_PITCH_SPEED,
+  stuckCheckSeconds: TANK_STUCK_CHECK_INTERVAL,
+  stuckDistanceThresholdMetersSquared: TANK_STUCK_DIST_THRESHOLD_SQ / (FINITE_WORLD_UNITS_PER_METER ** 2),
+  stuckAvoidSeconds: TANK_STUCK_AVOID_TIMER,
+  lineOfSightClearanceMeters: finiteWorldUnitsToMeters(20),
+  baseSpawnRangeMeters: finiteWorldUnitsToMeters(5_800),
+  baseSpawnScatterMeters: finiteWorldUnitsToMeters(400),
+  fallbackMinimumScore: 2_500,
+  fallbackMinimumDistanceMeters: finiteWorldUnitsToMeters(2_000),
+  fallbackMaximumDistanceMeters: finiteWorldUnitsToMeters(2_800),
+  spawnChanceBasePerFrame: 0.012,
+  spawnChanceMaximumBonusPerFrame: 0.028,
+  spawnChanceScoreFactor: 0.000003,
+  normalTankBaseLimit: 4,
+  bossTankLimit: 2,
+  tankLimitMaximum: 10,
+  tankLimitScoreDivisor: 6_000,
+});
+
 export const W7_NUCLEAR_CONTRACT = Object.freeze({
   allowedScaleStageId: 'MAX',
   chargeThresholdMs: CHARGE_THRESHOLD,
@@ -124,6 +168,45 @@ export const W7_MANUAL_BOSS_CONTRACT = Object.freeze({
   bodyContactDamage: BOSS_BODY_CONTACT_DAMAGE,
   playerKnockbackDecay: BOSS_PLAYER_KNOCKBACK_DECAY,
 });
+
+export const W8_COMBAT_COMMAND_SCHEMA = 'combat-command-1';
+export const W8_PRESENTATION_EVENT_SCHEMA = 'combat-presentation-event-1';
+export const W8_COMBAT_COMMAND_TYPES = Object.freeze({
+  LEFT: 'left-claw',
+  RIGHT: 'right-claw',
+  BOTH: 'both-claws',
+  CHARGE_START: 'charge-start',
+  CHARGE_RELEASE: 'charge-release',
+});
+
+export const W8_BOSS_CONTRACT = Object.freeze({
+  naturalSpawnScore: 35_000,
+  nextSpawnScoreDelta: 45_000,
+  segmentCount: BOSS_SEGMENT_COUNT,
+  rageHpRatio: BOSS_RAGE_HP_RATIO,
+  hyperRageHpRatio: BOSS_HYPERRAGE_HP_RATIO,
+  behaviorStates: Object.freeze(['slither', 'sweep', 'charge', 'dig', 'breach', 'recover']),
+});
+
+export function createCombatCommand(type, {
+  issuedAt = globalThis.performance?.now?.() ?? Date.now(),
+  airborne = false,
+  chargeMs = 0,
+} = {}) {
+  if (!Object.values(W8_COMBAT_COMMAND_TYPES).includes(type)) {
+    throw new RangeError(`unsupported CombatCommand: ${type}`);
+  }
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(chargeMs) || chargeMs < 0) {
+    throw new TypeError('CombatCommand timing must be finite and non-negative');
+  }
+  return Object.freeze({
+    schemaVersion: W8_COMBAT_COMMAND_SCHEMA,
+    type,
+    issuedAt,
+    airborne: airborne === true,
+    chargeMs,
+  });
+}
 
 export const W6_ENTITY_CONTRACTS = Object.freeze({
   human: Object.freeze({

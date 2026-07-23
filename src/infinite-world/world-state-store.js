@@ -10,9 +10,18 @@ import {
   W6_SAVE_VERSION,
   W6_STATIC_TARGET_CONTRACTS,
   W7_GAMEPLAY_SCHEMA,
+  W7_LEGACY_GAMEPLAY_SCHEMA,
+  W7_LEGACY_SAVE_ENVELOPE_SCHEMA,
+  W7_LEGACY_SAVE_SCHEMA,
+  W7_LEGACY_SAVE_SCHEMA_VERSION,
   W7_SAVE_ENVELOPE_SCHEMA,
   W7_SAVE_SCHEMA,
   W7_SAVE_SCHEMA_VERSION,
+  W8_BOSS_CONTRACT,
+  W8_LEGACY_GAMEPLAY_SCHEMA,
+  W8_LEGACY_SAVE_ENVELOPE_SCHEMA,
+  W8_LEGACY_SAVE_SCHEMA,
+  W8_LEGACY_SAVE_SCHEMA_VERSION,
   createW6PlayerState,
   isW6ScaleStageId,
 } from './gameplay-contract.js';
@@ -32,6 +41,50 @@ const DEFAULT_EXPERIENCE_STATE = Object.freeze({
     cameraShake: 1,
   }),
 });
+const DEFAULT_COMBAT_PROGRESS = Object.freeze({
+  nextBossScore: W8_BOSS_CONTRACT.naturalSpawnScore,
+  bossesDefeated: 0,
+  attacksIssued: 0,
+  damageDealt: 0,
+});
+
+function createDefaultBossBehavior() {
+  return {
+    phase: 'slither', phaseClock: 0, rage: false, hyperRage: false,
+    breakStage: 0, verticalOffset: 0, verticalVelocity: 0,
+    targetX: 0, targetZ: 0, acidSequence: 0,
+    segmentHp: Array.from({ length: W8_BOSS_CONTRACT.segmentCount }, () => 1),
+  };
+}
+
+function validateCombatProgress(value = DEFAULT_COMBAT_PROGRESS) {
+  return {
+    nextBossScore: nonNegative(value.nextBossScore, 'combatProgress.nextBossScore'),
+    bossesDefeated: nonNegativeInteger(value.bossesDefeated, 'combatProgress.bossesDefeated'),
+    attacksIssued: nonNegativeInteger(value.attacksIssued, 'combatProgress.attacksIssued'),
+    damageDealt: nonNegative(value.damageDealt, 'combatProgress.damageDealt'),
+  };
+}
+
+function validateBossBehavior(value = createDefaultBossBehavior()) {
+  if (!W8_BOSS_CONTRACT.behaviorStates.includes(value.phase)) throw new RangeError('unsupported Boss phase');
+  if (!Array.isArray(value.segmentHp) || value.segmentHp.length !== W8_BOSS_CONTRACT.segmentCount) {
+    throw new TypeError('Boss segment state is incomplete');
+  }
+  return {
+    phase: value.phase,
+    phaseClock: nonNegative(value.phaseClock, 'boss.phaseClock'),
+    rage: value.rage === true,
+    hyperRage: value.hyperRage === true,
+    breakStage: integerInRange(value.breakStage, 0, 3, 'boss.breakStage'),
+    verticalOffset: finite(value.verticalOffset, 'boss.verticalOffset'),
+    verticalVelocity: finite(value.verticalVelocity, 'boss.verticalVelocity'),
+    targetX: finite(value.targetX, 'boss.targetX'),
+    targetZ: finite(value.targetZ, 'boss.targetZ'),
+    acidSequence: nonNegativeInteger(value.acidSequence, 'boss.acidSequence'),
+    segmentHp: value.segmentHp.map((hp, index) => numberInRange(hp, 0, 1, `boss.segmentHp[${index}]`)),
+  };
+}
 
 function finite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
@@ -40,6 +93,18 @@ function finite(value, name) {
 
 function nonNegative(value, name) {
   if (!Number.isFinite(value) || value < 0) throw new TypeError(`${name} must be non-negative`);
+  return value;
+}
+
+function nonNegativeInteger(value, name) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new TypeError(`${name} must be a non-negative integer`);
+  return value;
+}
+
+function integerInRange(value, minimum, maximum, name) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} is outside its supported integer range`);
+  }
   return value;
 }
 
@@ -79,6 +144,24 @@ function validateExperience(experience = DEFAULT_EXPERIENCE_STATE) {
   };
 }
 
+function migrateTankLifecycleState(record, { spawned = record?.alive === true } = {}) {
+  if (record?.type !== 'tank') return record;
+  return {
+    ...record,
+    spawned: record.spawned ?? spawned,
+    baseX: record.baseX ?? record.x,
+    baseZ: record.baseZ ?? record.z,
+    lastShotAtMs: record.lastShotAtMs ?? 0,
+    gunPitch: record.gunPitch ?? 0,
+    stuckCheckClock: record.stuckCheckClock ?? 0,
+    stuckRemainingSeconds: record.stuckRemainingSeconds ?? 0,
+    avoidAngle: record.avoidAngle ?? record.rotationY ?? 0,
+    lastX: record.lastX ?? record.x,
+    lastZ: record.lastZ ?? record.z,
+    aiState: record.aiState || (record.spawned ?? spawned ? 'acquire' : 'reserve'),
+  };
+}
+
 function migrateW6SaveSnapshot(snapshot, { worldSeed }) {
   if (snapshot?.schemaVersion !== W6_SAVE_SCHEMA
     || snapshot?.gameplaySchemaVersion !== W6_GAMEPLAY_SCHEMA
@@ -100,11 +183,52 @@ function migrateW6SaveSnapshot(snapshot, { worldSeed }) {
     activeScaleStageId: snapshot.activeScaleStageId,
     player: snapshot.player,
     featureDamage: snapshot.featureDamage,
-    entityStates,
+    entityStates: (entityStates ?? []).map(record => migrateTankLifecycleState(record)),
     manualBossStableId,
     manualBossSequence: manualBossStableId ? (snapshot.manualBossSequence ?? 1) : 0,
     nuclearCooldownMs: snapshot.nuclearCooldownMs ?? 0,
     experience: structuredClone(DEFAULT_EXPERIENCE_STATE),
+    developerTools: false,
+    combatProgress: structuredClone(DEFAULT_COMBAT_PROGRESS),
+    tankReinforcementSequence: 0,
+    gameplayTimeMs: 0,
+  };
+}
+
+function migrateW7SaveSnapshot(snapshot) {
+  if (snapshot?.schemaVersion !== W7_LEGACY_SAVE_SCHEMA
+    || snapshot?.schemaVersionNumber !== W7_LEGACY_SAVE_SCHEMA_VERSION
+    || snapshot?.gameplaySchemaVersion !== W7_LEGACY_GAMEPLAY_SCHEMA) {
+    throw new Error('unsupported W7 Infinite World save schema or version');
+  }
+  return {
+    ...structuredClone(snapshot),
+    schemaVersion: W7_SAVE_SCHEMA,
+    schemaVersionNumber: W7_SAVE_SCHEMA_VERSION,
+    gameplaySchemaVersion: W7_GAMEPLAY_SCHEMA,
+    developerTools: snapshot.developerTools === true,
+    combatProgress: structuredClone(snapshot.combatProgress ?? DEFAULT_COMBAT_PROGRESS),
+    tankReinforcementSequence: snapshot.tankReinforcementSequence ?? 0,
+    entityStates: (snapshot.entityStates ?? []).map(record => record.type === 'boss'
+      ? { ...record, bossBehavior: record.bossBehavior ?? createDefaultBossBehavior(), aiState: record.aiState || 'slither' }
+      : migrateTankLifecycleState(record)),
+    gameplayTimeMs: snapshot.gameplayTimeMs ?? 0,
+  };
+}
+
+function migrateW8SaveSnapshot(snapshot) {
+  if (snapshot?.schemaVersion !== W8_LEGACY_SAVE_SCHEMA
+    || snapshot?.schemaVersionNumber !== W8_LEGACY_SAVE_SCHEMA_VERSION
+    || snapshot?.gameplaySchemaVersion !== W8_LEGACY_GAMEPLAY_SCHEMA) {
+    throw new Error('unsupported previous W8 Infinite World save schema or version');
+  }
+  return {
+    ...structuredClone(snapshot),
+    schemaVersion: W7_SAVE_SCHEMA,
+    schemaVersionNumber: W7_SAVE_SCHEMA_VERSION,
+    gameplaySchemaVersion: W7_GAMEPLAY_SCHEMA,
+    gameplayTimeMs: snapshot.gameplayTimeMs ?? 0,
+    entityStates: (snapshot.entityStates ?? []).map(record => migrateTankLifecycleState(record)),
   };
 }
 
@@ -179,6 +303,25 @@ function validateEntityStates(records) {
       aiState: requiredString(record.aiState, 'entityState.aiState'),
       aiClock: nonNegative(record.aiClock, 'entityState.aiClock'),
     };
+    if (type === 'boss') validated.bossBehavior = validateBossBehavior(record.bossBehavior);
+    if (type === 'tank') {
+      validated.reinforcementSequence = nonNegativeInteger(record.reinforcementSequence ?? 0, 'tank.reinforcementSequence');
+      validated.fireSequence = nonNegativeInteger(record.fireSequence ?? 0, 'tank.fireSequence');
+      validated.turretRotationY = finite(record.turretRotationY ?? record.rotationY, 'tank.turretRotationY');
+      validated.spawned = record.spawned === true;
+      validated.baseX = finite(record.baseX ?? record.x, 'tank.baseX');
+      validated.baseZ = finite(record.baseZ ?? record.z, 'tank.baseZ');
+      validated.lastShotAtMs = nonNegative(record.lastShotAtMs ?? 0, 'tank.lastShotAtMs');
+      validated.gunPitch = finite(record.gunPitch ?? 0, 'tank.gunPitch');
+      validated.stuckCheckClock = nonNegative(record.stuckCheckClock ?? 0, 'tank.stuckCheckClock');
+      validated.stuckRemainingSeconds = nonNegative(record.stuckRemainingSeconds ?? 0, 'tank.stuckRemainingSeconds');
+      validated.avoidAngle = finite(record.avoidAngle ?? record.rotationY, 'tank.avoidAngle');
+      validated.lastX = finite(record.lastX ?? record.x, 'tank.lastX');
+      validated.lastZ = finite(record.lastZ ?? record.z, 'tank.lastZ');
+    }
+    if (type === 'human') {
+      validated.knockdownSeconds = nonNegative(record.knockdownSeconds ?? 0, 'human.knockdownSeconds');
+    }
     if (result.has(stableId)) throw new Error(`duplicate entity Stable ID: ${stableId}`);
     result.set(stableId, validated);
   }
@@ -196,6 +339,10 @@ export class InfiniteWorldState {
     this.manualBossStableId = null;
     this.manualBossSequence = 0;
     this.nuclearCooldownMs = 0;
+    this.developerTools = false;
+    this.combatProgress = validateCombatProgress(DEFAULT_COMBAT_PROGRESS);
+    this.tankReinforcementSequence = 0;
+    this.gameplayTimeMs = 0;
     this.experience = validateExperience(DEFAULT_EXPERIENCE_STATE);
     this.revision = 0;
   }
@@ -221,6 +368,33 @@ export class InfiniteWorldState {
       hudHidden: next.hudHidden,
       settings: Object.freeze({ ...next.settings }),
     });
+  }
+
+  setDeveloperTools(enabled) {
+    this.developerTools = enabled === true;
+    this.revision += 1;
+    return this.developerTools;
+  }
+
+  updateCombatProgress(patch = {}) {
+    this.combatProgress = validateCombatProgress({ ...this.combatProgress, ...patch });
+    this.revision += 1;
+    return Object.freeze({ ...this.combatProgress });
+  }
+
+  nextTankReinforcementSequence() {
+    this.tankReinforcementSequence += 1;
+    this.revision += 1;
+    return this.tankReinforcementSequence;
+  }
+
+  tickGameplayTime(deltaMilliseconds) {
+    const delta = nonNegative(deltaMilliseconds, 'gameplay time delta');
+    if (delta > 0) {
+      this.gameplayTimeMs += delta;
+      this.revision += 1;
+    }
+    return this.gameplayTimeMs;
   }
 
   updatePlayer(patch) {
@@ -258,6 +432,9 @@ export class InfiniteWorldState {
     this.manualBossStableId = null;
     this.manualBossSequence = 0;
     this.nuclearCooldownMs = 0;
+    this.combatProgress = validateCombatProgress(DEFAULT_COMBAT_PROGRESS);
+    this.tankReinforcementSequence = 0;
+    this.gameplayTimeMs = 0;
     this.revision += 1;
     return this.snapshot();
   }
@@ -296,6 +473,23 @@ export class InfiniteWorldState {
       aiState: requiredString(descriptor.aiState ?? 'idle', 'entity aiState'),
       aiClock: 0,
     };
+    if (type === 'boss') state.bossBehavior = validateBossBehavior(descriptor.bossBehavior);
+    if (type === 'tank') {
+      state.reinforcementSequence = nonNegativeInteger(descriptor.reinforcementSequence ?? 0, 'tank reinforcementSequence');
+      state.fireSequence = nonNegativeInteger(descriptor.fireSequence ?? 0, 'tank fireSequence');
+      state.turretRotationY = finite(descriptor.turretRotationY ?? state.rotationY, 'tank turretRotationY');
+      state.spawned = descriptor.spawned === true;
+      state.baseX = finite(descriptor.baseX ?? state.x, 'tank baseX');
+      state.baseZ = finite(descriptor.baseZ ?? state.z, 'tank baseZ');
+      state.lastShotAtMs = nonNegative(descriptor.lastShotAtMs ?? 0, 'tank lastShotAtMs');
+      state.gunPitch = finite(descriptor.gunPitch ?? 0, 'tank gunPitch');
+      state.stuckCheckClock = nonNegative(descriptor.stuckCheckClock ?? 0, 'tank stuckCheckClock');
+      state.stuckRemainingSeconds = nonNegative(descriptor.stuckRemainingSeconds ?? 0, 'tank stuckRemainingSeconds');
+      state.avoidAngle = finite(descriptor.avoidAngle ?? state.rotationY, 'tank avoidAngle');
+      state.lastX = finite(descriptor.lastX ?? state.x, 'tank lastX');
+      state.lastZ = finite(descriptor.lastZ ?? state.z, 'tank lastZ');
+    }
+    if (type === 'human') state.knockdownSeconds = nonNegative(descriptor.knockdownSeconds ?? 0, 'human knockdownSeconds');
     this.entityStates.set(stableId, state);
     this.revision += 1;
     return state;
@@ -390,12 +584,20 @@ export class InfiniteWorldState {
       manualBossSequence: this.manualBossSequence,
       nuclearCooldownMs: this.nuclearCooldownMs,
       experience: structuredClone(this.experience),
+      developerTools: this.developerTools,
+      combatProgress: structuredClone(this.combatProgress),
+      tankReinforcementSequence: this.tankReinforcementSequence,
+      gameplayTimeMs: this.gameplayTimeMs,
     };
   }
 
   restoreSaveSnapshot(snapshot) {
     const candidate = snapshot?.schemaVersion === W6_SAVE_SCHEMA
       ? migrateW6SaveSnapshot(snapshot, { worldSeed: this.worldSeed })
+      : snapshot?.schemaVersion === W7_LEGACY_SAVE_SCHEMA
+        ? migrateW7SaveSnapshot(snapshot)
+        : snapshot?.schemaVersion === W8_LEGACY_SAVE_SCHEMA
+          ? migrateW8SaveSnapshot(snapshot)
       : structuredClone(snapshot);
     if (candidate?.schemaVersion !== W7_SAVE_SCHEMA
       || candidate?.schemaVersionNumber !== W7_SAVE_SCHEMA_VERSION
@@ -419,6 +621,13 @@ export class InfiniteWorldState {
     const manualBossSequence = candidate.manualBossSequence ?? 0;
     const nuclearCooldownMs = nonNegative(candidate.nuclearCooldownMs ?? 0, 'nuclearCooldownMs');
     const experience = validateExperience(candidate.experience);
+    if (typeof candidate.developerTools !== 'boolean') throw new TypeError('developerTools must be boolean');
+    const combatProgress = validateCombatProgress(candidate.combatProgress);
+    const tankReinforcementSequence = nonNegativeInteger(
+      candidate.tankReinforcementSequence,
+      'tankReinforcementSequence',
+    );
+    const gameplayTimeMs = nonNegative(candidate.gameplayTimeMs ?? 0, 'gameplayTimeMs');
     if (!Number.isSafeInteger(manualBossSequence) || manualBossSequence < 0) {
       throw new TypeError('manualBossSequence must be a non-negative integer');
     }
@@ -438,6 +647,10 @@ export class InfiniteWorldState {
     this.manualBossSequence = manualBossSequence;
     this.nuclearCooldownMs = nuclearCooldownMs;
     this.experience = experience;
+    this.developerTools = candidate.developerTools;
+    this.combatProgress = combatProgress;
+    this.tankReinforcementSequence = tankReinforcementSequence;
+    this.gameplayTimeMs = gameplayTimeMs;
     this.revision += 1;
     return this.snapshot();
   }
@@ -463,6 +676,10 @@ export class InfiniteWorldState {
         hudHidden: this.experience.hudHidden,
         settings: Object.freeze({ ...this.experience.settings }),
       }),
+      developerTools: this.developerTools,
+      combatProgress: Object.freeze({ ...this.combatProgress }),
+      tankReinforcementSequence: this.tankReinforcementSequence,
+      gameplayTimeMs: this.gameplayTimeMs,
       revision: this.revision,
     });
   }
@@ -478,6 +695,10 @@ export async function encodeInfiniteWorldSave(snapshot) {
     ? W7_SAVE_ENVELOPE_SCHEMA
     : payload?.schemaVersion === W6_SAVE_SCHEMA
       ? W6_SAVE_ENVELOPE_SCHEMA
+      : payload?.schemaVersion === W7_LEGACY_SAVE_SCHEMA
+        ? W7_LEGACY_SAVE_ENVELOPE_SCHEMA
+        : payload?.schemaVersion === W8_LEGACY_SAVE_SCHEMA
+          ? W8_LEGACY_SAVE_ENVELOPE_SCHEMA
       : null;
   if (!schemaVersion) throw new Error('unsupported Infinite World save payload schema');
   return JSON.stringify({
@@ -498,6 +719,10 @@ export async function decodeInfiniteWorldSave(serialized, { worldSeedHash } = {}
     ? W6_SAVE_SCHEMA
     : envelope?.schemaVersion === W7_SAVE_ENVELOPE_SCHEMA
       ? W7_SAVE_SCHEMA
+      : envelope?.schemaVersion === W7_LEGACY_SAVE_ENVELOPE_SCHEMA
+        ? W7_LEGACY_SAVE_SCHEMA
+        : envelope?.schemaVersion === W8_LEGACY_SAVE_ENVELOPE_SCHEMA
+          ? W8_LEGACY_SAVE_SCHEMA
       : null;
   if (!matchingPayloadSchema || typeof envelope?.checksum !== 'string' || !envelope.payload
     || envelope.payload.schemaVersion !== matchingPayloadSchema) {
@@ -511,13 +736,51 @@ export async function decodeInfiniteWorldSave(serialized, { worldSeedHash } = {}
   return structuredClone(envelope.payload);
 }
 
+export function createBrowserSaveStorage({ indexedDB, legacyStorage = null } = {}) {
+  if (!indexedDB?.open) return legacyStorage;
+  const databasePromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open('KaniNingenInfiniteWorld', 1);
+    request.onupgradeneeded = () => {
+      if (!request.result.objectStoreNames.contains('saves')) request.result.createObjectStore('saves');
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'));
+  });
+  const transact = async (mode, operation) => {
+    const database = await databasePromise;
+    return new Promise((resolve, reject) => {
+      const transaction = database.transaction('saves', mode);
+      const request = operation(transaction.objectStore('saves'));
+      request.onsuccess = () => resolve(request.result ?? null);
+      request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'));
+      transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'));
+    });
+  };
+  return Object.freeze({
+    diagnosticStage: 'indexeddb',
+    async getItem(key) {
+      const stored = await transact('readonly', store => store.get(key));
+      if (stored !== null && stored !== undefined) return stored;
+      const legacy = legacyStorage?.getItem?.(key) ?? null;
+      if (legacy !== null) await transact('readwrite', store => store.put(legacy, key));
+      return legacy;
+    },
+    async setItem(key, value) {
+      await transact('readwrite', store => store.put(value, key));
+    },
+  });
+}
+
 export class InfiniteWorldSaveStore {
-  constructor({ storage, worldSeedHash } = {}) {
+  constructor({ storage, worldSeedHash, measure = async (_stage, operation) => operation() } = {}) {
     if (storage && (typeof storage.getItem !== 'function' || typeof storage.setItem !== 'function')) {
       throw new TypeError('storage must implement getItem and setItem');
     }
     this.storage = storage ?? null;
+    this.storageDiagnosticStage = storage?.diagnosticStage ?? 'storage';
     this.worldSeedHash = requiredString(worldSeedHash, 'worldSeedHash');
+    if (typeof measure !== 'function') throw new TypeError('measure must be a function');
+    this.measure = measure;
     this.key = `KaniNingen:InfiniteWorld:${this.worldSeedHash}`;
     this.counts = { saved: 0, loaded: 0, missing: 0, failed: 0 };
   }
@@ -526,9 +789,12 @@ export class InfiniteWorldSaveStore {
     if (!(state instanceof InfiniteWorldState) || state.worldSeedHash !== this.worldSeedHash) {
       throw new TypeError('matching InfiniteWorldState is required');
     }
-    const serialized = await encodeInfiniteWorldSave(state.createSaveSnapshot());
+    const serialized = await this.measure(
+      'save-serialization',
+      () => encodeInfiniteWorldSave(state.createSaveSnapshot()),
+    );
     try {
-      this.storage?.setItem(this.key, serialized);
+      await this.measure(`save-${this.storageDiagnosticStage}`, () => this.storage?.setItem(this.key, serialized));
       this.counts.saved += 1;
       return serialized;
     } catch (error) {
@@ -540,7 +806,7 @@ export class InfiniteWorldSaveStore {
   async loadSnapshot() {
     let serialized;
     try {
-      serialized = this.storage?.getItem(this.key) ?? null;
+      serialized = await this.measure(`load-${this.storageDiagnosticStage}`, () => this.storage?.getItem(this.key) ?? null);
     } catch (error) {
       this.counts.failed += 1;
       throw error;
@@ -550,7 +816,10 @@ export class InfiniteWorldSaveStore {
       return null;
     }
     try {
-      const snapshot = await decodeInfiniteWorldSave(serialized, { worldSeedHash: this.worldSeedHash });
+      const snapshot = await this.measure(
+        'load-serialization',
+        () => decodeInfiniteWorldSave(serialized, { worldSeedHash: this.worldSeedHash }),
+      );
       this.counts.loaded += 1;
       return snapshot;
     } catch (error) {
