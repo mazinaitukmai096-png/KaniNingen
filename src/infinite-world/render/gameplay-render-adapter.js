@@ -762,7 +762,11 @@ export class GameplayRenderAdapter {
     if (this.disposed) return false;
     if (!state?.alive || state.spawned !== true) return this.removeReinforcement(state?.stableId);
     const loadedEntity = this.entityMeshes.get(state.stableId);
-    if (loadedEntity) loadedEntity.mesh.visible = false;
+    if (loadedEntity) {
+      this.removeReinforcement(state.stableId);
+      this.#positionMesh(loadedEntity.mesh, state, loadedEntity.entry);
+      return true;
+    }
     let entry = this.reinforcementMeshes.get(state.stableId);
     if (!entry) {
       const mesh = this.visualAssets.createEntityModel('tank');
@@ -806,6 +810,7 @@ export class GameplayRenderAdapter {
     const entry = { key, chunkX, chunkZ, group, entityIds: new Set() };
     this.#positionGroup(entry);
     for (const state of entityStates) {
+      this.removeReinforcement(state.stableId);
       if (this.entityMeshes.has(state.stableId)) throw new Error(`duplicate live gameplay Stable ID: ${state.stableId}`);
       const mesh = this.visualAssets.createEntityModel(state.type);
       mesh.name = `production-${state.type}`;
