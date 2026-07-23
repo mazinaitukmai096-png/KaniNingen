@@ -20,8 +20,11 @@ import {
   DEBUG_BOSS_SPAWN_DIST,
 } from '../src/constants.js';
 import {
+  W6_ENTITY_CONTRACTS,
   W7_MANUAL_BOSS_CONTRACT,
   W7_NUCLEAR_CONTRACT,
+  W8_COMBAT_COMMAND_TYPES,
+  createCombatCommand,
   finiteWorldUnitsToMeters,
 } from '../src/infinite-world/gameplay-contract.js';
 import {
@@ -44,7 +47,7 @@ class MemoryStorage {
 class FakeRenderer {
   constructor() {
     this.loaded = new Map(); this.entities = new Map(); this.manualBoss = null;
-    this.projectiles = []; this.effects = [];
+    this.reinforcements = new Map(); this.projectiles = []; this.effects = [];
   }
   async rebase(origin) { this.origin = { ...origin }; }
   async loadChunk(key, states) {
@@ -52,6 +55,13 @@ class FakeRenderer {
     for (const state of states) this.entities.set(state.stableId, { ...state });
   }
   syncEntity(state) { if (this.entities.has(state.stableId)) this.entities.set(state.stableId, { ...state }); }
+  syncReinforcement(state) {
+    if (!state?.alive || state.spawned !== true) return this.removeReinforcement(state?.stableId);
+    this.reinforcements.set(state.stableId, { ...state });
+    return true;
+  }
+  removeReinforcement(stableId) { return this.reinforcements.delete(stableId); }
+  clearReinforcements() { this.reinforcements.clear(); }
   syncManualBoss(state) { this.manualBoss = state?.alive ? { ...state } : null; }
   syncTransientCombat(projectiles, effects) {
     this.projectiles = projectiles.map(value => ({ ...value }));
@@ -64,11 +74,13 @@ class FakeRenderer {
   snapshot() {
     return {
       liveChunkGroups: this.loaded.size, liveEntityMeshes: this.entities.size,
+      liveReinforcementMeshes: this.reinforcements.size,
       liveManualBossMeshes: this.manualBoss ? 1 : 0,
     };
   }
   async shutdown() {
     this.loaded.clear(); this.entities.clear(); this.manualBoss = null;
+    this.reinforcements.clear();
     this.projectiles = []; this.effects = [];
   }
 }
@@ -86,6 +98,45 @@ function syntheticChunk(chunkX, chunkZ) {
       worldPosition: { x, y: 0, z }, owningChunkCoordinate: { x: chunkX, z: chunkZ },
     }],
     settlementReferences: [],
+  };
+}
+
+function emptyChunk(chunkX, chunkZ) {
+  return {
+    chunkX, chunkZ,
+    vegetationCandidates: [], rockCandidates: [], settlementFeatures: [],
+    settlementReferences: [], settlementLandmarks: [], ambientDetails: [],
+    streetDetails: [], waterSurfaces: [],
+  };
+}
+
+function canonicalMilitaryChunk(chunkX, chunkZ) {
+  if (chunkX !== 0 || chunkZ !== 0) return emptyChunk(chunkX, chunkZ);
+  const settlementId = 'settlement-v1:atomic-tank-owner';
+  return {
+    ...emptyChunk(chunkX, chunkZ),
+    settlementReferences: [{
+      settlementId,
+      townType: 'military',
+      settlementType: 'RURAL',
+      center: { x: 8, z: 8 },
+    }],
+    settlementLandmarks: [{
+      schemaVersion: 'w8-settlement-landmark-1',
+      stableId: 'wf1:settlement-landmark:atomic-tank-base',
+      parentSettlementId: settlementId,
+      settlementType: 'RURAL',
+      townType: 'military',
+      landmarkType: 'militaryBase',
+      worldPosition: { x: 8, y: 0, z: 8 },
+      rotationY: 0,
+      widthMeters: 11,
+      heightMeters: 6,
+      depthMeters: 11,
+      destructible: true,
+      owningChunkCoordinate: { x: 0, z: 0 },
+      logicalLocal: { x: 8, z: 8 },
+    }],
   };
 }
 
@@ -169,6 +220,85 @@ test('Nuclear destruction is independent of active rendered and Simulation Chunk
   assert.equal(inactive.featureRenderer.refreshes, 1);
   await inactive.runtime.shutdown();
   await active.runtime.shutdown();
+});
+
+test('Atomic destroys moved base-slot and fallback Tanks through active occurrences without Tank score', async () => {
+  const fixture = createRuntime({ query: canonicalMilitaryChunk });
+  await fixture.runtime.syncActiveChunks({
+    renderedKeys: ['0,0'],
+    getChunkData: canonicalMilitaryChunk,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+  });
+
+  const baseTank = [...fixture.state.entityStates.values()].find(entity =>
+    entity.type === 'tank' && entity.reinforcementSequence === 0);
+  assert.ok(baseTank);
+  assert.deepEqual({ x: baseTank.x, z: baseTank.z, owner: baseTank.ownerChunkKey }, {
+    x: 8, z: 8, owner: '0,0',
+  });
+  Object.assign(baseTank, {
+    alive: true,
+    hp: baseTank.maxHp,
+    spawned: true,
+    aiState: 'acquire',
+    lastShotAtMs: 0,
+  });
+  fixture.runtime.update({ deltaSeconds: 0, player: fixture.state.player });
+
+  Object.assign(baseTank, { x: 80, z: 8, lastX: 80, lastZ: 8 });
+  const reinforcementSequence = fixture.state.nextTankReinforcementSequence();
+  const fallbackTank = fixture.state.ensureEntity({
+    stableId: `wf1:tank:w8-atomic-fallback:${reinforcementSequence}`,
+    ownerChunkKey: '5,0',
+    type: 'tank',
+    maxHp: W6_ENTITY_CONTRACTS.tank.maxHp,
+    x: 81,
+    z: 8,
+    rotationY: 0,
+    aiState: 'engage',
+    spawned: true,
+    reinforcementSequence,
+    baseX: 81,
+    baseZ: 8,
+  });
+  fixture.runtime.clearTransientCombat();
+  await fixture.runtime.syncActiveChunks({
+    renderedKeys: ['5,0'],
+    getChunkData: canonicalMilitaryChunk,
+    renderOrigin: { renderOriginChunkX: 5, renderOriginChunkZ: 0 },
+  });
+  fixture.state.updatePlayer({ x: 80, z: 8, score: 777 });
+
+  assert.equal(baseTank.ownerChunkKey, '0,0');
+  assert.equal(fixture.renderer.loaded.has('0,0'), false);
+  assert.equal(fixture.runtime.snapshot().activeTankCount, 2);
+  assert.deepEqual([...fixture.renderer.reinforcements.keys()].sort(),
+    [baseTank.stableId, fallbackTank.stableId].sort());
+
+  const result = await fixture.runtime.executeCombatCommand(createCombatCommand(
+    W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE,
+    { airborne: true, chargeMs: W7_NUCLEAR_CONTRACT.chargeThresholdMs },
+  ));
+  assert.equal(result.accepted, true);
+  assert.equal(result.queriedChunkKeys.includes('0,0'), false);
+  assert.deepEqual(result.hitStableIds, [baseTank.stableId, fallbackTank.stableId].sort());
+  assert.deepEqual({ hp: baseTank.hp, alive: baseTank.alive, spawned: baseTank.spawned }, {
+    hp: 0, alive: false, spawned: false,
+  });
+  assert.equal(fixture.state.entityStates.has(baseTank.stableId), true);
+  assert.equal(fixture.state.entityStates.has(fallbackTank.stableId), false);
+  assert.equal(fixture.state.player.score, 777);
+  assert.equal(fixture.renderer.reinforcements.size, 0);
+  assert.equal(fixture.renderer.effects.filter(effect => effect.type === 'tank-destruction').length, 2);
+  assert.equal(fixture.renderer.effects.filter(effect => effect.type === 'nuclear-destruction').length, 1);
+  assert.deepEqual({
+    active: fixture.runtime.snapshot().activeTankCount,
+    fallback: fixture.runtime.snapshot().fallbackTankCount,
+    slots: fixture.runtime.snapshot().tankSlotCount,
+    owners: fixture.runtime.snapshot().tankOwnerRegistryCount,
+    destroyed: fixture.runtime.snapshot().counts.destroyedEntities,
+  }, { active: 0, fallback: 0, slots: 1, owners: 1, destroyed: 2 });
+  await fixture.runtime.shutdown();
 });
 
 test('Nuclear rejects Scale, air-release and cooldown violations without partial state mutation', async () => {

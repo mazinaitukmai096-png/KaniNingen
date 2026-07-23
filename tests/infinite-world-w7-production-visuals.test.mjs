@@ -199,6 +199,44 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
 
   const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
   adapter.consumePresentationEvents([], { playerMarker: player });
+  const tankState = {
+    stableId: 'wf1:tank:w8-scale-suppression',
+    ownerChunkKey: '0,0',
+    type: 'tank',
+    x: 2,
+    z: 3,
+    rotationY: 0,
+    turretRotationY: 0,
+    gunPitch: 0,
+    groundY: 1,
+    groundPitch: 0,
+    groundRoll: 0,
+    alive: true,
+    spawned: true,
+  };
+  await adapter.loadChunk('0,0', [tankState]);
+  const loadedTankMesh = adapter.entityMeshes.get(tankState.stableId).mesh;
+  assert.equal(loadedTankMesh.visible, true);
+  adapter.syncEntity({ ...tankState, sandboxSuppressed: true });
+  assert.equal(loadedTankMesh.visible, false);
+  adapter.syncEntity({ ...tankState, sandboxSuppressed: false });
+  assert.equal(loadedTankMesh.visible, true);
+  adapter.syncReinforcement({
+    ...tankState,
+    stableId: 'wf1:tank:w8-scale-suppression-fallback',
+    sandboxSuppressed: true,
+  });
+  const fallbackTankMesh = adapter.reinforcementMeshes
+    .get('wf1:tank:w8-scale-suppression-fallback').mesh;
+  assert.equal(fallbackTankMesh.visible, false);
+  adapter.syncReinforcement({
+    ...tankState,
+    stableId: 'wf1:tank:w8-scale-suppression-fallback',
+    sandboxSuppressed: false,
+  });
+  assert.equal(fallbackTankMesh.visible, true);
+  adapter.removeReinforcement('wf1:tank:w8-scale-suppression-fallback');
+  await adapter.unloadChunk('0,0');
   assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
   assert.notEqual(parts.legs[0].rotation.x, 0);
   assert.equal(parts.visualRoot.position.y, 0);
@@ -220,10 +258,23 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(parts.visualRoot.position.y, 0);
 
   adapter.syncTransientCombat([{
-    id: 'tank-shot', ownerStableId: 'tank', type: 'tank-shell', x: 0, z: 0,
+    id: 'tank-shot', ownerStableId: 'tank', type: 'tank-shell', x: 1.25, y: 2.05, z: -3.5,
     directionX: 0, directionZ: 1, remainingSeconds: 1,
   }], []);
-  assert.ok(adapter.projectileMeshes.get('tank-shot').mesh.position.z > 0);
+  assert.deepEqual(
+    { ...adapter.projectileMeshes.get('tank-shot').mesh.position },
+    { x: 1.25 * adapter.unitsPerMeter, y: 2.05 * adapter.unitsPerMeter,
+      z: -3.5 * adapter.unitsPerMeter },
+  );
+  const tankShellMesh = adapter.projectileMeshes.get('tank-shot').mesh;
+  assert.equal(tankShellMesh.name, 'tank-projectile');
+  assert.equal(tankShellMesh.material, assets.materials.blood);
+  assert.equal(tankShellMesh.material.options.color, 0x7e1019);
+  assert.deepEqual(
+    { ...tankShellMesh.scale },
+    { x: 0.5 * adapter.unitsPerMeter, y: 0.5 * adapter.unitsPerMeter,
+      z: 0.5 * adapter.unitsPerMeter },
+  );
 
   adapter.consumePresentationEvents([{
     sequence: 41, type: 'nuclear-destruction', logicalPosition: { x: 0, z: 0 },
@@ -254,6 +305,91 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   });
   assert.equal(bossCollision.collided, true);
   assert.equal(bossCollision.stableId, 'manual-boss-camera');
+  await adapter.shutdown();
+  assets.dispose();
+});
+
+test('W8 Tank death presentation is mechanical, timed, persistent, and bounded', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  const event = (sequence, type, lifetimeSeconds, intensity) => ({
+    sequence,
+    type,
+    logicalPosition: { x: 2, y: 1.5, z: -3 },
+    direction: { x: 0, y: 0, z: 1 },
+    intensity,
+    lifetimeSeconds,
+    soundCue: null,
+  });
+
+  assert.equal(adapter.consumePresentationEvents([
+    event(1, 'tank-destruction', 4, 1.8),
+    event(2, 'tank-ruin', 15, 0.85),
+    event(3, 'tank-scar', 0, 1.75),
+  ]), 3);
+  adapter.updatePresentation(0);
+
+  let snapshot = adapter.snapshot();
+  assert.equal(snapshot.activePresentationEffectCount, 2);
+  assert.equal(snapshot.persistentTankScarCount, 1);
+  assert.equal(snapshot.effectInstancePools.debris.count, 4);
+  assert.equal(snapshot.effectInstancePools.spark.count, 6);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 3);
+  assert.equal(snapshot.effectInstancePools.smoke.count, 4);
+  assert.equal(snapshot.effectInstancePools.scorch.count, 2);
+  assert.equal(snapshot.effectInstancePools.blood.count, 0);
+
+  adapter.updatePresentation(4);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.activePresentationEffectCount, 1);
+  assert.equal(snapshot.effectInstancePools.debris.count, 0);
+  assert.equal(snapshot.effectInstancePools.spark.count, 0);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 3);
+  assert.equal(snapshot.effectInstancePools.smoke.count, 1);
+  assert.equal(snapshot.effectInstancePools.scorch.count, 1);
+  assert.equal(snapshot.effectInstancePools.blood.count, 0);
+
+  adapter.updatePresentation(11);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.activePresentationEffectCount, 0);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 0);
+  assert.equal(snapshot.effectInstancePools.smoke.count, 0);
+  assert.equal(snapshot.persistentTankScarCount, 1);
+  assert.equal(snapshot.effectInstancePools.scorch.count, 1);
+  adapter.updatePresentation(100);
+  assert.equal(adapter.snapshot().persistentTankScarCount, 1);
+  assert.equal(adapter.snapshot().effectInstancePools.scorch.count, 1);
+
+  adapter.consumePresentationEvents([
+    ...Array.from({ length: 60 }, (_, index) =>
+      event(100 + index, 'tank-scar', 0, 1.75)),
+    ...Array.from({ length: 40 }, (_, index) =>
+      event(200 + index, 'tank-ruin', 15, 0.85)),
+  ]);
+  adapter.updatePresentation(0);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.persistentTankScarCount, snapshot.tankScarLimit);
+  assert.equal(snapshot.tankScarLimit, 50);
+  assert.equal(snapshot.activePresentationEffectCount, snapshot.tankRuinLimit);
+  assert.equal(snapshot.tankRuinLimit, 30);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 90);
+  assert.equal(snapshot.presentationPoolCapacity <= snapshot.presentationPoolLimit, true);
+  assert.equal(
+    Object.values(snapshot.effectInstancePools)
+      .every(pool => pool.count <= pool.capacity),
+    true,
+  );
+
+  assert.equal(adapter.clearCombatPresentation(), true);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.activePresentationEffectCount, 0);
+  assert.equal(snapshot.persistentTankScarCount, 0);
+  assert.equal(
+    Object.values(snapshot.effectInstancePools).every(pool => pool.count === 0),
+    true,
+  );
+
   await adapter.shutdown();
   assets.dispose();
 });

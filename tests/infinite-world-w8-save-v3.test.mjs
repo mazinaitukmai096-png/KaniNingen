@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   W6_ENTITY_CONTRACTS,
+  W6_STATIC_TARGET_CONTRACTS,
   W8_GAMEPLAY_SCHEMA,
   W8_LEGACY_GAMEPLAY_SCHEMA,
   W8_LEGACY_SAVE_SCHEMA,
@@ -19,6 +20,18 @@ import {
 
 const worldSeed = 'W8 save seed';
 const worldSeedHash = `sha256:${'8'.repeat(64)}`;
+const SAVE_V4_FIELDS = [
+  'activeScaleStageId', 'combatProgress', 'developerTools', 'entityStates', 'experience',
+  'featureDamage', 'gameplaySchemaVersion', 'gameplayTimeMs', 'legacySaveVersion',
+  'manualBossSequence', 'manualBossStableId', 'nuclearCooldownMs', 'player', 'schemaVersion',
+  'schemaVersionNumber', 'tankReinforcementSequence', 'worldSeed', 'worldSeedHash',
+].sort();
+const TANK_SAVE_FIELDS = [
+  'aiClock', 'aiState', 'alive', 'avoidAngle', 'baseX', 'baseZ', 'fireSequence', 'gunPitch',
+  'hp', 'lastShotAtMs', 'lastX', 'lastZ', 'maxHp', 'ownerChunkKey',
+  'reinforcementSequence', 'rotationY', 'spawned', 'stableId', 'stuckCheckClock',
+  'stuckRemainingSeconds', 'turretRotationY', 'type', 'x', 'z',
+].sort();
 
 function bossRecord() {
   return {
@@ -36,9 +49,24 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   const tank = state.ensureEntity({
     stableId: 'wf1:tank:w8-save', ownerChunkKey: '0,0', type: 'tank',
     maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 7, z: 8, rotationY: 0.2,
-    aiState: 'acquire', spawned: true, lastShotAtMs: 4_000,
+    aiState: 'acquire', spawned: true, baseX: 6.5, baseZ: 8.5, lastShotAtMs: 4_000,
   });
-  tank.gunPitch = 0.15;
+  state.damageEntity(tank.stableId, 37);
+  Object.assign(tank, {
+    x: 7.25,
+    z: 8.75,
+    rotationY: -0.45,
+    turretRotationY: 0.85,
+    gunPitch: 0.15,
+    aiState: 'avoid',
+    aiClock: 1.75,
+    fireSequence: 9,
+    stuckCheckClock: 0.65,
+    stuckRemainingSeconds: 0.4,
+    avoidAngle: -1.2,
+    lastX: 7.1,
+    lastZ: 8.6,
+  });
   const boss = state.ensureEntity(bossRecord());
   boss.bossBehavior.phase = 'dig';
   boss.bossBehavior.phaseClock = 2.25;
@@ -51,6 +79,10 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   assert.equal(envelope.payload.schemaVersion, W8_SAVE_SCHEMA);
   assert.equal(envelope.payload.schemaVersionNumber, W8_SAVE_SCHEMA_VERSION);
   assert.equal(envelope.payload.gameplaySchemaVersion, W8_GAMEPLAY_SCHEMA);
+  assert.deepEqual(Object.keys(envelope.payload).sort(), SAVE_V4_FIELDS);
+  const savedTank = envelope.payload.entityStates.find(entity => entity.stableId === tank.stableId);
+  assert.deepEqual(Object.keys(savedTank).sort(), TANK_SAVE_FIELDS);
+  assert.equal(Object.keys(savedTank).length, 24);
 
   const restored = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
   restored.restoreSaveSnapshot(await decodeInfiniteWorldSave(serialized, { worldSeedHash }));
@@ -61,6 +93,118 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   assert.equal(restored.gameplayTimeMs, 4_250);
   assert.equal(restored.entityStates.get(tank.stableId).spawned, true);
   assert.equal(restored.entityStates.get(tank.stableId).lastShotAtMs, 4_000);
+  assert.deepEqual(restored.entityStates.get(tank.stableId), savedTank);
+});
+
+test('empty base Tank slots round-trip and legacy spawned dead slots hydrate as rearmable empties', () => {
+  const source = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  const slot = source.ensureEntity({
+    stableId: 'wf1:tank:w8-empty-slot', ownerChunkKey: '2,-1', type: 'tank',
+    maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 12, z: -4, rotationY: 0.3,
+    aiState: 'destroyed', spawned: true, reinforcementSequence: 0,
+  });
+  source.damageEntity(slot.stableId, slot.maxHp);
+  const legacySpawnedDead = source.createSaveSnapshot();
+  assert.equal(legacySpawnedDead.entityStates[0].spawned, true);
+
+  const restored = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  restored.restoreSaveSnapshot(legacySpawnedDead);
+  const emptySlot = restored.entityStates.get(slot.stableId);
+  assert.equal(emptySlot.hp, 0);
+  assert.equal(emptySlot.alive, false);
+  assert.equal(emptySlot.spawned, false);
+  assert.equal(restored.snapshot().entityStateCount, 1);
+  assert.equal(restored.snapshot().destroyedEntityCount, 0);
+
+  const continued = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  continued.restoreSaveSnapshot(restored.createSaveSnapshot());
+  assert.deepEqual(continued.entityStates.get(slot.stableId), emptySlot);
+  assert.equal(continued.snapshot().destroyedEntityCount, 0);
+});
+
+test('fallback hydration prunes tombstones, preserves the sequence, rejects ID reuse, and supports removal', () => {
+  const source = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  for (let sequence = 1; sequence <= 5; sequence += 1) source.nextTankReinforcementSequence();
+  const active = source.ensureEntity({
+    stableId: 'wf1:tank:w8-tank-reinforcement:3', ownerChunkKey: '0,0', type: 'tank',
+    maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 3, z: 3, rotationY: 0,
+    aiState: 'engage', spawned: true, reinforcementSequence: 3,
+  });
+  const dead = source.ensureEntity({
+    stableId: 'wf1:tank:w8-tank-reinforcement:4', ownerChunkKey: '0,0', type: 'tank',
+    maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 4, z: 4, rotationY: 0,
+    aiState: 'destroyed', spawned: true, reinforcementSequence: 4,
+  });
+  source.damageEntity(dead.stableId, dead.maxHp);
+  const inactive = source.ensureEntity({
+    stableId: 'wf1:tank:w8-tank-reinforcement:5', ownerChunkKey: '0,0', type: 'tank',
+    maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 5, z: 5, rotationY: 0,
+    aiState: 'reserve', spawned: false, reinforcementSequence: 5,
+  });
+  const saved = source.createSaveSnapshot();
+
+  const invalid = structuredClone(saved);
+  invalid.tankReinforcementSequence = dead.reinforcementSequence;
+  assert.ok(invalid.tankReinforcementSequence >= active.reinforcementSequence);
+  assert.ok(invalid.tankReinforcementSequence < inactive.reinforcementSequence);
+  const untouched = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 9, z: 9 } });
+  const before = untouched.createSaveSnapshot();
+  assert.throws(
+    () => untouched.restoreSaveSnapshot(invalid),
+    /lower than a fallback Tank sequence/,
+  );
+  assert.deepEqual(untouched.createSaveSnapshot(), before);
+
+  const restored = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  restored.restoreSaveSnapshot(saved);
+  assert.equal(restored.entityStates.has(active.stableId), true);
+  assert.equal(restored.entityStates.has(dead.stableId), false);
+  assert.equal(restored.entityStates.has(inactive.stableId), false);
+  assert.equal(restored.tankReinforcementSequence, 5);
+  assert.equal(restored.removeEntity(active.stableId), true);
+  assert.equal(restored.entityStates.has(active.stableId), false);
+  assert.equal(restored.nextTankReinforcementSequence(), 6);
+});
+
+test('legacy Military Base damage reconciliation keeps destroyed state and partial absolute damage', () => {
+  const destroyedStableId = 'wf1:settlement-landmark:w8-destroyed-base';
+  const partialStableId = 'wf1:settlement-landmark:w8-partial-base';
+  const state = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  const saved = state.createSaveSnapshot();
+  saved.featureDamage = [{
+    stableId: destroyedStableId,
+    maxHp: W6_STATIC_TARGET_CONTRACTS.house.maxHp,
+    damage: W6_STATIC_TARGET_CONTRACTS.house.maxHp,
+    destroyed: true,
+  }, {
+    stableId: partialStableId,
+    maxHp: W6_STATIC_TARGET_CONTRACTS.house.maxHp,
+    damage: 120,
+    destroyed: false,
+  }];
+  state.restoreSaveSnapshot(saved);
+
+  const destroyed = state.reconcileFeatureDamage({
+    stableId: destroyedStableId,
+    type: 'militaryBase',
+    maxHp: W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp,
+  });
+  assert.deepEqual(destroyed, {
+    stableId: destroyedStableId,
+    maxHp: W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp,
+    damage: W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp,
+    destroyed: true,
+  });
+
+  const partial = state.reconcileFeatureDamage({
+    stableId: partialStableId,
+    type: 'militaryBase',
+    maxHp: W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp,
+  });
+  assert.equal(partial.maxHp, W6_STATIC_TARGET_CONTRACTS.militaryBase.maxHp);
+  assert.equal(partial.damage, 120);
+  assert.equal(partial.destroyed, false);
+  assert.equal(state.featureHp(partialStableId, partial.maxHp), partial.maxHp - 120);
 });
 
 test('schema v3 migrates once to v4, reacquires persisted Tanks, and supplies lifecycle defaults', async () => {
