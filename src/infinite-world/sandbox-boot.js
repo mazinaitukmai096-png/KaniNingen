@@ -281,65 +281,181 @@ function createRuntimeRenderProfile() {
   });
 }
 
-function createW8ScenePresentation({ THREE, scene, visualAssets }) {
+export function createW8ScenePresentation({ THREE, scene, visualAssets }) {
   const cloudBaseCount = 70;
-  const cloudPuffCount = 21;
-  const cloudRoot = new THREE.InstancedMesh(
-    visualAssets.geometries.box,
-    visualAssets.materials.cloud,
-    cloudBaseCount + cloudPuffCount,
-  );
-  cloudRoot.name = 'w8-finite-cloud-instance-pool';
-  cloudRoot.userData = { presentationOnly: true, cloudBaseCount, cloudPuffCount };
-  cloudRoot.castShadow = false;
-  cloudRoot.receiveShadow = false;
-  const cloudTransform = new THREE.Object3D();
-  let cloudInstanceIndex = 0;
+  const cloudInstances = [];
   const cloudRoll = (index, salt) => {
     let value = Math.imul(index + 1, 0x45d9f3b) ^ Math.imul(salt + 1, 0x119de1f3);
     value ^= value >>> 16; value = Math.imul(value, 0x45d9f3b); value ^= value >>> 16;
     return (value >>> 0) / 0x1_0000_0000;
   };
-  const appendCloudInstance = ({ x, y, z, widthFinite, heightFinite, depthFinite, warm }) => {
-    cloudTransform.position.set(
-      finiteVisualToRender(x), finiteVisualToRender(y), finiteVisualToRender(z),
-    );
-    cloudTransform.rotation.set(0, 0, 0);
-    cloudTransform.scale.set(
-      finiteVisualToRender(widthFinite),
-      finiteVisualToRender(heightFinite),
-      finiteVisualToRender(depthFinite),
-    );
-    cloudTransform.updateMatrix();
-    cloudRoot.setMatrixAt(cloudInstanceIndex, cloudTransform.matrix);
-    cloudRoot.setColorAt?.(cloudInstanceIndex, new THREE.Color(warm ? 0xfff3e0 : 0xffffff));
-    cloudInstanceIndex += 1;
+  const appendCloud = ({
+    sourceIndex,
+    xFinite,
+    yFinite,
+    zFinite,
+    widthFinite,
+    heightFinite,
+    depthFinite,
+    speedFinite,
+    opacity,
+    warm,
+    puff,
+  }) => {
+    cloudInstances.push({
+      sourceIndex,
+      logicalX: xFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+      logicalY: yFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+      logicalZ: zFinite / PRODUCTION_VISUAL_UNITS_PER_METER,
+      widthFinite,
+      heightFinite,
+      depthFinite,
+      speedFinite,
+      opacity,
+      warm,
+      puff,
+      wrapCount: 0,
+    });
   };
+  const warmBaseIndices = new Set(
+    Array.from({ length: cloudBaseCount }, (_, index) => index)
+      .sort((left, right) => cloudRoll(left, 1) - cloudRoll(right, 1))
+      .slice(0, Math.round(cloudBaseCount * 0.4)),
+  );
   for (let index = 0; index < cloudBaseCount; index += 1) {
-    const angle = index / cloudBaseCount * Math.PI * 2 + cloudRoll(index, 0) * 0.08;
-    const radiusFinite = 9_000 + cloudRoll(index, 1) * 5_000;
+    const opacity = 0.55 + cloudRoll(index, 0) * 0.35;
+    const warm = warmBaseIndices.has(index);
     const widthFinite = 600 + cloudRoll(index, 2) * 1_400;
     const heightFinite = 100 + cloudRoll(index, 3) * 220;
     const depthFinite = 400 + cloudRoll(index, 4) * 900;
-    const x = Math.sin(angle) * radiusFinite;
-    const y = 1_600 + cloudRoll(index, 5) * 1_900;
-    const z = Math.cos(angle) * radiusFinite;
-    const warm = cloudRoll(index, 6) < 0.4;
-    appendCloudInstance({ x, y, z, widthFinite, heightFinite, depthFinite, warm });
-    if (index % 10 < 3) appendCloudInstance({
-      x: x + (cloudRoll(index, 7) - 0.5) * widthFinite * 0.8,
-      y: y + (cloudRoll(index, 8) - 0.5) * heightFinite * 0.4,
-      z: z + (cloudRoll(index, 9) - 0.5) * depthFinite * 0.8,
-      widthFinite: widthFinite * (0.4 + cloudRoll(index, 10) * 0.4),
-      heightFinite: heightFinite * (0.6 + cloudRoll(index, 11) * 0.4),
-      depthFinite: depthFinite * (0.4 + cloudRoll(index, 12) * 0.4),
+    const xFinite = (cloudRoll(index, 5) - 0.5) * 28_000;
+    const yFinite = 1_600 + cloudRoll(index, 6) * 1_900;
+    const zFinite = (cloudRoll(index, 7) - 0.5) * 28_000;
+    const speedFinite = 1.5 + cloudRoll(index, 8) * 2.5;
+    appendCloud({
+      sourceIndex: index,
+      xFinite,
+      yFinite,
+      zFinite,
+      widthFinite,
+      heightFinite,
+      depthFinite,
+      speedFinite,
+      opacity,
       warm,
+      puff: false,
+    });
+    if (index % 10 < 3) appendCloud({
+      sourceIndex: index,
+      xFinite: xFinite + (cloudRoll(index, 9) - 0.5) * widthFinite * 0.8,
+      yFinite: yFinite + (cloudRoll(index, 10) - 0.5) * heightFinite * 0.4,
+      zFinite: zFinite + (cloudRoll(index, 11) - 0.5) * depthFinite * 0.8,
+      widthFinite: widthFinite * (0.4 + cloudRoll(index, 12) * 0.4),
+      heightFinite: heightFinite * (0.6 + cloudRoll(index, 13) * 0.4),
+      depthFinite: depthFinite * (0.4 + cloudRoll(index, 14) * 0.4),
+      speedFinite,
+      opacity,
+      warm,
+      puff: true,
     });
   }
-  cloudRoot.count = cloudInstanceIndex;
-  cloudRoot.instanceMatrix.needsUpdate = true;
+  const cloudPuffCount = cloudInstances.length - cloudBaseCount;
+  const sharedCloudGeometry = visualAssets.geometries.box;
+  const cloudGeometry = sharedCloudGeometry.clone?.() ?? sharedCloudGeometry;
+  const ownsCloudGeometry = cloudGeometry !== sharedCloudGeometry;
+  const SharedCloudMaterial = visualAssets.materials.cloud;
+  const cloudMaterial = SharedCloudMaterial.clone?.() ?? SharedCloudMaterial;
+  const ownsCloudMaterial = cloudMaterial !== SharedCloudMaterial;
+  if (ownsCloudMaterial) cloudMaterial.opacity = 1;
+  const InstancedBufferAttribute = THREE.InstancedBufferAttribute;
+  if (typeof InstancedBufferAttribute === 'function' && typeof cloudGeometry.setAttribute === 'function') {
+    const opacities = new Float32Array(cloudInstances.length);
+    for (let index = 0; index < cloudInstances.length; index += 1) {
+      opacities[index] = cloudInstances[index].opacity;
+    }
+    cloudGeometry.setAttribute('instanceOpacity', new InstancedBufferAttribute(opacities, 1));
+    cloudMaterial.onBeforeCompile = shader => {
+      shader.vertexShader = `attribute float instanceOpacity;
+varying float vInstanceOpacity;
+${shader.vertexShader}`.replace(
+        '#include <begin_vertex>',
+        '#include <begin_vertex>\nvInstanceOpacity = instanceOpacity;',
+      );
+      shader.fragmentShader = `varying float vInstanceOpacity;
+${shader.fragmentShader}`.replace(
+        '#include <color_fragment>',
+        '#include <color_fragment>\ndiffuseColor.a *= vInstanceOpacity;',
+      );
+    };
+    cloudMaterial.customProgramCacheKey = () => 'w8-finite-cloud-instance-opacity-v1';
+  }
+  const cloudRoot = new THREE.InstancedMesh(
+    cloudGeometry,
+    cloudMaterial,
+    cloudInstances.length,
+  );
+  cloudRoot.name = 'w8-finite-cloud-instance-pool';
+  cloudRoot.userData = { presentationOnly: true, cloudBaseCount, cloudPuffCount };
+  cloudRoot.castShadow = false;
+  cloudRoot.receiveShadow = false;
+  cloudRoot.frustumCulled = false;
+  const cloudTransform = new THREE.Object3D();
+  const warmCloudColor = new THREE.Color(0xfff3e0);
+  const whiteCloudColor = new THREE.Color(0xffffff);
+  let renderOriginChunkX = 0;
+  let renderOriginChunkZ = 0;
+  let cloudMatrixWriteCount = 0;
+  const writeCloudMatrices = renderOrigin => {
+    renderOriginChunkX = renderOrigin?.renderOriginChunkX ?? renderOriginChunkX;
+    renderOriginChunkZ = renderOrigin?.renderOriginChunkZ ?? renderOriginChunkZ;
+    const originMetersX = renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const originMetersZ = renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    for (let index = 0; index < cloudInstances.length; index += 1) {
+      const cloud = cloudInstances[index];
+      cloudTransform.position.set(
+        (cloud.logicalX - originMetersX) * UNITS_PER_METER,
+        cloud.logicalY * UNITS_PER_METER,
+        (cloud.logicalZ - originMetersZ) * UNITS_PER_METER,
+      );
+      cloudTransform.rotation.set(0, 0, 0);
+      cloudTransform.scale.set(
+        finiteVisualToRender(cloud.widthFinite),
+        finiteVisualToRender(cloud.heightFinite),
+        finiteVisualToRender(cloud.depthFinite),
+      );
+      cloudTransform.updateMatrix();
+      cloudRoot.setMatrixAt(index, cloudTransform.matrix);
+    }
+    cloudRoot.instanceMatrix.needsUpdate = true;
+    cloudMatrixWriteCount += 1;
+  };
+  for (let index = 0; index < cloudInstances.length; index += 1) {
+    const cloud = cloudInstances[index];
+    cloudRoot.setColorAt?.(index, cloud.warm ? warmCloudColor : whiteCloudColor);
+  }
+  cloudRoot.count = cloudInstances.length;
   if (cloudRoot.instanceColor) cloudRoot.instanceColor.needsUpdate = true;
+  writeCloudMatrices({ renderOriginChunkX: 0, renderOriginChunkZ: 0 });
   scene.add(cloudRoot);
+
+  const updateClouds = (deltaSeconds, renderOrigin) => {
+    const dtScale = Math.min(Math.max(0, deltaSeconds) * 60, 4);
+    if (dtScale > 0) {
+      for (let index = 0; index < cloudInstances.length; index += 1) {
+        const cloud = cloudInstances[index];
+        cloud.logicalX += cloud.speedFinite * dtScale / PRODUCTION_VISUAL_UNITS_PER_METER;
+        if (cloud.logicalX * PRODUCTION_VISUAL_UNITS_PER_METER > 14_000) {
+          cloud.logicalX = -14_000 / PRODUCTION_VISUAL_UNITS_PER_METER;
+          cloud.wrapCount += 1;
+          cloud.logicalZ = (cloudRoll(
+            cloud.sourceIndex,
+            1_000 + cloud.wrapCount * 2 + (cloud.puff ? 1 : 0),
+          ) - 0.5) * 28_000 / PRODUCTION_VISUAL_UNITS_PER_METER;
+        }
+      }
+    }
+    writeCloudMatrices(renderOrigin);
+  };
 
   const titlePresentationRoot = new THREE.Group();
   titlePresentationRoot.name = 'w8-main-world-title-presentation';
@@ -445,11 +561,50 @@ function createW8ScenePresentation({ THREE, scene, visualAssets }) {
   let disposed = false;
   return Object.freeze({
     titlePresentationRoot, titleCrab, titleCrabParts, explosionRoot, cloudRoot,
+    update(deltaSeconds, renderOrigin) {
+      if (disposed) return;
+      updateClouds(deltaSeconds, renderOrigin);
+    },
+    rebase(renderOrigin) {
+      if (disposed) return;
+      writeCloudMatrices(renderOrigin);
+    },
+    snapshot() {
+      let warmBaseCount = 0;
+      for (let index = 0; index < cloudInstances.length; index += 1) {
+        if (!cloudInstances[index].puff && cloudInstances[index].warm) warmBaseCount += 1;
+      }
+      return Object.freeze({
+        cloudBaseCount,
+        cloudPuffCount,
+        cloudInstanceCount: cloudInstances.length,
+        warmBaseCount,
+        cloudMatrixWriteCount,
+        renderOriginChunkX,
+        renderOriginChunkZ,
+        clouds: Object.freeze(cloudInstances.map(cloud => Object.freeze({
+          sourceIndex: cloud.sourceIndex,
+          logicalX: cloud.logicalX,
+          logicalY: cloud.logicalY,
+          logicalZ: cloud.logicalZ,
+          widthFinite: cloud.widthFinite,
+          heightFinite: cloud.heightFinite,
+          depthFinite: cloud.depthFinite,
+          speedFinite: cloud.speedFinite,
+          opacity: cloud.opacity,
+          warm: cloud.warm,
+          puff: cloud.puff,
+          wrapCount: cloud.wrapCount,
+        }))),
+      });
+    },
     dispose() {
       if (disposed) return;
       scene.remove(cloudRoot);
       scene.remove(titlePresentationRoot);
       titlePresentationRoot.clear?.();
+      if (ownsCloudGeometry) cloudGeometry.dispose?.();
+      if (ownsCloudMaterial) cloudMaterial.dispose?.();
       disposed = true;
     },
   });
@@ -706,6 +861,7 @@ export async function bootInfiniteWorldSandbox({
     const { logicalPlayer, initialOwner } = runtimeContext;
 
     await runStage('Terrain', () => runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ));
+    scenePresentation.rebase(runtime.snapshot().renderOrigin);
     distantPresentation = await createW8DistantPresentation({
       THREE,
       scene,
@@ -847,6 +1003,7 @@ export async function bootInfiniteWorldSandbox({
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
       );
       const runtimeSnapshot = runtime.snapshot();
+      scenePresentation.rebase(runtimeSnapshot.renderOrigin);
       if (diagnosticProfile.distant) {
         await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
           activeDataKeys: runtimeSnapshot.activeDataKeys,
@@ -1132,6 +1289,7 @@ export async function bootInfiniteWorldSandbox({
       )
         .then(async () => {
           const nextSnapshot = runtime.snapshot();
+          scenePresentation.rebase(nextSnapshot.renderOrigin);
           if (diagnosticProfile.distant) {
             await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
               activeDataKeys: nextSnapshot.activeDataKeys,
@@ -1177,7 +1335,7 @@ export async function bootInfiniteWorldSandbox({
         .finally(() => directionalPrefetchPending.delete(missing.key));
     }
 
-    function updatePlayer(deltaSeconds) {
+    function updatePlayer(deltaSeconds, renderOrigin = runtime.snapshot().renderOrigin) {
       const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
       if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
         logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
@@ -1188,12 +1346,11 @@ export async function bootInfiniteWorldSandbox({
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       requestDirectionalPrefetch(owner);
       requestTransition(owner);
-      const origin = runtime.snapshot().renderOrigin;
       const renderLocal = logicalWorldToRenderLocal(
         logicalPlayer.x,
         logicalPlayer.z,
-        origin.renderOriginChunkX,
-        origin.renderOriginChunkZ,
+        renderOrigin.renderOriginChunkX,
+        renderOrigin.renderOriginChunkZ,
       );
       playerMarker.rotation.y = logicalPlayer.facingY;
       const productionScale = scaleProfile.stage.visualScale
@@ -1343,7 +1500,8 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       renderSandboxBootStatus(hud, state);
     }
 
-    function updateScenePresentation(deltaSeconds, frameNow) {
+    function updateScenePresentation(deltaSeconds, frameNow, cloudDeltaSeconds, renderOrigin) {
+      scenePresentation.update(cloudDeltaSeconds, renderOrigin);
       if (!measurement.mode && experienceShell.getMode?.() === 'menu') {
         const lobbyPulse = Math.sin(frameNow * 0.0035);
         scenePresentation.titleCrab.position.y = finiteVisualToRender(lobbyPulse * 5);
@@ -1420,20 +1578,34 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const runPhase = experienceShell.getRunPhase?.();
         const experiencePhaseRunning = measurement.mode
           || ['intro', 'playing', 'dying'].includes(runPhase);
+        const hitStopped = gameplay.isHitStopped(frameNow);
         const effectiveDeltaSeconds = (!experiencePhaseRunning
           || (experienceShell.isPaused() && !measurement.mode))
-          || gameplay.isHitStopped(frameNow) ? 0 : deltaSeconds;
-        diagnostics.measure('scene-presentation', () => updateScenePresentation(deltaSeconds, frameNow));
+          || hitStopped ? 0 : deltaSeconds;
+        const cloudPhaseRunning = measurement.mode || ['playing', 'dying'].includes(runPhase);
+        const cloudDeltaSeconds = !cloudPhaseRunning
+          || (experienceShell.isPaused() && !measurement.mode)
+          || hitStopped ? 0 : deltaSeconds * (runPhase === 'dying' ? 0.15 : 1);
+        const frameRenderOrigin = runtime.snapshot().renderOrigin;
+        diagnostics.measure('scene-presentation', () => updateScenePresentation(
+          deltaSeconds,
+          frameNow,
+          cloudDeltaSeconds,
+          frameRenderOrigin,
+        ));
         if (playerRelocationInProgress) {
           renderActiveScene();
           animationFrameId = requestAnimationFrameFn(frame);
           return;
         }
-        const owner = diagnostics.measure('player-update', () => updatePlayer(effectiveDeltaSeconds));
+        const owner = diagnostics.measure(
+          'player-update',
+          () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin),
+        );
         diagnostics.measure('gameplay-update', () => gameplay.update({
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,
-            renderOrigin: runtime.snapshot().renderOrigin,
+            renderOrigin: frameRenderOrigin,
             simulationEnabled: isW8GameplaySimulationEnabled(measurement.mode, runPhase),
           }));
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
