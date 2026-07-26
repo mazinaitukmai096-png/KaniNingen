@@ -72,6 +72,50 @@ Gameplay value may change during measurement. Unfavourable runs must not be
 discarded. If an abnormal run must be excluded, record its reason and do not silently
 replace it with a rerun. Use medians, not means.
 
+### Measurement protocol
+
+The following is a Project Owner decision for Gate C measurement. It fixes the
+measurement conditions and recording method without starting Gate C execution.
+
+#### Environment and execution conditions
+
+- Record the OS used for measurement.
+- Use Microsoft Edge and record the current browser version at measurement time.
+- Record Window or Fullscreen mode and the Window Size or Resolution used.
+- Record Device Pixel Ratio.
+- Use the browser-default VSync state, with Hardware Acceleration enabled.
+- Measure in the normal state with DevTools closed and without extension influence.
+- Use the same PC, browser, display settings, power state, and measurement order for
+  the finite World and W8.
+
+#### Runs, warm-up, start, and end
+
+- Run five independent formal runs for the finite World and five independent formal
+  runs for W8. Do not stop a set because of an intermediate result.
+- Perform one warm-up Run before formal measurement. It is not part of the formal
+  result.
+- Start each Run through New Game. Begin recording when the Player becomes
+  controllable after the normal start sequence; retain the corresponding initial
+  camera and UI state for the finite World and W8.
+- The Project Owner performs the same operation in the finite World and W8. A Run
+  ends after that same operation is completed.
+
+#### Recording, abnormal Runs, and remeasurement
+
+For every Run, record frame p50, frame p95, frame max, frames-over-50ms rate, and
+Chunk transition p95. Record each five-run median and the per-metric pass/fail result.
+
+Do not exclude an abnormal Run merely because its result is unfavourable. Browser
+crash, OS update, or an external factor may justify exclusion only when the reason is
+recorded. If production code, Gameplay, save schema, or generator behavior changes
+during measurement, restart all five formal runs from the beginning.
+
+#### Undefined protocol items
+
+Existing documents do not define the detailed Project Owner operation, its route or
+duration, an exact Run end event beyond completion of that operation, or an exact
+finite-World/W8 run interleaving order. This contract does not invent those details.
+
 ### Performance acceptance criteria
 
 Existing W8 documentation defines the comparison method: five finite-World runs
