@@ -21,6 +21,7 @@ import { sha256Hex } from './legacy-core/g0/sha256.js';
 import { parseGeneratorVersion } from './legacy-core/g0/generator-version.js';
 import { sampleFormalTerrainHeightMeters } from './player-vertical-movement.js';
 import { FINITE_WORLD_UNITS_PER_METER } from './single-rural-settlement.js';
+import { createW8SettlementParityOverlay } from './w8-settlement-parity-overlay.js';
 
 export const W8_PARITY_GENERATOR_VERSION = parseGeneratorVersion('800.0.0');
 export const W8_PARITY_CHUNK_DATA_SCHEMA = 'w8-finite-experience-parity-chunk-data-1';
@@ -725,6 +726,7 @@ export async function hashW8ParityChunkContent(content) {
     ambientDetailIds: content.ambientDetails.map(value => value.stableId),
     settlementLandmarkIds: content.settlementLandmarks.map(value => value.stableId),
     streetDetailIds: content.streetDetails.map(value => value.stableId),
+    settlementOverlayFeatureIds: content.settlementOverlayFeatures.map(value => value.stableId),
     presentationLayerOrder: content.presentationLayers.integrationOrder,
     presentationVegetationIds: content.presentationLayers.natural.vegetation
       .map(value => value.candidateId ?? value.stableId),
@@ -739,7 +741,7 @@ export function validateW8ParityChunkData(chunk) {
   if (chunk?.sourceChunkData?.schemaVersion !== W5_CHUNK_DATA_SCHEMA) errors.push('missing W5 source ChunkData');
   if (chunk?.sourceW5ContentHash !== chunk?.sourceChunkData?.contentHash) errors.push('W5 source hash mismatch');
   const ids = new Set();
-  for (const name of ['waterSurfaces', 'ambientDetails', 'settlementLandmarks', 'streetDetails']) {
+  for (const name of ['waterSurfaces', 'ambientDetails', 'settlementLandmarks', 'streetDetails', 'settlementOverlayFeatures']) {
     if (!Array.isArray(chunk?.[name])) { errors.push(`${name} must be an array`); continue; }
     for (let index = 0; index < chunk[name].length; index += 1) {
       const value = chunk[name][index];
@@ -768,6 +770,7 @@ export async function createW8ParityChunkGenerator({
   const seed = textSeed(`${base.worldSeedHash}:${W8_PARITY_CONTENT.schemaVersion}`);
   const warmSourceChunks = new Map();
   const pendingSourceChunks = new Map();
+  const settlementOverlayTemplates = new Map();
   const warmSourceChunkCapacity = 256;
   const trimWarmSourceChunks = () => {
     while (warmSourceChunks.size > warmSourceChunkCapacity) {
@@ -797,6 +800,25 @@ export async function createW8ParityChunkGenerator({
     );
     pendingSourceChunks.set(key, pending);
     return pending;
+  };
+  const getSettlementOverlay = async reference => {
+    if (!reference) return null;
+    if (!settlementOverlayTemplates.has(reference.settlementId)) {
+      const pending = createW8SettlementParityOverlay({
+        worldSeedHash: base.worldSeedHash,
+        candidate: {
+          settlementId: reference.settlementId,
+          settlementType: reference.settlementType,
+          townType: reference.townType,
+          macroRegion: reference.macroRegion,
+          center: reference.center,
+          urbanization: reference.urbanization,
+          terrainSuitability: reference.terrainSuitability,
+        },
+      });
+      settlementOverlayTemplates.set(reference.settlementId, pending);
+    }
+    return settlementOverlayTemplates.get(reference.settlementId);
   };
   const prepareSourceSquare = async (centerChunkX, centerChunkZ, radius) => {
     // Materialize the owning Settlement template once before parallel edge projection.
@@ -888,27 +910,64 @@ export async function createW8ParityChunkGenerator({
     experienceSpawn,
     async generateChunk(chunkX, chunkZ) {
       const sourceChunkData = await getSourceChunk(chunkX, chunkZ);
+      const overlayTemplates = await Promise.all(
+        (sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay),
+      );
+      const settlementOverlayFeatures = overlayTemplates.filter(Boolean)
+        .flatMap(template => template.buildings)
+        .filter(building => building.owningChunkCoordinate.x === chunkX
+          && building.owningChunkCoordinate.z === chunkZ)
+        .map(building => Object.freeze({
+          ...building,
+          worldPosition: Object.freeze({
+            x: building.x,
+            y: q6(sampleFormalTerrainHeightMeters(sourceChunkData, building.x, building.z)),
+            z: building.z,
+          }),
+        }))
+        .sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const overlayBySettlement = new Map(overlayTemplates.filter(Boolean)
+        .map(template => [template.settlementId, template]));
+      const settlementReferences = (sourceChunkData.settlementReferences ?? []).map(reference => {
+        const overlay = overlayBySettlement.get(reference.settlementId);
+        return overlay ? Object.freeze({
+          ...reference,
+          parityTargetBuildingCount: overlay.targetBuildingCount,
+          parityOverlayBuildingCount: overlay.overlayBuildingCount,
+          parityBuildingShortageCount: overlay.shortageCount,
+        }) : reference;
+      });
+      const settlementFeatures = [
+        ...(sourceChunkData.settlementFeatures ?? []),
+        ...settlementOverlayFeatures,
+      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const parityGameplayChunk = Object.freeze({
+        ...sourceChunkData,
+        settlementReferences: Object.freeze(settlementReferences),
+        settlementFeatures: Object.freeze(settlementFeatures),
+      });
       const [waterSurfaces, ambientDetails, settlementLandmarks, streetDetails] = await Promise.all([
-        createWaterSurfaces(sourceChunkData, base.worldSeedHash),
-        createAmbientDetails(sourceChunkData, seed, base.worldSeedHash),
-        createSettlementLandmarks(sourceChunkData, seed, base.worldSeedHash),
-        createStreetDetails(sourceChunkData, base.worldSeedHash),
+        createWaterSurfaces(parityGameplayChunk, base.worldSeedHash),
+        createAmbientDetails(parityGameplayChunk, seed, base.worldSeedHash),
+        createSettlementLandmarks(parityGameplayChunk, seed, base.worldSeedHash),
+        createStreetDetails(parityGameplayChunk, base.worldSeedHash),
       ]);
       const chunkId = createChunkId({
         worldSeedHash: base.worldSeedHash,
         generatorMajor: W8_PARITY_GENERATOR_VERSION.major,
         chunkCoordinate: { x: chunkX, z: chunkZ },
       });
-      const presentationLayers = createPresentationLayers(sourceChunkData, {
+      const presentationLayers = createPresentationLayers(parityGameplayChunk, {
         waterSurfaces, ambientDetails, settlementLandmarks, streetDetails,
       }, experienceSpawn);
       const content = {
-        ...sourceChunkData,
+        ...parityGameplayChunk,
         schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,
         chunkId,
         generatorVersion: { ...W8_PARITY_GENERATOR_VERSION },
         sourceW5ContentHash: sourceChunkData.contentHash,
         sourceChunkData,
+        settlementOverlayFeatures,
         waterSurfaces,
         ambientDetails,
         settlementLandmarks,
