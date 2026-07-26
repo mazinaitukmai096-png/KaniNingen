@@ -1619,6 +1619,177 @@ test('stale in-flight fallback work cannot cross restart or restored-state refre
   });
 });
 
+test('Tank Projectile terrain queries are non-generating without changing combat lifecycle', async t => {
+  const addTankShell = (runtime, tank, occurrence, {
+    id,
+    x = 70,
+    y = 10,
+    z = 8,
+    directionX = 1,
+    directionZ = 0,
+  }) => {
+    runtime.projectiles.push({
+      id,
+      ownerStableId: tank.stableId,
+      ownerChunkKey: tank.ownerChunkKey,
+      ownerRuntimeGeneration: occurrence.runtimeGeneration,
+      x,
+      y,
+      z,
+      directionX,
+      directionY: 0,
+      directionZ,
+      remainingSeconds: 2,
+      type: 'tank-shell',
+    });
+    return runtime.projectiles.at(-1);
+  };
+
+  await t.test('uncached traversal starts no Chunk request with Developer Tools OFF', async () => {
+    let generationRequests = 0;
+    const { state, runtime, renderer } = await createRuntime({
+      playerSpawn: { x: 8, z: 8 },
+      chunk: tankOnlyChunk(),
+      sampleTerrainHeight(x, z, chunkData) {
+        if (logicalWorldToOwnedChunk(x, z).key === '0,0') return 0;
+        return chunkData?.testTerrainHeight ?? null;
+      },
+      getChunkDataForQuery(chunkX, chunkZ) {
+        generationRequests += 1;
+        return emptyChunk(chunkX, chunkZ, { terrainHeight: 0 });
+      },
+    });
+    assert.equal(state.developerTools, false);
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 8, z: 8 });
+    const occurrence = runtime.activeTankOccurrences.get(tank.stableId);
+    const shell = addTankShell(runtime, tank, occurrence, {
+      id: `${tank.stableId}:uncached-non-generating`,
+    });
+    const before = { x: shell.x, remainingSeconds: shell.remainingSeconds };
+
+    runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 0 } });
+    await drainAsyncWork();
+    assert.equal(generationRequests, 0);
+    assert.ok(shell.x > before.x, 'movement continues without terrain data');
+    assert.ok(shell.remainingSeconds < before.remainingSeconds, 'lifetime continues');
+    assert.equal(renderer.projectiles.length, 1, 'renderer synchronization continues');
+
+    for (let tick = 0; tick < 250 && runtime.projectiles.length > 0; tick += 1) {
+      runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 0 } });
+    }
+    assert.equal(generationRequests, 0, 'crossing further uncached Chunks starts no request');
+    assert.equal(runtime.projectiles.length, 0, 'lifetime expiry removes Projectile state');
+    assert.equal(renderer.projectiles.length, 0, 'lifetime expiry removes its renderer entry');
+    await runtime.shutdown();
+  });
+
+  await t.test('cached terrain is sampled once and still collides without regeneration', async () => {
+    let generationRequests = 0;
+    let projectileTerrainSamples = 0;
+    const { state, runtime, renderer } = await createRuntime({
+      playerSpawn: { x: 0, z: 100 },
+      chunk: tankOnlyChunk(),
+      sampleTerrainHeight(x, z, chunkData) {
+        if (z > 90) return 0;
+        if (!chunkData) return null;
+        if (x > 75) projectileTerrainSamples += 1;
+        return chunkData.testTerrainHeight;
+      },
+      getChunkDataForQuery(chunkX, chunkZ) {
+        generationRequests += 1;
+        return emptyChunk(chunkX, chunkZ, { terrainHeight: 0 });
+      },
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 70, z: 8 });
+    const occurrence = runtime.activeTankOccurrences.get(tank.stableId);
+    await waitForAsync(() => generationRequests === 1
+      && runtime.snapshot().tankTerrainPendingQueryCount === 0);
+
+    generationRequests = 0;
+    projectileTerrainSamples = 0;
+    addTankShell(runtime, tank, occurrence, {
+      id: `${tank.stableId}:cached-terrain-hit`,
+      x: 75,
+      y: 0,
+    });
+    runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 0 } });
+
+    assert.equal(generationRequests, 0);
+    assert.equal(projectileTerrainSamples, 1);
+    assert.equal(runtime.projectiles.length, 0, 'cached terrain collision consumes the shell');
+    assert.equal(renderer.projectiles.length, 0);
+    await runtime.shutdown();
+  });
+
+  await t.test('Tank AI and firing plus uncached World Object damage and presentation remain active', async () => {
+    let generationRequests = 0;
+    const firing = await createRuntime({
+      playerSpawn: { x: 0, z: 0 },
+      chunk: tankOnlyChunk(),
+      sampleTerrainHeight: () => 0,
+      getChunkDataForQuery() { generationRequests += 1; return null; },
+    });
+    const firingTank = armTank(
+      firing.runtime,
+      firing.state,
+      findBaseTank(firing.state),
+      { x: 0, z: 20, heading: Math.PI },
+    );
+    const aiClockBefore = firingTank.aiClock;
+    firing.runtime.update({ deltaSeconds: 0.01, player: { ...firing.state.player, y: 0 } });
+    assert.ok(firingTank.aiClock > aiClockBefore, 'active Tank AI remains live');
+    firing.state.gameplayTimeMs = 3_000;
+    firingTank.lastShotAtMs = 0;
+    firing.runtime.update({ deltaSeconds: 0, player: { ...firing.state.player, y: 0 } });
+    assert.equal(firing.runtime.snapshot().activeTankCount, 1);
+    assert.equal(firing.runtime.snapshot().counts.tankShots, 1);
+    assert.equal(firing.runtime.projectiles.length, 1);
+    assert.equal(generationRequests, 0);
+    await firing.runtime.shutdown();
+
+    const targetStableId = 'wf1:rock:w8-projectile-uncached-target';
+    generationRequests = 0;
+    const collision = await createRuntime({
+      playerSpawn: { x: 8, z: 8 },
+      chunk: tankOnlyChunk({ rocks: [{
+        candidateId: targetStableId,
+        worldPosition: { x: 0, y: 0, z: 10 },
+        metadata: { candidateRadiusMeters: 2 },
+        owningChunkCoordinate: { x: 0, z: 0 },
+      }] }),
+      sampleTerrainHeight: x => (x > 2 ? 0 : null),
+      getChunkDataForQuery() { generationRequests += 1; return null; },
+    });
+    const collisionTank = armTank(
+      collision.runtime,
+      collision.state,
+      findBaseTank(collision.state),
+      { x: 8, z: 8 },
+    );
+    const occurrence = collision.runtime.activeTankOccurrences.get(collisionTank.stableId);
+    addTankShell(collision.runtime, collisionTank, occurrence, {
+      id: `${collisionTank.stableId}:uncached-world-hit`,
+      x: 0,
+      y: 0,
+      z: 0,
+      directionX: 0,
+      directionZ: 1,
+    });
+    for (let tick = 0; tick < 12 && collision.runtime.projectiles.length > 0; tick += 1) {
+      collision.runtime.update({
+        deltaSeconds: 0.01,
+        player: { ...collision.state.player, y: 0 },
+      });
+    }
+    assert.equal(generationRequests, 0);
+    assert.equal(collision.runtime.projectiles.length, 0);
+    assert.equal(collision.state.featureDamage.get(targetStableId)?.damage, 150);
+    assert.ok(collision.runtime.consumePresentationEffects().events.some(event =>
+      event.type === 'tank-impact'));
+    await collision.runtime.shutdown();
+  });
+});
+
 test('Tank shell keeps finite player, world, terrain, and difficulty-speed collision semantics', async t => {
   await t.test('world targets receive exactly 150 damage', async () => {
     const rockStableId = 'wf1:rock:w7c-shell-target';

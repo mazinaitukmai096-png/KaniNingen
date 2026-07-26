@@ -269,10 +269,12 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.notEqual(adapter.getPlayerPresentationOffsetUnits().x, 0);
   assert.equal(parts.visualRoot.position.y, 0);
 
-  adapter.syncTransientCombat([{
+  const rendererBeforeTankShell = adapter.snapshot();
+  const tankShellState = {
     id: 'tank-shot', ownerStableId: 'tank', type: 'tank-shell', x: 1.25, y: 2.05, z: -3.5,
     directionX: 0, directionZ: 1, remainingSeconds: 1,
-  }], []);
+  };
+  adapter.syncTransientCombat([tankShellState], []);
   assert.deepEqual(
     { ...adapter.projectileMeshes.get('tank-shot').mesh.position },
     { x: 1.25 * adapter.unitsPerMeter, y: 2.05 * adapter.unitsPerMeter,
@@ -286,6 +288,32 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
     { ...tankShellMesh.scale },
     { x: 0.5 * adapter.unitsPerMeter, y: 0.5 * adapter.unitsPerMeter,
       z: 0.5 * adapter.unitsPerMeter },
+  );
+  assert.equal(
+    adapter.snapshot().counts.transientCreated - rendererBeforeTankShell.counts.transientCreated,
+    1,
+    'one Projectile state creates one renderer entry',
+  );
+  adapter.syncTransientCombat([{ ...tankShellState, x: 2.5, remainingSeconds: 0.5 }], []);
+  assert.equal(adapter.projectileMeshes.get('tank-shot').mesh, tankShellMesh,
+    'later frames update the existing renderer entry');
+  assert.equal(
+    adapter.snapshot().counts.transientCreated - rendererBeforeTankShell.counts.transientCreated,
+    1,
+    'later frames do not recreate the Projectile model',
+  );
+  adapter.syncTransientCombat([], []);
+  assert.equal(adapter.snapshot().liveProjectileMeshes, 0);
+  assert.equal(
+    adapter.snapshot().counts.transientRemoved - rendererBeforeTankShell.counts.transientRemoved,
+    1,
+    'Projectile state removal removes its renderer entry once',
+  );
+  adapter.syncTransientCombat([], []);
+  assert.equal(
+    adapter.snapshot().counts.transientRemoved - rendererBeforeTankShell.counts.transientRemoved,
+    1,
+    'later frames cannot remove the same renderer entry again',
   );
 
   adapter.consumePresentationEvents([{
