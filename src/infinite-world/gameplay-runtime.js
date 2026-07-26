@@ -29,6 +29,7 @@ import {
 } from './gameplay-contract.js';
 import { createDeterministicRandom, deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
+import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js';
 
 const EPSILON_METERS = 0.05;
 const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
@@ -363,7 +364,11 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
   }
 
   const staticTargets = [];
-  for (const candidate of chunkData.vegetationCandidates ?? []) {
+  const vegetationCandidates = chunkData.presentationLayers?.natural?.vegetation
+    ?? chunkData.vegetationCandidates ?? [];
+  const usesW8Presentation = (chunkData.generatorVersion?.major ?? generatorMajor) >= 800;
+  for (const candidate of vegetationCandidates) {
+    if (usesW8Presentation && !isW8NaturalCandidateVisible(candidate)) continue;
     const radius = (candidate.metadata?.candidateRadiusMeters ?? 0.625) * 40;
     staticTargets.push(staticTarget(
       candidate,

@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { createW6ChunkGameplay } from '../src/infinite-world/gameplay-runtime.js';
+import { isW8NaturalCandidateVisible } from '../src/infinite-world/w8-natural-presentation-policy.js';
 import {
   W8_PARITY_CHUNK_DATA_SCHEMA,
   W8_SPAWN_SAFETY_CONTRACT,
@@ -156,6 +157,21 @@ test('W8 selects a deterministic pond start and every surface consumer retains t
       }
     }
   }
+  const gameplayModels = await Promise.all(preparedChunks.map(prepared => createW6ChunkGameplay({
+    chunkData: prepared,
+    worldSeedHash: generator.worldSeedHash,
+    generatorMajor: generator.generatorVersion.major,
+  })));
+  const presentationTreeIds = preparedChunks.flatMap(prepared => (
+    prepared.presentationLayers.natural.vegetation
+      .filter(isW8NaturalCandidateVisible)
+      .map(candidate => candidate.candidateId)
+  )).sort();
+  const gameplayTreeIds = gameplayModels.flatMap(model => model.staticTargets
+    .filter(target => target.type === 'tree')
+    .map(target => target.stableId)).sort();
+  assert.ok(presentationTreeIds.length > 0);
+  assert.deepEqual(gameplayTreeIds, presentationTreeIds);
   const height = sampleW8SurfaceHeightMeters(
     chunk,
     generator.experienceSpawn.x,

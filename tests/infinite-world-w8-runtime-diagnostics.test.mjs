@@ -9,6 +9,7 @@ import {
 } from '../src/infinite-world/runtime-diagnostics.js';
 import {
   W8_CANONICAL_VISIBILITY_METERS,
+  W8_NATURAL_CANONICAL_VISIBILITY_METERS,
   W8_PRESENTATION_TERRAIN_PALETTE,
   createW8DistantPresentation,
   createW8ClipmapTopology,
@@ -130,6 +131,14 @@ const SHRUB_PART = Object.freeze({
   rotation: Object.freeze([0, 0, 0]),
 });
 
+const TREE_PART = Object.freeze({
+  geometry: 'box',
+  material: 'bush',
+  position: Object.freeze([0, 0.5, 0]),
+  scale: Object.freeze([1, 1, 1]),
+  rotation: Object.freeze([0, 0, 0]),
+});
+
 function createDistantTestVisualAssets() {
   const geometry = new DistantTestGeometry();
   const material = () => new DistantTestMaterial();
@@ -145,9 +154,9 @@ function createDistantTestVisualAssets() {
     },
     featureParts: {
       house: [CANONICAL_HOUSE_PART],
-      tree: [],
-      broadleafTree: [],
-      wetlandTree: [],
+      tree: [TREE_PART],
+      broadleafTree: [TREE_PART],
+      wetlandTree: [TREE_PART],
       shrub: [SHRUB_PART],
       rock: [],
     },
@@ -424,7 +433,7 @@ test('five-run acceptance uses finite, before-W8, and after-W8 medians without w
   assert.throws(() => evaluateW8PerformanceRuns({ finiteReports: [], w8Reports }), /exactly five/);
 });
 
-test('natural-object LOD selection is stable and anchored proxies persist into the near field', () => {
+test('natural-object selection is distance-stable and canonical visibility is bounded', () => {
   const candidate = {
     candidateId: 'detail-v1:vegetation:lod-stability',
     subtype: 'broadleaf-tree',
@@ -439,6 +448,11 @@ test('natural-object LOD selection is stable and anchored proxies persist into t
   assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 0 }), false);
   assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 1 }), true);
 
+  assert.deepEqual(W8_NATURAL_CANONICAL_VISIBILITY_METERS, {
+    high: 56,
+    medium: 48,
+    low: 40,
+  });
   assert.equal(isW8DistantNaturalProxyInRange(0), true);
   assert.equal(isW8DistantNaturalProxyInRange(24), true);
   assert.equal(isW8DistantNaturalProxyInRange(40), true);
@@ -487,7 +501,7 @@ test('shrub visuals remain aligned across mid and near LOD', async () => {
   })), true);
   const generationRoot = scene.children[0].children[0];
   const shrubMesh = generationRoot.children.find(child => (
-    child.name === 'w8-midground-major-natural-box-bush'
+    child.name === 'w8-canonical-lod-natural-box-bush'
   ));
   assert.ok(shrubMesh);
   assert.equal(shrubMesh.count, 1);
@@ -496,9 +510,90 @@ test('shrub visuals remain aligned across mid and near LOD', async () => {
     y: visual.heightMeters * 256,
     z: visual.depthMeters * 256,
   });
-  assert.equal(generationRoot.children.some(child => (
-    child.name.includes('major-natural') && child.name.includes('treeLeaves')
-  )), false);
+  assert.equal(presentation.canonicalAuditSnapshot().find(
+    object => object.identity.stableId === candidate.candidateId,
+  )?.visibleLod, 'mid');
+  presentation.dispose();
+});
+
+test('canonical vegetation keeps one Stable ID and owner across far, mid, and near LOD', async () => {
+  const candidate = Object.freeze({
+    candidateId: 'detail-v1:vegetation:canonical-lod-tree',
+    subtype: 'broadleaf-tree',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = [candidate];
+  chunk.presentationLayers.natural.vegetation = [candidate];
+  let holdQuery = false;
+  let releaseQuery = null;
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => {
+      if (!holdQuery) return [];
+      return new Promise(resolve => { releaseQuery = () => resolve([]); });
+    },
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? chunk : null
+    ),
+  });
+  const states = [
+    { lod: 'far', centerChunkX: 2, activeDataKeys: [], renderedKeys: [] },
+    { lod: 'mid', centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [] },
+    { lod: 'near', centerChunkX: 4, activeDataKeys: ['5,0'], renderedKeys: ['5,0'] },
+    { lod: 'mid', centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [] },
+    { lod: 'far', centerChunkX: 2, activeDataKeys: [], renderedKeys: [] },
+  ];
+  let identity = null;
+  for (const state of states) {
+    assert.equal(await presentation.sync(canonicalSyncInput({
+      ...state,
+      chunk,
+    })), true);
+    const object = presentation.canonicalAuditSnapshot().find(
+      value => value.identity.stableId === candidate.candidateId,
+    );
+    assert.ok(object);
+    identity ??= object.identity;
+    assert.deepEqual(object.identity, identity);
+    assert.equal(object.visibleLod, state.lod);
+    assert.equal(object.ownerKey, '5,0');
+    assert.equal(object.instanceCount, 1);
+    const snapshot = presentation.snapshot();
+    assert.equal(snapshot.canonicalVegetationRecordCount, 1);
+    assert.equal(snapshot.distantTreeProxyCount, 0);
+    assert.equal(snapshot.distantRockProxyCount, snapshot.distantNaturalProxyCount);
+  }
+  assert.deepEqual(identity.owningChunkCoordinate, { x: 5, z: 0 });
+  assert.equal(identity.featureType, 'natural-vegetation');
+  assert.equal(identity.candidateId, candidate.candidateId);
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 3,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk,
+  })), true);
+  holdQuery = true;
+  const pendingFarSync = presentation.sync(canonicalSyncInput({
+    centerChunkX: 2,
+    activeDataKeys: [],
+    renderedKeys: [],
+    chunk,
+  }));
+  assert.equal(presentation.canonicalAuditSnapshot().find(
+    value => value.identity.stableId === candidate.candidateId,
+  )?.visibleLod, 'far', 'the committed generation must not hide a tree while its replacement builds');
+  await new Promise(resolve => setImmediate(resolve));
+  releaseQuery();
+  assert.equal(await pendingFarSync, true);
   presentation.dispose();
 });
 
@@ -712,10 +807,11 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     assert.equal(snapshot.canonicalVisibleMeshCount, 1);
     assert.equal(snapshot.queryCandidateCount, 1);
     assert.equal(snapshot.queryTemplateSuccessCount, 1);
-    assert.equal(snapshot.queryOwnerChunkCount, 1);
-    assert.deepEqual(snapshot.queryOwnerChunkKeys, ['5,0']);
-    assert.equal(snapshot.queryCanonicalChunkSuccessCount, 1);
-    assert.equal(snapshot.querySettlementFeatureCount, 1);
+    assert.ok(snapshot.queryNaturalOwnerChunkCount > 0);
+    assert.equal(snapshot.queryOwnerChunkKeys.length, snapshot.queryOwnerChunkCount);
+    assert.equal(new Set(snapshot.queryOwnerChunkKeys).size, snapshot.queryOwnerChunkCount);
+    assert.equal(snapshot.queryCanonicalChunkSuccessCount, state.lod === 'far' ? 1 : 0);
+    assert.equal(snapshot.querySettlementFeatureCount, state.lod === 'far' ? 1 : 0);
     assert.equal(snapshot.queryLandmarkCount, 0);
     assert.equal(snapshot.rootAttached, true);
     assert.equal(snapshot.duplicateVisibleStableIdCount, 0);
@@ -770,7 +866,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
       centerChunkX: 3,
       activeDataKeys: ['5,0'],
       renderedKeys: [],
-      chunk: canonicalChunk(5, 0, [conflictingBuilding]),
+      chunk: canonicalChunk(5, 0, [CANONICAL_BUILDING, conflictingBuilding]),
     })),
     /canonical LOD identity mismatch/,
   );
@@ -873,13 +969,17 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
   const snapshot = presentation.snapshot();
   assert.equal(snapshot.queryCandidateCount, 8);
   assert.equal(snapshot.queryTemplateSuccessCount, 8);
-  assert.equal(snapshot.queryOwnerChunkCount, 80);
-  assert.equal(snapshot.queryOwnerChunkKeys.length, 80);
-  assert.equal(snapshot.queryCanonicalChunkSuccessCount, 80);
+  assert.ok(snapshot.queryOwnerChunkCount >= 80);
+  assert.ok(snapshot.queryNaturalOwnerChunkCount > 0);
+  assert.equal(snapshot.queryOwnerChunkKeys.length, snapshot.queryOwnerChunkCount);
+  assert.equal(snapshot.queryCanonicalChunkSuccessCount, snapshot.queryOwnerChunkCount);
   assert.equal(snapshot.templateCacheCapacity, 4);
   assert.equal(snapshot.templateCacheSize, 4);
-  assert.equal(snapshot.farOwnerChunkCacheCapacity, 64);
-  assert.equal(snapshot.farOwnerChunkCacheSize, 64);
+  assert.equal(snapshot.farOwnerChunkCacheCapacity, 128);
+  assert.equal(
+    snapshot.farOwnerChunkCacheSize,
+    Math.min(snapshot.queryOwnerChunkCount, snapshot.farOwnerChunkCacheCapacity),
+  );
   assert.equal(snapshot.queryConcurrencyLimit, 4);
   assert.equal(snapshot.maximumObservedQueryConcurrency, 4);
   assert.equal(maximumProviderConcurrency, 4);

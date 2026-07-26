@@ -942,6 +942,7 @@ export async function bootInfiniteWorldSandbox({
            quality: worldState.experience.settings.quality,
            playerLogicalX: logicalPlayer.x,
            playerLogicalZ: logicalPlayer.z,
+           includeFarNatural: false,
          }));
     }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
@@ -1014,6 +1015,7 @@ export async function bootInfiniteWorldSandbox({
     let saveIdleCallback = null;
     let lastSavedRevision = -1;
     let runStarted = false;
+    let farNaturalWarmStarted = false;
     let lastRunStartDiagnostics = null;
     let lastCameraCollision = Object.freeze({
       collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0,
@@ -1676,6 +1678,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (!running) return;
       try {
         const frameNow = Number.isFinite(now) ? now : clock();
+        if (!farNaturalWarmStarted && diagnosticProfile.distant) {
+          farNaturalWarmStarted = true;
+          void diagnostics.measureAsync(
+            'distant-sync',
+            () => synchronizeDistantPresentation(runtime.snapshot()),
+          ).catch(error => { transitionError = error; });
+        }
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
         if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
         diagnostics.startFrame(frameNow);

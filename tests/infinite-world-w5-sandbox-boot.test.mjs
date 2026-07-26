@@ -492,13 +492,31 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.presentation.maximumInnerBoundaryErrorMeters <= 0.001);
     assert.ok(snapshot.presentation.maximumInnerBoundaryColorDifference <= 0.03);
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
-    assert.ok(snapshot.presentation.distantNaturalProxyCount > 0);
-    assert.ok(snapshot.presentation.distantNaturalProxyCount <= 500);
+    assert.equal(snapshot.presentation.distantNaturalProxyCount, 46);
+    assert.equal(snapshot.presentation.distantRockProxyLimit, 64);
+    assert.equal(snapshot.presentation.distantNaturalProxyLimit, 64);
+    assert.equal(snapshot.presentation.distantTreeProxyCount, 0);
+    assert.equal(
+      snapshot.presentation.distantRockProxyCount,
+      snapshot.presentation.distantNaturalProxyCount,
+    );
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
+    assert.equal(snapshot.presentation.canonicalVegetationRecordCount, 109);
+    assert.equal(snapshot.presentation.canonicalTreeRecordCount, 99);
+    assert.equal(snapshot.presentation.canonicalShrubRecordCount, 10);
+    assert.equal(snapshot.presentation.visibleCanonicalVegetationCount, 109);
+    assert.equal(snapshot.presentation.visibleCanonicalTreeCount, 99);
+    assert.equal(snapshot.presentation.visibleCanonicalShrubCount, 10);
+    assert.equal(
+      snapshot.presentation.canonicalTreeRecordCount
+        + snapshot.presentation.canonicalShrubRecordCount,
+      snapshot.presentation.canonicalVegetationRecordCount,
+    );
     assert.equal(
       snapshot.presentation.canonicalBuildingRecordCount
+        + snapshot.presentation.canonicalVegetationRecordCount
         + snapshot.presentation.canonicalLandmarkRecordCount
         + snapshot.presentation.canonicalRoadRecordCount,
       snapshot.presentation.canonicalRecordCount,
@@ -509,7 +527,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(
       snapshot.presentation.canonicalFarObjectCount
         + snapshot.presentation.canonicalMidObjectCount
-        + snapshot.presentation.canonicalNearObjectCount,
+        + snapshot.presentation.canonicalNearObjectCount
+        + snapshot.presentation.canonicalHiddenObjectCount
+        + snapshot.presentation.canonicalDestroyedObjectCount,
       snapshot.presentation.canonicalRecordCount,
     );
     assert.equal(
@@ -520,12 +540,17 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       snapshot.presentation.queryCanonicalChunkSuccessCount,
       snapshot.presentation.queryOwnerChunkCount,
     );
-    assert.equal(snapshot.presentation.queryOwnerChunkKeys.length, 5);
+    assert.equal(
+      snapshot.presentation.queryOwnerChunkKeys.length,
+      snapshot.presentation.queryOwnerChunkCount,
+    );
+    assert.equal(snapshot.presentation.queryNaturalOwnerChunkCount, 0);
+    assert.equal(snapshot.presentation.queryNaturalCandidateCount, 0);
     assert.equal(snapshot.presentation.rootAttached, true);
     assert.equal(snapshot.presentation.templateCacheCapacity, 4);
     assert.ok(snapshot.presentation.templateCacheSize <= 4);
-    assert.equal(snapshot.presentation.farOwnerChunkCacheCapacity, 64);
-    assert.ok(snapshot.presentation.farOwnerChunkCacheSize <= 64);
+    assert.equal(snapshot.presentation.farOwnerChunkCacheCapacity, 128);
+    assert.ok(snapshot.presentation.farOwnerChunkCacheSize <= 128);
     assert.equal(snapshot.presentation.queryConcurrencyLimit, 4);
     assert.ok(snapshot.presentation.maximumObservedQueryConcurrency <= 4);
     assert.ok(snapshot.presentation.distantWaterProxyCount <= 24);
@@ -569,6 +594,16 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.rafCallbacks[0](performance.now() + 100);
     environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
     assert.ok(outcome.sandbox.logicalPlayer.x > playerXBeforeInput);
+    let warmed = outcome.sandbox.snapshot();
+    for (let attempt = 0; attempt < 500 && warmed.presentation.queryNaturalCandidateCount === 0;
+      attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      warmed = outcome.sandbox.snapshot();
+    }
+    assert.equal(warmed.presentation.queryNaturalCandidateCount, 105);
+    assert.equal(warmed.presentation.canonicalVegetationRecordCount, 214);
+    assert.equal(warmed.presentation.visibleCanonicalVegetationCount, 178);
+    assert.equal(warmed.presentation.distantTreeProxyCount, 0);
     environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
     environment.listeners.get('keydown')({ code: 'Digit1', preventDefault() {} });
     assert.equal(outcome.sandbox.snapshot().gameplay.state.activeScaleStageId, 'TINY');
