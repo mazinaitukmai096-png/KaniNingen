@@ -33,7 +33,7 @@ W8 は、保護コミット `f8bc9f80c2af417bb585bff26c99522c4229ab8e` の有限
 
 ## W8 Gate B closure
 
-- Status: formal freeze fix ready for Gate B closure; Gate C has not started.
+- Status: Gate B closed; Gate C has not started.
 - Root cause: Tank Projectile terrain queries generated uncached Chunks through `generator.generateChunk()` during the gameplay frame.
 - Formal behavior: Projectile terrain queries are non-generating. Cached terrain keeps normal sampling and collision; a cache miss returns no terrain hit while Projectile movement, lifetime, World Object collision, damage, presentation, and renderer synchronization continue.
 - Temporary W8 isolation, frame diagnostics, Audio batching/priming, Clipmap cache, runtime snapshot hot-path, and Projectile shader investigation changes were removed from the closure diff.
