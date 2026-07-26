@@ -771,7 +771,7 @@ export class InfiniteGameplayRuntime {
     return pending;
   }
 
-  #tryTerrainHeightAt(x, z) {
+  #tryTerrainHeightAt(x, z, requestMissingTerrain = true) {
     if (this.sampleTerrainHeight === null) return 0;
     const owner = logicalWorldToOwnedChunk(x, z);
     const height = this.sampleTerrainHeight(
@@ -782,7 +782,7 @@ export class InfiniteGameplayRuntime {
     if (height === null || height === undefined) {
       const queryError = this.tankTerrainQueryErrors.get(owner.key);
       if (queryError) throw queryError;
-      void this.#requestTankTerrainChunk(x, z).catch(() => {});
+      if (requestMissingTerrain) void this.#requestTankTerrainChunk(x, z).catch(() => {});
       return null;
     }
     if (!Number.isFinite(height)) {
@@ -2181,14 +2181,7 @@ export class InfiniteGameplayRuntime {
         const nextX = projectile.x + projectile.directionX * projectileSpeed * boundedDelta;
         const nextY = projectile.y + projectile.directionY * projectileSpeed * boundedDelta;
         const nextZ = projectile.z + projectile.directionZ * projectileSpeed * boundedDelta;
-        const terrainHeight = this.#tryTerrainHeightAt(nextX, nextZ);
-        if (terrainHeight === null) {
-          projectile.terrainWaitSeconds = (projectile.terrainWaitSeconds ?? 0) + boundedDelta;
-          if (projectile.terrainWaitSeconds >= combat.bulletLifeFrames / 60) {
-            this.projectiles.splice(index, 1);
-          }
-          continue;
-        }
+        const terrainHeight = this.#tryTerrainHeightAt(nextX, nextZ, false);
         projectile.terrainWaitSeconds = 0;
         projectile.x = nextX;
         projectile.y = nextY;
@@ -2278,7 +2271,7 @@ export class InfiniteGameplayRuntime {
             break;
           }
         }
-        if (!hitSomething
+        if (!hitSomething && terrainHeight !== null
           && projectile.y <= terrainHeight
             + W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters) {
           this.#emitCombatEffect({
