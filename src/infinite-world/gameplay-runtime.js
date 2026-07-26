@@ -14,7 +14,9 @@ import {
   W8_BOSS_CONTRACT,
   W8_COMBAT_COMMAND_SCHEMA,
   W8_COMBAT_COMMAND_TYPES,
+  W8_DESTRUCTION_PRESENTATION_CONTRACT,
   W8_HUMAN_BEHAVIOR_CONTRACT,
+  W8_NUCLEAR_PRESENTATION_CONTRACT,
   W8_PRESENTATION_EVENT_SCHEMA,
   W8_PLAYER_LANDING_CONTRACT,
   W8_TANK_LIFECYCLE_CONTRACT,
@@ -34,6 +36,44 @@ const TANK_COLLISION_OBSTACLE_TYPES = new Set([
   'house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory',
 ]);
 const TANK_TERRAIN_QUERY_CACHE_CAPACITY = 128;
+
+function finitePresentationProfile(target, destroyed) {
+  const contract = W8_DESTRUCTION_PRESENTATION_CONTRACT;
+  const type = target?.type ?? 'unknown';
+  const radiusMeters = finiteWorldUnitsToMeters(target?.radius ?? 0);
+  const profile = {
+    targetType: type,
+    radiusMeters,
+    charredCount: type === 'human' ? 0 : contract.nonHumanImpact.charredCount,
+    sparkCount: type === 'human' ? 0 : contract.nonHumanImpact.sparkCount,
+    debrisCount: 0,
+    bloodCount: 0,
+    ruinScale: 0,
+    scarKind: null,
+    scarRadiusMeters: 0,
+    shockwaveRadiusMeters: 0,
+  };
+  if (!destroyed) return Object.freeze(profile);
+  if (type === 'human') {
+    profile.bloodCount = contract.humanDeath.bloodCount;
+    profile.shockwaveRadiusMeters = contract.humanDeath.shockwaveRadiusMeters;
+    profile.scarKind = 'blood';
+    profile.scarRadiusMeters = radiusMeters * contract.humanDeath.bloodScarRadiusMultiplier;
+  } else if (type === 'rock' || type === 'pebble') {
+    profile.debrisCount = contract.rockShardCount;
+    profile.scarKind = 'scorch';
+    profile.scarRadiusMeters = radiusMeters;
+  } else {
+    const instanced = type === 'tree';
+    profile.debrisCount = instanced
+      ? contract.instancedWorldObject.debrisCount : contract.debrisPieceLimit;
+    profile.ruinScale = contract.ruinScaleByType[type]
+      ?? contract.instancedWorldObject.ruinScale;
+    profile.scarKind = 'scorch';
+    profile.scarRadiusMeters = radiusMeters;
+  }
+  return Object.freeze(profile);
+}
 
 function sorted(values) {
   return [...values].sort((a, b) => a.localeCompare(b));
@@ -502,7 +542,7 @@ export class InfiniteGameplayRuntime {
 
   #emitPresentationEvent({
     type, x, y = 0, z, directionX = 0, directionY = 0, directionZ = 0, intensity = 1,
-    lifetimeSeconds = 0.25, soundCue = null,
+    lifetimeSeconds = 0.25, soundCue = null, soundCueRepeats = 1, presentation = null,
   }) {
     const event = Object.freeze({
       schemaVersion: W8_PRESENTATION_EVENT_SCHEMA,
@@ -514,6 +554,8 @@ export class InfiniteGameplayRuntime {
       intensity: q6(intensity),
       lifetimeSeconds: q6(lifetimeSeconds),
       soundCue,
+      soundCueRepeats: Math.max(1, Math.floor(soundCueRepeats)),
+      presentation: presentation ? Object.freeze({ ...presentation }) : null,
     });
     this.presentationEvents.push(event);
     if (this.presentationEvents.length > 256) this.presentationEvents.shift();
@@ -523,6 +565,7 @@ export class InfiniteGameplayRuntime {
   #emitCombatEffect({
     type, x, y = 0, z, durationSeconds, cameraShake = 0, hitStopMs = 0,
     directionX = 0, directionY = 0, directionZ = 0, intensity = 1, soundCue = null,
+    soundCueRepeats = 1, presentation = null,
   }) {
     const effect = {
       id: `combat-effect:${this.combatSequence + 1}`,
@@ -535,7 +578,7 @@ export class InfiniteGameplayRuntime {
     if (this.combatEffects.length > 256) this.combatEffects.shift();
     this.#emitPresentationEvent({
       type, x, y, z, directionX, directionY, directionZ, intensity,
-      lifetimeSeconds: durationSeconds, soundCue,
+      lifetimeSeconds: durationSeconds, soundCue, soundCueRepeats, presentation,
     });
     this.pendingCameraShake = Math.max(this.pendingCameraShake, cameraShake);
     if (hitStopMs > 0) this.hitStopUntil = Math.max(this.hitStopUntil, this.clock() + hitStopMs);
@@ -1809,6 +1852,18 @@ export class InfiniteGameplayRuntime {
       const beforeDestroyed = this.state.isFeatureDestroyed(target.stableId);
       const result = this.state.damageFeature(target, amount);
       const justDestroyed = !beforeDestroyed && result.destroyed;
+      if (amount > 0 && target.worldDetail !== true) {
+        this.#emitPresentationEvent({
+          type: justDestroyed ? 'finite-target-destruction' : 'finite-target-impact',
+          x: target.x,
+          y: target.y ?? this.#terrainHeightAt(target.x, target.z),
+          z: target.z,
+          intensity: Math.max(0.25, finiteWorldUnitsToMeters(target.radius)),
+          lifetimeSeconds: justDestroyed
+            ? W8_DESTRUCTION_PRESENTATION_CONTRACT.debrisLifetimeSeconds : 0.4,
+          presentation: finitePresentationProfile(target, justDestroyed),
+        });
+      }
       if (justDestroyed) {
         this.counts.destroyedFeatures += 1;
         if (awardPlayerCredit) {
@@ -1861,6 +1916,26 @@ export class InfiniteGameplayRuntime {
     const beforeAlive = entity.alive;
     const result = this.state.damageEntity(entity.stableId, amount);
     const justDestroyed = beforeAlive && !result.alive;
+    if (amount > 0 && entity.type !== 'boss') {
+      this.#emitPresentationEvent({
+        type: justDestroyed ? 'finite-target-destruction' : 'finite-target-impact',
+        x: entity.x,
+        y: entity.type === 'tank'
+          ? (this.activeTankOccurrences.get(entity.stableId)?.groundY
+            ?? this.#terrainHeightAt(entity.x, entity.z))
+          : this.#terrainHeightAt(entity.x, entity.z),
+        z: entity.z,
+        intensity: Math.max(0.25, finiteWorldUnitsToMeters(
+          W6_ENTITY_CONTRACTS[entity.type]?.radius ?? 0,
+        )),
+        lifetimeSeconds: justDestroyed
+          ? W8_DESTRUCTION_PRESENTATION_CONTRACT.debrisLifetimeSeconds : 0.4,
+        presentation: finitePresentationProfile({
+          type: entity.type,
+          radius: W6_ENTITY_CONTRACTS[entity.type]?.radius ?? 0,
+        }, justDestroyed),
+      });
+    }
     if (entity.type === 'tank') {
       if (justDestroyed) {
         const destroyedX = entity.x;
@@ -1879,22 +1954,6 @@ export class InfiniteGameplayRuntime {
             cameraShake,
             intensity: 1.8,
             soundCue: 'hit',
-          });
-          this.#emitPresentationEvent({
-            type: 'tank-ruin',
-            x: destroyedX,
-            y: destroyedY,
-            z: destroyedZ,
-            intensity: 0.85,
-            lifetimeSeconds: 15,
-          });
-          this.#emitPresentationEvent({
-            type: 'tank-scar',
-            x: destroyedX,
-            y: destroyedY,
-            z: destroyedZ,
-            intensity: finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.tank.radius),
-            lifetimeSeconds: 0,
           });
           this.#syncTransientCombat();
         }
@@ -2716,6 +2775,7 @@ export class InfiniteGameplayRuntime {
       x: this.state.player.x, z: this.state.player.z,
       directionX: Math.sin(facingY), directionZ: Math.cos(facingY),
       intensity: mode === 'double' ? 1.35 : 1, lifetimeSeconds: 0.24, soundCue: 'swish',
+      soundCueRepeats: mode === 'double' ? 2 : 1,
     });
     const combatTargets = [...this.#collectCombatTargets().values()]
       .sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -3005,7 +3065,8 @@ export class InfiniteGameplayRuntime {
     hitStableIds.sort((a, b) => a.localeCompare(b));
     this.state.setNuclearCooldown(W7_NUCLEAR_CONTRACT.cooldownMs);
     this.#emitCombatEffect({
-      type: 'nuclear-destruction', x, z, durationSeconds: 2.2,
+      type: 'nuclear-destruction', x, z,
+      durationSeconds: W8_NUCLEAR_PRESENTATION_CONTRACT.cloudLifetimeSeconds,
       cameraShake: W7_NUCLEAR_CONTRACT.cameraShake,
       intensity: 4, soundCue: 'atomic',
     });

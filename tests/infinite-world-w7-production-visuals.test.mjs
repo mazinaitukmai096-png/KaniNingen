@@ -318,14 +318,18 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
 
   adapter.consumePresentationEvents([{
     sequence: 41, type: 'nuclear-destruction', logicalPosition: { x: 0, z: 0 },
-    direction: { x: 0, z: 1 }, intensity: 4, lifetimeSeconds: 2.2, soundCue: 'atomic',
+    direction: { x: 0, z: 1 }, intensity: 4, lifetimeSeconds: 3.5, soundCue: 'atomic',
   }], { playerMarker: player });
   adapter.updatePresentation(0.1);
   const nuclearPools = adapter.snapshot().effectInstancePools;
   assert.equal(nuclearPools.flash.count, 1);
-  assert.equal(nuclearPools.smoke.count, 8);
-  assert.equal(nuclearPools.shockwave.count, 3);
-  assert.equal(nuclearPools.scorch.count, 1);
+  assert.equal(nuclearPools.atomicWhite.count, 36);
+  assert.equal(nuclearPools.atomicOrange.count, 36);
+  assert.equal(nuclearPools.goldSpark.count, 35);
+  assert.equal(nuclearPools.atomicRing.count, 26);
+  assert.equal(nuclearPools.smoke.count, 0);
+  assert.equal(nuclearPools.shockwave.count, 0);
+  assert.equal(nuclearPools.scorch.count, 0);
   assert.equal(Object.values(nuclearPools).every(pool => pool.count <= pool.capacity), true);
 
   adapter.syncManualBoss({
@@ -363,29 +367,35 @@ test('W8 Tank death presentation is mechanical, timed, persistent, and bounded',
     soundCue: null,
   });
 
-  assert.equal(adapter.consumePresentationEvents([
-    event(1, 'tank-destruction', 4, 1.8),
-    event(2, 'tank-ruin', 15, 0.85),
-    event(3, 'tank-scar', 0, 1.75),
-  ]), 3);
+  assert.equal(adapter.consumePresentationEvents([{
+    ...event(1, 'finite-target-destruction', 4, 1.8),
+    presentation: {
+      targetType: 'tank', radiusMeters: 1.75,
+      charredCount: 5, sparkCount: 6, debrisCount: 10, bloodCount: 0,
+      ruinScale: 0.85, scarKind: 'scorch', scarRadiusMeters: 1.75,
+      shockwaveRadiusMeters: 0,
+    },
+  }]), 1);
   adapter.updatePresentation(0);
 
   let snapshot = adapter.snapshot();
   assert.equal(snapshot.activePresentationEffectCount, 2);
   assert.equal(snapshot.persistentTankScarCount, 1);
-  assert.equal(snapshot.effectInstancePools.debris.count, 4);
-  assert.equal(snapshot.effectInstancePools.spark.count, 6);
-  assert.equal(snapshot.effectInstancePools.ruin.count, 3);
-  assert.equal(snapshot.effectInstancePools.smoke.count, 4);
-  assert.equal(snapshot.effectInstancePools.scorch.count, 2);
+  assert.equal(snapshot.effectInstancePools.debris.count, 10);
+  assert.equal(snapshot.effectInstancePools.charredImpact.count, 5);
+  assert.equal(snapshot.effectInstancePools.goldSpark.count, 6);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 2);
+  assert.equal(snapshot.effectInstancePools.smoke.count, 1);
+  assert.equal(snapshot.effectInstancePools.scorch.count, 1);
   assert.equal(snapshot.effectInstancePools.blood.count, 0);
 
   adapter.updatePresentation(4);
   snapshot = adapter.snapshot();
   assert.equal(snapshot.activePresentationEffectCount, 1);
   assert.equal(snapshot.effectInstancePools.debris.count, 0);
-  assert.equal(snapshot.effectInstancePools.spark.count, 0);
-  assert.equal(snapshot.effectInstancePools.ruin.count, 3);
+  assert.equal(snapshot.effectInstancePools.charredImpact.count, 0);
+  assert.equal(snapshot.effectInstancePools.goldSpark.count, 0);
+  assert.equal(snapshot.effectInstancePools.ruin.count, 2);
   assert.equal(snapshot.effectInstancePools.smoke.count, 1);
   assert.equal(snapshot.effectInstancePools.scorch.count, 1);
   assert.equal(snapshot.effectInstancePools.blood.count, 0);
@@ -430,6 +440,58 @@ test('W8 Tank death presentation is mechanical, timed, persistent, and bounded',
     true,
   );
 
+  await adapter.shutdown();
+  assets.dispose();
+});
+
+test('finite Human and Rock destruction retain exact High-quality particle counts', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  const base = {
+    logicalPosition: { x: 0, y: 0, z: 0 },
+    direction: { x: 1, y: 0, z: 0 },
+    intensity: 1,
+    lifetimeSeconds: 4,
+    soundCue: null,
+  };
+  adapter.consumePresentationEvents([{
+    ...base,
+    sequence: 1,
+    type: 'finite-target-destruction',
+    presentation: {
+      targetType: 'human', radiusMeters: 0.625,
+      charredCount: 0, sparkCount: 0, debrisCount: 0, bloodCount: 35,
+      ruinScale: 0, scarKind: 'blood', scarRadiusMeters: 0.9375,
+      shockwaveRadiusMeters: 4,
+    },
+  }]);
+  adapter.updatePresentation(0.1);
+  let snapshot = adapter.snapshot();
+  assert.equal(snapshot.effectInstancePools.blood.count, 35);
+  assert.equal(snapshot.effectInstancePools.shockwave.count, 1);
+  assert.equal(snapshot.effectInstancePools.bloodScar.count, 1);
+  assert.equal(snapshot.effectInstancePools.charredImpact.count, 0);
+  assert.equal(snapshot.effectInstancePools.goldSpark.count, 0);
+
+  adapter.clearCombatPresentation();
+  adapter.consumePresentationEvents([{
+    ...base,
+    sequence: 2,
+    type: 'finite-target-destruction',
+    presentation: {
+      targetType: 'rock', radiusMeters: 1.25,
+      charredCount: 5, sparkCount: 6, debrisCount: 8, bloodCount: 0,
+      ruinScale: 0, scarKind: 'scorch', scarRadiusMeters: 1.25,
+      shockwaveRadiusMeters: 0,
+    },
+  }]);
+  adapter.updatePresentation(0.1);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.effectInstancePools.charredImpact.count, 5);
+  assert.equal(snapshot.effectInstancePools.goldSpark.count, 6);
+  assert.equal(snapshot.effectInstancePools.rockDebris.count, 8);
+  assert.equal(snapshot.effectInstancePools.scorch.count, 1);
   await adapter.shutdown();
   assets.dispose();
 });

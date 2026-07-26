@@ -10,7 +10,11 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
-import { W7_NUCLEAR_CONTRACT } from '../gameplay-contract.js';
+import {
+  W7_NUCLEAR_CONTRACT,
+  W8_NUCLEAR_PRESENTATION_CONTRACT,
+  finiteWorldUnitsToMeters,
+} from '../gameplay-contract.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -43,7 +47,8 @@ export class GameplayRenderAdapter {
     this.presentationPool = [];
     this.activePresentationEffects = [];
     this.presentationPoolLimit = 96;
-    this.persistentTankScars = [];
+    this.persistentScars = [];
+    this.persistentTankScars = this.persistentScars;
     this.tankScarLimit = 50;
     this.tankRuinLimit = 30;
     const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
@@ -52,7 +57,13 @@ export class GameplayRenderAdapter {
     this.effectInstancePools = new Map();
     const effectPoolSpecs = Object.freeze({
       flash: Object.freeze({ geometry: 'sphere', material: 'atomicFlash', capacity: 96 }),
-      debris: Object.freeze({ geometry: 'box', material: 'charred', capacity: 384 }),
+      debris: Object.freeze({ geometry: 'box', material: 'charred', capacity: 500 }),
+      charredImpact: Object.freeze({ geometry: 'box', material: 'charred', capacity: 500 }),
+      goldSpark: Object.freeze({ geometry: 'box', material: 'gold', capacity: 600 }),
+      atomicWhite: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
+      atomicOrange: Object.freeze({ geometry: 'box', material: 'shockwave', capacity: 64 }),
+      atomicRing: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
+      rockDebris: Object.freeze({ geometry: 'dodeca', material: 'rock', capacity: 500 }),
       worldDetailDebris: Object.freeze({ geometry: 'box', material: 'roadSign', capacity: 192 }),
       dust: Object.freeze({ geometry: 'box', material: 'road', capacity: 384 }),
       blood: Object.freeze({ geometry: 'box', material: 'blood', capacity: 192 }),
@@ -60,6 +71,7 @@ export class GameplayRenderAdapter {
       shockwave: Object.freeze({ geometry: 'torus', material: 'shockwave', capacity: 288 }),
       smoke: Object.freeze({ geometry: 'sphere', material: 'smoke', capacity: 384 }),
       scorch: Object.freeze({ geometry: 'sphere', material: 'scorch', capacity: 96 }),
+      bloodScar: Object.freeze({ geometry: 'sphere', material: 'blood', capacity: 50 }),
       spark: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 192 }),
       ruin: Object.freeze({ geometry: 'box', material: 'charred', capacity: 90 }),
     });
@@ -268,6 +280,99 @@ export class GameplayRenderAdapter {
       const unit = this.unitsPerMeter;
       const baseY = (event.logicalPosition.y ?? 0) * unit;
       const base = { x: local.x, z: local.z };
+      if (event.type === 'finite-target-impact' || event.type === 'finite-target-destruction') {
+        const finite = event.presentation ?? {};
+        const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
+        const charredCount = elapsedSeconds <= 2 ? (finite.charredCount ?? 0) : 0;
+        const sparkCount = elapsedSeconds <= 2 ? (finite.sparkCount ?? 0) : 0;
+        const bloodCount = elapsedSeconds <= 2 ? (finite.bloodCount ?? 0) : 0;
+        for (let index = 0; index < charredCount; index += 1) {
+          const angle = index / Math.max(1, charredCount) * Math.PI * 2
+            + (event.sequence ?? 0) * 0.31;
+          const travel = progress * (0.25 + index * 0.08) * unit;
+          this.#appendEffectInstance('charredImpact', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.15 + Math.sin(progress * Math.PI) * (0.25 + index * 0.04)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.3 * unit, scaleY: 0.3 * unit, scaleZ: 0.3 * unit,
+            rotationX: progress * 4 + index, rotationY: angle,
+          });
+        }
+        for (let index = 0; index < sparkCount; index += 1) {
+          const angle = index / Math.max(1, sparkCount) * Math.PI * 2
+            + (event.sequence ?? 0) * 0.19;
+          const travel = progress * (0.35 + index * 0.07) * unit;
+          this.#appendEffectInstance('goldSpark', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.35 + index * 0.03)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.2 * unit, scaleY: 0.2 * unit, scaleZ: 0.2 * unit,
+            rotationX: progress * 6 + index, rotationY: angle,
+          });
+        }
+        for (let index = 0; index < bloodCount; index += 1) {
+          const angle = index / Math.max(1, bloodCount) * Math.PI * 2
+            + (event.sequence ?? 0) * 0.11;
+          const variation = ((index * 17 + (event.sequence ?? 0) * 7) % 31) / 31;
+          const travel = progress * (0.3 + variation * 1.8) * unit;
+          this.#appendEffectInstance('blood', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.4 + variation)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.3 * unit, scaleY: 0.3 * unit, scaleZ: 0.3 * unit,
+            rotationX: progress * 5 + index, rotationY: angle,
+          });
+        }
+        for (let index = 0; index < (finite.debrisCount ?? 0); index += 1) {
+          const angle = index / Math.max(1, finite.debrisCount) * Math.PI * 2
+            + (event.sequence ?? 0) * 0.23;
+          const travel = progress * (0.4 + index * 0.12) * unit;
+          const role = finite.targetType === 'rock' || finite.targetType === 'pebble'
+            ? 'rockDebris' : 'debris';
+          this.#appendEffectInstance(role, {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.3 + Math.sin(progress * Math.PI) * (0.7 + index * 0.08)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
+            scaleY: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
+            scaleZ: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
+            rotationX: progress * 4 + index, rotationY: angle,
+          });
+        }
+        if ((finite.shockwaveRadiusMeters ?? 0) > 0 && elapsedSeconds <= 1) {
+          const ringScale = Math.max(0.1,
+            finite.shockwaveRadiusMeters * Math.min(1, elapsedSeconds)) * unit;
+          this.#appendEffectInstance('shockwave', {
+            ...base, y: baseY + 0.08 * unit,
+            scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
+            rotationX: Math.PI / 2,
+          });
+        }
+        continue;
+      }
+      if (event.type === 'finite-ruin') {
+        const ruinScale = event.presentation?.ruinScale ?? 0.85;
+        const blockCount = 1 + ((event.sequence ?? 0) % 3);
+        for (let index = 0; index < blockCount; index += 1) {
+          const angle = index / blockCount * Math.PI * 2 + event.sequence * 0.37;
+          this.#appendEffectInstance('ruin', {
+            x: base.x + Math.cos(angle) * 0.8 * ruinScale * unit,
+            y: baseY + (0.15 + index * 0.1) * ruinScale * unit,
+            z: base.z + Math.sin(angle) * 0.8 * ruinScale * unit,
+            scaleX: (1.5 + index * 0.35) * ruinScale * unit,
+            scaleY: (0.375 + index * 0.18) * ruinScale * unit,
+            scaleZ: (1 + (blockCount - index) * 0.3) * ruinScale * unit,
+            rotationX: (index - 1) * 0.18, rotationY: angle,
+            rotationZ: (1 - index) * 0.14,
+          });
+        }
+        const smokeScale = ruinScale * (0.55 + progress * 0.65) * unit;
+        this.#appendEffectInstance('smoke', {
+          ...base, y: baseY + (0.8 + progress * 1.5) * unit,
+          scaleX: smokeScale * 1.2, scaleY: smokeScale, scaleZ: smokeScale * 1.2,
+        });
+        continue;
+      }
       if (event.type.includes('claw-swish') || event.type === 'boss-sweep') {
         this.#appendEffectInstance('wind', {
           ...base, y: baseY + 1.2 * unit,
@@ -277,35 +382,54 @@ export class GameplayRenderAdapter {
         continue;
       }
       if (event.type.startsWith('nuclear')) {
-        this.#appendEffectInstance('flash', {
-          ...base, y: baseY + (2 + progress * 9) * unit,
-          scaleX: (2 + progress * 12) * unit,
-          scaleY: (2 + progress * 15) * unit,
-          scaleZ: (2 + progress * 12) * unit,
+        const nuclear = W8_NUCLEAR_PRESENTATION_CONTRACT;
+        const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
+        if (elapsedSeconds <= nuclear.screenFlashSeconds) this.#appendEffectInstance('flash', {
+          ...base, y: baseY + 2 * unit,
+          scaleX: 12 * unit, scaleY: 15 * unit, scaleZ: 12 * unit,
         });
-        for (let index = 0; index < 8; index += 1) {
-          const angle = index * 2.399963 + progress * 0.3;
-          const radius = (0.5 + index * 0.22) * unit;
-          const puffScale = (1.2 + index * 0.18 + progress * 1.6) * unit;
-          this.#appendEffectInstance('smoke', {
-            x: base.x + Math.cos(angle) * radius,
-            y: baseY + (2 + index * 1.8 + progress * 7) * unit,
-            z: base.z + Math.sin(angle) * radius,
-            scaleX: puffScale * 1.25, scaleY: puffScale, scaleZ: puffScale * 1.25,
+        for (const [role, phase] of [['atomicWhite', 0], ['atomicOrange', Math.PI]]) {
+          for (let index = 0; index < nuclear.cloudParticlesPerColor; index += 1) {
+            const angle = index / nuclear.cloudParticlesPerColor * Math.PI * 2 + phase;
+            const variation = ((index * 19 + (event.sequence ?? 0) * 11) % 37) / 37;
+            const travel = progress * (4 + variation * 26) * unit;
+            const size = (1.25 + variation * 1.2) * unit;
+            this.#appendEffectInstance(role, {
+              x: base.x + Math.cos(angle) * travel,
+              y: baseY + progress * (8 + variation * 38) * unit,
+              z: base.z + Math.sin(angle) * travel,
+              scaleX: size, scaleY: size, scaleZ: size,
+              rotationX: progress * 5 + index, rotationY: angle,
+            });
+          }
+        }
+        for (let index = 0; index < nuclear.goldSparkCount; index += 1) {
+          const angle = index / nuclear.goldSparkCount * Math.PI * 2;
+          const variation = ((index * 13 + (event.sequence ?? 0) * 5) % 31) / 31;
+          const travel = progress * (3 + variation * 20) * unit;
+          this.#appendEffectInstance('goldSpark', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + progress * (6 + variation * 25) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.625 * unit, scaleY: 0.625 * unit, scaleZ: 0.625 * unit,
+            rotationX: progress * 6 + index, rotationY: angle,
           });
         }
-        for (let index = 0; index < 3; index += 1) {
-          const ringScale = (5 + index * 4 + progress * 18) * unit;
-          this.#appendEffectInstance('shockwave', {
-            ...base, y: baseY + (0.12 + index * 0.06) * unit,
-            scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
-            rotationX: Math.PI / 2,
-          });
+        if (elapsedSeconds <= nuclear.ringLifetimeSeconds) {
+          const ringProgress = elapsedSeconds / nuclear.ringLifetimeSeconds;
+          for (let index = 0; index < nuclear.radialRingCount; index += 1) {
+            const angle = index / nuclear.radialRingCount * Math.PI * 2;
+            const travel = ringProgress * finiteWorldUnitsToMeters(W7_NUCLEAR_CONTRACT.pushRadius)
+              * unit;
+            this.#appendEffectInstance('atomicRing', {
+              x: base.x + Math.cos(angle) * travel,
+              y: baseY + 2.5 * unit,
+              z: base.z + Math.sin(angle) * travel,
+              scaleX: 8 * unit, scaleY: 2.25 * unit, scaleZ: 8 * unit,
+              rotationY: angle,
+            });
+          }
         }
-        this.#appendEffectInstance('scorch', {
-          ...base, y: baseY + 0.05 * unit,
-          scaleX: 8 * unit, scaleY: 0.08 * unit, scaleZ: 8 * unit,
-        });
         continue;
       }
       if (event.type === 'player-landing-shockwave') {
@@ -382,9 +506,10 @@ export class GameplayRenderAdapter {
         });
         continue;
       }
-      const destructive = event.type.includes('destruction')
-        || event.type.includes('landing') || event.type.includes('breach');
-      const tankDestruction = event.type === 'tank-destruction';
+      const destructive = event.type.startsWith('boss-')
+        && (event.type.includes('destruction') || event.type.includes('landing')
+          || event.type.includes('breach'));
+      const tankDestruction = false;
       const impact = event.type.includes('impact') || event.type.includes('fire')
         || event.type.includes('spit') || destructive;
       if (impact) this.#appendEffectInstance('flash', {
@@ -458,7 +583,7 @@ export class GameplayRenderAdapter {
         });
       }
     }
-    for (const event of this.persistentTankScars) {
+    for (const event of this.persistentScars) {
       const local = logicalWorldToRenderLocal(
         event.logicalPosition.x,
         event.logicalPosition.z,
@@ -467,7 +592,7 @@ export class GameplayRenderAdapter {
         this.renderChunkSize,
       );
       const radius = Math.max(0.15, event.intensity) * 1.5 * this.unitsPerMeter;
-      this.#appendEffectInstance('scorch', {
+      this.#appendEffectInstance(event.presentation?.scarKind === 'blood' ? 'bloodScar' : 'scorch', {
         x: local.x,
         y: ((event.logicalPosition.y ?? 0) + 0.0375) * this.unitsPerMeter,
         z: local.z,
@@ -486,6 +611,39 @@ export class GameplayRenderAdapter {
     if (this.disposed) return 0;
     this.playerPresentation = playerMarker ?? this.playerPresentation;
     for (const event of events) {
+      if (event.type === 'finite-target-destruction') {
+        const finite = event.presentation ?? {};
+        if (finite.scarKind && finite.scarRadiusMeters > 0) {
+          this.persistentScars.push(Object.freeze({
+            ...event,
+            type: 'finite-scar',
+            intensity: finite.scarRadiusMeters,
+            presentation: Object.freeze({ scarKind: finite.scarKind }),
+          }));
+          if (this.persistentScars.length > this.tankScarLimit) this.persistentScars.shift();
+        }
+        if (finite.ruinScale > 0) {
+          let ruinCount = 0;
+          let oldestRuinIndex = -1;
+          for (let index = 0; index < this.activePresentationEffects.length; index += 1) {
+            if (!['finite-ruin', 'tank-ruin'].includes(
+              this.activePresentationEffects[index].event?.type,
+            )) continue;
+            ruinCount += 1;
+            if (oldestRuinIndex < 0) oldestRuinIndex = index;
+          }
+          if (ruinCount >= this.tankRuinLimit && oldestRuinIndex >= 0) {
+            const [oldest] = this.activePresentationEffects.splice(oldestRuinIndex, 1);
+            oldest.active = false;
+            oldest.event = null;
+          }
+          this.#acquirePresentationEffect(Object.freeze({
+            ...event,
+            type: 'finite-ruin',
+            lifetimeSeconds: 15,
+          }));
+        }
+      }
       if (event.type === 'tank-scar') {
         this.persistentTankScars.push(event);
         if (this.persistentTankScars.length > this.tankScarLimit) {

@@ -170,6 +170,17 @@ export const W7_NUCLEAR_CONTRACT = Object.freeze({
   cameraShake: 450,
 });
 
+export const W8_NUCLEAR_PRESENTATION_CONTRACT = Object.freeze({
+  requestedCloudParticlesPerColor: 80,
+  cloudParticlesPerColor: 36,
+  requestedGoldSparkCount: 40,
+  goldSparkCount: 35,
+  radialRingCount: 26,
+  cloudLifetimeSeconds: 3.5,
+  ringLifetimeSeconds: 2.2,
+  screenFlashSeconds: 0.3,
+});
+
 export const W8_PLAYER_LANDING_CONTRACT = Object.freeze({
   damage: 800,
   pushSpeed: 400,
@@ -177,6 +188,38 @@ export const W8_PLAYER_LANDING_CONTRACT = Object.freeze({
   shockwaveRadiusMultipliers: Object.freeze([1.1, 0.76]),
   minimumDustCount: 4,
   dustCountPerVisualScale: 14,
+});
+
+export const W8_DESTRUCTION_PRESENTATION_CONTRACT = Object.freeze({
+  normalParticleCapacity: 500,
+  heavyParticleCapacity: 800,
+  scarLimit: 50,
+  ruinLimit: 30,
+  debrisPieceLimit: 10,
+  rockShardCount: 8,
+  nonHumanImpact: Object.freeze({ charredCount: 5, sparkCount: 6 }),
+  humanDeath: Object.freeze({
+    requestedBloodCount: 38,
+    bloodCount: 35,
+    shockwaveRadiusMeters: finiteWorldUnitsToMeters(160),
+    bloodScarRadiusMultiplier: 1.5,
+  }),
+  instancedWorldObject: Object.freeze({ debrisCount: 6, ruinScale: 0.6 }),
+  ruinScaleByType: Object.freeze({
+    school: 2.2,
+    church: 1.6,
+    tower: 1.1,
+    house: 0.85,
+    barn: 0.85,
+    factory: 0.85,
+    haystack: 0.85,
+    cow: 0.85,
+    militaryBase: 0.85,
+    tank: 0.85,
+  }),
+  debrisLifetimeSeconds: 4,
+  rockLifetimeSeconds: 3.5,
+  ruinLifetimeSeconds: 15,
 });
 
 export const W8_HUMAN_BEHAVIOR_CONTRACT = Object.freeze({

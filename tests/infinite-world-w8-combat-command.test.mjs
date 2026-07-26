@@ -8,6 +8,7 @@ import {
 } from '../src/infinite-world/gameplay-contract.js';
 import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
 import { InfiniteWorldState } from '../src/infinite-world/world-state-store.js';
+import { createW8AudioDirector } from '../src/infinite-world/w8-audio.js';
 
 class RenderAdapter {
   constructor() { this.boss = null; }
@@ -44,6 +45,38 @@ test('CombatCommand distinguishes left, right and both claws while gameplay reso
   const events = runtime.consumePresentationEffects().events;
   assert.equal(events.every(event => event.schemaVersion === W8_PRESENTATION_EVENT_SCHEMA), true);
   assert.deepEqual(events.map(event => event.type), ['left-claw-swish', 'both-claw-swish']);
+  assert.deepEqual(events.map(event => event.soundCueRepeats), [1, 2],
+    'finite double-claw attack plays the Swish cue twice on the same presentation frame');
+});
+
+test('Audio consumes finite same-frame cue repetitions without duplicating presentation events', async () => {
+  const parameter = () => ({
+    value: 0,
+    setValueAtTime() {},
+    exponentialRampToValueAtTime() {},
+    linearRampToValueAtTime() {},
+  });
+  class FakeAudioContext {
+    constructor() {
+      this.currentTime = 0;
+      this.state = 'running';
+      this.destination = {};
+    }
+    createGain() {
+      return { gain: parameter(), connect() {}, disconnect() {} };
+    }
+    createOscillator() {
+      return {
+        frequency: parameter(), connect() {}, disconnect() {}, start() {}, stop() {},
+        onended: null,
+      };
+    }
+    close() { return Promise.resolve(); }
+  }
+  const audio = createW8AudioDirector({ globalObject: { AudioContext: FakeAudioContext } });
+  audio.consume([{ soundCue: 'swish', soundCueRepeats: 2 }]);
+  assert.equal(audio.snapshot().playedCueCount, 2);
+  await audio.dispose();
 });
 
 test('Atomic follows airborne, cooldown, persistent-state, and Restart event order', async () => {

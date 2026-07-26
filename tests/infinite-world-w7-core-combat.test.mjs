@@ -1893,7 +1893,20 @@ test('building destruction, score, healing, hit stop and effects share the W6 Wo
   assert.equal(features.destroyed.has(houseHit.stableId), true);
   assert.equal(runtime.isHitStopped(64), true);
   assert.equal(runtime.isHitStopped(65), false);
-  assert.ok(runtime.consumePresentationEffects().cameraShake > 0);
+  const presentation = runtime.consumePresentationEffects();
+  assert.ok(presentation.cameraShake > 0);
+  const finiteDestruction = presentation.events.find(event =>
+    event.type === 'finite-target-destruction' && event.presentation?.targetType === 'house');
+  assert.ok(finiteDestruction);
+  assert.deepEqual({
+    charredCount: finiteDestruction.presentation.charredCount,
+    sparkCount: finiteDestruction.presentation.sparkCount,
+    debrisCount: finiteDestruction.presentation.debrisCount,
+    ruinScale: finiteDestruction.presentation.ruinScale,
+    scarKind: finiteDestruction.presentation.scarKind,
+  }, {
+    charredCount: 5, sparkCount: 6, debrisCount: 10, ruinScale: 0.85, scarKind: 'scorch',
+  });
   assert.ok(runtime.snapshot().activeCombatEffectCount > 0);
   await runtime.shutdown();
 });

@@ -60,7 +60,11 @@ export function createW8AudioDirector({ globalObject = globalThis, volume = 0.5 
     schemaVersion: 'w8-finite-web-audio-director-1',
     play,
     consume(events = []) {
-      for (const event of events) if (event.soundCue) play(event.soundCue);
+      for (const event of events) {
+        if (!event.soundCue) continue;
+        const repeats = Math.max(1, Math.floor(event.soundCueRepeats ?? 1));
+        for (let index = 0; index < repeats; index += 1) play(event.soundCue);
+      }
     },
     setVolume(value) {
       currentVolume = Math.max(0, Math.min(1, Number(value)));
