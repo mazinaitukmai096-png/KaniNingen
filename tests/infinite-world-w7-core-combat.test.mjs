@@ -1018,6 +1018,155 @@ test('World Object destruction cannot burst duplicate Tank spawn reservations or
   await runtime.shutdown();
 });
 
+test('fallback Tank replenishment keeps the finite one-evaluation cadence after score bursts', async () => {
+  const chunk = emptyChunk(0, 0);
+  chunk.rockCandidates = Array.from({ length: 10 }, (_, index) => ({
+    candidateId: `wf1:rock:w8-fallback-cadence-${index}`,
+    worldPosition: { x: 2 + index, y: 0, z: 4 },
+    metadata: { candidateRadiusMeters: 0.8 },
+    owningChunkCoordinate: { x: 0, z: 0 },
+  }));
+  const { runtime, state, renderer } = await createRuntime({
+    playerSpawn: { x: 8, z: 8 },
+    chunk,
+    configureState(candidate) {
+      candidate.player.score = 2_400;
+    },
+  });
+
+  for (const rock of chunk.rockCandidates) {
+    const result = runtime.applyCombatDamage(runtime.resolveCombatTarget(rock.candidateId), 600, {
+      awardPlayerCredit: true,
+    });
+    assert.equal(result.justDestroyed, true);
+  }
+  assert.equal(state.player.score, 3_400);
+  assert.equal(runtime.snapshot().reservedTankCapacityCount, 0,
+    'ten same-frame World Object destructions do not directly reserve fallback Tanks');
+
+  for (let update = 0; update < 47; update += 1) {
+    runtime.update({ deltaSeconds: 1 / 240, player: state.player });
+  }
+  await drainAsyncWork();
+  assert.equal(runtime.snapshot().reservedTankCapacityCount, 0,
+    'sub-reference-frame updates cannot advance the finite spawn evaluation sequence early');
+
+  runtime.update({ deltaSeconds: 1 / 240, player: state.player });
+  await waitForAsync(() => runtime.snapshot().activeTankCount === 1);
+  let snapshot = runtime.snapshot();
+  assert.equal(snapshot.activeTankCount, 1);
+  assert.equal(snapshot.pendingTankSpawnCount, 0);
+  assert.equal(snapshot.fallbackTankCount, 1);
+  assert.equal(state.tankReinforcementSequence, 1,
+    'one eligible update can commit at most one fallback Tank');
+
+  for (let update = 0; update < 40; update += 1) {
+    runtime.update({ deltaSeconds: 0, player: state.player });
+  }
+  await drainAsyncWork();
+  assert.equal(state.tankReinforcementSequence, 1,
+    'Promise completion and zero-time updates cannot create the next reservation');
+
+  for (let update = 0; update < 37; update += 1) {
+    runtime.update({ deltaSeconds: 1 / 60, player: state.player });
+  }
+  await drainAsyncWork();
+  assert.equal(state.tankReinforcementSequence, 1,
+    'the next fallback candidate is not evaluated before its finite reference-frame chance');
+  runtime.update({ deltaSeconds: 1 / 60, player: state.player });
+  await waitForAsync(() => runtime.snapshot().activeTankCount === 2);
+  snapshot = runtime.snapshot();
+  assert.equal(state.tankReinforcementSequence, 2);
+  assert.equal(snapshot.activeTankCount, 2);
+  assert.equal(snapshot.pendingTankSpawnCount, 0);
+  assert.ok(snapshot.reservedTankCapacityCount <= snapshot.allowedTankCount);
+  assert.equal(renderer.occurrences.size, snapshot.activeTankCount,
+    'each fallback Stable ID owns exactly one renderer entry');
+  await runtime.shutdown();
+});
+
+test('an occupied living Military Base never opens the finite fallback branch', async () => {
+  const { runtime, state, renderer } = await createRuntime({
+    playerSpawn: { x: 14, z: 25 },
+    chunk: tankOnlyChunk(),
+    configureState(candidate) {
+      candidate.player.score = 36_000;
+    },
+  });
+  const baseTank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14, heading: 0 });
+  for (let update = 0; update < 240; update += 1) {
+    runtime.update({ deltaSeconds: 1 / 60, player: state.player });
+    await Promise.resolve();
+  }
+  const snapshot = runtime.snapshot();
+  assert.equal(baseTank.spawned, true);
+  assert.equal(snapshot.activeTankCount, 1);
+  assert.equal(snapshot.fallbackTankCount, 0,
+    'finite fallback requires no living Military Base inside the spawn range');
+  assert.equal(snapshot.pendingTankSpawnCount, 0);
+  assert.equal(renderer.occurrences.size, 0);
+  assert.ok(snapshot.reservedTankCapacityCount <= W8_TANK_LIFECYCLE_CONTRACT.tankLimitMaximum);
+  await runtime.shutdown();
+});
+
+test('fallback cadence state resets across Restart, Continue refresh, and Scale changes', async t => {
+  const createCadenceRuntime = () => createRuntime({
+    playerSpawn: { x: 8, z: 8 },
+    chunk: emptyChunk(0, 0),
+    configureState(candidate) {
+      candidate.player.score = 3_400;
+    },
+  });
+  const advanceQuarterFrames = (runtime, state, count) => {
+    for (let update = 0; update < count; update += 1) {
+      runtime.update({ deltaSeconds: 1 / 240, player: state.player });
+    }
+  };
+
+  await t.test('Scale change clears fractional spawn time', async () => {
+    const { runtime, state } = await createCadenceRuntime();
+    advanceQuarterFrames(runtime, state, 47);
+    state.setScaleStage('TINY');
+    runtime.update({ deltaSeconds: 0, player: state.player });
+    state.setScaleStage('MAX');
+    runtime.update({ deltaSeconds: 0, player: state.player });
+    advanceQuarterFrames(runtime, state, 3);
+    await drainAsyncWork();
+    assert.equal(runtime.snapshot().reservedTankCapacityCount, 0);
+    advanceQuarterFrames(runtime, state, 1);
+    await waitForAsync(() => runtime.snapshot().activeTankCount === 1);
+    assert.equal(runtime.snapshot().activeTankCount, 1);
+    await runtime.shutdown();
+  });
+
+  await t.test('Continue refresh clears fractional spawn time', async () => {
+    const { runtime, state } = await createCadenceRuntime();
+    advanceQuarterFrames(runtime, state, 47);
+    await runtime.refreshFromState();
+    advanceQuarterFrames(runtime, state, 3);
+    await drainAsyncWork();
+    assert.equal(runtime.snapshot().reservedTankCapacityCount, 0);
+    advanceQuarterFrames(runtime, state, 1);
+    await waitForAsync(() => runtime.snapshot().activeTankCount === 1);
+    assert.equal(runtime.snapshot().activeTankCount, 1);
+    await runtime.shutdown();
+  });
+
+  await t.test('Restart clears the evaluation sequence and fractional spawn time', async () => {
+    const { runtime, state } = await createCadenceRuntime();
+    advanceQuarterFrames(runtime, state, 47);
+    await runtime.restart({ playerSpawn: { x: 8, z: 8 } });
+    state.player.score = 3_400;
+    advanceQuarterFrames(runtime, state, 47);
+    await drainAsyncWork();
+    assert.equal(runtime.snapshot().reservedTankCapacityCount, 0);
+    advanceQuarterFrames(runtime, state, 1);
+    await waitForAsync(() => runtime.snapshot().activeTankCount === 1);
+    assert.equal(runtime.snapshot().activeTankCount, 1);
+    await runtime.shutdown();
+  });
+});
+
 test('destroying a Military Base cancels its pending slot and later destroy events cannot rearm it', async () => {
   const chunk = tankOnlyChunk({
     rocks: Array.from({ length: 3 }, (_, index) => ({
