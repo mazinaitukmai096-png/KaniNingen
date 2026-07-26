@@ -12,6 +12,8 @@ import {
   W8_PRESENTATION_TERRAIN_PALETTE,
   createW8DistantPresentation,
   createW8ClipmapTopology,
+  isW8DistantNaturalProxyInRange,
+  isW8NaturalCandidateVisible,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
@@ -409,6 +411,29 @@ test('five-run acceptance uses finite, before-W8, and after-W8 medians without w
   assert.deepEqual(rejected.recurringStageStops, [{ stage: 'distant-sync', runCount: 2 }]);
   assert.deepEqual(correlateW8HitchStages(stopped), [{ stage: 'distant-sync', runCount: 2 }]);
   assert.throws(() => evaluateW8PerformanceRuns({ finiteReports: [], w8Reports }), /exactly five/);
+});
+
+test('natural-object LOD selection is stable and anchored proxies persist into the near field', () => {
+  const candidate = {
+    candidateId: 'detail-v1:vegetation:lod-stability',
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.7,
+    worldPosition: { x: 12, y: 0, z: -7 },
+  };
+  assert.equal(
+    isW8NaturalCandidateVisible(candidate, 0),
+    isW8NaturalCandidateVisible(candidate, 12),
+    'camera distance must not change the canonical tree set',
+  );
+  assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 0 }), false);
+  assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 1 }), true);
+
+  assert.equal(isW8DistantNaturalProxyInRange(0), true);
+  assert.equal(isW8DistantNaturalProxyInRange(24), true);
+  assert.equal(isW8DistantNaturalProxyInRange(40), true);
+  assert.equal(isW8DistantNaturalProxyInRange(339.999), true);
+  assert.equal(isW8DistantNaturalProxyInRange(340), false);
+  assert.equal(isW8DistantNaturalProxyInRange(Number.NaN), false);
 });
 
 test('clipmap topology and terrain sampling remain Float32-identical to the pre-refactor path', () => {

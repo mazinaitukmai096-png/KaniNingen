@@ -10,7 +10,8 @@ const FIVE_BY_FIVE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 2.5;
 const CLIPMAP_EXTENT_METERS = 352;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
-const DISTANT_NATURAL_PROXY_LIMIT = 300;
+const DISTANT_NATURAL_PROXY_LIMIT = 500;
+const DISTANT_NATURAL_PROXY_SPACING_METERS = 18;
 const DISTANT_WATER_PROXY_LIMIT = 24;
 const TEMPLATE_CACHE_CAPACITY = 4;
 const FAR_OWNER_CHUNK_CACHE_CAPACITY = 64;
@@ -47,17 +48,22 @@ function presentationClusterRoll(candidate) {
   return (value >>> 0) / 0x1_0000_0000;
 }
 
-export function isW8NaturalCandidateVisible(candidate, distanceChunks = 0) {
+export function isW8NaturalCandidateVisible(candidate) {
   if (candidate?.candidateId === undefined) return true;
   const cluster = presentationClusterRoll(candidate);
-  const clusteredThreshold = cluster < 0.28 ? 0.22 : cluster < 0.65 ? 0.48 : 0.68;
+  const clusteredThreshold = cluster < 0.28 ? 0.32 : cluster < 0.65 ? 0.58 : 0.78;
   const subtypeAdjustment = candidate.subtype === 'shrub' ? -0.08 : 0;
-  const distanceAdjustment = Math.max(0, distanceChunks - 1.25) * 0.1;
   return candidate.variationSeed >= clamp(
-    clusteredThreshold + subtypeAdjustment + distanceAdjustment,
+    clusteredThreshold + subtypeAdjustment,
     0.12,
     0.82,
   );
+}
+
+export function isW8DistantNaturalProxyInRange(distanceMeters) {
+  return Number.isFinite(distanceMeters)
+    && distanceMeters >= 0
+    && distanceMeters < CLIPMAP_EXTENT_METERS - 12;
 }
 
 function requireConstructor(THREE, name) {
@@ -471,16 +477,10 @@ export async function createW8DistantPresentation({
         push(part.geometry, part.material, matrixForPart(feature, part, dimensions), name);
       }
     };
-    const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const presentationDistanceChunks = candidate => Math.hypot(
-        candidate.worldPosition.x - centerWorldX,
-        candidate.worldPosition.z - centerWorldZ,
-      ) / LOGICAL_CHUNK_SIZE_METERS;
     for (const chunk of chunks) {
       const layers = chunk.presentationLayers;
       for (const candidate of layers?.natural?.vegetation ?? chunk.vegetationCandidates ?? []) {
-        if (!isW8NaturalCandidateVisible(candidate, presentationDistanceChunks(candidate))) continue;
+        if (!isW8NaturalCandidateVisible(candidate)) continue;
         const kind = candidate.subtype === 'wetland-tree' ? 'wetlandTree'
           : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree';
         const variation = 0.84 + candidate.variationSeed * 0.32;
@@ -491,8 +491,14 @@ export async function createW8DistantPresentation({
         }, 'major-natural');
       }
       for (const candidate of layers?.natural?.rocks ?? chunk.rockCandidates ?? []) {
+        const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+        const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+        const presentationDistanceChunks = Math.hypot(
+          candidate.worldPosition.x - centerWorldX,
+          candidate.worldPosition.z - centerWorldZ,
+        ) / LOGICAL_CHUNK_SIZE_METERS;
         if (candidate.variationSeed < clamp(
-          0.42 + Math.max(0, presentationDistanceChunks(candidate) - 1.5) * 0.12,
+          0.42 + Math.max(0, presentationDistanceChunks - 1.5) * 0.12,
           0.42,
           0.68,
         )) continue;
@@ -904,7 +910,9 @@ export async function createW8DistantPresentation({
     buildTarget.add(mesh); buildStats.clipmapMeshCount = 1;
   };
 
-  const createDistantNaturalAndWaterProxies = ({ centerChunkX, centerChunkZ, origin }) => {
+  const createDistantNaturalAndWaterProxies = ({
+    centerChunkX, centerChunkZ, activeChunks, origin,
+  }) => {
     const seed = textHash(worldSeedHash);
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
@@ -948,16 +956,18 @@ export async function createW8DistantPresentation({
       }
     };
 
-    forAnchoredGrid(24, (cellX, cellZ) => {
+    forAnchoredGrid(DISTANT_NATURAL_PROXY_SPACING_METERS, (cellX, cellZ) => {
       if (buildStats.distantNaturalProxyCount >= DISTANT_NATURAL_PROXY_LIMIT
-        || cellRoll(seed, cellX, cellZ, 1) > 0.31) return;
-      const worldX = (cellX + 0.18 + cellRoll(seed, cellX, cellZ, 2) * 0.64) * 24;
-      const worldZ = (cellZ + 0.18 + cellRoll(seed, cellX, cellZ, 3) * 0.64) * 24;
+        || cellRoll(seed, cellX, cellZ, 1) > 0.25) return;
+      const worldX = (cellX + 0.18 + cellRoll(seed, cellX, cellZ, 2) * 0.64)
+        * DISTANT_NATURAL_PROXY_SPACING_METERS;
+      const worldZ = (cellZ + 0.18 + cellRoll(seed, cellX, cellZ, 3) * 0.64)
+        * DISTANT_NATURAL_PROXY_SPACING_METERS;
       const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
-      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS || distance >= CLIPMAP_EXTENT_METERS - 12) return;
-      const fade = fadeAt(worldX, worldZ);
-      if (fade <= 0) return;
+      if (!isW8DistantNaturalProxyInRange(distance)) return;
+      const fade = 1;
       const sample = baseClipmapSample(worldX, worldZ);
+      const activeHeight = sampleActiveTerrain(activeChunks, worldX, worldZ);
       const roll = cellRoll(seed, cellX, cellZ, 4);
       const kind = roll > 0.9 ? 'rock'
         : sample.moisture > 0.68 ? 'wetlandTree'
@@ -969,7 +979,7 @@ export async function createW8DistantPresentation({
         : { width: 2 * size * UNITS_PER_METER, height: 3.625 * size * UNITS_PER_METER,
           depth: 2 * size * UNITS_PER_METER };
       for (const part of visualAssets.featureParts[kind] ?? []) placePart({
-        worldX, worldZ, height: sample.height,
+        worldX, worldZ, height: activeHeight ?? sample.height,
         rotationY: cellRoll(seed, cellX, cellZ, 6) * Math.PI * 2,
         dimensions, part, fade,
       });
@@ -1278,6 +1288,7 @@ export async function createW8DistantPresentation({
         measure('distant-feature-proxies', () => createDistantNaturalAndWaterProxies({
           centerChunkX,
           centerChunkZ,
+          activeChunks,
           origin: renderOrigin,
         }));
         positionGenerationForOrigin(generation, renderOrigin);

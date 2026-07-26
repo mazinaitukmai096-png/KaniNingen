@@ -493,7 +493,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.presentation.maximumInnerBoundaryColorDifference <= 0.03);
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
     assert.ok(snapshot.presentation.distantNaturalProxyCount > 0);
-    assert.ok(snapshot.presentation.distantNaturalProxyCount <= 300);
+    assert.ok(snapshot.presentation.distantNaturalProxyCount <= 500);
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
