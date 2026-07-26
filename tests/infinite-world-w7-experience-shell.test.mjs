@@ -269,6 +269,27 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   fixture.shell.dispose();
 });
 
+test('Boss Acid movement multiplier scales normal and sprint movement without changing inputs', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 0, z: 0, facingY: 0 };
+  const profile = getW6ScaleProfile('MAX');
+  finishIntro(fixture, player, profile);
+  fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+  fixture.shell.updatePlayer({
+    deltaSeconds: 1, player, scaleProfile: profile, movementMultiplier: 0.75,
+  });
+  assert.equal(player.x, profile.movementMetersPerSecond * 0.75);
+  fixture.globalObject.dispatch('keydown', { code: 'ShiftLeft' });
+  fixture.shell.updatePlayer({
+    deltaSeconds: 1, player, scaleProfile: profile, movementMultiplier: 0.75,
+  });
+  assert.equal(player.x, profile.movementMetersPerSecond * 0.75 * (1 + 1.45));
+  fixture.globalObject.dispatch('keyup', { code: 'KeyD' });
+  fixture.globalObject.dispatch('keyup', { code: 'ShiftLeft' });
+  fixture.shell.dispose();
+});
+
 test('Tab and Scale remain available while advanced Developer commands stay isolated when OFF', () => {
   const fixture = createFixture({ exposeDeveloperTools: true });
   fixture.elements.get('start-button').dispatch('click');

@@ -451,7 +451,7 @@ export function createInfiniteExperienceShell({
     },
   });
 
-  function updatePlayer({ deltaSeconds, player, scaleProfile }) {
+  function updatePlayer({ deltaSeconds, player, scaleProfile, movementMultiplier = 1 }) {
     const previousStageId = state.lastScaleProfile?.stage?.id;
     state.lastPlayer = player;
     state.lastScaleProfile = scaleProfile;
@@ -487,7 +487,8 @@ export function createInfiniteExperienceShell({
       if (length > 0) {
         dx /= length; dz /= length;
         const sprint = keys.isPressed('ShiftLeft') || keys.isPressed('ShiftRight');
-        const speed = scaleProfile.movementMetersPerSecond * (intro ? 0.35 : sprint ? 1.45 : 1);
+        const speed = scaleProfile.movementMetersPerSecond
+          * (intro ? 0.35 : sprint ? 1.45 : 1) * movementMultiplier;
         player.x += dx * speed * deltaSeconds;
         player.z += dz * speed * deltaSeconds;
         player.facingY = Math.atan2(dx, dz);

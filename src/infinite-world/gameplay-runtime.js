@@ -499,6 +499,9 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.playerAcidDebuffSeconds = 0;
+    this.acidDebuffParticleAccumulator = 0;
+    this.previousPlayerPosition = { x: state.player.x, z: state.player.z };
     this.entityKnockbacks = new Map();
     this.pendingBossSpawn = null;
     this.pendingTankReinforcement = null;
@@ -608,79 +611,279 @@ export class InfiniteGameplayRuntime {
     }
     behavior.breakStage = stage;
     this.#emitCombatEffect({
-      type: 'boss-segment-break', x: boss.x, z: boss.z, durationSeconds: 0.8,
-      cameraShake: 110, intensity: 2.4, hitStopMs: 70, soundCue: 'roar',
+      type: 'boss-segment-break', x: boss.x, z: boss.z, durationSeconds: 3.5,
+      cameraShake: 200, intensity: 2.4, soundCue: 'boom',
+      presentation: { bloodCount: broken * 25, segmentCount: broken },
     });
+  }
+
+  #spawnBossAcid(boss, directionX, directionY, directionZ, eventType = 'acid-spit') {
+    const length = Math.hypot(directionX, directionY, directionZ) || 1;
+    const behavior = boss.bossBehavior;
+    behavior.acidSequence = (behavior.acidSequence ?? 0) + 1;
+    const groundY = this.#tryTerrainHeightAt(boss.x, boss.z, false) ?? 0;
+    const verticalOffset = behavior.verticalOffset ?? 0;
+    const forwardX = Math.sin(boss.rotationY ?? 0);
+    const forwardZ = Math.cos(boss.rotationY ?? 0);
+    const projectile = {
+      id: `${boss.stableId}:acid:${behavior.acidSequence}`,
+      ownerStableId: boss.stableId,
+      ownerChunkKey: boss.ownerChunkKey,
+      x: boss.x + forwardX * finiteWorldUnitsToMeters(60),
+      y: groundY + verticalOffset + finiteWorldUnitsToMeters(90),
+      z: boss.z + forwardZ * finiteWorldUnitsToMeters(60),
+      directionX: directionX / length,
+      directionY: directionY / length,
+      directionZ: directionZ / length,
+      remainingSeconds: W8_BOSS_CONTRACT.acid.lifeFiniteFrames / 60,
+      type: 'acid',
+    };
+    this.projectiles.push(projectile);
+    this.#emitPresentationEvent({
+      type: eventType, x: projectile.x, y: projectile.y, z: projectile.z,
+      directionX: projectile.directionX, directionY: projectile.directionY,
+      directionZ: projectile.directionZ,
+      intensity: 1.4, lifetimeSeconds: 0.35, soundCue: 'acid-spit',
+    });
+    return projectile;
+  }
+
+  #applyBossLanding(boss, player) {
+    const landing = W8_BOSS_CONTRACT.landing;
+    const center = { x: boss.x, z: boss.z };
+    const damageRadiusMeters = finiteWorldUnitsToMeters(landing.damageRadius);
+    const pushRadiusMeters = finiteWorldUnitsToMeters(landing.pushRadius);
+    for (const resolved of [...this.#collectCombatTargets().values()]
+      .sort((a, b) => a.stableId.localeCompare(b.stableId))) {
+      if (resolved.stableId === boss.stableId) continue;
+      const target = resolved.kind === 'feature' ? resolved.target : resolved.entity;
+      if (!target || distanceSquared(target, center) >= damageRadiusMeters ** 2) continue;
+      const result = this.applyCombatDamage(resolved, landing.damageAmount, { awardPlayerCredit: true });
+      if (resolved.kind === 'feature' && BUILDING_TYPES.has(target.type) && result.justDestroyed) {
+        this.hitStopUntil = Math.max(this.hitStopUntil,
+          this.clock() + W7_CORE_COMBAT_CONTRACT.building.destroyedHitStopMs);
+      }
+    }
+    const playerDistance = Math.sqrt(distanceSquared(player, center));
+    if (playerDistance < pushRadiusMeters) {
+      let dx = player.x - boss.x;
+      let dz = player.z - boss.z;
+      if (Math.hypot(dx, dz) < 1e-9) {
+        const angle = deterministicUnitFloat(`${boss.stableId}:landing:${boss.aiClock}`) * Math.PI * 2;
+        dx = Math.cos(angle);
+        dz = Math.sin(angle);
+      }
+      this.applyPlayerKnockback({
+        directionX: dx,
+        directionZ: dz,
+        metersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(
+          landing.playerKnockbackPerFiniteFrame * (1 - playerDistance / pushRadiusMeters),
+        ),
+        decayPerFrame: W7_MANUAL_BOSS_CONTRACT.playerKnockbackDecay,
+      });
+    }
+    this.#emitCombatEffect({
+      type: 'boss-landing', x: boss.x, z: boss.z, durationSeconds: 1.2,
+      cameraShake: 220, intensity: 3, soundCue: 'boom',
+      presentation: { dustCount: 24 },
+    });
+    this.#emitPresentationEvent({
+      type: 'boss-landing-scar', x: boss.x, z: boss.z,
+      intensity: finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.boss.radius)
+        * landing.scarRadiusMultiplier,
+      lifetimeSeconds: 0,
+    });
+    if (boss.bossBehavior.hyperRage) {
+      for (let index = 0; index < landing.acidSprayCount; index += 1) {
+        const angle = index / landing.acidSprayCount * Math.PI * 2;
+        this.#spawnBossAcid(boss, Math.cos(angle), 0.5, Math.sin(angle), 'boss-landing-acid');
+      }
+    }
   }
 
   #advanceBossBehavior(boss, player, deltaSeconds) {
     const behavior = boss.bossBehavior;
     if (!behavior || deltaSeconds <= 0) return;
     this.#syncBossDamageStage(boss);
-    const durations = { slither: 6, sweep: 5, charge: 3, dig: 5, breach: 3.5, recover: 5 };
-    behavior.phaseClock += deltaSeconds;
-    const previousPhase = behavior.phase;
-    if (behavior.phaseClock >= durations[behavior.phase]) {
-      behavior.phaseClock = 0;
-      if (behavior.phase === 'slither') {
-        const choice = boss.aiClock < durations.slither + 0.1
-          ? 2 : Math.floor(boss.aiClock / durations.slither) % 3;
-        behavior.phase = choice === 0 ? 'sweep' : choice === 1 ? 'dig' : 'charge';
-      } else if (behavior.phase === 'sweep') behavior.phase = 'charge';
-      else if (behavior.phase === 'charge') behavior.phase = 'dig';
-      else if (behavior.phase === 'dig') {
+    const contract = W8_BOSS_CONTRACT;
+    const difficulty = Math.min(1.5, 1 + this.state.player.score * 0.000005);
+    const frameScale = deltaSeconds * 60;
+    const turnAndMove = (targetX, targetZ, turnPerFrame, speedPerFrame) => {
+      const heading = Math.atan2(targetX - boss.x, targetZ - boss.z);
+      boss.rotationY = turnTowardAngle(boss.rotationY ?? 0, heading, turnPerFrame * frameScale);
+      boss.x += Math.sin(boss.rotationY) * finiteWorldFrameSpeedToMetersPerSecond(speedPerFrame)
+        * deltaSeconds;
+      boss.z += Math.cos(boss.rotationY) * finiteWorldFrameSpeedToMetersPerSecond(speedPerFrame)
+        * deltaSeconds;
+    };
+    behavior.phaseClock = (behavior.phaseClock ?? 0) + deltaSeconds;
+    behavior.tailCooldownSeconds = Math.max(0, (behavior.tailCooldownSeconds ?? 0) - deltaSeconds);
+    behavior.phaseSequence ??= 0;
+    behavior.lastPick ??= null;
+    behavior.landingApplied ??= false;
+    behavior.recoverSpitWindow ??= -1;
+    const phaseBefore = behavior.phase;
+
+    if (behavior.phase === 'slither') {
+      const far = distanceSquared(boss, player)
+        > finiteWorldUnitsToMeters(contract.slither.approachDistance) ** 2;
+      if (far) turnAndMove(player.x, player.z, contract.slither.turnRadiansPerFrame,
+        behavior.rage ? contract.slither.rageSpeed : contract.slither.speed);
+      behavior.slitherAcidDecisionSequence = (behavior.slitherAcidDecisionSequence ?? 0) + 1;
+      const slitherAcidChance = finiteFrameChanceProbability(
+        contract.slither.acidChancePerFiniteFrame,
+        deltaSeconds,
+      );
+      if (behavior.hyperRage && deterministicUnitFloat(
+        `${boss.stableId}:slither-acid:${behavior.slitherAcidDecisionSequence}`,
+      ) < slitherAcidChance) {
+        this.#spawnBossAcid(boss, player.x - boss.x, finiteWorldUnitsToMeters(20), player.z - boss.z);
+      }
+      const slitherDuration = behavior.phaseDurationSeconds ?? contract.slither.durationSeconds;
+      if (behavior.phaseClock >= slitherDuration / difficulty) {
+        behavior.phaseClock = 0;
+        behavior.phaseDurationSeconds = null;
+        behavior.phaseSequence += 1;
+        const choices = behavior.rage ? ['charge', 'dig', 'sweep'] : ['charge', 'dig', 'slither'];
+        const candidates = choices.filter(value => value !== behavior.lastPick);
+        const index = behavior.phaseSequence === 1 && candidates.includes('charge')
+          ? candidates.indexOf('charge')
+          : Math.floor(deterministicUnitFloat(
+            `${this.worldSeedHash}:${boss.stableId}:phase:${behavior.phaseSequence}`,
+          ) * candidates.length);
+        behavior.phase = candidates[Math.min(index, candidates.length - 1)];
+        behavior.lastPick = behavior.phase;
+        if (behavior.phase === 'charge') {
+          behavior.phaseDurationSeconds = contract.charge.durationFromSlitherSeconds;
+        }
+      }
+    } else if (behavior.phase === 'sweep') {
+      const duration = contract.sweep.durationSeconds / difficulty;
+      const radius = finiteWorldUnitsToMeters(contract.sweep.radiusStart
+        - Math.min(contract.sweep.durationSeconds, behavior.phaseClock * difficulty)
+          * contract.sweep.closeRate);
+      const playerAngle = Math.atan2(boss.x - player.x, boss.z - player.z) + Math.PI / 2;
+      turnAndMove(player.x + Math.sin(playerAngle) * radius,
+        player.z + Math.cos(playerAngle) * radius,
+        contract.sweep.turnRadiansPerFrame,
+        behavior.rage ? contract.sweep.rageSpeed : contract.sweep.speed);
+      const livingSegments = behavior.segmentHp.filter(hp => hp > 0).length;
+      const tailDistance = finiteWorldUnitsToMeters(contract.tail.segmentSpacing
+        * Math.max(1, livingSegments - 1));
+      const tailX = boss.x - Math.sin(boss.rotationY) * tailDistance;
+      const tailZ = boss.z - Math.cos(boss.rotationY) * tailDistance;
+      behavior.tailX = tailX;
+      behavior.tailZ = tailZ;
+      if (behavior.tailCooldownSeconds <= 0
+        && (player.x - tailX) ** 2 + (player.z - tailZ) ** 2
+          < finiteWorldUnitsToMeters(contract.tail.hitRadius) ** 2) {
+        this.state.damagePlayer(contract.tail.damage);
+        this.applyPlayerKnockback({
+          directionX: player.x - tailX,
+          directionZ: player.z - tailZ,
+          metersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(contract.tail.knockbackPerFiniteFrame),
+          decayPerFrame: W7_MANUAL_BOSS_CONTRACT.playerKnockbackDecay,
+        });
+        behavior.tailCooldownSeconds = contract.tail.cooldownSeconds;
+        this.#emitCombatEffect({
+          type: 'boss-tail-hit', x: tailX, z: tailZ, durationSeconds: 0.35,
+          cameraShake: 20, intensity: 1.2, soundCue: 'hit',
+          presentation: { particleCount: 8 },
+        });
+        this.counts.playerHits += 1;
+      }
+      if (behavior.phaseClock >= duration) {
+        behavior.phase = 'charge';
+        behavior.phaseClock = 0;
+        behavior.phaseDurationSeconds = contract.sweep.chargeDurationSeconds;
+      }
+    } else if (behavior.phase === 'charge') {
+      turnAndMove(player.x, player.z, contract.charge.turnRadiansPerFrame,
+        behavior.rage ? contract.charge.rageSpeed : contract.charge.speed);
+      if (behavior.phaseClock >= (behavior.phaseDurationSeconds
+        ?? contract.charge.durationFromSlitherSeconds) / difficulty) {
+        behavior.phase = 'dig';
+        behavior.phaseClock = 0;
+        behavior.phaseDurationSeconds = contract.charge.digDurationSeconds;
+      }
+    } else if (behavior.phase === 'dig') {
+      const far = distanceSquared(boss, player)
+        > finiteWorldUnitsToMeters(contract.dig.catchupDistance) ** 2;
+      const speed = (behavior.rage ? contract.dig.rageSpeed : contract.dig.speed)
+        + (far ? contract.dig.catchupBoost : 0);
+      turnAndMove(player.x, player.z, contract.dig.turnRadiansPerFrame, speed);
+      behavior.verticalOffset = Math.max(finiteWorldUnitsToMeters(contract.dig.maximumDepth),
+        (behavior.verticalOffset ?? 0)
+          - finiteWorldUnitsToMeters(contract.dig.sinkPerFiniteFrame) * frameScale);
+      if (behavior.phaseClock >= contract.dig.durationFromSlitherSeconds / difficulty) {
         behavior.phase = 'breach';
-        behavior.targetX = player.x;
-        behavior.targetZ = player.z;
-        behavior.verticalVelocity = 75;
+        behavior.phaseClock = 0;
+        behavior.verticalVelocity = finiteWorldFrameSpeedToMetersPerSecond(
+          contract.breach.jumpVelocityPerFiniteFrame,
+        );
+        const velocityX = (player.x - (this.previousPlayerPosition?.x ?? player.x))
+          / Math.max(deltaSeconds, 1 / 60);
+        const velocityZ = (player.z - (this.previousPlayerPosition?.z ?? player.z))
+          / Math.max(deltaSeconds, 1 / 60);
+        behavior.targetX = player.x + velocityX * contract.breach.predictionSeconds;
+        behavior.targetZ = player.z + velocityZ * contract.breach.predictionSeconds;
+        behavior.landingApplied = false;
         this.#emitCombatEffect({
-          type: 'boss-breach-warning', x: player.x, z: player.z, durationSeconds: 1,
-          cameraShake: 45, intensity: 1.5, soundCue: 'rumble',
+          type: 'boss-breach-warning', x: behavior.targetX, z: behavior.targetZ,
+          durationSeconds: 1, cameraShake: 45,
+          intensity: finiteWorldUnitsToMeters(contract.breach.warningScarRadius), soundCue: 'rumble',
         });
-      } else if (behavior.phase === 'breach') {
-        behavior.phase = 'recover';
-        behavior.verticalOffset = 0;
-        this.#emitCombatEffect({
-          type: 'boss-landing', x: boss.x, z: boss.z, durationSeconds: 1.2,
-          cameraShake: 180, intensity: 3, hitStopMs: 90, soundCue: 'roar',
-        });
-      } else behavior.phase = 'slither';
-    }
-    if (behavior.phase === 'breach') {
-      const progress = behavior.phaseClock / durations.breach;
-      behavior.verticalOffset = Math.max(0, Math.sin(progress * Math.PI) * 3.75);
+      }
+    } else if (behavior.phase === 'breach') {
       const dx = behavior.targetX - boss.x;
       const dz = behavior.targetZ - boss.z;
-      const length = Math.hypot(dx, dz);
-      if (length > 0.01) {
-        boss.x += dx / length * finiteWorldFrameSpeedToMetersPerSecond(35) * deltaSeconds;
-        boss.z += dz / length * finiteWorldFrameSpeedToMetersPerSecond(35) * deltaSeconds;
-      }
-    }
-    if (behavior.hyperRage) {
-      const interval = 1.25;
-      const prior = Math.floor((boss.aiClock - deltaSeconds) / interval);
-      const next = Math.floor(boss.aiClock / interval);
-      if (next > prior) {
-        let dx = player.x - boss.x;
-        let dz = player.z - boss.z;
+      if (Math.hypot(dx, dz) > finiteWorldUnitsToMeters(contract.breach.arriveDistance)) {
         const length = Math.hypot(dx, dz) || 1;
-        behavior.acidSequence += 1;
-        this.projectiles.push({
-          id: `${boss.stableId}:acid:${behavior.acidSequence}`,
-          ownerChunkKey: boss.ownerChunkKey,
-          x: boss.x, z: boss.z, directionX: dx / length, directionZ: dz / length,
-          remainingSeconds: 3, type: 'acid',
-        });
+        const speed = finiteWorldFrameSpeedToMetersPerSecond(contract.breach.movePerFiniteFrame);
+        boss.x += dx / length * speed * deltaSeconds;
+        boss.z += dz / length * speed * deltaSeconds;
+        boss.rotationY = Math.atan2(dx, dz);
+      }
+      behavior.verticalOffset += behavior.verticalVelocity * deltaSeconds;
+      behavior.verticalVelocity -= finiteWorldFrameSpeedToMetersPerSecond(
+        contract.breach.gravityPerFiniteFrame,
+      ) * deltaSeconds;
+      if (behavior.verticalOffset <= 0 && behavior.verticalVelocity < 0 && !behavior.landingApplied) {
+        behavior.verticalOffset = 0;
+        behavior.landingApplied = true;
+        this.#applyBossLanding(boss, player);
+        behavior.phase = 'recover';
+        behavior.phaseClock = 0;
+        behavior.recoverSpitWindow = -1;
+      }
+    } else if (behavior.phase === 'recover') {
+      behavior.verticalOffset = finiteWorldUnitsToMeters(15);
+      boss.rotationY = normalizedAngle((boss.rotationY ?? 0) + 0.08 * frameScale);
+      behavior.recoverStarAccumulator = (behavior.recoverStarAccumulator ?? 0)
+        + frameScale * 0.45;
+      while (behavior.recoverStarAccumulator >= 1) {
+        behavior.recoverStarAccumulator -= 1;
         this.#emitPresentationEvent({
-          type: 'acid-spit', x: boss.x, z: boss.z,
-          directionX: dx / length, directionZ: dz / length,
-          intensity: 1.4, lifetimeSeconds: 0.35, soundCue: 'acid',
+          type: 'boss-recover-star', x: boss.x,
+          y: (this.#tryTerrainHeightAt(boss.x, boss.z, false) ?? 0)
+            + finiteWorldUnitsToMeters(140), z: boss.z,
+          intensity: 1, lifetimeSeconds: 1.2,
         });
       }
+      const window = Math.floor((boss.aiClock + deltaSeconds) * contract.recover.spitRate);
+      if (window % 2 === 0 && behavior.recoverSpitWindow !== window) {
+        behavior.recoverSpitWindow = window;
+        this.#spawnBossAcid(boss, player.x - boss.x, finiteWorldUnitsToMeters(20), player.z - boss.z);
+      }
+      if (behavior.phaseClock >= contract.recover.durationSeconds) {
+        behavior.phase = 'slither';
+        behavior.phaseClock = 0;
+        behavior.phaseDurationSeconds = contract.recover.slitherDurationSeconds;
+      }
     }
+
     boss.aiState = behavior.phase;
-    if (previousPhase !== behavior.phase && ['charge', 'sweep'].includes(behavior.phase)) {
+    if (phaseBefore !== behavior.phase && ['charge', 'sweep', 'dig', 'slither'].includes(behavior.phase)) {
       this.#emitPresentationEvent({
         type: `boss-${behavior.phase}`, x: boss.x, z: boss.z,
         intensity: 1.6, lifetimeSeconds: 0.45, soundCue: 'roar',
@@ -1993,6 +2196,17 @@ export class InfiniteGameplayRuntime {
           });
         }
       }
+      if (entity.type === 'boss') {
+        this.#emitCombatEffect({
+          type: 'nuclear-boss-death', x: entity.x,
+          y: this.#tryTerrainHeightAt(entity.x, entity.z, false) ?? 0, z: entity.z,
+          durationSeconds: W8_NUCLEAR_PRESENTATION_CONTRACT.cloudLifetimeSeconds,
+          cameraShake: 450, intensity: 4, soundCue: 'atomic',
+          presentation: {
+            segmentCount: entity.bossBehavior?.segmentHp?.filter(hp => hp > 0).length ?? 0,
+          },
+        });
+      }
     }
     if (entity.type === 'boss') {
       this.renderAdapter.syncManualBoss?.(entity);
@@ -2358,6 +2572,18 @@ export class InfiniteGameplayRuntime {
     const combatPlayer = Number.isFinite(playerY)
       ? { x: player.x, y: playerY, z: player.z }
       : player;
+    if (this.playerAcidDebuffSeconds > 0) {
+      this.playerAcidDebuffSeconds = Math.max(0, this.playerAcidDebuffSeconds - boundedDelta);
+      this.acidDebuffParticleAccumulator += boundedDelta * 60 * 0.2;
+      while (this.acidDebuffParticleAccumulator >= 1) {
+        this.acidDebuffParticleAccumulator -= 1;
+        this.#emitPresentationEvent({
+          type: 'acid-debuff', x: player.x, y: Number.isFinite(playerY) ? playerY : 0, z: player.z,
+          intensity: 1, lifetimeSeconds: 0.35,
+          presentation: { particleCount: 2 },
+        });
+      }
+    } else this.acidDebuffParticleAccumulator = 0;
     if (boundedDelta > 0 && (this.playerKnockback.x !== 0 || this.playerKnockback.z !== 0)) {
       player.x += this.playerKnockback.x * boundedDelta;
       player.z += this.playerKnockback.z * boundedDelta;
@@ -2374,6 +2600,7 @@ export class InfiniteGameplayRuntime {
     this.state.tickNuclearCooldown(boundedDelta * 1000);
     this.#syncTankSandboxState();
     if (simulationEnabled !== true) {
+      this.previousPlayerPosition = { x: player.x, z: player.z };
       this.#syncTransientCombat();
       return;
     }
@@ -2408,39 +2635,21 @@ export class InfiniteGameplayRuntime {
       ? this.state.entityStates.get(this.state.manualBossStableId)
       : null;
     if (manualBoss?.alive) {
-      const contract = W6_ENTITY_CONTRACTS.boss;
-      const distance = Math.sqrt(distanceSquared(manualBoss, player));
       const bossCombat = W7_MANUAL_BOSS_CONTRACT;
       this.#advanceBossBehavior(manualBoss, player, boundedDelta);
       const charging = manualBoss.aiState === 'charge';
       const rage = manualBoss.bossBehavior?.rage === true;
-      const moving = !['recover', 'breach'].includes(manualBoss.aiState);
-      if (moving && (charging || manualBoss.aiState === 'sweep' || manualBoss.aiState === 'dig'
-        || distance > finiteWorldUnitsToMeters(contract.approachDistance))) {
-        let dx = player.x - manualBoss.x;
-        let dz = player.z - manualBoss.z;
-        const length = Math.hypot(dx, dz);
-        if (length > 1e-9) {
-          dx /= length;
-          dz /= length;
-          const speed = charging
-            ? (rage ? bossCombat.chargeSpeedRage : bossCombat.chargeSpeed)
-            : manualBoss.aiState === 'sweep' ? (rage ? 22 : 16)
-              : manualBoss.aiState === 'dig' ? (rage ? 19 : 14)
-                : (rage ? contract.rageMoveSpeed : contract.moveSpeed);
-          manualBoss.x += dx * finiteWorldFrameSpeedToMetersPerSecond(speed) * boundedDelta;
-          manualBoss.z += dz * finiteWorldFrameSpeedToMetersPerSecond(speed) * boundedDelta;
-          manualBoss.rotationY = Math.atan2(dx, dz);
-          const nextOwner = logicalWorldToOwnedChunk(manualBoss.x, manualBoss.z).key;
-          this.state.moveEntityOwner(manualBoss.stableId, nextOwner);
-          this.stableIdOwners.set(manualBoss.stableId, nextOwner);
-        }
-      }
+      const nextOwner = logicalWorldToOwnedChunk(manualBoss.x, manualBoss.z).key;
+      this.state.moveEntityOwner(manualBoss.stableId, nextOwner);
+      this.stableIdOwners.set(manualBoss.stableId, nextOwner);
       const playerHitRange = finiteWorldUnitsToMeters(
         charging ? bossCombat.chargeHitRadius : bossCombat.bodyContactRange,
       );
       const hitDistance = Math.sqrt(distanceSquared(manualBoss, player));
-      if (boundedDelta > 0 && this.state.player.hp > 0 && hitDistance <= playerHitRange) {
+      const bossContactActive = manualBoss.aiState !== 'breach'
+        && (manualBoss.bossBehavior?.verticalOffset ?? 0) >= finiteWorldUnitsToMeters(-35);
+      if (bossContactActive && boundedDelta > 0 && this.state.player.hp > 0
+        && hitDistance <= playerHitRange) {
         const damagePerFrame = charging
           ? (rage ? bossCombat.chargeDamageRage : bossCombat.chargeDamage)
           : bossCombat.bodyContactDamage;
@@ -2595,29 +2804,84 @@ export class InfiniteGameplayRuntime {
         continue;
       }
 
-      const start = { x: projectile.x, z: projectile.z };
-      const projectileSpeed = bulletSpeed * (50 / 60);
+      const projectileSpeed = finiteWorldFrameSpeedToMetersPerSecond(
+        W8_BOSS_CONTRACT.acid.speedPerFiniteFrame,
+      );
       projectile.x += projectile.directionX * projectileSpeed * boundedDelta;
+      projectile.y += (projectile.directionY ?? 0) * projectileSpeed * boundedDelta;
       projectile.z += projectile.directionZ * projectileSpeed * boundedDelta;
       projectile.remainingSeconds -= boundedDelta;
-      const hit = this.state.player.hp > 0 && pointSegmentDistanceSquared(
-        this.state.player,
-        start,
-        projectile,
-      ) <= bulletHitRadius ** 2;
+      const acidHitRadius = finiteWorldUnitsToMeters(W8_BOSS_CONTRACT.acid.hitRadius);
+      const playerCenter = {
+        x: this.state.player.x,
+        y: Number.isFinite(combatPlayer.y) ? combatPlayer.y
+          : (this.#tryTerrainHeightAt(this.state.player.x, this.state.player.z, false) ?? 0),
+        z: this.state.player.z,
+      };
+      let hit = this.state.player.hp > 0
+        && distanceSquared3D(playerCenter, projectile) < acidHitRadius ** 2;
       if (hit) {
         const wasAlive = this.state.player.hp > 0;
-        this.state.damagePlayer(6);
+        this.state.damagePlayer(W8_BOSS_CONTRACT.acid.damage);
+        this.playerAcidDebuffSeconds = W8_BOSS_CONTRACT.acid.debuffSeconds;
         this.#emitCombatEffect({
           type: 'acid-impact',
           x: projectile.x,
+          y: projectile.y,
           z: projectile.z,
           durationSeconds: 0.18,
-          cameraShake: W7_CORE_COMBAT_CONTRACT.tank.bulletCameraShake,
+          cameraShake: 40,
+          intensity: 1,
+          presentation: { acidCount: 12, dustCount: 0 },
           soundCue: 'acid',
         });
         this.counts.playerHits += 1;
         if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
+      }
+      if (!hit) {
+        for (const candidate of this.#tankShellWorldCandidates(projectile, projectile)) {
+          if (candidate.type === 'tank' || candidate.type === 'boss'
+            || this.state.isFeatureDestroyed(candidate.stableId)) continue;
+          const radius = finiteWorldUnitsToMeters(
+            (candidate.radius ?? W6_ENTITY_CONTRACTS.human.radius) + 15,
+          );
+          const center = {
+            x: candidate.x,
+            y: candidate.y ?? this.#tryTerrainHeightAt(candidate.x, candidate.z, false) ?? 0,
+            z: candidate.z,
+          };
+          if (distanceSquared3D(center, projectile) >= radius ** 2) continue;
+          let resolved;
+          if (candidate.type === 'human') {
+            const entity = this.state.ensureEntity(candidate);
+            if (!entity.alive) continue;
+            resolved = {
+              kind: 'entity', stableId: candidate.stableId, type: 'human', entity,
+            };
+          } else {
+            resolved = {
+              kind: 'feature', stableId: candidate.stableId, type: candidate.type, target: candidate,
+            };
+          }
+          this.applyCombatDamage(resolved, 150, { awardPlayerCredit: true });
+          this.#emitCombatEffect({
+            type: 'acid-world-impact', x: projectile.x, y: projectile.y, z: projectile.z,
+            durationSeconds: 0.35, soundCue: 'hit',
+            presentation: { acidCount: 8, dustCount: 6 },
+          });
+          hit = true;
+          break;
+        }
+      }
+      const terrainHeight = this.#tryTerrainHeightAt(projectile.x, projectile.z, false);
+      if (!hit && terrainHeight !== null
+        && projectile.y <= terrainHeight + finiteWorldUnitsToMeters(10)) {
+        this.#emitPresentationEvent({
+          type: 'acid-terrain-impact', x: projectile.x, y: projectile.y, z: projectile.z,
+          intensity: 1, lifetimeSeconds: 0.35,
+          presentation: { acidCount: 0, dustCount: 5 },
+        });
+        hit = true;
       }
       if (hit || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
     }
@@ -2626,6 +2890,7 @@ export class InfiniteGameplayRuntime {
       if (this.combatEffects[index].remainingSeconds <= 0) this.combatEffects.splice(index, 1);
     }
     this.#syncTransientCombat();
+    this.previousPlayerPosition = { x: player.x, z: player.z };
     this.counts.simulationTicks += 1;
   }
 
@@ -2842,7 +3107,10 @@ export class InfiniteGameplayRuntime {
       : null;
     if (manualBoss?.alive
       && canW6StageDamageTarget(this.state.activeScaleStageId, manualBoss)
-      && insideAttack(manualBoss)) {
+      && insideAttack(manualBoss)
+      && !(['dig'].includes(manualBoss.bossBehavior?.phase)
+        && (manualBoss.bossBehavior?.verticalOffset ?? 0) < finiteWorldUnitsToMeters(-20))) {
+      const bossDamage = manualBoss.bossBehavior?.phase === 'recover' ? damage * 1.5 : damage;
       const result = this.applyCombatDamage(
         {
           kind: 'boss',
@@ -2850,7 +3118,7 @@ export class InfiniteGameplayRuntime {
           type: 'boss',
           entity: manualBoss,
         },
-        damage,
+        bossDamage,
         { awardPlayerCredit: true },
       );
       this.#syncBossDamageStage(manualBoss);
@@ -2860,11 +3128,12 @@ export class InfiniteGameplayRuntime {
         z: manualBoss.z,
         durationSeconds: result.alive ? 0.16 : 0.8,
         cameraShake: damage / 7 * profile.stage.playerShakeMultiplier,
-        soundCue: result.alive ? 'hit' : 'roar',
+        soundCue: result.alive ? 'hit' : null,
       });
       hits.push(Object.freeze({
         stableId: manualBoss.stableId,
         type: 'boss',
+        damage: bossDamage,
         destroyed: result.destroyed,
       }));
     }
@@ -3102,6 +3371,10 @@ export class InfiniteGameplayRuntime {
     return Object.freeze({ ...this.playerKnockback });
   }
 
+  getPlayerMovementMultiplier() {
+    return this.playerAcidDebuffSeconds > 0 ? W8_BOSS_CONTRACT.acid.movementMultiplier : 1;
+  }
+
   consumePresentationEffects() {
     const result = Object.freeze({
       cameraShake: this.pendingCameraShake,
@@ -3125,6 +3398,8 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.playerAcidDebuffSeconds = 0;
+    this.acidDebuffParticleAccumulator = 0;
     this.entityKnockbacks.clear();
     this.lastAttackAt = -Infinity;
     this.renderAdapter.clearReinforcements?.();
@@ -3148,6 +3423,8 @@ export class InfiniteGameplayRuntime {
     this.presentationEvents.length = 0;
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
+    this.playerAcidDebuffSeconds = 0;
+    this.acidDebuffParticleAccumulator = 0;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.activeTankOccurrences.clear();
     this.tankBindings.clear();
@@ -3250,6 +3527,8 @@ export class InfiniteGameplayRuntime {
       tankTerrainPendingQueryCount: this.pendingTankTerrainChunks.size,
       activeProjectileCount: this.projectiles.length,
       activeCombatEffectCount: this.combatEffects.length,
+      playerAcidDebuffSeconds: this.playerAcidDebuffSeconds,
+      playerMovementMultiplier: this.getPlayerMovementMultiplier(),
       hitStopped: this.isHitStopped(),
       state: this.state.snapshot(),
       render: this.renderAdapter.snapshot(),

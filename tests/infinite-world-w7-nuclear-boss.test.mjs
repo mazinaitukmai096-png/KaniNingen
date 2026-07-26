@@ -24,6 +24,7 @@ import {
   W7_MANUAL_BOSS_CONTRACT,
   W7_NUCLEAR_CONTRACT,
   W8_COMBAT_COMMAND_TYPES,
+  W8_BOSS_CONTRACT,
   createCombatCommand,
   finiteWorldUnitsToMeters,
 } from '../src/infinite-world/gameplay-contract.js';
@@ -380,5 +381,100 @@ test('manual Boss reaches its protected charge phase and damages the existing pl
     fixture.state.entityStates.get(fixture.state.manualBossStableId).aiState,
   ));
   assert.ok(fixture.runtime.snapshot().counts.playerHits > 0);
+  await fixture.runtime.shutdown();
+});
+
+test('Boss sweep Tail uses finite radius, damage, knockback and cooldown exactly once', async () => {
+  const fixture = createRuntime();
+  const spawned = await fixture.runtime.spawnManualBoss();
+  const boss = fixture.state.entityStates.get(spawned.stableId);
+  Object.assign(boss, { x: 0, z: 0, rotationY: 0 });
+  Object.assign(boss.bossBehavior, {
+    phase: 'sweep', phaseClock: 0, tailCooldownSeconds: 0,
+  });
+  const tailDistance = finiteWorldUnitsToMeters(
+    W8_BOSS_CONTRACT.tail.segmentSpacing * (W8_BOSS_CONTRACT.segmentCount - 1),
+  );
+  fixture.state.updatePlayer({ x: 0, z: -tailDistance });
+  fixture.runtime.update({ deltaSeconds: 0.01, player: fixture.state.player });
+  assert.equal(fixture.state.player.hp, 100 - W8_BOSS_CONTRACT.tail.damage);
+  assert.ok(boss.bossBehavior.tailCooldownSeconds > 1.18);
+  assert.ok(fixture.runtime.consumePresentationEffects().events.some(
+    event => event.type === 'boss-tail-hit' && event.presentation.particleCount === 8,
+  ));
+  fixture.runtime.update({ deltaSeconds: 0.01, player: fixture.state.player });
+  assert.equal(fixture.state.player.hp, 100 - W8_BOSS_CONTRACT.tail.damage,
+    'Tail cooldown prevents a second contact hit');
+  await fixture.runtime.shutdown();
+});
+
+test('Boss Breach landing applies World AoE, Player push, Scar and 15 hyper-rage Acid shots once', async () => {
+  const fixture = createRuntime({ active: true });
+  await fixture.initialize;
+  const spawned = await fixture.runtime.spawnManualBoss();
+  const boss = fixture.state.entityStates.get(spawned.stableId);
+  Object.assign(boss, { x: 8, z: 8, rotationY: 0, hp: boss.maxHp * 0.2 });
+  Object.assign(boss.bossBehavior, {
+    phase: 'breach', phaseClock: 1, verticalOffset: 0.01, verticalVelocity: -1,
+    targetX: 8, targetZ: 8, hyperRage: true, landingApplied: false,
+  });
+  fixture.state.updatePlayer({ x: 50, z: 8 });
+  fixture.runtime.update({ deltaSeconds: 0.05, player: fixture.state.player });
+  assert.equal(boss.bossBehavior.phase, 'recover');
+  assert.equal(boss.bossBehavior.landingApplied, true);
+  assert.equal(fixture.state.isFeatureDestroyed('settlement-building-v1:nuclear:0,0'), true);
+  const events = fixture.runtime.consumePresentationEffects().events;
+  assert.equal(events.filter(event => event.type === 'boss-landing').length, 1);
+  assert.equal(events.filter(event => event.type === 'boss-landing-scar').length, 1);
+  assert.equal(events.filter(event => event.type === 'boss-landing-acid').length,
+    W8_BOSS_CONTRACT.landing.acidSprayCount);
+  const pushedX = fixture.state.player.x;
+  fixture.runtime.update({ deltaSeconds: 0.05, player: fixture.state.player });
+  assert.ok(fixture.state.player.x > pushedX);
+  assert.equal(fixture.runtime.consumePresentationEffects().events
+    .filter(event => event.type === 'boss-landing').length, 0,
+  'landing resolves only once');
+  await fixture.runtime.shutdown();
+});
+
+test('Boss Acid uses finite flight, Player damage, 1.1 second debuff and movement multiplier', async () => {
+  const fixture = createRuntime();
+  const spawned = await fixture.runtime.spawnManualBoss();
+  const boss = fixture.state.entityStates.get(spawned.stableId);
+  Object.assign(boss, { x: 0, z: 0, rotationY: 0, aiClock: 0 });
+  Object.assign(boss.bossBehavior, {
+    phase: 'recover', phaseClock: 0, recoverSpitWindow: -1,
+  });
+  fixture.state.updatePlayer({ x: 0, z: 10 });
+  fixture.runtime.update({ deltaSeconds: 0.05, player: fixture.state.player });
+  fixture.runtime.update({ deltaSeconds: 0.05, player: fixture.state.player });
+  assert.equal(fixture.state.player.hp, 100 - W8_BOSS_CONTRACT.acid.damage);
+  assert.ok(fixture.runtime.snapshot().playerAcidDebuffSeconds > 1);
+  assert.equal(fixture.runtime.getPlayerMovementMultiplier(),
+    W8_BOSS_CONTRACT.acid.movementMultiplier);
+  assert.ok(fixture.runtime.consumePresentationEffects().events.some(
+    event => event.type === 'acid-impact' && event.presentation.acidCount === 12,
+  ));
+  for (let index = 0; index < 23; index += 1) {
+    fixture.runtime.update({ deltaSeconds: 0.05, player: fixture.state.player });
+  }
+  assert.equal(fixture.runtime.getPlayerMovementMultiplier(), 1);
+  await fixture.runtime.shutdown();
+});
+
+test('Boss defeat emits the finite death cloud and advances the next score threshold', async () => {
+  const fixture = createRuntime();
+  const spawned = await fixture.runtime.spawnManualBoss();
+  const result = fixture.runtime.applyCombatDamage(spawned.stableId,
+    W6_ENTITY_CONTRACTS.boss.maxHp, { awardPlayerCredit: true });
+  assert.equal(result.justDestroyed, true);
+  assert.equal(fixture.state.combatProgress.bossesDefeated, 1);
+  assert.equal(fixture.state.combatProgress.nextBossScore,
+    fixture.state.player.score + W8_BOSS_CONTRACT.nextSpawnScoreDelta);
+  const death = fixture.runtime.consumePresentationEffects().events.find(
+    event => event.type === 'nuclear-boss-death');
+  assert.ok(death);
+  assert.equal(death.soundCue, 'atomic');
+  assert.ok(death.presentation.segmentCount > 0);
   await fixture.runtime.shutdown();
 });

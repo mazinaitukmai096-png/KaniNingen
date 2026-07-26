@@ -1437,7 +1437,12 @@ export async function bootInfiniteWorldSandbox({
         logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
         logicalPlayer.facingY = Math.PI / 2;
       } else if (!measurement.mode) {
-        experienceShell.updatePlayer({ deltaSeconds, player: logicalPlayer, scaleProfile });
+        experienceShell.updatePlayer({
+          deltaSeconds,
+          player: logicalPlayer,
+          scaleProfile,
+          movementMultiplier: gameplay.getPlayerMovementMultiplier(),
+        });
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       requestDirectionalPrefetch(owner);

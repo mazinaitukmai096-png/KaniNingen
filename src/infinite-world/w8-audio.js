@@ -2,11 +2,13 @@ const CUES = Object.freeze({
   attack: Object.freeze([[180, 0.1, 'square', 0.15, 50]]),
   swish: Object.freeze([[600, 0.15, 'triangle', 0.3, 40]]),
   hit: Object.freeze([[60, 0.2, 'sawtooth', 0.1, 20]]),
+  boom: Object.freeze([[20, 1.2, 'sawtooth', 0.5, 5], [40, 0.6, 'sine', 0.4, 10]]),
   splat: Object.freeze([[40, 0.15, 'sawtooth', 0.4, 10]]),
   'tank-fire': Object.freeze([[120, 0.45, 'sawtooth', 0.35, 10], [50, 0.25, 'triangle', 0.4, 5]]),
   roar: Object.freeze([[70, 0.8, 'sawtooth', 0.5, 25], [110, 0.5, 'square', 0.3, 40]]),
   rumble: Object.freeze([[35, 0.3, 'sawtooth', 0.15, 10]]),
   acid: Object.freeze([[800, 0.25, 'square', 0.18, 150]]),
+  'acid-spit': Object.freeze([[450, 0.2, 'triangle', 0.15, 100]]),
   atomic: Object.freeze([[28, 2.5, 'sawtooth', 0.65, 3], [95, 1.2, 'square', 0.4, 8]]),
 });
 

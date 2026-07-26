@@ -496,6 +496,37 @@ test('finite Human and Rock destruction retain exact High-quality particle count
   assets.dispose();
 });
 
+test('Boss Tail, segment, landing, Acid and recover events use bounded finite presentation pools', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  const event = (sequence, type, lifetimeSeconds, presentation = null) => ({
+    sequence, type, logicalPosition: { x: 0, y: 0, z: 0 },
+    direction: { x: 1, y: 0, z: 0 }, intensity: 1,
+    lifetimeSeconds, soundCue: null, presentation,
+  });
+  adapter.consumePresentationEvents([
+    event(1, 'boss-tail-hit', 0.35, { particleCount: 8 }),
+    event(2, 'boss-segment-break', 3.5, { bloodCount: 75, segmentCount: 3 }),
+    event(3, 'boss-landing', 1.2, { dustCount: 24 }),
+    event(4, 'boss-landing-scar', 0),
+    event(5, 'acid-impact', 0.35, { acidCount: 12, dustCount: 0 }),
+    event(6, 'boss-recover-star', 1.2),
+  ]);
+  adapter.updatePresentation(0.1);
+  const pools = adapter.snapshot().effectInstancePools;
+  assert.equal(pools.whiteParticle.count, 8);
+  assert.equal(pools.blood.count, 75);
+  assert.equal(pools.debris.count, 3);
+  assert.equal(pools.dust.count, 24);
+  assert.equal(pools.scorch.count, 1);
+  assert.equal(pools.acid.count, 12);
+  assert.equal(pools.dizzyStar.count, 1);
+  assert.equal(Object.values(pools).every(pool => pool.count <= pool.capacity), true);
+  await adapter.shutdown();
+  assets.dispose();
+});
+
 test('Player landing renders two bounded shockwaves and finite-parity radial dust', async () => {
   const scene = new Group();
   const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });

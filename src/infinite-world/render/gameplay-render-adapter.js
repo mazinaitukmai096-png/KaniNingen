@@ -63,6 +63,9 @@ export class GameplayRenderAdapter {
       atomicWhite: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
       atomicOrange: Object.freeze({ geometry: 'box', material: 'shockwave', capacity: 64 }),
       atomicRing: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
+      acid: Object.freeze({ geometry: 'box', material: 'acid', capacity: 384 }),
+      whiteParticle: Object.freeze({ geometry: 'box', material: 'whiteEye', capacity: 192 }),
+      dizzyStar: Object.freeze({ geometry: 'box', material: 'gold', capacity: 128 }),
       rockDebris: Object.freeze({ geometry: 'dodeca', material: 'rock', capacity: 500 }),
       worldDetailDebris: Object.freeze({ geometry: 'box', material: 'roadSign', capacity: 192 }),
       dust: Object.freeze({ geometry: 'box', material: 'road', capacity: 384 }),
@@ -373,6 +376,97 @@ export class GameplayRenderAdapter {
         });
         continue;
       }
+      if (event.type.startsWith('acid-') || event.type === 'boss-landing-acid') {
+        const acidCount = event.type === 'acid-debuff'
+          ? (event.presentation?.particleCount ?? 2) : (event.presentation?.acidCount ?? 0);
+        const dustCount = event.presentation?.dustCount ?? 0;
+        for (let index = 0; index < acidCount; index += 1) {
+          const angle = index / Math.max(1, acidCount) * Math.PI * 2
+            + (event.sequence ?? 0) * 0.29;
+          const travel = progress * (0.2 + index * 0.08) * unit;
+          this.#appendEffectInstance('acid', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.4 + index * 0.03)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.3 * unit, scaleY: 0.3 * unit, scaleZ: 0.3 * unit,
+            rotationX: progress * 5 + index, rotationY: angle,
+          });
+        }
+        for (let index = 0; index < dustCount; index += 1) {
+          const angle = index / Math.max(1, dustCount) * Math.PI * 2;
+          this.#appendEffectInstance('dust', {
+            x: base.x + Math.cos(angle) * progress * unit,
+            y: baseY + Math.sin(progress * Math.PI) * 0.6 * unit,
+            z: base.z + Math.sin(angle) * progress * unit,
+            scaleX: 0.55 * unit, scaleY: 0.55 * unit, scaleZ: 0.55 * unit,
+            rotationY: angle,
+          });
+        }
+        if (acidCount > 0 || dustCount > 0
+          || event.type === 'acid-spit' || event.type === 'boss-landing-acid') continue;
+      }
+      if (event.type === 'boss-tail-hit') {
+        const count = event.presentation?.particleCount ?? 8;
+        for (let index = 0; index < count; index += 1) {
+          const angle = index / count * Math.PI * 2;
+          this.#appendEffectInstance('whiteParticle', {
+            x: base.x + Math.cos(angle) * progress * unit,
+            y: baseY + Math.sin(progress * Math.PI) * unit,
+            z: base.z + Math.sin(angle) * progress * unit,
+            scaleX: 0.5 * unit, scaleY: 0.5 * unit, scaleZ: 0.5 * unit,
+            rotationY: angle,
+          });
+        }
+        continue;
+      }
+      if (event.type === 'boss-segment-break') {
+        const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
+        const bloodCount = elapsedSeconds <= 2 ? (event.presentation?.bloodCount ?? 0) : 0;
+        for (let index = 0; index < bloodCount; index += 1) {
+          const angle = index / Math.max(1, bloodCount) * Math.PI * 2;
+          this.#appendEffectInstance('blood', {
+            x: base.x + Math.cos(angle) * progress * 2 * unit,
+            y: baseY + Math.sin(progress * Math.PI) * (1 + index % 5) * unit,
+            z: base.z + Math.sin(angle) * progress * 2 * unit,
+            scaleX: 0.5 * unit, scaleY: 0.5 * unit, scaleZ: 0.5 * unit,
+            rotationX: progress * 5 + index, rotationY: angle,
+          });
+        }
+        for (let index = 0; index < (event.presentation?.segmentCount ?? 0); index += 1) {
+          const angle = index / Math.max(1, event.presentation.segmentCount) * Math.PI * 2;
+          this.#appendEffectInstance('debris', {
+            x: base.x + Math.cos(angle) * progress * 8 * unit,
+            y: baseY + Math.sin(progress * Math.PI) * 8 * unit,
+            z: base.z + Math.sin(angle) * progress * 8 * unit,
+            scaleX: 2.5 * unit, scaleY: 2.25 * unit, scaleZ: 2.5 * unit,
+            rotationX: progress * 6 + index, rotationY: angle,
+          });
+        }
+        continue;
+      }
+      if (event.type === 'boss-recover-star') {
+        this.#appendEffectInstance('dizzyStar', {
+          ...base, y: baseY + Math.sin(progress * Math.PI) * 1.5 * unit,
+          scaleX: 0.45 * unit, scaleY: 0.45 * unit, scaleZ: 0.45 * unit,
+          rotationX: progress * 8, rotationY: progress * 9,
+        });
+        continue;
+      }
+      if (event.type === 'boss-landing') {
+        const count = event.presentation?.dustCount ?? 24;
+        for (let index = 0; index < count; index += 1) {
+          const angle = index / count * Math.PI * 2;
+          const travel = progress * (2 + index * 0.25) * unit;
+          this.#appendEffectInstance('dust', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + Math.sin(progress * Math.PI) * (1 + index % 4) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 2 * unit, scaleY: 2 * unit, scaleZ: 2 * unit,
+            rotationX: progress * 4 + index, rotationY: angle,
+          });
+        }
+        continue;
+      }
       if (event.type.includes('claw-swish') || event.type === 'boss-sweep') {
         this.#appendEffectInstance('wind', {
           ...base, y: baseY + 1.2 * unit,
@@ -429,6 +523,16 @@ export class GameplayRenderAdapter {
               rotationY: angle,
             });
           }
+        }
+        for (let index = 0; index < (event.presentation?.segmentCount ?? 0); index += 1) {
+          const angle = index / Math.max(1, event.presentation.segmentCount) * Math.PI * 2;
+          this.#appendEffectInstance('debris', {
+            x: base.x + Math.cos(angle) * progress * 45 * unit,
+            y: baseY + Math.sin(progress * Math.PI) * 62.5 * unit,
+            z: base.z + Math.sin(angle) * progress * 45 * unit,
+            scaleX: 2.8 * unit, scaleY: 2.5 * unit, scaleZ: 2.8 * unit,
+            rotationX: progress * 8 + index, rotationY: angle,
+          });
         }
         continue;
       }
@@ -611,6 +715,15 @@ export class GameplayRenderAdapter {
     if (this.disposed) return 0;
     this.playerPresentation = playerMarker ?? this.playerPresentation;
     for (const event of events) {
+      if (event.type === 'boss-landing-scar' || event.type === 'boss-breach-warning') {
+        this.persistentScars.push(Object.freeze({
+          ...event,
+          type: 'finite-scar',
+          presentation: Object.freeze({ scarKind: 'scorch' }),
+        }));
+        if (this.persistentScars.length > this.tankScarLimit) this.persistentScars.shift();
+        if (event.type === 'boss-landing-scar') continue;
+      }
       if (event.type === 'finite-target-destruction') {
         const finite = event.presentation ?? {};
         if (finite.scarKind && finite.scarRadiusMeters > 0) {
