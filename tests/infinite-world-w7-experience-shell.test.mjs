@@ -28,8 +28,16 @@ class FakeEventTarget {
 }
 
 function createElement() {
+  const attributes = new Map();
+  const classes = new Set();
   return Object.assign(new FakeEventTarget(), {
     style: {}, textContent: '', value: '', checked: false, dataset: {},
+    classList: {
+      toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+      contains(name) { return classes.has(name); },
+    },
+    setAttribute(name, value) { attributes.set(name, String(value)); },
+    getAttribute(name) { return attributes.get(name) ?? null; },
   });
 }
 
@@ -37,6 +45,7 @@ function createFixture({
   exposeDeveloperTools = false,
   runConfiguration = true,
   useCombatCommands = false,
+  treeLodDiagnosticsAvailable = false,
 } = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
@@ -44,7 +53,7 @@ function createFixture({
     'atomic-status', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
     'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
-    'debug-close-btn', 'debug-summary', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
+    'debug-close-btn', 'debug-summary', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
@@ -100,7 +109,7 @@ function createFixture({
   };
   const calls = {
     attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
-    nuclear: [], landings: [], bossSpawns: 0, starts: [], combatCommands: [],
+    nuclear: [], landings: [], bossSpawns: 0, starts: [], combatCommands: [], treeLodOverlays: [],
   };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
@@ -121,6 +130,8 @@ function createFixture({
     onNuclearRelease: input => { calls.nuclear.push(input); },
     onPlayerLanding: input => { calls.landings.push(input); },
     onSpawnManualBoss: () => { calls.bossSpawns += 1; },
+    treeLodDiagnosticsAvailable,
+    onTreeLodOverlayChanged: enabled => { calls.treeLodOverlays.push(enabled); },
   });
   return {
     shell, globalObject, documentObject, canvas, camera, playerMarker, worldState,
@@ -392,6 +403,68 @@ test('Tab and Scale remain available while advanced Developer commands stay isol
   assert.equal(fixture.shell.snapshot().debugOpen, false);
   assert.equal(fixture.shell.isPaused(), false);
   fixture.shell.dispose();
+});
+
+test('Tree LOD overlay is a diagnostics-only transient toggle independent from the Developer Tools modal', () => {
+  const fixture = createFixture({ treeLodDiagnosticsAvailable: true });
+  const offToggle = fixture.elements.get('debug-tree-lod-overlay-off-btn');
+  const onToggle = fixture.elements.get('debug-tree-lod-overlay-on-btn');
+  assert.equal(fixture.shell.snapshot().treeLodOverlayEnabled, false);
+  assert.equal(offToggle.textContent, 'OFF');
+  assert.equal(onToggle.textContent, 'ON');
+  assert.equal(offToggle.disabled, false);
+  assert.equal(onToggle.disabled, false);
+  assert.equal(offToggle.getAttribute('aria-pressed'), 'true');
+  assert.equal(onToggle.getAttribute('aria-pressed'), 'false');
+  assert.equal(offToggle.classList.contains('debug-on'), true);
+
+  fixture.elements.get('start-button').dispatch('click');
+  fixture.shell.openDebug();
+  onToggle.dispatch('click');
+  assert.equal(fixture.shell.snapshot().treeLodOverlayEnabled, true);
+  assert.deepEqual(fixture.calls.treeLodOverlays, [true]);
+  assert.equal(onToggle.getAttribute('aria-pressed'), 'true');
+  assert.equal(offToggle.getAttribute('aria-pressed'), 'false');
+  assert.equal(onToggle.classList.contains('debug-on'), true);
+
+  fixture.elements.get('debug-close-btn').dispatch('click');
+  assert.equal(fixture.shell.snapshot().debugOpen, false);
+  assert.equal(fixture.shell.snapshot().treeLodOverlayEnabled, true);
+  assert.deepEqual(fixture.calls.treeLodOverlays, [true]);
+
+  fixture.shell.openDebug();
+  offToggle.dispatch('click');
+  assert.equal(fixture.shell.snapshot().treeLodOverlayEnabled, false);
+  assert.deepEqual(fixture.calls.treeLodOverlays, [true, false]);
+  assert.equal(offToggle.getAttribute('aria-pressed'), 'true');
+  assert.equal(onToggle.getAttribute('aria-pressed'), 'false');
+  assert.equal(offToggle.classList.contains('debug-on'), true);
+  fixture.shell.dispose();
+
+  let diagnosticsOn = true;
+  const dynamic = createFixture({ treeLodDiagnosticsAvailable: () => diagnosticsOn });
+  dynamic.elements.get('start-button').dispatch('click');
+  dynamic.elements.get('debug-tree-lod-overlay-on-btn').dispatch('click');
+  assert.equal(dynamic.shell.snapshot().treeLodOverlayEnabled, true);
+  diagnosticsOn = false;
+  dynamic.shell.openDebug();
+  assert.equal(dynamic.shell.snapshot().treeLodOverlayEnabled, false);
+  assert.deepEqual(dynamic.calls.treeLodOverlays, [true, false]);
+  assert.equal(dynamic.elements.get('debug-tree-lod-overlay-on-btn').disabled, true);
+  dynamic.shell.dispose();
+
+  const unavailable = createFixture();
+  const unavailableOffToggle = unavailable.elements.get('debug-tree-lod-overlay-off-btn');
+  const unavailableOnToggle = unavailable.elements.get('debug-tree-lod-overlay-on-btn');
+  assert.equal(unavailable.shell.snapshot().treeLodOverlayEnabled, false);
+  assert.equal(unavailableOffToggle.disabled, true);
+  assert.equal(unavailableOnToggle.disabled, true);
+  assert.equal(unavailableOffToggle.getAttribute('aria-disabled'), 'true');
+  assert.equal(unavailableOnToggle.getAttribute('aria-disabled'), 'true');
+  unavailableOnToggle.dispatch('click');
+  assert.deepEqual(unavailable.calls.treeLodOverlays, []);
+  assert.equal(unavailable.shell.snapshot().treeLodOverlayEnabled, false);
+  unavailable.shell.dispose();
 });
 
 test('normal HUD is a read-only adapter and no Boss UI appears without a manual Boss', () => {

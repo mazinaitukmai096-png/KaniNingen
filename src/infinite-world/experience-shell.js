@@ -63,6 +63,8 @@ export function createInfiniteExperienceShell({
   onSettingsChanged = () => {},
   onStartRun = () => true,
   continueAvailable = false,
+  treeLodDiagnosticsAvailable = false,
+  onTreeLodOverlayChanged = () => {},
 } = {}) {
   if (!worldState || typeof worldState.setScaleStage !== 'function') {
     throw new TypeError('experience shell requires the existing InfiniteWorldState');
@@ -90,6 +92,8 @@ export function createInfiniteExperienceShell({
     news: byId('news-ticker'), settings: byId('settings-modal'), settingsClose: byId('settings-close-btn'),
     home: byId('set-home-btn'), reset: byId('set-reset-btn'), resume: byId('resume-overlay'),
     debug: byId('debug-modal'), debugClose: byId('debug-close-btn'), debugSummary: byId('debug-summary'),
+    treeLodOverlayOff: byId('debug-tree-lod-overlay-off-btn'),
+    treeLodOverlayOn: byId('debug-tree-lod-overlay-on-btn'),
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
     quality: byId('set-quality'), fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
     shake: byId('set-shake'), shakeValue: byId('val-shake'), finalScore: byId('final-score'),
@@ -106,6 +110,7 @@ export function createInfiniteExperienceShell({
     paused: Boolean(elements.startButton),
     hudHidden: persistedExperience.hudHidden,
     debugOpen: false,
+    treeLodOverlayEnabled: false,
     settingsOpen: false,
     bossActive: false,
     threatActive: false,
@@ -135,6 +140,9 @@ export function createInfiniteExperienceShell({
   const developerToolsEnabled = () => worldState.developerTools === true
     || typeof worldState.setDeveloperTools !== 'function'
     || elements.developerTools === null;
+  const treeLodOverlayAvailable = () => (typeof treeLodDiagnosticsAvailable === 'function'
+    ? treeLodDiagnosticsAvailable()
+    : treeLodDiagnosticsAvailable) === true;
   const listen = (target, type, listener, options) => {
     if (typeof target?.addEventListener !== 'function') return;
     target.addEventListener(type, listener, options);
@@ -161,6 +169,23 @@ export function createInfiniteExperienceShell({
     setVisible(elements.settings, state.settingsOpen);
     setVisible(elements.debug, state.debugOpen);
     setVisible(elements.developerSection, true, 'block');
+    if (!treeLodOverlayAvailable() && state.treeLodOverlayEnabled) {
+      state.treeLodOverlayEnabled = false;
+      onTreeLodOverlayChanged(false);
+    }
+    for (const [element, selected, label] of [
+      [elements.treeLodOverlayOff, !state.treeLodOverlayEnabled, 'OFF'],
+      [elements.treeLodOverlayOn, state.treeLodOverlayEnabled, 'ON'],
+    ]) {
+      if (!element) continue;
+      const available = treeLodOverlayAvailable();
+      element.disabled = !available;
+      element.setAttribute?.('aria-disabled', String(!available));
+      element.textContent = label;
+      element.setAttribute?.('aria-pressed', String(selected));
+      element.classList?.toggle?.('debug-on', selected);
+      setVisible(element, true, 'inline-block');
+    }
     setVisible(elements.resume, state.mode === 'playing' && state.paused
       && !state.settingsOpen && !state.debugOpen);
     setVisible(elements.fps, state.settings.showFps, 'block');
@@ -306,6 +331,14 @@ export function createInfiniteExperienceShell({
   listen(elements.settingsClose, 'click', () => (state.mode === 'playing' ? resume() : (state.settingsOpen = false, syncShellVisibility())));
   listen(elements.resume, 'click', resume);
   listen(elements.debugClose, 'click', closeDebug);
+  const setTreeLodOverlayEnabled = enabled => {
+    if (!treeLodOverlayAvailable() || state.treeLodOverlayEnabled === enabled) return;
+    state.treeLodOverlayEnabled = enabled;
+    onTreeLodOverlayChanged(state.treeLodOverlayEnabled);
+    syncShellVisibility();
+  };
+  listen(elements.treeLodOverlayOff, 'click', () => setTreeLodOverlayEnabled(false));
+  listen(elements.treeLodOverlayOn, 'click', () => setTreeLodOverlayEnabled(true));
   listen(elements.home, 'click', () => { void returnHome(); });
   listen(elements.restart, 'click', () => { void restart(); });
   listen(elements.spawnBoss, 'click', () => {
@@ -710,14 +743,22 @@ export function createInfiniteExperienceShell({
       if (elements.finalScore) elements.finalScore.textContent = money(player.score);
       syncShellVisibility();
     }
-    if (elements.debugSummary) elements.debugSummary.textContent = [
+    const debugSummary = [
       `Chunk ${runtimeSnapshot.centerChunkX},${runtimeSnapshot.centerChunkZ}  Rendered ${runtimeSnapshot.renderedCount}/9  Data ${runtimeSnapshot.activeDataCount}/25`,
       `Midground ${presentationSnapshot?.midgroundChunkCount ?? 0}/16  Clipmap ${presentationSnapshot?.clipmapMeshCount ?? 0}/1`,
       `Simulation ${gameplaySnapshot.activeSimulationChunkCount}/9  Entities ${gameplaySnapshot.simulatedEntityCount}  Targets ${gameplaySnapshot.simulatedStaticTargetCount}`,
       `Stable destruction ${gameplaySnapshot.state.destroyedFeatureCount + gameplaySnapshot.state.destroyedEntityCount}  Save ${saveStatus}`,
       `Frame p50/p95/max ${runtimeSnapshot.performance.frame.p50.toFixed(2)} / ${runtimeSnapshot.performance.frame.p95.toFixed(2)} / ${runtimeSnapshot.performance.frame.max.toFixed(2)} ms`,
       `Draw ${renderInfo?.drawCalls ?? 'n/a'}  Geometry ${renderInfo?.geometries ?? 'n/a'}  Material ${resources.sharedMaterialCount}`,
-    ].join('\n');
+    ];
+    if (treeLodOverlayAvailable() && state.treeLodOverlayEnabled) {
+      debugSummary.splice(4, 0,
+        `Tree LOD full ${presentationSnapshot?.visibleCanonicalFullTreeCount ?? 0}  silhouette ${presentationSnapshot?.visibleCanonicalSilhouetteTreeCount ?? 0}`,
+        `Tree LOD 56-76m ${presentationSnapshot?.visibleCanonicalTreeMidBandCount ?? 0}  76-84m ${presentationSnapshot?.visibleCanonicalTreeOuterBandCount ?? 0}`,
+        `Tree LOD far owners ${presentationSnapshot?.queryOwnerChunkCount ?? 0}  active-external natural ${presentationSnapshot?.queryNaturalOwnerChunkCount ?? 0}`,
+      );
+    }
+    if (elements.debugSummary) elements.debugSummary.textContent = debugSummary.join('\n');
   }
 
   syncSettingsControls();
@@ -758,6 +799,7 @@ export function createInfiniteExperienceShell({
       persistentGameplayTimeMs: worldState.gameplayTimeMs ?? state.gameplayTimeMs,
       paused: state.paused,
       hudHidden: state.hudHidden, debugOpen: state.debugOpen,
+      treeLodOverlayEnabled: state.treeLodOverlayEnabled,
       camera: Object.freeze({ ...state.camera }),
       playerVertical: snapshotPlayerVerticalMovement(state.playerVertical),
       settings: Object.freeze({ ...state.settings }),

@@ -1233,6 +1233,12 @@ export async function bootInfiniteWorldSandbox({
       onSave: () => { void saveWorld({ force: true }); },
       onLoad: () => { void loadWorld(); },
       continueAvailable: state.saveAvailable,
+      treeLodDiagnosticsAvailable: () => diagnostics.enabled || worldState.developerTools === true,
+      onTreeLodOverlayChanged: enabled => {
+        distantPresentation.setTreeLodDiagnosticsEnabled?.(
+          (diagnostics.enabled || worldState.developerTools === true) && enabled === true,
+        );
+      },
       onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
         playerRelocationInProgress = true;
         const phaseBefore = experienceShell?.getRunPhase?.() ?? 'menu';
@@ -1541,6 +1547,10 @@ export async function bootInfiniteWorldSandbox({
     function updateHud(owner) {
       const runtimeSnapshot = runtime.snapshot();
       const experienceSnapshot = experienceShell.snapshot();
+      distantPresentation.setTreeLodDiagnosticsEnabled?.(
+        (diagnostics.enabled || worldState.developerTools === true)
+          && experienceSnapshot.treeLodOverlayEnabled === true,
+      );
       const presentationSnapshot = distantPresentation.snapshot();
       const scenePresentationSnapshot = scenePresentation.snapshot();
       const renderOrigin = runtimeSnapshot.renderOrigin;
@@ -1601,6 +1611,9 @@ W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPer
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
 Distant: mid ${presentationSnapshot.midgroundChunkCount}  natural ${presentationSnapshot.distantNaturalProxyCount}/${presentationSnapshot.distantNaturalProxyLimit}  town ${presentationSnapshot.distantTownProxyCount}/${presentationSnapshot.distantTownProxyLimit}  water ${presentationSnapshot.distantWaterProxyCount}  boundary RGB ${number(presentationSnapshot.maximumInnerBoundaryColorDifference)}
 Canonical: settlements ${presentationSnapshot.queryCandidateCount}/${presentationSnapshot.queryTemplateSuccessCount} resolved  owner Chunks ${presentationSnapshot.queryCanonicalChunkSuccessCount}/${presentationSnapshot.queryOwnerChunkCount}  records ${presentationSnapshot.canonicalRecordCount} (building ${presentationSnapshot.canonicalBuildingRecordCount}, landmark ${presentationSnapshot.canonicalLandmarkRecordCount}, road ${presentationSnapshot.canonicalRoadRecordCount})  visible Far ${presentationSnapshot.canonicalFarObjectCount} / Mid ${presentationSnapshot.canonicalMidObjectCount} / Near handoff ${presentationSnapshot.canonicalNearObjectCount}
+Tree LOD: full ${presentationSnapshot.visibleCanonicalFullTreeCount}  silhouette ${presentationSnapshot.visibleCanonicalSilhouetteTreeCount}  ultra ${presentationSnapshot.visibleCanonicalUltraTreeCount}  84-124m ${presentationSnapshot.visibleCanonicalTreeUltraInnerBandCount}  124-140m ${presentationSnapshot.visibleCanonicalTreeUltraOuterBandCount}  parts ${presentationSnapshot.visibleCanonicalTreePartInstanceCount}
+Horizon: current Settlement ${escapeHtml(presentationSnapshot.currentSettlementId ?? 'none')}  building ${presentationSnapshot.visibleCanonicalHorizonBuildingCount}  landmark ${presentationSnapshot.visibleCanonicalHorizonLandmarkCount}  parts ${presentationSnapshot.visibleCanonicalHorizonPartInstanceCount}  destroyed ${presentationSnapshot.destroyedHorizonBuildingCount}
+Far Query: ultra owner ${presentationSnapshot.queryUltraOwnerChunkCount}  cache ${presentationSnapshot.queryUltraOwnerChunkCacheHits}/${presentationSnapshot.queryUltraOwnerChunkCacheMisses}/${presentationSnapshot.queryUltraOwnerChunkCacheEvictions}  warm ${number(presentationSnapshot.ultraWarmDurationMs)}ms  building owner ${presentationSnapshot.queryBuildingOwnerChunkCount}  cache ${presentationSnapshot.queryFarOwnerChunkCacheHits}/${presentationSnapshot.queryFarOwnerChunkCacheMisses}/${presentationSnapshot.queryFarOwnerChunkCacheEvictions}  inner warm ${number(presentationSnapshot.innerWarmDurationMs)}ms
 Generated: ${runtimeSnapshot.counts.generated}  Loaded: ${runtimeSnapshot.counts.renderLoaded}  Unloaded: ${runtimeSnapshot.counts.renderUnloaded}  Rebase: ${runtimeSnapshot.renderOrigin.rebaseCount}
 Latest crossing: ${number(transition?.durationMs)}ms  generated Δ${transition?.generatedDelta ?? 0}  load Δ${transition?.renderLoadedDelta ?? 0}  unload Δ${transition?.renderUnloadedDelta ?? 0}
 Generation ms latest/p50/p95/max: ${number(metrics.generation.latest)} / ${number(metrics.generation.p50)} / ${number(metrics.generation.p95)} / ${number(metrics.generation.max)}
