@@ -439,6 +439,20 @@ test('W8 Tank death presentation is mechanical, timed, persistent, and bounded',
     Object.values(snapshot.effectInstancePools).every(pool => pool.count === 0),
     true,
   );
+  adapter.consumePresentationEvents([{
+    ...event(400, 'finite-destruction-revisit', 0, 1.8),
+    presentation: {
+      targetType: 'house', radiusMeters: 2,
+      charredCount: 5, sparkCount: 6, debrisCount: 10, bloodCount: 0,
+      ruinScale: 0.85, scarKind: 'scorch', scarRadiusMeters: 2,
+      shockwaveRadiusMeters: 0,
+    },
+  }]);
+  adapter.updatePresentation(0);
+  snapshot = adapter.snapshot();
+  assert.equal(snapshot.activePresentationEffectCount, 1, 'revisit recreates only the timed Ruin');
+  assert.equal(snapshot.persistentTankScarCount, 1, 'revisit recreates the durable Scorch');
+  assert.equal(snapshot.effectInstancePools.debris.count, 0, 'transient debris is not replayed');
 
   await adapter.shutdown();
   assets.dispose();

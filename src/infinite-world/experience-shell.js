@@ -75,7 +75,7 @@ export function createInfiniteExperienceShell({
     hudHidden: false,
     settings: {
       mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
-      fpsCap: 0, cameraShake: 1,
+      fpsCap: 0, cameraShake: 1, antialias: true,
     },
   };
   const elements = {
@@ -92,6 +92,7 @@ export function createInfiniteExperienceShell({
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
     quality: byId('set-quality'), fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
     shake: byId('set-shake'), shakeValue: byId('val-shake'), finalScore: byId('final-score'),
+    antialias: byId('set-antialias'), antialiasNote: byId('antialias-note'),
     gameOver: byId('game-over'), restart: byId('restart-button'),
     spawnBoss: byId('debug-spawn-boss-btn'),
     developerTools: byId('set-developer-tools'),
@@ -183,6 +184,7 @@ export function createInfiniteExperienceShell({
     if (elements.fpsCap) elements.fpsCap.value = String(state.settings.fpsCap);
     if (elements.shake) elements.shake.value = String(state.settings.cameraShake);
     if (elements.shakeValue) elements.shakeValue.textContent = state.settings.cameraShake.toFixed(1);
+    if (elements.antialias) elements.antialias.checked = state.settings.antialias;
     if (elements.developerTools) elements.developerTools.checked = worldState.developerTools === true;
   }
 
@@ -328,6 +330,10 @@ export function createInfiniteExperienceShell({
   setting(elements.fpsCap, 'change', target => { state.settings.fpsCap = Number(target.value); });
   setting(elements.shake, 'input', target => {
     state.settings.cameraShake = Number(target.value); if (elements.shakeValue) elements.shakeValue.textContent = state.settings.cameraShake.toFixed(1);
+  });
+  setting(elements.antialias, 'change', target => {
+    state.settings.antialias = target.checked === true;
+    setVisible(elements.antialiasNote, true, 'block');
   });
   listen(elements.developerTools, 'change', event => {
     worldState.setDeveloperTools?.(event.target.checked === true);

@@ -22,6 +22,10 @@ import {
   W8_LEGACY_SAVE_ENVELOPE_SCHEMA,
   W8_LEGACY_SAVE_SCHEMA,
   W8_LEGACY_SAVE_SCHEMA_VERSION,
+  W8_V4_GAMEPLAY_SCHEMA,
+  W8_V4_SAVE_ENVELOPE_SCHEMA,
+  W8_V4_SAVE_SCHEMA,
+  W8_V4_SAVE_SCHEMA_VERSION,
   createW6PlayerState,
   isW6ScaleStageId,
 } from './gameplay-contract.js';
@@ -39,6 +43,7 @@ const DEFAULT_EXPERIENCE_STATE = Object.freeze({
     showFps: false,
     fpsCap: 0,
     cameraShake: 1,
+    antialias: true,
   }),
 });
 const DEFAULT_COMBAT_PROGRESS = Object.freeze({
@@ -53,6 +58,10 @@ function createDefaultBossBehavior() {
     phase: 'slither', phaseClock: 0, rage: false, hyperRage: false,
     breakStage: 0, verticalOffset: 0, verticalVelocity: 0,
     targetX: 0, targetZ: 0, acidSequence: 0,
+    tailCooldownSeconds: 0, tailX: 0, tailZ: 0,
+    phaseSequence: 0, lastPick: null, phaseDurationSeconds: null,
+    landingApplied: false, recoverSpitWindow: -1, recoverStarAccumulator: 0,
+    slitherAcidDecisionSequence: 0,
     segmentHp: Array.from({ length: W8_BOSS_CONTRACT.segmentCount }, () => 1),
   };
 }
@@ -68,6 +77,10 @@ function validateCombatProgress(value = DEFAULT_COMBAT_PROGRESS) {
 
 function validateBossBehavior(value = createDefaultBossBehavior()) {
   if (!W8_BOSS_CONTRACT.behaviorStates.includes(value.phase)) throw new RangeError('unsupported Boss phase');
+  const lastPick = value.lastPick ?? null;
+  if (lastPick !== null && !W8_BOSS_CONTRACT.behaviorStates.includes(lastPick)) {
+    throw new RangeError('unsupported previous Boss phase');
+  }
   if (!Array.isArray(value.segmentHp) || value.segmentHp.length !== W8_BOSS_CONTRACT.segmentCount) {
     throw new TypeError('Boss segment state is incomplete');
   }
@@ -82,6 +95,21 @@ function validateBossBehavior(value = createDefaultBossBehavior()) {
     targetX: finite(value.targetX, 'boss.targetX'),
     targetZ: finite(value.targetZ, 'boss.targetZ'),
     acidSequence: nonNegativeInteger(value.acidSequence, 'boss.acidSequence'),
+    tailCooldownSeconds: nonNegative(value.tailCooldownSeconds ?? 0, 'boss.tailCooldownSeconds'),
+    tailX: finite(value.tailX ?? 0, 'boss.tailX'),
+    tailZ: finite(value.tailZ ?? 0, 'boss.tailZ'),
+    phaseSequence: nonNegativeInteger(value.phaseSequence ?? 0, 'boss.phaseSequence'),
+    lastPick,
+    phaseDurationSeconds: value.phaseDurationSeconds === null
+      || value.phaseDurationSeconds === undefined
+      ? null : nonNegative(value.phaseDurationSeconds, 'boss.phaseDurationSeconds'),
+    landingApplied: value.landingApplied === true,
+    recoverSpitWindow: integerInRange(value.recoverSpitWindow ?? -1, -1,
+      Number.MAX_SAFE_INTEGER, 'boss.recoverSpitWindow'),
+    recoverStarAccumulator: nonNegative(value.recoverStarAccumulator ?? 0,
+      'boss.recoverStarAccumulator'),
+    slitherAcidDecisionSequence: nonNegativeInteger(value.slitherAcidDecisionSequence ?? 0,
+      'boss.slitherAcidDecisionSequence'),
     segmentHp: value.segmentHp.map((hp, index) => numberInRange(hp, 0, 1, `boss.segmentHp[${index}]`)),
   };
 }
@@ -128,8 +156,9 @@ function validateExperience(experience = DEFAULT_EXPERIENCE_STATE) {
     throw new RangeError('unsupported graphics quality');
   }
   if (![0, 30, 60, 120].includes(settings.fpsCap)) throw new RangeError('unsupported FPS cap');
-  if (typeof settings.showFps !== 'boolean' || typeof experience.hudHidden !== 'boolean') {
-    throw new TypeError('HUD and FPS visibility must be boolean');
+  if (typeof settings.showFps !== 'boolean' || typeof settings.antialias !== 'boolean'
+    || typeof experience.hudHidden !== 'boolean') {
+    throw new TypeError('HUD, FPS visibility, and antialias must be boolean');
   }
   return {
     hudHidden: experience.hudHidden,
@@ -140,6 +169,7 @@ function validateExperience(experience = DEFAULT_EXPERIENCE_STATE) {
       showFps: settings.showFps,
       fpsCap: settings.fpsCap,
       cameraShake: numberInRange(settings.cameraShake, 0, 2, 'cameraShake'),
+      antialias: settings.antialias,
     },
   };
 }
@@ -160,6 +190,80 @@ function migrateTankLifecycleState(record, { spawned = record?.alive === true } 
     lastZ: record.lastZ ?? record.z,
     aiState: record.aiState || (record.spawned ?? spawned ? 'acquire' : 'reserve'),
   };
+}
+
+function migrateParityV5EntityState(record) {
+  if (record?.type === 'human') {
+    return {
+      ...record,
+      knockdownSeconds: record.knockdownSeconds ?? 0,
+      humanTimer: record.humanTimer ?? 0,
+      wiggleTime: record.wiggleTime ?? 0,
+      tripTimer: record.tripTimer ?? 0,
+      idleWaitTimer: record.idleWaitTimer ?? 0,
+      fleeAngleOffset: record.fleeAngleOffset ?? 0,
+      waterAvoidTimer: record.waterAvoidTimer ?? 0,
+      waterAvoidX: record.waterAvoidX ?? 0,
+      waterAvoidZ: record.waterAvoidZ ?? 0,
+      targetBuildingStableId: record.targetBuildingStableId ?? null,
+      humanRandomSequence: record.humanRandomSequence ?? 0,
+    };
+  }
+  if (record?.type === 'boss') {
+    return {
+      ...record,
+      bossBehavior: { ...createDefaultBossBehavior(), ...(record.bossBehavior ?? {}) },
+    };
+  }
+  return record;
+}
+
+function migrateParityV5State(snapshot) {
+  return {
+    ...snapshot,
+    player: { ...snapshot.player, acidDebuffSeconds: snapshot.player?.acidDebuffSeconds ?? 0 },
+    entityStates: (snapshot.entityStates ?? []).map(migrateParityV5EntityState),
+    experience: {
+      ...snapshot.experience,
+      settings: { ...snapshot.experience?.settings, antialias: snapshot.experience?.settings?.antialias ?? true },
+    },
+  };
+}
+
+const REQUIRED_HUMAN_V5_FIELDS = Object.freeze([
+  'knockdownSeconds', 'humanTimer', 'wiggleTime', 'tripTimer', 'idleWaitTimer',
+  'fleeAngleOffset', 'waterAvoidTimer', 'waterAvoidX', 'waterAvoidZ',
+  'targetBuildingStableId', 'humanRandomSequence',
+]);
+const REQUIRED_BOSS_V5_FIELDS = Object.freeze([
+  'phase', 'phaseClock', 'rage', 'hyperRage', 'breakStage', 'verticalOffset',
+  'verticalVelocity', 'targetX', 'targetZ', 'acidSequence', 'tailCooldownSeconds',
+  'tailX', 'tailZ', 'phaseSequence', 'lastPick', 'phaseDurationSeconds',
+  'landingApplied', 'recoverSpitWindow', 'recoverStarAccumulator',
+  'slitherAcidDecisionSequence', 'segmentHp',
+]);
+
+function requireOwnFields(value, fields, label) {
+  if (!value || typeof value !== 'object') throw new TypeError(`${label} is required`);
+  for (const field of fields) {
+    if (!Object.hasOwn(value, field)) throw new TypeError(`${label}.${field} is required`);
+  }
+}
+
+function validateCompleteV5ParityState(snapshot) {
+  requireOwnFields(snapshot.player, ['acidDebuffSeconds'], 'player');
+  requireOwnFields(snapshot.experience?.settings, ['antialias'], 'experience.settings');
+  for (const record of snapshot.entityStates ?? []) {
+    if (record?.type === 'human') requireOwnFields(record, REQUIRED_HUMAN_V5_FIELDS, 'human');
+    if (record?.type === 'boss') {
+      requireOwnFields(record.bossBehavior, REQUIRED_BOSS_V5_FIELDS, 'bossBehavior');
+      if (typeof record.bossBehavior.rage !== 'boolean'
+        || typeof record.bossBehavior.hyperRage !== 'boolean'
+        || typeof record.bossBehavior.landingApplied !== 'boolean') {
+        throw new TypeError('Boss v5 boolean state is invalid');
+      }
+    }
+  }
 }
 
 function migrateW6SaveSnapshot(snapshot, { worldSeed }) {
@@ -232,6 +336,20 @@ function migrateW8SaveSnapshot(snapshot) {
   };
 }
 
+function migrateW8V4SaveSnapshot(snapshot) {
+  if (snapshot?.schemaVersion !== W8_V4_SAVE_SCHEMA
+    || snapshot?.schemaVersionNumber !== W8_V4_SAVE_SCHEMA_VERSION
+    || snapshot?.gameplaySchemaVersion !== W8_V4_GAMEPLAY_SCHEMA) {
+    throw new Error('unsupported W8 v4 Infinite World save schema or version');
+  }
+  return {
+    ...structuredClone(snapshot),
+    schemaVersion: W7_SAVE_SCHEMA,
+    schemaVersionNumber: W7_SAVE_SCHEMA_VERSION,
+    gameplaySchemaVersion: W7_GAMEPLAY_SCHEMA,
+  };
+}
+
 function sortedRecords(map) {
   return [...map.values()].sort((a, b) => a.stableId.localeCompare(b.stableId));
 }
@@ -253,6 +371,7 @@ function validatePlayer(player) {
     maxHp,
     score: nonNegative(player.score, 'player.score'),
     facingY: finite(player.facingY, 'player.facingY'),
+    acidDebuffSeconds: nonNegative(player.acidDebuffSeconds ?? 0, 'player.acidDebuffSeconds'),
   };
 }
 
@@ -321,6 +440,19 @@ function validateEntityStates(records) {
     }
     if (type === 'human') {
       validated.knockdownSeconds = nonNegative(record.knockdownSeconds ?? 0, 'human.knockdownSeconds');
+      validated.humanTimer = nonNegative(record.humanTimer ?? 0, 'human.humanTimer');
+      validated.wiggleTime = nonNegative(record.wiggleTime ?? 0, 'human.wiggleTime');
+      validated.tripTimer = nonNegative(record.tripTimer ?? 0, 'human.tripTimer');
+      validated.idleWaitTimer = nonNegative(record.idleWaitTimer ?? 0, 'human.idleWaitTimer');
+      validated.fleeAngleOffset = finite(record.fleeAngleOffset ?? 0, 'human.fleeAngleOffset');
+      validated.waterAvoidTimer = nonNegative(record.waterAvoidTimer ?? 0, 'human.waterAvoidTimer');
+      validated.waterAvoidX = finite(record.waterAvoidX ?? 0, 'human.waterAvoidX');
+      validated.waterAvoidZ = finite(record.waterAvoidZ ?? 0, 'human.waterAvoidZ');
+      validated.targetBuildingStableId = record.targetBuildingStableId === null
+        || record.targetBuildingStableId === undefined
+        ? null : requiredString(record.targetBuildingStableId, 'human.targetBuildingStableId');
+      validated.humanRandomSequence = nonNegativeInteger(record.humanRandomSequence ?? 0,
+        'human.humanRandomSequence');
     }
     if (result.has(stableId)) throw new Error(`duplicate entity Stable ID: ${stableId}`);
     result.set(stableId, validated);
@@ -358,7 +490,7 @@ export class InfiniteWorldState {
     this.worldSeedHash = requiredString(worldSeedHash, 'worldSeedHash');
     this.worldSeed = requiredString(worldSeed, 'worldSeed');
     this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
-    this.player = cloneRecord(createW6PlayerState(playerSpawn));
+    this.player = { ...cloneRecord(createW6PlayerState(playerSpawn)), acidDebuffSeconds: 0 };
     this.featureDamage = new Map();
     this.entityStates = new Map();
     this.manualBossStableId = null;
@@ -451,7 +583,7 @@ export class InfiniteWorldState {
       z: finite(playerSpawn?.z, 'restart playerSpawn.z'),
     };
     this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
-    Object.assign(this.player, createW6PlayerState(spawn));
+    Object.assign(this.player, createW6PlayerState(spawn), { acidDebuffSeconds: 0 });
     this.featureDamage.clear();
     this.entityStates.clear();
     this.manualBossStableId = null;
@@ -514,7 +646,12 @@ export class InfiniteWorldState {
       state.lastX = finite(descriptor.lastX ?? state.x, 'tank lastX');
       state.lastZ = finite(descriptor.lastZ ?? state.z, 'tank lastZ');
     }
-    if (type === 'human') state.knockdownSeconds = nonNegative(descriptor.knockdownSeconds ?? 0, 'human knockdownSeconds');
+    if (type === 'human') {
+      Object.assign(state, migrateParityV5EntityState({
+        ...state,
+        knockdownSeconds: descriptor.knockdownSeconds,
+      }));
+    }
     this.entityStates.set(stableId, state);
     this.revision += 1;
     return state;
@@ -644,19 +781,24 @@ export class InfiniteWorldState {
   }
 
   restoreSaveSnapshot(snapshot) {
-    const candidate = snapshot?.schemaVersion === W6_SAVE_SCHEMA
+    const isCurrentV5 = snapshot?.schemaVersion === W7_SAVE_SCHEMA;
+    const migrated = snapshot?.schemaVersion === W6_SAVE_SCHEMA
       ? migrateW6SaveSnapshot(snapshot, { worldSeed: this.worldSeed })
       : snapshot?.schemaVersion === W7_LEGACY_SAVE_SCHEMA
         ? migrateW7SaveSnapshot(snapshot)
         : snapshot?.schemaVersion === W8_LEGACY_SAVE_SCHEMA
           ? migrateW8SaveSnapshot(snapshot)
-      : structuredClone(snapshot);
+          : snapshot?.schemaVersion === W8_V4_SAVE_SCHEMA
+            ? migrateW8V4SaveSnapshot(snapshot)
+            : structuredClone(snapshot);
+    const candidate = isCurrentV5 ? migrated : migrateParityV5State(migrated);
     if (candidate?.schemaVersion !== W7_SAVE_SCHEMA
       || candidate?.schemaVersionNumber !== W7_SAVE_SCHEMA_VERSION
       || candidate?.gameplaySchemaVersion !== W7_GAMEPLAY_SCHEMA
       || candidate?.legacySaveVersion !== W6_SAVE_VERSION) {
       throw new Error('unsupported Infinite World save schema or version');
     }
+    validateCompleteV5ParityState(candidate);
     if (candidate.worldSeedHash !== this.worldSeedHash || candidate.worldSeed !== this.worldSeed) {
       throw new Error('save world seed does not match runtime');
     }
@@ -753,6 +895,8 @@ export async function encodeInfiniteWorldSave(snapshot) {
       ? W6_SAVE_ENVELOPE_SCHEMA
       : payload?.schemaVersion === W7_LEGACY_SAVE_SCHEMA
         ? W7_LEGACY_SAVE_ENVELOPE_SCHEMA
+        : payload?.schemaVersion === W8_V4_SAVE_SCHEMA
+          ? W8_V4_SAVE_ENVELOPE_SCHEMA
         : payload?.schemaVersion === W8_LEGACY_SAVE_SCHEMA
           ? W8_LEGACY_SAVE_ENVELOPE_SCHEMA
       : null;
@@ -777,6 +921,8 @@ export async function decodeInfiniteWorldSave(serialized, { worldSeedHash } = {}
       ? W7_SAVE_SCHEMA
       : envelope?.schemaVersion === W7_LEGACY_SAVE_ENVELOPE_SCHEMA
         ? W7_LEGACY_SAVE_SCHEMA
+        : envelope?.schemaVersion === W8_V4_SAVE_ENVELOPE_SCHEMA
+          ? W8_V4_SAVE_SCHEMA
         : envelope?.schemaVersion === W8_LEGACY_SAVE_ENVELOPE_SCHEMA
           ? W8_LEGACY_SAVE_SCHEMA
       : null;

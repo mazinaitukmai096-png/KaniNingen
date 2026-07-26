@@ -724,7 +724,7 @@ export class GameplayRenderAdapter {
         if (this.persistentScars.length > this.tankScarLimit) this.persistentScars.shift();
         if (event.type === 'boss-landing-scar') continue;
       }
-      if (event.type === 'finite-target-destruction') {
+      if (event.type === 'finite-target-destruction' || event.type === 'finite-destruction-revisit') {
         const finite = event.presentation ?? {};
         if (finite.scarKind && finite.scarRadiusMeters > 0) {
           this.persistentScars.push(Object.freeze({
@@ -756,6 +756,7 @@ export class GameplayRenderAdapter {
             lifetimeSeconds: 15,
           }));
         }
+        if (event.type === 'finite-destruction-revisit') continue;
       }
       if (event.type === 'tank-scar') {
         this.persistentTankScars.push(event);

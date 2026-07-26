@@ -11,6 +11,10 @@ import {
   W8_SAVE_ENVELOPE_SCHEMA,
   W8_SAVE_SCHEMA,
   W8_SAVE_SCHEMA_VERSION,
+  W8_V4_GAMEPLAY_SCHEMA,
+  W8_V4_SAVE_ENVELOPE_SCHEMA,
+  W8_V4_SAVE_SCHEMA,
+  W8_V4_SAVE_SCHEMA_VERSION,
 } from '../src/infinite-world/gameplay-contract.js';
 import {
   InfiniteWorldState,
@@ -20,7 +24,7 @@ import {
 
 const worldSeed = 'W8 save seed';
 const worldSeedHash = `sha256:${'8'.repeat(64)}`;
-const SAVE_V4_FIELDS = [
+const SAVE_V5_FIELDS = [
   'activeScaleStageId', 'combatProgress', 'developerTools', 'entityStates', 'experience',
   'featureDamage', 'gameplaySchemaVersion', 'gameplayTimeMs', 'legacySaveVersion',
   'manualBossSequence', 'manualBossStableId', 'nuclearCooldownMs', 'player', 'schemaVersion',
@@ -40,12 +44,24 @@ function bossRecord() {
   };
 }
 
-test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, full Boss behavior and Developer Tools', async () => {
+test('schema v5 persists Player debuff, Human behavior, Boss sequence, Tank lifecycle and experience', async () => {
   const state = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 1, z: 2 } });
   state.setDeveloperTools(true);
   state.updateCombatProgress({ nextBossScore: 91_000, bossesDefeated: 2, attacksIssued: 11, damageDealt: 7200 });
   state.nextTankReinforcementSequence();
   state.tickGameplayTime(4_250);
+  state.updatePlayer({ acidDebuffSeconds: 0.75 });
+  const human = state.ensureEntity({
+    stableId: 'wf1:human:w8-save', ownerChunkKey: '0,0', type: 'human',
+    maxHp: W6_ENTITY_CONTRACTS.human.maxHp, x: 2, z: 3, rotationY: 0.1,
+    aiState: 'flee',
+  });
+  Object.assign(human, {
+    knockdownSeconds: 0.4, humanTimer: 1.5, wiggleTime: 0.2, tripTimer: 0.7,
+    idleWaitTimer: 0.3, fleeAngleOffset: -0.25, waterAvoidTimer: 0.6,
+    waterAvoidX: 1, waterAvoidZ: -1, targetBuildingStableId: 'wf1:house:target',
+    humanRandomSequence: 8,
+  });
   const tank = state.ensureEntity({
     stableId: 'wf1:tank:w8-save', ownerChunkKey: '0,0', type: 'tank',
     maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 7, z: 8, rotationY: 0.2,
@@ -71,6 +87,12 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   boss.bossBehavior.phase = 'dig';
   boss.bossBehavior.phaseClock = 2.25;
   boss.bossBehavior.segmentHp[13] = 0;
+  Object.assign(boss.bossBehavior, {
+    tailCooldownSeconds: 0.8, tailX: 9, tailZ: 10, phaseSequence: 4,
+    lastPick: 'charge', phaseDurationSeconds: 1.2, landingApplied: true,
+    recoverSpitWindow: 2, recoverStarAccumulator: 0.5,
+    slitherAcidDecisionSequence: 6,
+  });
   state.setManualBoss(boss.stableId, 1);
 
   const serialized = await encodeInfiniteWorldSave(state.createSaveSnapshot());
@@ -79,7 +101,7 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   assert.equal(envelope.payload.schemaVersion, W8_SAVE_SCHEMA);
   assert.equal(envelope.payload.schemaVersionNumber, W8_SAVE_SCHEMA_VERSION);
   assert.equal(envelope.payload.gameplaySchemaVersion, W8_GAMEPLAY_SCHEMA);
-  assert.deepEqual(Object.keys(envelope.payload).sort(), SAVE_V4_FIELDS);
+  assert.deepEqual(Object.keys(envelope.payload).sort(), SAVE_V5_FIELDS);
   const savedTank = envelope.payload.entityStates.find(entity => entity.stableId === tank.stableId);
   assert.deepEqual(Object.keys(savedTank).sort(), TANK_SAVE_FIELDS);
   assert.equal(Object.keys(savedTank).length, 24);
@@ -90,6 +112,9 @@ test('schema v4 persists combat progression, gameplay clock, Tank lifecycle, ful
   assert.equal(restored.developerTools, true);
   assert.equal(restored.entityStates.get(boss.stableId).bossBehavior.phase, 'dig');
   assert.equal(restored.entityStates.get(boss.stableId).bossBehavior.segmentHp[13], 0);
+  assert.equal(restored.entityStates.get(boss.stableId).bossBehavior.landingApplied, true);
+  assert.equal(restored.entityStates.get(human.stableId).targetBuildingStableId, 'wf1:house:target');
+  assert.equal(restored.player.acidDebuffSeconds, 0.75);
   assert.equal(restored.gameplayTimeMs, 4_250);
   assert.equal(restored.entityStates.get(tank.stableId).spawned, true);
   assert.equal(restored.entityStates.get(tank.stableId).lastShotAtMs, 4_000);
@@ -207,7 +232,7 @@ test('legacy Military Base damage reconciliation keeps destroyed state and parti
   assert.equal(state.featureHp(partialStableId, partial.maxHp), partial.maxHp - 120);
 });
 
-test('schema v3 migrates once to v4, reacquires persisted Tanks, and supplies lifecycle defaults', async () => {
+test('schema v3 migrates once to v5, reacquires persisted Tanks, and supplies lifecycle defaults', async () => {
   const source = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 1, z: 2 } });
   source.ensureEntity({
     stableId: 'wf1:tank:w8-v3', ownerChunkKey: '0,0', type: 'tank',
@@ -237,12 +262,51 @@ test('schema v3 migrates once to v4, reacquires persisted Tanks, and supplies li
   assert.equal(tank.lastShotAtMs, 0);
 });
 
-test('invalid v4 data validates in a temporary candidate and never mutates live state', () => {
+test('v4 migrates once to v5 with neutral Player, Human, and Boss parity state', async () => {
+  const source = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 1, z: 2 } });
+  source.ensureEntity({
+    stableId: 'wf1:human:w8-v4', ownerChunkKey: '0,0', type: 'human',
+    maxHp: W6_ENTITY_CONTRACTS.human.maxHp, x: 2, z: 3, rotationY: 0, aiState: 'idle',
+  });
+  source.ensureEntity(bossRecord());
+  const legacy = source.createSaveSnapshot();
+  legacy.schemaVersion = W8_V4_SAVE_SCHEMA;
+  legacy.schemaVersionNumber = W8_V4_SAVE_SCHEMA_VERSION;
+  legacy.gameplaySchemaVersion = W8_V4_GAMEPLAY_SCHEMA;
+  delete legacy.player.acidDebuffSeconds;
+  for (const entity of legacy.entityStates) {
+    if (entity.type === 'human') {
+      for (const field of ['knockdownSeconds', 'humanTimer', 'wiggleTime', 'tripTimer',
+        'idleWaitTimer', 'fleeAngleOffset', 'waterAvoidTimer', 'waterAvoidX', 'waterAvoidZ',
+        'targetBuildingStableId', 'humanRandomSequence']) delete entity[field];
+    }
+    if (entity.type === 'boss') {
+      for (const field of ['tailCooldownSeconds', 'tailX', 'tailZ', 'phaseSequence', 'lastPick',
+        'phaseDurationSeconds', 'landingApplied', 'recoverSpitWindow', 'recoverStarAccumulator',
+        'slitherAcidDecisionSequence']) delete entity.bossBehavior[field];
+    }
+  }
+  const serialized = await encodeInfiniteWorldSave(legacy);
+  assert.equal(JSON.parse(serialized).schemaVersion, W8_V4_SAVE_ENVELOPE_SCHEMA);
+  const restored = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  restored.restoreSaveSnapshot(await decodeInfiniteWorldSave(serialized, { worldSeedHash }));
+  assert.equal(restored.createSaveSnapshot().schemaVersion, W8_SAVE_SCHEMA);
+  assert.equal(restored.player.acidDebuffSeconds, 0);
+  assert.equal(restored.entityStates.get('wf1:human:w8-v4').humanRandomSequence, 0);
+  assert.equal(restored.entityStates.get('wf1:boss:w8-save').bossBehavior.recoverSpitWindow, -1);
+});
+
+test('incomplete v5 data validates in a temporary candidate and never mutates live state', () => {
   const state = new InfiniteWorldState({ worldSeed, worldSeedHash, playerSpawn: { x: 7, z: 9 } });
   state.updatePlayer({ score: 321 });
   const before = state.createSaveSnapshot();
   const invalid = structuredClone(before);
   invalid.combatProgress.nextBossScore = -1;
   assert.throws(() => state.restoreSaveSnapshot(invalid), /combatProgress.nextBossScore/);
+  assert.deepEqual(state.createSaveSnapshot(), before);
+
+  const incomplete = structuredClone(before);
+  delete incomplete.player.acidDebuffSeconds;
+  assert.throws(() => state.restoreSaveSnapshot(incomplete), /player.acidDebuffSeconds is required/);
   assert.deepEqual(state.createSaveSnapshot(), before);
 });

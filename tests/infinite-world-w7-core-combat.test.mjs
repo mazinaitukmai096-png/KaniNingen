@@ -1908,6 +1908,12 @@ test('building destruction, score, healing, hit stop and effects share the W6 Wo
     charredCount: 5, sparkCount: 6, debrisCount: 10, ruinScale: 0.85, scarKind: 'scorch',
   });
   assert.ok(runtime.snapshot().activeCombatEffectCount > 0);
+  runtime.clearTransientCombat();
+  await runtime.refreshFromState();
+  const revisit = runtime.consumePresentationEffects().events.find(event =>
+    event.type === 'finite-destruction-revisit' && event.presentation?.targetType === 'house');
+  assert.ok(revisit, 'destroyed Stable ID rebuilds its deterministic Ruin and Scorch on revisit');
+  assert.equal(revisit.presentation.debrisCount, 10);
   await runtime.shutdown();
 });
 
@@ -2047,7 +2053,7 @@ test('death and restart mutate the single World State atomically and restore act
     renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
   });
   assert.deepEqual(state.player, {
-    x: 2, z: 3, hp: 100, maxHp: 100, score: 0, facingY: 0,
+    x: 2, z: 3, hp: 100, maxHp: 100, score: 0, facingY: 0, acidDebuffSeconds: 0,
   });
   assert.equal(state.featureDamage.size, 0);
   assert.deepEqual([...state.entityStates.keys()].sort(), entityIds.sort());

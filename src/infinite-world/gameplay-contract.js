@@ -120,11 +120,15 @@ export const W8_LEGACY_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-1';
 export const W8_LEGACY_SAVE_SCHEMA = 'w8-infinite-world-save-3';
 export const W8_LEGACY_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-3';
 export const W8_LEGACY_SAVE_SCHEMA_VERSION = 3;
-export const W8_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-2';
-export const W8_SAVE_SCHEMA = 'w8-infinite-world-save-4';
-export const W8_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-4';
-export const W8_SAVE_SCHEMA_VERSION = 4;
-// Kept as source-compatible aliases for W7 callers. The formal output is W8/schema v4.
+export const W8_V4_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-2';
+export const W8_V4_SAVE_SCHEMA = 'w8-infinite-world-save-4';
+export const W8_V4_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-4';
+export const W8_V4_SAVE_SCHEMA_VERSION = 4;
+export const W8_GAMEPLAY_SCHEMA = 'w8-finite-experience-parity-3';
+export const W8_SAVE_SCHEMA = 'w8-infinite-world-save-5';
+export const W8_SAVE_ENVELOPE_SCHEMA = 'w8-infinite-world-save-envelope-5';
+export const W8_SAVE_SCHEMA_VERSION = 5;
+// Kept as source-compatible aliases for W7 callers. The formal output is W8/schema v5.
 export const W7_GAMEPLAY_SCHEMA = W8_GAMEPLAY_SCHEMA;
 export const W7_SAVE_SCHEMA = W8_SAVE_SCHEMA;
 export const W7_SAVE_ENVELOPE_SCHEMA = W8_SAVE_ENVELOPE_SCHEMA;

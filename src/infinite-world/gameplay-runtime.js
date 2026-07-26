@@ -499,7 +499,6 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
-    this.playerAcidDebuffSeconds = 0;
     this.acidDebuffParticleAccumulator = 0;
     this.previousPlayerPosition = { x: state.player.x, z: state.player.z };
     this.entityKnockbacks = new Map();
@@ -2572,8 +2571,9 @@ export class InfiniteGameplayRuntime {
     const combatPlayer = Number.isFinite(playerY)
       ? { x: player.x, y: playerY, z: player.z }
       : player;
-    if (this.playerAcidDebuffSeconds > 0) {
-      this.playerAcidDebuffSeconds = Math.max(0, this.playerAcidDebuffSeconds - boundedDelta);
+    const acidDebuffSeconds = Math.max(0,
+      (this.state.player.acidDebuffSeconds ?? 0) - boundedDelta);
+    if (acidDebuffSeconds > 0) {
       this.acidDebuffParticleAccumulator += boundedDelta * 60 * 0.2;
       while (this.acidDebuffParticleAccumulator >= 1) {
         this.acidDebuffParticleAccumulator -= 1;
@@ -2595,7 +2595,7 @@ export class InfiniteGameplayRuntime {
         this.playerKnockback.z = 0;
       }
     }
-    this.state.updatePlayer({ x: player.x, z: player.z });
+    this.state.updatePlayer({ x: player.x, z: player.z, acidDebuffSeconds });
     this.state.tickGameplayTime(boundedDelta * 1000);
     this.state.tickNuclearCooldown(boundedDelta * 1000);
     this.#syncTankSandboxState();
@@ -2823,7 +2823,7 @@ export class InfiniteGameplayRuntime {
       if (hit) {
         const wasAlive = this.state.player.hp > 0;
         this.state.damagePlayer(W8_BOSS_CONTRACT.acid.damage);
-        this.playerAcidDebuffSeconds = W8_BOSS_CONTRACT.acid.debuffSeconds;
+        this.state.updatePlayer({ acidDebuffSeconds: W8_BOSS_CONTRACT.acid.debuffSeconds });
         this.#emitCombatEffect({
           type: 'acid-impact',
           x: projectile.x,
@@ -3372,7 +3372,8 @@ export class InfiniteGameplayRuntime {
   }
 
   getPlayerMovementMultiplier() {
-    return this.playerAcidDebuffSeconds > 0 ? W8_BOSS_CONTRACT.acid.movementMultiplier : 1;
+    return (this.state.player.acidDebuffSeconds ?? 0) > 0
+      ? W8_BOSS_CONTRACT.acid.movementMultiplier : 1;
   }
 
   consumePresentationEffects() {
@@ -3398,7 +3399,6 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
-    this.playerAcidDebuffSeconds = 0;
     this.acidDebuffParticleAccumulator = 0;
     this.entityKnockbacks.clear();
     this.lastAttackAt = -Infinity;
@@ -3407,6 +3407,28 @@ export class InfiniteGameplayRuntime {
     this.#rebuildTankOccurrences({ sync: false });
     this.#syncTransientCombat();
     return this.snapshot();
+  }
+
+  #rebuildDurableDestructionPresentation() {
+    const destroyed = new Map();
+    for (const model of this.spatialChunks.values()) {
+      for (const target of model.staticTargets) {
+        if (this.state.isFeatureDestroyed(target.stableId)) destroyed.set(target.stableId, target);
+      }
+    }
+    for (const target of [...destroyed.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
+      const presentation = finitePresentationProfile(target, true);
+      this.#emitPresentationEvent({
+        type: 'finite-destruction-revisit',
+        stableId: target.stableId,
+        targetType: target.type,
+        x: target.x,
+        z: target.z,
+        intensity: presentation.shake,
+        durationSeconds: 0,
+        presentation,
+      });
+    }
   }
 
   async restart({ playerSpawn, renderOrigin } = {}) {
@@ -3423,7 +3445,6 @@ export class InfiniteGameplayRuntime {
     this.presentationEvents.length = 0;
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
-    this.playerAcidDebuffSeconds = 0;
     this.acidDebuffParticleAccumulator = 0;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
     this.activeTankOccurrences.clear();
@@ -3489,6 +3510,7 @@ export class InfiniteGameplayRuntime {
         : null,
     );
     this.featureRenderAdapter?.refreshFeatureStates?.();
+    this.#rebuildDurableDestructionPresentation();
   }
 
   snapshot() {
@@ -3527,7 +3549,7 @@ export class InfiniteGameplayRuntime {
       tankTerrainPendingQueryCount: this.pendingTankTerrainChunks.size,
       activeProjectileCount: this.projectiles.length,
       activeCombatEffectCount: this.combatEffects.length,
-      playerAcidDebuffSeconds: this.playerAcidDebuffSeconds,
+      playerAcidDebuffSeconds: this.state.player.acidDebuffSeconds ?? 0,
       playerMovementMultiplier: this.getPlayerMovementMultiplier(),
       hitStopped: this.isHitStopped(),
       state: this.state.snapshot(),

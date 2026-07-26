@@ -811,7 +811,8 @@ export async function bootInfiniteWorldSandbox({
         W8_GAMEPLAY_CAMERA_FAR,
       );
       const nextRenderer = new THREE.WebGLRenderer({
-        antialias: true, powerPreference: 'high-performance', logarithmicDepthBuffer: true,
+        antialias: availableSaveSnapshot?.experience?.settings?.antialias !== false,
+        powerPreference: 'high-performance', logarithmicDepthBuffer: true,
       });
       nextRenderer.setPixelRatio(measurementMode
         ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, 1.5));

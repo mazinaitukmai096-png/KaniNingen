@@ -33,7 +33,7 @@ class MemoryStorage {
 
 function entityRecord(type, suffix, overrides = {}) {
   const contract = W6_ENTITY_CONTRACTS[type];
-  return {
+  const record = {
     stableId: `wf1:${type}:${suffix}`,
     ownerChunkKey: '0,0',
     type,
@@ -47,6 +47,14 @@ function entityRecord(type, suffix, overrides = {}) {
     aiClock: 0,
     ...overrides,
   };
+  if (type === 'human') Object.assign(record, {
+    knockdownSeconds: 0, humanTimer: 0, wiggleTime: 0, tripTimer: 0,
+    idleWaitTimer: 0, fleeAngleOffset: 0, waterAvoidTimer: 0,
+    waterAvoidX: 0, waterAvoidZ: 0, targetBuildingStableId: null,
+    humanRandomSequence: 0,
+    ...overrides,
+  });
+  return record;
 }
 
 function legacyW6Payload(overrides = {}) {
@@ -120,7 +128,7 @@ test('an original W6 save migrates atomically with defaults and discards legacy 
     hudHidden: false,
     settings: {
       mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
-      fpsCap: 0, cameraShake: 1,
+      fpsCap: 0, cameraShake: 1, antialias: true,
     },
   });
 });

@@ -42,6 +42,7 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
     'debug-close-btn', 'debug-summary', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
+    'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
     'nuclear-flash',
   ];
@@ -80,7 +81,7 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
       hudHidden: false,
       settings: {
         mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
-        fpsCap: 0, cameraShake: 1,
+        fpsCap: 0, cameraShake: 1, antialias: true,
       },
     },
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
@@ -388,6 +389,10 @@ test('debug stays transient while HUD visibility and settings use the existing W
   fixture.elements.get('set-vol').value = '0.25';
   fixture.elements.get('set-vol').dispatch('input');
   assert.equal(fixture.worldState.experience.settings.volume, 0.25);
+  fixture.elements.get('set-antialias').checked = false;
+  fixture.elements.get('set-antialias').dispatch('change');
+  assert.equal(fixture.worldState.experience.settings.antialias, false);
+  assert.equal(fixture.elements.get('antialias-note').style.display, 'block');
   fixture.globalObject.dispatch('keydown', { code: 'Tab' });
   assert.equal(fixture.shell.snapshot().debugOpen, true);
   assert.equal(fixture.shell.isPaused(), true);
