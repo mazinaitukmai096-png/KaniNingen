@@ -39,6 +39,79 @@ W8 は、保護コミット `f8bc9f80c2af417bb585bff26c99522c4229ab8e` の有限
 - Temporary W8 isolation, frame diagnostics, Audio batching/priming, Clipmap cache, runtime snapshot hot-path, and Projectile shader investigation changes were removed from the closure diff.
 - Verification: repository serial test run 394/394 passed; related Core Combat, Sandbox Boot, Production Visuals, and Save tests passed; syntax and whitespace checks passed.
 
+## W8 complete finite-experience migration contract
+
+### Status and authority
+
+- Source of truth: protected finite-World commit `f8bc9f80c2af417bb585bff26c99522c4229ab8e`.
+- Migration contract: defined by Project Owner decision.
+- Migration execution: active outside Gate C and split into independently verified parity Gates.
+- Gate C execution: not started. Gate C measurement cannot begin until every parity Gate below is closed.
+- Completion meaning: intended Player-visible Gameplay, presentation, controls, UI, and Audio match the finite-World source within the explicit Infinite World exceptions below. Pixel-identical fixed-map topology is not required.
+
+The finite-World source and protected shared modules remain unchanged. Every migrated
+value or behavior must be traceable to the protected source, an existing provenance
+record, or an explicit Project Owner decision. An unexplained Player-visible difference
+keeps this migration incomplete.
+
+### Intentional Infinite World exceptions
+
+The following differences are retained intentionally and are not parity defects:
+
+- Infinite terrain and distributed RURAL/TOWN/CITY Settlement coordinates and count.
+- 3x3 rendered Chunks, 5x5 active data, incremental directional prefetch, distant LOD,
+  Floating Origin, and Stable-ID persistence.
+- Safe pond selection and asynchronous Chunk preparation before the intro begins.
+- Separate New Game and Continue paths, W8 Save persistence, and isolated Developer Tools.
+- Shift sprint and graphics Quality affecting presentation rather than Human population.
+- Fixed Project Owner Haystack Gameplay radius 35.
+- Gate B non-generating Tank Projectile terrain queries on cache miss.
+
+Settlement coordinates need not match the fixed finite map. RURAL/TOWN/CITY must instead
+reproduce the finite source's intended archetype density, composition, scale cues,
+destruction opportunities, and population experience. The finite High-quality population
+and World Object density are the comparison baseline and do not vary with W8 Quality.
+
+Growth, Wanted, Threat, Nation, future-facing comments, and the finite capital/link HUD
+placeholders whose values are not driven by formal Gameplay are outside this migration.
+
+### Parity ledger
+
+| Area | Protected finite source | Current state | Required parity work | Verification owner |
+| --- | --- | --- | --- | --- |
+| Player movement, jump, fall, Scale camera, Claw input | `src/game.js`, `src/scale-sandbox.js`, `src/core/input.js` | matched except landing experience | Preserve existing values and W8 sprint; migrate finite landing Damage, push, Shake, Shockwave, Particle, World Detail interaction, and intro/drop conditions | Player vertical, Experience Shell, Core Combat tests |
+| Start and camera choreography | `src/game.js` `updateDropSequence`, intro camera path | partial | Retain safe pond/preparation while matching the finite drop and intro camera state transitions; retain building/Boss camera collision | Experience Shell, Sandbox Boot, render-adapter tests; PO 30-second review |
+| Terrain and Infinite runtime | W5 canonical source plus finite visual provenance | intentional W8 exception | Do not change W5 height/hash; keep terrain, collision, foundations, and far presentation on the same height source | W5 snapshot/hash, height-source, streaming tests |
+| Settlement composition and density | finite town generation, frontage, Lot, civic and life-detail modules | partial | Match finite High-quality archetype counts, ratios, spacing, landmarks, vegetation, rocks, and destructible opportunities through deterministic W8 parity layers | RURAL/TOWN/CITY fixtures, Stable-ID and boundary tests; PO 5-minute review |
+| Human population and AI | `src/game.js` Human spawn/update paths | partial | Match High-quality population independent of W8 Quality; migrate idle, flee variation, trip/fallen/recover, building avoidance, and tangent water avoidance with deterministic frame-rate-independent decisions | Gameplay and Save tests; PO settlement review |
+| Tank | `src/game.js`, `src/constants.js` Tank paths | matched | Preserve score limits, spawn, LOS, turn, cooldown, Projectile, collision, presentation, and Gate B cache-miss behavior while connecting parity obstacles | Core Combat, W8 diagnostics, Save tests |
+| Boss | `src/game.js`, `src/constants.js` Boss paths | partial | Complete Tail contact, landing AoE/push/scorch, hyper-rage landing Acid spray, recover spit cadence, Acid debuff, and corresponding presentation/save state | Nuclear/Boss, Combat, Production Visuals, Save tests; PO Boss run |
+| Buildings and World Objects | `src/game.js`, settlement visual/life modules | partial | Preserve existing Building values including Barn/Factory/Haystack/Cow; replace ambient/street `tree` substitutes with formal finite World Detail type, Scale gate, radius, one-hit destruction, debris, and persistence | Gameplay, parity Chunk, Production Visuals, Save tests |
+| Combat and destruction | `src/game.js`, `src/constants.js`, `src/scale-sandbox.js` | partial | Match Damage, Heal, Score, Hit Stop, Shake, Particle, Debris, Smoke, Shockwave, Scorch, Ruins, caps, and lifetimes without changing finite sources | Combat, destruction, resource lifecycle tests; PO 5-minute review |
+| HUD and settings | `index.html`, `src/game.js` | partial with intentional W8 menu differences | Keep New Game/Continue and functional W8 controls; match finite functional HP, Score, Scale, Atomic, Boss, News, Game Over, Mouse, Volume, Shake, FPS, Quality, and confirmed antialias behavior; omit inactive placeholders | Experience Shell, browser-equivalent tests; PO review |
+| Audio | `src/game.js` | matched vocabulary, synchronization pending review | Keep Attack, Swish, Hit, Splat, Tank fire, Roar, Rumble, Acid, and Atomic cues synchronized to their presentation event | Audio/presentation tests; PO review |
+| Save and revisit | finite has no equivalent Infinite persistence; W8 v4 contract | intentional W8 extension, new parity state pending | Preserve old-save compatibility and persist durable Player/Human/Boss parity state; rebuild durable destruction presentation from Stable IDs; never persist transient Particle/cache state | migration, round-trip, corruption, revisit tests |
+
+Ledger states may change only with code and verification evidence recorded in this section.
+No row may be marked matched because a similarly named module exists; the finite behavior,
+presentation, and Player-visible outcome must be covered.
+
+### Migration Gate order
+
+1. P0: this contract and ledger.
+2. P1: Player, intro, camera, and landing Gameplay.
+3. P2: World and Settlement archetype experience.
+4. P3: Human and World Detail Gameplay.
+5. P4: Combat, destruction, Tank integration, presentation, and Audio.
+6. P5: complete Boss Gameplay and presentation.
+7. P6: UI, settings, and backward-compatible Save continuity.
+8. P7: automated regression, paired Player Experience acceptance, then a fresh Gate C execution.
+
+Each production Gate is one scoped change. A failed test, an untraceable specification,
+or a required W5/protected-source change stops that Gate without starting Gate C. Content
+density must not be reduced merely to make performance pass; optimization requires a
+separate measured change that preserves the parity ledger.
+
 ## W8 Gate C contract
 
 ### Status
