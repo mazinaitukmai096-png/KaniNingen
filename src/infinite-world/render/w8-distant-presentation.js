@@ -60,6 +60,23 @@ export function isW8NaturalCandidateVisible(candidate) {
   );
 }
 
+export function resolveW8NaturalCandidateVisual(candidate) {
+  const formal = candidate?.candidateId !== undefined;
+  const variation = formal ? 0.84 + candidate.variationSeed * 0.32 : 1;
+  const shrub = formal && candidate.subtype === 'shrub';
+  const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.32;
+  const widthMeters = (shrub ? radiusMeters * 2.2 : 2) * variation;
+  return Object.freeze({
+    visualKind: shrub ? 'shrub'
+      : candidate.subtype === 'wetland-tree' ? 'wetlandTree'
+        : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree',
+    widthMeters,
+    heightMeters: (shrub ? 0.85 : 3.625) * variation,
+    depthMeters: widthMeters,
+    rotationY: formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians,
+  });
+}
+
 export function isW8DistantNaturalProxyInRange(distanceMeters) {
   return Number.isFinite(distanceMeters)
     && distanceMeters >= 0
@@ -481,13 +498,11 @@ export async function createW8DistantPresentation({
       const layers = chunk.presentationLayers;
       for (const candidate of layers?.natural?.vegetation ?? chunk.vegetationCandidates ?? []) {
         if (!isW8NaturalCandidateVisible(candidate)) continue;
-        const kind = candidate.subtype === 'wetland-tree' ? 'wetlandTree'
-          : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree';
-        const variation = 0.84 + candidate.variationSeed * 0.32;
-        addParts(candidate, kind, {
-          width: 2 * variation * UNITS_PER_METER,
-          height: 3.625 * variation * UNITS_PER_METER,
-          depth: 2 * variation * UNITS_PER_METER,
+        const visual = resolveW8NaturalCandidateVisual(candidate);
+        addParts(candidate, visual.visualKind, {
+          width: visual.widthMeters * UNITS_PER_METER,
+          height: visual.heightMeters * UNITS_PER_METER,
+          depth: visual.depthMeters * UNITS_PER_METER,
         }, 'major-natural');
       }
       for (const candidate of layers?.natural?.rocks ?? chunk.rockCandidates ?? []) {

@@ -11,6 +11,7 @@ import {
 } from './production-visual-assets.js';
 import {
   isW8NaturalCandidateVisible,
+  resolveW8NaturalCandidateVisual,
   w8TerrainColorFromWeights,
 } from './w8-distant-presentation.js';
 
@@ -499,23 +500,22 @@ export class ChunkRenderAdapter {
         ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
       const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
-      const variation = formal ? 0.84 + candidate.variationSeed * 0.32 : 1;
-      const shrub = formal && candidate.subtype === 'shrub';
-      const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.32;
-      const width = (shrub ? radiusMeters * 2.2 : 2) * variation * this.unitsPerMeter;
-      const height = (shrub ? 0.85 : 3.625) * variation * this.unitsPerMeter;
-      const rotationY = formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians;
-      const visualKind = shrub ? 'shrub'
-        : candidate.subtype === 'wetland-tree' ? 'wetlandTree'
-          : candidate.subtype === 'broadleaf-tree' ? 'broadleafTree' : 'tree';
-      const descriptors = this.visualAssets.featureParts[visualKind]
+      const visual = resolveW8NaturalCandidateVisual(candidate);
+      const descriptors = this.visualAssets.featureParts[visual.visualKind]
         ?? this.visualAssets.featureParts.broadleafTree;
       for (const descriptor of descriptors) {
         vegetationParts.push({
           stableId: candidate.candidateId ?? candidate.stableId,
           part: descriptor,
           matrix: createPartMatrix({
-            localX, localZ, groundY, rotationY, width, height, depth: width, part: descriptor,
+            localX,
+            localZ,
+            groundY,
+            rotationY: visual.rotationY,
+            width: visual.widthMeters * this.unitsPerMeter,
+            height: visual.heightMeters * this.unitsPerMeter,
+            depth: visual.depthMeters * this.unitsPerMeter,
+            part: descriptor,
           }),
         });
       }

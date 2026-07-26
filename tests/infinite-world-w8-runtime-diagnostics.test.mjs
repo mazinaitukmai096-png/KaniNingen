@@ -14,6 +14,7 @@ import {
   createW8ClipmapTopology,
   isW8DistantNaturalProxyInRange,
   isW8NaturalCandidateVisible,
+  resolveW8NaturalCandidateVisual,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
@@ -121,6 +122,14 @@ const CANONICAL_HOUSE_PART = Object.freeze({
   materialRole: 'wall',
 });
 
+const SHRUB_PART = Object.freeze({
+  geometry: 'box',
+  material: 'bush',
+  position: Object.freeze([0, 0.38, 0]),
+  scale: Object.freeze([1, 1, 1]),
+  rotation: Object.freeze([0, 0, 0]),
+});
+
 function createDistantTestVisualAssets() {
   const geometry = new DistantTestGeometry();
   const material = () => new DistantTestMaterial();
@@ -132,12 +141,14 @@ function createDistantTestVisualAssets() {
       lotResidential: material(),
       lotCivic: material(),
       water: material(),
+      bush: material(),
     },
     featureParts: {
       house: [CANONICAL_HOUSE_PART],
       tree: [],
       broadleafTree: [],
       wetlandTree: [],
+      shrub: [SHRUB_PART],
       rock: [],
     },
     resolveBuildingParts: record =>
@@ -434,6 +445,61 @@ test('natural-object LOD selection is stable and anchored proxies persist into t
   assert.equal(isW8DistantNaturalProxyInRange(339.999), true);
   assert.equal(isW8DistantNaturalProxyInRange(340), false);
   assert.equal(isW8DistantNaturalProxyInRange(Number.NaN), false);
+});
+
+test('shrub visuals remain aligned across mid and near LOD', async () => {
+  const candidate = Object.freeze({
+    candidateId: 'detail-v1:vegetation:shrub-lod-parity',
+    subtype: 'shrub',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+  });
+  const visual = resolveW8NaturalCandidateVisual(candidate);
+  assert.deepEqual(visual, {
+    visualKind: 'shrub',
+    widthMeters: 0.2 * 2.2 * 1.16,
+    heightMeters: 0.85 * 1.16,
+    depthMeters: 0.2 * 2.2 * 1.16,
+    rotationY: Math.PI / 2,
+  });
+
+  const scene = new DistantTestGroup();
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = [candidate];
+  chunk.presentationLayers.natural.vegetation = [candidate];
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+  });
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 3,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk,
+  })), true);
+  const generationRoot = scene.children[0].children[0];
+  const shrubMesh = generationRoot.children.find(child => (
+    child.name === 'w8-midground-major-natural-box-bush'
+  ));
+  assert.ok(shrubMesh);
+  assert.equal(shrubMesh.count, 1);
+  assert.deepEqual(shrubMesh.matrices[0].value.scale, {
+    x: visual.widthMeters * 256,
+    y: visual.heightMeters * 256,
+    z: visual.depthMeters * 256,
+  });
+  assert.equal(generationRoot.children.some(child => (
+    child.name.includes('major-natural') && child.name.includes('treeLeaves')
+  )), false);
+  presentation.dispose();
 });
 
 test('clipmap topology and terrain sampling remain Float32-identical to the pre-refactor path', () => {
