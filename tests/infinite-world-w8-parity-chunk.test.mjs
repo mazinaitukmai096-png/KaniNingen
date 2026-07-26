@@ -1,10 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
+import { LOGICAL_CHUNK_SIZE_METERS, logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { createW6ChunkGameplay } from '../src/infinite-world/gameplay-runtime.js';
-import { isW8NaturalCandidateVisible } from '../src/infinite-world/w8-natural-presentation-policy.js';
+import {
+  W8_NATURAL_PRESENTATION_PHASE_1,
+  createW8NaturalPresentationPhase1Policy,
+  evaluateW8SettlementDensityFactor,
+  evaluateW8SpawnDensityFactor,
+  isW8NaturalCandidateVisible,
+} from '../src/infinite-world/w8-natural-presentation-policy.js';
 import {
   W8_PARITY_CHUNK_DATA_SCHEMA,
   W8_SPAWN_SAFETY_CONTRACT,
@@ -15,6 +21,124 @@ import {
 } from '../src/infinite-world/w8-parity-chunk-generator.js';
 
 const seed = 'W8 parity golden seed';
+
+function candidateAt({ id, x, z, subtype = 'broadleaf-tree', radius = 2, metadata = {} }) {
+  return Object.freeze({
+    candidateId: id,
+    kind: 'vegetation',
+    subtype,
+    ownerChunk: Object.freeze({ chunkX: 0, chunkZ: 0 }),
+    worldPosition: Object.freeze({ x, y: 0, z }),
+    candidateRadius: radius,
+    candidateHeight: subtype === 'shrub' ? 0.85 : 5,
+    variation: 1,
+    variationSeed: 0.9,
+    sourceBiomeWeights: Object.freeze([
+      Object.freeze({ biomeId: 'mixed-woodland', weight: 0.45 }),
+      Object.freeze({ biomeId: 'wetland', weight: 0.1 }),
+      Object.freeze({ biomeId: 'temperate-grassland', weight: 0.35 }),
+      Object.freeze({ biomeId: 'rocky-highland', weight: 0.05 }),
+    ]),
+    metadata: Object.freeze({
+      biomeMembership: Object.freeze({
+        mixedWoodland: 0.45,
+        wetland: 0.1,
+        grassland: 0.35,
+        rockyHighland: 0.05,
+      }),
+      moisture: 0.5,
+      slope: 0.04,
+      rockiness: 0.05,
+      candidateRadiusMeters: radius,
+      ...metadata,
+    }),
+  });
+}
+
+function stableCandidateIds(candidates) {
+  return candidates.map((candidate) => candidate.candidateId).sort();
+}
+
+function connectedTreeMetrics(trees, bounds) {
+  const positions = trees.map((tree) => tree.worldPosition);
+  const nearest = positions.map((point, index) => {
+    let distance = Number.POSITIVE_INFINITY;
+    for (let otherIndex = 0; otherIndex < positions.length; otherIndex += 1) {
+      if (otherIndex === index) continue;
+      const other = positions[otherIndex];
+      distance = Math.min(distance, Math.hypot(point.x - other.x, point.z - other.z));
+    }
+    return distance;
+  }).filter(Number.isFinite).sort((left, right) => left - right);
+
+  const parent = positions.map((_, index) => index);
+  const root = (index) => {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  };
+  const join = (left, right) => {
+    const leftRoot = root(left);
+    const rightRoot = root(right);
+    if (leftRoot !== rightRoot) parent[rightRoot] = leftRoot;
+  };
+  for (let left = 0; left < positions.length; left += 1) {
+    for (let right = left + 1; right < positions.length; right += 1) {
+      if (Math.hypot(
+        positions[left].x - positions[right].x,
+        positions[left].z - positions[right].z,
+      ) <= 6) join(left, right);
+    }
+  }
+  const componentSizes = new Map();
+  for (let index = 0; index < positions.length; index += 1) {
+    const component = root(index);
+    componentSizes.set(component, (componentSizes.get(component) ?? 0) + 1);
+  }
+  const components = [...componentSizes.values()];
+  let openSamples = 0;
+  let sampleCount = 0;
+  for (let x = bounds.minX; x <= bounds.maxX; x += 2) {
+    for (let z = bounds.minZ; z <= bounds.maxZ; z += 2) {
+      sampleCount += 1;
+      if (!positions.some((point) => Math.hypot(point.x - x, point.z - z) <= 6)) openSamples += 1;
+    }
+  }
+  const percentile = (fraction) => nearest.length
+    ? nearest[Math.min(nearest.length - 1, Math.floor((nearest.length - 1) * fraction))]
+    : null;
+  return Object.freeze({
+    count: trees.length,
+    nearestMean: nearest.length ? nearest.reduce((total, value) => total + value, 0) / nearest.length : null,
+    nearestMedian: percentile(0.5),
+    nearestP10: percentile(0.1),
+    nearestMinimum: nearest[0] ?? null,
+    componentCount: components.length,
+    singletonRate: trees.length
+      ? components.filter((size) => size === 1).length / trees.length
+      : 0,
+    maxComponentSize: Math.max(0, ...components),
+    openRate6m: sampleCount ? openSamples / sampleCount : 0,
+  });
+}
+
+function rangeCounts(entries, ranges, valueForEntry, selectedForEntry) {
+  return ranges.map(([label, minimum, maximum]) => {
+    const matches = entries.filter((entry) => {
+      const value = valueForEntry(entry);
+      return value >= minimum && value < maximum;
+    });
+    const selected = matches.filter(selectedForEntry).length;
+    return Object.freeze({
+      label,
+      raw: matches.length,
+      selected,
+      selectedRate: matches.length ? selected / matches.length : 0,
+    });
+  });
+}
 
 function pointToRotatedRectangleDistance(point, rectangle) {
   const cosine = Math.cos(-(rectangle.rotationY ?? 0));
@@ -37,6 +161,52 @@ function distanceToSegment(point, start, end) {
     ((point.x - start.x) * dx + (point.z - start.z) * dz) / lengthSquared));
   return Math.hypot(point.x - start.x - dx * t, point.z - start.z - dz * t);
 }
+
+test('Phase 1 natural presentation policy is world-fixed, smooth, and preserves Shrub inputs', async () => {
+  const policy = await createW8NaturalPresentationPhase1Policy({
+    worldSeedHash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  });
+  const left = candidateAt({ id: 'phase-1:left', x: 31.999, z: 19 });
+  const right = candidateAt({ id: 'phase-1:right', x: 32.001, z: 19 });
+  const leftEvaluation = policy.evaluateTree({ candidate: left });
+  const rightEvaluation = policy.evaluateTree({ candidate: right });
+  assert.ok(Math.abs(leftEvaluation.macroField - rightEvaluation.macroField) < 0.001);
+  assert.ok(Math.abs(leftEvaluation.groveField - rightEvaluation.groveField) < 0.001);
+  assert.deepEqual(policy.evaluateTree({ candidate: left }), leftEvaluation);
+
+  const settlement = Object.freeze({
+    center: Object.freeze({ x: 0, z: 0 }),
+    radiusMeters: 100,
+  });
+  const settlementFactors = [0, 0.65, 0.725, 0.8, 0.9, 1, 1.125, 1.25, 1.5]
+    .map(q => evaluateW8SettlementDensityFactor([settlement], { x: q * 100, z: 0 }));
+  assert.equal(settlementFactors[0], 0.18);
+  assert.equal(settlementFactors.at(-1), 1);
+  for (let index = 1; index < settlementFactors.length; index += 1) {
+    assert.ok(settlementFactors[index] >= settlementFactors[index - 1]);
+  }
+
+  const spawn = Object.freeze({ x: 0, z: 0, facingY: 0 });
+  const spawnFactorAt = (outsideMeters) => evaluateW8SpawnDensityFactor({
+    candidate: candidateAt({
+      id: `phase-1:spawn:${outsideMeters}`,
+      x: 12.625 + outsideMeters,
+      z: 6,
+      radius: 0.625,
+    }),
+    experienceSpawn: spawn,
+    introDistanceMeters: 12,
+  });
+  assert.equal(spawnFactorAt(0), 0);
+  assert.equal(spawnFactorAt(W8_NATURAL_PRESENTATION_PHASE_1.spawnFeatherMeters), 1);
+  assert.ok(spawnFactorAt(6) > 0 && spawnFactorAt(6) < 1);
+
+  const shrub = candidateAt({ id: 'phase-1:shrub', x: 100, z: 100, subtype: 'shrub' });
+  const tree = candidateAt({ id: 'phase-1:tree', x: 100, z: 100 });
+  const selected = policy.selectVegetation({ candidates: [shrub, tree] });
+  assert.equal(selected.includes(shrub), true);
+  assert.equal(selected.filter(candidate => candidate.subtype === 'shrub').length, 1);
+});
 
 test('W8 wraps byte-identical W5 output and publishes sorted deterministic overlays', async () => {
   const [w5, w8] = await Promise.all([
@@ -212,6 +382,10 @@ test('W8 generation is invariant under reverse and parallel request order', asyn
     assert.deepEqual(other.ambientDetails, chunk.ambientDetails);
     assert.deepEqual(other.settlementLandmarks, chunk.settlementLandmarks);
     assert.deepEqual(other.streetDetails, chunk.streetDetails);
+    assert.deepEqual(
+      stableCandidateIds(other.presentationLayers.natural.vegetation),
+      stableCandidateIds(chunk.presentationLayers.natural.vegetation),
+    );
   }
   for (const generator of [first, second]) {
     const snapshot = generator.snapshot();
@@ -219,6 +393,100 @@ test('W8 generation is invariant under reverse and parallel request order', asyn
     assert.ok(snapshot.warmSourceChunkCacheSize <= 256);
     assert.equal(snapshot.warmSourceChunkPendingCount, 0);
   }
+});
+
+test('Phase 1 creates deterministic meadow and grove diagnostics from the legacy-visible Tree set', async (t) => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
+  const owner = logicalWorldToOwnedChunk(generator.experienceSpawn.x, generator.experienceSpawn.z);
+  const coordinates = [];
+  for (let chunkX = owner.chunkX - 4; chunkX <= owner.chunkX + 4; chunkX += 1) {
+    for (let chunkZ = owner.chunkZ - 4; chunkZ <= owner.chunkZ + 4; chunkZ += 1) {
+      coordinates.push([chunkX, chunkZ]);
+    }
+  }
+  const chunks = await Promise.all(coordinates.map(([chunkX, chunkZ]) => generator.generateChunk(chunkX, chunkZ)));
+  const rawEntries = chunks.flatMap(chunk => chunk.sourceChunkData.vegetationCandidates
+    .filter(candidate => candidate.subtype !== 'shrub' && isW8NaturalCandidateVisible(candidate))
+    .map(candidate => Object.freeze({ candidate, settlementReferences: chunk.settlementReferences })));
+  const selectedCandidates = chunks.flatMap(chunk => chunk.presentationLayers.natural.vegetation)
+    .filter(candidate => candidate.subtype !== 'shrub' && isW8NaturalCandidateVisible(candidate));
+  const selectedIds = new Set(selectedCandidates.map(candidate => candidate.candidateId));
+  const rawById = new Map(rawEntries.map(entry => [entry.candidate.candidateId, entry.candidate]));
+  for (const candidate of selectedCandidates) {
+    assert.equal(rawById.has(candidate.candidateId), true);
+    assert.equal(rawById.get(candidate.candidateId), candidate);
+  }
+
+  const bounds = Object.freeze({
+    minX: (owner.chunkX - 4) * LOGICAL_CHUNK_SIZE_METERS,
+    maxX: (owner.chunkX + 5) * LOGICAL_CHUNK_SIZE_METERS,
+    minZ: (owner.chunkZ - 4) * LOGICAL_CHUNK_SIZE_METERS,
+    maxZ: (owner.chunkZ + 5) * LOGICAL_CHUNK_SIZE_METERS,
+  });
+  const baseline = connectedTreeMetrics(rawEntries.map(entry => entry.candidate), bounds);
+  const phase1 = connectedTreeMetrics(selectedCandidates, bounds);
+  assert.ok(phase1.openRate6m > baseline.openRate6m);
+  assert.ok(phase1.maxComponentSize < baseline.maxComponentSize);
+
+  const settlementDistance = (entry) => Math.min(...(entry.settlementReferences ?? []).map(reference => (
+    Math.hypot(
+      entry.candidate.worldPosition.x - reference.center.x,
+      entry.candidate.worldPosition.z - reference.center.z,
+    ) / reference.radiusMeters
+  )), Number.POSITIVE_INFINITY);
+  const settlementBands = rangeCounts(
+    rawEntries,
+    [
+      ['0-0.65r', 0, 0.65],
+      ['0.65-0.8r', 0.65, 0.8],
+      ['0.8-1.0r', 0.8, 1],
+      ['1.0-1.25r', 1, 1.25],
+      ['1.25r+', 1.25, Number.POSITIVE_INFINITY],
+    ],
+    settlementDistance,
+    entry => selectedIds.has(entry.candidate.candidateId),
+  );
+  const introEnd = Object.freeze({
+    x: generator.experienceSpawn.x
+      + Math.sin(generator.experienceSpawn.facingY) * W8_SPAWN_SAFETY_CONTRACT.introDistanceMeters,
+    z: generator.experienceSpawn.z
+      + Math.cos(generator.experienceSpawn.facingY) * W8_SPAWN_SAFETY_CONTRACT.introDistanceMeters,
+  });
+  const spawnSignedDistance = (entry) => distanceToSegment(
+    entry.candidate.worldPosition,
+    generator.experienceSpawn,
+    introEnd,
+  ) - ((entry.candidate.metadata?.candidateRadiusMeters ?? 0.625)
+    + W8_NATURAL_PRESENTATION_PHASE_1.spawnHardClearanceMeters);
+  const spawnBands = rangeCounts(
+    rawEntries,
+    [
+      ['0-3m', 0, 3],
+      ['3-6m', 3, 6],
+      ['6-12m', 6, 12],
+      ['12-18m', 12, 18],
+      ['18m+', 18, Number.POSITIVE_INFINITY],
+    ],
+    spawnSignedDistance,
+    entry => selectedIds.has(entry.candidate.candidateId),
+  );
+  t.diagnostic(JSON.stringify({
+    baseline,
+    phase1,
+    settlementBands,
+    spawnBands,
+  }));
+
+  const policy = await createW8NaturalPresentationPhase1Policy({ worldSeedHash: generator.worldSeedHash });
+  const shrubInputs = rawEntries.slice(0, 4).map(entry => Object.freeze({
+    ...entry.candidate,
+    candidateId: `${entry.candidate.candidateId}:shrub-fixture`,
+    subtype: 'shrub',
+  }));
+  assert.deepEqual(
+    stableCandidateIds(policy.selectVegetation({ candidates: shrubInputs })),
+    stableCandidateIds(shrubInputs),
+  );
 });
 
 test('Settlement center ownership deterministically adds finite-language landmarks', async () => {

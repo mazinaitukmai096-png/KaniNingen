@@ -21,6 +21,7 @@ import { sha256Hex } from './legacy-core/g0/sha256.js';
 import { parseGeneratorVersion } from './legacy-core/g0/generator-version.js';
 import { sampleFormalTerrainHeightMeters } from './player-vertical-movement.js';
 import { FINITE_WORLD_UNITS_PER_METER } from './single-rural-settlement.js';
+import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
 import { createW8SettlementParityOverlay } from './w8-settlement-parity-overlay.js';
 
 export const W8_PARITY_GENERATOR_VERSION = parseGeneratorVersion('800.0.0');
@@ -420,13 +421,19 @@ function conflictsWithPresentation(point, radius, chunk, {
   return false;
 }
 
-function createPresentationLayers(chunk, overlays, experienceSpawn) {
-  const vegetation = (chunk.vegetationCandidates ?? []).filter(candidate => !conflictsWithPresentation(
+function createPresentationLayers(chunk, overlays, experienceSpawn, naturalPresentationPolicy) {
+  const compatibleVegetation = (chunk.vegetationCandidates ?? []).filter(candidate => !conflictsWithPresentation(
     candidate.worldPosition,
     candidate.metadata?.candidateRadiusMeters ?? 0.625,
     chunk,
     { ...overlays, experienceSpawn },
   ));
+  const vegetation = naturalPresentationPolicy.selectVegetation({
+    candidates: compatibleVegetation,
+    settlementReferences: chunk.settlementReferences,
+    experienceSpawn,
+    introDistanceMeters: W8_SPAWN_SAFETY_CONTRACT.introDistanceMeters,
+  });
   const rocks = (chunk.rockCandidates ?? []).filter(candidate => !conflictsWithPresentation(
     candidate.worldPosition,
     candidate.metadata?.candidateRadiusMeters ?? 0.45,
@@ -767,6 +774,9 @@ export async function createW8ParityChunkGenerator({
   baseGeneratorFactory = createDistributedSettlementChunkGenerator,
 } = {}) {
   const base = await baseGeneratorFactory({ worldSeed });
+  const naturalPresentationPolicy = await createW8NaturalPresentationPhase1Policy({
+    worldSeedHash: base.worldSeedHash,
+  });
   const seed = textSeed(`${base.worldSeedHash}:${W8_PARITY_CONTENT.schemaVersion}`);
   const warmSourceChunks = new Map();
   const pendingSourceChunks = new Map();
@@ -959,7 +969,7 @@ export async function createW8ParityChunkGenerator({
       });
       const presentationLayers = createPresentationLayers(parityGameplayChunk, {
         waterSurfaces, ambientDetails, settlementLandmarks, streetDetails,
-      }, experienceSpawn);
+      }, experienceSpawn, naturalPresentationPolicy);
       const content = {
         ...parityGameplayChunk,
         schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,

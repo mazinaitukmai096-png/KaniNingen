@@ -503,11 +503,11 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
-    assert.equal(snapshot.presentation.canonicalVegetationRecordCount, 109);
-    assert.equal(snapshot.presentation.canonicalTreeRecordCount, 99);
+    assert.equal(snapshot.presentation.canonicalVegetationRecordCount, 17);
+    assert.equal(snapshot.presentation.canonicalTreeRecordCount, 7);
     assert.equal(snapshot.presentation.canonicalShrubRecordCount, 10);
-    assert.equal(snapshot.presentation.visibleCanonicalVegetationCount, 109);
-    assert.equal(snapshot.presentation.visibleCanonicalTreeCount, 99);
+    assert.equal(snapshot.presentation.visibleCanonicalVegetationCount, 17);
+    assert.equal(snapshot.presentation.visibleCanonicalTreeCount, 7);
     assert.equal(snapshot.presentation.visibleCanonicalShrubCount, 10);
     assert.equal(
       snapshot.presentation.canonicalTreeRecordCount
@@ -600,9 +600,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       await new Promise(resolve => setTimeout(resolve, 10));
       warmed = outcome.sandbox.snapshot();
     }
-    assert.equal(warmed.presentation.queryNaturalCandidateCount, 105);
-    assert.equal(warmed.presentation.canonicalVegetationRecordCount, 214);
-    assert.equal(warmed.presentation.visibleCanonicalVegetationCount, 178);
+    assert.equal(warmed.presentation.queryNaturalCandidateCount, 18);
+    assert.equal(warmed.presentation.canonicalVegetationRecordCount, 35);
+    assert.equal(warmed.presentation.visibleCanonicalVegetationCount, 28);
     assert.equal(warmed.presentation.distantTreeProxyCount, 0);
     environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
     environment.listeners.get('keydown')({ code: 'Digit1', preventDefault() {} });
