@@ -21,6 +21,8 @@ import {
 } from '../src/constants.js';
 import {
   W6_ENTITY_CONTRACTS,
+  W6_STATIC_TARGET_CONTRACTS,
+  W7_CORE_COMBAT_CONTRACT,
   W7_MANUAL_BOSS_CONTRACT,
   W7_NUCLEAR_CONTRACT,
   W8_COMBAT_COMMAND_TYPES,
@@ -202,25 +204,80 @@ test('circle query enumerates every intersecting logical Chunk in stable order',
     || (value.chunkZ === first[index - 1].chunkZ && value.chunkX > first[index - 1].chunkX)), true);
 });
 
-test('Nuclear destruction is independent of active rendered and Simulation Chunk sets', async () => {
-  const inactive = createRuntime({ active: false });
-  const active = createRuntime({ active: true });
-  await Promise.all([inactive.initialize, active.initialize]);
-  const first = await inactive.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
-  const second = await active.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
-  assert.equal(first.accepted, true);
-  assert.equal(second.accepted, true);
-  assert.deepEqual(first.queriedChunkKeys, second.queriedChunkKeys);
-  assert.deepEqual(first.hitStableIds, second.hitStableIds);
-  assert.ok(first.hitStableIds.includes('settlement-building-v1:nuclear:2,0'));
-  assert.equal(inactive.runtime.snapshot().activeSimulationChunkCount, 0);
-  assert.equal(inactive.renderer.loaded.size, 0);
-  assert.equal(inactive.state.isFeatureDestroyed('settlement-building-v1:nuclear:2,0'), true);
-  assert.equal(inactive.state.nuclearCooldownMs, BOMB_COOLDOWN);
-  assert.equal(inactive.runtime.snapshot().counts.nuclearChunksQueried, first.queriedChunkKeys.length);
-  assert.equal(inactive.featureRenderer.refreshes, 1);
-  await inactive.runtime.shutdown();
-  await active.runtime.shutdown();
+test('Atomic reuses active Gameplay Data without reaching the final ChunkData query', async () => {
+  let queryCalls = 0;
+  const fixture = createRuntime({ query() {
+    queryCalls += 1;
+    throw new Error('Atomic must not generate final ChunkData');
+  } });
+  await fixture.runtime.syncActiveChunks({
+    activeDataKeys: ['0,0'],
+    renderedKeys: ['0,0'],
+    getChunkData: () => syntheticChunk(0, 0),
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+  });
+  fixture.state.updatePlayer({ hp: 50, score: 100 });
+  const refreshesBeforeAttack = fixture.featureRenderer.refreshes;
+
+  const result = await fixture.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
+  const houseId = 'settlement-building-v1:nuclear:0,0';
+  const outsideId = 'settlement-building-v1:nuclear:2,0';
+  assert.equal(result.accepted, true);
+  assert.equal(queryCalls, 0);
+  assert.deepEqual(result.queriedChunkKeys, ['0,0']);
+  assert.ok(result.hitStableIds.includes(houseId));
+  assert.equal(result.hitStableIds.includes(outsideId), false);
+  assert.equal(fixture.state.isFeatureDestroyed(houseId), true);
+  assert.equal(fixture.state.isFeatureDestroyed(outsideId), false);
+  assert.equal(fixture.state.player.score, 100
+    + W6_STATIC_TARGET_CONTRACTS.house.scoreValue
+    + W6_ENTITY_CONTRACTS.human.scoreValue);
+  assert.equal(fixture.state.player.hp, 50
+    + W7_CORE_COMBAT_CONTRACT.healing.house
+    + W7_CORE_COMBAT_CONTRACT.healing.human);
+  assert.equal(fixture.state.nuclearCooldownMs, BOMB_COOLDOWN);
+  assert.equal(fixture.runtime.snapshot().counts.nuclearChunksQueried, 1);
+  assert.equal(fixture.featureRenderer.refreshes, refreshesBeforeAttack + 1);
+  const events = fixture.runtime.consumePresentationEffects().events;
+  assert.equal(events.some(event => event.type === 'nuclear-destruction'), true);
+  assert.equal(events.some(event => event.type === 'finite-target-destruction'), true);
+
+  const storage = new MemoryStorage();
+  const store = new InfiniteWorldSaveStore({ storage, worldSeedHash });
+  await store.save(fixture.state);
+  const restored = new InfiniteWorldState({ worldSeedHash, playerSpawn: { x: 99, z: 99 } });
+  await store.loadInto(restored);
+  assert.equal(restored.isFeatureDestroyed(houseId), true);
+  assert.equal(restored.player.score, fixture.state.player.score);
+  assert.equal(restored.player.hp, fixture.state.player.hp);
+  assert.equal(restored.nuclearCooldownMs, BOMB_COOLDOWN);
+
+  assert.doesNotThrow(() => fixture.runtime.update({
+    deltaSeconds: 1 / 60,
+    player: fixture.state.player,
+    simulationEnabled: false,
+  }));
+  assert.equal(queryCalls, 0);
+  await fixture.runtime.shutdown();
+});
+
+test('Atomic ignores an unavailable attack range instead of synchronously generating it', async () => {
+  let queryCalls = 0;
+  const fixture = createRuntime({ query() {
+    queryCalls += 1;
+    return syntheticChunk(2, 0);
+  } });
+  const before = fixture.state.createSaveSnapshot();
+  const result = await fixture.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
+  assert.equal(result.accepted, true);
+  assert.deepEqual(result.queriedChunkKeys, []);
+  assert.deepEqual(result.hitStableIds, []);
+  assert.equal(queryCalls, 0);
+  assert.equal(fixture.state.featureDamage.size, 0);
+  assert.equal(fixture.state.player.hp, before.player.hp);
+  assert.equal(fixture.state.player.score, before.player.score);
+  assert.equal(fixture.state.nuclearCooldownMs, BOMB_COOLDOWN);
+  await fixture.runtime.shutdown();
 });
 
 test('Atomic destroys moved base-slot and fallback Tanks through active occurrences without Tank score', async () => {
@@ -315,15 +372,6 @@ test('Nuclear rejects Scale, air-release and cooldown violations without partial
   assert.equal((await fixture.runtime.nuclearAttack({ airborne: true })).reason, 'cooldown');
   assert.equal(before.worldSeedHash, fixture.state.worldSeedHash);
   await fixture.runtime.shutdown();
-
-  const failing = createRuntime({ query(chunkX, chunkZ) {
-    if (chunkX === 0 && chunkZ === 0) throw new Error('query failure');
-    return syntheticChunk(chunkX, chunkZ);
-  } });
-  const beforeFailure = failing.state.createSaveSnapshot();
-  await assert.rejects(() => failing.runtime.nuclearAttack({ airborne: true }), /query failure/);
-  assert.deepEqual(failing.state.createSaveSnapshot(), beforeFailure);
-  await failing.runtime.shutdown();
 });
 
 test('manual Boss is unique, Stable-ID backed, moves across Chunk ownership and respawns only after defeat', async () => {

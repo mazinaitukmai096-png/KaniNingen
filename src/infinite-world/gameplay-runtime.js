@@ -3234,16 +3234,10 @@ export class InfiniteGameplayRuntime {
         hitStableIds: Object.freeze([]),
       });
     }
-    if (typeof this.getChunkDataForQuery !== 'function') {
-      throw new Error('nuclear attack requires the existing ChunkData query');
-    }
     const radiusMeters = finiteWorldUnitsToMeters(W7_NUCLEAR_CONTRACT.damageRadius);
     const coordinates = chunksIntersectingLogicalCircle(x, z, radiusMeters);
-    const models = await Promise.all(coordinates.map(async coordinate => createW6ChunkGameplay({
-      chunkData: await this.getChunkDataForQuery(coordinate.chunkX, coordinate.chunkZ),
-      worldSeedHash: this.worldSeedHash,
-      generatorMajor: this.generatorMajor,
-    })));
+    const availableCoordinates = coordinates.filter(coordinate => this.spatialChunks.has(coordinate.key));
+    const models = availableCoordinates.map(coordinate => this.spatialChunks.get(coordinate.key));
     const staticTargets = new Map();
     const entityDescriptors = new Map();
     for (const model of models) {
@@ -3342,13 +3336,13 @@ export class InfiniteGameplayRuntime {
     this.featureRenderAdapter?.refreshFeatureStates?.();
     this.#syncTransientCombat();
     this.counts.nuclearAttacks += 1;
-    this.counts.nuclearChunksQueried += coordinates.length;
+    this.counts.nuclearChunksQueried += availableCoordinates.length;
     this.counts.nuclearTargetsHit += hitStableIds.length;
     return Object.freeze({
       accepted: true,
       radiusMeters,
       damage: W7_NUCLEAR_CONTRACT.damageAmount,
-      queriedChunkKeys: Object.freeze(coordinates.map(value => value.key)),
+      queriedChunkKeys: Object.freeze(availableCoordinates.map(value => value.key)),
       hitStableIds: Object.freeze(hitStableIds),
     });
   }

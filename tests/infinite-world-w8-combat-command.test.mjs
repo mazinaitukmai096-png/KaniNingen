@@ -87,12 +87,22 @@ test('Atomic follows airborne, cooldown, persistent-state, and Restart event ord
       streetDetails: [], settlementLandmarks: [], waterSurfaces: [],
     }),
   });
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['0,0'],
+    renderedKeys: ['0,0'],
+    getChunkData: async (chunkX, chunkZ) => ({
+      chunkX, chunkZ, vegetationCandidates: [], rockCandidates: [],
+      settlementFeatures: [], settlementReferences: [], ambientDetails: [],
+      streetDetails: [], settlementLandmarks: [], waterSurfaces: [],
+    }),
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+  });
   const release = createCombatCommand(W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE, {
     airborne: true, chargeMs: 1_800,
   });
   const first = await runtime.executeCombatCommand(release);
   assert.equal(first.accepted, true);
-  assert.ok(first.queriedChunkKeys.length > 9);
+  assert.deepEqual(first.queriedChunkKeys, ['0,0']);
   assert.equal(state.nuclearCooldownMs, 12_000);
   assert.equal((await runtime.executeCombatCommand(release)).reason, 'cooldown');
   assert.equal(runtime.consumePresentationEffects().events.some(event => event.type === 'nuclear-destruction'), true);
