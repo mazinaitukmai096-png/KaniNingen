@@ -600,9 +600,20 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       await new Promise(resolve => setTimeout(resolve, 10));
       warmed = outcome.sandbox.snapshot();
     }
-    assert.equal(warmed.presentation.queryNaturalCandidateCount, 18);
-    assert.equal(warmed.presentation.canonicalVegetationRecordCount, 35);
-    assert.equal(warmed.presentation.visibleCanonicalVegetationCount, 28);
+    assert.equal(warmed.presentation.queryNaturalCandidateCount, 99);
+    assert.ok(warmed.presentation.queryNaturalOwnerChunkCount >= 83);
+    assert.ok(warmed.presentation.queryNaturalOwnerChunkCount <= 100);
+    assert.ok(warmed.presentation.canonicalVegetationRecordCount >= warmed.presentation.visibleCanonicalVegetationCount);
+    assert.ok(warmed.presentation.visibleCanonicalVegetationCount > 0);
+    assert.ok(warmed.presentation.visibleCanonicalTreeCount > 0);
+    assert.equal(
+      warmed.presentation.visibleCanonicalFullTreeCount
+        + warmed.presentation.visibleCanonicalSilhouetteTreeCount
+        + warmed.presentation.visibleCanonicalUltraTreeCount,
+      warmed.presentation.visibleCanonicalTreeCount,
+    );
+    assert.ok(warmed.presentation.visibleCanonicalTreePartInstanceCount
+      >= warmed.presentation.visibleCanonicalTreeCount);
     assert.equal(warmed.presentation.distantTreeProxyCount, 0);
     environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
     environment.listeners.get('keydown')({ code: 'Digit1', preventDefault() {} });

@@ -943,6 +943,9 @@ export async function bootInfiniteWorldSandbox({
            playerLogicalX: logicalPlayer.x,
            playerLogicalZ: logicalPlayer.z,
            includeFarNatural: false,
+           // Boot must present the already-canonical inner scene before the optional
+           // 84–140m tier warms.  The latter is queued from the first frame below.
+           includeUltraNatural: false,
          }));
     }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
@@ -1016,6 +1019,7 @@ export async function bootInfiniteWorldSandbox({
     let lastSavedRevision = -1;
     let runStarted = false;
     let farNaturalWarmStarted = false;
+    let ultraNaturalWarmStarted = false;
     let lastRunStartDiagnostics = null;
     let lastCameraCollision = Object.freeze({
       collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0,
@@ -1032,7 +1036,9 @@ export async function bootInfiniteWorldSandbox({
     let distantQuality = worldState.experience.settings.quality;
     running = true;
 
-    const synchronizeDistantPresentation = runtimeSnapshot => distantPresentation.sync({
+    const synchronizeDistantPresentation = (runtimeSnapshot, {
+      includeUltraNatural = true,
+    } = {}) => distantPresentation.sync({
       activeDataKeys: runtimeSnapshot.activeDataKeys,
       renderedKeys: runtimeSnapshot.renderedKeys,
       getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1042,6 +1048,7 @@ export async function bootInfiniteWorldSandbox({
       quality: distantQuality,
       playerLogicalX: logicalPlayer.x,
       playerLogicalZ: logicalPlayer.z,
+      includeUltraNatural,
     });
 
     function sampleCanonicalTerrainHeightMeters(
@@ -1682,8 +1689,15 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           farNaturalWarmStarted = true;
           void diagnostics.measureAsync(
             'distant-sync',
-            () => synchronizeDistantPresentation(runtime.snapshot()),
-          ).catch(error => { transitionError = error; });
+            () => synchronizeDistantPresentation(runtime.snapshot(), { includeUltraNatural: false }),
+          ).then(() => {
+            if (!running || ultraNaturalWarmStarted) return;
+            ultraNaturalWarmStarted = true;
+            void diagnostics.measureAsync(
+              'distant-sync-ultra',
+              () => synchronizeDistantPresentation(runtime.snapshot()),
+            ).catch(error => { transitionError = error; });
+          }).catch(error => { transitionError = error; });
         }
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
         if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
