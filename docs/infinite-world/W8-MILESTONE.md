@@ -33,8 +33,116 @@ W8 は、保護コミット `f8bc9f80c2af417bb585bff26c99522c4229ab8e` の有限
 
 ## W8 Gate B closure
 
-- Status: Gate B closed; Gate C has not started.
+- Status: Gate B closed.
 - Root cause: Tank Projectile terrain queries generated uncached Chunks through `generator.generateChunk()` during the gameplay frame.
 - Formal behavior: Projectile terrain queries are non-generating. Cached terrain keeps normal sampling and collision; a cache miss returns no terrain hit while Projectile movement, lifetime, World Object collision, damage, presentation, and renderer synchronization continue.
 - Temporary W8 isolation, frame diagnostics, Audio batching/priming, Clipmap cache, runtime snapshot hot-path, and Projectile shader investigation changes were removed from the closure diff.
 - Verification: repository serial test run 394/394 passed; related Core Combat, Sandbox Boot, Production Visuals, and Save tests passed; syntax and whitespace checks passed.
+
+## W8 Gate C contract
+
+### Status
+
+- Gate B: closed.
+- Gate C contract: defined.
+- Gate C execution: not started.
+- W8 milestone: not yet closed.
+
+### New contract decision
+
+Gate C is the final performance and hands-on verification Gate for the W8 already
+implemented through Gates A and B. It adds no W8 feature and performs no additional
+optimization. Its purpose is to determine whether W8 can be formally closed after
+comparison measurements against the finite World and Project Owner hands-on
+verification.
+
+### Required work
+
+1. Measure the finite World for five runs under the same conditions.
+2. Measure W8 for five runs under the same conditions.
+3. Record the prerequisites for every run, calculate each median, and compare the
+   existing documented performance metrics.
+4. Have the Project Owner verify W8 in its normal state for three minutes, record
+   the result, and determine whether W8 may be formally closed.
+5. Record the outcome in this W8 progress document.
+
+The finite World and W8 must use, as far as possible, the same device, browser,
+resolution, settings, start conditions, and warm-up policy. No code, setting, or
+Gameplay value may change during measurement. Unfavourable runs must not be
+discarded. If an abnormal run must be excluded, record its reason and do not silently
+replace it with a rerun. Use medians, not means.
+
+### Performance acceptance criteria
+
+Existing W8 documentation defines the comparison method: five finite-World runs
+and five W8 runs with median comparison. It also records these measurement metrics:
+frame p50, frame p95, frame max, percentage of frames over 50ms, and Chunk transition
+p95. The W8 diagnostic section records a single W8 confirmation run and states that
+it met the W8 absolute floor.
+
+The following are Project Owner decisions formally adopted for Gate C. They are not
+values discovered in existing documentation. Measure both the finite World and W8 for
+five runs, record the raw data and each five-run median without rounding a value into
+passing, and judge every metric individually. Both absolute and relative criteria
+must pass; passing only one does not pass Gate C.
+
+| Metric | Absolute criterion | Relative criterion |
+| --- | --- | --- |
+| frame p95 | 33ms or less | W8 median must not worsen by more than 20% from the corresponding finite-World median |
+| frame max | 100ms or less | W8 median must not worsen by more than 20% from the corresponding finite-World median |
+| frames over 50ms | 1.0% or less | W8 median must not worsen by more than 20% from the corresponding finite-World median |
+| Chunk transition p95 | 100ms or less | W8 median must not worsen by more than 20% from the corresponding finite-World median |
+
+Any run immediately fails Gate C if it has a freeze, loss of control, Runtime stop,
+missing Chunk, clear visual collapse, Save or Continue corruption, or mismatched
+measurement conditions. A blocker found during the Project Owner three-minute hands-on
+verification is also an immediate failure.
+
+If production correction becomes necessary during measurement, stop Gate C as
+incomplete, keep the correction separate from Gate C measurement results, and repeat
+all five runs from the beginning after the correction. Gate C execution remains not
+started until measurement is explicitly begun.
+
+### Three-minute hands-on verification
+
+The Project Owner verifies, through New Game or the formal normal start path, that:
+
+- Chunk streaming continues without conspicuous missing Chunks, terrain loss, or
+  boundary failure.
+- There is no loss of control, blocked progression, or recurrence of a long freeze.
+- Tank spawn, Tank AI, Tank fire, Projectile, World Object collision, and combat
+  operate normally.
+- Production Visuals have no clear missing elements.
+- Save and Load follow the W8 formal contract.
+- No new serious Console error recurs continuously.
+
+Visual review does not define a new abstract "visual parity" requirement. It uses
+only the finite-World comparison source, invariants, and provenance already recorded
+for W8.
+
+### Completion and failure conditions
+
+Gate C can close W8 only when the Gate C contract is recorded; the required five-run
+raw data and medians for both finite World and W8 are recorded; the Project Owner
+performance acceptance criteria are met; the Project Owner three-minute verification is
+complete without a blocker; W8 invariants and protected files remain intact; existing
+repository regression tests pass; and the result is recorded here.
+
+Gate C fails or remains incomplete if measurement conditions cannot be aligned, a
+required performance metric cannot be identified, W8 misses a Project Owner
+performance acceptance criterion, hands-on verification finds a freeze, blocked
+progression, serious Chunk loss, serious error, or a blocker in Save, combat,
+streaming, or Production Visuals, or a production change or protected/invariant change
+becomes necessary.
+
+If Gate C fails or a defect is found, do not close W8 and do not begin a production
+fix in the Gate C measurement change. Record the measurements and blocker, separate
+any fix into another Gate or fix contract, and do not mix pre-fix and post-fix
+measurement results.
+
+### Scope restrictions
+
+Gate C does not add features, adjust Gameplay, add after-the-fact optimization,
+permanently add performance instrumentation, change save schema, generator or Chunk
+streaming behavior, W5 canonical ChunkData, terrain height, Stable ID, content hash,
+or protected finite-World files, or add Growth, Wanted, Threat, or Nation.
