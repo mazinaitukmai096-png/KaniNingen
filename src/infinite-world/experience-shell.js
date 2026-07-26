@@ -57,6 +57,7 @@ export function createInfiniteExperienceShell({
   onHome = () => {},
   onRestart = () => {},
   onNuclearRelease = () => {},
+  onChargeEnd = () => {},
   onPlayerLanding = () => null,
   onSpawnManualBoss = () => {},
   onSettingsChanged = () => {},
@@ -256,7 +257,14 @@ export function createInfiniteExperienceShell({
     return enterRun(startMode, result && typeof result === 'object' ? result : {});
   }
   function openSettings() {
+    const hadCharge = state.nuclearChargeStartedAt !== null;
     state.paused = state.mode === 'playing'; state.settingsOpen = true; state.debugOpen = false;
+    state.nuclearChargeStartedAt = null;
+    state.attackButtons.clear();
+    state.suppressedMouseUps.clear();
+    state.camera.shake = 0;
+    state.camera.chargeZoom = 0;
+    if (hadCharge) onChargeEnd();
     leaveLock(); syncShellVisibility();
   }
   function openDebug() {
@@ -409,6 +417,7 @@ export function createInfiniteExperienceShell({
       if (state.runPhase !== 'playing' || state.paused) return;
       if (documentObject && 'pointerLockElement' in documentObject
         && documentObject.pointerLockElement !== canvas) {
+        if (event.button === 0 || event.button === 2) state.suppressedMouseUps.add(event.button);
         requestLock();
         return;
       }
@@ -439,10 +448,18 @@ export function createInfiniteExperienceShell({
       if (wasCharging) {
         state.attackButtons.clear();
         state.nuclearChargeStartedAt = null;
-        if (chargeMs >= W7_NUCLEAR_CONTRACT.chargeThresholdMs) {
-          void onNuclearRelease({ airborne: !state.playerVertical.grounded, chargeMs });
-        } else {
+        state.camera.chargeZoom = 0;
+        onChargeEnd();
+        if (chargeMs < W7_NUCLEAR_CONTRACT.chargeThresholdMs
+          && typeof onCombatCommand !== 'function') {
           emitCombat(W8_COMBAT_COMMAND_TYPES.BOTH, { issuedAt: releasedAt });
+        } else {
+          void onNuclearRelease({
+            airborne: !state.playerVertical.grounded,
+            chargeMs,
+            issuedAt: releasedAt,
+            originY: state.playerVertical.rootY ?? state.playerVertical.groundRootY ?? 0,
+          });
         }
         syncShellVisibility();
       } else if (state.runPhase === 'playing' && !state.paused) {
@@ -450,12 +467,17 @@ export function createInfiniteExperienceShell({
           ? W8_COMBAT_COMMAND_TYPES.LEFT : W8_COMBAT_COMMAND_TYPES.RIGHT, { issuedAt: releasedAt });
       }
     },
-    onPointerLockChange() {
-      if (state.mode !== 'playing') return;
-      if (documentObject?.pointerLockElement === canvas) resume();
-      else if (!state.settingsOpen && !state.debugOpen) openSettings();
-    },
+    onPointerLockChange: handlePointerLockChange,
   });
+
+  function handlePointerLockChange() {
+    if (state.mode !== 'playing') return;
+    if (documentObject?.pointerLockElement === canvas) resume();
+    else if (!state.settingsOpen && !state.debugOpen) openSettings();
+  }
+  if (documentObject && documentObject !== globalObject) {
+    listen(documentObject, 'pointerlockchange', handlePointerLockChange);
+  }
 
   function updatePlayer({ deltaSeconds, player, scaleProfile, movementMultiplier = 1 }) {
     const previousStageId = state.lastScaleProfile?.stage?.id;
@@ -500,6 +522,10 @@ export function createInfiniteExperienceShell({
         player.facingY = Math.atan2(dx, dz);
       }
     }
+    if (!state.paused && state.runPhase === 'playing' && state.jumpHeld
+      && state.playerVertical.grounded) {
+      tryStartPlayerJump(state.playerVertical, scaleProfile);
+    }
     const wasGrounded = state.playerVertical.grounded;
     const vertical = stepPlayerVerticalMovement(state.playerVertical, {
       deltaSeconds: state.paused ? 0 : deltaSeconds,
@@ -519,6 +545,7 @@ export function createInfiniteExperienceShell({
 
   function updateCamera({
     renderLocal, scaleProfile, unitsPerMeter, playerPresentationOffsetMeters = 0,
+    deltaSeconds = 1 / 60,
   }) {
     const playerRootY = (state.playerVertical.rootY ?? state.playerVertical.groundRootY ?? 0)
       + playerPresentationOffsetMeters;
@@ -536,17 +563,19 @@ export function createInfiniteExperienceShell({
     const horizontal = Math.cos(state.camera.pitch) * activeDistanceMeters * unitsPerMeter;
     const vertical = (Math.sin(state.camera.pitch) * activeDistanceMeters
       + scaleProfile.cameraHeightMeters) * unitsPerMeter;
-    state.camera.shakePhase += 1.61803398875;
-    const shakeRender = state.camera.shake * state.settings.cameraShake * unitsPerMeter;
-    const shakeX = Math.sin(state.camera.shakePhase * 2.31) * shakeRender;
-    const shakeY = Math.sin(state.camera.shakePhase * 3.17) * shakeRender * 0.55;
-    const shakeZ = Math.cos(state.camera.shakePhase * 1.87) * shakeRender;
-    state.camera.shake *= 0.88;
+    const shakeCapMeters = Number.isFinite(scaleProfile.stage.cameraShakeCap)
+      ? finiteWorldUnitsToMeters(scaleProfile.stage.cameraShakeCap) : Infinity;
+    const shakeRender = Math.min(state.camera.shake, shakeCapMeters)
+      * state.settings.cameraShake * unitsPerMeter;
+    const random = globalObject.Math?.random ?? Math.random;
+    const shakeX = (random() - 0.5) * shakeRender;
+    const shakeY = (random() - 0.5) * shakeRender;
+    state.camera.shake *= Math.pow(0.85, Math.max(0, deltaSeconds) * 60);
     if (state.camera.shake < 0.001) state.camera.shake = 0;
     const targetCamera = {
       x: renderLocal.x + Math.sin(state.camera.yaw) * horizontal + shakeX,
       y: playerRootY * unitsPerMeter + vertical + shakeY,
-      z: renderLocal.z + Math.cos(state.camera.yaw) * horizontal + shakeZ,
+      z: renderLocal.z + Math.cos(state.camera.yaw) * horizontal,
     };
     let lookAtY = targetY;
     if (state.runPhase === 'intro') {
@@ -617,8 +646,7 @@ export function createInfiniteExperienceShell({
     state.bossActive = boss?.alive === true;
     state.threatActive = state.bossActive || gameplaySnapshot.activeTankCount > 0;
     state.canNuclearCharge = gameplaySnapshot.state.activeScaleStageId === W7_NUCLEAR_CONTRACT.allowedScaleStageId
-      && (gameplaySnapshot.state.nuclearCooldownMs ?? 0) <= 0
-      && !state.playerVertical.grounded;
+      && (gameplaySnapshot.state.nuclearCooldownMs ?? 0) <= 0;
     state.newsActive = state.bossActive;
     if (elements.bossFill?.style && boss) {
       const bossPercent = clamp(boss.hp / boss.maxHp * 100, 0, 100);

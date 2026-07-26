@@ -166,6 +166,20 @@ test('Settlement instances fade in one frame and restore after the bounded hyste
   }), 1);
   assert.deepEqual(first.mesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
   assert.notEqual(first.fadeMesh.matrices[first.index].scale.x, 0);
+  assert.equal(adapter.updateCameraOcclusion({ enabled: false }), 0);
+  assert.notEqual(first.mesh.matrices[first.index].scale.x, 0);
+  assert.deepEqual(first.fadeMesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
+  Raycaster.hits = [{ object: first.mesh, instanceId: first.index }];
+  assert.equal(adapter.updateCameraOcclusion({
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+    nowMs: 1_010, enabled: false,
+  }), 0);
+  assert.notEqual(first.mesh.matrices[first.index].scale.x, 0);
+  Raycaster.hits = [{ object: first.mesh, instanceId: first.index }];
+  assert.equal(adapter.updateCameraOcclusion({
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 },
+    nowMs: 1_020, enabled: true,
+  }), 1);
   Raycaster.hits = [];
   assert.equal(adapter.updateCameraOcclusion({
     camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_100,
@@ -173,7 +187,7 @@ test('Settlement instances fade in one frame and restore after the bounded hyste
   assert.deepEqual(first.mesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });
   assert.notEqual(first.fadeMesh.matrices[first.index].scale.x, 0);
   assert.equal(adapter.updateCameraOcclusion({
-    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_120,
+    camera: { position: { x: 0, y: 100, z: 0 } }, target: { x: 100, y: 0, z: 100 }, nowMs: 1_140,
   }), 0);
   assert.notEqual(first.mesh.matrices[first.index].scale.x, 0);
   assert.deepEqual(first.fadeMesh.matrices[first.index].scale, { x: 0, y: 0, z: 0 });

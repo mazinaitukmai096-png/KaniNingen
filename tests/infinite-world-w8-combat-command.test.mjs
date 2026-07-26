@@ -98,20 +98,39 @@ test('Atomic follows airborne, cooldown, persistent-state, and Restart event ord
     renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
   });
   const release = createCombatCommand(W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE, {
-    airborne: true, chargeMs: 1_800,
+    airborne: true, chargeMs: 1_800, originY: 12.5,
   });
   const first = await runtime.executeCombatCommand(release);
   assert.equal(first.accepted, true);
   assert.deepEqual(first.queriedChunkKeys, ['0,0']);
   assert.equal(state.nuclearCooldownMs, 12_000);
   assert.equal((await runtime.executeCombatCommand(release)).reason, 'cooldown');
-  assert.equal(runtime.consumePresentationEffects().events.some(event => event.type === 'nuclear-destruction'), true);
+  const releaseEvents = runtime.consumePresentationEffects().events;
+  assert.equal(releaseEvents.some(event => event.type === 'charge-release'), true);
+  assert.equal(releaseEvents.some(event => event.type === 'nuclear-destruction'), true);
+  assert.equal(releaseEvents.find(event => event.type === 'nuclear-destruction').logicalPosition.y, 12.5);
+  assert.equal(releaseEvents.at(-1).type, 'charge-release',
+    'the control event remains after every Atomic destruction event');
   await runtime.restart({
     playerSpawn: { x: 0, z: 0 },
     renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
   });
   assert.equal(state.nuclearCooldownMs, 0);
   assert.equal(runtime.snapshot().activeProjectileCount, 0);
+});
+
+test('short charge release clears presentation and resolves the protected double-claw attack', () => {
+  const { runtime } = fixture();
+  runtime.executeCombatCommand(createCombatCommand(W8_COMBAT_COMMAND_TYPES.CHARGE_START));
+  const result = runtime.executeCombatCommand(createCombatCommand(
+    W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE,
+    { airborne: false, chargeMs: 500, issuedAt: 2_000 },
+  ));
+  assert.equal(result.accepted, true);
+  const events = runtime.consumePresentationEffects().events;
+  assert.equal(events.some(event => event.type === 'charge-release'), true);
+  assert.equal(events.some(event => event.type === 'both-claw-swish'), true);
+  assert.equal(events.some(event => event.type === 'nuclear-destruction'), false);
 });
 
 test('Charge commands retain airborne, Scale and cooldown rejection without gameplay mutation', async () => {

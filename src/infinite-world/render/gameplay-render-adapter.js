@@ -21,6 +21,28 @@ function requireConstructor(THREE, name) {
   return THREE[name];
 }
 
+const FINITE_PARTICLE_DRAG_PER_SECOND = -60 * Math.log(0.98);
+const FINITE_PARTICLE_GRAVITY_PER_SECOND = finiteWorldUnitsToMeters(1_500);
+
+function presentationRandom(sequence, index, salt = 0) {
+  let value = ((sequence ?? 0) * 0x9e3779b1 + index * 0x85ebca6b + salt * 0xc2b2ae35) >>> 0;
+  value ^= value >>> 16; value = Math.imul(value, 0x7feb352d);
+  value ^= value >>> 15; value = Math.imul(value, 0x846ca68b);
+  value ^= value >>> 16;
+  return (value >>> 0) / 0x1_0000_0000;
+}
+
+function draggedDistance(initialVelocity, elapsedSeconds) {
+  return initialVelocity * (1 - Math.exp(-FINITE_PARTICLE_DRAG_PER_SECOND * elapsedSeconds))
+    / FINITE_PARTICLE_DRAG_PER_SECOND;
+}
+
+function draggedVerticalDistance(initialVelocity, elapsedSeconds, gravity = FINITE_PARTICLE_GRAVITY_PER_SECOND) {
+  const drag = FINITE_PARTICLE_DRAG_PER_SECOND;
+  return (initialVelocity + gravity / drag) * (1 - Math.exp(-drag * elapsedSeconds)) / drag
+    - gravity * elapsedSeconds / drag;
+}
+
 export class GameplayRenderAdapter {
   constructor({ THREE, scene, renderChunkSize = RENDER_CHUNK_SIZE, visualAssets = null } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
@@ -61,7 +83,7 @@ export class GameplayRenderAdapter {
       charredImpact: Object.freeze({ geometry: 'box', material: 'charred', capacity: 500 }),
       goldSpark: Object.freeze({ geometry: 'box', material: 'gold', capacity: 600 }),
       atomicWhite: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
-      atomicOrange: Object.freeze({ geometry: 'box', material: 'shockwave', capacity: 64 }),
+      atomicOrange: Object.freeze({ geometry: 'box', material: 'atomicOrange', capacity: 64 }),
       atomicRing: Object.freeze({ geometry: 'box', material: 'atomicFlash', capacity: 64 }),
       acid: Object.freeze({ geometry: 'box', material: 'acid', capacity: 384 }),
       whiteParticle: Object.freeze({ geometry: 'box', material: 'whiteEye', capacity: 192 }),
@@ -70,8 +92,10 @@ export class GameplayRenderAdapter {
       worldDetailDebris: Object.freeze({ geometry: 'box', material: 'roadSign', capacity: 192 }),
       dust: Object.freeze({ geometry: 'box', material: 'road', capacity: 384 }),
       blood: Object.freeze({ geometry: 'box', material: 'blood', capacity: 192 }),
-      wind: Object.freeze({ geometry: 'windArc', material: 'wind', capacity: 96 }),
+      wind: Object.freeze({ geometry: 'box', material: 'wind', capacity: 96 }),
       shockwave: Object.freeze({ geometry: 'torus', material: 'shockwave', capacity: 288 }),
+      landingOuter: Object.freeze({ geometry: 'landingRing', material: 'landingOuter', capacity: 48 }),
+      landingInner: Object.freeze({ geometry: 'landingRing', material: 'landingInner', capacity: 48 }),
       smoke: Object.freeze({ geometry: 'sphere', material: 'smoke', capacity: 384 }),
       scorch: Object.freeze({ geometry: 'sphere', material: 'scorch', capacity: 96 }),
       bloodScar: Object.freeze({ geometry: 'sphere', material: 'blood', capacity: 50 }),
@@ -468,58 +492,138 @@ export class GameplayRenderAdapter {
         continue;
       }
       if (event.type.includes('claw-swish') || event.type === 'boss-sweep') {
-        this.#appendEffectInstance('wind', {
-          ...base, y: baseY + 1.2 * unit,
-          scaleX: intensity * 2.4 * unit, scaleY: intensity * 1.2 * unit,
-          scaleZ: intensity * 2.4 * unit, rotationY: directionHeading,
-        });
+        if (event.type === 'boss-sweep') {
+          this.#appendEffectInstance('wind', {
+            ...base, y: baseY + 1.2 * unit,
+            scaleX: intensity * 2.4 * unit, scaleY: intensity * 1.2 * unit,
+            scaleZ: intensity * 2.4 * unit, rotationY: directionHeading,
+          });
+          continue;
+        }
+        const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
+        const presentation = event.presentation ?? {};
+        const particleCount = presentation.particleCountPerSide ?? 28;
+        const particleScale = presentation.particleScale ?? 1;
+        const radiusMeters = presentation.arcRadiusMeters ?? finiteWorldUnitsToMeters(180);
+        const heading = presentation.heading ?? directionHeading;
+        const visualScale = presentation.visualScale ?? 1;
+        for (const side of presentation.sides ?? ['right']) {
+          const isLeft = side === 'left';
+          const startAngle = isLeft ? 1.1 : -1.1;
+          const endAngle = isLeft ? -0.3 : 0.3;
+          for (let index = 0; index < particleCount; index += 1) {
+            const life = 0.45 + presentationRandom(event.sequence, index, isLeft ? 41 : 42) * 0.25;
+            if (elapsedSeconds > life) continue;
+            const t = index / Math.max(1, particleCount - 1);
+            const angleOffset = startAngle + (endAngle - startAngle) * Math.sin(t * Math.PI / 2);
+            const finalAngle = heading + angleOffset;
+            const localX = Math.sin(angleOffset) * radiusMeters;
+            const localZ = Math.cos(angleOffset) * radiusMeters;
+            const originX = base.x + (localX * Math.cos(heading) + localZ * Math.sin(heading)) * unit;
+            const originZ = base.z + (localZ * Math.cos(heading) - localX * Math.sin(heading)) * unit;
+            const speed = finiteWorldUnitsToMeters(
+              (45 + presentationRandom(event.sequence, index, isLeft ? 43 : 44) * 35) * particleScale,
+            );
+            const travel = draggedDistance(speed, elapsedSeconds) * unit;
+            const flowSign = isLeft ? 1 : -1;
+            const length = finiteWorldUnitsToMeters(
+              (8 + presentationRandom(event.sequence, index, isLeft ? 45 : 46) * 6) * particleScale,
+            ) * unit;
+            const thickness = finiteWorldUnitsToMeters(2.6 * particleScale) * unit;
+            const lifeRatio = Math.max(0, (life - elapsedSeconds) / life);
+            this.#appendEffectInstance('wind', {
+              x: originX + Math.cos(finalAngle) * travel * flowSign,
+              y: baseY + finiteWorldUnitsToMeters(
+                30 * visualScale
+                  + (presentationRandom(event.sequence, index, isLeft ? 47 : 48) - 0.5)
+                    * 4 * particleScale,
+              ) * unit,
+              z: originZ - Math.sin(finalAngle) * travel * flowSign,
+              scaleX: thickness * lifeRatio,
+              scaleY: length * lifeRatio,
+              scaleZ: thickness * lifeRatio,
+              rotationY: finalAngle + Math.PI / 2,
+              rotationZ: Math.PI / 4,
+            });
+          }
+        }
         continue;
       }
       if (event.type.startsWith('nuclear')) {
         const nuclear = W8_NUCLEAR_PRESENTATION_CONTRACT;
         const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
-        if (elapsedSeconds <= nuclear.screenFlashSeconds) this.#appendEffectInstance('flash', {
-          ...base, y: baseY + 2 * unit,
-          scaleX: 12 * unit, scaleY: 15 * unit, scaleZ: 12 * unit,
-        });
-        for (const [role, phase] of [['atomicWhite', 0], ['atomicOrange', Math.PI]]) {
+        for (const [role, finiteSize, salt] of [
+          ['atomicWhite', 50, 100], ['atomicOrange', 70, 200],
+        ]) {
           for (let index = 0; index < nuclear.cloudParticlesPerColor; index += 1) {
-            const angle = index / nuclear.cloudParticlesPerColor * Math.PI * 2 + phase;
-            const variation = ((index * 19 + (event.sequence ?? 0) * 11) % 37) / 37;
-            const travel = progress * (4 + variation * 26) * unit;
-            const size = (1.25 + variation * 1.2) * unit;
+            const velocityX = finiteWorldUnitsToMeters(
+              (presentationRandom(event.sequence, index, salt) - 0.5) * 1_200,
+            );
+            const velocityY = finiteWorldUnitsToMeters(
+              presentationRandom(event.sequence, index, salt + 1) * 2_200,
+            );
+            const velocityZ = finiteWorldUnitsToMeters(
+              (presentationRandom(event.sequence, index, salt + 2) - 0.5) * 1_200,
+            );
+            const size = finiteWorldUnitsToMeters(
+              finiteSize * 1.4 * (0.6 + presentationRandom(event.sequence, index, salt + 3)),
+            ) * unit;
             this.#appendEffectInstance(role, {
-              x: base.x + Math.cos(angle) * travel,
-              y: baseY + progress * (8 + variation * 38) * unit,
-              z: base.z + Math.sin(angle) * travel,
+              x: base.x + draggedDistance(velocityX, elapsedSeconds) * unit,
+              y: baseY + draggedVerticalDistance(velocityY, elapsedSeconds) * unit,
+              z: base.z + draggedDistance(velocityZ, elapsedSeconds) * unit,
               scaleX: size, scaleY: size, scaleZ: size,
-              rotationX: progress * 5 + index, rotationY: angle,
+              rotationX: (presentationRandom(event.sequence, index, salt + 4) - 0.5)
+                * 0.2 * elapsedSeconds * 60,
+              rotationY: (presentationRandom(event.sequence, index, salt + 5) - 0.5)
+                * 0.2 * elapsedSeconds * 60,
             });
           }
         }
-        for (let index = 0; index < nuclear.goldSparkCount; index += 1) {
-          const angle = index / nuclear.goldSparkCount * Math.PI * 2;
-          const variation = ((index * 13 + (event.sequence ?? 0) * 5) % 31) / 31;
-          const travel = progress * (3 + variation * 20) * unit;
-          this.#appendEffectInstance('goldSpark', {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + progress * (6 + variation * 25) * unit,
-            z: base.z + Math.sin(angle) * travel,
-            scaleX: 0.625 * unit, scaleY: 0.625 * unit, scaleZ: 0.625 * unit,
-            rotationX: progress * 6 + index, rotationY: angle,
-          });
+        if (elapsedSeconds <= 2) {
+          for (let index = 0; index < nuclear.goldSparkCount; index += 1) {
+            const velocityX = finiteWorldUnitsToMeters(
+              (presentationRandom(event.sequence, index, 300) - 0.5) * 800,
+            );
+            const velocityY = finiteWorldUnitsToMeters(
+              presentationRandom(event.sequence, index, 301) * 900,
+            );
+            const velocityZ = finiteWorldUnitsToMeters(
+              (presentationRandom(event.sequence, index, 302) - 0.5) * 800,
+            );
+            const size = finiteWorldUnitsToMeters(
+              25 * (0.6 + presentationRandom(event.sequence, index, 303)),
+            ) * unit;
+            this.#appendEffectInstance('goldSpark', {
+              x: base.x + draggedDistance(velocityX, elapsedSeconds) * unit,
+              y: baseY + draggedVerticalDistance(velocityY, elapsedSeconds) * unit,
+              z: base.z + draggedDistance(velocityZ, elapsedSeconds) * unit,
+              scaleX: size, scaleY: size, scaleZ: size,
+              rotationX: (presentationRandom(event.sequence, index, 304) - 0.5)
+                * 0.2 * elapsedSeconds * 60,
+              rotationY: (presentationRandom(event.sequence, index, 305) - 0.5)
+                * 0.2 * elapsedSeconds * 60,
+            });
+          }
         }
         if (elapsedSeconds <= nuclear.ringLifetimeSeconds) {
-          const ringProgress = elapsedSeconds / nuclear.ringLifetimeSeconds;
+          const ringDecay = FINITE_PARTICLE_DRAG_PER_SECOND;
+          const ringSpeedFinite = W7_NUCLEAR_CONTRACT.pushRadius * ringDecay
+            / (1 - Math.exp(-ringDecay * nuclear.ringLifetimeSeconds));
+          const ringTravel = draggedDistance(
+            finiteWorldUnitsToMeters(ringSpeedFinite), elapsedSeconds,
+          ) * unit;
           for (let index = 0; index < nuclear.radialRingCount; index += 1) {
             const angle = index / nuclear.radialRingCount * Math.PI * 2;
-            const travel = ringProgress * finiteWorldUnitsToMeters(W7_NUCLEAR_CONTRACT.pushRadius)
-              * unit;
             this.#appendEffectInstance('atomicRing', {
-              x: base.x + Math.cos(angle) * travel,
-              y: baseY + 2.5 * unit,
-              z: base.z + Math.sin(angle) * travel,
-              scaleX: 8 * unit, scaleY: 2.25 * unit, scaleZ: 8 * unit,
+              x: base.x + Math.cos(angle) * ringTravel,
+              y: baseY + draggedVerticalDistance(
+                finiteWorldUnitsToMeters(100), elapsedSeconds,
+              ) * unit,
+              z: base.z + Math.sin(angle) * ringTravel,
+              scaleX: finiteWorldUnitsToMeters(320) * unit,
+              scaleY: finiteWorldUnitsToMeters(90) * unit,
+              scaleZ: finiteWorldUnitsToMeters(320) * unit,
               rotationY: angle,
             });
           }
@@ -537,11 +641,24 @@ export class GameplayRenderAdapter {
         continue;
       }
       if (event.type === 'player-landing-shockwave') {
-        const ringScale = Math.max(0.1, intensity * progress) * unit;
-        this.#appendEffectInstance('shockwave', {
-          ...base, y: baseY + 0.08 * unit,
-          scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
-          rotationX: Math.PI / 2,
+        const finite = event.presentation ?? {};
+        const elapsedFrames = (entry.durationSeconds - entry.remainingSeconds) * 60;
+        const initialRadius = finite.initialRadiusMeters ?? finiteWorldUnitsToMeters(10);
+        const maximumRadius = finite.maximumRadiusMeters ?? intensity;
+        const ringScale = maximumRadius
+          - (maximumRadius - initialRadius) * Math.pow(0.88, elapsedFrames);
+        const ringRole = finite.ringRole === 'inner' ? 'landingInner' : 'landingOuter';
+        const ringPool = this.effectInstancePools.get(ringRole);
+        const opacity = Math.max(0, (finite.initialOpacity ?? 0.85) - 0.04 * elapsedFrames);
+        if (ringPool?.mesh?.material) {
+          ringPool.mesh.material.opacity = opacity;
+          if (ringPool.mesh.material.options) ringPool.mesh.material.options.opacity = opacity;
+          ringPool.mesh.material.needsUpdate = true;
+        }
+        this.#appendEffectInstance(ringRole, {
+          ...base, y: baseY + finiteWorldUnitsToMeters(4) * unit,
+          scaleX: ringScale * unit, scaleY: ringScale * unit, scaleZ: ringScale * unit,
+          rotationX: -Math.PI / 2,
         });
         continue;
       }
@@ -797,8 +914,7 @@ export class GameplayRenderAdapter {
         this.playerChargeElapsedSeconds = 0;
       }
       if (event.type === 'charge-release') {
-        this.playerAttackPresentation.charging = false;
-        this.playerChargeElapsedSeconds = 0;
+        this.#resetPlayerChargePresentation();
       }
     }
     return events.length;
@@ -811,22 +927,49 @@ export class GameplayRenderAdapter {
     }
     this.activePresentationEffects.length = 0;
     this.persistentTankScars.length = 0;
+    this.playerAttackPresentation.left = null;
+    this.playerAttackPresentation.right = null;
+    this.#resetPlayerChargePresentation();
     this.#syncEffectInstances();
     return true;
   }
 
-  setPlayerLocomotion({ movedMeters = 0, walkPhase = 0, grounded = true } = {}) {
+  clearPlayerChargePresentation() {
+    this.#resetPlayerChargePresentation();
+    return true;
+  }
+
+  #resetPlayerChargePresentation() {
+    this.playerAttackPresentation.charging = false;
+    this.playerChargeElapsedSeconds = 0;
+    this.playerChargePhase = 0;
+    this.playerPresentationOffsetUnits.x = 0;
+    this.playerPresentationOffsetUnits.z = 0;
+    this.playerPresentationOffsetUnits.y = this.playerLocomotionY;
+    const parts = this.playerPresentation?.userData?.presentationParts;
+    parts?.shell?.material?.color?.setHex?.(0xff4500);
+    parts?.shell?.material?.emissive?.setRGB?.(0, 0, 0);
+  }
+
+  setPlayerLocomotion({
+    movedMeters = 0, elapsedSeconds = 0, grounded = true, intro = false,
+  } = {}) {
     const parts = this.playerPresentation?.userData?.presentationParts;
     if (!parts) return false;
     const moving = movedMeters > 0.0001;
+    const legPhase = elapsedSeconds * (intro ? 6 : 30);
+    const liftPhase = elapsedSeconds * (intro ? 12 : 60);
+    const bodyPhase = elapsedSeconds * (intro ? 10 : 25);
+    const legLift = intro ? 4 : 10;
+    const bodyBounce = intro ? 8 : 20;
     parts.legs.forEach((leg, index) => {
       const offset = index * 0.5;
-      leg.rotation.x = moving ? Math.sin(walkPhase + offset) * 0.8 : 0;
+      leg.rotation.x = moving ? Math.sin(legPhase + offset) * 0.8 : 0;
       leg.position.y = moving && grounded
-        ? Math.max(0, Math.sin(walkPhase * 2 + offset) * 10) : 0;
+        ? Math.max(0, Math.sin(liftPhase + offset) * legLift) : 0;
     });
     const locomotionY = moving && grounded
-      ? Math.abs(Math.sin(walkPhase * 5 / 6)) * 20 : 0;
+      ? Math.abs(Math.sin(bodyPhase)) * bodyBounce : 0;
     this.playerLocomotionY = locomotionY;
     this.playerPresentationOffsetUnits.y = locomotionY;
     parts.visualRoot.userData.locomotionY = locomotionY;

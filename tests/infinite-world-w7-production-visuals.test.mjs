@@ -17,6 +17,7 @@ import {
   createW8ParityVisualAssetLibrary,
 } from '../src/infinite-world/render/w8-parity-visual-assets.js';
 import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
+import { W7_NUCLEAR_CONTRACT } from '../src/infinite-world/gameplay-contract.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const provenancePath = resolve(repoRoot, 'docs/infinite-world/W7-VISUAL-PROVENANCE.json');
@@ -45,6 +46,11 @@ class Geometry { dispose() { this.disposed = true; } }
 class BoxGeometry extends Geometry {}
 class ConeGeometry extends Geometry {}
 class CylinderGeometry extends Geometry {}
+class RingGeometry extends Geometry {
+  constructor(innerRadius, outerRadius, segments) {
+    super(); Object.assign(this, { innerRadius, outerRadius, segments });
+  }
+}
 class SphereGeometry extends Geometry {}
 class DodecahedronGeometry extends Geometry {}
 class Material { constructor(options) { this.options = options; } dispose() { this.disposed = true; } }
@@ -62,7 +68,7 @@ class InstancedMesh extends Mesh {
 }
 const FakeThree = {
   Group, BoxGeometry, ConeGeometry, CylinderGeometry, SphereGeometry,
-  DodecahedronGeometry, MeshLambertMaterial, MeshPhongMaterial, Mesh, InstancedMesh,
+  RingGeometry, DodecahedronGeometry, MeshLambertMaterial, MeshPhongMaterial, Mesh, InstancedMesh,
   Object3D: NodeObject,
 };
 
@@ -249,15 +255,29 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(adapter.reinforcementMeshes.has(tankState.stableId), false,
     'canonical owner reload atomically replaces the occurrence renderer entry');
   await adapter.unloadChunk('0,0');
-  assert.equal(adapter.setPlayerLocomotion({ movedMeters: 1, walkPhase: 0.8, grounded: true }), true);
+  assert.equal(adapter.setPlayerLocomotion({
+    movedMeters: 1, elapsedSeconds: 0.1, grounded: true, intro: false,
+  }), true);
   assert.notEqual(parts.legs[0].rotation.x, 0);
   assert.equal(parts.visualRoot.position.y, 0);
   assert.ok(adapter.getPlayerPresentationOffsetUnits().y > 0);
+  assert.ok(Math.abs(parts.legs[0].rotation.x - Math.sin(3) * 0.8) < 1e-12);
+  assert.ok(Math.abs(parts.legs[0].position.y - Math.max(0, Math.sin(6) * 10)) < 1e-12);
+  assert.ok(Math.abs(adapter.getPlayerPresentationOffsetUnits().y
+    - Math.abs(Math.sin(2.5)) * 20) < 1e-12);
   adapter.consumePresentationEvents([{
     type: 'both-claw-swish', logicalPosition: { x: 0, z: 0 }, intensity: 1,
     lifetimeSeconds: 0.28, soundCue: 'swish',
+    sequence: 12,
+    direction: { x: 0, z: 1 },
+    presentation: {
+      sides: ['left', 'right'], heading: 0, arcRadiusMeters: 4.5,
+      particleScale: 1, visualScale: 1, particleCountPerSide: 28,
+    },
   }], { playerMarker: player });
   adapter.updatePresentation(0.1);
+  assert.equal(adapter.snapshot().effectInstancePools.wind.count, 56);
+  assert.equal(adapter.effectInstancePools.get('wind').mesh.geometry, assets.geometries.box);
   assert.notEqual(parts.leftClaw.position.z, 5);
   assert.notEqual(parts.rightClaw.position.z, 5);
   assert.notEqual(parts.visualRoot.rotation.x, 0);
@@ -268,6 +288,13 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   adapter.updatePresentation(0.5);
   assert.notEqual(adapter.getPlayerPresentationOffsetUnits().x, 0);
   assert.equal(parts.visualRoot.position.y, 0);
+  adapter.consumePresentationEvents([{
+    type: 'charge-release', logicalPosition: { x: 0, z: 0 }, intensity: 0,
+    lifetimeSeconds: 0.01,
+  }], { playerMarker: player });
+  assert.equal(adapter.playerAttackPresentation.charging, false);
+  assert.equal(adapter.getPlayerPresentationOffsetUnits().x, 0);
+  assert.equal(adapter.getPlayerPresentationOffsetUnits().z, 0);
 
   const rendererBeforeTankShell = adapter.snapshot();
   const tankShellState = {
@@ -317,12 +344,12 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   );
 
   adapter.consumePresentationEvents([{
-    sequence: 41, type: 'nuclear-destruction', logicalPosition: { x: 0, z: 0 },
+    sequence: 41, type: 'nuclear-destruction', logicalPosition: { x: 0, y: 12.5, z: 0 },
     direction: { x: 0, z: 1 }, intensity: 4, lifetimeSeconds: 3.5, soundCue: 'atomic',
   }], { playerMarker: player });
   adapter.updatePresentation(0.1);
   const nuclearPools = adapter.snapshot().effectInstancePools;
-  assert.equal(nuclearPools.flash.count, 1);
+  assert.equal(nuclearPools.flash.count, 0);
   assert.equal(nuclearPools.atomicWhite.count, 36);
   assert.equal(nuclearPools.atomicOrange.count, 36);
   assert.equal(nuclearPools.goldSpark.count, 35);
@@ -331,6 +358,20 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(nuclearPools.shockwave.count, 0);
   assert.equal(nuclearPools.scorch.count, 0);
   assert.equal(Object.values(nuclearPools).every(pool => pool.count <= pool.capacity), true);
+  const firstRing = adapter.effectInstancePools.get('atomicRing').mesh.matrices[0];
+  assert.deepEqual(firstRing.scale, {
+    x: 8 * adapter.unitsPerMeter,
+    y: 2.25 * adapter.unitsPerMeter,
+    z: 8 * adapter.unitsPerMeter,
+  });
+  const drag = -60 * Math.log(0.98);
+  const ringSpeed = W7_NUCLEAR_CONTRACT.pushRadius * drag / (1 - Math.exp(-drag * 2.2));
+  const expectedRingTravel = ringSpeed * (1 - Math.exp(-drag * 0.1)) / drag
+    / 40 * adapter.unitsPerMeter;
+  assert.ok(Math.abs(firstRing.position.x - expectedRingTravel) < 1e-9);
+  const atomicWhiteY = adapter.effectInstancePools.get('atomicWhite').mesh.matrices[0].position.y;
+  assert.ok(atomicWhiteY > 10 * adapter.unitsPerMeter,
+    `Atomic cloud originates at the airborne Player instead of terrain zero: ${atomicWhiteY}`);
 
   adapter.syncManualBoss({
     stableId: 'manual-boss-camera', alive: true, x: 0, z: 0, rotationY: 0,
@@ -545,7 +586,7 @@ test('Player landing renders two bounded shockwaves and finite-parity radial dus
   const scene = new Group();
   const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
   const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
-  const event = (sequence, type, intensity, lifetimeSeconds) => ({
+  const event = (sequence, type, intensity, lifetimeSeconds, presentation = undefined) => ({
     sequence,
     type,
     logicalPosition: { x: 2, y: 1, z: -3 },
@@ -553,18 +594,39 @@ test('Player landing renders two bounded shockwaves and finite-parity radial dus
     intensity,
     lifetimeSeconds,
     soundCue: null,
+    presentation,
   });
   adapter.consumePresentationEvents([
-    event(1, 'player-landing-shockwave', 13.75, 0.55),
-    event(2, 'player-landing-shockwave', 9.5, 0.55),
+    event(1, 'player-landing-shockwave', 13.75, 0.85 / 2.4, {
+      ringRole: 'outer', initialRadiusMeters: 0.25, maximumRadiusMeters: 13.75,
+      color: 0xff3300, initialOpacity: 0.85,
+    }),
+    event(2, 'player-landing-shockwave', 9.5, 0.85 / 2.4, {
+      ringRole: 'inner', initialRadiusMeters: 0.25, maximumRadiusMeters: 9.5,
+      color: 0xffaa00, initialOpacity: 0.85,
+    }),
     event(3, 'player-landing-dust', 1, 1.8),
   ]);
   adapter.updatePresentation(0.1);
   const snapshot = adapter.snapshot();
-  assert.equal(snapshot.effectInstancePools.shockwave.count, 2);
+  assert.equal(snapshot.effectInstancePools.landingOuter.count, 1);
+  assert.equal(snapshot.effectInstancePools.landingInner.count, 1);
   assert.equal(snapshot.effectInstancePools.dust.count, 14);
   assert.equal(snapshot.effectInstancePools.flash.count, 0);
   assert.equal(snapshot.effectInstancePools.debris.count, 0);
+  assert.ok(Math.abs(adapter.effectInstancePools.get('landingOuter').mesh.material.opacity
+    - (0.85 - 0.04 * 6)) < 1e-12);
+  const outerMatrix = adapter.effectInstancePools.get('landingOuter').mesh.matrices[0];
+  const expectedOuterRadius = 13.75 - (13.75 - 0.25) * (0.88 ** 6);
+  assert.ok(Math.abs(outerMatrix.scale.x - expectedOuterRadius * adapter.unitsPerMeter) < 1e-12);
+  assert.equal(assets.geometries.landingRing.innerRadius, 0.1);
+  assert.equal(assets.geometries.landingRing.outerRadius, 1);
+  assert.equal(assets.geometries.landingRing.segments, 20);
+  assert.equal(assets.materials.landingOuter.options.color, 0xff3300);
+  assert.equal(assets.materials.landingOuter.options.transparent, true);
+  assert.equal(assets.materials.landingOuter.options.depthTest, false);
+  assert.equal(assets.materials.landingOuter.options.depthWrite, false);
+  assert.equal(assets.materials.landingInner.options.color, 0xffaa00);
   await adapter.shutdown();
   assets.dispose();
 });

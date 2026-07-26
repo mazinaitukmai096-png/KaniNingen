@@ -421,11 +421,13 @@ export function createCombatCommand(type, {
   issuedAt = globalThis.performance?.now?.() ?? Date.now(),
   airborne = false,
   chargeMs = 0,
+  originY = 0,
 } = {}) {
   if (!Object.values(W8_COMBAT_COMMAND_TYPES).includes(type)) {
     throw new RangeError(`unsupported CombatCommand: ${type}`);
   }
-  if (!Number.isFinite(issuedAt) || !Number.isFinite(chargeMs) || chargeMs < 0) {
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(chargeMs) || chargeMs < 0
+    || !Number.isFinite(originY)) {
     throw new TypeError('CombatCommand timing must be finite and non-negative');
   }
   return Object.freeze({
@@ -434,6 +436,7 @@ export function createCombatCommand(type, {
     issuedAt,
     airborne: airborne === true,
     chargeMs,
+    originY,
   });
 }
 
@@ -519,6 +522,8 @@ export function getW6ScaleProfile(stageId) {
     landingRadiusMeters: finiteWorldUnitsToMeters(stage.landingRadius),
     landingPushRadiusMeters: finiteWorldUnitsToMeters(stage.landingPushRadius),
     landingShake: stage.landingShake,
+    windArcRadiusMeters: finiteWorldUnitsToMeters(stage.windArcRadius),
+    windArcParticleScale: stage.windArcParticleScale,
     cameraDistanceMeters: finiteWorldUnitsToMeters(stage.cameraDistance),
     cameraHeightMeters: finiteWorldUnitsToMeters(stage.cameraHeight),
     cameraTargetHeightMeters: finiteWorldUnitsToMeters(stage.cameraTargetHeight),

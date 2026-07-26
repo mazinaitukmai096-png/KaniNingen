@@ -224,7 +224,16 @@ export class ChunkRenderAdapter {
     });
   }
 
-  updateCameraOcclusion({ camera, target, nowMs = Date.now(), restoreDelayMs = 120 } = {}) {
+  clearCameraOcclusion() {
+    for (const stableId of [...this.occludedFeatureIds]) this.setFeatureOccluded(stableId, false);
+    this.occlusionLastHitAt.clear();
+    return 0;
+  }
+
+  updateCameraOcclusion({
+    camera, target, nowMs = Date.now(), restoreDelayMs = 120, enabled = true,
+  } = {}) {
+    if (!enabled) return this.clearCameraOcclusion();
     if (!this.transparencyEnabled) return 0;
     const Raycaster = this.THREE?.Raycaster;
     const Vector3 = this.THREE?.Vector3;
@@ -853,8 +862,7 @@ export class ChunkRenderAdapter {
     this.transparencyEnabled = enabled === true;
     for (const mesh of this.transparentMeshes) mesh.visible = this.transparencyEnabled;
     if (!this.transparencyEnabled) {
-      for (const stableId of [...this.occludedFeatureIds]) this.setFeatureOccluded(stableId, false);
-      this.occlusionLastHitAt.clear();
+      this.clearCameraOcclusion();
     }
     return this.transparencyEnabled;
   }

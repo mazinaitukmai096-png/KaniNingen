@@ -2942,7 +2942,18 @@ export class InfiniteGameplayRuntime {
       return Object.freeze({ accepted: true, charging: true });
     }
     if (command.type === W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE) {
-      return this.nuclearAttack({ airborne: command.airborne });
+      const emitChargeRelease = () => this.#emitPresentationEvent({
+        type: 'charge-release', x: this.state.player.x, z: this.state.player.z,
+        intensity: 0, lifetimeSeconds: 0.01,
+      });
+      if (command.chargeMs > 0 && command.chargeMs < W7_NUCLEAR_CONTRACT.chargeThresholdMs) {
+        emitChargeRelease();
+        return this.attack('double', command.issuedAt);
+      }
+      return Promise.resolve(this.nuclearAttack({
+        airborne: command.airborne,
+        y: command.originY,
+      })).finally(emitChargeRelease);
     }
     const mode = command.type === W8_COMBAT_COMMAND_TYPES.LEFT ? 'left'
       : command.type === W8_COMBAT_COMMAND_TYPES.RIGHT ? 'right'
@@ -3013,14 +3024,21 @@ export class InfiniteGameplayRuntime {
       intensity: visualScale,
       soundCue: 'hit',
     });
-    for (const multiplier of W8_PLAYER_LANDING_CONTRACT.shockwaveRadiusMultipliers) {
+    for (const [index, multiplier] of W8_PLAYER_LANDING_CONTRACT.shockwaveRadiusMultipliers.entries()) {
       this.#emitPresentationEvent({
         type: 'player-landing-shockwave',
         x,
         y: terrainHeightMeters,
         z,
         intensity: profile.landingRadiusMeters * multiplier,
-        lifetimeSeconds: 0.55,
+        lifetimeSeconds: 0.85 / (0.04 * 60),
+        presentation: {
+          ringRole: index === 0 ? 'outer' : 'inner',
+          color: index === 0 ? 0xff3300 : 0xffaa00,
+          initialRadiusMeters: finiteWorldUnitsToMeters(10),
+          maximumRadiusMeters: profile.landingRadiusMeters * multiplier,
+          initialOpacity: 0.85,
+        },
       });
     }
     this.#emitPresentationEvent({
@@ -3077,8 +3095,17 @@ export class InfiniteGameplayRuntime {
       type: mode === 'double' ? 'both-claw-swish' : mode === 'left' ? 'left-claw-swish' : 'right-claw-swish',
       x: this.state.player.x, z: this.state.player.z,
       directionX: Math.sin(facingY), directionZ: Math.cos(facingY),
-      intensity: mode === 'double' ? 1.35 : 1, lifetimeSeconds: 0.24, soundCue: 'swish',
+      intensity: mode === 'double' ? 1.35 : 1, lifetimeSeconds: 0.7, soundCue: 'swish',
       soundCueRepeats: mode === 'double' ? 2 : 1,
+      presentation: {
+        sides: mode === 'double' ? ['left', 'right']
+          : [mode === 'left' ? 'left' : 'right'],
+        heading: facingY,
+        arcRadiusMeters: profile.windArcRadiusMeters,
+        particleScale: profile.windArcParticleScale,
+        visualScale: profile.stage.visualScale,
+        particleCountPerSide: 28,
+      },
     });
     const combatTargets = [...this.#collectCombatTargets().values()]
       .sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -3257,7 +3284,9 @@ export class InfiniteGameplayRuntime {
     });
   }
 
-  async nuclearAttack({ x = this.state.player.x, z = this.state.player.z, airborne = false } = {}) {
+  async nuclearAttack({
+    x = this.state.player.x, y = 0, z = this.state.player.z, airborne = false,
+  } = {}) {
     if (this.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId) {
       return Object.freeze({ accepted: false, reason: 'scale-not-allowed', hitStableIds: Object.freeze([]) });
     }
@@ -3366,7 +3395,7 @@ export class InfiniteGameplayRuntime {
     hitStableIds.sort((a, b) => a.localeCompare(b));
     this.state.setNuclearCooldown(W7_NUCLEAR_CONTRACT.cooldownMs);
     this.#emitCombatEffect({
-      type: 'nuclear-destruction', x, z,
+      type: 'nuclear-destruction', x, y, z,
       durationSeconds: W8_NUCLEAR_PRESENTATION_CONTRACT.cloudLifetimeSeconds,
       cameraShake: W7_NUCLEAR_CONTRACT.cameraShake,
       intensity: 4, soundCue: 'atomic',

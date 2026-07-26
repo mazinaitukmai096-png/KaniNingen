@@ -1938,7 +1938,7 @@ test('Player landing applies finite Scale damage, outer push, shake, shockwaves,
     featureType: 'settlement-building',
     buildingType: 'house',
     radiusMeters: 2,
-    worldPosition: { x: 22, y: 0, z: 4 },
+    worldPosition: { x: 15.5, y: 0, z: 15.5 },
     owningChunkCoordinate: { x: 0, z: 0 },
   });
   const { runtime, state } = await createRuntime({ chunk });

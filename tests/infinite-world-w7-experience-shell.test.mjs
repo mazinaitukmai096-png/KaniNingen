@@ -33,7 +33,11 @@ function createElement() {
   });
 }
 
-function createFixture({ exposeDeveloperTools = false, runConfiguration = true } = {}) {
+function createFixture({
+  exposeDeveloperTools = false,
+  runConfiguration = true,
+  useCombatCommands = false,
+} = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
     'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill', 'hp-bar-lag',
@@ -96,7 +100,7 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
   };
   const calls = {
     attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
-    nuclear: [], landings: [], bossSpawns: 0, starts: [],
+    nuclear: [], landings: [], bossSpawns: 0, starts: [], combatCommands: [],
   };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
@@ -108,6 +112,12 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
     onHome: () => { calls.homes += 1; },
     onRestart: () => { calls.restarts += 1; },
     onStartRun: mode => { calls.starts.push(mode); return runConfiguration; },
+    ...(useCombatCommands ? {
+      onCombatCommand: command => {
+        calls.combatCommands.push(command);
+        return { accepted: true };
+      },
+    } : {}),
     onNuclearRelease: input => { calls.nuclear.push(input); },
     onPlayerLanding: input => { calls.landings.push(input); },
     onSpawnManualBoss: () => { calls.bossSpawns += 1; },
@@ -228,6 +238,39 @@ test('W8 finite camera projection keeps target height out of camera Y and resets
   fixture.shell.dispose();
 });
 
+test('finite camera shake is XY-only and decays equally at 30, 60, and 120fps', () => {
+  const run = (fps, frames) => {
+    const fixture = createFixture();
+    fixture.globalObject.Math = { random: () => 1 };
+    fixture.elements.get('start-button').dispatch('click');
+    const player = finishIntro(fixture);
+    const profile = getW6ScaleProfile('MAX');
+    fixture.shell.applyCameraShake(450);
+    let baselineZ;
+    let sawPositiveX = false;
+    for (let frame = 0; frame < frames; frame += 1) {
+      fixture.shell.updateCamera({
+        renderLocal: { x: 0, z: 0 }, scaleProfile: profile, unitsPerMeter: 40,
+        deltaSeconds: 1 / fps,
+      });
+      const cameraState = fixture.shell.snapshot().camera;
+      baselineZ = Math.cos(cameraState.yaw)
+        * cameraState.distanceMeters * Math.cos(cameraState.pitch) * 40;
+      assert.ok(Math.abs(fixture.camera.position.z - baselineZ) < 1e-9);
+      sawPositiveX ||= fixture.camera.position.x > 0;
+    }
+    const result = fixture.shell.snapshot().camera.shake;
+    assert.equal(sawPositiveX, true);
+    fixture.shell.dispose();
+    return result;
+  };
+  const at30 = run(30, 30);
+  const at60 = run(60, 60);
+  const at120 = run(120, 120);
+  assert.ok(Math.abs(at30 - at60) < 1e-12);
+  assert.ok(Math.abs(at60 - at120) < 1e-12);
+});
+
 test('W7 experience shell restores movement, jump, camera, scale, attacks, save and load controls', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
@@ -270,6 +313,24 @@ test('W7 experience shell restores movement, jump, camera, scale, attacks, save 
   fixture.shell.dispose();
 });
 
+test('document Pointer Lock exit opens settings immediately and relock click cannot attack', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
+  fixture.documentObject.exitPointerLock();
+  assert.equal(fixture.shell.isPaused(), true);
+  assert.equal(fixture.elements.get('settings-modal').style.display, 'flex');
+  assert.equal(fixture.shell.snapshot().camera.shake, 0);
+
+  fixture.elements.get('settings-close-btn').dispatch('click');
+  assert.equal(fixture.shell.isPaused(), false);
+  fixture.documentObject.pointerLockElement = null;
+  fixture.globalObject.dispatch('mousedown', { button: 0 });
+  fixture.globalObject.dispatch('mouseup', { button: 0 });
+  assert.deepEqual(fixture.calls.attacks, []);
+  fixture.shell.dispose();
+});
+
 test('Boss Acid movement multiplier scales normal and sprint movement without changing inputs', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
@@ -289,6 +350,23 @@ test('Boss Acid movement multiplier scales normal and sprint movement without ch
   fixture.globalObject.dispatch('keyup', { code: 'KeyD' });
   fixture.globalObject.dispatch('keyup', { code: 'ShiftLeft' });
   fixture.shell.dispose();
+});
+
+test('finite Scale movement ratios remain 0.5, 0.75, and 1 while Shift sprint remains 1.45', () => {
+  for (const [stageId, ratio] of [['TINY', 0.5], ['MID', 0.75], ['MAX', 1]]) {
+    const fixture = createFixture();
+    fixture.elements.get('start-button').dispatch('click');
+    const profile = getW6ScaleProfile(stageId);
+    const player = finishIntro(fixture, { x: 0, z: 0, facingY: 0 }, profile);
+    fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+    fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+    assert.equal(player.x, getW6ScaleProfile('MAX').movementMetersPerSecond * ratio);
+    player.x = 0;
+    fixture.globalObject.dispatch('keydown', { code: 'ShiftLeft' });
+    fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+    assert.equal(player.x, profile.movementMetersPerSecond * 1.45);
+    fixture.shell.dispose();
+  }
 });
 
 test('Tab and Scale remain available while advanced Developer commands stay isolated when OFF', () => {
@@ -444,7 +522,7 @@ test('zero HP enters Game Over and Retry delegates to the existing runtime resta
   fixture.shell.dispose();
 });
 
-test('Space is edge-triggered and held or repeated keydown cannot add another jump impulse', () => {
+test('held Space repeats the finite jump after landing without adding a midair impulse', () => {
   const fixture = createFixture();
   fixture.elements.get('start-button').dispatch('click');
   const player = { x: 0, z: 0, facingY: 0 };
@@ -456,18 +534,19 @@ test('Space is edge-triggered and held or repeated keydown cannot add another ju
   fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
   assert.equal(fixture.shell.snapshot().playerVertical.velocityMetersPerSecond, initialVelocity);
 
-  for (let frame = 0; frame < 600 && !fixture.shell.snapshot().playerVertical.grounded; frame += 1) {
-    fixture.shell.updatePlayer({ deltaSeconds: 1 / 120, player, scaleProfile: profile });
+  let landed = false;
+  for (let frame = 0; frame < 600 && !landed; frame += 1) {
+    landed = fixture.shell.updatePlayer({
+      deltaSeconds: 1 / 120, player, scaleProfile: profile,
+    }).landed;
     fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: true });
   }
+  assert.equal(landed, true);
   assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
   assert.equal(fixture.shell.snapshot().playerVertical.velocityMetersPerSecond, 0);
-  fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
-  assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
-
-  fixture.globalObject.dispatch('keyup', { code: 'Space' });
-  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
+  fixture.shell.updatePlayer({ deltaSeconds: 1 / 120, player, scaleProfile: profile });
   assert.equal(fixture.shell.snapshot().playerVertical.grounded, false);
+  fixture.globalObject.dispatch('keyup', { code: 'Space' });
   fixture.shell.dispose();
 });
 
@@ -480,6 +559,7 @@ test('a playable airborne-to-grounded transition emits one finite-parity landing
   assert.deepEqual(fixture.calls.landings, []);
 
   fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
+  fixture.globalObject.dispatch('keyup', { code: 'Space' });
   for (let frame = 0; frame < 600 && !fixture.shell.snapshot().playerVertical.grounded; frame += 1) {
     fixture.shell.updatePlayer({ deltaSeconds: 1 / 120, player, scaleProfile: profile });
   }
@@ -503,14 +583,60 @@ test('W7D mouse charge releases nuclear input only after the protected threshold
   fixture.globalObject.dispatch('mousedown', { button: 0 });
   fixture.globalObject.dispatch('mousedown', { button: 2 });
   fixture.setNow(1800);
+  fixture.shell.updateCamera({
+    renderLocal: { x: 0, z: 0 }, scaleProfile: getW6ScaleProfile('MAX'), unitsPerMeter: 40,
+  });
+  assert.ok(fixture.shell.snapshot().camera.chargeZoom > 0);
   fixture.globalObject.dispatch('mouseup', { button: 0 });
-  assert.deepEqual(fixture.calls.nuclear, [{ airborne: true, chargeMs: 1800 }]);
+  assert.deepEqual(fixture.calls.nuclear, [{
+    airborne: true,
+    chargeMs: 1800,
+    issuedAt: 1800,
+    originY: fixture.shell.snapshot().playerVertical.rootY,
+  }]);
   assert.equal(fixture.calls.attacks.length, 0);
+  assert.equal(fixture.shell.snapshot().camera.chargeZoom, 0);
 
   fixture.elements.get('debug-spawn-boss-btn').dispatch('click');
   assert.equal(fixture.calls.bossSpawns, 1);
   assert.equal(fixture.shell.triggerNuclearEffect(), true);
   assert.equal(fixture.elements.get('nuclear-flash').style.opacity, '0');
+  fixture.shell.dispose();
+});
+
+test('Atomic charge can start while grounded and retains the airborne release contract', () => {
+  const fixture = createFixture({ useCombatCommands: true });
+  fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
+  assert.equal(fixture.shell.snapshot().playerVertical.grounded, true);
+  fixture.shell.renderHud({
+    fps: 60,
+    gameplaySnapshot: {
+      state: {
+        player: { hp: 100, maxHp: 100, score: 0 }, activeScaleStageId: 'MAX',
+        nuclearCooldownMs: 0, destroyedFeatureCount: 0, destroyedEntityCount: 0,
+      },
+      activeTankCount: 0, activeSimulationChunkCount: 9,
+      simulatedEntityCount: 0, simulatedStaticTargetCount: 0,
+    },
+    runtimeSnapshot: {
+      centerChunkX: 0, centerChunkZ: 0, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 15 } },
+    },
+    saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
+  });
+  fixture.globalObject.dispatch('mousedown', { button: 0 });
+  fixture.globalObject.dispatch('mousedown', { button: 2 });
+  assert.equal(fixture.calls.combatCommands.at(-1).type, 'charge-start');
+  assert.notEqual(fixture.shell.snapshot().nuclearChargeStartedAt, null);
+  fixture.setNow(1_800);
+  fixture.globalObject.dispatch('mouseup', { button: 0 });
+  assert.deepEqual(fixture.calls.nuclear, [{
+    airborne: false,
+    chargeMs: 1_800,
+    issuedAt: 1_800,
+    originY: fixture.shell.snapshot().playerVertical.rootY,
+  }]);
   fixture.shell.dispose();
 });
 

@@ -18,7 +18,12 @@ import {
 import { createMigratedSettlementTemplate } from './single-rural-settlement.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
-import { getW6ScaleProfile } from './gameplay-contract.js';
+import {
+  W7_NUCLEAR_CONTRACT,
+  W8_COMBAT_COMMAND_TYPES,
+  createCombatCommand,
+  getW6ScaleProfile,
+} from './gameplay-contract.js';
 import { GameplayRenderAdapter } from './render/gameplay-render-adapter.js';
 import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
@@ -1002,7 +1007,6 @@ export async function bootInfiniteWorldSandbox({
     let saveStatus = state.saveAvailable ? 'available' : state.saveError ? 'invalid' : 'new';
     let lastFrameAt = clock();
     let lastHudAt = 0;
-    let playerWalkPhase = 0;
     let lastVisualPlayerX = logicalPlayer.x;
     let lastVisualPlayerZ = logicalPlayer.z;
     let diagnosticFrameStarted = false;
@@ -1315,10 +1319,13 @@ export async function bootInfiniteWorldSandbox({
           playerRelocationInProgress = false;
         }
       },
-      onNuclearRelease: async ({ airborne }) => {
+      onNuclearRelease: async ({ airborne, chargeMs, issuedAt, originY }) => {
         try {
-          const result = await gameplay.nuclearAttack({ airborne });
-          if (result.accepted) {
+          const result = await gameplay.executeCombatCommand(createCombatCommand(
+            W8_COMBAT_COMMAND_TYPES.CHARGE_RELEASE,
+            { airborne, chargeMs, issuedAt, originY },
+          ));
+          if (result.accepted && chargeMs >= W7_NUCLEAR_CONTRACT.chargeThresholdMs) {
             experienceShell.triggerNuclearEffect();
             scheduleSave({ immediate: true });
           }
@@ -1328,6 +1335,7 @@ export async function bootInfiniteWorldSandbox({
           return Object.freeze({ accepted: false, reason: 'runtime-error', error });
         }
       },
+      onChargeEnd: () => gameplayRenderAdapter.clearPlayerChargePresentation?.(),
       onSpawnManualBoss: async () => {
         try {
           const result = await gameplay.spawnManualBoss();
@@ -1432,7 +1440,11 @@ export async function bootInfiniteWorldSandbox({
         .finally(() => directionalPrefetchPending.delete(missing.key));
     }
 
-    function updatePlayer(deltaSeconds, renderOrigin = runtime.snapshot().renderOrigin) {
+    function updatePlayer(
+      deltaSeconds,
+      renderOrigin = runtime.snapshot().renderOrigin,
+      cameraDeltaSeconds = deltaSeconds,
+    ) {
       const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
       if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
         logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
@@ -1463,12 +1475,12 @@ export async function bootInfiniteWorldSandbox({
         productionScale,
       );
       const movedMeters = Math.hypot(logicalPlayer.x - lastVisualPlayerX, logicalPlayer.z - lastVisualPlayerZ);
-      playerWalkPhase += movedMeters * 2.4;
       const shellSnapshot = experienceShell.snapshot();
       gameplayRenderAdapter.setPlayerLocomotion?.({
         movedMeters,
-        walkPhase: playerWalkPhase,
+        elapsedSeconds: shellSnapshot.gameplayTimeMs / 1000,
         grounded: shellSnapshot.playerVertical.grounded,
+        intro: shellSnapshot.runPhase === 'intro',
       });
       const presentationOffset = gameplayRenderAdapter.getPlayerPresentationOffsetUnits?.()
         ?? { x: 0, y: 0, z: 0 };
@@ -1490,6 +1502,7 @@ export async function bootInfiniteWorldSandbox({
         scaleProfile,
         unitsPerMeter: UNITS_PER_METER,
         playerPresentationOffsetMeters: presentationOffsetMeters,
+        deltaSeconds: cameraDeltaSeconds,
       });
       const cameraTarget = {
         x: presentedRenderLocal.x,
@@ -1511,6 +1524,7 @@ export async function bootInfiniteWorldSandbox({
         camera,
         target: cameraTarget,
         nowMs: clock(),
+        enabled: shellSnapshot.runPhase === 'intro',
       });
       return owner;
     }
@@ -1713,7 +1727,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         }
         const owner = diagnostics.measure(
           'player-update',
-          () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin),
+          () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin, deltaSeconds),
         );
         diagnostics.measure('distant-update', () => distantPresentation.update(
           logicalPlayer.x,

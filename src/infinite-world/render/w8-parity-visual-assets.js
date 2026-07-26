@@ -213,8 +213,10 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
   const CylinderGeometry = requireType(THREE, 'CylinderGeometry');
   const Material = requireType(THREE, 'MeshLambertMaterial');
   const PhongMaterial = requireType(THREE, 'MeshPhongMaterial', 'MeshLambertMaterial');
+  const BasicMaterial = requireType(THREE, 'MeshBasicMaterial', 'MeshLambertMaterial');
   const material = (color, extra = {}) => new Material({ color, flatShading: true, ...extra });
   const phong = (color, extra = {}) => new PhongMaterial({ color, ...extra });
+  const basic = (color, extra = {}) => new BasicMaterial({ color, ...extra });
   const supplementalGeometries = Object.freeze({
     cylinder: new CylinderGeometry(0.5, 0.5, 1, 8),
     halfCylinder: new CylinderGeometry(0.5, 0.5, 1, 16, 1, false, Math.PI / 2, Math.PI),
@@ -222,6 +224,7 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     windArc: new (requireType(THREE, 'TorusGeometry', 'CylinderGeometry'))(
       0.5, 0.045, 6, 20, Math.PI * 1.35,
     ),
+    landingRing: new (requireType(THREE, 'RingGeometry', 'CylinderGeometry'))(0.1, 1, 20),
   });
   const settlementPaletteMaterials = {};
   for (const palette of Object.values(SETTLEMENT_BUILDING_PALETTES)) {
@@ -266,9 +269,18 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     bossSegmentLight: phong(0x7b354b, { shininess: 40 }),
     bossTeeth: phong(0xeeeedd, { shininess: 80 }),
     bossEyeCyan: phong(0x00ffcc, { shininess: 100, emissive: 0x004c3d }),
-    atomicFlash: phong(0xfff2b0, { transparent: true, opacity: 0.82, depthWrite: false }),
+    atomicFlash: basic(0xffffff, { transparent: true, opacity: 0.65, depthWrite: false }),
+    atomicOrange: basic(0xffaa00, { transparent: true, opacity: 0.65, depthWrite: false }),
     shockwave: phong(0xffb020, { transparent: true, opacity: 0.72, depthWrite: false }),
-    wind: phong(0xd8f7ff, { transparent: true, opacity: 0.5, depthWrite: false }),
+    landingOuter: basic(0xff3300, {
+      side: THREE.DoubleSide, transparent: true, opacity: 0.85,
+      depthTest: false, depthWrite: false,
+    }),
+    landingInner: basic(0xffaa00, {
+      side: THREE.DoubleSide, transparent: true, opacity: 0.85,
+      depthTest: false, depthWrite: false,
+    }),
+    wind: basic(0xffffff, { transparent: true, opacity: 0.8, depthWrite: false }),
     smoke: phong(0x4a413d, { transparent: true, opacity: 0.68, depthWrite: false }),
     lobbyFire: phong(0xff5500, { emissive: 0x662200, shininess: 0 }),
     lobbySmoke: phong(0x1a1a1a, { shininess: 0 }),
