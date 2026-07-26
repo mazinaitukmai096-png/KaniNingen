@@ -1180,6 +1180,7 @@ export class InfiniteGameplayRuntime {
     this.tankSandboxSuppressed = sandboxSuppressed;
     if (changed) {
       this.tankSpawnEpoch += 1;
+      this.tankSpawnFrameAccumulator = 0;
       this.pendingTankReinforcement = null;
       this.#cancelAllPendingTankSpawns();
       this.pendingTankTerrainChunks.clear();
@@ -1616,16 +1617,22 @@ export class InfiniteGameplayRuntime {
     const lifecycle = W8_TANK_LIFECYCLE_CONTRACT;
     if (this.isShutdown || this.state.activeScaleStageId !== 'MAX' || deltaSeconds <= 0) return;
     const frameScale = deltaSeconds * 60;
-    this.tankSpawnFrameAccumulator = (this.tankSpawnFrameAccumulator + frameScale) % 1;
-    this.tankSpawnFrame += 1;
     const allowed = this.#allowedTankCount();
     const reserved = this.activeTankOccurrences.size + this.pendingTankSpawnReservations.size;
-    if (reserved >= allowed) return;
+    if (reserved >= allowed) {
+      this.tankSpawnFrameAccumulator = 0;
+      return;
+    }
+    this.tankSpawnFrameAccumulator += frameScale;
+    if (this.tankSpawnFrameAccumulator < 1) return;
+    const evaluationFrameScale = this.tankSpawnFrameAccumulator;
+    this.tankSpawnFrameAccumulator %= 1;
+    this.tankSpawnFrame += 1;
     const chancePerFrame = lifecycle.spawnChanceBasePerFrame + Math.min(
       lifecycle.spawnChanceMaximumBonusPerFrame,
       this.state.player.score * lifecycle.spawnChanceScoreFactor,
     );
-    const adjustedChance = 1 - Math.pow(1 - chancePerFrame, frameScale);
+    const adjustedChance = 1 - Math.pow(1 - chancePerFrame, evaluationFrameScale);
     if (deterministicUnitFloat(`${this.worldSeedHash}:tank-spawn:${this.tankSpawnFrame}`)
       >= adjustedChance) return;
     const loadedBaseBindings = [];
@@ -1639,21 +1646,27 @@ export class InfiniteGameplayRuntime {
         if (binding?.kind === 'base') loadedBaseBindings.push(binding);
       }
     }
-    const nearbyBases = loadedBaseBindings
+    const nearbyBaseBindings = loadedBaseBindings
       .filter(binding => binding.baseStableId
         && !this.state.isFeatureDestroyed(binding.baseStableId)
-        && !this.pendingTankSpawnReservations.has(binding.slotStableId)
         && (binding.baseX - player.x) ** 2
           + (binding.baseY - playerY) ** 2
-          + (binding.baseZ - player.z) ** 2 < lifecycle.baseSpawnRangeMeters ** 2)
+          + (binding.baseZ - player.z) ** 2 < lifecycle.baseSpawnRangeMeters ** 2);
+    const availableBaseTanks = nearbyBaseBindings
+      .filter(binding => !this.pendingTankSpawnReservations.has(binding.slotStableId))
       .map(binding => this.state.entityStates.get(binding.slotStableId))
       .filter(entity => entity && entity.spawned !== true)
       .sort((a, b) => a.stableId.localeCompare(b.stableId));
-    if (nearbyBases.length > 0) {
+    if (nearbyBaseBindings.length > 0) {
+      if (availableBaseTanks.length === 0) return;
       const selection = Math.floor(
-        deterministicUnitFloat(`${this.worldSeedHash}:tank-base:${this.tankSpawnFrame}`) * nearbyBases.length,
+        deterministicUnitFloat(`${this.worldSeedHash}:tank-base:${this.tankSpawnFrame}`)
+          * availableBaseTanks.length,
       );
-      this.#activateBaseTank(nearbyBases[Math.min(selection, nearbyBases.length - 1)], this.tankSpawnFrame);
+      this.#activateBaseTank(
+        availableBaseTanks[Math.min(selection, availableBaseTanks.length - 1)],
+        this.tankSpawnFrame,
+      );
     } else if (this.state.player.score > lifecycle.fallbackMinimumScore) {
       this.#spawnFallbackTank(player, this.tankSpawnFrame);
     }
@@ -2700,6 +2713,7 @@ export class InfiniteGameplayRuntime {
     this.tankSpawnEpoch += 1;
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
+    this.tankSpawnFrameAccumulator = 0;
     this.#cancelAllPendingTankSpawns();
     this.pendingTankTerrainChunks.clear();
     this.tankTerrainQueryErrors.clear();
@@ -2755,6 +2769,7 @@ export class InfiniteGameplayRuntime {
     this.tankSpawnEpoch += 1;
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
+    this.tankSpawnFrameAccumulator = 0;
     this.#cancelAllPendingTankSpawns();
     this.pendingTankTerrainChunks.clear();
     this.tankTerrainQueryErrors.clear();
