@@ -122,6 +122,8 @@ export const W7_CORE_COMBAT_CONTRACT = Object.freeze({
     school: 12,
     rock: 2,
     pebble: 0.5,
+    barn: 3,
+    factory: 5,
   }),
 });
 
@@ -263,6 +265,11 @@ export const W6_STATIC_TARGET_CONTRACTS = Object.freeze({
   tower: Object.freeze({ type: 'tower', maxHp: 1200, radius: 65, scoreValue: 800 }),
   church: Object.freeze({ type: 'church', maxHp: 2200, radius: 115, scoreValue: 1500 }),
   school: Object.freeze({ type: 'school', maxHp: 3500, radius: 145, scoreValue: 2500 }),
+  barn: Object.freeze({ type: 'barn', maxHp: 900, radius: 140, scoreValue: 700 }),
+  factory: Object.freeze({ type: 'factory', maxHp: 1600, radius: 160, scoreValue: 1200 }),
+  // Project Owner decision: W8 uses the fixed representative finite-world radius.
+  haystack: Object.freeze({ type: 'haystack', maxHp: 120, radius: 35, scoreValue: 40 }),
+  cow: Object.freeze({ type: 'cow', maxHp: 60, radius: 35, scoreValue: 80 }),
   militaryBase: Object.freeze({
     type: 'militaryBase', maxHp: 3200, radius: 160, scoreValue: 2200,
   }),

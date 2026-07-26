@@ -25,7 +25,7 @@ import { createDeterministicRandom, deriveLocalSeed64 } from './legacy-core/g0/d
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 
 const EPSILON_METERS = 0.05;
-const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school']);
+const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
 const TANK_COLLISION_OBSTACLE_TYPES = new Set([
   'house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory',
 ]);
@@ -356,16 +356,16 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
     ));
   }
   for (const landmark of chunkData.settlementLandmarks ?? []) {
-    const type = landmark.landmarkType === 'militaryBase' ? 'militaryBase' : 'house';
+    const type = W6_STATIC_TARGET_CONTRACTS[landmark.landmarkType]
+      ? landmark.landmarkType
+      : 'house';
     const contract = W6_STATIC_TARGET_CONTRACTS[type];
     staticTargets.push(staticTarget(
       landmark,
       type,
       contract,
       landmark.worldPosition,
-      type === 'militaryBase'
-        ? contract.radius
-        : Math.hypot(landmark.widthMeters, landmark.depthMeters) * 20,
+      contract.radius,
     ));
   }
   entityDescriptors.sort((a, b) => a.stableId.localeCompare(b.stableId));
