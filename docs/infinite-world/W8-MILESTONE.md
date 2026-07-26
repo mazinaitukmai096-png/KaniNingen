@@ -30,3 +30,11 @@ W8 は、保護コミット `f8bc9f80c2af417bb585bff26c99522c4229ab8e` の有限
 ## 検証
 
 自動テストは337件です。開始モード、非同期Chunk準備、safe pond/camera corridor、camera衝突、旧save移行、破損save、Tank生成・LOS・旋回・射撃、Atomic、Boss、死亡、Restart、W5 snapshot/content hash、height source、表示資源、診断集計を含みます。抽出元とSHA-256は `W8-FINITE-PARITY-PROVENANCE.json` に固定しています。
+
+## W8 Gate B closure
+
+- Status: formal freeze fix ready for Gate B closure; Gate C has not started.
+- Root cause: Tank Projectile terrain queries generated uncached Chunks through `generator.generateChunk()` during the gameplay frame.
+- Formal behavior: Projectile terrain queries are non-generating. Cached terrain keeps normal sampling and collision; a cache miss returns no terrain hit while Projectile movement, lifetime, World Object collision, damage, presentation, and renderer synchronization continue.
+- Temporary W8 isolation, frame diagnostics, Audio batching/priming, Clipmap cache, runtime snapshot hot-path, and Projectile shader investigation changes were removed from the closure diff.
+- Verification: repository serial test run 394/394 passed; related Core Combat, Sandbox Boot, Production Visuals, and Save tests passed; syntax and whitespace checks passed.
