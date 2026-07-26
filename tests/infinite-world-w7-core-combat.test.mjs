@@ -14,10 +14,13 @@ import {
 import {
   W6_ENTITY_CONTRACTS,
   W7_CORE_COMBAT_CONTRACT,
+  W8_HUMAN_BEHAVIOR_CONTRACT,
   W8_TANK_LIFECYCLE_CONTRACT,
+  finiteFrameChanceProbability,
 } from '../src/infinite-world/gameplay-contract.js';
 import {
   InfiniteGameplayRuntime,
+  createW6ChunkGameplay,
 } from '../src/infinite-world/gameplay-runtime.js';
 import {
   InfiniteWorldState,
@@ -1884,8 +1887,8 @@ test('building destruction, score, healing, hit stop and effects share the W6 Wo
   assert.deepEqual(houseHit, {
     stableId: 'settlement-building-v1:w7c-house', type: 'house', destroyed: true,
   });
-  assert.equal(state.player.score, 300, 'a reserve Tank is not an invisible attack target');
-  assert.equal(state.player.hp, 54);
+  assert.equal(state.player.score, 200, 'a reserve Tank is not an invisible attack target');
+  assert.equal(state.player.hp, 53);
   assert.equal(state.isFeatureDestroyed(houseHit.stableId), true);
   assert.equal(features.destroyed.has(houseHit.stableId), true);
   assert.equal(runtime.isHitStopped(64), true);
@@ -1902,12 +1905,14 @@ test('Player landing applies finite Scale damage, outer push, shake, shockwaves,
     featureType: 'settlement-building',
     buildingType: 'house',
     radiusMeters: 2,
-    worldPosition: { x: 18, y: 0, z: 4 },
+    worldPosition: { x: 22, y: 0, z: 4 },
     owningChunkCoordinate: { x: 0, z: 0 },
   });
   const { runtime, state } = await createRuntime({ chunk });
-  const pushedHuman = [...state.entityStates.values()].find(entity =>
-    entity.type === 'human' && entity.x > 12.5);
+  const pushedHuman = [...state.entityStates.values()].find(entity => {
+    const distance = Math.hypot(entity.x - 4, entity.z - 4);
+    return entity.type === 'human' && distance > 12.5 && distance < 25;
+  });
   assert.ok(pushedHuman);
   const result = runtime.playerLanding({
     x: 4,
@@ -1930,6 +1935,91 @@ test('Player landing applies finite Scale damage, outer push, shake, shockwaves,
   assert.ok(pushedHuman.x > beforePush);
   assert.equal(runtime.snapshot().counts.playerLandings, 1);
   await runtime.shutdown();
+});
+
+test('World Detail descriptors retain formal types and only finite-destructible props enter combat', async () => {
+  const chunk = combatChunk();
+  chunk.ambientDetails = [
+    { stableId: 'wf1:ambient:grass', detailType: 'grass', worldPosition: { x: 2, y: 0, z: 2 } },
+    { stableId: 'wf1:ambient:flower', detailType: 'flower', worldPosition: { x: 3, y: 0, z: 2 } },
+    { stableId: 'wf1:ambient:shrub', detailType: 'shrub', worldPosition: { x: 4, y: 0, z: 2 } },
+  ];
+  chunk.streetDetails = [
+    { stableId: 'wf1:street:lamp', detailType: 'streetLamp', worldPosition: { x: 4, y: 0, z: 4 } },
+    { stableId: 'wf1:street:sign', detailType: 'roadSign', worldPosition: { x: 4, y: 0, z: 4 } },
+  ];
+  const model = await createW6ChunkGameplay({ chunkData: chunk, worldSeedHash, generatorMajor: 1 });
+  assert.deepEqual(model.worldDetailDescriptors.map(detail => detail.type).sort(),
+    ['flower', 'grass', 'roadSign', 'shrub', 'streetLamp']);
+  assert.deepEqual(model.staticTargets.filter(target => target.worldDetail).map(target => target.type),
+    ['roadSign']);
+
+  const { runtime, state, features } = await createRuntime({ chunk });
+  state.setScaleStage('TINY');
+  const landing = runtime.playerLanding({ x: 4, z: 4, scaleStageId: 'TINY', terrainHeightMeters: 0 });
+  assert.ok(landing.hits.some(hit => hit.stableId === 'wf1:street:sign'));
+  assert.equal(features.destroyed.has('wf1:street:sign'), true);
+  assert.equal(features.destroyed.has('wf1:street:lamp'), false);
+  const presentation = runtime.consumePresentationEffects();
+  assert.ok(presentation.events.some(event => event.type === 'world-detail-destruction'));
+  assert.ok(presentation.cameraShake >= 8);
+  await runtime.shutdown();
+});
+
+test('Human finite-frame chances compose independently of frame rate', () => {
+  const perFrame = W8_HUMAN_BEHAVIOR_CONTRACT.tripProbabilityPerFiniteFrame;
+  assert.ok(Math.abs(finiteFrameChanceProbability(perFrame, 1 / 60) - perFrame) < 1e-15);
+  const halfFrame = finiteFrameChanceProbability(perFrame, 1 / 120);
+  assert.ok(Math.abs((1 - (1 - halfFrame) ** 2) - perFrame) < 1e-12);
+  assert.equal(finiteFrameChanceProbability(perFrame, 0), 0);
+});
+
+test('Human behavior is Stable-ID deterministic and preserves trip, recover, and water avoidance states', async () => {
+  const waterChunk = combatChunk();
+  waterChunk.waterSurfaces = [{
+    stableId: 'wf1:water:w8-human-avoidance',
+    worldPosition: { x: 4, y: 0, z: 8 },
+    widthMeters: 3,
+    depthMeters: 3,
+  }];
+  const first = await createRuntime({ playerSpawn: { x: 4, z: -20 }, chunk: waterChunk });
+  const second = await createRuntime({ playerSpawn: { x: 4, z: -20 }, chunk: waterChunk });
+  const humanA = [...first.state.entityStates.values()].find(entity => entity.type === 'human');
+  const humanB = [...second.state.entityStates.values()].find(entity => entity.type === 'human');
+  assert.ok(Math.hypot(humanA.x - 4, humanA.z - 4) > 2.75,
+    'the deterministic resident starts outside its Building avoidance radius');
+  for (let frame = 0; frame < 180; frame += 1) {
+    first.runtime.update({ deltaSeconds: 1 / 60, player: first.state.player });
+    second.runtime.update({ deltaSeconds: 1 / 60, player: second.state.player });
+  }
+  for (const key of ['x', 'z', 'rotationY', 'aiState', 'humanTimer', 'wiggleTime',
+    'tripTimer', 'idleWaitTimer', 'humanRandomSequence']) {
+    assert.equal(humanA[key], humanB[key], `Human ${key} must be deterministic`);
+  }
+
+  humanA.aiState = 'tripped';
+  humanA.tripTimer = 0.05;
+  first.runtime.update({ deltaSeconds: 0.05, player: first.state.player });
+  assert.equal(humanA.aiState, 'recovering');
+  assert.equal(humanA.tripTimer, W8_HUMAN_BEHAVIOR_CONTRACT.tripRecoverySeconds);
+  for (let frame = 0; frame < 12 && humanA.aiState === 'recovering'; frame += 1) {
+    first.runtime.update({ deltaSeconds: 0.1, player: first.state.player });
+  }
+  assert.equal(humanA.aiState, 'flee');
+  Object.assign(humanA, {
+    x: 4,
+    z: 6,
+    rotationY: 0,
+    aiState: 'idle',
+    humanTimer: 10,
+    idleWaitTimer: 0,
+    waterAvoidTimer: 0,
+  });
+  first.runtime.update({ deltaSeconds: 0.1, player: { x: 4, z: -100 } });
+  assert.ok(humanA.waterAvoidTimer > 0);
+  assert.ok(Math.hypot(humanA.waterAvoidX, humanA.waterAvoidZ) > 0.99);
+  await first.runtime.shutdown();
+  await second.runtime.shutdown();
 });
 
 test('death and restart mutate the single World State atomically and restore active descriptors', async () => {

@@ -462,6 +462,27 @@ test('Player landing renders two bounded shockwaves and finite-parity radial dus
   assets.dispose();
 });
 
+test('World Detail destruction renders six fixed-pool colored fragments', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  adapter.consumePresentationEvents([{
+    sequence: 1,
+    type: 'world-detail-destruction',
+    logicalPosition: { x: 2, y: 0, z: 3 },
+    direction: { x: 0, y: 0, z: 1 },
+    intensity: 0.5,
+    lifetimeSeconds: 0.45,
+    soundCue: 'hit',
+  }]);
+  adapter.updatePresentation(0.1);
+  const snapshot = adapter.snapshot();
+  assert.equal(snapshot.effectInstancePools.worldDetailDebris.count, 6);
+  assert.equal(snapshot.effectInstancePools.debris.count, 0);
+  await adapter.shutdown();
+  assets.dispose();
+});
+
 test('W7A normal render paths no longer name Proxy geometry', () => {
   const source = [
     'src/infinite-world/render/chunk-render-adapter.js',

@@ -53,6 +53,7 @@ export class GameplayRenderAdapter {
     const effectPoolSpecs = Object.freeze({
       flash: Object.freeze({ geometry: 'sphere', material: 'atomicFlash', capacity: 96 }),
       debris: Object.freeze({ geometry: 'box', material: 'charred', capacity: 384 }),
+      worldDetailDebris: Object.freeze({ geometry: 'box', material: 'roadSign', capacity: 192 }),
       dust: Object.freeze({ geometry: 'box', material: 'road', capacity: 384 }),
       blood: Object.freeze({ geometry: 'box', material: 'blood', capacity: 192 }),
       wind: Object.freeze({ geometry: 'windArc', material: 'wind', capacity: 96 }),
@@ -65,7 +66,7 @@ export class GameplayRenderAdapter {
     for (const [role, spec] of Object.entries(effectPoolSpecs)) {
       const mesh = new InstancedMesh(
         this.visualAssets.geometries[spec.geometry],
-        this.visualAssets.materials[spec.material],
+        this.visualAssets.materials[spec.material] ?? this.visualAssets.materials.charred,
         spec.capacity,
       );
       mesh.name = `w8-fixed-effect-pool-${role}`;
@@ -129,6 +130,7 @@ export class GameplayRenderAdapter {
         || (state.spawned === true && state.sandboxSuppressed !== true));
     const parts = mesh.userData.presentationParts;
     if (state.type === 'human' && parts) {
+      mesh.rotation.x = state.aiState === 'tripped' ? Math.PI / 2 : 0;
       mesh.rotation.z = state.aiState === 'fallen' ? Math.PI / 2 : 0;
     }
     if (state.type === 'tank' && parts) {
@@ -331,6 +333,23 @@ export class GameplayRenderAdapter {
             scaleZ: dustScale,
             rotationX: progress * 4 + index,
             rotationY: progress * 3 - index,
+          });
+        }
+        continue;
+      }
+      if (event.type === 'world-detail-destruction') {
+        for (let index = 0; index < 6; index += 1) {
+          const angle = index / 6 * Math.PI * 2 + (event.sequence ?? 0) * 0.37;
+          const travel = progress * (0.4 + index * 0.12) * unit;
+          this.#appendEffectInstance('worldDetailDebris', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.5 + index * 0.08)) * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: 0.16 * unit,
+            scaleY: 0.1 * unit,
+            scaleZ: 0.16 * unit,
+            rotationX: progress * 5 + index,
+            rotationY: progress * 4 - index,
           });
         }
         continue;

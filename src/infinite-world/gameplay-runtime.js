@@ -14,10 +14,13 @@ import {
   W8_BOSS_CONTRACT,
   W8_COMBAT_COMMAND_SCHEMA,
   W8_COMBAT_COMMAND_TYPES,
+  W8_HUMAN_BEHAVIOR_CONTRACT,
   W8_PRESENTATION_EVENT_SCHEMA,
   W8_PLAYER_LANDING_CONTRACT,
   W8_TANK_LIFECYCLE_CONTRACT,
+  W8_WORLD_DETAIL_CONTRACTS,
   canW6StageDamageTarget,
+  finiteFrameChanceProbability,
   finiteWorldFrameSpeedToMetersPerSecond,
   finiteWorldUnitsToMeters,
   getW6ScaleProfile,
@@ -142,13 +145,19 @@ async function humanDescriptor({ building, chunkData, worldSeedHash, generatorMa
   });
   const random = createDeterministicRandom(seed64);
   const angle = await random.float01('angle') * Math.PI * 2;
-  const distance = 0.5 + await random.float01('distance') * 0.75;
-  let x = building.worldPosition.x + Math.cos(angle) * distance;
-  let z = building.worldPosition.z + Math.sin(angle) * distance;
+  const distance = (building.radiusMeters ?? 2) + 0.75
+    + await random.float01('distance') * 0.75;
   const ownerChunkKey = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
-  if (!ownerContains(ownerChunkKey, x, z)) {
-    x = building.worldPosition.x;
-    z = building.worldPosition.z;
+  let x = building.worldPosition.x;
+  let z = building.worldPosition.z;
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const candidateAngle = angle + attempt * Math.PI / 4;
+    const candidateX = building.worldPosition.x + Math.cos(candidateAngle) * distance;
+    const candidateZ = building.worldPosition.z + Math.sin(candidateAngle) * distance;
+    if (!ownerContains(ownerChunkKey, candidateX, candidateZ)) continue;
+    x = candidateX;
+    z = candidateZ;
+    break;
   }
   return Object.freeze({
     stableId: result.stableId,
@@ -270,7 +279,7 @@ function rotateVectorXYZ(vector, rotationX, rotationY, rotationZ) {
   };
 }
 
-function staticTarget(feature, type, contract, position, radius = contract.radius) {
+function staticTarget(feature, type, contract, position, radius = contract.radius, extra = {}) {
   return Object.freeze({
     stableId: feature.candidateId ?? feature.stableId,
     ownerChunkKey: createChunkKey(
@@ -284,6 +293,7 @@ function staticTarget(feature, type, contract, position, radius = contract.radiu
     x: position.x,
     y: position.y ?? 0,
     z: position.z,
+    ...extra,
   });
 }
 
@@ -338,22 +348,32 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
       building.radiusMeters * 40,
     ));
   }
-  for (const detail of chunkData.ambientDetails ?? []) {
+  const worldDetailDescriptors = [...(chunkData.ambientDetails ?? []), ...(chunkData.streetDetails ?? [])]
+    .map(detail => {
+      const contract = W8_WORLD_DETAIL_CONTRACTS[detail.detailType];
+      if (!contract) throw new Error(`unsupported W8 World Detail type: ${detail.detailType}`);
+      return Object.freeze({
+        stableId: detail.stableId,
+        ownerChunkKey,
+        type: detail.detailType,
+        worldDetail: true,
+        destructible: contract.destructible,
+        radius: contract.radius,
+        color: contract.color,
+        x: detail.worldPosition.x,
+        y: detail.worldPosition.y ?? 0,
+        z: detail.worldPosition.z,
+      });
+    }).sort((left, right) => left.stableId.localeCompare(right.stableId));
+  for (const detail of worldDetailDescriptors.filter(value => value.destructible)) {
+    const contract = W8_WORLD_DETAIL_CONTRACTS[detail.type];
     staticTargets.push(staticTarget(
       detail,
-      'tree',
-      W6_STATIC_TARGET_CONTRACTS.tree,
-      detail.worldPosition,
-      detail.detailType === 'shrub' ? 18 : 10,
-    ));
-  }
-  for (const detail of chunkData.streetDetails ?? []) {
-    staticTargets.push(staticTarget(
+      detail.type,
+      contract,
       detail,
-      'tree',
-      W6_STATIC_TARGET_CONTRACTS.tree,
-      detail.worldPosition,
-      detail.detailType === 'streetLamp' ? 14 : 12,
+      contract.radius,
+      { worldDetail: true, presentationColor: contract.color },
     ));
   }
   for (const landmark of chunkData.settlementLandmarks ?? []) {
@@ -380,6 +400,7 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
     chunkKey: ownerChunkKey,
     entityDescriptors: Object.freeze(entityDescriptors),
     staticTargets: Object.freeze(staticTargets),
+    worldDetailDescriptors: Object.freeze(worldDetailDescriptors),
     avoidanceSurfaces: Object.freeze([
       ...(chunkData.waterSurfaces ?? []).map(surface => Object.freeze({
         type: 'water', x: surface.worldPosition.x, z: surface.worldPosition.z,
@@ -1802,6 +1823,18 @@ export class InfiniteGameplayRuntime {
           }
         }
         this.featureRenderAdapter?.setFeatureDestroyed?.(target.stableId, true);
+        if (target.worldDetail === true) {
+          this.#emitCombatEffect({
+            type: 'world-detail-destruction',
+            x: target.x,
+            y: target.y ?? 0,
+            z: target.z,
+            durationSeconds: 0.45,
+            cameraShake: 8,
+            intensity: Math.max(0.4, finiteWorldUnitsToMeters(target.radius)),
+            soundCue: 'hit',
+          });
+        }
       }
       return Object.freeze({
         ...result,
@@ -2060,6 +2093,200 @@ export class InfiniteGameplayRuntime {
     }
   }
 
+  #humanRandom(entity, purpose) {
+    entity.humanRandomSequence = Number.isSafeInteger(entity.humanRandomSequence)
+      ? entity.humanRandomSequence + 1 : 1;
+    return deterministicUnitFloat(`${entity.stableId}:${purpose}:${entity.humanRandomSequence}`);
+  }
+
+  #humanChance(entity, purpose, probabilityPerFiniteFrame, deltaSeconds) {
+    if (deltaSeconds <= 0) return false;
+    const probability = finiteFrameChanceProbability(probabilityPerFiniteFrame, deltaSeconds);
+    return this.#humanRandom(entity, purpose) < probability;
+  }
+
+  #initializeHumanBehavior(entity) {
+    if (Number.isFinite(entity.humanTimer)) return;
+    entity.humanTimer = deterministicUnitFloat(`${entity.stableId}:idle-timer`) * 3;
+    entity.wiggleTime = deterministicUnitFloat(`${entity.stableId}:wiggle-time`) * 100;
+    entity.tripTimer = 0;
+    entity.idleWaitTimer = 0;
+    entity.fleeAngleOffset = 0;
+    entity.waterAvoidTimer = 0;
+    entity.waterAvoidX = 0;
+    entity.waterAvoidZ = 0;
+    entity.targetBuildingStableId = null;
+    entity.humanRandomSequence = 0;
+  }
+
+  #selectHumanShelter(entity, model) {
+    const maximumDistanceSquared = W8_HUMAN_BEHAVIOR_CONTRACT.shelterSearchMeters ** 2;
+    return model.staticTargets.filter(target => BUILDING_TYPES.has(target.type)
+      && !this.state.isFeatureDestroyed(target.stableId))
+      .map(target => ({ target, distanceSquared: distanceSquared(entity, target) }))
+      .filter(value => value.distanceSquared < maximumDistanceSquared)
+      .sort((left, right) => left.distanceSquared - right.distanceSquared
+        || left.target.stableId.localeCompare(right.target.stableId))[0]?.target ?? null;
+  }
+
+  #moveHuman(entity, model, directionX, directionZ, speedMetersPerSecond, deltaSeconds) {
+    const priorX = entity.x;
+    const priorZ = entity.z;
+    entity.x += directionX * speedMetersPerSecond * deltaSeconds;
+    entity.z += directionZ * speedMetersPerSecond * deltaSeconds;
+    const humanRadiusMeters = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius);
+    const obstacle = model.avoidanceSurfaces.find(surface =>
+      distanceSquared(entity, surface) < (surface.radius + humanRadiusMeters) ** 2);
+    if (obstacle?.type === 'water') {
+      let awayX = entity.x - obstacle.x;
+      let awayZ = entity.z - obstacle.z;
+      const length = Math.hypot(awayX, awayZ) || 1;
+      awayX /= length;
+      awayZ /= length;
+      entity.x = obstacle.x + awayX * (obstacle.radius + humanRadiusMeters);
+      entity.z = obstacle.z + awayZ * (obstacle.radius + humanRadiusMeters);
+      entity.waterAvoidX = awayX;
+      entity.waterAvoidZ = awayZ;
+      entity.waterAvoidTimer = W8_HUMAN_BEHAVIOR_CONTRACT.waterAvoidSeconds;
+    } else if (obstacle) {
+      entity.x = priorX;
+      entity.z = priorZ;
+      entity.rotationY += Math.PI * 0.5;
+    }
+    clampToOwner(entity);
+  }
+
+  #updateHuman(entity, model, player, deltaSeconds) {
+    const contract = W8_HUMAN_BEHAVIOR_CONTRACT;
+    const finiteContract = W6_ENTITY_CONTRACTS.human;
+    this.#initializeHumanBehavior(entity);
+    entity.wiggleTime += deltaSeconds * contract.wiggleRadiansPerSecond;
+    entity.waterAvoidTimer = Math.max(0, entity.waterAvoidTimer - deltaSeconds);
+    const playerDistanceSquared = distanceSquared(entity, player);
+    const fleeRangeMeters = finiteWorldUnitsToMeters(finiteContract.fleeRange);
+    if (playerDistanceSquared < fleeRangeMeters ** 2
+      && !['flee', 'tripped', 'recovering'].includes(entity.aiState)) {
+      entity.aiState = 'flee';
+      entity.humanTimer = 0;
+      entity.fleeAngleOffset = (this.#humanRandom(entity, 'flee-offset') - 0.5)
+        * contract.fleeDirectionOffsetMaximum * 2;
+      entity.targetBuildingStableId = null;
+      if (this.#humanRandom(entity, 'shelter-choice') < contract.shelterSelectionProbability) {
+        entity.targetBuildingStableId = this.#selectHumanShelter(entity, model)?.stableId ?? null;
+      }
+    } else if (playerDistanceSquared >= fleeRangeMeters ** 2 && entity.aiState === 'flee') {
+      entity.aiState = 'idle';
+      entity.humanTimer = this.#humanRandom(entity, 'idle-return') * 3;
+      entity.targetBuildingStableId = null;
+    }
+
+    if (entity.aiState === 'tripped') {
+      entity.tripTimer = Math.max(0, entity.tripTimer - deltaSeconds);
+      if (entity.tripTimer === 0) {
+        entity.aiState = 'recovering';
+        entity.tripTimer = contract.tripRecoverySeconds;
+      }
+      return;
+    }
+    if (entity.aiState === 'recovering') {
+      entity.tripTimer = Math.max(0, entity.tripTimer - deltaSeconds);
+      if (entity.tripTimer === 0) {
+        entity.aiState = 'flee';
+        entity.humanTimer = 0;
+      }
+      return;
+    }
+    if (entity.aiState === 'flee') {
+      entity.humanTimer += deltaSeconds;
+      if (entity.humanTimer > contract.tripEligibilitySeconds
+        && this.#humanChance(entity, 'trip', contract.tripProbabilityPerFiniteFrame, deltaSeconds)) {
+        entity.aiState = 'tripped';
+        entity.tripTimer = contract.tripMinimumSeconds
+          + this.#humanRandom(entity, 'trip-duration') * contract.tripVariationSeconds;
+        this.entityKnockbacks.delete(entity.stableId);
+        return;
+      }
+      if (entity.humanTimer > contract.pauseEligibilitySeconds
+        && this.#humanChance(entity, 'pause', contract.pauseProbabilityPerFiniteFrame, deltaSeconds)) {
+        entity.aiState = 'recovering';
+        entity.tripTimer = contract.pauseMinimumSeconds
+          + this.#humanRandom(entity, 'pause-duration') * contract.pauseVariationSeconds;
+        entity.fleeAngleOffset = (this.#humanRandom(entity, 'pause-offset') - 0.5)
+          * contract.fleeDirectionOffsetMaximum * 2;
+        this.entityKnockbacks.delete(entity.stableId);
+        return;
+      }
+      let directionX = entity.x - player.x;
+      let directionZ = entity.z - player.z;
+      let length = Math.hypot(directionX, directionZ) || 1;
+      directionX /= length;
+      directionZ /= length;
+      const shelter = entity.targetBuildingStableId
+        ? model.staticTargets.find(target => target.stableId === entity.targetBuildingStableId
+          && !this.state.isFeatureDestroyed(target.stableId)) : null;
+      if (shelter) {
+        const shelterDistance = Math.sqrt(distanceSquared(entity, shelter));
+        if (shelterDistance < finiteWorldUnitsToMeters(shelter.radius)
+          + contract.shelterReachPaddingMeters) {
+          entity.targetBuildingStableId = null;
+          entity.aiState = 'recovering';
+          entity.tripTimer = contract.shelterPauseMinimumSeconds
+            + this.#humanRandom(entity, 'shelter-pause') * contract.shelterPauseVariationSeconds;
+          return;
+        }
+        const toShelterX = (shelter.x - entity.x) / (shelterDistance || 1);
+        const toShelterZ = (shelter.z - entity.z) / (shelterDistance || 1);
+        directionX = directionX * 0.6 + toShelterX * 0.4;
+        directionZ = directionZ * 0.6 + toShelterZ * 0.4;
+        length = Math.hypot(directionX, directionZ) || 1;
+        directionX /= length;
+        directionZ /= length;
+      } else {
+        entity.targetBuildingStableId = null;
+      }
+      if (entity.waterAvoidTimer > 0) {
+        let tangentX = -entity.waterAvoidZ;
+        let tangentZ = entity.waterAvoidX;
+        if (tangentX * directionX + tangentZ * directionZ < 0) {
+          tangentX *= -1;
+          tangentZ *= -1;
+        }
+        directionX = directionX * (1 - contract.waterAvoidBlend) + tangentX * contract.waterAvoidBlend;
+        directionZ = directionZ * (1 - contract.waterAvoidBlend) + tangentZ * contract.waterAvoidBlend;
+      }
+      const angle = entity.fleeAngleOffset + Math.sin(entity.wiggleTime * 0.3)
+        * contract.fleeZigzagRadians;
+      const cosine = Math.cos(angle);
+      const sine = Math.sin(angle);
+      const rotatedX = directionX * cosine + directionZ * sine;
+      const rotatedZ = directionZ * cosine - directionX * sine;
+      entity.rotationY = Math.atan2(rotatedX, rotatedZ);
+      this.#moveHuman(entity, model, rotatedX, rotatedZ,
+        finiteWorldFrameSpeedToMetersPerSecond(finiteContract.fleeSpeed), deltaSeconds);
+      return;
+    }
+
+    entity.aiState = 'idle';
+    if (entity.idleWaitTimer > 0) {
+      entity.idleWaitTimer = Math.max(0, entity.idleWaitTimer - deltaSeconds);
+      return;
+    }
+    entity.humanTimer -= deltaSeconds;
+    if (entity.humanTimer <= 0) {
+      if (this.#humanRandom(entity, 'idle-choice') < contract.idleWaitProbability) {
+        entity.idleWaitTimer = contract.idleWaitMinimumSeconds
+          + this.#humanRandom(entity, 'idle-wait') * contract.idleWaitVariationSeconds;
+      } else {
+        entity.rotationY = this.#humanRandom(entity, 'wander-angle') * Math.PI * 2;
+        entity.humanTimer = contract.idleWalkMinimumSeconds
+          + this.#humanRandom(entity, 'idle-walk') * contract.idleWalkVariationSeconds;
+      }
+      return;
+    }
+    this.#moveHuman(entity, model, Math.sin(entity.rotationY), Math.cos(entity.rotationY),
+      finiteWorldFrameSpeedToMetersPerSecond(finiteContract.idleSpeed), deltaSeconds);
+  }
+
   update({ deltaSeconds, player, playerY = null, simulationEnabled = true } = {}) {
     if (this.isShutdown) return;
     if (this.pendingTankRuntimeError) {
@@ -2104,28 +2331,7 @@ export class InfiniteGameplayRuntime {
         }
         const distance = Math.sqrt(distanceSquared(entity, player));
         if (entity.type === 'human') {
-          const contract = W6_ENTITY_CONTRACTS.human;
-          if (entity.knockdownSeconds > 0) {
-            entity.knockdownSeconds = Math.max(0, entity.knockdownSeconds - boundedDelta);
-            entity.aiState = entity.knockdownSeconds > 0 ? 'fallen' : 'recover';
-          } else if (distance < finiteWorldUnitsToMeters(contract.fleeRange)) {
-            const priorX = entity.x; const priorZ = entity.z;
-            entity.aiState = 'flee';
-            this.#moveToward(entity, player,
-              finiteWorldFrameSpeedToMetersPerSecond(contract.fleeSpeed), boundedDelta, true);
-            const obstacle = model.avoidanceSurfaces.find(surface =>
-              distanceSquared(entity, surface) < surface.radius ** 2);
-            if (obstacle) {
-              entity.x = priorX; entity.z = priorZ;
-              entity.rotationY += Math.PI * 0.5;
-              entity.aiState = obstacle.type === 'water' ? 'avoid-water' : 'avoid-building';
-            }
-          } else {
-            entity.aiState = 'idle';
-            entity.x += Math.sin(entity.rotationY) * finiteWorldFrameSpeedToMetersPerSecond(contract.idleSpeed) * boundedDelta;
-            entity.z += Math.cos(entity.rotationY) * finiteWorldFrameSpeedToMetersPerSecond(contract.idleSpeed) * boundedDelta;
-            clampToOwner(entity);
-          }
+          this.#updateHuman(entity, model, player, boundedDelta);
         } else if (entity.type === 'boss') {
           const contract = W6_ENTITY_CONTRACTS.boss;
           if (distance > finiteWorldUnitsToMeters(contract.approachDistance)) {
@@ -2521,6 +2727,14 @@ export class InfiniteGameplayRuntime {
           || !canW6StageDamageTarget(this.state.activeScaleStageId, target)
           || !insideAttack(target)) continue;
         const result = this.applyCombatDamage(resolved, damage, { awardPlayerCredit: true });
+        if (target.worldDetail === true) {
+          hits.push(Object.freeze({
+            stableId: target.stableId,
+            type: target.type,
+            destroyed: result.destroyed,
+          }));
+          continue;
+        }
         const building = W7_CORE_COMBAT_CONTRACT.building;
         const destroyedNow = result.justDestroyed;
         const buildingHitStopMs = BUILDING_TYPES.has(target.type)

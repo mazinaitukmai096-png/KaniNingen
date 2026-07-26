@@ -26,6 +26,8 @@ import {
   BOSS_SLITHER_DURATION,
   CHARGE_THRESHOLD,
   DEBUG_BOSS_SPAWN_DIST,
+  HUMAN_WATER_AVOID_BLEND,
+  HUMAN_WATER_AVOID_DURATION,
   PLAYER_MAX_HP,
   SAVE_VERSION,
   TANK_APPROACH_DIST,
@@ -177,6 +179,43 @@ export const W8_PLAYER_LANDING_CONTRACT = Object.freeze({
   dustCountPerVisualScale: 14,
 });
 
+export const W8_HUMAN_BEHAVIOR_CONTRACT = Object.freeze({
+  wiggleRadiansPerSecond: 15,
+  fleeDirectionOffsetMaximum: Math.PI / 4,
+  shelterSelectionProbability: 0.3,
+  shelterSearchMeters: finiteWorldUnitsToMeters(3_000),
+  shelterReachPaddingMeters: finiteWorldUnitsToMeters(40),
+  tripEligibilitySeconds: 0.8,
+  tripProbabilityPerFiniteFrame: 0.003,
+  tripMinimumSeconds: 1,
+  tripVariationSeconds: 0.8,
+  tripRecoverySeconds: 0.5,
+  pauseEligibilitySeconds: 1.5,
+  pauseProbabilityPerFiniteFrame: 0.005,
+  pauseMinimumSeconds: 0.3,
+  pauseVariationSeconds: 0.4,
+  shelterPauseMinimumSeconds: 1,
+  shelterPauseVariationSeconds: 2,
+  waterAvoidSeconds: HUMAN_WATER_AVOID_DURATION,
+  waterAvoidBlend: HUMAN_WATER_AVOID_BLEND,
+  fleeZigzagRadians: 0.18,
+  idleWaitProbability: 0.4,
+  idleWaitMinimumSeconds: 1,
+  idleWaitVariationSeconds: 2,
+  idleWalkMinimumSeconds: 1.5,
+  idleWalkVariationSeconds: 3,
+});
+
+export const W8_WORLD_DETAIL_CONTRACTS = Object.freeze({
+  grass: Object.freeze({ type: 'grass', destructible: false, radius: 10, color: 0x376b22 }),
+  flower: Object.freeze({ type: 'flower', destructible: false, radius: 10, color: 0xffd54f }),
+  shrub: Object.freeze({ type: 'shrub', destructible: false, radius: 18, color: 0x4f7d32 }),
+  streetLamp: Object.freeze({ type: 'streetLamp', destructible: false, radius: 14, color: 0x454b50 }),
+  roadSign: Object.freeze({
+    type: 'roadSign', destructible: true, radius: 20, maxHp: 1, scoreValue: 0, color: 0x2c6eaf,
+  }),
+});
+
 export const W7_MANUAL_BOSS_CONTRACT = Object.freeze({
   spawnDistance: DEBUG_BOSS_SPAWN_DIST,
   simultaneousLimit: 1,
@@ -268,6 +307,7 @@ export const W6_ENTITY_CONTRACTS = Object.freeze({
 
 export const W6_STATIC_TARGET_CONTRACTS = Object.freeze({
   tree: Object.freeze({ type: 'tree', maxHp: 80, radius: 25, scoreValue: 50 }),
+  roadSign: Object.freeze({ type: 'roadSign', maxHp: 1, radius: 20, scoreValue: 0 }),
   pebble: Object.freeze({ type: 'pebble', maxHp: 150, radius: 24, scoreValue: 20 }),
   rock: Object.freeze({ type: 'rock', maxHp: 600, radius: 50, scoreValue: 100 }),
   house: Object.freeze({ type: 'house', maxHp: 300, radius: 75, scoreValue: 200 }),
@@ -293,6 +333,14 @@ export function finiteWorldFrameSpeedToMetersPerSecond(value) {
   return finiteWorldUnitsToMeters(value) * 60;
 }
 
+export function finiteFrameChanceProbability(probabilityPerFrame, deltaSeconds) {
+  if (!Number.isFinite(probabilityPerFrame) || probabilityPerFrame < 0 || probabilityPerFrame > 1
+    || !Number.isFinite(deltaSeconds) || deltaSeconds < 0) {
+    throw new RangeError('finite frame chance requires a probability and non-negative deltaSeconds');
+  }
+  return 1 - (1 - probabilityPerFrame) ** (deltaSeconds * 60);
+}
+
 export function getW6ScaleProfile(stageId) {
   const stage = getScaleStage(stageId);
   return Object.freeze({
@@ -316,6 +364,10 @@ export function isW6ScaleStageId(value) {
 }
 
 export function canW6StageDamageTarget(stageId, target) {
+  if (target?.worldDetail === true) {
+    return ['TINY', 'MID', 'MAX'].includes(stageId)
+      && W8_WORLD_DETAIL_CONTRACTS[target.type]?.destructible === true;
+  }
   return canScaleStageDamageTarget(stageId, target);
 }
 
