@@ -173,6 +173,20 @@ function emptyChunk(chunkX, chunkZ, { terrainHeight = chunkX * 10 + chunkZ } = {
   };
 }
 
+function boundaryHumanChunk(chunkX) {
+  return {
+    ...emptyChunk(chunkX, 0),
+    settlementFeatures: [{
+      stableId: 'settlement-building-v1:boundary-1',
+      featureType: 'settlement-building',
+      buildingType: 'house',
+      radiusMeters: 2,
+      worldPosition: { x: 15.5, y: 0, z: 8 },
+      owningChunkCoordinate: { x: 0, z: 0 },
+    }],
+  };
+}
+
 function squareChunkKeys(radius) {
   const keys = [];
   for (let chunkZ = -radius; chunkZ <= radius; chunkZ += 1) {
@@ -1953,6 +1967,82 @@ test('Player landing applies finite Scale damage, outer push, shake, shockwaves,
   runtime.update({ deltaSeconds: 0.05, player: state.player });
   assert.ok(pushedHuman.x > beforePush);
   assert.equal(runtime.snapshot().counts.playerLandings, 1);
+  await runtime.shutdown();
+});
+
+test('boundary-projected Building creates one owner-Chunk Human Gameplay descriptor', async () => {
+  const ownerModel = await createW6ChunkGameplay({
+    chunkData: boundaryHumanChunk(0), worldSeedHash, generatorMajor: 1,
+  });
+  const adjacentModel = await createW6ChunkGameplay({
+    chunkData: boundaryHumanChunk(1), worldSeedHash, generatorMajor: 1,
+  });
+  const ownerHumans = ownerModel.entityDescriptors.filter(value => value.type === 'human');
+  const adjacentHumans = adjacentModel.entityDescriptors.filter(value => value.type === 'human');
+  assert.equal(ownerHumans.length, 1);
+  assert.equal(ownerHumans[0].ownerChunkKey, '0,0');
+  assert.equal(logicalWorldToOwnedChunk(ownerHumans[0].x, ownerHumans[0].z).key, '0,0');
+  assert.deepEqual(adjacentHumans, []);
+});
+
+test('Human boundary knockback preserves one owner through attack, Atomic, eviction and revisit', async () => {
+  const chunkKeys = ['0,0', '1,0'];
+  const getChunkData = chunkX => boundaryHumanChunk(chunkX);
+  const { runtime, state, renderer } = await createRuntime({
+    playerSpawn: { x: 0, z: 8 },
+    renderedKeys: chunkKeys,
+    activeDataKeys: chunkKeys,
+    getChunkData,
+  });
+  const humans = [...state.entityStates.values()].filter(entity => entity.type === 'human');
+  assert.equal(humans.length, 1);
+  const human = humans[0];
+  assert.equal(human.ownerChunkKey, '0,0');
+  assert.equal(renderer.entities.has(human.stableId), true);
+
+  const landing = runtime.playerLanding({ x: 0, z: human.z, scaleStageId: 'MAX' });
+  assert.ok(landing.pushedStableIds.includes(human.stableId));
+  runtime.update({ deltaSeconds: 0.05, player: state.player });
+  assert.equal(human.ownerChunkKey, '0,0');
+  assert.equal(logicalWorldToOwnedChunk(human.x, human.z).key, '0,0');
+  const savedBehavior = {
+    aiState: human.aiState,
+    humanTimer: human.humanTimer,
+    humanRandomSequence: human.humanRandomSequence,
+  };
+
+  await runtime.syncActiveChunks({
+    renderedKeys: ['1,0'], activeDataKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0 },
+  });
+  assert.equal(renderer.entities.has(human.stableId), false);
+  assert.equal(state.entityStates.get(human.stableId), human);
+  await runtime.syncActiveChunks({
+    renderedKeys: chunkKeys, activeDataKeys: chunkKeys, getChunkData,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+  });
+  assert.equal(renderer.entities.has(human.stableId), true);
+  assert.deepEqual({
+    aiState: human.aiState,
+    humanTimer: human.humanTimer,
+    humanRandomSequence: human.humanRandomSequence,
+  }, savedBehavior);
+  state.moveEntityOwner(human.stableId, '1,0');
+  human.x = 16.25;
+  await assert.doesNotReject(() => runtime.refreshFromState());
+  assert.equal(human.ownerChunkKey, '0,0');
+  assert.equal(logicalWorldToOwnedChunk(human.x, human.z).key, '0,0');
+  assert.deepEqual({
+    aiState: human.aiState,
+    humanTimer: human.humanTimer,
+    humanRandomSequence: human.humanRandomSequence,
+  }, savedBehavior);
+  assert.doesNotThrow(() => runtime.attack('single', 1_000));
+  const atomic = await runtime.nuclearAttack({ x: 0, z: human.z, airborne: true });
+  assert.equal(atomic.accepted, true);
+  assert.ok(atomic.hitStableIds.includes(human.stableId));
+  assert.equal(state.createSaveSnapshot().entityStates
+    .filter(entity => entity.stableId === human.stableId).length, 1);
   await runtime.shutdown();
 });
 

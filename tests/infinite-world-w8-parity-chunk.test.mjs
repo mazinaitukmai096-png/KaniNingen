@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
+import { createW6ChunkGameplay } from '../src/infinite-world/gameplay-runtime.js';
 import {
   W8_PARITY_CHUNK_DATA_SCHEMA,
   W8_SPAWN_SAFETY_CONTRACT,
@@ -65,6 +66,25 @@ test('W8 wraps byte-identical W5 output and publishes sorted deterministic overl
       parity[name].map(value => value.stableId).toSorted());
   }
   assert.ok(parity.ambientDetails.length > 8);
+});
+
+test('the reported 31,21 boundary resident has one canonical Gameplay owner', async () => {
+  const generator = await createW8ParityChunkGenerator();
+  const chunks = await Promise.all([
+    generator.generateChunk(31, 21),
+    generator.generateChunk(32, 21),
+  ]);
+  const models = await Promise.all(chunks.map(chunkData => createW6ChunkGameplay({
+    chunkData,
+    worldSeedHash: generator.worldSeedHash,
+    generatorMajor: generator.generatorVersion.major,
+  })));
+  const stableId = 'wf1:human:de6f08ad3426dd2ad7bef1499769579c';
+  const descriptors = models.flatMap(model => model.entityDescriptors)
+    .filter(descriptor => descriptor.stableId === stableId);
+  assert.equal(descriptors.length, 1);
+  assert.equal(descriptors[0].ownerChunkKey, '31,21');
+  assert.equal(logicalWorldToOwnedChunk(descriptors[0].x, descriptors[0].z).key, '31,21');
 });
 
 test('W8 selects a deterministic pond start and every surface consumer retains the W5 height value and scale', async () => {

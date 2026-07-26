@@ -344,7 +344,13 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
   const ownerChunkKey = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
   const buildings = (chunkData.settlementFeatures ?? [])
     .filter(feature => feature.featureType === 'settlement-building');
-  const entityDescriptors = await Promise.all(buildings.map(building => humanDescriptor({
+  const ownedBuildings = buildings.filter(building => createChunkKey(
+    building.owningChunkCoordinate?.x
+      ?? logicalWorldToOwnedChunk(building.worldPosition.x, building.worldPosition.z).chunkX,
+    building.owningChunkCoordinate?.z
+      ?? logicalWorldToOwnedChunk(building.worldPosition.x, building.worldPosition.z).chunkZ,
+  ) === ownerChunkKey);
+  const entityDescriptors = await Promise.all(ownedBuildings.map(building => humanDescriptor({
     building, chunkData, worldSeedHash, generatorMajor,
   })));
   for (const reference of chunkData.settlementReferences ?? []) {
@@ -959,6 +965,33 @@ export class InfiniteGameplayRuntime {
         && !this.activeTankOccurrences.has(entity.stableId)) {
         this.#startTankOccurrence(entity, { sync: false });
       }
+    }
+  }
+
+  #reconcileSpatialHumanOwnership() {
+    const descriptors = new Map();
+    for (const [chunkKey, model] of this.spatialChunks) {
+      for (const descriptor of model.entityDescriptors) {
+        if (descriptor.type !== 'human') continue;
+        const existingDescriptor = descriptors.get(descriptor.stableId);
+        if (existingDescriptor) {
+          throw new Error(
+            `Stable ID collision across ${existingDescriptor.chunkKey} and ${chunkKey}: `
+            + descriptor.stableId,
+          );
+        }
+        descriptors.set(descriptor.stableId, { chunkKey, descriptor });
+      }
+    }
+    for (const { descriptor } of descriptors.values()) {
+      const entity = this.state.entityStates.get(descriptor.stableId);
+      if (!entity || entity.ownerChunkKey === descriptor.ownerChunkKey) continue;
+      if (entity.type !== 'human' || entity.maxHp !== descriptor.maxHp) {
+        throw new Error(`Stable ID collision or entity contract mismatch: ${descriptor.stableId}`);
+      }
+      this.state.moveEntityOwner(entity.stableId, descriptor.ownerChunkKey);
+      clampToOwner(entity);
+      this.stableIdOwners.set(entity.stableId, descriptor.ownerChunkKey);
     }
   }
 
@@ -2265,17 +2298,18 @@ export class InfiniteGameplayRuntime {
       this.spatialChunks.set(key, model);
       this.#registerSpatialGameplayModel(key, model);
     }
+    this.#reconcileSpatialHumanOwnership();
     this.#refreshSpatialBroadphaseBounds();
     for (const key of sorted(desired)) {
       if (this.activeChunks.has(key)) continue;
       const model = this.spatialChunks.get(key);
       if (!model) throw new Error(`missing W6 spatial gameplay model: ${key}`);
       for (const target of model.staticTargets) {
-        this.#registerStableId(target.stableId, key);
+        this.#registerStableId(target.stableId, target.ownerChunkKey ?? key);
         if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
       }
       const entityStates = model.entityDescriptors.map(descriptor => {
-        this.#registerStableId(descriptor.stableId, key);
+        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
         const existed = this.state.entityStates.has(descriptor.stableId);
         const entityState = this.state.ensureEntity(descriptor);
         if (entityState.type === 'tank') {
@@ -2356,10 +2390,14 @@ export class InfiniteGameplayRuntime {
       entity.z += velocity.z * deltaSeconds;
       velocity.x *= decay;
       velocity.z *= decay;
-      const nextOwner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
-      if (nextOwner !== entity.ownerChunkKey) {
-        this.state.moveEntityOwner(entity.stableId, nextOwner);
-        this.stableIdOwners.set(entity.stableId, nextOwner);
+      if (entity.type === 'human') {
+        clampToOwner(entity);
+      } else {
+        const nextOwner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
+        if (nextOwner !== entity.ownerChunkKey) {
+          this.state.moveEntityOwner(entity.stableId, nextOwner);
+          this.stableIdOwners.set(entity.stableId, nextOwner);
+        }
       }
       if (Math.hypot(velocity.x, velocity.z) < 0.01) this.entityKnockbacks.delete(stableId);
     }
@@ -3482,10 +3520,13 @@ export class InfiniteGameplayRuntime {
     for (const [key, model] of this.spatialChunks) {
       this.#registerSpatialGameplayModel(key, model, { startOccurrences: false });
     }
+    this.#reconcileSpatialHumanOwnership();
     for (const [key, model] of activeModels) {
-      for (const target of model.staticTargets) this.#registerStableId(target.stableId, key);
+      for (const target of model.staticTargets) {
+        this.#registerStableId(target.stableId, target.ownerChunkKey ?? key);
+      }
       const states = model.entityDescriptors.map(descriptor => {
-        this.#registerStableId(descriptor.stableId, key);
+        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
         const entity = this.state.ensureEntity(descriptor);
         if (entity.type === 'tank') this.#bindTank(entity, descriptor);
         return entity;
