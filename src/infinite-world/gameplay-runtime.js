@@ -15,6 +15,7 @@ import {
   W8_COMBAT_COMMAND_SCHEMA,
   W8_COMBAT_COMMAND_TYPES,
   W8_PRESENTATION_EVENT_SCHEMA,
+  W8_PLAYER_LANDING_CONTRACT,
   W8_TANK_LIFECYCLE_CONTRACT,
   canW6StageDamageTarget,
   finiteWorldFrameSpeedToMetersPerSecond,
@@ -437,6 +438,7 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.entityKnockbacks = new Map();
     this.pendingBossSpawn = null;
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
@@ -466,6 +468,7 @@ export class InfiniteGameplayRuntime {
       tankShots: 0,
       playerHits: 0,
       playerDeaths: 0,
+      playerLandings: 0,
       combatEffects: 0,
       restarts: 0,
       nuclearAttacks: 0,
@@ -2019,6 +2022,44 @@ export class InfiniteGameplayRuntime {
     clampToOwner(state);
   }
 
+  #queueEntityKnockback(entity, center, pushRadiusMeters) {
+    const distance = Math.sqrt(distanceSquared(entity, center));
+    if (distance >= pushRadiusMeters) return false;
+    const deterministicAngle = deterministicUnitFloat(`${entity.stableId}:landing-push`) * Math.PI * 2;
+    const directionX = distance > 1e-9 ? (entity.x - center.x) / distance : Math.sin(deterministicAngle);
+    const directionZ = distance > 1e-9 ? (entity.z - center.z) / distance : Math.cos(deterministicAngle);
+    const speedMetersPerSecond = finiteWorldUnitsToMeters(W8_PLAYER_LANDING_CONTRACT.pushSpeed)
+      * (1 - distance / pushRadiusMeters);
+    const existing = this.entityKnockbacks.get(entity.stableId) ?? { x: 0, z: 0 };
+    this.entityKnockbacks.set(entity.stableId, {
+      x: existing.x + directionX * speedMetersPerSecond,
+      z: existing.z + directionZ * speedMetersPerSecond,
+    });
+    return true;
+  }
+
+  #advanceEntityKnockbacks(deltaSeconds) {
+    if (deltaSeconds <= 0 || this.entityKnockbacks.size === 0) return;
+    const decay = W8_PLAYER_LANDING_CONTRACT.pushDecayPerFrame ** (deltaSeconds * 60);
+    for (const [stableId, velocity] of [...this.entityKnockbacks]) {
+      const entity = this.state.entityStates.get(stableId);
+      if (!entity?.alive) {
+        this.entityKnockbacks.delete(stableId);
+        continue;
+      }
+      entity.x += velocity.x * deltaSeconds;
+      entity.z += velocity.z * deltaSeconds;
+      velocity.x *= decay;
+      velocity.z *= decay;
+      const nextOwner = logicalWorldToOwnedChunk(entity.x, entity.z).key;
+      if (nextOwner !== entity.ownerChunkKey) {
+        this.state.moveEntityOwner(entity.stableId, nextOwner);
+        this.stableIdOwners.set(entity.stableId, nextOwner);
+      }
+      if (Math.hypot(velocity.x, velocity.z) < 0.01) this.entityKnockbacks.delete(stableId);
+    }
+  }
+
   update({ deltaSeconds, player, playerY = null, simulationEnabled = true } = {}) {
     if (this.isShutdown) return;
     if (this.pendingTankRuntimeError) {
@@ -2050,6 +2091,7 @@ export class InfiniteGameplayRuntime {
       this.#syncTransientCombat();
       return;
     }
+    this.#advanceEntityKnockbacks(boundedDelta);
     for (const model of this.activeChunks.values()) {
       for (const descriptor of model.entityDescriptors) {
         const entity = this.state.entityStates.get(descriptor.stableId);
@@ -2339,6 +2381,98 @@ export class InfiniteGameplayRuntime {
         : command.type === W8_COMBAT_COMMAND_TYPES.BOTH ? 'double' : null;
     if (!mode) throw new RangeError(`unsupported CombatCommand: ${command.type}`);
     return this.attack(mode, command.issuedAt);
+  }
+
+  playerLanding({
+    x = this.state.player.x,
+    z = this.state.player.z,
+    scaleStageId = this.state.activeScaleStageId,
+    terrainHeightMeters = 0,
+  } = {}) {
+    if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(terrainHeightMeters)) {
+      throw new TypeError('Player landing position must be finite');
+    }
+    if (scaleStageId !== this.state.activeScaleStageId) {
+      throw new Error('Player landing Scale must match the active Scale stage');
+    }
+    if (this.state.player.hp <= 0) {
+      return Object.freeze({ accepted: false, reason: 'player-dead', hits: Object.freeze([]) });
+    }
+    const profile = getW6ScaleProfile(scaleStageId);
+    const center = { x, z };
+    const damageRadiusSquared = profile.landingRadiusMeters ** 2;
+    const hits = [];
+    const pushedStableIds = [];
+    const combatTargets = [...this.#collectCombatTargets().values()]
+      .sort((a, b) => a.stableId.localeCompare(b.stableId));
+    for (const resolved of combatTargets) {
+      const target = resolved.kind === 'feature' ? resolved.target : resolved.entity;
+      if (!target || (resolved.kind === 'feature' && this.state.isFeatureDestroyed(target.stableId))
+        || (resolved.kind !== 'feature' && !target.alive)
+        || !canW6StageDamageTarget(scaleStageId, target)) continue;
+      const targetDistanceSquared = distanceSquared(target, center);
+      const bossUnderground = target.type === 'boss'
+        && ['dig'].includes(target.bossBehavior?.phase ?? target.aiState);
+      if (targetDistanceSquared < damageRadiusSquared) {
+        let damage = W8_PLAYER_LANDING_CONTRACT.damage;
+        if (target.type === 'boss') {
+          if (bossUnderground) damage *= 0.05;
+          else if ((target.bossBehavior?.phase ?? target.aiState) === 'recover') damage *= 1.5;
+        }
+        const result = this.applyCombatDamage(resolved, damage, {
+          awardPlayerCredit: true,
+        });
+        hits.push(Object.freeze({
+          stableId: resolved.stableId,
+          type: resolved.type,
+          damage,
+          destroyed: result.destroyed === true || result.alive === false,
+        }));
+      } else if (resolved.kind !== 'feature' && !bossUnderground
+        && targetDistanceSquared < profile.landingPushRadiusMeters ** 2
+        && this.#queueEntityKnockback(target, center, profile.landingPushRadiusMeters)) {
+        pushedStableIds.push(resolved.stableId);
+      }
+    }
+    const visualScale = Math.max(0.35, profile.stage.visualScale);
+    this.#emitCombatEffect({
+      type: 'player-landing-impact',
+      x,
+      y: terrainHeightMeters,
+      z,
+      durationSeconds: 0.55,
+      cameraShake: profile.landingShake,
+      intensity: visualScale,
+      soundCue: 'hit',
+    });
+    for (const multiplier of W8_PLAYER_LANDING_CONTRACT.shockwaveRadiusMultipliers) {
+      this.#emitPresentationEvent({
+        type: 'player-landing-shockwave',
+        x,
+        y: terrainHeightMeters,
+        z,
+        intensity: profile.landingRadiusMeters * multiplier,
+        lifetimeSeconds: 0.55,
+      });
+    }
+    this.#emitPresentationEvent({
+      type: 'player-landing-dust',
+      x,
+      y: terrainHeightMeters,
+      z,
+      intensity: visualScale,
+      lifetimeSeconds: 1.8,
+    });
+    this.counts.playerLandings += 1;
+    this.#syncTransientCombat();
+    return Object.freeze({
+      accepted: true,
+      damage: W8_PLAYER_LANDING_CONTRACT.damage,
+      radiusMeters: profile.landingRadiusMeters,
+      pushRadiusMeters: profile.landingPushRadiusMeters,
+      hits: Object.freeze(hits),
+      pushedStableIds: Object.freeze(pushedStableIds.sort((a, b) => a.localeCompare(b))),
+    });
   }
 
   attack(mode = 'single', now = this.clock()) {
@@ -2716,6 +2850,7 @@ export class InfiniteGameplayRuntime {
     this.pendingCameraShake = 0;
     this.hitStopUntil = -Infinity;
     this.playerKnockback = { x: 0, z: 0, decayPerFrame: 0.85 };
+    this.entityKnockbacks.clear();
     this.lastAttackAt = -Infinity;
     this.renderAdapter.clearReinforcements?.();
     this.renderAdapter.clearCombatPresentation?.();
@@ -2731,6 +2866,7 @@ export class InfiniteGameplayRuntime {
     this.#cancelAllPendingTankSpawns();
     this.pendingTankTerrainChunks.clear();
     this.tankTerrainQueryErrors.clear();
+    this.entityKnockbacks.clear();
     this.state.restartRun({ playerSpawn });
     this.projectiles.length = 0;
     this.combatEffects.length = 0;

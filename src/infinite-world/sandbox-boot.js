@@ -1215,6 +1215,7 @@ export async function bootInfiniteWorldSandbox({
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
       onAttack: mode => gameplay.attack(mode),
       onCombatCommand: command => gameplay.executeCombatCommand(command),
+      onPlayerLanding: input => gameplay.playerLanding(input),
       onSave: () => { void saveWorld({ force: true }); },
       onLoad: () => { void loadWorld(); },
       continueAvailable: state.saveAvailable,

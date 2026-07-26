@@ -1895,6 +1895,43 @@ test('building destruction, score, healing, hit stop and effects share the W6 Wo
   await runtime.shutdown();
 });
 
+test('Player landing applies finite Scale damage, outer push, shake, shockwaves, and dust once', async () => {
+  const chunk = combatChunk();
+  chunk.settlementFeatures.push({
+    stableId: 'settlement-building-v1:w8-player-landing-push-house',
+    featureType: 'settlement-building',
+    buildingType: 'house',
+    radiusMeters: 2,
+    worldPosition: { x: 18, y: 0, z: 4 },
+    owningChunkCoordinate: { x: 0, z: 0 },
+  });
+  const { runtime, state } = await createRuntime({ chunk });
+  const pushedHuman = [...state.entityStates.values()].find(entity =>
+    entity.type === 'human' && entity.x > 12.5);
+  assert.ok(pushedHuman);
+  const result = runtime.playerLanding({
+    x: 4,
+    z: 4,
+    scaleStageId: 'MAX',
+    terrainHeightMeters: 2,
+  });
+  assert.equal(result.accepted, true);
+  assert.equal(result.damage, 800);
+  assert.equal(result.radiusMeters, 12.5);
+  assert.equal(result.pushRadiusMeters, 25);
+  assert.ok(result.hits.some(hit => hit.stableId === 'settlement-building-v1:w7c-house'));
+  assert.ok(result.pushedStableIds.includes(pushedHuman.stableId));
+  const effects = runtime.consumePresentationEffects();
+  assert.equal(effects.cameraShake, 80);
+  assert.equal(effects.events.filter(event => event.type === 'player-landing-shockwave').length, 2);
+  assert.equal(effects.events.filter(event => event.type === 'player-landing-dust').length, 1);
+  const beforePush = pushedHuman.x;
+  runtime.update({ deltaSeconds: 0.05, player: state.player });
+  assert.ok(pushedHuman.x > beforePush);
+  assert.equal(runtime.snapshot().counts.playerLandings, 1);
+  await runtime.shutdown();
+});
+
 test('death and restart mutate the single World State atomically and restore active descriptors', async () => {
   const { runtime, state, renderer } = await createRuntime();
   const entityIds = [...state.entityStates.keys()];

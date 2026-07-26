@@ -95,7 +95,7 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
   };
   const calls = {
     attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
-    nuclear: [], bossSpawns: 0, starts: [],
+    nuclear: [], landings: [], bossSpawns: 0, starts: [],
   };
   const shell = createInfiniteExperienceShell({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
@@ -108,6 +108,7 @@ function createFixture({ exposeDeveloperTools = false, runConfiguration = true }
     onRestart: () => { calls.restarts += 1; },
     onStartRun: mode => { calls.starts.push(mode); return runConfiguration; },
     onNuclearRelease: input => { calls.nuclear.push(input); },
+    onPlayerLanding: input => { calls.landings.push(input); },
     onSpawnManualBoss: () => { calls.bossSpawns += 1; },
   });
   return {
@@ -441,6 +442,30 @@ test('Space is edge-triggered and held or repeated keydown cannot add another ju
   fixture.globalObject.dispatch('keyup', { code: 'Space' });
   fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
   assert.equal(fixture.shell.snapshot().playerVertical.grounded, false);
+  fixture.shell.dispose();
+});
+
+test('a playable airborne-to-grounded transition emits one finite-parity landing and intro does not', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 2, z: 3, facingY: 0 };
+  const profile = getW6ScaleProfile('MAX');
+  finishIntro(fixture, player, profile);
+  assert.deepEqual(fixture.calls.landings, []);
+
+  fixture.globalObject.dispatch('keydown', { code: 'Space', repeat: false });
+  for (let frame = 0; frame < 600 && !fixture.shell.snapshot().playerVertical.grounded; frame += 1) {
+    fixture.shell.updatePlayer({ deltaSeconds: 1 / 120, player, scaleProfile: profile });
+  }
+  assert.equal(fixture.calls.landings.length, 1);
+  assert.deepEqual(fixture.calls.landings[0], {
+    x: 2,
+    z: 3,
+    scaleStageId: 'MAX',
+    terrainHeightMeters: 1.08,
+  });
+  fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+  assert.equal(fixture.calls.landings.length, 1);
   fixture.shell.dispose();
 });
 

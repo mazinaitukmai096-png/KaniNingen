@@ -53,6 +53,7 @@ export class GameplayRenderAdapter {
     const effectPoolSpecs = Object.freeze({
       flash: Object.freeze({ geometry: 'sphere', material: 'atomicFlash', capacity: 96 }),
       debris: Object.freeze({ geometry: 'box', material: 'charred', capacity: 384 }),
+      dust: Object.freeze({ geometry: 'box', material: 'road', capacity: 384 }),
       blood: Object.freeze({ geometry: 'box', material: 'blood', capacity: 192 }),
       wind: Object.freeze({ geometry: 'windArc', material: 'wind', capacity: 96 }),
       shockwave: Object.freeze({ geometry: 'torus', material: 'shockwave', capacity: 288 }),
@@ -303,6 +304,35 @@ export class GameplayRenderAdapter {
           ...base, y: baseY + 0.05 * unit,
           scaleX: 8 * unit, scaleY: 0.08 * unit, scaleZ: 8 * unit,
         });
+        continue;
+      }
+      if (event.type === 'player-landing-shockwave') {
+        const ringScale = Math.max(0.1, intensity * progress) * unit;
+        this.#appendEffectInstance('shockwave', {
+          ...base, y: baseY + 0.08 * unit,
+          scaleX: ringScale, scaleY: ringScale, scaleZ: ringScale,
+          rotationX: Math.PI / 2,
+        });
+        continue;
+      }
+      if (event.type === 'player-landing-dust') {
+        const dustCount = Math.max(4, Math.round(14 * intensity));
+        for (let index = 0; index < dustCount; index += 1) {
+          const angle = index / dustCount * Math.PI * 2 + (event.sequence ?? 0) * 0.37;
+          const variation = ((index * 17 + (event.sequence ?? 0) * 13) % 29) / 29;
+          const travel = progress * (10 + variation * 12.5) * intensity * unit;
+          const dustScale = (0.375 + variation * 0.5) * intensity * unit;
+          this.#appendEffectInstance('dust', {
+            x: base.x + Math.cos(angle) * travel,
+            y: baseY + Math.sin(progress * Math.PI) * (0.6 + variation) * intensity * unit,
+            z: base.z + Math.sin(angle) * travel,
+            scaleX: dustScale,
+            scaleY: dustScale,
+            scaleZ: dustScale,
+            rotationX: progress * 4 + index,
+            rotationY: progress * 3 - index,
+          });
+        }
         continue;
       }
       if (event.type === 'tank-ruin') {

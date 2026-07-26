@@ -434,6 +434,34 @@ test('W8 Tank death presentation is mechanical, timed, persistent, and bounded',
   assets.dispose();
 });
 
+test('Player landing renders two bounded shockwaves and finite-parity radial dust', async () => {
+  const scene = new Group();
+  const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const adapter = new GameplayRenderAdapter({ THREE: FakeThree, scene, visualAssets: assets });
+  const event = (sequence, type, intensity, lifetimeSeconds) => ({
+    sequence,
+    type,
+    logicalPosition: { x: 2, y: 1, z: -3 },
+    direction: { x: 0, y: 0, z: 1 },
+    intensity,
+    lifetimeSeconds,
+    soundCue: null,
+  });
+  adapter.consumePresentationEvents([
+    event(1, 'player-landing-shockwave', 13.75, 0.55),
+    event(2, 'player-landing-shockwave', 9.5, 0.55),
+    event(3, 'player-landing-dust', 1, 1.8),
+  ]);
+  adapter.updatePresentation(0.1);
+  const snapshot = adapter.snapshot();
+  assert.equal(snapshot.effectInstancePools.shockwave.count, 2);
+  assert.equal(snapshot.effectInstancePools.dust.count, 14);
+  assert.equal(snapshot.effectInstancePools.flash.count, 0);
+  assert.equal(snapshot.effectInstancePools.debris.count, 0);
+  await adapter.shutdown();
+  assets.dispose();
+});
+
 test('W7A normal render paths no longer name Proxy geometry', () => {
   const source = [
     'src/infinite-world/render/chunk-render-adapter.js',

@@ -168,6 +168,15 @@ export const W7_NUCLEAR_CONTRACT = Object.freeze({
   cameraShake: 450,
 });
 
+export const W8_PLAYER_LANDING_CONTRACT = Object.freeze({
+  damage: 800,
+  pushSpeed: 400,
+  pushDecayPerFrame: 0.85,
+  shockwaveRadiusMultipliers: Object.freeze([1.1, 0.76]),
+  minimumDustCount: 4,
+  dustCountPerVisualScale: 14,
+});
+
 export const W7_MANUAL_BOSS_CONTRACT = Object.freeze({
   spawnDistance: DEBUG_BOSS_SPAWN_DIST,
   simultaneousLimit: 1,
@@ -293,6 +302,9 @@ export function getW6ScaleProfile(stageId) {
     doubleAttackRadiusMeters: finiteWorldUnitsToMeters(stage.doubleAttackRadius),
     attackOffsetXMeters: finiteWorldUnitsToMeters(stage.attackOffsetX),
     attackOffsetZMeters: finiteWorldUnitsToMeters(stage.attackOffsetZ),
+    landingRadiusMeters: finiteWorldUnitsToMeters(stage.landingRadius),
+    landingPushRadiusMeters: finiteWorldUnitsToMeters(stage.landingPushRadius),
+    landingShake: stage.landingShake,
     cameraDistanceMeters: finiteWorldUnitsToMeters(stage.cameraDistance),
     cameraHeightMeters: finiteWorldUnitsToMeters(stage.cameraHeight),
     cameraTargetHeightMeters: finiteWorldUnitsToMeters(stage.cameraTargetHeight),

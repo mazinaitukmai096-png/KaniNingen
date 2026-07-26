@@ -57,6 +57,7 @@ export function createInfiniteExperienceShell({
   onHome = () => {},
   onRestart = () => {},
   onNuclearRelease = () => {},
+  onPlayerLanding = () => null,
   onSpawnManualBoss = () => {},
   onSettingsChanged = () => {},
   onStartRun = () => true,
@@ -492,12 +493,21 @@ export function createInfiniteExperienceShell({
         player.facingY = Math.atan2(dx, dz);
       }
     }
+    const wasGrounded = state.playerVertical.grounded;
     const vertical = stepPlayerVerticalMovement(state.playerVertical, {
       deltaSeconds: state.paused ? 0 : deltaSeconds,
       terrainHeightMeters: getTerrainHeightMeters(player.x, player.z),
       scaleProfile,
     });
-    return Object.freeze({ moved: !state.paused, vertical });
+    const landed = !wasGrounded && vertical.grounded
+      && !state.paused && state.runPhase === 'playing';
+    const landing = landed ? onPlayerLanding(Object.freeze({
+      x: player.x,
+      z: player.z,
+      scaleStageId: scaleProfile.stage.id,
+      terrainHeightMeters: vertical.terrainHeightMeters,
+    })) : null;
+    return Object.freeze({ moved: !state.paused, vertical, landed, landing });
   }
 
   function updateCamera({
