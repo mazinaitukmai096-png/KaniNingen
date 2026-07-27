@@ -49,8 +49,8 @@ function createFixture({
 } = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
-    'compass-arrow', 'fps-counter', 'score', 'scale-label', 'hp-number', 'hp-bar-fill', 'hp-bar-lag',
-    'atomic-status', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
+    'compass-arrow', 'fps-counter', 'score', 'hp-number', 'hp-bar-fill',
+    'atomic-status', 'atomic-cd-label', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
     'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
     'debug-close-btn', 'debug-summary', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
@@ -489,12 +489,50 @@ test('normal HUD is a read-only adapter and no Boss UI appears without a manual 
   });
   assert.deepEqual(gameplaySnapshot, before);
   assert.equal(fixture.elements.get('score').textContent, '$3,000,000');
-  assert.equal(fixture.elements.get('scale-label').textContent, 'MID');
   assert.equal(fixture.elements.get('hp-number').textContent, 75);
   assert.equal(fixture.elements.get('hp-bar-fill').style.width, '75%');
   assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
   assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
-  assert.equal(fixture.elements.get('atomic-status').textContent, 'ATOMIC: MAX SCALE ONLY');
+  assert.equal(fixture.elements.get('atomic-cd-label').textContent, 'SCALE SANDBOX: LOCKED');
+  fixture.shell.dispose();
+});
+
+test('debug mode and Developer Tools changes preserve the finite normal HUD state', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
+  const gameplaySnapshot = {
+    state: {
+      player: { hp: 64, maxHp: 100, score: 42 }, activeScaleStageId: 'MAX',
+      nuclearCooldownMs: 0, manualBoss: null, destroyedFeatureCount: 0, destroyedEntityCount: 0,
+    },
+    activeTankCount: 0, activeSimulationChunkCount: 9, simulatedEntityCount: 0, simulatedStaticTargetCount: 0,
+  };
+  const render = () => fixture.shell.renderHud({
+    fps: 60, gameplaySnapshot,
+    runtimeSnapshot: {
+      centerChunkX: 0, centerChunkZ: 0, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 15 } },
+    },
+    saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
+  });
+  render();
+  const before = {
+    score: fixture.elements.get('score').textContent,
+    hp: fixture.elements.get('hp-number').textContent,
+    atomic: fixture.elements.get('atomic-cd-label').textContent,
+  };
+  fixture.shell.openDebug();
+  render();
+  fixture.worldState.setDeveloperTools(true);
+  render();
+  fixture.elements.get('debug-close-btn').dispatch('click');
+  render();
+  assert.deepEqual({
+    score: fixture.elements.get('score').textContent,
+    hp: fixture.elements.get('hp-number').textContent,
+    atomic: fixture.elements.get('atomic-cd-label').textContent,
+  }, before);
   fixture.shell.dispose();
 });
 
@@ -527,7 +565,7 @@ test('Boss HP keeps the finite immediate fill, 500ms damage lag, and tick-ready 
   assert.equal(fixture.elements.get('boss-hp-damage').style.width, '100%');
   fixture.setNow(601); renderBoss(50);
   assert.equal(fixture.elements.get('boss-hp-damage').style.width, '50%');
-  assert.equal(fixture.elements.get('boss-ui').style.display, 'flex');
+  assert.equal(fixture.elements.get('boss-ui').style.display, 'block');
   fixture.shell.dispose();
 });
 

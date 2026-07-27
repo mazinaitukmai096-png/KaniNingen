@@ -17,6 +17,7 @@ import {
   stepPlayerVerticalMovement,
   tryStartPlayerJump,
 } from './player-vertical-movement.js';
+import { createFiniteGameplayHudAdapter } from './finite-gameplay-hud.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 const money = score => `$${Math.round(score * 10_000).toLocaleString('en-US')}`;
@@ -85,8 +86,8 @@ export function createInfiniteExperienceShell({
     start: byId('start-screen'), startButton: byId('start-button'), continueButton: byId('continue-button'),
     lobbySettings: byId('lobby-settings-btn'),
     ui: byId('ui'), crosshair: byId('crosshair'), compass: byId('compass'), compassArrow: byId('compass-arrow'),
-    fps: byId('fps-counter'), score: byId('score'), scale: byId('scale-label'), hp: byId('hp-number'),
-    hpFill: byId('hp-bar-fill'), hpLag: byId('hp-bar-lag'), atomic: byId('atomic-status'), boss: byId('boss-ui'), charge: byId('charge-ui'),
+    fps: byId('fps-counter'), score: byId('score'), hp: byId('hp-number'), hpFill: byId('hp-bar-fill'),
+    atomic: byId('atomic-status'), atomicLabel: byId('atomic-cd-label'), boss: byId('boss-ui'), charge: byId('charge-ui'),
     chargeFill: byId('charge-bar-fill'), chargeLabel: byId('charge-label'),
     bossFill: byId('boss-hp-fill'), bossDamage: byId('boss-hp-damage'), bossTitle: byId('boss-title'),
     news: byId('news-ticker'), settings: byId('settings-modal'), settingsClose: byId('settings-close-btn'),
@@ -117,6 +118,7 @@ export function createInfiniteExperienceShell({
     newsActive: false,
     attackButtons: new Set(),
     nuclearChargeStartedAt: null,
+    chargeVisible: false,
     canNuclearCharge: false,
     camera: createExperienceCameraState(initialScaleProfile),
     playerVertical: createPlayerVerticalMovementState(),
@@ -131,11 +133,8 @@ export function createInfiniteExperienceShell({
     deathStartedAtMs: null,
     startPending: false,
     continueAvailable: continueAvailable === true,
-    bossLastHpPercent: 100,
-    bossDamagePercent: 100,
-    bossDamageTargetPercent: 100,
-    bossDamageDelayUntil: 0,
   };
+  const finiteGameplayHud = createFiniteGameplayHudAdapter({ elements, globalObject });
   const removers = [];
   const developerToolsEnabled = () => worldState.developerTools === true
     || typeof worldState.setDeveloperTools !== 'function'
@@ -189,8 +188,8 @@ export function createInfiniteExperienceShell({
     setVisible(elements.resume, state.mode === 'playing' && state.paused
       && !state.settingsOpen && !state.debugOpen);
     setVisible(elements.fps, state.settings.showFps, 'block');
-    setVisible(elements.boss, state.runPhase === 'playing' && state.bossActive);
-    setVisible(elements.charge, state.runPhase === 'playing' && state.nuclearChargeStartedAt !== null);
+    setVisible(elements.boss, state.runPhase === 'playing' && state.bossActive, 'block');
+    setVisible(elements.charge, state.runPhase === 'playing' && state.chargeVisible, 'block');
     setVisible(elements.news, state.runPhase === 'playing' && state.newsActive);
     setVisible(elements.gameOver, state.mode === 'gameover');
     if (elements.continueButton) {
@@ -665,63 +664,46 @@ export function createInfiniteExperienceShell({
         button.dataset?.scaleStage === gameplaySnapshot.state.activeScaleStageId,
       );
     }
-    const hpPercent = player.maxHp ? player.hp / player.maxHp * 100 : 0;
-    if (elements.score) elements.score.textContent = money(player.score);
-    if (elements.scale) elements.scale.textContent = gameplaySnapshot.state.activeScaleStageId;
-    if (elements.hp) elements.hp.textContent = Math.ceil(player.hp);
-    if (elements.hpFill?.style) elements.hpFill.style.width = `${clamp(hpPercent, 0, 100)}%`;
-    if (elements.hpLag?.style) elements.hpLag.style.width = `${clamp(hpPercent, 0, 100)}%`;
+    const finiteHudSnapshot = finiteGameplayHud.render({
+      gameplaySnapshot,
+      chargeStartedAt: state.nuclearChargeStartedAt,
+      grounded: state.playerVertical.grounded,
+    });
     if (elements.fps) elements.fps.textContent = `FPS: ${Math.round(fps)}`;
     if (elements.compassArrow?.style) {
       elements.compassArrow.style.transform = `translate(-50%,-60%) rotate(${state.camera.yaw}rad)`;
     }
-    const boss = gameplaySnapshot.state.manualBoss;
-    state.bossActive = boss?.alive === true;
+    state.bossActive = finiteHudSnapshot.bossActive;
     state.threatActive = state.bossActive || gameplaySnapshot.activeTankCount > 0;
-    state.canNuclearCharge = gameplaySnapshot.state.activeScaleStageId === W7_NUCLEAR_CONTRACT.allowedScaleStageId
+    state.canNuclearCharge = finiteHudSnapshot.nuclearAllowed
       && (gameplaySnapshot.state.nuclearCooldownMs ?? 0) <= 0;
+    state.chargeVisible = finiteHudSnapshot.chargeVisible;
     state.newsActive = state.bossActive;
-    if (elements.bossFill?.style && boss) {
-      const bossPercent = clamp(boss.hp / boss.maxHp * 100, 0, 100);
-      const now = globalObject.performance?.now?.() ?? Date.now();
-      if (!state.bossActive || bossPercent > state.bossLastHpPercent) {
-        state.bossDamagePercent = bossPercent;
-        state.bossDamageTargetPercent = bossPercent;
-      } else if (bossPercent < state.bossLastHpPercent) {
-        state.bossDamageTargetPercent = bossPercent;
-        state.bossDamageDelayUntil = now + 500;
-      }
-      if (now >= state.bossDamageDelayUntil) state.bossDamagePercent = state.bossDamageTargetPercent;
-      state.bossLastHpPercent = bossPercent;
-      elements.bossFill.style.width = `${bossPercent}%`;
-      if (elements.bossDamage?.style) {
-        elements.bossDamage.style.width = `${state.bossDamagePercent}%`;
-      }
-    } else if (!boss) {
-      state.bossLastHpPercent = 100;
-      state.bossDamagePercent = 100;
-      state.bossDamageTargetPercent = 100;
-      state.bossDamageDelayUntil = 0;
-    }
-    if (elements.bossTitle && boss) {
+    /* Legacy W8-only normal-HUD rendering (Boss title variants, bespoke
+       Atomic strings, and charge text) is intentionally replaced by the
+       finite adapter above. */
+    /*
+    const boss = null;
+    if (false && elements.bossTitle && boss) {
       elements.bossTitle.textContent = boss.hp / boss.maxHp <= 0.5
         ? '【狂暴怒り】ギガ・ミミズ' : 'ギガ・ミミズ';
     }
     const cooldownMs = gameplaySnapshot.state.nuclearCooldownMs ?? 0;
-    if (elements.atomic) {
+    if (false && elements.atomic) {
       elements.atomic.textContent = gameplaySnapshot.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId
         ? 'ATOMIC: MAX SCALE ONLY'
         : cooldownMs > 0 ? `ATOMIC CD: ${(cooldownMs / 1000).toFixed(1)}s` : 'ATOMIC: READY';
       elements.atomic.classList?.toggle?.('inactive', cooldownMs > 0
         || gameplaySnapshot.state.activeScaleStageId !== W7_NUCLEAR_CONTRACT.allowedScaleStageId);
     }
-    if (state.nuclearChargeStartedAt !== null) {
+    if (false && state.nuclearChargeStartedAt !== null) {
       const elapsed = (globalObject.performance?.now?.() ?? Date.now()) - state.nuclearChargeStartedAt;
       const progress = clamp(elapsed / W7_NUCLEAR_CONTRACT.chargeThresholdMs, 0, 1);
       if (elements.chargeFill?.style) elements.chargeFill.style.width = `${progress * 100}%`;
       if (elements.chargeLabel) elements.chargeLabel.textContent = progress >= 1
         ? 'AIR RELEASE TO DETONATE' : 'ATOMIC CHARGING...';
     }
+    */
     if (elements.spawnBoss) {
       elements.spawnBoss.disabled = state.bossActive || !developerToolsEnabled();
       elements.spawnBoss.textContent = state.bossActive
