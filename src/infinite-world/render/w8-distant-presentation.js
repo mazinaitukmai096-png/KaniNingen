@@ -33,9 +33,6 @@ const W8_HIGH_TREE_SILHOUETTE_HANDOFF_METERS = Object.freeze({ minimum: 54, maxi
 const W8_HIGH_TREE_ULTRA_HANDOFF_METERS = Object.freeze({ minimum: 76, maximum: 84 });
 const W8_HIGH_TREE_ULTRA_VISIBILITY_METERS = 140;
 const W8_HIGH_TREE_ULTRA_FADE_START_METERS = 124;
-const W8_HIGH_TREE_SILHOUETTE_SCALE_AT_OUTER_EDGE = 0.62;
-const W8_HIGH_TREE_ULTRA_SCALE_AT_OUTER_EDGE = 0.46;
-const W8_HIGH_TREE_SILHOUETTE_VERTICAL_JITTER_METERS = 0.18;
 const W8_HIGH_BUILDING_HORIZON_START_METERS = 140;
 const W8_HIGH_BUILDING_HORIZON_FADE_START_METERS = 171.5;
 export const W8_CANONICAL_VISIBILITY_METERS = Object.freeze({
@@ -649,7 +646,6 @@ export async function createW8DistantPresentation({
     name,
     matrix,
     visibilityTiers = Object.freeze(['full']),
-    silhouettePresentation = null,
   ) => {
     const key = `${geometry}:${material}:${name}`;
     if (!buildGeneration.canonicalBuckets.has(key)) {
@@ -664,7 +660,6 @@ export async function createW8DistantPresentation({
       object,
       matrix: matrix.clone?.() ?? structuredClone(matrix),
       visibilityTiers,
-      silhouettePresentation,
     });
   };
 
@@ -752,70 +747,6 @@ export async function createW8DistantPresentation({
     if (record.featureType !== 'natural-vegetation' || record.subtype === 'shrub') return null;
     const geometry = record.subtype === 'conifer-tree' ? 'cone' : 'sphere';
     return parts.find(part => part.geometry === geometry) ?? null;
-  };
-
-  const canonicalTreeSilhouettePresentationMatrix = (
-    record,
-    part,
-    dimensions,
-    origin,
-    distanceScale,
-  ) => {
-    const heightRank = textHash(`${record.stableId}:w8-silhouette-height`) / 0x1_0000_0000;
-    const heightScale = 0.92 + heightRank * 0.16;
-    const verticalOffset = (heightRank - 0.5) * W8_HIGH_TREE_SILHOUETTE_VERTICAL_JITTER_METERS
-      * UNITS_PER_METER;
-    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
-    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const rotationY = Number.isFinite(record.rotationY) ? record.rotationY : 0;
-    const offsetX = part.position[0] * dimensions.width * distanceScale;
-    const offsetZ = part.position[2] * dimensions.depth * distanceScale;
-    const cosine = Math.cos(rotationY); const sine = Math.sin(rotationY);
-    transform.position.set(
-      (record.worldPosition.x - originMetersX) * UNITS_PER_METER + offsetX * cosine + offsetZ * sine,
-      record.worldPosition.y * UNITS_PER_METER
-        + part.position[1] * dimensions.height * distanceScale * heightScale + verticalOffset,
-      (record.worldPosition.z - originMetersZ) * UNITS_PER_METER - offsetX * sine + offsetZ * cosine,
-    );
-    transform.rotation.set(part.rotation[0], rotationY + part.rotation[1], part.rotation[2]);
-    transform.scale.set(
-      dimensions.width * part.scale[0] * distanceScale,
-      dimensions.height * part.scale[1] * distanceScale * heightScale,
-      dimensions.depth * part.scale[2] * distanceScale,
-    );
-    transform.updateMatrix();
-    return transform.matrix;
-  };
-
-  const canonicalTreeSilhouetteMatrix = (record, part, dimensions, origin, playerX, playerZ) => {
-    const distanceMeters = Math.hypot(record.worldPosition.x - playerX, record.worldPosition.z - playerZ);
-    const distanceProgress = smoothstep((distanceMeters - 56)
-      / (W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS - 56));
-    const distanceScale = 1 - (1 - W8_HIGH_TREE_SILHOUETTE_SCALE_AT_OUTER_EDGE)
-      * distanceProgress;
-    return canonicalTreeSilhouettePresentationMatrix(
-      record,
-      part,
-      dimensions,
-      origin,
-      distanceScale,
-    );
-  };
-
-  const canonicalTreeUltraMatrix = (record, part, dimensions, origin, playerX, playerZ) => {
-    const distanceMeters = Math.hypot(record.worldPosition.x - playerX, record.worldPosition.z - playerZ);
-    const distanceProgress = smoothstep((distanceMeters - W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS)
-      / (W8_HIGH_TREE_ULTRA_VISIBILITY_METERS - W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS));
-    const distanceScale = W8_HIGH_TREE_SILHOUETTE_SCALE_AT_OUTER_EDGE
-      - (W8_HIGH_TREE_SILHOUETTE_SCALE_AT_OUTER_EDGE - W8_HIGH_TREE_ULTRA_SCALE_AT_OUTER_EDGE)
-        * distanceProgress;
-    return canonicalTreeSilhouettePresentationMatrix(
-      record,
-      part,
-      dimensions,
-      origin,
-      distanceScale,
-    );
   };
 
   const isHorizonRecord = record => record?.featureType === 'settlement-building'
@@ -911,17 +842,15 @@ export async function createW8DistantPresentation({
           : record.landmarkType ? 'landmark' : 'building',
         canonicalPartMatrix(record, part, dimensions, origin),
         silhouette ? Object.freeze(['full', 'silhouette']) : undefined,
-        silhouette ? Object.freeze({ record, part, dimensions, origin }) : null,
       );
       if (silhouette && buildGeneration.quality === 'high') {
         addCanonicalMatrix(
           registration.object,
           part.geometry,
-          '__ultra__',
+          part.material,
           'natural-ultra',
           canonicalPartMatrix(record, part, dimensions, origin),
           Object.freeze(['ultra']),
-          Object.freeze({ record, part, dimensions, origin }),
         );
       }
     }
@@ -987,22 +916,6 @@ export async function createW8DistantPresentation({
     }
   };
 
-  const createSilhouetteMaterial = sourceMaterial => {
-    const material = sourceMaterial?.clone?.() ?? new Material({ color: 0x29452b });
-    if (material.color?.setRGB) material.color.setRGB(0.16, 0.27, 0.17);
-    else material.color = 0x29452b;
-    material.flatShading = true;
-    material.shininess = 0;
-    material.needsUpdate = true;
-    return material;
-  };
-
-  const createUltraSilhouetteMaterial = () => new Material({
-    color: 0x29452b,
-    flatShading: true,
-    shininess: 0,
-  });
-
   const createHorizonSilhouetteMaterial = () => new Material({
     color: 0x3a3932,
     flatShading: true,
@@ -1015,22 +928,13 @@ export async function createW8DistantPresentation({
       const geometry = bucket.geometry === '__road__'
         ? roadGeometry : visualAssets.geometries[bucket.geometry];
       const sourceMaterial = visualAssets.materials[bucket.material];
-      const generatedMaterial = bucket.name === 'natural-ultra'
-        || bucket.name === 'horizon-building'
+      const generatedMaterial = bucket.name === 'horizon-building'
         || bucket.name === 'horizon-landmark';
       if (!geometry || (!sourceMaterial && !generatedMaterial)) {
         throw new Error(`canonical finite visual resource is missing: ${bucket.geometry}/${bucket.material}`);
       }
       let material = sourceMaterial;
-      if (bucket.name === 'natural-silhouette') {
-        material = createSilhouetteMaterial(sourceMaterial);
-        buildGeneration.ownedMaterials.add(material);
-      } else if (bucket.name === 'natural-ultra') {
-        material = buildGeneration.ultraSilhouetteMaterial
-          ?? createUltraSilhouetteMaterial();
-        buildGeneration.ultraSilhouetteMaterial = material;
-        buildGeneration.ownedMaterials.add(material);
-      } else if (bucket.name === 'horizon-building' || bucket.name === 'horizon-landmark') {
+      if (bucket.name === 'horizon-building' || bucket.name === 'horizon-landmark') {
         material = buildGeneration.horizonSilhouetteMaterial
           ?? createHorizonSilhouetteMaterial();
         buildGeneration.horizonSilhouetteMaterial = material;
@@ -1075,25 +979,7 @@ export async function createW8DistantPresentation({
       for (const item of bucket.items) {
         if (!item.object.presentationTier
           || !item.visibilityTiers.includes(item.object.presentationTier)) continue;
-        const matrix = item.silhouettePresentation && item.object.presentationTier === 'silhouette'
-          ? canonicalTreeSilhouetteMatrix(
-            item.silhouettePresentation.record,
-            item.silhouettePresentation.part,
-            item.silhouettePresentation.dimensions,
-            item.silhouettePresentation.origin,
-            generation.playerX,
-            generation.playerZ,
-          )
-          : item.silhouettePresentation && item.object.presentationTier === 'ultra'
-            ? canonicalTreeUltraMatrix(
-              item.silhouettePresentation.record,
-              item.silhouettePresentation.part,
-              item.silhouettePresentation.dimensions,
-              item.silhouettePresentation.origin,
-              generation.playerX,
-              generation.playerZ,
-            )
-            : item.matrix;
+        const matrix = item.matrix;
         mesh.setMatrixAt(count, matrix);
         stableIds.push(item.object.stableId);
         count += 1;
@@ -1147,28 +1033,10 @@ export async function createW8DistantPresentation({
           entry.full.setMatrixAt(fullCount, item.matrix);
           fullCount += 1;
         } else if (entry.silhouette && item.object.presentationTier === 'silhouette') {
-          entry.silhouette?.setMatrixAt(silhouetteCount, item.silhouettePresentation
-            ? canonicalTreeSilhouetteMatrix(
-              item.silhouettePresentation.record,
-              item.silhouettePresentation.part,
-              item.silhouettePresentation.dimensions,
-              item.silhouettePresentation.origin,
-              generation.playerX,
-              generation.playerZ,
-            )
-            : item.matrix);
+          entry.silhouette?.setMatrixAt(silhouetteCount, item.matrix);
           silhouetteCount += 1;
         } else if (entry.ultra && item.object.presentationTier === 'ultra') {
-          entry.ultra?.setMatrixAt(ultraCount, item.silhouettePresentation
-            ? canonicalTreeUltraMatrix(
-              item.silhouettePresentation.record,
-              item.silhouettePresentation.part,
-              item.silhouettePresentation.dimensions,
-              item.silhouettePresentation.origin,
-              generation.playerX,
-              generation.playerZ,
-            )
-            : item.matrix);
+          entry.ultra?.setMatrixAt(ultraCount, item.matrix);
           ultraCount += 1;
         }
       }

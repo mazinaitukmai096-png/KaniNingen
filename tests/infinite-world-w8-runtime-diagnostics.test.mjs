@@ -773,19 +773,93 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
     y: visual.heightMeters * 256 * 0.72,
     z: visual.depthMeters * 256 * 0.82,
   };
-  assert.equal(broadleafMatrix.position.x, broadleafSilhouette.worldPosition.x * 256);
-  assert.equal(broadleafMatrix.position.z, broadleafSilhouette.worldPosition.z * 256);
-  assert.ok(broadleafMatrix.position.y <
-    broadleafSilhouette.worldPosition.y * 256 + visual.heightMeters * 256 * 0.64);
-  assert.deepEqual(broadleafMatrix.rotation, { x: 0, y: Math.PI / 2, z: 0 });
-  assert.ok(broadleafMatrix.scale.x < fullScale.x);
-  assert.ok(broadleafMatrix.scale.y < fullScale.y);
-  assert.ok(broadleafMatrix.scale.z < fullScale.z);
-  assert.equal(broadleafMesh.material.color, 0x29452b);
-  assert.equal(broadleafMesh.material.flatShading, true);
-  assert.equal(broadleafMesh.material.shininess, 0);
-  /* The authored canonical transform remains in the immutable audit identity; only its silhouette
-     presentation matrix is distance-scaled and vertically jittered. */
+  const canonicalBroadleafMatrix = {
+    position: {
+      x: broadleafSilhouette.worldPosition.x * 256,
+      y: broadleafSilhouette.worldPosition.y * 256 + visual.heightMeters * 256 * 0.64,
+      z: broadleafSilhouette.worldPosition.z * 256,
+    },
+    rotation: { x: 0, y: Math.PI / 2, z: 0 },
+    scale: fullScale,
+  };
+  assert.deepEqual(broadleafMatrix, canonicalBroadleafMatrix);
+  const canonicalTreeMatrix = (tree, part) => {
+    const treeVisual = resolveW8NaturalCandidateVisual(tree);
+    return {
+      position: {
+        x: tree.worldPosition.x * 256 + part.position[0] * treeVisual.widthMeters * 256,
+        y: tree.worldPosition.y * 256 + part.position[1] * treeVisual.heightMeters * 256,
+        z: tree.worldPosition.z * 256 + part.position[2] * treeVisual.depthMeters * 256,
+      },
+      rotation: { x: part.rotation[0], y: Math.PI / 2 + part.rotation[1], z: part.rotation[2] },
+      scale: {
+        x: treeVisual.widthMeters * 256 * part.scale[0],
+        y: treeVisual.heightMeters * 256 * part.scale[1],
+        z: treeVisual.depthMeters * 256 * part.scale[2],
+      },
+    };
+  };
+  const matrixFor = (mesh, stableId) => mesh.matrices[mesh.userData.canonicalStableIds.indexOf(
+    stableId,
+  )].value;
+  const wetlandMesh = normal.meshes.find(mesh => (
+    mesh.name === 'w8-canonical-lod-natural-silhouette-sphere-wetlandLeaves'
+  ));
+  const coniferMesh = normal.meshes.find(mesh => (
+    mesh.name === 'w8-canonical-lod-natural-silhouette-cone-treeLeaves'
+  ));
+  assert.ok(wetlandMesh);
+  assert.ok(coniferMesh);
+  assert.deepEqual(
+    matrixFor(wetlandMesh, candidates[2].candidateId),
+    canonicalTreeMatrix(candidates[2], SILHOUETTE_WETLAND_PRIMARY_PART),
+  );
+  assert.deepEqual(
+    matrixFor(coniferMesh, candidates[3].candidateId),
+    canonicalTreeMatrix(candidates[3], SILHOUETTE_CONIFER_PART),
+  );
+  assert.equal(broadleafMesh.material.flatShading, undefined);
+  assert.equal(broadleafMesh.material.shininess, undefined);
+  const ultraMesh = normal.meshes.find(mesh => (
+    mesh.name === 'w8-canonical-lod-natural-ultra-sphere-treeLeaves'
+  ));
+  assert.ok(ultraMesh);
+  assert.equal(ultraMesh.material, broadleafMesh.material);
+  const ultraTree = candidates[4];
+  const ultraMatrix = ultraMesh.matrices[ultraMesh.userData.canonicalStableIds.indexOf(
+    ultraTree.candidateId,
+  )].value;
+  const ultraVisual = resolveW8NaturalCandidateVisual(ultraTree);
+  assert.deepEqual(ultraMatrix, {
+    position: {
+      x: ultraTree.worldPosition.x * 256,
+      y: ultraTree.worldPosition.y * 256 + ultraVisual.heightMeters * 256 * 0.64,
+      z: ultraTree.worldPosition.z * 256,
+    },
+    rotation: { x: 0, y: Math.PI / 2, z: 0 },
+    scale: {
+      x: ultraVisual.widthMeters * 256 * 0.82,
+      y: ultraVisual.heightMeters * 256 * 0.72,
+      z: ultraVisual.depthMeters * 256 * 0.82,
+    },
+  });
+  normal.presentation.update(32, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+  assert.equal(normal.presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === broadleafSilhouette.candidateId
+  )).presentationTier, 'full');
+  const fullMatrix = broadleafMesh.matrices[broadleafMesh.userData.canonicalStableIds.indexOf(
+    broadleafSilhouette.candidateId,
+  )].value;
+  normal.presentation.update(-12, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+  assert.equal(normal.presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === broadleafSilhouette.candidateId
+  )).presentationTier, 'ultra');
+  const switchedUltraMatrix = ultraMesh.matrices[ultraMesh.userData.canonicalStableIds.indexOf(
+    broadleafSilhouette.candidateId,
+  )].value;
+  assert.deepEqual(fullMatrix, canonicalBroadleafMatrix);
+  assert.deepEqual(switchedUltraMatrix, canonicalBroadleafMatrix);
+  /* Full, silhouette, and Ultra share the authored canonical transform; LOD only reduces parts. */
   assert.deepEqual(broadleafAudit.identity.worldPosition, broadleafSilhouette.worldPosition);
   normal.presentation.dispose();
   reverse.presentation.dispose();
