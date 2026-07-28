@@ -14,6 +14,8 @@ import {
   resolveW8NaturalCandidateVisual,
   w8TerrainColorFromWeights,
 } from './w8-distant-presentation.js';
+import { resolveW8RockCanonicalObject } from '../rock-canonical-object.js';
+import { resolveW8CanonicalWorldObject } from '../world-object-canonical-contract.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
@@ -133,7 +135,9 @@ export class ChunkRenderAdapter {
     for (const mesh of registry.transparentMeshes) this.transparentMeshes.add(mesh);
   }
 
-  #registerFeatureInstance({ stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group }) {
+  #registerFeatureInstance({
+    stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group, canonicalObject = null,
+  }) {
     if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
     const registry = this.#registry();
     let existing = registry.featureInstances.get(stableId) ?? this.featureInstances.get(stableId);
@@ -144,7 +148,7 @@ export class ChunkRenderAdapter {
     if (!existing) {
       existing = {
         stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix,
-        parts: [], group, rubbleMesh: null,
+        parts: [], group, rubbleMesh: null, canonicalObject,
       };
       registry.featureInstances.set(stableId, existing);
     }
@@ -448,6 +452,7 @@ export class ChunkRenderAdapter {
           index,
           matrix: item.matrix,
           group,
+          canonicalObject: item.canonicalObject ?? null,
         });
       });
       mesh.instanceMatrix.needsUpdate = true;
@@ -479,6 +484,7 @@ export class ChunkRenderAdapter {
     if (deferredRegistration) this.projectionStaging = this.#createProjectionRegistry();
     try {
     const layers = chunkData.presentationLayers;
+    const usesW8CanonicalObjects = (chunkData.generatorVersion?.major ?? 0) >= 800;
     const canonicalCandidates = resolveW8CanonicalCandidateSet(chunkData);
     const { vegetation, rocks } = canonicalCandidates;
     const settlementFeatures = layers?.formal?.roadsAndBuildings ?? chunkData.settlementFeatures ?? [];
@@ -538,28 +544,39 @@ export class ChunkRenderAdapter {
     const vegetationParts = [];
     vegetation.forEach(candidate => {
       const formal = candidate.candidateId !== undefined;
+      const canonical = usesW8CanonicalObjects && formal
+        && candidate.worldPosition && candidate.owningChunkCoordinate
+        ? resolveW8CanonicalWorldObject(candidate) : null;
       const localX = formal
-        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+        ? (canonical?.position.x ?? candidate.worldPosition.x)
+          - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalX;
       const localZ = formal
-        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+        ? (canonical?.position.z ?? candidate.worldPosition.z)
+          - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
-      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
-      const visual = resolveW8NaturalCandidateVisual(candidate);
-      const descriptors = this.visualAssets.featureParts[visual.visualKind]
+      const groundY = formal
+        ? (canonical?.position.y ?? candidate.worldPosition.y) * this.unitsPerMeter : 0;
+      const visual = canonical ? null : resolveW8NaturalCandidateVisual(candidate);
+      const dimensions = canonical?.visualBounds ?? {
+        width: visual.widthMeters, height: visual.heightMeters, depth: visual.depthMeters,
+      };
+      const descriptors = canonical?.presentation.parts
+        ?? this.visualAssets.featureParts[visual.visualKind]
         ?? this.visualAssets.featureParts.broadleafTree;
       for (const descriptor of descriptors) {
         vegetationParts.push({
-          stableId: candidate.candidateId ?? candidate.stableId,
+          stableId: canonical?.stableId ?? candidate.candidateId ?? candidate.stableId,
+          canonicalObject: canonical,
           part: descriptor,
           matrix: createPartMatrix({
             localX,
             localZ,
             groundY,
-            rotationY: visual.rotationY,
-            width: visual.widthMeters * this.unitsPerMeter,
-            height: visual.heightMeters * this.unitsPerMeter,
-            depth: visual.depthMeters * this.unitsPerMeter,
+            rotationY: canonical?.rotation.y ?? visual.rotationY,
+            width: dimensions.width * this.unitsPerMeter,
+            height: dimensions.height * this.unitsPerMeter,
+            depth: dimensions.depth * this.unitsPerMeter,
             part: descriptor,
           }),
         });
@@ -577,24 +594,37 @@ export class ChunkRenderAdapter {
     const rockParts = [];
     rocks.forEach(candidate => {
       const formal = candidate.candidateId !== undefined;
+      const rock = usesW8CanonicalObjects && formal
+        && candidate.worldPosition && candidate.owningChunkCoordinate
+        ? resolveW8RockCanonicalObject(candidate) : null;
       const localX = formal
-        ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+        ? (rock?.position.x ?? candidate.worldPosition.x)
+          - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalX;
       const localZ = formal
-        ? candidate.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+        ? (rock?.position.z ?? candidate.worldPosition.z)
+          - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
-      const groundY = formal ? candidate.worldPosition.y * this.unitsPerMeter : 0;
-      const radiusMeters = formal ? candidate.metadata.candidateRadiusMeters : 0.45;
-      const variation = formal ? 0.9 + candidate.variationSeed * 0.2 : 1;
-      const width = radiusMeters * 2 * variation * this.unitsPerMeter;
-      const height = radiusMeters * 1.25 * variation * this.unitsPerMeter;
-      const rotationY = formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians;
-      const descriptor = this.visualAssets.featureParts.rock[0];
+      const groundY = formal ? (rock?.position.y ?? candidate.worldPosition.y) * this.unitsPerMeter : 0;
+      const rockDimensions = rock ? {
+        width: rock.widthMeters, height: rock.heightMeters, depth: rock.depthMeters,
+      } : {
+        width: 0.45, height: 0.45, depth: 0.45,
+      };
+      const descriptor = rock?.presentation.parts[0] ?? this.visualAssets.featureParts.rock[0];
       rockParts.push({
-        stableId: candidate.candidateId ?? candidate.stableId,
+        stableId: rock?.stableId ?? candidate.candidateId ?? candidate.stableId,
+        canonicalObject: rock,
         part: descriptor,
         matrix: createPartMatrix({
-          localX, localZ, groundY, rotationY, width, height, depth: width, part: descriptor,
+          localX,
+          localZ,
+          groundY,
+          rotationY: rock?.rotation.y ?? candidate.yawRadians,
+          width: rockDimensions.width * this.unitsPerMeter,
+          height: rockDimensions.height * this.unitsPerMeter,
+          depth: rockDimensions.depth * this.unitsPerMeter,
+          part: descriptor,
         }),
       });
     });
@@ -732,48 +762,72 @@ export class ChunkRenderAdapter {
 
       const buildingParts = [];
       buildings.forEach(building => {
-        const localX = building.worldPosition.x
+        const canonical = usesW8CanonicalObjects
+          && building.worldPosition && building.owningChunkCoordinate
+          ? resolveW8CanonicalWorldObject(building) : null;
+        const position = canonical?.position ?? building.worldPosition;
+        const rotationY = canonical?.rotation.y ?? building.rotationY;
+        const matrixDimensions = canonical ? {
+          width: canonical.widthMeters,
+          height: canonical.heightMeters,
+          depth: canonical.depthMeters,
+        } : {
+          width: building.widthMeters,
+          height: building.heightMeters,
+          depth: building.depthMeters,
+        };
+        const localX = position.x
           - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
-        const localZ = building.worldPosition.z
+        const localZ = position.z
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-        const descriptors = this.visualAssets.resolveBuildingParts?.(building)
+        const descriptors = (canonical
+          ? this.visualAssets.resolveBuildingParts?.(canonical)
+            ?? this.visualAssets.featureParts[canonical.presentation.partSetKey]
+            ?? canonical.presentation.parts
+          : this.visualAssets.resolveBuildingParts?.(building))
           ?? this.visualAssets.featureParts[building.buildingType];
         if (!descriptors) throw new Error(`unsupported production building visual: ${building.buildingType}`);
         for (const descriptor of descriptors) {
           buildingParts.push({
-            stableId: building.stableId,
+            stableId: canonical?.stableId ?? building.stableId,
+            canonicalObject: canonical,
             part: descriptor,
             matrix: createPartMatrix({
               localX,
               localZ,
-              groundY: building.worldPosition.y * this.unitsPerMeter,
-              rotationY: building.rotationY,
-              width: building.widthMeters * this.unitsPerMeter,
-              height: building.heightMeters * this.unitsPerMeter,
-              depth: building.depthMeters * this.unitsPerMeter,
+              groundY: position.y * this.unitsPerMeter,
+              rotationY,
+              width: matrixDimensions.width * this.unitsPerMeter,
+              height: matrixDimensions.height * this.unitsPerMeter,
+              depth: matrixDimensions.depth * this.unitsPerMeter,
               part: descriptor,
             }),
           });
         }
-        const visualHeightScale = Math.max(1, ...descriptors.map(descriptor => (
+        const cameraCollision = canonical?.collision;
+        const visualHeightScale = canonical ? null : Math.max(1, ...descriptors.map(descriptor => (
           descriptor.position[1] + descriptor.scale[1] * 0.5
         )));
-        const visualHalfWidthScale = Math.max(...descriptors.map(descriptor => (
+        const visualHalfWidthScale = canonical ? null : Math.max(...descriptors.map(descriptor => (
           Math.abs(descriptor.position[0]) + descriptor.scale[0] * 0.5
         )));
-        const visualHalfDepthScale = Math.max(...descriptors.map(descriptor => (
+        const visualHalfDepthScale = canonical ? null : Math.max(...descriptors.map(descriptor => (
           Math.abs(descriptor.position[2]) + descriptor.scale[2] * 0.5
         )));
         this.#registry().cameraCollisionBounds.push(Object.freeze({
           chunkKey: key,
-          stableId: building.stableId,
-          worldX: building.worldPosition.x,
-          worldZ: building.worldPosition.z,
-          groundY: building.worldPosition.y * this.unitsPerMeter,
-          halfWidth: building.widthMeters * visualHalfWidthScale * this.unitsPerMeter,
-          halfDepth: building.depthMeters * visualHalfDepthScale * this.unitsPerMeter,
-          height: building.heightMeters * visualHeightScale * this.unitsPerMeter,
-          rotationY: building.rotationY,
+          stableId: canonical?.stableId ?? building.stableId,
+          canonicalObject: canonical,
+          worldX: position.x,
+          worldZ: position.z,
+          groundY: position.y * this.unitsPerMeter,
+          halfWidth: (cameraCollision?.halfWidthMeters
+            ?? building.widthMeters * visualHalfWidthScale) * this.unitsPerMeter,
+          halfDepth: (cameraCollision?.halfDepthMeters
+            ?? building.depthMeters * visualHalfDepthScale) * this.unitsPerMeter,
+          height: (cameraCollision?.cameraHeightMeters
+            ?? building.heightMeters * visualHeightScale) * this.unitsPerMeter,
+          rotationY,
         }));
       });
       layerMeshes.buildings.push(...this.#createProductionPartMeshes({
@@ -820,23 +874,39 @@ export class ChunkRenderAdapter {
 
     const formalDetailParts = [];
     const ambientDetailParts = [];
-    const addDetail = (
-      target, { stableId, worldPosition, rotationY = 0, detailType, variation = 1 }, dimensions,
-    ) => {
-      const parts = this.visualAssets.featureParts[detailType];
+    const addDetail = (target, source, fallbackDimensions) => {
+      const canonicalEligible = usesW8CanonicalObjects
+        && source.worldPosition && source.owningChunkCoordinate && (
+        ['shrub', 'streetLamp', 'roadSign'].includes(source.detailType)
+        || typeof source.landmarkType === 'string'
+      );
+      const canonical = canonicalEligible ? resolveW8CanonicalWorldObject(source) : null;
+      const stableId = canonical?.stableId ?? source.stableId;
+      const worldPosition = canonical?.position ?? source.worldPosition;
+      const rotationY = canonical?.rotation.y ?? source.rotationY ?? 0;
+      const detailType = canonical?.presentation.partSetKey
+        ?? source.detailType ?? source.landmarkType;
+      const variation = canonical ? 1 : source.variation ?? 1;
+      const objectDimensions = canonical ? {
+        width: canonical.widthMeters,
+        height: canonical.heightMeters,
+        depth: canonical.depthMeters,
+      } : fallbackDimensions;
+      const parts = canonical?.presentation.parts ?? this.visualAssets.featureParts[detailType];
       if (!parts) return;
       const localX = worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
       const localZ = worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
       for (const part of parts) {
         target.push({
           stableId,
+          canonicalObject: canonical,
           part,
           matrix: createPartMatrix({
             localX, localZ, groundY: worldPosition.y * this.unitsPerMeter,
             rotationY,
-            width: dimensions.width * variation * this.unitsPerMeter,
-            height: dimensions.height * variation * this.unitsPerMeter,
-            depth: dimensions.depth * variation * this.unitsPerMeter,
+            width: objectDimensions.width * variation * this.unitsPerMeter,
+            height: objectDimensions.height * variation * this.unitsPerMeter,
+            depth: objectDimensions.depth * variation * this.unitsPerMeter,
             part,
           }),
         });
@@ -853,7 +923,7 @@ export class ChunkRenderAdapter {
         : { width: 1.2, height: 2.1, depth: 0.25 });
     }
     for (const landmark of settlementLandmarks) {
-      addDetail(formalDetailParts, { ...landmark, detailType: landmark.landmarkType }, {
+      addDetail(formalDetailParts, landmark, {
         width: landmark.widthMeters,
         height: landmark.heightMeters,
         depth: landmark.depthMeters,

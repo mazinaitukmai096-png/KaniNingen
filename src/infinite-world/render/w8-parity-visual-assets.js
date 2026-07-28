@@ -137,6 +137,11 @@ export const W8_PARITY_FEATURE_PARTS = Object.freeze({
     descriptor('sphere', 'treeLeavesForest', [0, 0.552, 0], [0.6875, 0.448, 0.6875]),
     descriptor('sphere', 'treeLeavesForest', [-0.265, 0.655, 0.265], [0.4375, 0.241, 0.4375]),
   ]),
+  // finite rock/pebble used a unit dodecahedron with its centre at half its
+  // scale.  The projection supplies that finite scale in metres.
+  rock: Object.freeze([
+    descriptor('dodeca', 'rock', [0, 0.5, 0], [1, 1, 1]),
+  ]),
   grass: Object.freeze([
     descriptor('box', 'grass', [-0.13, 0.3, 0], [0.08, 0.6, 0.08], [0, 0, -0.16]),
     descriptor('box', 'grassLight', [0.12, 0.25, 0.05], [0.07, 0.5, 0.07], [0, 0, 0.2]),

@@ -30,6 +30,9 @@ import {
 import { createDeterministicRandom, deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js';
+import { resolveW8RockCanonicalObject } from './rock-canonical-object.js';
+import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
+import { resolveCanonicalPlayerMovement } from './player-world-collision.js';
 
 const EPSILON_METERS = 0.05;
 const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
@@ -369,51 +372,79 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
   const usesW8Presentation = (chunkData.generatorVersion?.major ?? generatorMajor) >= 800;
   for (const candidate of vegetationCandidates) {
     if (usesW8Presentation && !isW8NaturalCandidateVisible(candidate)) continue;
-    const radius = (candidate.metadata?.candidateRadiusMeters ?? 0.625) * 40;
+    const canonical = usesW8Presentation ? resolveW8CanonicalWorldObject(candidate) : null;
+    const radius = canonical
+      ? canonical.interaction.radiusMeters * 40
+      : (candidate.metadata?.candidateRadiusMeters ?? 0.625) * 40;
+    const type = canonical?.interaction.targetType ?? 'tree';
     staticTargets.push(staticTarget(
-      candidate,
-      'tree',
-      W6_STATIC_TARGET_CONTRACTS.tree,
-      candidate.worldPosition,
-      radius,
-    ));
-  }
-  for (const candidate of chunkData.rockCandidates ?? []) {
-    const radius = (candidate.metadata?.candidateRadiusMeters ?? 0.6) * 40;
-    const type = radius <= W6_STATIC_TARGET_CONTRACTS.pebble.radius ? 'pebble' : 'rock';
-    staticTargets.push(staticTarget(
-      candidate,
+      canonical ?? candidate,
       type,
       W6_STATIC_TARGET_CONTRACTS[type],
-      candidate.worldPosition,
+      canonical?.position ?? candidate.worldPosition,
       radius,
+      canonical ? { canonicalObject: canonical } : undefined,
+    ));
+  }
+  const rockCandidates = usesW8Presentation
+    ? chunkData.presentationLayers?.natural?.rocks ?? chunkData.rockCandidates ?? []
+    : chunkData.rockCandidates ?? [];
+  for (const candidate of rockCandidates) {
+    const rock = usesW8Presentation ? resolveW8RockCanonicalObject(candidate) : null;
+    const radius = rock
+      ? rock.interaction.radiusMeters * 40
+      : (candidate.metadata?.candidateRadiusMeters ?? 0.6) * 40;
+    const type = rock?.interaction.targetType
+      ?? (radius <= W6_STATIC_TARGET_CONTRACTS.pebble.radius ? 'pebble' : 'rock');
+    staticTargets.push(staticTarget(
+      rock ?? candidate,
+      type,
+      W6_STATIC_TARGET_CONTRACTS[type],
+      rock?.worldPosition ?? candidate.worldPosition,
+      radius,
+      rock ? {
+        canonicalObject: rock,
+        canonicalObjectSchema: rock.schemaVersion,
+        collisionShape: rock.collision.shape,
+        collisionHeightMeters: rock.collision.heightMeters,
+        visualSizeClass: rock.sizeClass,
+      } : undefined,
     ));
   }
   for (const building of buildings) {
-    const contract = W6_STATIC_TARGET_CONTRACTS[building.buildingType];
+    const canonical = usesW8Presentation ? resolveW8CanonicalWorldObject(building) : null;
+    const type = canonical?.interaction.targetType ?? building.buildingType;
+    const contract = W6_STATIC_TARGET_CONTRACTS[type];
     if (contract) staticTargets.push(staticTarget(
-      building,
-      building.buildingType,
+      canonical ?? building,
+      type,
       contract,
-      building.worldPosition,
-      building.radiusMeters * 40,
+      canonical?.position ?? building.worldPosition,
+      (canonical?.interaction.radiusMeters ?? building.radiusMeters) * 40,
+      canonical ? { canonicalObject: canonical } : undefined,
     ));
   }
   const worldDetailDescriptors = [...(chunkData.ambientDetails ?? []), ...(chunkData.streetDetails ?? [])]
     .map(detail => {
       const contract = W8_WORLD_DETAIL_CONTRACTS[detail.detailType];
       if (!contract) throw new Error(`unsupported W8 World Detail type: ${detail.detailType}`);
+      const canonical = usesW8Presentation
+        && ['shrub', 'streetLamp', 'roadSign'].includes(detail.detailType)
+        ? resolveW8CanonicalWorldObject(detail) : null;
+      const position = canonical?.position ?? detail.worldPosition;
       return Object.freeze({
-        stableId: detail.stableId,
-        ownerChunkKey,
-        type: detail.detailType,
+        stableId: canonical?.stableId ?? detail.stableId,
+        ownerChunkKey: canonical
+          ? createChunkKey(canonical.owner.x, canonical.owner.z) : ownerChunkKey,
+        type: canonical?.objectType ?? detail.detailType,
         worldDetail: true,
-        destructible: contract.destructible,
-        radius: contract.radius,
+        destructible: canonical?.destruction.destructible ?? contract.destructible,
+        radius: canonical ? canonical.interaction.radiusMeters * 40 : contract.radius,
         color: contract.color,
-        x: detail.worldPosition.x,
-        y: detail.worldPosition.y ?? 0,
-        z: detail.worldPosition.z,
+        x: position.x,
+        y: position.y ?? 0,
+        z: position.z,
+        ...(canonical ? { canonicalObject: canonical } : {}),
       });
     }).sort((left, right) => left.stableId.localeCompare(right.stableId));
   for (const detail of worldDetailDescriptors.filter(value => value.destructible)) {
@@ -423,21 +454,27 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
       detail.type,
       contract,
       detail,
-      contract.radius,
-      { worldDetail: true, presentationColor: contract.color },
+      detail.radius,
+      {
+        worldDetail: true,
+        presentationColor: contract.color,
+        ...(detail.canonicalObject ? { canonicalObject: detail.canonicalObject } : {}),
+      },
     ));
   }
   for (const landmark of chunkData.settlementLandmarks ?? []) {
-    const type = W6_STATIC_TARGET_CONTRACTS[landmark.landmarkType]
+    const canonical = usesW8Presentation ? resolveW8CanonicalWorldObject(landmark) : null;
+    const type = canonical?.interaction.targetType ?? (W6_STATIC_TARGET_CONTRACTS[landmark.landmarkType]
       ? landmark.landmarkType
-      : 'house';
+      : 'house');
     const contract = W6_STATIC_TARGET_CONTRACTS[type];
     staticTargets.push(staticTarget(
-      landmark,
+      canonical ?? landmark,
       type,
       contract,
-      landmark.worldPosition,
-      contract.radius,
+      canonical?.position ?? landmark.worldPosition,
+      canonical ? canonical.interaction.radiusMeters * 40 : contract.radius,
+      canonical ? { canonicalObject: canonical } : undefined,
     ));
   }
   entityDescriptors.sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -457,10 +494,15 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
         type: 'water', x: surface.worldPosition.x, z: surface.worldPosition.z,
         radius: Math.hypot(surface.widthMeters, surface.depthMeters) / 2,
       })),
-      ...buildings.map(building => Object.freeze({
-        type: 'building', x: building.worldPosition.x, z: building.worldPosition.z,
-        radius: building.radiusMeters + 0.5,
-      })),
+      ...buildings.map(building => {
+        const canonical = usesW8Presentation ? resolveW8CanonicalWorldObject(building) : null;
+        const position = canonical?.position ?? building.worldPosition;
+        return Object.freeze({
+          type: 'building', x: position.x, z: position.z,
+          radius: (canonical?.collision.radiusMeters ?? building.radiusMeters) + 0.5,
+          ...(canonical ? { canonicalObject: canonical } : {}),
+        });
+      }),
     ]),
   });
 }
@@ -506,6 +548,8 @@ export class InfiniteGameplayRuntime {
     this.maximumSpatialTargetRadiusMeters = finiteWorldUnitsToMeters(
       W6_ENTITY_CONTRACTS.human.radius,
     );
+    this.maximumPlayerBlockingRadiusMeters = 0;
+    this.playerBlockingColliderCount = 0;
     this.stableIdOwners = new Map();
     this.lastAttackAt = -Infinity;
     this.projectiles = [];
