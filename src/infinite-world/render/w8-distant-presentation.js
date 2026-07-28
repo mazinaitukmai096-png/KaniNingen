@@ -19,8 +19,7 @@ const FIVE_BY_FIVE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 2.5;
 const CLIPMAP_EXTENT_METERS = 352;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
-const DISTANT_ROCK_PROXY_LIMIT = 64;
-const DISTANT_NATURAL_PROXY_SPACING_METERS = 18;
+const DISTANT_ROCK_PROXY_LIMIT = 0;
 const DISTANT_WATER_PROXY_LIMIT = 24;
 const TEMPLATE_CACHE_CAPACITY = 4;
 const FAR_OWNER_CHUNK_CACHE_CAPACITY = 128;
@@ -79,6 +78,22 @@ export function resolveW8NaturalCandidateVisual(candidate) {
     heightMeters: (shrub ? 0.85 : 3.625) * variation,
     depthMeters: widthMeters,
     rotationY: formal ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians,
+  });
+}
+
+export function resolveW8CanonicalCandidateSet(chunkData) {
+  const layers = chunkData?.presentationLayers;
+  const vegetationSource = layers?.natural?.vegetation
+    ?? chunkData?.vegetationCandidates ?? chunkData?.vegetationProxies ?? [];
+  const vegetation = vegetationSource.filter(candidate => {
+    const formal = candidate?.candidateId !== undefined;
+    return !(formal && chunkData?.generatorVersion?.major >= 800)
+      || isW8NaturalCandidateVisible(candidate);
+  });
+  return Object.freeze({
+    vegetation: Object.freeze(vegetation),
+    rocks: Object.freeze([...(layers?.natural?.rocks
+      ?? chunkData?.rockCandidates ?? chunkData?.rockProxies ?? [])]),
   });
 }
 
@@ -308,6 +323,7 @@ export async function createW8DistantPresentation({
     canonicalVegetationRecordCount: 0,
     canonicalTreeRecordCount: 0,
     canonicalShrubRecordCount: 0,
+    canonicalRockRecordCount: 0,
     canonicalLandmarkRecordCount: 0,
     canonicalRoadRecordCount: 0,
     canonicalMeshCount: 0,
@@ -323,6 +339,7 @@ export async function createW8DistantPresentation({
     visibleCanonicalVegetationCount: 0,
     visibleCanonicalTreeCount: 0,
     visibleCanonicalShrubCount: 0,
+    visibleCanonicalRockCount: 0,
     visibleCanonicalFullTreeCount: 0,
     visibleCanonicalSilhouetteTreeCount: 0,
     visibleCanonicalUltraTreeCount: 0,
@@ -515,81 +532,6 @@ export async function createW8DistantPresentation({
     buildTarget.add(mesh);
   };
 
-  const createMidgroundNaturalFeatures = (chunks, origin, centerChunkX, centerChunkZ) => {
-    const buckets = new Map();
-    const push = (geometry, material, matrix, name) => {
-      const key = `${geometry}:${material}:${name}`;
-      if (!buckets.has(key)) buckets.set(key, { geometry, material, name, matrices: [] });
-      buckets.get(key).matrices.push(matrix.clone?.() ?? structuredClone(matrix));
-    };
-    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
-    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const matrixForPart = (feature, part, dimensions) => {
-      const rotationY = Number.isFinite(feature.rotationY)
-        ? feature.rotationY
-        : Number.isFinite(feature.orientationSeed) ? feature.orientationSeed * Math.PI * 2 : 0;
-      const offsetX = part.position[0] * dimensions.width;
-      const offsetZ = part.position[2] * dimensions.depth;
-      const cosine = Math.cos(rotationY); const sine = Math.sin(rotationY);
-      transform.position.set(
-        (feature.worldPosition.x - originMetersX) * UNITS_PER_METER + offsetX * cosine + offsetZ * sine,
-        feature.worldPosition.y * UNITS_PER_METER + part.position[1] * dimensions.height,
-        (feature.worldPosition.z - originMetersZ) * UNITS_PER_METER - offsetX * sine + offsetZ * cosine,
-      );
-      transform.rotation.set(part.rotation[0], rotationY + part.rotation[1], part.rotation[2]);
-      transform.scale.set(
-        dimensions.width * part.scale[0],
-        dimensions.height * part.scale[1],
-        dimensions.depth * part.scale[2],
-      );
-      transform.updateMatrix();
-      return transform.matrix;
-    };
-    const addParts = (feature, kind, dimensions, name) => {
-      if (isFeatureDestroyed(feature.stableId ?? feature.candidateId)) return;
-      const parts = feature.featureType === 'settlement-building'
-        ? visualAssets.resolveBuildingParts?.(feature) ?? visualAssets.featureParts[kind]
-        : visualAssets.featureParts[kind];
-      for (const part of parts ?? []) {
-        push(part.geometry, part.material, matrixForPart(feature, part, dimensions), name);
-      }
-    };
-    for (const chunk of chunks) {
-      const layers = chunk.presentationLayers;
-      for (const candidate of layers?.natural?.rocks ?? chunk.rockCandidates ?? []) {
-        const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-        const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-        const presentationDistanceChunks = Math.hypot(
-          candidate.worldPosition.x - centerWorldX,
-          candidate.worldPosition.z - centerWorldZ,
-        ) / LOGICAL_CHUNK_SIZE_METERS;
-        if (candidate.variationSeed < clamp(
-          0.42 + Math.max(0, presentationDistanceChunks - 1.5) * 0.12,
-          0.42,
-          0.68,
-        )) continue;
-        const radius = candidate.metadata.candidateRadiusMeters * (0.9 + candidate.variationSeed * 0.2);
-        addParts(candidate, 'rock', {
-          width: radius * 2 * UNITS_PER_METER,
-          height: radius * 1.25 * UNITS_PER_METER,
-          depth: radius * 2 * UNITS_PER_METER,
-        }, 'major-natural');
-      }
-    }
-    for (const bucket of buckets.values()) {
-      const geometry = bucket.geometry === '__road__'
-        ? roadGeometry : visualAssets.geometries[bucket.geometry];
-      const material = visualAssets.materials[bucket.material];
-      const mesh = new InstancedMesh(geometry, material, Math.max(1, bucket.matrices.length));
-      mesh.name = `w8-midground-${bucket.name}-${bucket.geometry}-${bucket.material}`;
-      mesh.count = bucket.matrices.length;
-      bucket.matrices.forEach((matrix, index) => mesh.setMatrixAt(index, matrix));
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.castShadow = false; mesh.receiveShadow = false;
-      buildTarget.add(mesh);
-    }
-  };
-
   const canonicalNaturalRecord = candidate => {
     const stableId = candidate?.candidateId ?? candidate?.stableId;
     const visual = resolveW8NaturalCandidateVisual(candidate);
@@ -613,12 +555,34 @@ export async function createW8DistantPresentation({
     });
   };
 
+  const canonicalRockRecord = candidate => {
+    const stableId = candidate?.candidateId ?? candidate?.stableId;
+    const radiusMeters = candidate?.metadata?.candidateRadiusMeters ?? 0.45;
+    const variation = candidate?.candidateId !== undefined
+      ? 0.9 + candidate.variationSeed * 0.2 : 1;
+    return Object.freeze({
+      stableId,
+      candidateId: stableId,
+      featureType: 'natural-rock',
+      worldPosition: candidate.worldPosition,
+      rotationY: candidate?.candidateId !== undefined
+        ? candidate.orientationSeed * Math.PI * 2 : candidate.yawRadians,
+      widthMeters: radiusMeters * 2 * variation,
+      heightMeters: radiusMeters * 1.25 * variation,
+      depthMeters: radiusMeters * 2 * variation,
+      owningChunkCoordinate: candidate.owningChunkCoordinate,
+      destructible: true,
+      visual: Object.freeze({ visualKind: 'rock', variationSeed: candidate.variationSeed ?? null }),
+    });
+  };
+
   const canonicalPartsFor = record => {
     if (record.featureType === 'settlement-building') {
       return visualAssets.resolveBuildingParts?.(record)
         ?? visualAssets.featureParts[record.buildingType] ?? null;
     }
-    if (record.featureType === 'natural-vegetation') {
+    if (record.featureType === 'natural-vegetation'
+      || record.featureType === 'natural-rock') {
       return visualAssets.featureParts[record.visual?.visualKind] ?? null;
     }
     if (record.landmarkType) return visualAssets.featureParts[record.landmarkType] ?? null;
@@ -628,7 +592,7 @@ export async function createW8DistantPresentation({
   const canonicalIdentity = (record, chunk, parts) => ({
     stableId: record.stableId,
     settlementId: record.settlementId ?? record.parentSettlementId ?? null,
-    ...(record.featureType === 'natural-vegetation' ? {
+    ...(record.candidateId ? {
       candidateId: record.candidateId,
       subtype: record.subtype ?? null,
     } : {}),
@@ -736,6 +700,8 @@ export async function createW8DistantPresentation({
       buildStats.canonicalVegetationRecordCount += 1;
       if (record.subtype === 'shrub') buildStats.canonicalShrubRecordCount += 1;
       else buildStats.canonicalTreeRecordCount += 1;
+    } else if (record.featureType === 'natural-rock') {
+      buildStats.canonicalRockRecordCount += 1;
     } else if (record.featureType === 'settlement-road') {
       buildStats.canonicalRoadRecordCount += 1;
     } else if (record.landmarkType) {
@@ -863,8 +829,9 @@ export async function createW8DistantPresentation({
         part.geometry,
         part.material,
         silhouette ? 'natural-silhouette'
-          : record.featureType === 'natural-vegetation' ? 'natural'
-          : record.landmarkType ? 'landmark' : 'building',
+          : ['natural-vegetation', 'natural-rock'].includes(record.featureType)
+            ? 'natural'
+            : record.landmarkType ? 'landmark' : 'building',
         canonicalPartMatrix(record, part, dimensions, origin),
         silhouette ? Object.freeze(['full', 'silhouette']) : undefined,
       );
@@ -906,18 +873,30 @@ export async function createW8DistantPresentation({
     naturalQueryCenter = null,
     queryRadius = Infinity,
     naturalQueryRadius = Infinity,
+    naturalDetailQueryRadius = Infinity,
   }) => {
     const layers = chunk.presentationLayers;
     if (includeNatural) {
-      const vegetation = layers?.natural?.vegetation ?? chunk.vegetationCandidates ?? [];
-      for (const candidate of vegetation) {
-        if (!isW8NaturalCandidateVisible(candidate)) continue;
+      const candidates = resolveW8CanonicalCandidateSet(chunk);
+      for (const candidate of candidates.vegetation) {
         if (naturalQueryCenter && Math.hypot(
           candidate.worldPosition.x - naturalQueryCenter.x,
           candidate.worldPosition.z - naturalQueryCenter.z,
         ) > naturalQueryRadius) continue;
         addCanonicalRecord({
           record: canonicalNaturalRecord(candidate),
+          chunk,
+          origin,
+          farEligible: farNaturalEligible,
+        });
+      }
+      for (const candidate of candidates.rocks) {
+        if (naturalQueryCenter && Math.hypot(
+          candidate.worldPosition.x - naturalQueryCenter.x,
+          candidate.worldPosition.z - naturalQueryCenter.z,
+        ) > naturalDetailQueryRadius) continue;
+        addCanonicalRecord({
+          record: canonicalRockRecord(candidate),
           chunk,
           origin,
           farEligible: farNaturalEligible,
@@ -1233,6 +1212,7 @@ export async function createW8DistantPresentation({
     let visibleVegetationCount = 0;
     let visibleTreeCount = 0;
     let visibleShrubCount = 0;
+    let visibleRockCount = 0;
     let visibleFullTreeCount = 0;
     let visibleSilhouetteTreeCount = 0;
     let visibleUltraTreeCount = 0;
@@ -1254,8 +1234,13 @@ export async function createW8DistantPresentation({
       const distanceMeters = Math.hypot(object.worldX - playerX, object.worldZ - playerZ);
       const tree = object.record.featureType === 'natural-vegetation'
         && object.record.subtype !== 'shrub';
+      const natural = object.record.featureType === 'natural-vegetation'
+        || object.record.featureType === 'natural-rock';
       const highTreeVisibility = generation.quality === 'high' && tree
         ? W8_HIGH_TREE_ULTRA_VISIBILITY_METERS : naturalVisibility;
+      const insideNaturalVisibility = generation.quality === 'high' && tree
+        ? distanceMeters < highTreeVisibility
+        : distanceMeters <= highTreeVisibility;
       if (object.destructible && isFeatureDestroyed(object.stableId)) {
         nextLod = 'destroyed';
         if (isHorizonRecord(object.record)
@@ -1266,14 +1251,12 @@ export async function createW8DistantPresentation({
       } else if (generation.renderedKeys.has(object.ownerKey)) {
         nextLod = 'near';
       } else if (generation.activeKeys.has(object.ownerKey)
-        && (!tree || distanceMeters < highTreeVisibility)) {
+        && (!natural || insideNaturalVisibility)) {
         nextLod = 'mid';
       } else if (object.farEligible) {
-        const visibilityDistance = object.record.featureType === 'natural-vegetation'
-          ? highTreeVisibility : visibility;
-        const insideVisibility = generation.quality === 'high' && tree
-          ? distanceMeters < visibilityDistance
-          : distanceMeters <= visibilityDistance;
+        const insideVisibility = natural
+          ? insideNaturalVisibility
+          : distanceMeters <= visibility;
         if (insideVisibility) nextLod = 'far';
       }
       const distantVisible = nextLod === 'far' || nextLod === 'mid';
@@ -1343,6 +1326,9 @@ export async function createW8DistantPresentation({
             )).length;
           }
         }
+      } else if ((nextLod === 'far' || nextLod === 'mid' || nextLod === 'near')
+        && object.record.featureType === 'natural-rock') {
+        visibleRockCount += 1;
       } else if (isHorizonRecord(object.record)
         && (nextLod === 'far' || nextLod === 'mid' || nextLod === 'near')) {
         if (presentationTier === 'horizon') {
@@ -1378,6 +1364,7 @@ export async function createW8DistantPresentation({
     generation.stats.visibleCanonicalVegetationCount = visibleVegetationCount;
     generation.stats.visibleCanonicalTreeCount = visibleTreeCount;
     generation.stats.visibleCanonicalShrubCount = visibleShrubCount;
+    generation.stats.visibleCanonicalRockCount = visibleRockCount;
     generation.stats.visibleCanonicalFullTreeCount = visibleFullTreeCount;
     generation.stats.visibleCanonicalSilhouetteTreeCount = visibleSilhouetteTreeCount;
     generation.stats.visibleCanonicalUltraTreeCount = visibleUltraTreeCount;
@@ -1454,8 +1441,8 @@ export async function createW8DistantPresentation({
     buildTarget.add(mesh); buildStats.clipmapMeshCount = 1;
   };
 
-  const createDistantNaturalAndWaterProxies = ({
-    centerChunkX, centerChunkZ, activeChunks, origin,
+  const createDistantWaterProxies = ({
+    centerChunkX, centerChunkZ, origin,
   }) => {
     const seed = textHash(worldSeedHash);
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
@@ -1467,24 +1454,6 @@ export async function createW8DistantPresentation({
       const key = `${geometry}:${material}:${name}`;
       if (!buckets.has(key)) buckets.set(key, { geometry, material, name, matrices: [] });
       buckets.get(key).matrices.push(transform.matrix.clone?.() ?? structuredClone(transform.matrix));
-    };
-    const placePart = ({ worldX, worldZ, height, rotationY, dimensions, part, fade }) => {
-      const offsetX = part.position[0] * dimensions.width;
-      const offsetZ = part.position[2] * dimensions.depth;
-      const cosine = Math.cos(rotationY); const sine = Math.sin(rotationY);
-      transform.position.set(
-        (worldX - originMetersX) * UNITS_PER_METER + offsetX * cosine + offsetZ * sine,
-        height * UNITS_PER_METER + part.position[1] * dimensions.height,
-        (worldZ - originMetersZ) * UNITS_PER_METER - offsetX * sine + offsetZ * cosine,
-      );
-      transform.rotation.set(part.rotation[0], rotationY + part.rotation[1], part.rotation[2]);
-      transform.scale.set(
-        dimensions.width * part.scale[0] * fade,
-        dimensions.height * part.scale[1] * fade,
-        dimensions.depth * part.scale[2] * fade,
-      );
-      transform.updateMatrix();
-      push(part.geometry, part.material, 'finite-language-proxy');
     };
     const fadeAt = (worldX, worldZ) => smoothstep((
       Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ))
@@ -1499,35 +1468,6 @@ export async function createW8DistantPresentation({
         for (let cellX = minimumX; cellX <= maximumX; cellX += 1) operation(cellX, cellZ);
       }
     };
-
-    forAnchoredGrid(DISTANT_NATURAL_PROXY_SPACING_METERS, (cellX, cellZ) => {
-      if (buildStats.distantRockProxyCount >= DISTANT_ROCK_PROXY_LIMIT
-        || cellRoll(seed, cellX, cellZ, 1) > 0.25) return;
-      const worldX = (cellX + 0.18 + cellRoll(seed, cellX, cellZ, 2) * 0.64)
-        * DISTANT_NATURAL_PROXY_SPACING_METERS;
-      const worldZ = (cellZ + 0.18 + cellRoll(seed, cellX, cellZ, 3) * 0.64)
-        * DISTANT_NATURAL_PROXY_SPACING_METERS;
-      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
-      if (!isW8DistantNaturalProxyInRange(distance)) return;
-      const fade = 1;
-      const roll = cellRoll(seed, cellX, cellZ, 4);
-      if (roll <= 0.9) return;
-      const sample = baseClipmapSample(worldX, worldZ);
-      const activeHeight = sampleActiveTerrain(activeChunks, worldX, worldZ);
-      const size = 0.78 + cellRoll(seed, cellX, cellZ, 5) * 0.48;
-      const dimensions = {
-        width: 1.8 * size * UNITS_PER_METER,
-        height: 1.1 * size * UNITS_PER_METER,
-        depth: 1.8 * size * UNITS_PER_METER,
-      };
-      for (const part of visualAssets.featureParts.rock ?? []) placePart({
-        worldX, worldZ, height: activeHeight ?? sample.height,
-        rotationY: cellRoll(seed, cellX, cellZ, 6) * Math.PI * 2,
-        dimensions, part, fade,
-      });
-      buildStats.distantNaturalProxyCount += 1;
-      buildStats.distantRockProxyCount += 1;
-    });
 
     forAnchoredGrid(64, (cellX, cellZ) => {
       if (buildStats.distantWaterProxyCount >= DISTANT_WATER_PROXY_LIMIT
@@ -1564,7 +1504,7 @@ export async function createW8DistantPresentation({
     }
   };
 
-  const mapWithQueryConcurrency = async (values, operation) => {
+  const mapWithQueryConcurrency = async (values, operation, assertCurrent = null) => {
     const results = new Array(values.length);
     let cursor = 0;
     const acquireQuerySlot = () => {

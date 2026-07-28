@@ -15,6 +15,7 @@ import {
   createW8ClipmapTopology,
   isW8DistantNaturalProxyInRange,
   isW8NaturalCandidateVisible,
+  resolveW8CanonicalCandidateSet,
   resolveW8NaturalCandidateVisual,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
@@ -147,6 +148,14 @@ const TREE_PART = Object.freeze({
   rotation: Object.freeze([0, 0, 0]),
 });
 
+const ROCK_PART = Object.freeze({
+  geometry: 'box',
+  material: 'bush',
+  position: Object.freeze([0, 0.42, 0]),
+  scale: Object.freeze([1, 0.72, 1]),
+  rotation: Object.freeze([0, 0, 0]),
+});
+
 function createDistantTestVisualAssets() {
   const geometry = new DistantTestGeometry();
   const material = () => new DistantTestMaterial();
@@ -166,7 +175,7 @@ function createDistantTestVisualAssets() {
       broadleafTree: [TREE_PART],
       wetlandTree: [TREE_PART],
       shrub: [SHRUB_PART],
-      rock: [],
+      rock: [ROCK_PART],
     },
     resolveBuildingParts: record =>
       record.buildingType === 'house' ? [CANONICAL_HOUSE_PART] : null,
@@ -537,7 +546,7 @@ test('five-run acceptance uses finite, before-W8, and after-W8 medians without w
   assert.throws(() => evaluateW8PerformanceRuns({ finiteReports: [], w8Reports }), /exactly five/);
 });
 
-test('natural-object selection is distance-stable and canonical visibility is bounded', () => {
+test('natural-object selection has no 12m cluster threshold and canonical visibility is bounded', () => {
   const candidate = {
     candidateId: 'detail-v1:vegetation:lod-stability',
     subtype: 'broadleaf-tree',
@@ -549,7 +558,13 @@ test('natural-object selection is distance-stable and canonical visibility is bo
     isW8NaturalCandidateVisible(candidate, 12),
     'camera distance must not change the canonical tree set',
   );
-  assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 0 }), false);
+  for (const worldX of [0.001, 11.999, 12.001, 23.999, 24.001]) {
+    assert.equal(
+      isW8NaturalCandidateVisible({ ...candidate, worldPosition: { x: worldX, y: 0, z: 11.999 }, variationSeed: 0 }),
+      true,
+      `12m boundary at ${worldX} must not change candidate admission`,
+    );
+  }
   assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 1 }), true);
 
   assert.deepEqual(W8_NATURAL_CANONICAL_VISIBILITY_METERS, {
@@ -698,6 +713,65 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
   await new Promise(resolve => setImmediate(resolve));
   releaseQuery();
   assert.equal(await pendingFarSync, true);
+  presentation.dispose();
+});
+
+test('Near, Outer, and Far use one canonical natural candidate set', async () => {
+  const tree = Object.freeze({
+    candidateId: 'detail-v1:vegetation:stage-3a-tree',
+    subtype: 'broadleaf-tree',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const rock = Object.freeze({
+    candidateId: 'detail-v1:rock:stage-3a-rock',
+    variationSeed: 0.25,
+    orientationSeed: 0.5,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.45 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.generatorVersion = { major: 800, minor: 0, patch: 0 };
+  chunk.vegetationCandidates = [tree];
+  chunk.rockCandidates = [rock];
+  chunk.presentationLayers.natural = { vegetation: [tree], rocks: [rock] };
+
+  const sourceSet = resolveW8CanonicalCandidateSet(chunk);
+  assert.deepEqual(sourceSet.vegetation.map(value => value.candidateId), [tree.candidateId]);
+  assert.deepEqual(sourceSet.rocks.map(value => value.candidateId), [rock.candidateId]);
+
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? chunk : null
+    ),
+  });
+  const expectedStableIds = [tree.candidateId, rock.candidateId].sort();
+  for (const state of [
+    { lod: 'far', centerChunkX: 2, activeDataKeys: [], renderedKeys: [] },
+    { lod: 'mid', centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [] },
+    { lod: 'near', centerChunkX: 4, activeDataKeys: ['5,0'], renderedKeys: ['5,0'] },
+  ]) {
+    assert.equal(await presentation.sync(canonicalSyncInput({ ...state, chunk })), true);
+    const audit = presentation.canonicalAuditSnapshot();
+    assert.deepEqual(audit.map(value => value.identity.stableId).sort(), expectedStableIds);
+    assert.equal(audit.every(value => value.visibleLod === state.lod), true);
+    assert.equal(new Set(audit.map(value => value.ownerKey)).size, 1);
+    const snapshot = presentation.snapshot();
+    assert.equal(snapshot.canonicalVegetationRecordCount, 1);
+    assert.equal(snapshot.canonicalRockRecordCount, 1);
+    assert.equal(snapshot.distantRockProxyCount, 0);
+    assert.equal(snapshot.distantNaturalProxyCount, 0);
+  }
   presentation.dispose();
 });
 

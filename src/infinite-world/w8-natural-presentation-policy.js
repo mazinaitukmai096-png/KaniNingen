@@ -20,17 +20,6 @@ export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze({
   low: 40,
 });
 
-function presentationClusterRoll(candidate) {
-  const x = Math.floor((candidate?.worldPosition?.x ?? 0) / 12);
-  const z = Math.floor((candidate?.worldPosition?.z ?? 0) / 12);
-  let value = Math.imul(x ^ 0x51ed270b, 0x85ebca6b)
-    ^ Math.imul(z ^ 0x68bc21eb, 0xc2b2ae35);
-  value ^= value >>> 16;
-  value = Math.imul(value, 0x7feb352d);
-  value ^= value >>> 15;
-  return (value >>> 0) / 0x1_0000_0000;
-}
-
 function mix32(value) {
   let result = value >>> 0;
   result ^= result >>> 16;
@@ -204,25 +193,20 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
     selectVegetation({ candidates, settlementReferences, experienceSpawn, introDistanceMeters }) {
       return Object.freeze((candidates ?? []).filter(candidate => (
         candidate?.subtype === 'shrub'
-          || (isW8NaturalCandidateVisible(candidate) && evaluateTree({
+          || evaluateTree({
             candidate,
             settlementReferences,
             experienceSpawn,
             introDistanceMeters,
-          }).accepted)
+          }).accepted
       )));
     },
   });
 }
 
-export function isW8NaturalCandidateVisible(candidate) {
-  if (candidate?.candidateId === undefined) return true;
-  const cluster = presentationClusterRoll(candidate);
-  const clusteredThreshold = cluster < 0.28 ? 0.32 : cluster < 0.65 ? 0.58 : 0.78;
-  const subtypeAdjustment = candidate.subtype === 'shrub' ? -0.08 : 0;
-  return candidate.variationSeed >= clamp(
-    clusteredThreshold + subtypeAdjustment,
-    0.12,
-    0.82,
-  );
+export function isW8NaturalCandidateVisible() {
+  // Stage 3B: the former 12m quantized cluster threshold was a presentation-only
+  // filter that made density appear to reset at Chunk-like intervals.  Candidate
+  // admission now remains with the existing continuous 96m/32m Phase 1 fields.
+  return true;
 }

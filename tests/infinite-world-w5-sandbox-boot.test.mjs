@@ -444,8 +444,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(WebGLRenderer.instances.length, 1);
     assert.equal(WebGLRenderer.instances[0].renderCount, 1);
     assert.equal(environment.viewport.children.length, 1);
-    assert.match(environment.hud.innerHTML, /World Seed:/);
-    assert.doesNotMatch(environment.hud.innerHTML, /起動中/);
+    assert.doesNotMatch(environment.hud.innerHTML, /World Seed:/);
+    assert.match(environment.hud.innerHTML, /W8 \/ FINITE EXPERIENCE PARITY/);
 
     const gameplayScene = Scene.instances[0];
     assert.equal(Scene.instances.length, 1);
@@ -493,9 +493,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.presentation.maximumInnerBoundaryErrorMeters <= 0.001);
     assert.ok(snapshot.presentation.maximumInnerBoundaryColorDifference <= 0.03);
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
-    assert.equal(snapshot.presentation.distantNaturalProxyCount, 46);
-    assert.equal(snapshot.presentation.distantRockProxyLimit, 64);
-    assert.equal(snapshot.presentation.distantNaturalProxyLimit, 64);
+    assert.equal(snapshot.presentation.distantNaturalProxyCount, 0);
+    assert.equal(snapshot.presentation.distantRockProxyLimit, 0);
+    assert.equal(snapshot.presentation.distantNaturalProxyLimit, 0);
     assert.equal(snapshot.presentation.distantTreeProxyCount, 0);
     assert.equal(
       snapshot.presentation.distantRockProxyCount,
@@ -504,12 +504,27 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
-    assert.equal(snapshot.presentation.canonicalVegetationRecordCount, 17);
-    assert.equal(snapshot.presentation.canonicalTreeRecordCount, 7);
-    assert.equal(snapshot.presentation.canonicalShrubRecordCount, 10);
-    assert.equal(snapshot.presentation.visibleCanonicalVegetationCount, 17);
-    assert.equal(snapshot.presentation.visibleCanonicalTreeCount, 7);
-    assert.equal(snapshot.presentation.visibleCanonicalShrubCount, 10);
+    // Stage 3B deliberately removes the presentation-only 12m cluster gate.
+    // Keep this boot check tied to the canonical-set contract, rather than a
+    // historic post-filter count: all canonical records must be visible and
+    // their subtype totals must describe the same set.
+    assert.ok(snapshot.presentation.canonicalVegetationRecordCount > 0);
+    assert.ok(snapshot.presentation.canonicalTreeRecordCount > 0);
+    assert.ok(snapshot.presentation.canonicalShrubRecordCount > 0);
+    assert.equal(
+      snapshot.presentation.visibleCanonicalVegetationCount,
+      snapshot.presentation.canonicalVegetationRecordCount,
+    );
+    assert.equal(
+      snapshot.presentation.visibleCanonicalTreeCount,
+      snapshot.presentation.canonicalTreeRecordCount,
+    );
+    assert.equal(
+      snapshot.presentation.visibleCanonicalShrubCount,
+      snapshot.presentation.canonicalShrubRecordCount,
+    );
+    assert.ok(snapshot.presentation.canonicalRockRecordCount > 0);
+    assert.ok(snapshot.presentation.visibleCanonicalRockCount > 0);
     assert.equal(
       snapshot.presentation.canonicalTreeRecordCount
         + snapshot.presentation.canonicalShrubRecordCount,
@@ -518,6 +533,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(
       snapshot.presentation.canonicalBuildingRecordCount
         + snapshot.presentation.canonicalVegetationRecordCount
+        + snapshot.presentation.canonicalRockRecordCount
         + snapshot.presentation.canonicalLandmarkRecordCount
         + snapshot.presentation.canonicalRoadRecordCount,
       snapshot.presentation.canonicalRecordCount,
@@ -567,9 +583,10 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       }
     };
     visitDistantPresentation(distantWorld);
-    assert.ok(distantPresentationObjects.some(
-      child => child.name?.includes('finite-language-proxy'),
-    ));
+    assert.equal(distantPresentationObjects.some(
+      child => child.name?.includes('finite-language-proxy')
+        || child.name?.includes('w8-midground-major-natural'),
+    ), false);
     assert.equal(distantPresentationObjects
       .filter(child => child instanceof Mesh && child.userData?.presentationOnly)
       .every(child => child.castShadow === false && child.receiveShadow === false), true);
@@ -602,7 +619,16 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       await new Promise(resolve => setTimeout(resolve, 10));
       warmed = outcome.sandbox.snapshot();
     }
-    assert.equal(warmed.presentation.queryNaturalCandidateCount, 99);
+    assert.ok(warmed.presentation.queryNaturalCandidateCount > 0, JSON.stringify({
+      farSyncPending: warmed.presentation.farSyncPending,
+      farSyncPendingCount: warmed.presentation.farSyncPendingCount,
+      syncEpoch: warmed.presentation.syncEpoch,
+      committedEpoch: warmed.presentation.committedEpoch,
+      staleEpochDiscardCount: warmed.presentation.staleEpochDiscardCount,
+      localTerrainCoverageCenter: warmed.presentation.localTerrainCoverageCenter,
+      localTerrainCommitCount: warmed.presentation.localTerrainCommitCount,
+      localTerrainRejectionCount: warmed.presentation.localTerrainRejectionCount,
+    }));
     assert.ok(warmed.presentation.queryNaturalOwnerChunkCount >= 83);
     assert.ok(warmed.presentation.queryNaturalOwnerChunkCount <= 100);
     assert.ok(warmed.presentation.canonicalVegetationRecordCount >= warmed.presentation.visibleCanonicalVegetationCount);
@@ -676,6 +702,37 @@ test('measurement frames pass strict boolean simulation state into Gameplay Runt
     } finally {
       environment.restore();
     }
+  }
+});
+
+test('normal play skips detailed runtime snapshots and debug HUD writes while diagnostics are off', async () => {
+  const environment = installBrowserEquivalentEnvironment();
+  let snapshotCalls = 0;
+  try {
+    const sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      runtimeFactory(options) {
+        const runtime = new ChunkRuntimeManager(options);
+        const snapshot = runtime.snapshot.bind(runtime);
+        runtime.snapshot = (...args) => {
+          snapshotCalls += 1;
+          return snapshot(...args);
+        };
+        return runtime;
+      },
+    });
+    const snapshotsBeforeFrame = snapshotCalls;
+    const hudBeforeFrame = environment.hud.innerHTML;
+    environment.rafCallbacks[0](performance.now() + 100);
+    assert.equal(snapshotCalls, snapshotsBeforeFrame);
+    assert.equal(environment.hud.innerHTML, hudBeforeFrame);
+    await sandbox.shutdown();
+  } finally {
+    environment.restore();
   }
 });
 
