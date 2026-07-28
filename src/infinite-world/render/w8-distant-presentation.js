@@ -373,6 +373,8 @@ export async function createW8DistantPresentation({
   let syncEpoch = 0;
   let committedEpoch = 0;
   let staleEpochDiscardCount = 0;
+  let committedRenderOrigin = null;
+  let staleRenderOriginRejectCount = 0;
   let localTerrainSyncEpoch = 0;
   let committedLocalTerrainEpoch = 0;
   let localTerrainCommitCount = 0;
@@ -406,6 +408,45 @@ export async function createW8DistantPresentation({
   let treeLodDiagnosticsEnabled = false;
   let disposed = false;
   const SYNC_CANCELLED = Symbol('w8-distant-sync-cancelled');
+
+  const acceptCommittedRenderOrigin = renderOrigin => {
+    if (!Number.isSafeInteger(renderOrigin?.renderOriginChunkX)
+      || !Number.isSafeInteger(renderOrigin?.renderOriginChunkZ)) {
+      throw new TypeError('Distant presentation requires a committed render origin');
+    }
+    const incomingEpoch = Number.isSafeInteger(renderOrigin.rebaseCount)
+      ? renderOrigin.rebaseCount : null;
+    const currentEpoch = Number.isSafeInteger(committedRenderOrigin?.rebaseCount)
+      ? committedRenderOrigin.rebaseCount : null;
+    if (incomingEpoch !== null && currentEpoch !== null && incomingEpoch < currentEpoch) {
+      staleRenderOriginRejectCount += 1;
+      return false;
+    }
+    if (incomingEpoch !== null && currentEpoch !== null && incomingEpoch === currentEpoch
+      && (renderOrigin.renderOriginChunkX !== committedRenderOrigin.renderOriginChunkX
+        || renderOrigin.renderOriginChunkZ !== committedRenderOrigin.renderOriginChunkZ)) {
+      throw new Error(`Distant render origin identity mismatch at epoch ${incomingEpoch}`);
+    }
+    const changed = !committedRenderOrigin
+      || renderOrigin.renderOriginChunkX !== committedRenderOrigin.renderOriginChunkX
+      || renderOrigin.renderOriginChunkZ !== committedRenderOrigin.renderOriginChunkZ
+      || (incomingEpoch !== null && incomingEpoch !== currentEpoch);
+    if (!changed) return true;
+    committedRenderOrigin = Object.freeze({
+      renderOriginChunkX: renderOrigin.renderOriginChunkX,
+      renderOriginChunkZ: renderOrigin.renderOriginChunkZ,
+      rebaseCount: incomingEpoch,
+    });
+    if (pendingFarSyncEpochs.size > 0 && incomingEpoch !== null
+      && (currentEpoch === null || incomingEpoch > currentEpoch)) {
+      syncEpoch += 1;
+      cancelCanonicalChunkRequests?.({
+        consumerId: 'distant-owner-query',
+        beforeEpoch: syncEpoch + 1,
+      });
+    }
+    return true;
+  };
 
   const disposeGeneration = generation => {
     if (!generation) return;
@@ -1381,6 +1422,25 @@ export async function createW8DistantPresentation({
     }
   };
 
+  const commitRuntimePresentationState = ({
+    activeDataKeys = [],
+    renderedKeys = [],
+    renderOrigin,
+    quality = activeGeneration?.quality ?? 'high',
+    playerLogicalX = activeGeneration?.playerX ?? 0,
+    playerLogicalZ = activeGeneration?.playerZ ?? 0,
+  } = {}) => {
+    if (!acceptCommittedRenderOrigin(renderOrigin)) return false;
+    positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+    if (!activeGeneration) return true;
+    activeGeneration.activeKeys = new Set(activeDataKeys);
+    activeGeneration.renderedKeys = new Set(renderedKeys);
+    activeGeneration.quality = quality;
+    positionGenerationForOrigin(activeGeneration, renderOrigin);
+    updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
+    return true;
+  };
+
   const createClipmap = ({ centerChunkX, centerChunkZ, activeChunks, origin }) => {
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
@@ -1848,6 +1908,10 @@ export async function createW8DistantPresentation({
       };
 
       if (disposed) return reject('disposed');
+      if (!acceptCommittedRenderOrigin(renderOrigin)) {
+        localTerrainStaleDiscardCount += 1;
+        return reject('stale-render-origin');
+      }
       if (requestedEpoch < localTerrainSyncEpoch) {
         localTerrainStaleDiscardCount += 1;
         return reject('stale-epoch');
@@ -1983,6 +2047,14 @@ export async function createW8DistantPresentation({
       includeUltraNatural = true,
     }) {
       if (disposed) throw new Error('distant presentation is disposed');
+      if (!commitRuntimePresentationState({
+        activeDataKeys,
+        renderedKeys,
+        renderOrigin,
+        quality,
+        playerLogicalX,
+        playerLogicalZ,
+      })) return false;
       const epoch = ++syncEpoch;
       pendingFarSyncEpochs.add(epoch);
       cancelCanonicalChunkRequests?.({
@@ -1994,17 +2066,6 @@ export async function createW8DistantPresentation({
       };
       const rendered = new Set(renderedKeys);
       const activeKeys = new Set(activeDataKeys);
-      if (activeGeneration) {
-        activeGeneration.renderedKeys = rendered;
-        activeGeneration.activeKeys = activeKeys;
-        activeGeneration.quality = quality;
-        positionGenerationForOrigin(activeGeneration, renderOrigin);
-        updateCanonicalVisibility(
-          activeGeneration,
-          playerLogicalX,
-          playerLogicalZ,
-        );
-      }
       const activeChunks = new Map();
       measure('distant-collect', () => {
         for (const key of activeDataKeys) {
@@ -2180,18 +2241,25 @@ export async function createW8DistantPresentation({
       }
       return treeLodDiagnosticsEnabled;
     },
+    commitRuntimeState(state) {
+      if (disposed) return false;
+      return commitRuntimePresentationState(state);
+    },
     update(playerLogicalX, playerLogicalZ, renderOrigin) {
       if (disposed) return;
+      if (!acceptCommittedRenderOrigin(renderOrigin)) return false;
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
       if (activeGeneration) {
         positionGenerationForOrigin(activeGeneration, renderOrigin);
         updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
       }
+      return true;
     },
     rebase(renderOrigin) {
-      if (disposed) return;
+      if (disposed || !acceptCommittedRenderOrigin(renderOrigin)) return false;
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
       positionGenerationForOrigin(activeGeneration, renderOrigin);
+      return true;
     },
     snapshot() {
       const stats = activeGeneration?.stats ?? emptyStats;
@@ -2268,6 +2336,8 @@ export async function createW8DistantPresentation({
         syncEpoch,
         committedEpoch,
         staleEpochDiscardCount,
+        committedRenderOrigin,
+        staleRenderOriginRejectCount,
         farSyncPending: pendingFarSyncEpochs.size > 0,
         farSyncPendingCount: pendingFarSyncEpochs.size,
         localTerrainSyncEpoch,

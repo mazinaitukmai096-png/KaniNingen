@@ -2372,6 +2372,7 @@ export class InfiniteGameplayRuntime {
     activeDataKeys = renderedKeys,
     getChunkData,
     renderOrigin,
+    isCurrent = null,
   } = {}) {
     if (this.isShutdown) throw new Error('gameplay runtime is shut down');
     if (!Array.isArray(renderedKeys) || !Array.isArray(activeDataKeys)
@@ -2380,12 +2381,15 @@ export class InfiniteGameplayRuntime {
     }
     const desired = new Set(renderedKeys);
     const desiredSpatial = new Set(activeDataKeys);
+    const stillCurrent = () => typeof isCurrent !== 'function' || isCurrent() === true;
+    if (!stillCurrent()) return null;
     for (const key of desired) {
       if (!desiredSpatial.has(key)) {
         throw new Error(`rendered gameplay Chunk ${key} is outside Active Data`);
       }
     }
     for (const key of sorted(this.activeChunks.keys())) {
+      if (!stillCurrent()) return null;
       if (desired.has(key)) continue;
       await this.renderAdapter.unloadChunk(key);
       this.activeChunks.delete(key);
@@ -2394,26 +2398,32 @@ export class InfiniteGameplayRuntime {
         || (projectile.ownerStableId
           && this.activeTankOccurrences.has(projectile.ownerStableId)));
       this.counts.chunksUnloaded += 1;
+      if (!stillCurrent()) return null;
     }
     for (const key of sorted(this.spatialChunks.keys())) {
+      if (!stillCurrent()) return null;
       if (!desiredSpatial.has(key)) this.spatialChunks.delete(key);
     }
     for (const key of sorted(desiredSpatial)) {
+      if (!stillCurrent()) return null;
       if (this.spatialChunks.has(key)) continue;
       const { chunkX, chunkZ } = parseChunkKey(key);
       const chunkData = await getChunkData(chunkX, chunkZ);
+      if (!stillCurrent()) return null;
       if (!chunkData) throw new Error(`missing W6 Active Data ChunkData: ${key}`);
       const model = await createW6ChunkGameplay({
         chunkData,
         worldSeedHash: this.worldSeedHash,
         generatorMajor: this.generatorMajor,
       });
+      if (!stillCurrent()) return null;
       this.spatialChunks.set(key, model);
       this.#registerSpatialGameplayModel(key, model);
     }
     this.#reconcileSpatialHumanOwnership();
     this.#refreshSpatialBroadphaseBounds();
     for (const key of sorted(desired)) {
+      if (!stillCurrent()) return null;
       if (this.activeChunks.has(key)) continue;
       const model = this.spatialChunks.get(key);
       if (!model) throw new Error(`missing W6 spatial gameplay model: ${key}`);
@@ -2440,16 +2450,20 @@ export class InfiniteGameplayRuntime {
         if (entityState.type === 'tank') this.#syncTank(entityState);
       }
       this.counts.chunksLoaded += 1;
+      if (!stillCurrent()) return null;
     }
     if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
     if (this.spatialChunks.size !== desiredSpatial.size) {
       throw new Error('gameplay Active Data Chunk set mismatch');
     }
     const terrainReadyTankIds = await this.#prepareActiveTankTerrainForPresentation();
+    if (!stillCurrent()) return null;
     for (const stableId of terrainReadyTankIds) {
       this.#syncTank(this.state.entityStates.get(stableId));
     }
+    if (!stillCurrent()) return null;
     await this.renderAdapter.rebase(renderOrigin);
+    if (!stillCurrent()) return null;
     this.renderAdapter.syncManualBoss?.(
       this.state.manualBossStableId
         ? this.state.entityStates.get(this.state.manualBossStableId) ?? null
@@ -3708,6 +3722,8 @@ export class InfiniteGameplayRuntime {
       activeSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
       activeDataChunkCount: this.spatialChunks.size,
       activeDataChunkKeys: Object.freeze(sorted(this.spatialChunks.keys())),
+      playerBlockingColliderCount: this.playerBlockingColliderCount,
+      maximumPlayerBlockingRadiusMeters: this.maximumPlayerBlockingRadiusMeters,
       simulatedEntityCount,
       simulatedStaticTargetCount,
       activeTankCount,

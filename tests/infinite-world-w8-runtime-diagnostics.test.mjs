@@ -21,6 +21,7 @@ import {
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
 import { W6_STATIC_TARGET_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
+import { RENDER_CHUNK_SIZE } from '../src/infinite-world/chunk-coordinates.js';
 import {
   InfiniteWorldState,
   decodeInfiniteWorldSave,
@@ -775,6 +776,59 @@ test('Near, Outer, and Far use one canonical natural candidate set', async () =>
   presentation.dispose();
 });
 
+test('committed runtime state updates Near/Outer exclusion immediately and rejects an older origin', async () => {
+  const tree = Object.freeze({
+    candidateId: 'detail-v1:vegetation:origin-handoff',
+    subtype: 'broadleaf-tree', variationSeed: 1, orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.generatorVersion = { major: 800, minor: 0, patch: 0 };
+  chunk.vegetationCandidates = [tree];
+  chunk.presentationLayers.natural = { vegetation: [tree], rocks: [] };
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+  });
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+  })), true);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'mid');
+  const generationRoot = scene.children[0].children[0];
+  const buildLocalX = generationRoot.position.x;
+
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: ['5,0'], renderedKeys: ['5,0'],
+    renderOrigin: { renderOriginChunkX: 4, renderOriginChunkZ: 0, rebaseCount: 4 },
+    quality: 'medium', playerLogicalX: 72, playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'near');
+  assert.equal(scene.children[0].children[0], generationRoot,
+    'owner handoff reuses the complete generation instead of flashing a replacement root');
+  assert.equal(generationRoot.position.x, buildLocalX - RENDER_CHUNK_SIZE,
+    'the generation root applies exactly one Chunk of origin delta');
+  const currentOrigin = presentation.snapshot().currentOrigin;
+
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: ['5,0'], renderedKeys: [],
+    renderOrigin: { renderOriginChunkX: 3, renderOriginChunkZ: 0, rebaseCount: 3 },
+    quality: 'medium', playerLogicalX: 56, playerLogicalZ: 8,
+  }), false);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'near');
+  assert.equal(generationRoot.position.x, buildLocalX - RENDER_CHUNK_SIZE);
+  assert.deepEqual(presentation.snapshot().currentOrigin, currentOrigin);
+  assert.equal(presentation.snapshot().staleRenderOriginRejectCount, 1);
+  presentation.dispose();
+});
+
 test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, exclusive, and deterministic', async () => {
   const candidate = (candidateId, subtype, x) => Object.freeze({
     candidateId,
@@ -1187,14 +1241,23 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
     },
     cancelCanonicalChunkRequests: options => cancelledConsumers.push(options),
   });
-  const first = presentation.sync(canonicalSyncInput({
+  const firstInput = canonicalSyncInput({
     centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(0, 0, []), quality: 'high',
-  }));
+  });
+  firstInput.renderOrigin.rebaseCount = 1;
+  const first = presentation.sync(firstInput);
   await firstOwnerStarted;
   assert.equal(ownerCalls > 0, true);
-  const second = presentation.sync(canonicalSyncInput({
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [], renderedKeys: [],
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+    quality: 'high', playerLogicalX: 24, playerLogicalZ: 8,
+  }), true, 'publishing a newer committed origin invalidates the pending Far generation');
+  const secondInput = canonicalSyncInput({
     centerChunkX: 1, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(1, 0, []), quality: 'high',
-  }));
+  });
+  secondInput.renderOrigin.rebaseCount = 2;
+  const second = presentation.sync(secondInput);
   releaseFirstOwner();
   assert.equal(await first, false);
   assert.equal(await second, true);
@@ -1204,7 +1267,7 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   assert.ok(requestMetadata.every(value => value.consumerId === 'distant-owner-query'
     && Number.isSafeInteger(value.epoch)));
   assert.ok(cancelledConsumers.some(value => value.consumerId === 'distant-owner-query'
-    && value.beforeEpoch === 2));
+    && value.beforeEpoch > requestMetadata[0].epoch));
   presentation.dispose();
 });
 

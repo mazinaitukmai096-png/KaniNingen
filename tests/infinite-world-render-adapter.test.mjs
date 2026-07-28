@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ChunkRenderAdapter } from '../src/infinite-world/render/chunk-render-adapter.js';
+import { resolveW8RockCanonicalObject } from '../src/infinite-world/rock-canonical-object.js';
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 
 class Triple {
@@ -142,6 +143,49 @@ test('render adapter applies Stable-ID destruction without allocating or leaking
   assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.resourceSnapshot().trackedFeatureInstanceCount, 0);
+  await adapter.shutdown();
+});
+
+test('destroyed canonical Rock removes every instance without retaining a full-scale rubble mesh', async () => {
+  const scene = new Scene();
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
+  const stableId = 'detail-v1:rock:destroyed-presentation';
+  const canonicalObject = resolveW8RockCanonicalObject(Object.freeze({
+    candidateId: stableId,
+    subtype: 'medium-rock',
+    sizeClass: 'medium',
+    variationSeed: 1,
+    orientationSeed: 0,
+    worldPosition: Object.freeze({ x: 8, y: 0, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  }));
+  const mesh = new InstancedMesh(new DodecahedronGeometry(), new MeshLambertMaterial({}), 1);
+  const transform = new Object3D();
+  transform.position.set(8, 0, 8);
+  transform.scale.set(4, 4, 4);
+  transform.updateMatrix();
+  mesh.setMatrixAt(0, transform.matrix);
+  const group = new Group();
+  group.add(mesh);
+  adapter.featureInstances.set(stableId, {
+    stableId,
+    chunkKey: '0,0',
+    mesh,
+    index: 0,
+    originalMatrix: structuredClone(transform.matrix),
+    parts: [{ mesh, fadeMesh: null, index: 0, originalMatrix: structuredClone(transform.matrix) }],
+    group,
+    rubbleMesh: null,
+    canonicalObject,
+  });
+
+  assert.equal(canonicalObject.destruction.presentation, 'none');
+  assert.equal(adapter.setFeatureDestroyed(stableId, true), true);
+  assert.deepEqual(mesh.matrices[0].scale, { x: 0, y: 0, z: 0 });
+  assert.equal(adapter.featureInstances.get(stableId).rubbleMesh, null);
+  assert.equal(group.children.includes(mesh), true);
+  assert.equal(group.children.some(child => child.name === 'w8-persistent-destruction-rubble'), false);
   await adapter.shutdown();
 });
 

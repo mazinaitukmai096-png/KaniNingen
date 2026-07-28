@@ -53,7 +53,7 @@ export class GameplayRenderAdapter {
     this.scene = scene;
     this.renderChunkSize = renderChunkSize;
     this.unitsPerMeter = renderChunkSize / LOGICAL_CHUNK_SIZE_METERS;
-    this.origin = { renderOriginChunkX: 0, renderOriginChunkZ: 0 };
+    this.origin = { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: -1 };
     this.root = new Group();
     this.root.name = 'w6-gameplay-root';
     this.scene.add(this.root);
@@ -127,6 +127,7 @@ export class GameplayRenderAdapter {
     this.disposed = false;
     this.counts = {
       loaded: 0, unloaded: 0, created: 0, removed: 0, rebased: 0,
+      staleRebasesRejected: 0,
       transientCreated: 0, transientRemoved: 0,
     };
   }
@@ -186,9 +187,22 @@ export class GameplayRenderAdapter {
 
   async rebase(origin) {
     if (this.disposed) throw new Error('gameplay render adapter is shut down');
+    const incomingEpoch = Number.isSafeInteger(origin?.rebaseCount) ? origin.rebaseCount : null;
+    const currentEpoch = Number.isSafeInteger(this.origin.rebaseCount) && this.origin.rebaseCount >= 0
+      ? this.origin.rebaseCount : null;
+    if (incomingEpoch !== null && currentEpoch !== null && incomingEpoch < currentEpoch) {
+      this.counts.staleRebasesRejected += 1;
+      return false;
+    }
+    if (incomingEpoch !== null && currentEpoch !== null && incomingEpoch === currentEpoch
+      && (origin.renderOriginChunkX !== this.origin.renderOriginChunkX
+        || origin.renderOriginChunkZ !== this.origin.renderOriginChunkZ)) {
+      throw new Error(`Gameplay render origin identity mismatch at epoch ${incomingEpoch}`);
+    }
     this.origin = {
       renderOriginChunkX: origin.renderOriginChunkX,
       renderOriginChunkZ: origin.renderOriginChunkZ,
+      rebaseCount: incomingEpoch ?? currentEpoch ?? -1,
     };
     for (const entry of this.loaded.values()) this.#positionGroup(entry);
     for (const entry of this.projectileMeshes.values()) this.#positionTransient(entry);
@@ -197,6 +211,7 @@ export class GameplayRenderAdapter {
     for (const entry of this.reinforcementMeshes.values()) this.#positionReinforcement(entry);
     this.#syncEffectInstances();
     this.counts.rebased += 1;
+    return true;
   }
 
   #positionTransient(entry) {
@@ -1316,6 +1331,7 @@ export class GameplayRenderAdapter {
   snapshot() {
     return Object.freeze({
       schemaVersion: 'w6-gameplay-render-adapter-1',
+      renderOrigin: Object.freeze({ ...this.origin }),
       liveChunkGroups: this.loaded.size,
       liveEntityMeshes: this.entityMeshes.size,
       liveProjectileMeshes: this.projectileMeshes.size,

@@ -174,7 +174,8 @@ export class ChunkRenderAdapter {
         part.fadeMesh.instanceMatrix.needsUpdate = true;
       }
     }
-    if (destroyed && !entry.rubbleMesh) {
+    const destructionPresentation = entry.canonicalObject?.destruction?.presentation ?? 'rubble';
+    if (destroyed && destructionPresentation === 'rubble' && !entry.rubbleMesh) {
       const Mesh = requireConstructor(this.THREE, 'Mesh');
       const rubble = new Mesh(
         this.visualAssets.geometries.dodeca,
@@ -187,7 +188,7 @@ export class ChunkRenderAdapter {
       rubble.castShadow = true; rubble.receiveShadow = true;
       entry.group?.add?.(rubble);
       entry.rubbleMesh = rubble;
-    } else if (!destroyed && entry.rubbleMesh) {
+    } else if ((!destroyed || destructionPresentation !== 'rubble') && entry.rubbleMesh) {
       entry.group?.remove?.(entry.rubbleMesh);
       entry.rubbleMesh = null;
     }

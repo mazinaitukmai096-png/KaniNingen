@@ -490,6 +490,16 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(distantWorld.userData.presentationOnly, true);
     assert.equal(snapshot.presentation.midgroundChunkCount, 16);
     assert.equal(snapshot.presentation.clipmapMeshCount, 1);
+    assert.deepEqual(snapshot.gameplay.render.renderOrigin, {
+      renderOriginChunkX: snapshot.runtime.renderOrigin.renderOriginChunkX,
+      renderOriginChunkZ: snapshot.runtime.renderOrigin.renderOriginChunkZ,
+      rebaseCount: snapshot.runtime.renderOrigin.rebaseCount,
+    });
+    assert.deepEqual(snapshot.presentation.committedRenderOrigin, {
+      renderOriginChunkX: snapshot.runtime.renderOrigin.renderOriginChunkX,
+      renderOriginChunkZ: snapshot.runtime.renderOrigin.renderOriginChunkZ,
+      rebaseCount: snapshot.runtime.renderOrigin.rebaseCount,
+    });
     assert.ok(snapshot.presentation.maximumInnerBoundaryErrorMeters <= 0.001);
     assert.ok(snapshot.presentation.maximumInnerBoundaryColorDifference <= 0.03);
     assert.ok(snapshot.presentation.clipmapDeterministicChecksum > 0);
@@ -535,9 +545,11 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         + snapshot.presentation.canonicalVegetationRecordCount
         + snapshot.presentation.canonicalRockRecordCount
         + snapshot.presentation.canonicalLandmarkRecordCount
-        + snapshot.presentation.canonicalRoadRecordCount,
+        + snapshot.presentation.canonicalRoadRecordCount
+        + snapshot.presentation.canonicalWorldDetailRecordCount,
       snapshot.presentation.canonicalRecordCount,
     );
+    assert.ok(snapshot.presentation.canonicalWorldDetailRecordCount >= 0);
     assert.ok(snapshot.presentation.canonicalFarObjectCount >= 0);
     assert.ok(snapshot.presentation.canonicalMidObjectCount >= 0);
     assert.ok(snapshot.presentation.canonicalNearObjectCount >= 0);
@@ -891,6 +903,11 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
+  assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);\s*\n\s*synchronizeLocalTerrain/g) ?? []).length, 2,
+    'runtime relocation and moving Chunk transitions publish one committed origin before follow-up');
+  assert.match(boot, /if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-sync[\s\S]*if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*gameplay-sync/);
+  assert.doesNotMatch(boot, /distantPresentation\.rebase\(runtimeState\.renderOrigin\)[\s\S]*synchronizeLocalTerrain\(runtimeState\)/,
+    'delayed work cannot reapply an origin or rebuild Local terrain from an older snapshot');
   assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w8-finite-parity"><\/script>/);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js')), true);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);

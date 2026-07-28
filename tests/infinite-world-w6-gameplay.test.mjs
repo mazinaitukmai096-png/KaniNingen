@@ -332,6 +332,30 @@ test('Human and Tank use deterministic Stable IDs while W7D excludes natural Bos
   await runtime.shutdown();
 });
 
+test('stale post-commit Gameplay sync exits before applying an older render origin', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-stale-origin-guard', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-stale-origin-guard',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const result = await runtime.syncActiveChunks({
+    activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 1 },
+    isCurrent: () => false,
+  });
+  assert.equal(result, null);
+  assert.equal(renderer.counts.rebased, 0);
+  assert.equal(runtime.activeChunks.size, 0);
+  assert.equal(runtime.spatialChunks.size, 0);
+  await runtime.shutdown();
+});
+
 test('real W5 military through W8 parity materializes Tank while capital no longer materializes a natural Boss', async () => {
   const generator = await createW8ParityChunkGenerator({ worldSeed: 'W8 parity golden seed' });
   const candidates = await generator.distributor.findInMacroRange(-8, 8, -8, 8);

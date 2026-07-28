@@ -1142,6 +1142,25 @@ export async function bootInfiniteWorldSandbox({
       centerChunkZ: runtimeSnapshot.centerChunkZ,
     });
 
+    const commitDistantRuntimeState = runtimeSnapshot => distantPresentation.commitRuntimeState?.({
+      activeDataKeys: runtimeSnapshot.activeDataKeys,
+      renderedKeys: runtimeSnapshot.renderedKeys,
+      renderOrigin: runtimeSnapshot.renderOrigin,
+      quality: distantQuality,
+      playerLogicalX: logicalPlayer.x,
+      playerLogicalZ: logicalPlayer.z,
+    });
+
+    const isSameCommittedRuntimeState = (workEpoch, runtimeSnapshot) => {
+      if (workEpoch !== postCommitRequestedEpoch) return false;
+      const current = runtime.getCommittedChunkState();
+      return current.centerChunkX === runtimeSnapshot.centerChunkX
+        && current.centerChunkZ === runtimeSnapshot.centerChunkZ
+        && current.renderOrigin.rebaseCount === runtimeSnapshot.renderOrigin.rebaseCount
+        && current.renderOrigin.renderOriginChunkX === runtimeSnapshot.renderOrigin.renderOriginChunkX
+        && current.renderOrigin.renderOriginChunkZ === runtimeSnapshot.renderOrigin.renderOriginChunkZ;
+    };
+
     const deferToNextTask = () => new Promise(resolve => {
       setTimeoutFn(resolve, 0);
     });
@@ -1156,22 +1175,24 @@ export async function bootInfiniteWorldSandbox({
             await deferToNextTask();
             const committedEpoch = postCommitRequestedEpoch;
             const runtimeState = runtime.getCommittedChunkState();
-            distantPresentation.rebase(runtimeState.renderOrigin);
-            synchronizeLocalTerrain(runtimeState);
+            if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             if (diagnosticProfile.distant) {
               await diagnostics.measureAsync(
                 'distant-sync',
                 () => synchronizeDistantPresentation(runtimeState),
               );
             }
+            if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             if (diagnosticProfile.gameplaySync) {
               await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
                 activeDataKeys: runtimeState.activeDataKeys,
                 renderedKeys: runtimeState.renderedKeys,
                 getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
                 renderOrigin: runtimeState.renderOrigin,
+                isCurrent: () => isSameCommittedRuntimeState(committedEpoch, runtimeState),
               }));
             }
+            if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             postCommitCompletedEpoch = committedEpoch;
           } catch (error) {
             transitionError = error;
@@ -1243,7 +1264,8 @@ export async function bootInfiniteWorldSandbox({
       );
       const runtimeSnapshot = runtime.getCommittedChunkState();
       scenePresentation.rebase(runtimeSnapshot.renderOrigin);
-      distantPresentation.rebase(runtimeSnapshot.renderOrigin);
+      commitDistantRuntimeState(runtimeSnapshot);
+      await gameplayRenderAdapter.rebase(runtimeSnapshot.renderOrigin);
       synchronizeLocalTerrain(runtimeSnapshot);
       if (diagnosticProfile.distant) {
         await diagnostics.measureAsync(
@@ -1517,7 +1539,7 @@ export async function bootInfiniteWorldSandbox({
         if (qualityChanged && diagnosticProfile.distant) {
           const runtimeSnapshot = runtime.snapshot();
           scenePresentation.rebase(runtimeSnapshot.renderOrigin);
-          distantPresentation.rebase(runtimeSnapshot.renderOrigin);
+          commitDistantRuntimeState(runtimeSnapshot);
           void diagnostics.measureAsync(
             'distant-sync',
             () => synchronizeDistantPresentation(runtimeSnapshot),
@@ -1557,10 +1579,11 @@ export async function bootInfiniteWorldSandbox({
         'chunk-transition',
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
       )
-        .then(() => {
+        .then(async () => {
           const nextState = runtime.getCommittedChunkState();
           scenePresentation.rebase(nextState.renderOrigin);
-          distantPresentation.rebase(nextState.renderOrigin);
+          commitDistantRuntimeState(nextState);
+          await gameplayRenderAdapter.rebase(nextState.renderOrigin);
           synchronizeLocalTerrain(nextState);
           schedulePostCommitWork();
         })

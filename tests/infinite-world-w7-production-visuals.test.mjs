@@ -627,6 +627,15 @@ test('Player landing renders two bounded shockwaves and finite-parity radial dus
   assert.equal(assets.materials.landingOuter.options.depthTest, false);
   assert.equal(assets.materials.landingOuter.options.depthWrite, false);
   assert.equal(assets.materials.landingInner.options.color, 0xffaa00);
+  await adapter.rebase({ renderOriginChunkX: 1, renderOriginChunkZ: -1, rebaseCount: 2 });
+  const rebasedOuterMatrix = adapter.effectInstancePools.get('landingOuter').mesh.matrices[0];
+  assert.equal(rebasedOuterMatrix.position.x, (2 - 16) * adapter.unitsPerMeter);
+  assert.equal(rebasedOuterMatrix.position.z, (-3 + 16) * adapter.unitsPerMeter);
+  assert.equal(await adapter.rebase({
+    renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1,
+  }), false, 'a delayed sync cannot restore an older effect origin');
+  assert.deepEqual(adapter.effectInstancePools.get('landingOuter').mesh.matrices[0], rebasedOuterMatrix);
+  assert.equal(adapter.snapshot().counts.staleRebasesRejected, 1);
   await adapter.shutdown();
   assets.dispose();
 });
