@@ -98,7 +98,12 @@ class DistantTestInstancedMesh extends DistantTestMesh {
     this.capacity = capacity;
     this.count = 0;
     this.matrices = [];
-    this.instanceMatrix = {};
+    this.instanceMatrix = { updateCount: 0 };
+    Object.defineProperty(this.instanceMatrix, 'needsUpdate', {
+      set(value) {
+        if (value === true) this.updateCount += 1;
+      },
+    });
   }
   setMatrixAt(index, matrix) { this.matrices[index] = matrix.clone?.() ?? structuredClone(matrix); }
 }
@@ -306,6 +311,46 @@ function canonicalSyncInput({
     playerLogicalX,
     playerLogicalZ: 8,
   };
+}
+
+function localTerrainCoverageFixture(centerChunkX = 0, centerChunkZ = 0) {
+  const activeDataKeys = [];
+  const renderedKeys = [];
+  const chunks = new Map();
+  for (let chunkZ = centerChunkZ - 2; chunkZ <= centerChunkZ + 2; chunkZ += 1) {
+    for (let chunkX = centerChunkX - 2; chunkX <= centerChunkX + 2; chunkX += 1) {
+      const key = `${chunkX},${chunkZ}`;
+      activeDataKeys.push(key);
+      if (Math.abs(chunkX - centerChunkX) <= 1 && Math.abs(chunkZ - centerChunkZ) <= 1) {
+        renderedKeys.push(key);
+      }
+      chunks.set(key, canonicalChunk(chunkX, chunkZ, []));
+    }
+  }
+  activeDataKeys.sort();
+  renderedKeys.sort();
+  return {
+    activeDataKeys,
+    renderedKeys,
+    chunks,
+    getChunkData: (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null,
+    renderOrigin: { renderOriginChunkX: centerChunkX, renderOriginChunkZ: centerChunkZ },
+    centerChunkX,
+    centerChunkZ,
+  };
+}
+
+async function createLocalTerrainTestPresentation(scene = new DistantTestGroup(), overrides = {}) {
+  return createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(chunkX, chunkZ, []),
+    ...overrides,
+  });
 }
 
 function legacyClipmapAxis() {
@@ -864,6 +909,229 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
   normal.presentation.dispose();
   reverse.presentation.dispose();
   parallel.presentation.dispose();
+});
+
+test('Local terrain publishes only complete 25-Chunk coverage and swaps roots atomically', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const initial = localTerrainCoverageFixture(0, 0);
+  const first = presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  assert.equal(first.committed, true);
+  assert.equal(first.reused, false);
+  const distantRoot = scene.children[0];
+  assert.equal(distantRoot.children.length, 1);
+  const firstRoot = distantRoot.children[0];
+  const firstGeometries = firstRoot.children.map(child => child.geometry).filter(Boolean);
+  const firstSnapshot = presentation.snapshot();
+  assert.equal(firstSnapshot.localTerrainRootAttached, true);
+  assert.equal(firstSnapshot.localTerrainActiveKeyCount, 25);
+  assert.equal(firstSnapshot.localTerrainResolvedChunkCount, 25);
+  assert.equal(firstSnapshot.localTerrainRenderedKeyCount, 9);
+  assert.equal(firstSnapshot.localTerrainMidgroundOwnerCount, 16);
+  assert.deepEqual(
+    firstSnapshot.localTerrainMidgroundOwnerKeys,
+    initial.activeDataKeys.filter(key => !initial.renderedKeys.includes(key)).sort(),
+  );
+  assert.equal(firstSnapshot.midgroundChunkCount, 16);
+  assert.equal(firstSnapshot.clipmapMeshCount, 1);
+  assert.equal(firstRoot.children.length, 2, 'Local terrain contains only midground terrain and clipmap');
+  assert.equal(firstRoot.children.filter(child => child.name === 'w8-midground-outer-sixteen-terrain').length, 1);
+  assert.equal(firstRoot.children.filter(child => child.name === 'w8-seeded-macro-terrain-clipmap').length, 1);
+
+  const incomplete = localTerrainCoverageFixture(1, 0);
+  const missingKey = incomplete.activeDataKeys[7];
+  incomplete.chunks.delete(missingKey);
+  const rejected = presentation.syncLocalTerrain({ coverageEpoch: 2, ...incomplete });
+  assert.equal(rejected.committed, false);
+  assert.equal(rejected.reason, 'missing-chunk-data');
+  assert.deepEqual(rejected.missingOwnerKeys, [missingKey]);
+  assert.equal(distantRoot.children.length, 1, 'no partial Local root is attached');
+  assert.equal(distantRoot.children[0], firstRoot, 'the complete old root remains active');
+  assert.ok(firstGeometries.every(geometry => geometry.disposed !== true));
+  const rejectedSnapshot = presentation.snapshot();
+  assert.deepEqual(rejectedSnapshot.localTerrainMissingOwnerKeys, [missingKey]);
+  assert.equal(rejectedSnapshot.localTerrainCommitCount, 1);
+  assert.equal(rejectedSnapshot.localTerrainRejectionCount, 1);
+
+  const onlyTwentyFour = localTerrainCoverageFixture(1, 0);
+  onlyTwentyFour.activeDataKeys = onlyTwentyFour.activeDataKeys.slice(0, 24);
+  const shortRejected = presentation.syncLocalTerrain({ coverageEpoch: 2, ...onlyTwentyFour });
+  assert.equal(shortRejected.committed, false);
+  assert.equal(shortRejected.reason, 'active-key-count');
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], firstRoot);
+  assert.ok(firstGeometries.every(geometry => geometry.disposed !== true));
+  assert.equal(presentation.snapshot().localTerrainRejectionCount, 2);
+
+  const second = presentation.syncLocalTerrain({ coverageEpoch: 3, ...localTerrainCoverageFixture(1, 0) });
+  assert.equal(second.committed, true);
+  assert.equal(second.reused, false);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], firstRoot);
+  assert.ok(firstGeometries.every(geometry => geometry.disposed === true));
+  const secondRoot = distantRoot.children[0];
+
+  const stale = presentation.syncLocalTerrain({ coverageEpoch: 2, ...initial });
+  assert.equal(stale.committed, false);
+  assert.equal(stale.reason, 'stale-epoch');
+  assert.equal(distantRoot.children[0], secondRoot);
+  presentation.dispose();
+});
+
+test('Local terrain remains current while Far owner generation is unresolved', async () => {
+  let releaseOwner;
+  const heldOwner = new Promise(resolve => { releaseOwner = resolve; });
+  let signalOwner;
+  const ownerStarted = new Promise(resolve => { signalOwner = resolve; });
+  let firstOwner = true;
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    getCanonicalChunkData: async (chunkX, chunkZ) => {
+      if (firstOwner) {
+        firstOwner = false;
+        signalOwner();
+        await heldOwner;
+      }
+      return canonicalChunk(chunkX, chunkZ, []);
+    },
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  const pendingFar = presentation.sync({ ...initial, quality: 'high' });
+  await ownerStarted;
+  const next = localTerrainCoverageFixture(1, 0);
+  const localCommit = presentation.syncLocalTerrain({ coverageEpoch: 2, ...next });
+  assert.equal(localCommit.committed, true);
+  const whilePending = presentation.snapshot();
+  assert.equal(whilePending.farSyncPending, true);
+  assert.deepEqual(whilePending.localTerrainCoverageCenter, { chunkX: 1, chunkZ: 0 });
+  assert.equal(whilePending.committedLocalTerrainEpoch, 2);
+  assert.equal(whilePending.midgroundChunkCount, 16);
+  assert.equal(whilePending.clipmapMeshCount, 1);
+  releaseOwner();
+  assert.equal(await pendingFar, true);
+  assert.equal(presentation.snapshot().farSyncPending, false);
+  presentation.dispose();
+});
+
+test('Local terrain build failure never replaces or disposes the complete old root', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const initial = localTerrainCoverageFixture(0, 0);
+  presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  const distantRoot = scene.children[0];
+  const oldRoot = distantRoot.children[0];
+  const oldGeometries = oldRoot.children.map(child => child.geometry).filter(Boolean);
+  const broken = localTerrainCoverageFixture(1, 0);
+  const brokenKey = broken.activeDataKeys.find(key => !broken.renderedKeys.includes(key));
+  broken.chunks.get(brokenKey).terrain.materialWeights = null;
+  assert.throws(
+    () => presentation.syncLocalTerrain({ coverageEpoch: 2, ...broken }),
+    TypeError,
+  );
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], oldRoot);
+  assert.ok(oldGeometries.every(geometry => geometry.disposed !== true));
+  assert.equal(presentation.snapshot().localTerrainLastRejectionReason, 'build-error');
+  presentation.dispose();
+});
+
+test('canonical LOD only rewrites dirty buckets', async () => {
+  const candidates = Object.freeze([
+    Object.freeze({
+      candidateId: 'detail-v1:dirty-full', subtype: 'broadleaf-tree', variationSeed: 1,
+      orientationSeed: 0.25, worldPosition: Object.freeze({ x: 56, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+    }),
+    Object.freeze({
+      candidateId: 'detail-v1:dirty-silhouette', subtype: 'conifer-tree', variationSeed: 1,
+      orientationSeed: 0.25, worldPosition: Object.freeze({ x: 80, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+    }),
+  ]);
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = candidates;
+  chunk.presentationLayers.natural.vegetation = candidates;
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 0, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+    playerLogicalX: 8, quality: 'high',
+  });
+  assert.equal(await presentation.sync(input), true);
+  const baseline = presentation.snapshot();
+  presentation.update(8, 8, input.renderOrigin);
+  const unchanged = presentation.snapshot();
+  assert.equal(unchanged.canonicalComposeCount, baseline.canonicalComposeCount);
+  assert.equal(unchanged.canonicalMatrixUpdateCount, baseline.canonicalMatrixUpdateCount);
+  assert.equal(unchanged.canonicalNeedsUpdateCount, baseline.canonicalNeedsUpdateCount);
+  const reused = unchanged;
+  presentation.update(32, 8, input.renderOrigin);
+  const changed = presentation.snapshot();
+  assert.ok(changed.canonicalComposeCount > reused.canonicalComposeCount);
+  assert.ok(changed.canonicalDirtyBucketCount - reused.canonicalDirtyBucketCount < changed.canonicalMeshCount);
+  assert.equal(changed.distantTreeProxyCount, 0);
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.deepEqual(audit.map(value => value.ownerKey).sort(), ['5,0', '5,0']);
+  assert.equal(new Set(audit.map(value => value.identity.stableId)).size, 2);
+  presentation.dispose();
+});
+
+test('superseded distant sync cancels during owner acquisition and cannot commit an old epoch', async () => {
+  let releaseFirstOwner;
+  const firstOwner = new Promise(resolve => { releaseFirstOwner = resolve; });
+  let signalFirstOwner;
+  const firstOwnerStarted = new Promise(resolve => { signalFirstOwner = resolve; });
+  let ownerCalls = 0;
+  const requestMetadata = [];
+  const cancelledConsumers = [];
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ, metadata) => {
+      requestMetadata.push(metadata);
+      ownerCalls += 1;
+      if (ownerCalls === 1) {
+        signalFirstOwner();
+        await firstOwner;
+      }
+      return canonicalChunk(chunkX, chunkZ, []);
+    },
+    cancelCanonicalChunkRequests: options => cancelledConsumers.push(options),
+  });
+  const first = presentation.sync(canonicalSyncInput({
+    centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(0, 0, []), quality: 'high',
+  }));
+  await firstOwnerStarted;
+  assert.equal(ownerCalls > 0, true);
+  const second = presentation.sync(canonicalSyncInput({
+    centerChunkX: 1, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(1, 0, []), quality: 'high',
+  }));
+  releaseFirstOwner();
+  assert.equal(await first, false);
+  assert.equal(await second, true);
+  const snapshot = presentation.snapshot();
+  assert.ok(snapshot.staleEpochDiscardCount >= 1);
+  assert.equal(snapshot.committedEpoch, snapshot.syncEpoch);
+  assert.ok(requestMetadata.every(value => value.consumerId === 'distant-owner-query'
+    && Number.isSafeInteger(value.epoch)));
+  assert.ok(cancelledConsumers.some(value => value.consumerId === 'distant-owner-query'
+    && value.beforeEpoch === 2));
+  presentation.dispose();
 });
 
 test('High current-Settlement horizon uses canonical Building and Landmark records exclusively', async () => {

@@ -120,7 +120,11 @@ test('static runtime smoke resolves imports and keeps generator free of Three.js
       const target = resolve(dirname(file), match[1]);
       assert.equal(existsSync(target), true, `${file} has unresolved import ${match[1]}`);
     }
-    if (!file.endsWith('sandbox-main.js')) await import(pathToFileURL(file));
+    if (![
+      'sandbox-main.js',
+      'chunk-generator-worker.js',
+      'chunk-generator-node-worker.js',
+    ].some(entry => file.endsWith(entry))) await import(pathToFileURL(file));
   }
   const generatorSource = readFileSync(resolve(sourceRoot, 'sandbox-chunk-generator.js'), 'utf8');
   assert.doesNotMatch(generatorSource, /\b(?:THREE|document|window|HTMLElement|WebGL)\b/);

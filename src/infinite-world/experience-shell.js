@@ -536,6 +536,13 @@ export function createInfiniteExperienceShell({
         syncShellVisibility();
       }
     }
+    let movement = Object.freeze({
+      velocityX: 0,
+      velocityZ: 0,
+      speedMetersPerSecond: 0,
+      sprint: false,
+      scaleStageId: scaleProfile.stage.id,
+    });
     if (!state.paused && ['intro', 'playing'].includes(state.runPhase)) {
       const keys = input.getInputSnapshot();
       const intro = state.runPhase === 'intro';
@@ -552,6 +559,13 @@ export function createInfiniteExperienceShell({
         player.x += dx * speed * deltaSeconds;
         player.z += dz * speed * deltaSeconds;
         player.facingY = Math.atan2(dx, dz);
+        movement = Object.freeze({
+          velocityX: dx * speed,
+          velocityZ: dz * speed,
+          speedMetersPerSecond: speed,
+          sprint,
+          scaleStageId: scaleProfile.stage.id,
+        });
       }
     }
     if (!state.paused && state.runPhase === 'playing' && state.jumpHeld
@@ -572,7 +586,7 @@ export function createInfiniteExperienceShell({
       scaleStageId: scaleProfile.stage.id,
       terrainHeightMeters: vertical.terrainHeightMeters,
     })) : null;
-    return Object.freeze({ moved: !state.paused, vertical, landed, landing });
+    return Object.freeze({ moved: !state.paused, vertical, landed, landing, movement });
   }
 
   function updateCamera({
@@ -643,8 +657,8 @@ export function createInfiniteExperienceShell({
   }
 
   function renderHud({
-    fps, gameplaySnapshot, runtimeSnapshot, presentationSnapshot = null,
-    saveStatus, renderInfo, resources,
+    fps, gameplaySnapshot, runtimeSnapshot = null, presentationSnapshot = null,
+    saveStatus, renderInfo, resources, debugDetailsEnabled = false,
   }) {
     const savedExperience = gameplaySnapshot.state.experience;
     if (savedExperience) {
@@ -725,6 +739,7 @@ export function createInfiniteExperienceShell({
       if (elements.finalScore) elements.finalScore.textContent = money(player.score);
       syncShellVisibility();
     }
+    if (!debugDetailsEnabled || runtimeSnapshot === null) return;
     const debugSummary = [
       `Chunk ${runtimeSnapshot.centerChunkX},${runtimeSnapshot.centerChunkZ}  Rendered ${runtimeSnapshot.renderedCount}/9  Data ${runtimeSnapshot.activeDataCount}/25`,
       `Midground ${presentationSnapshot?.midgroundChunkCount ?? 0}/16  Clipmap ${presentationSnapshot?.clipmapMeshCount ?? 0}/1`,

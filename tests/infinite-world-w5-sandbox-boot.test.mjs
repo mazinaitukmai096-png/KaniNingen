@@ -13,6 +13,7 @@ import {
   recordSandboxBootFailure,
   w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
+import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
 import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
 import { UNITS_PER_METER } from '../src/infinite-world/chunk-coordinates.js';
 import {
@@ -555,8 +556,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.presentation.maximumObservedQueryConcurrency <= 4);
     assert.ok(snapshot.presentation.distantWaterProxyCount <= 24);
     assert.ok(snapshot.presentation.distantProxyInstancedMeshCount > 0);
-    assert.equal(distantWorld.children.length, 1);
-    assert.match(distantWorld.children[0].name, /^w8-distant-presentation-epoch-/);
+    assert.equal(distantWorld.children.length, 2);
+    assert.ok(distantWorld.children.some(child => /^w8-distant-presentation-epoch-/.test(child.name)));
+    assert.ok(distantWorld.children.some(child => /^w8-local-terrain-coverage-epoch-/.test(child.name)));
     const distantPresentationObjects = [];
     const visitDistantPresentation = object => {
       for (const child of object.children ?? []) {
@@ -824,6 +826,8 @@ test('production startup contains no distribution survey, golden generation, or 
   const bootstrap = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js'), 'utf8');
   const entry = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js'), 'utf8');
   const boot = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-boot.js'), 'utf8');
+  const runtime = readFileSync(resolve(repoRoot, 'src/infinite-world/chunk-runtime-manager.js'), 'utf8');
+  const distant = readFileSync(resolve(repoRoot, 'src/infinite-world/render/w8-distant-presentation.js'), 'utf8');
   const sources = `${bootstrap}\n${entry}\n${boot}`;
   assert.doesNotMatch(sources, /findInMacroRange\s*\(|41\s*[x×]\s*41|453\s+Settlement/);
   assert.doesNotMatch(sources, /runW1BChunkSizeBenchmark|golden|performance benchmark/i);
@@ -834,4 +838,10 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-entry.js')), true);
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);
+  assert.match(boot, /new ChunkDataService\(/);
+  assert.match(boot, /createInlineChunkGeneratorTransport/);
+  assert.doesNotMatch(runtime, /this\.generator\.generateChunk/);
+  assert.doesNotMatch(boot, /runtime\.getChunkData\([^)]*\)\s*\?\?\s*generator\.generateChunk/);
+  assert.doesNotMatch(boot, /getChunkDataForQuery:\s*\([^)]*\)\s*=>\s*generator\.generateChunk/);
+  assert.doesNotMatch(distant, /generator\.generateChunk/);
 });

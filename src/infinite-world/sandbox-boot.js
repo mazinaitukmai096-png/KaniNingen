@@ -1,4 +1,8 @@
 import { ChunkRuntimeManager } from './chunk-runtime-manager.js';
+import { ChunkDataService } from './chunk-data-service.js';
+import { CHUNK_DATA_PRIORITY } from './chunk-data-service-protocol.js';
+import { createInlineChunkGeneratorTransport } from './inline-chunk-generator-transport.js';
+import { createWorkerChunkGeneratorTransport } from './worker-chunk-generator-transport.js';
 import {
   W1B_SELECTED_RENDER_CHUNK_SIZE,
   describeRenderChunkCandidate,
@@ -10,6 +14,7 @@ import {
   logicalWorldToRenderLocal,
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
+import { planNextChunkBoundaryPrefetch } from './chunk-streaming-plan.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import {
   createW8ParityChunkGenerator,
@@ -43,6 +48,13 @@ import {
 } from './runtime-diagnostics.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
+
+export function shouldDeferAutosaveForStreaming(streamingState, { force = false } = {}) {
+  if (force) return false;
+  return streamingState?.transitionPending === true
+    || streamingState?.preparationPending === true
+    || Number(streamingState?.pendingPrefetchCount ?? 0) > 0;
+}
 
 const FINITE_TO_INFINITE_RENDER_SCALE = UNITS_PER_METER / PRODUCTION_VISUAL_UNITS_PER_METER;
 const finiteVisualToRender = value => value * FINITE_TO_INFINITE_RENDER_SCALE;
@@ -686,6 +698,7 @@ export async function bootInfiniteWorldSandbox({
     || diagnosticProfile.profileId !== 'baseline',
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
+  chunkGeneratorWorkerFactory = null,
   renderAdapterFactory = options => new ChunkRenderAdapter(options),
   runtimeFactory = options => new ChunkRuntimeManager(options),
   chunkIndexFactory = options => new PersistentChunkIndex(options),
@@ -707,6 +720,9 @@ export async function bootInfiniteWorldSandbox({
   }
 
   let generator = null;
+  let chunkDataService = null;
+  let chunkGeneratorTransport = null;
+  let chunkGenerationMs = 0;
   let renderAdapter = null;
   let runtime = null;
   let worldState = null;
@@ -719,6 +735,7 @@ export async function bootInfiniteWorldSandbox({
   let scene = null;
   let scenePresentation = null;
   let distantPresentation = null;
+  let localTerrainCoverageEpoch = 0;
   let audioDirector = null;
   let diagnostics = null;
   let availableSaveSnapshot = null;
@@ -761,7 +778,48 @@ export async function bootInfiniteWorldSandbox({
         worldSeed: requestedSeed,
       },
     });
-    generator = await runStage('Legacy Core', () => generatorFactory({ worldSeed: requestedSeed }));
+    const generatorMetadata = await runStage('Legacy Core', async () => {
+      const workerTransport = createWorkerChunkGeneratorTransport({
+        worldSeed: requestedSeed,
+        workerFactory: chunkGeneratorWorkerFactory ?? undefined,
+        fallbackTransportFactory: async () => createInlineChunkGeneratorTransport({
+          generator: await generatorFactory({ worldSeed: requestedSeed }),
+        }),
+        clock,
+      });
+      chunkGeneratorTransport = Object.freeze({
+        initialize: () => workerTransport.initialize(),
+        async generateChunk(request) {
+          const startedAt = clock();
+          try {
+            return await diagnostics.measureAsync(
+              'chunk-generation',
+              () => workerTransport.generateChunk(request),
+            );
+          } finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
+        },
+        findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
+        snapshot: () => workerTransport.snapshot(),
+        shutdown: () => workerTransport.shutdown(),
+      });
+      chunkDataService = new ChunkDataService({
+        transport: chunkGeneratorTransport,
+        cacheCapacity: 81,
+      });
+      return chunkDataService.initialize();
+    });
+    generator = Object.freeze({
+      worldSeed: generatorMetadata.worldSeed,
+      worldSeedHash: generatorMetadata.worldSeedHash,
+      generatorVersion: generatorMetadata.generatorVersion,
+      experienceSpawn: generatorMetadata.experienceSpawn,
+      reviewSpawn: generatorMetadata.reviewSpawn,
+      distributor: Object.freeze({
+        findSettlementsNear: (...args) => chunkGeneratorTransport.findSettlementsNear(...args),
+      }),
+      snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot
+        ?? generatorMetadata.generatorSnapshot,
+    });
     experienceSpawn = generator.experienceSpawn ?? generator.reviewSpawn;
     await runStage('Save State', async () => {
       worldState = worldStateFactory({
@@ -867,28 +925,15 @@ export async function bootInfiniteWorldSandbox({
       const chunkIndex = chunkIndexFactory({ capacity: 65_536 });
       const logicalPlayer = worldState.player;
       const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-      let chunkGenerationMs = 0;
       let renderProjectionMs = 0;
-      const measuredGenerator = {
-        async generateChunk(chunkX, chunkZ) {
-          const startedAt = clock();
-          try {
-            return await diagnostics.measureAsync(
-              'chunk-generation',
-              () => generator.generateChunk(chunkX, chunkZ),
-            );
-          }
-          finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
-        },
-      };
       const measuredRenderAdapter = {
         rebase: origin => diagnostics.measure('chunk-rebase', () => renderAdapter.rebase(origin)),
-        async projectChunk(chunkData, origin) {
+        async projectChunk(chunkData, origin, options) {
           const startedAt = clock();
           try {
             return await diagnostics.measureAsync(
               'chunk-projection',
-              () => renderAdapter.projectChunk(chunkData, origin),
+              () => renderAdapter.projectChunk(chunkData, origin, options),
             );
           }
           finally { renderProjectionMs += Math.max(0, clock() - startedAt); }
@@ -899,10 +944,14 @@ export async function bootInfiniteWorldSandbox({
         unloadChunk: key => diagnostics.measure(
           'chunk-unload', () => renderAdapter.unloadChunk(key),
         ),
+        discardProjected: projected => diagnostics.measure(
+          'chunk-discard', () => renderAdapter.discardProjected?.(projected),
+        ),
+        renderCoverageSnapshot: () => renderAdapter.renderCoverageSnapshot?.() ?? null,
         shutdown: () => renderAdapter.shutdown(),
       };
       runtime = runtimeFactory({
-        generator: measuredGenerator,
+        chunkDataService,
         renderAdapter: measuredRenderAdapter,
         cacheCapacity: 81,
         chunkIndex,
@@ -925,11 +974,30 @@ export async function bootInfiniteWorldSandbox({
       visualAssets,
       findSettlementsNear: generator.distributor.findSettlementsNear,
       resolveTemplate: createMigratedSettlementTemplate,
-      getCanonicalChunkData: async (chunkX, chunkZ) =>
-        runtime.getChunkData(chunkX, chunkZ) ?? generator.generateChunk(chunkX, chunkZ),
+      getCanonicalChunkData: async (chunkX, chunkZ, request = {}) =>
+        runtime.getChunkData(chunkX, chunkZ) ?? chunkDataService.requestChunk({
+          chunkX,
+          chunkZ,
+          priority: request.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+          consumerId: request.consumerId ?? 'distant-owner-query',
+          epoch: request.epoch ?? 0,
+        }).promise,
+      cancelCanonicalChunkRequests: options => chunkDataService.cancelConsumer(options),
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
       measure: (stage, operation) => diagnostics.measure(stage, operation),
     });
+    {
+      const runtimeSnapshot = runtime.getCommittedChunkState();
+      distantPresentation.syncLocalTerrain({
+        coverageEpoch: ++localTerrainCoverageEpoch,
+        activeDataKeys: runtimeSnapshot.activeDataKeys,
+        renderedKeys: runtimeSnapshot.renderedKeys,
+        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+        renderOrigin: runtimeSnapshot.renderOrigin,
+        centerChunkX: runtimeSnapshot.centerChunkX,
+        centerChunkZ: runtimeSnapshot.centerChunkZ,
+      });
+    }
     if (diagnosticProfile.distant) {
       const runtimeSnapshot = runtime.snapshot();
       await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
@@ -986,7 +1054,16 @@ export async function bootInfiniteWorldSandbox({
         state: worldState,
         renderAdapter: gameplayRenderAdapter,
         featureRenderAdapter: renderAdapter,
-        getChunkDataForQuery: (chunkX, chunkZ) => generator.generateChunk(chunkX, chunkZ),
+        getChunkDataForQuery: (chunkX, chunkZ, {
+          consumerId = 'gameplay-tank-terrain', epoch = 0,
+        } = {}) => runtime.getChunkData(chunkX, chunkZ) ?? chunkDataService.requestChunk({
+          chunkX,
+          chunkZ,
+          priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+          consumerId,
+          epoch,
+        }).promise,
+        cancelChunkDataQueries: options => chunkDataService.cancelConsumer(options),
         sampleTerrainHeight: sampleCanonicalTerrainHeightMeters,
         clock,
       });
@@ -1010,6 +1087,7 @@ export async function bootInfiniteWorldSandbox({
     let playerRelocationInProgress = false;
     let saveStatus = state.saveAvailable ? 'available' : state.saveError ? 'invalid' : 'new';
     let lastFrameAt = clock();
+    let latestFrameDurationMs = 0;
     let lastHudAt = 0;
     let lastVisualPlayerX = logicalPlayer.x;
     let lastVisualPlayerZ = logicalPlayer.z;
@@ -1018,9 +1096,12 @@ export async function bootInfiniteWorldSandbox({
     let saveIdleCallback = null;
     let lastSavedRevision = -1;
     let runStarted = false;
-    let farNaturalWarmStarted = false;
-    let ultraNaturalWarmStarted = false;
     let lastRunStartDiagnostics = null;
+    let postCommitRequestedEpoch = 0;
+    let postCommitCompletedEpoch = 0;
+    let postCommitPumpActive = false;
+    let postCommitTimer = null;
+    let saveDeferredForStreaming = false;
     let lastCameraCollision = Object.freeze({
       collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0,
     });
@@ -1050,6 +1131,62 @@ export async function bootInfiniteWorldSandbox({
       playerLogicalZ: logicalPlayer.z,
       includeUltraNatural,
     });
+
+    const synchronizeLocalTerrain = runtimeSnapshot => distantPresentation.syncLocalTerrain({
+      coverageEpoch: ++localTerrainCoverageEpoch,
+      activeDataKeys: runtimeSnapshot.activeDataKeys,
+      renderedKeys: runtimeSnapshot.renderedKeys,
+      getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+      renderOrigin: runtimeSnapshot.renderOrigin,
+      centerChunkX: runtimeSnapshot.centerChunkX,
+      centerChunkZ: runtimeSnapshot.centerChunkZ,
+    });
+
+    const deferToNextTask = () => new Promise(resolve => {
+      setTimeoutFn(resolve, 0);
+    });
+
+    function schedulePostCommitPump() {
+      if (postCommitPumpActive || postCommitTimer !== null) return;
+      postCommitTimer = setTimeoutFn(() => {
+        postCommitTimer = null;
+        postCommitPumpActive = true;
+        void (async () => {
+          try {
+            await deferToNextTask();
+            const committedEpoch = postCommitRequestedEpoch;
+            const runtimeState = runtime.getCommittedChunkState();
+            distantPresentation.rebase(runtimeState.renderOrigin);
+            synchronizeLocalTerrain(runtimeState);
+            if (diagnosticProfile.distant) {
+              await diagnostics.measureAsync(
+                'distant-sync',
+                () => synchronizeDistantPresentation(runtimeState),
+              );
+            }
+            if (diagnosticProfile.gameplaySync) {
+              await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+                activeDataKeys: runtimeState.activeDataKeys,
+                renderedKeys: runtimeState.renderedKeys,
+                getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+                renderOrigin: runtimeState.renderOrigin,
+              }));
+            }
+            postCommitCompletedEpoch = committedEpoch;
+          } catch (error) {
+            transitionError = error;
+          } finally {
+            postCommitPumpActive = false;
+            if (running && postCommitCompletedEpoch < postCommitRequestedEpoch) schedulePostCommitPump();
+          }
+        })();
+      }, 0);
+    }
+
+    function schedulePostCommitWork() {
+      postCommitRequestedEpoch += 1;
+      schedulePostCommitPump();
+    }
 
     function sampleCanonicalTerrainHeightMeters(
       logicalWorldX,
@@ -1104,9 +1241,10 @@ export async function bootInfiniteWorldSandbox({
         'chunk-transition',
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
       );
-      const runtimeSnapshot = runtime.snapshot();
+      const runtimeSnapshot = runtime.getCommittedChunkState();
       scenePresentation.rebase(runtimeSnapshot.renderOrigin);
       distantPresentation.rebase(runtimeSnapshot.renderOrigin);
+      synchronizeLocalTerrain(runtimeSnapshot);
       if (diagnosticProfile.distant) {
         await diagnostics.measureAsync(
           'distant-sync',
@@ -1137,9 +1275,16 @@ export async function bootInfiniteWorldSandbox({
       }
       if (!runStarted && !force) return;
       if (!force && lastSavedRevision === worldState.revision) return;
+      if (shouldDeferAutosaveForStreaming(runtime.getStreamingState(), { force })) {
+        saveDeferredForStreaming = true;
+        saveStatus = 'deferred-streaming';
+        scheduleSave({ delayMs: 125 });
+        return;
+      }
       try {
         await diagnostics.measureAsync('save-total', () => saveStore.save(worldState));
         lastSavedRevision = worldState.revision;
+        saveDeferredForStreaming = false;
         state.saveAvailable = true;
         experienceShell?.setContinueAvailable?.(true);
         saveStatus = 'saved';
@@ -1148,7 +1293,7 @@ export async function bootInfiniteWorldSandbox({
         saveStatus = 'failed';
       }
     }
-    function scheduleSave({ immediate = false } = {}) {
+    function scheduleSave({ immediate = false, delayMs = 5_000, force = false } = {}) {
       if (!runStarted || !diagnosticProfile.save) return false;
       if (saveTimer !== null) {
         if (!immediate) return true;
@@ -1160,7 +1305,10 @@ export async function bootInfiniteWorldSandbox({
         saveIdleCallback = null;
       }
       if (immediate) {
-        void saveWorld({ force: true });
+        saveTimer = setTimeoutFn(() => {
+          saveTimer = null;
+          void saveWorld({ force });
+        }, 0);
         return true;
       }
       saveTimer = setTimeoutFn(() => {
@@ -1171,7 +1319,7 @@ export async function bootInfiniteWorldSandbox({
             void saveWorld();
           }, { timeout: 2_000 });
         } else void saveWorld();
-      }, 5_000);
+      }, delayMs);
       return true;
     }
     async function loadWorld() {
@@ -1387,7 +1535,7 @@ export async function bootInfiniteWorldSandbox({
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
     }
-    const handlePageHide = () => scheduleSave({ immediate: true });
+    const handlePageHide = () => scheduleSave({ immediate: true, force: true });
     function setMeasurementViewport(width, height) {
       if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
         throw new RangeError('measurement viewport dimensions must be positive finite numbers');
@@ -1401,79 +1549,81 @@ export async function bootInfiniteWorldSandbox({
     addWindowListener('pagehide', handlePageHide);
 
     function requestTransition(owner) {
-      const runtimeSnapshot = runtime.snapshot();
       if (transitionTargetKey
-        || (runtimeSnapshot.centerChunkX === owner.chunkX && runtimeSnapshot.centerChunkZ === owner.chunkZ)) return;
+        || runtime.isCenteredAt(owner.chunkX, owner.chunkZ)) return;
       transitionTargetKey = owner.key;
       diagnostics.measureAsync(
         'chunk-transition',
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
       )
-        .then(async () => {
-          const nextSnapshot = runtime.snapshot();
-          scenePresentation.rebase(nextSnapshot.renderOrigin);
-          distantPresentation.rebase(nextSnapshot.renderOrigin);
-          if (diagnosticProfile.distant) {
-            await diagnostics.measureAsync(
-              'distant-sync',
-              () => synchronizeDistantPresentation(nextSnapshot),
-            );
-          }
-          if (!diagnosticProfile.gameplaySync) return null;
-          return diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
-              activeDataKeys: nextSnapshot.activeDataKeys,
-              renderedKeys: nextSnapshot.renderedKeys,
-              getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-              renderOrigin: nextSnapshot.renderOrigin,
-            }));
+        .then(() => {
+          const nextState = runtime.getCommittedChunkState();
+          scenePresentation.rebase(nextState.renderOrigin);
+          distantPresentation.rebase(nextState.renderOrigin);
+          synchronizeLocalTerrain(nextState);
+          schedulePostCommitWork();
         })
         .catch(error => { transitionError = error; })
         .finally(() => { transitionTargetKey = null; });
     }
 
-    function requestDirectionalPrefetch(owner) {
-      const runtimeSnapshot = runtime.snapshot();
-      if (runtimeSnapshot.centerChunkX === null || transitionTargetKey) return;
-      const directionX = Math.sin(logicalPlayer.facingY);
-      const directionZ = Math.cos(logicalPlayer.facingY);
-      let targetChunkX = runtimeSnapshot.centerChunkX;
-      let targetChunkZ = runtimeSnapshot.centerChunkZ;
-      if (directionX > 0.35 && owner.logicalLocalX >= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkX += 1;
-      else if (directionX < -0.35 && owner.logicalLocalX <= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkX -= 1;
-      if (directionZ > 0.35 && owner.logicalLocalZ >= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkZ += 1;
-      else if (directionZ < -0.35 && owner.logicalLocalZ <= LOGICAL_CHUNK_SIZE_METERS * 0.5) targetChunkZ -= 1;
-      if (targetChunkX === runtimeSnapshot.centerChunkX && targetChunkZ === runtimeSnapshot.centerChunkZ) return;
-      const missing = squareChunkCoordinates(targetChunkX, targetChunkZ, 2)
-        .find(coordinate => runtime.getChunkData(coordinate.chunkX, coordinate.chunkZ) === null
-          && !directionalPrefetchPending.has(coordinate.key));
-      if (!missing) return;
-      directionalPrefetchPending.add(missing.key);
+    function requestDirectionalPrefetch(movement) {
+      const streaming = runtime.getStreamingState();
+      if (streaming.centerChunkX === null || transitionTargetKey || movement.speedMetersPerSecond <= 0) return;
+      const plan = planNextChunkBoundaryPrefetch({
+        centerChunkX: streaming.centerChunkX,
+        centerChunkZ: streaming.centerChunkZ,
+        logicalX: logicalPlayer.x,
+        logicalZ: logicalPlayer.z,
+        velocityX: movement.velocityX,
+        velocityZ: movement.velocityZ,
+        speedMetersPerSecond: movement.speedMetersPerSecond,
+        scaleStageId: movement.scaleStageId,
+        sprint: movement.sprint,
+      });
+      if (!plan || directionalPrefetchPending.has(plan.targetKey)) return;
+      directionalPrefetchPending.add(plan.targetKey);
       void diagnostics.measureAsync(
         'chunk-prefetch',
-        () => runtime.prefetchChunk(missing.chunkX, missing.chunkZ),
+        () => runtime.prepareTransition(plan.targetChunkX, plan.targetChunkZ),
       ).catch(error => { transitionError = error; })
-        .finally(() => directionalPrefetchPending.delete(missing.key));
+        .finally(() => directionalPrefetchPending.delete(plan.targetKey));
     }
 
     function updatePlayer(
       deltaSeconds,
-      renderOrigin = runtime.snapshot().renderOrigin,
+      renderOrigin = runtime.getRenderOrigin(),
       cameraDeltaSeconds = deltaSeconds,
     ) {
       const scaleProfile = getW6ScaleProfile(worldState.activeScaleStageId);
+      let movement = Object.freeze({
+        velocityX: 0,
+        velocityZ: 0,
+        speedMetersPerSecond: 0,
+        sprint: false,
+        scaleStageId: scaleProfile.stage.id,
+      });
       if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
         logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
         logicalPlayer.facingY = Math.PI / 2;
+        movement = Object.freeze({
+          velocityX: scaleProfile.movementMetersPerSecond,
+          velocityZ: 0,
+          speedMetersPerSecond: scaleProfile.movementMetersPerSecond,
+          sprint: false,
+          scaleStageId: scaleProfile.stage.id,
+        });
       } else if (!measurement.mode) {
-        experienceShell.updatePlayer({
+        const update = experienceShell.updatePlayer({
           deltaSeconds,
           player: logicalPlayer,
           scaleProfile,
           movementMultiplier: gameplay.getPlayerMovementMultiplier(),
         });
+        movement = update.movement;
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-      requestDirectionalPrefetch(owner);
+      requestDirectionalPrefetch(movement);
       requestTransition(owner);
       const renderLocal = logicalWorldToRenderLocal(
         logicalPlayer.x,
@@ -1545,6 +1695,20 @@ export async function bootInfiniteWorldSandbox({
     }
 
     function updateHud(owner) {
+      const gameplaySnapshot = gameplay.snapshot();
+      const debugDetailsEnabled = diagnostics.enabled || worldState.developerTools === true;
+      if (!debugDetailsEnabled) {
+        experienceShell.renderHud({
+          fps: latestFrameDurationMs > 0 ? 1000 / latestFrameDurationMs : 0,
+          gameplaySnapshot,
+          runtimeSnapshot: null,
+          saveStatus,
+          renderInfo: null,
+          resources: null,
+          debugDetailsEnabled: false,
+        });
+        return;
+      }
       const runtimeSnapshot = runtime.snapshot();
       const experienceSnapshot = experienceShell.snapshot();
       distantPresentation.setTreeLodDiagnosticsEnabled?.(
@@ -1561,13 +1725,20 @@ export async function bootInfiniteWorldSandbox({
       const currentChunk = runtime.getChunkData(owner.chunkX, owner.chunkZ);
       const metrics = runtimeSnapshot.performance;
       const transition = runtimeSnapshot.latestTransition;
-      const gameplaySnapshot = gameplay.snapshot();
+      const chunkTransportSnapshot = chunkDataService.snapshot().transport;
       const renderInfo = renderer.info;
+      const renderResources = renderAdapter.resourceSnapshot();
+      const renderedKeySet = new Set(runtimeSnapshot.renderedKeys);
+      const loadedKeySet = new Set(renderResources.renderCoverage?.loadedKeys ?? []);
+      const renderCoverageKeyDifference = [
+        ...runtimeSnapshot.renderedKeys.filter(key => !loadedKeySet.has(key)),
+        ...(renderResources.renderCoverage?.loadedKeys ?? []).filter(key => !renderedKeySet.has(key)),
+      ].sort();
       const measurementReport = diagnostics.snapshot({
         drawCalls: renderInfo?.render?.calls ?? null,
         triangles: renderInfo?.render?.triangles ?? null,
         geometries: renderInfo?.memory?.geometries ?? null,
-        materials: renderAdapter.resourceSnapshot().sharedMaterialCount,
+        materials: renderResources.sharedMaterialCount,
         sceneObjects: countSceneObjects(scene),
       });
       const stageP95 = stage => number(measurementReport.stages[stage]?.p95);
@@ -1609,6 +1780,9 @@ Controls: WASD / Shift / Space / Left + Right Mouse / Wheel / H / Escape (develo
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
+Chunk Generator: ${escapeHtml(chunkTransportSnapshot?.mode ?? chunkTransportSnapshot?.kind ?? 'unknown')}  fallback ${chunkTransportSnapshot?.fallbackOccurred ? escapeHtml(chunkTransportSnapshot.fallbackReason?.message ?? 'yes') : 'none'}  worker generation p50/max ${number(chunkTransportSnapshot?.generationMsP50)}/${number(chunkTransportSnapshot?.generationMsMaximum)}ms  receive p50/max ${number(chunkTransportSnapshot?.mainThreadReceiveMsP50)}/${number(chunkTransportSnapshot?.mainThreadReceiveMsMaximum)}ms
+Distant Local Terrain: epoch ${presentationSnapshot.committedLocalTerrainEpoch}/${presentationSnapshot.localTerrainSyncEpoch}  center (${presentationSnapshot.localTerrainCoverageCenter?.chunkX ?? 'n/a'}, ${presentationSnapshot.localTerrainCoverageCenter?.chunkZ ?? 'n/a'})  active/resolved/rendered/mid ${presentationSnapshot.localTerrainActiveKeyCount}/${presentationSnapshot.localTerrainResolvedChunkCount}/${presentationSnapshot.localTerrainRenderedKeyCount}/${presentationSnapshot.localTerrainMidgroundOwnerCount}  commits/rejects ${presentationSnapshot.localTerrainCommitCount}/${presentationSnapshot.localTerrainRejectionCount}  missing ${escapeHtml(presentationSnapshot.localTerrainMissingOwnerKeys.join(',') || 'none')}  far pending ${presentationSnapshot.farSyncPending ? presentationSnapshot.farSyncPendingCount : 0}
+Render Coverage Audit: loaded/terrain ${renderResources.renderCoverage?.loadedKeys.length ?? 0}/${renderResources.renderCoverage?.terrainKeys.length ?? 0}  key diff ${escapeHtml(renderCoverageKeyDifference.join(',') || 'none')}  missing ${escapeHtml(renderResources.renderCoverage?.missingTerrainKeys.join(',') || 'none')}  disposed ${escapeHtml(renderResources.renderCoverage?.disposedTerrainKeys.join(',') || 'none')}
 Distant: mid ${presentationSnapshot.midgroundChunkCount}  natural ${presentationSnapshot.distantNaturalProxyCount}/${presentationSnapshot.distantNaturalProxyLimit}  town ${presentationSnapshot.distantTownProxyCount}/${presentationSnapshot.distantTownProxyLimit}  water ${presentationSnapshot.distantWaterProxyCount}  boundary RGB ${number(presentationSnapshot.maximumInnerBoundaryColorDifference)}
 Canonical: settlements ${presentationSnapshot.queryCandidateCount}/${presentationSnapshot.queryTemplateSuccessCount} resolved  owner Chunks ${presentationSnapshot.queryCanonicalChunkSuccessCount}/${presentationSnapshot.queryOwnerChunkCount}  records ${presentationSnapshot.canonicalRecordCount} (building ${presentationSnapshot.canonicalBuildingRecordCount}, landmark ${presentationSnapshot.canonicalLandmarkRecordCount}, road ${presentationSnapshot.canonicalRoadRecordCount})  visible Far ${presentationSnapshot.canonicalFarObjectCount} / Mid ${presentationSnapshot.canonicalMidObjectCount} / Near handoff ${presentationSnapshot.canonicalNearObjectCount}
 Tree LOD: full ${presentationSnapshot.visibleCanonicalFullTreeCount}  silhouette ${presentationSnapshot.visibleCanonicalSilhouetteTreeCount}  ultra ${presentationSnapshot.visibleCanonicalUltraTreeCount}  84-124m ${presentationSnapshot.visibleCanonicalTreeUltraInnerBandCount}  124-140m ${presentationSnapshot.visibleCanonicalTreeUltraOuterBandCount}  parts ${presentationSnapshot.visibleCanonicalTreePartInstanceCount}
@@ -1622,7 +1796,7 @@ Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.lo
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
-Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderAdapter.resourceSnapshot().sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
       experienceShell.renderHud({
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
@@ -1633,8 +1807,9 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           drawCalls: renderInfo?.render?.calls ?? null,
           geometries: renderInfo?.memory?.geometries ?? null,
         },
-        resources: renderAdapter.resourceSnapshot(),
+        resources: renderResources,
         measurementReport,
+        debugDetailsEnabled: true,
       });
     }
 
@@ -1702,17 +1877,18 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           farNaturalWarmStarted = true;
           void diagnostics.measureAsync(
             'distant-sync',
-            () => synchronizeDistantPresentation(runtime.snapshot(), { includeUltraNatural: false }),
+            () => synchronizeDistantPresentation(runtime.getCommittedChunkState(), { includeUltraNatural: false }),
           ).then(() => {
             if (!running || ultraNaturalWarmStarted) return;
             ultraNaturalWarmStarted = true;
             void diagnostics.measureAsync(
               'distant-sync-ultra',
-              () => synchronizeDistantPresentation(runtime.snapshot()),
+              () => synchronizeDistantPresentation(runtime.getCommittedChunkState()),
             ).catch(error => { transitionError = error; });
           }).catch(error => { transitionError = error; });
         }
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
+        latestFrameDurationMs = rawFrameMs;
         if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
         diagnostics.startFrame(frameNow);
         diagnosticFrameStarted = diagnostics.enabled;
@@ -1749,7 +1925,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           paused: experienceShell.isPaused(),
           hitStopped,
         });
-        const frameRenderOrigin = runtime.snapshot().renderOrigin;
+        const frameRenderOrigin = runtime.getRenderOrigin();
         diagnostics.measure('scene-presentation', () => updateScenePresentation(
           deltaSeconds,
           frameNow,
@@ -1816,6 +1992,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (!running && runtime?.snapshot().activeDataCount === 0) return;
       running = false;
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
+      if (postCommitTimer !== null) { clearTimeoutFn(postCommitTimer); postCommitTimer = null; }
       if (saveTimer !== null) { clearTimeoutFn(saveTimer); saveTimer = null; }
       if (saveIdleCallback !== null) {
         globalObject.cancelIdleCallback?.(saveIdleCallback);
@@ -1830,6 +2007,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       await gameplay.shutdown();
       await runtime.shutdown();
       distantPresentation.dispose();
+      await chunkDataService.shutdown();
       scenePresentation.dispose();
       visualAssets.dispose();
       renderer.dispose();
@@ -1852,6 +2030,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           runtime: runtimeSnapshot,
           resources: renderAdapter.resourceSnapshot(),
           generator: generator.snapshot(),
+          chunkDataService: chunkDataService.snapshot(),
           gameplay: gameplay.snapshot(),
           experience: experienceSnapshot,
           runStart: lastRunStartDiagnostics ? Object.freeze({
@@ -1914,6 +2093,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       distantPresentation?.dispose?.();
+      await chunkDataService?.shutdown?.();
       scenePresentation?.dispose?.();
       visualAssets?.dispose?.();
       await audioDirector?.dispose?.();
@@ -1926,3 +2106,5 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     throw error;
   }
 }
+    let farNaturalWarmStarted = false;
+    let ultraNaturalWarmStarted = false;

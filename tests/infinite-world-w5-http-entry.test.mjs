@@ -104,7 +104,11 @@ test('real HTTP entry and recursive local import graph resolve with JavaScript M
     assert.ok(entryMatch, 'module entry script is missing');
 
     const entryUrl = new URL(entryMatch[1], htmlUrl).href;
-    const queue = [{ url: entryUrl, referrer: htmlUrl, specifier: entryMatch[1] }];
+    const workerUrl = new URL('./src/infinite-world/chunk-generator-worker.js', htmlUrl).href;
+    const queue = [
+      { url: entryUrl, referrer: htmlUrl, specifier: entryMatch[1] },
+      { url: workerUrl, referrer: htmlUrl, specifier: './src/infinite-world/chunk-generator-worker.js' },
+    ];
     const visited = new Map();
     while (queue.length) {
       const edge = queue.shift();
@@ -128,6 +132,8 @@ test('real HTTP entry and recursive local import graph resolve with JavaScript M
     assert.ok(visited.size >= 40, `expected complete W5 graph, received ${visited.size} modules`);
     assert.equal([...visited.keys()].some(url => url.includes('/sandbox-entry.js?v=w8-finite-parity')), true);
     assert.equal([...visited.keys()].some(url => url.includes('/sandbox-main.js?v=w8-finite-parity')), true);
+    assert.equal([...visited.keys()].some(url => url.endsWith('/chunk-generator-worker.js')), true);
+    assert.equal([...visited.keys()].some(url => url.endsWith('/chunk-generator-worker-core.js')), true);
     assert.equal([...visited.keys()].some(url => url.endsWith('/src/infinite-world/runtime-timing.js')), true);
     assert.equal([...visited.values()].every(record => record.status === 200 && javascriptMime.test(record.contentType)), true);
     assert.equal(findImportCycle(visited), null, 'entry import graph must remain acyclic');

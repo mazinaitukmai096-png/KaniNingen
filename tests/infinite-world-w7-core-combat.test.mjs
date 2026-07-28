@@ -346,6 +346,7 @@ async function drainAsyncWork(turns = 4) {
 async function createRuntime({
   playerSpawn = { x: 4, z: 4 }, clock = () => 0, chunk = combatChunk(),
   configureState = null, sampleTerrainHeight = null, getChunkDataForQuery = null,
+  cancelChunkDataQueries = null,
   renderedKeys = ['0,0'], activeDataKeys = renderedKeys, getChunkData = null,
 } = {}) {
   const state = new InfiniteWorldState({ worldSeedHash, playerSpawn });
@@ -361,6 +362,7 @@ async function createRuntime({
     clock,
     sampleTerrainHeight,
     getChunkDataForQuery,
+    cancelChunkDataQueries,
   });
   await runtime.syncActiveChunks({
     renderedKeys,
@@ -1534,12 +1536,14 @@ test('stale in-flight fallback work cannot cross restart or restored-state refre
 
   await t.test('restart rejects Stable ID work that began in the previous run', async () => {
     const deferredTerrain = [];
+    const cancelledQueries = [];
     const { runtime, state, renderer } = await createRuntime({
       playerSpawn: { x: 8, z: 8 },
       chunk: emptyChunk(0, 0),
       getChunkDataForQuery(chunkX, chunkZ) {
         return new Promise(resolveTerrain => deferredTerrain.push({ chunkX, chunkZ, resolveTerrain }));
       },
+      cancelChunkDataQueries(options) { cancelledQueries.push(options); },
       sampleTerrainHeight,
       configureState(candidate) {
         candidate.player.score = 3_000;
@@ -1551,6 +1555,8 @@ test('stale in-flight fallback work cannot cross restart or restored-state refre
       playerSpawn: { x: 2, z: 3 },
       renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
     });
+    assert.ok(cancelledQueries.some(value => value.consumerId === 'gameplay-tank-terrain'
+      && value.beforeEpoch === 1));
     for (const request of deferredTerrain) {
       request.resolveTerrain(emptyChunk(request.chunkX, request.chunkZ, { terrainHeight: 0 }));
     }

@@ -1,0 +1,66 @@
+export const CHUNK_DATA_PRIORITY = Object.freeze({
+  PLAYER_DATA: 1,
+  PLAYER_RENDER: 2,
+  GAMEPLAY_REQUIRED: 3,
+  DISTANT_OWNER: 4,
+  ULTRA_WARM: 5,
+});
+
+export const CHUNK_GENERATOR_PROTOCOL_VERSION = 1;
+
+export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
+  INITIALIZE: 'chunk-generator:initialize',
+  INITIALIZED: 'chunk-generator:initialized',
+  GENERATE: 'chunk-generator:generate',
+  GENERATED: 'chunk-generator:generated',
+  FIND_SETTLEMENTS: 'chunk-generator:find-settlements',
+  SETTLEMENTS: 'chunk-generator:settlements',
+  ERROR: 'chunk-generator:error',
+});
+
+export const CHUNK_DATA_PRIORITY_NAMES = Object.freeze(
+  new Map(Object.entries(CHUNK_DATA_PRIORITY).map(([name, value]) => [value, name])),
+);
+
+export function assertChunkDataPriority(priority) {
+  if (!Number.isSafeInteger(priority) || !CHUNK_DATA_PRIORITY_NAMES.has(priority)) {
+    throw new RangeError(`unknown ChunkData priority: ${priority}`);
+  }
+  return priority;
+}
+
+export function createChunkDataRequestKey(chunkX, chunkZ) {
+  if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
+    throw new TypeError('ChunkData request coordinates must be safe integers');
+  }
+  return `${chunkX},${chunkZ}`;
+}
+
+export function createChunkGeneratorInitializeRequest({ serviceGeneration, worldSeed }) {
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be a positive safe integer');
+  }
+  if (typeof worldSeed !== 'string' || !worldSeed) throw new TypeError('worldSeed is required');
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration,
+    worldSeed,
+  });
+}
+
+export function createChunkGeneratorRequest({ requestId, serviceGeneration, chunkX, chunkZ }) {
+  if (!Number.isSafeInteger(requestId) || requestId < 1) throw new RangeError('requestId must be positive');
+  createChunkDataRequestKey(chunkX, chunkZ);
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be positive');
+  }
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration,
+    chunkX,
+    chunkZ,
+  });
+}

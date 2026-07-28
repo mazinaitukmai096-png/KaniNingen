@@ -473,6 +473,7 @@ export class InfiniteGameplayRuntime {
     renderAdapter,
     featureRenderAdapter = null,
     getChunkDataForQuery = null,
+    cancelChunkDataQueries = null,
     sampleTerrainHeight = null,
     clock = () => globalThis.performance?.now?.() ?? Date.now(),
   } = {}) {
@@ -485,6 +486,9 @@ export class InfiniteGameplayRuntime {
     if (getChunkDataForQuery !== null && typeof getChunkDataForQuery !== 'function') {
       throw new TypeError('getChunkDataForQuery must be a function when provided');
     }
+    if (cancelChunkDataQueries !== null && typeof cancelChunkDataQueries !== 'function') {
+      throw new TypeError('cancelChunkDataQueries must be a function when provided');
+    }
     if (sampleTerrainHeight !== null && typeof sampleTerrainHeight !== 'function') {
       throw new TypeError('sampleTerrainHeight must be a function when provided');
     }
@@ -494,6 +498,7 @@ export class InfiniteGameplayRuntime {
     this.renderAdapter = renderAdapter;
     this.featureRenderAdapter = featureRenderAdapter;
     this.getChunkDataForQuery = getChunkDataForQuery;
+    this.cancelChunkDataQueries = cancelChunkDataQueries;
     this.sampleTerrainHeight = sampleTerrainHeight;
     this.clock = clock;
     this.activeChunks = new Map();
@@ -1047,7 +1052,9 @@ export class InfiniteGameplayRuntime {
     }
     const requestEpoch = this.tankSpawnEpoch;
     const pending = Promise.resolve()
-      .then(() => this.getChunkDataForQuery(owner.chunkX, owner.chunkZ))
+      .then(() => this.getChunkDataForQuery(owner.chunkX, owner.chunkZ, {
+        consumerId: 'gameplay-tank-terrain', epoch: requestEpoch,
+      }))
       .then(chunkData => {
         if (this.isShutdown || requestEpoch !== this.tankSpawnEpoch) return null;
         const source = chunkData?.sourceChunkData ?? chunkData;
@@ -1487,6 +1494,7 @@ export class InfiniteGameplayRuntime {
     this.tankSandboxSuppressed = sandboxSuppressed;
     if (changed) {
       this.tankSpawnEpoch += 1;
+      this.#cancelPendingTankTerrainQueries();
       this.tankSpawnFrameAccumulator = 0;
       this.pendingTankReinforcement = null;
       this.#cancelAllPendingTankSpawns();
@@ -1765,6 +1773,13 @@ export class InfiniteGameplayRuntime {
     for (const reservation of [...this.pendingTankSpawnReservations.values()]) {
       this.#releaseTankSpawnReservation(reservation);
     }
+  }
+
+  #cancelPendingTankTerrainQueries() {
+    this.cancelChunkDataQueries?.({
+      consumerId: 'gameplay-tank-terrain',
+      beforeEpoch: this.tankSpawnEpoch,
+    });
   }
 
   #canCommitTankSpawnReservation(reservation) {
@@ -3453,6 +3468,7 @@ export class InfiniteGameplayRuntime {
 
   clearTransientCombat() {
     this.tankSpawnEpoch += 1;
+    this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
     this.tankSpawnFrameAccumulator = 0;
@@ -3499,6 +3515,7 @@ export class InfiniteGameplayRuntime {
 
   async restart({ playerSpawn, renderOrigin } = {}) {
     this.tankSpawnEpoch += 1;
+    this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
     this.#cancelAllPendingTankSpawns();
@@ -3535,6 +3552,7 @@ export class InfiniteGameplayRuntime {
 
   async refreshFromState({ renderOrigin } = {}) {
     this.tankSpawnEpoch += 1;
+    this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
     this.tankSpawnFrameAccumulator = 0;
@@ -3631,6 +3649,7 @@ export class InfiniteGameplayRuntime {
     if (this.isShutdown) return;
     this.isShutdown = true;
     this.tankSpawnEpoch += 1;
+    this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
     this.#cancelAllPendingTankSpawns();

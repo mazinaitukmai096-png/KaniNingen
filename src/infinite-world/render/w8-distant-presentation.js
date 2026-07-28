@@ -262,6 +262,7 @@ export async function createW8DistantPresentation({
   findSettlementsNear,
   resolveTemplate,
   getCanonicalChunkData,
+  cancelCanonicalChunkRequests = null,
   isFeatureDestroyed = () => false,
   measure = (_stage, operation) => operation(),
 } = {}) {
@@ -270,6 +271,9 @@ export async function createW8DistantPresentation({
     || typeof resolveTemplate !== 'function'
     || typeof getCanonicalChunkData !== 'function') {
     throw new TypeError('canonical Settlement query, template, and ChunkData providers are required');
+  }
+  if (cancelCanonicalChunkRequests !== null && typeof cancelCanonicalChunkRequests !== 'function') {
+    throw new TypeError('cancelCanonicalChunkRequests must be a function when provided');
   }
   const Group = requireConstructor(THREE, 'Group');
   const Mesh = requireConstructor(THREE, 'Mesh');
@@ -334,9 +338,15 @@ export async function createW8DistantPresentation({
     destroyedHorizonBuildingCount: 0,
     duplicateVisibleStableIdCount: 0,
     identityAuditErrorCount: 0,
+    canonicalComposeCount: 0,
+    canonicalMatrixUpdateCount: 0,
+    canonicalNeedsUpdateCount: 0,
+    canonicalDirtyBucketCount: 0,
+    syncCancelledDuringQueryCount: 0,
   });
   const emptyStats = createStats();
   let activeGeneration = null;
+  let activeLocalTerrainGeneration = null;
   let buildTarget = null;
   let buildOwnedGeometries = null;
   let buildStats = null;
@@ -344,6 +354,20 @@ export async function createW8DistantPresentation({
   let syncEpoch = 0;
   let committedEpoch = 0;
   let staleEpochDiscardCount = 0;
+  let localTerrainSyncEpoch = 0;
+  let committedLocalTerrainEpoch = 0;
+  let localTerrainCommitCount = 0;
+  let localTerrainRejectionCount = 0;
+  let localTerrainStaleDiscardCount = 0;
+  let localTerrainLastRequestedEpoch = 0;
+  let localTerrainLastActiveKeyCount = 0;
+  let localTerrainLastResolvedChunkCount = 0;
+  let localTerrainLastRenderedKeyCount = 0;
+  let localTerrainLastMidgroundOwnerCount = 0;
+  let localTerrainLastMissingOwnerKeys = Object.freeze([]);
+  let localTerrainLastRejectionReason = null;
+  let stagingLocalTerrainRootId = null;
+  const pendingFarSyncEpochs = new Set();
   let activeQueryCount = 0;
   let maximumObservedQueryConcurrency = 0;
   const queryWaiters = [];
@@ -362,6 +386,7 @@ export async function createW8DistantPresentation({
   let ultraOwnerChunkCacheEvictions = 0;
   let treeLodDiagnosticsEnabled = false;
   let disposed = false;
+  const SYNC_CANCELLED = Symbol('w8-distant-sync-cancelled');
 
   const disposeGeneration = generation => {
     if (!generation) return;
@@ -970,8 +995,10 @@ export async function createW8DistantPresentation({
     );
   };
 
-  const composeCanonicalMeshes = generation => {
-    for (const bucket of generation.canonicalBuckets.values()) {
+  const composeCanonicalMeshes = (generation, dirtyBuckets = generation.canonicalBuckets) => {
+    let composed = 0;
+    let matrixUpdates = 0;
+    for (const bucket of dirtyBuckets.values()) {
       const mesh = bucket.mesh;
       if (!mesh) continue;
       let count = 0;
@@ -981,14 +1008,25 @@ export async function createW8DistantPresentation({
           || !item.visibilityTiers.includes(item.object.presentationTier)) continue;
         const matrix = item.matrix;
         mesh.setMatrixAt(count, matrix);
+        matrixUpdates += 1;
         stableIds.push(item.object.stableId);
         count += 1;
       }
       mesh.count = count;
       mesh.userData.canonicalStableIds = stableIds;
       mesh.instanceMatrix.needsUpdate = true;
+      composed += 1;
     }
+    generation.stats.canonicalComposeCount += 1;
+    generation.stats.canonicalDirtyBucketCount += composed;
+    generation.stats.canonicalMatrixUpdateCount += matrixUpdates;
+    generation.stats.canonicalNeedsUpdateCount += composed;
+    return Object.freeze({ buckets: composed, matrices: matrixUpdates });
   };
+
+  const sortedKeyList = values => [...values].sort((left, right) => left.localeCompare(right));
+  const equalKeySets = (left, right) => left.size === right.size
+    && [...left].every(key => right.has(key));
 
   const updateTreeLodDiagnosticRing = generation => {
     const diagnostic = generation.treeLodDiagnostics;
@@ -1210,7 +1248,7 @@ export async function createW8DistantPresentation({
     let destroyedHorizonBuildingCount = 0;
     const activeOwners = new Set();
     const renderedOwners = new Set();
-    let presentationChanged = false;
+    const dirtyBuckets = new Map();
     for (const object of generation.canonicalObjects.values()) {
       let nextLod = 'hidden';
       const distanceMeters = Math.hypot(object.worldX - playerX, object.worldZ - playerZ);
@@ -1320,13 +1358,15 @@ export async function createW8DistantPresentation({
         }
       }
       if (object.visibleLod === nextLod && object.presentationTier === presentationTier) continue;
-      presentationChanged = true;
+      for (const instance of object.instances) {
+        dirtyBuckets.set(instance.bucket.name + ':' + instance.bucket.geometry + ':' + instance.bucket.material, instance.bucket);
+      }
       object.visibleLod = nextLod;
       object.presentationTier = presentationTier;
     }
     generation.playerX = playerX;
     generation.playerZ = playerZ;
-    if (presentationChanged || visibleSilhouetteTreeCount > 0) composeCanonicalMeshes(generation);
+    if (dirtyBuckets.size) composeCanonicalMeshes(generation, dirtyBuckets);
     generation.stats.canonicalFarObjectCount = farCount;
     generation.stats.canonicalMidObjectCount = midCount;
     generation.stats.canonicalNearObjectCount = nearCount;
@@ -1552,11 +1592,13 @@ export async function createW8DistantPresentation({
     };
     const worker = async () => {
       while (cursor < values.length) {
+        assertCurrent?.();
         const index = cursor;
         cursor += 1;
         await acquireQuerySlot();
         try {
           results[index] = await operation(values[index], index);
+          assertCurrent?.();
         } finally {
           releaseQuerySlot();
         }
@@ -1578,7 +1620,10 @@ export async function createW8DistantPresentation({
     activeKeys,
     includeFarNatural,
     includeUltraNatural = true,
+    consumerEpoch,
+    assertCurrent = null,
   }) => {
+    assertCurrent?.();
     const queryStartedAt = globalThis.performance?.now?.() ?? Date.now();
     const visibilityMeters = W8_CANONICAL_VISIBILITY_METERS[quality]
       ?? W8_CANONICAL_VISIBILITY_METERS.high;
@@ -1601,7 +1646,9 @@ export async function createW8DistantPresentation({
         query.centerWorldZ,
         query.queryRadius,
       ),
+      assertCurrent,
     );
+    assertCurrent?.();
     const candidates = [...candidateResult]
       .sort((left, right) => left.settlementId.localeCompare(right.settlementId));
     const candidateDistance = candidate => Math.hypot(
@@ -1621,7 +1668,8 @@ export async function createW8DistantPresentation({
       candidate.settlementId,
       TEMPLATE_CACHE_CAPACITY,
       () => resolveTemplate({ candidate }),
-    ));
+    ), assertCurrent);
+    assertCurrent?.();
     const ownerQueries = new Map();
     const addOwnerCoordinate = (chunkX, chunkZ) => {
       const key = `${chunkX},${chunkZ}`;
@@ -1642,6 +1690,7 @@ export async function createW8DistantPresentation({
       addOwnerCoordinate(owner.x, owner.z).settlementIds.add(settlementId);
     };
     for (const template of templates) {
+      assertCurrent?.();
       for (const building of template.buildings) {
         if (Math.hypot(
           building.x - centerWorldX,
@@ -1736,7 +1785,11 @@ export async function createW8DistantPresentation({
           cache,
           owner.key,
           capacity,
-          () => getCanonicalChunkData(owner.chunkX, owner.chunkZ),
+          () => getCanonicalChunkData(owner.chunkX, owner.chunkZ, {
+            priority: ultraOnly ? 5 : 4,
+            consumerId: 'distant-owner-query',
+            epoch: consumerEpoch,
+          }),
           event => {
             if (ultraOnly) {
               if (event === 'hit') ultraOwnerChunkCacheHits += 1;
@@ -1748,14 +1801,16 @@ export async function createW8DistantPresentation({
           },
         ),
       };
-    });
+    }, assertCurrent);
     const innerOwners = owners.filter(owner => !ultraOnlyOwner(owner));
     const ultraOwners = owners.filter(ultraOnlyOwner);
     const innerWarmStartedAt = globalThis.performance?.now?.() ?? Date.now();
     const innerChunks = await loadOwners(innerOwners);
+    assertCurrent?.();
     const innerWarmDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - innerWarmStartedAt;
     const ultraWarmStartedAt = globalThis.performance?.now?.() ?? Date.now();
     const ultraChunks = await loadOwners(ultraOwners);
+    assertCurrent?.();
     const ultraWarmDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - ultraWarmStartedAt;
     const chunks = [...innerChunks, ...ultraChunks].sort((left, right) => (
       left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
@@ -1818,6 +1873,167 @@ export async function createW8DistantPresentation({
   };
 
   return Object.freeze({
+    syncLocalTerrain({
+      coverageEpoch,
+      activeDataKeys,
+      renderedKeys,
+      getChunkData,
+      renderOrigin,
+      centerChunkX,
+      centerChunkZ,
+    } = {}) {
+      const requestedEpoch = Number(coverageEpoch);
+      if (!Number.isSafeInteger(requestedEpoch) || requestedEpoch < 1) {
+        throw new TypeError('coverageEpoch must be a positive safe integer');
+      }
+      if (!Array.isArray(activeDataKeys) || !Array.isArray(renderedKeys)
+        || typeof getChunkData !== 'function') {
+        throw new TypeError('Local terrain sync requires active/rendered keys and a ChunkData provider');
+      }
+      localTerrainLastRequestedEpoch = requestedEpoch;
+      localTerrainLastActiveKeyCount = activeDataKeys.length;
+      localTerrainLastRenderedKeyCount = renderedKeys.length;
+      localTerrainLastResolvedChunkCount = 0;
+      localTerrainLastMidgroundOwnerCount = 0;
+      localTerrainLastMissingOwnerKeys = Object.freeze([]);
+      localTerrainLastRejectionReason = null;
+
+      const reject = (reason, missingOwnerKeys = []) => {
+        localTerrainRejectionCount += 1;
+        localTerrainLastRejectionReason = reason;
+        localTerrainLastMissingOwnerKeys = Object.freeze(sortedKeyList(missingOwnerKeys));
+        return Object.freeze({
+          committed: false,
+          reused: false,
+          coverageEpoch: requestedEpoch,
+          reason,
+          missingOwnerKeys: localTerrainLastMissingOwnerKeys,
+          activeRootId: activeLocalTerrainGeneration?.root?.name ?? null,
+        });
+      };
+
+      if (disposed) return reject('disposed');
+      if (requestedEpoch < localTerrainSyncEpoch) {
+        localTerrainStaleDiscardCount += 1;
+        return reject('stale-epoch');
+      }
+      localTerrainSyncEpoch = requestedEpoch;
+
+      const activeKeys = new Set(activeDataKeys);
+      const rendered = new Set(renderedKeys);
+      if (activeDataKeys.length !== 25 || activeKeys.size !== 25) {
+        return reject('active-key-count');
+      }
+      if (renderedKeys.length !== 9 || rendered.size !== 9) {
+        return reject('rendered-key-count');
+      }
+      const renderedOutsideActive = [...rendered].filter(key => !activeKeys.has(key));
+      if (renderedOutsideActive.length) return reject('rendered-owner-outside-active', renderedOutsideActive);
+
+      const activeChunks = new Map();
+      const missingOwnerKeys = [];
+      for (const key of activeDataKeys) {
+        const [chunkX, chunkZ] = key.split(',').map(Number);
+        const chunk = getChunkData(chunkX, chunkZ);
+        if (!chunk || chunk.chunkX !== chunkX || chunk.chunkZ !== chunkZ) {
+          missingOwnerKeys.push(key);
+          continue;
+        }
+        activeChunks.set(key, chunk);
+      }
+      localTerrainLastResolvedChunkCount = activeChunks.size;
+      if (missingOwnerKeys.length) return reject('missing-chunk-data', missingOwnerKeys);
+
+      const midgroundOwnerKeys = new Set([...activeKeys].filter(key => !rendered.has(key)));
+      localTerrainLastMidgroundOwnerCount = midgroundOwnerKeys.size;
+      if (midgroundOwnerKeys.size !== 16) return reject('midground-owner-count');
+
+      if (activeLocalTerrainGeneration
+        && activeLocalTerrainGeneration.centerChunkX === centerChunkX
+        && activeLocalTerrainGeneration.centerChunkZ === centerChunkZ
+        && equalKeySets(activeLocalTerrainGeneration.activeKeys, activeKeys)
+        && equalKeySets(activeLocalTerrainGeneration.renderedKeys, rendered)) {
+        positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+        committedLocalTerrainEpoch = requestedEpoch;
+        return Object.freeze({
+          committed: true,
+          reused: true,
+          coverageEpoch: requestedEpoch,
+          reason: null,
+          missingOwnerKeys: Object.freeze([]),
+          activeRootId: activeLocalTerrainGeneration.root.name,
+        });
+      }
+
+      const localRoot = new Group();
+      localRoot.name = `w8-local-terrain-coverage-epoch-${requestedEpoch}`;
+      localRoot.userData = { presentationOnly: true, localTerrainCoverage: true, coverageEpoch: requestedEpoch };
+      stagingLocalTerrainRootId = localRoot.name;
+      const generation = {
+        epoch: requestedEpoch,
+        root: localRoot,
+        ownedGeometries: new Set(),
+        ownedMaterials: new Set(),
+        stats: createStats(),
+        activeKeys,
+        renderedKeys: rendered,
+        midgroundOwnerKeys,
+        centerChunkX,
+        centerChunkZ,
+        buildOriginChunkX: renderOrigin.renderOriginChunkX,
+        buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
+        currentOriginChunkX: renderOrigin.renderOriginChunkX,
+        currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
+      };
+      const midground = [...midgroundOwnerKeys]
+        .map(key => activeChunks.get(key))
+        .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX);
+      buildTarget = localRoot;
+      buildOwnedGeometries = generation.ownedGeometries;
+      buildStats = generation.stats;
+      buildGeneration = generation;
+      try {
+        buildStats.midgroundChunkCount = midground.length;
+        measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
+        measure('distant-clipmap', () => createClipmap({
+          centerChunkX,
+          centerChunkZ,
+          activeChunks,
+          origin: renderOrigin,
+        }));
+        positionGenerationForOrigin(generation, renderOrigin);
+      } catch (error) {
+        disposeGeneration(generation);
+        localTerrainRejectionCount += 1;
+        localTerrainLastRejectionReason = 'build-error';
+        throw error;
+      } finally {
+        buildTarget = null;
+        buildOwnedGeometries = null;
+        buildStats = null;
+        buildGeneration = null;
+        stagingLocalTerrainRootId = null;
+      }
+      if (disposed || requestedEpoch !== localTerrainSyncEpoch) {
+        disposeGeneration(generation);
+        localTerrainStaleDiscardCount += 1;
+        return reject(disposed ? 'disposed-during-build' : 'stale-after-build');
+      }
+      const previous = activeLocalTerrainGeneration;
+      root.add(generation.root);
+      activeLocalTerrainGeneration = generation;
+      committedLocalTerrainEpoch = requestedEpoch;
+      localTerrainCommitCount += 1;
+      disposeGeneration(previous);
+      return Object.freeze({
+        committed: true,
+        reused: false,
+        coverageEpoch: requestedEpoch,
+        reason: null,
+        missingOwnerKeys: Object.freeze([]),
+        activeRootId: generation.root.name,
+      });
+    },
     async sync({
       activeDataKeys,
       renderedKeys,
@@ -1833,6 +2049,14 @@ export async function createW8DistantPresentation({
     }) {
       if (disposed) throw new Error('distant presentation is disposed');
       const epoch = ++syncEpoch;
+      pendingFarSyncEpochs.add(epoch);
+      cancelCanonicalChunkRequests?.({
+        consumerId: 'distant-owner-query',
+        beforeEpoch: epoch,
+      });
+      const assertCurrent = () => {
+        if (disposed || epoch !== syncEpoch) throw SYNC_CANCELLED;
+      };
       const rendered = new Set(renderedKeys);
       const activeKeys = new Set(activeDataKeys);
       if (activeGeneration) {
@@ -1856,23 +2080,36 @@ export async function createW8DistantPresentation({
       });
       const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
       const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-      const far = await prepareCanonicalFarChunks({
-        centerWorldX,
-        centerWorldZ,
-        naturalCenterWorldX: playerLogicalX,
-        naturalCenterWorldZ: playerLogicalZ,
-        quality,
-        activeKeys,
-        includeFarNatural,
-        includeUltraNatural,
-      });
+      let far;
+      try {
+        far = await prepareCanonicalFarChunks({
+          centerWorldX,
+          centerWorldZ,
+          naturalCenterWorldX: playerLogicalX,
+          naturalCenterWorldZ: playerLogicalZ,
+          quality,
+          activeKeys,
+          includeFarNatural,
+          includeUltraNatural,
+          consumerEpoch: epoch,
+          assertCurrent,
+        });
+      } catch (error) {
+        if (error !== SYNC_CANCELLED) {
+          pendingFarSyncEpochs.delete(epoch);
+          throw error;
+        }
+        staleEpochDiscardCount += 1;
+        activeGeneration && (activeGeneration.stats.syncCancelledDuringQueryCount += 1);
+        pendingFarSyncEpochs.delete(epoch);
+        return false;
+      }
       if (disposed || epoch !== syncEpoch) {
         staleEpochDiscardCount += 1;
+        pendingFarSyncEpochs.delete(epoch);
         return false;
       }
 
-      const midground = [...activeChunks].filter(([key]) => !rendered.has(key)).map(([, value]) => value);
-      midground.sort((a, b) => a.chunkZ - b.chunkZ || a.chunkX - b.chunkX);
       const stagingRoot = new Group();
       stagingRoot.name = `w8-distant-presentation-epoch-${epoch}`;
       stagingRoot.userData = { presentationOnly: true, epoch };
@@ -1929,14 +2166,6 @@ export async function createW8DistantPresentation({
       buildStats = generation.stats;
       buildGeneration = generation;
       try {
-        buildStats.midgroundChunkCount = midground.length;
-        measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
-        measure('distant-midground-features', () => createMidgroundNaturalFeatures(
-          midground,
-          renderOrigin,
-          centerChunkX,
-          centerChunkZ,
-        ));
         measure('distant-canonical-active', () => {
           const chunks = [...activeChunks.values()].sort((left, right) => (
             left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
@@ -1949,6 +2178,7 @@ export async function createW8DistantPresentation({
             farNaturalEligible: true,
           });
         });
+        assertCurrent();
         measure('distant-canonical-far', () => {
           for (const source of far.chunks) {
             addCanonicalChunk({
@@ -1961,26 +2191,28 @@ export async function createW8DistantPresentation({
               naturalQueryCenter: far.naturalQueryCenter,
               queryRadius: far.queryRadius,
               naturalQueryRadius: far.naturalQueryRadius,
+              naturalDetailQueryRadius: W8_NATURAL_CANONICAL_VISIBILITY_METERS[quality]
+                ?? W8_NATURAL_CANONICAL_VISIBILITY_METERS.high,
             });
           }
           finalizeCanonicalMeshes();
         });
-        measure('distant-clipmap', () => createClipmap({
+        assertCurrent();
+        measure('distant-feature-proxies', () => createDistantWaterProxies({
           centerChunkX,
           centerChunkZ,
-          activeChunks,
-          origin: renderOrigin,
-        }));
-        measure('distant-feature-proxies', () => createDistantNaturalAndWaterProxies({
-          centerChunkX,
-          centerChunkZ,
-          activeChunks,
           origin: renderOrigin,
         }));
         positionGenerationForOrigin(generation, renderOrigin);
         updateCanonicalVisibility(generation, playerLogicalX, playerLogicalZ);
       } catch (error) {
         disposeGeneration(generation);
+        if (error === SYNC_CANCELLED) {
+          staleEpochDiscardCount += 1;
+          pendingFarSyncEpochs.delete(epoch);
+          return false;
+        }
+        pendingFarSyncEpochs.delete(epoch);
         throw error;
       } finally {
         buildTarget = null;
@@ -1991,6 +2223,7 @@ export async function createW8DistantPresentation({
       if (disposed || epoch !== syncEpoch) {
         disposeGeneration(generation);
         staleEpochDiscardCount += 1;
+        pendingFarSyncEpochs.delete(epoch);
         return false;
       }
       const previous = activeGeneration;
@@ -1998,6 +2231,7 @@ export async function createW8DistantPresentation({
       activeGeneration = generation;
       committedEpoch = epoch;
       disposeGeneration(previous);
+      pendingFarSyncEpochs.delete(epoch);
       return true;
     },
     setTreeLodDiagnosticsEnabled(enabled) {
@@ -2012,19 +2246,29 @@ export async function createW8DistantPresentation({
       return treeLodDiagnosticsEnabled;
     },
     update(playerLogicalX, playerLogicalZ, renderOrigin) {
-      if (disposed || !activeGeneration) return;
-      positionGenerationForOrigin(activeGeneration, renderOrigin);
-      updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
+      if (disposed) return;
+      positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+      if (activeGeneration) {
+        positionGenerationForOrigin(activeGeneration, renderOrigin);
+        updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
+      }
     },
     rebase(renderOrigin) {
-      if (disposed || !activeGeneration) return;
+      if (disposed) return;
+      positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
       positionGenerationForOrigin(activeGeneration, renderOrigin);
     },
     snapshot() {
       const stats = activeGeneration?.stats ?? emptyStats;
+      const localTerrainStats = activeLocalTerrainGeneration?.stats ?? emptyStats;
       return Object.freeze({
         schemaVersion: 'w8-distant-presentation-snapshot-1',
         ...stats,
+        midgroundChunkCount: localTerrainStats.midgroundChunkCount,
+        clipmapMeshCount: localTerrainStats.clipmapMeshCount,
+        maximumInnerBoundaryErrorMeters: localTerrainStats.maximumInnerBoundaryErrorMeters,
+        maximumInnerBoundaryColorDifference: localTerrainStats.maximumInnerBoundaryColorDifference,
+        clipmapDeterministicChecksum: localTerrainStats.clipmapDeterministicChecksum,
         clipmapExtentMeters: CLIPMAP_EXTENT_METERS,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
@@ -2089,6 +2333,29 @@ export async function createW8DistantPresentation({
         syncEpoch,
         committedEpoch,
         staleEpochDiscardCount,
+        farSyncPending: pendingFarSyncEpochs.size > 0,
+        farSyncPendingCount: pendingFarSyncEpochs.size,
+        localTerrainSyncEpoch,
+        committedLocalTerrainEpoch,
+        localTerrainLastRequestedEpoch,
+        localTerrainCommitCount,
+        localTerrainRejectionCount,
+        localTerrainStaleDiscardCount,
+        localTerrainCoverageCenter: activeLocalTerrainGeneration ? Object.freeze({
+          chunkX: activeLocalTerrainGeneration.centerChunkX,
+          chunkZ: activeLocalTerrainGeneration.centerChunkZ,
+        }) : null,
+        localTerrainActiveKeyCount: localTerrainLastActiveKeyCount,
+        localTerrainResolvedChunkCount: localTerrainLastResolvedChunkCount,
+        localTerrainRenderedKeyCount: localTerrainLastRenderedKeyCount,
+        localTerrainMidgroundOwnerCount: localTerrainLastMidgroundOwnerCount,
+        localTerrainMidgroundOwnerKeys: Object.freeze(sortedKeyList(
+          activeLocalTerrainGeneration?.midgroundOwnerKeys ?? [],
+        )),
+        localTerrainMissingOwnerKeys: localTerrainLastMissingOwnerKeys,
+        localTerrainLastRejectionReason,
+        activeLocalTerrainRootId: activeLocalTerrainGeneration?.root?.name ?? null,
+        stagingLocalTerrainRootId,
         buildOrigin: activeGeneration ? Object.freeze({
           renderOriginChunkX: activeGeneration.buildOriginChunkX,
           renderOriginChunkZ: activeGeneration.buildOriginChunkZ,
@@ -2104,12 +2371,16 @@ export async function createW8DistantPresentation({
         rootAttached: Boolean(
           root.parent === scene && activeGeneration?.root?.parent === root,
         ),
+        localTerrainRootAttached: Boolean(
+          root.parent === scene && activeLocalTerrainGeneration?.root?.parent === root,
+        ),
         clipmapSampleCacheSize: clipmapSampleCache.size,
         clipmapSampleCacheCapacity: CLIPMAP_SAMPLE_CACHE_CAPACITY,
         clipmapSampleCacheHits,
         clipmapSampleCacheMisses,
         clipmapSampleCacheEvictions,
-        rootObjectCount: activeGeneration?.root.children?.length ?? 0,
+        rootObjectCount: (activeGeneration?.root.children?.length ?? 0)
+          + (activeLocalTerrainGeneration?.root.children?.length ?? 0),
         disposed,
       });
     },
@@ -2135,8 +2406,13 @@ export async function createW8DistantPresentation({
     dispose() {
       if (disposed) return;
       syncEpoch += 1;
+      localTerrainSyncEpoch += 1;
+      cancelCanonicalChunkRequests?.({ consumerId: 'distant-owner-query' });
       disposeGeneration(activeGeneration);
       activeGeneration = null;
+      disposeGeneration(activeLocalTerrainGeneration);
+      activeLocalTerrainGeneration = null;
+      pendingFarSyncEpochs.clear();
       scene.remove(root);
       roadGeometry.dispose?.();
       terrainMaterial.dispose?.();

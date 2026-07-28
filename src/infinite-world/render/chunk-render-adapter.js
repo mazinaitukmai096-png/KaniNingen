@@ -10,7 +10,7 @@ import {
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
 import {
-  isW8NaturalCandidateVisible,
+  resolveW8CanonicalCandidateSet,
   resolveW8NaturalCandidateVisual,
   w8TerrainColorFromWeights,
 } from './w8-distant-presentation.js';
@@ -43,6 +43,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkX = 0;
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
+    this.disposedChunkGeometries = new WeakSet();
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
     this.featureInstances = new Map();
@@ -52,6 +53,7 @@ export class ChunkRenderAdapter {
     this.occludedFeatureIds = new Set();
     this.occlusionLastHitAt = new Map();
     this.fadedMaterials = new Map();
+    this.projectionStaging = null;
     this.transparentMeshes = new Set();
     this.transparencyEnabled = true;
     this.disposed = false;
@@ -93,9 +95,48 @@ export class ChunkRenderAdapter {
     return matrix.clone?.() ?? structuredClone(matrix);
   }
 
+  #registry() {
+    return this.projectionStaging ?? {
+      featureInstances: this.featureInstances,
+      chunkFeatureIds: this.chunkFeatureIds,
+      occlusionMeshes: this.occlusionMeshes,
+      cameraCollisionBounds: this.cameraCollisionBounds,
+      transparentMeshes: this.transparentMeshes,
+    };
+  }
+
+  #createProjectionRegistry() {
+    return {
+      featureInstances: new Map(),
+      chunkFeatureIds: new Map(),
+      occlusionMeshes: [],
+      cameraCollisionBounds: [],
+      transparentMeshes: new Set(),
+    };
+  }
+
+  #commitProjectedRegistry(projected) {
+    const registry = projected?.registry;
+    if (!registry) return;
+    for (const [stableId, entry] of registry.featureInstances) {
+      const existing = this.featureInstances.get(stableId);
+      if (existing && existing.chunkKey !== entry.chunkKey) {
+        throw new Error(`Stable ID collision in render adapter: ${stableId}`);
+      }
+      this.featureInstances.set(stableId, entry);
+    }
+    for (const [chunkKey, stableIds] of registry.chunkFeatureIds) {
+      this.chunkFeatureIds.set(chunkKey, stableIds);
+    }
+    this.occlusionMeshes.push(...registry.occlusionMeshes);
+    this.cameraCollisionBounds.push(...registry.cameraCollisionBounds);
+    for (const mesh of registry.transparentMeshes) this.transparentMeshes.add(mesh);
+  }
+
   #registerFeatureInstance({ stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group }) {
     if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
-    let existing = this.featureInstances.get(stableId);
+    const registry = this.#registry();
+    let existing = registry.featureInstances.get(stableId) ?? this.featureInstances.get(stableId);
     if (existing && existing.chunkKey !== chunkKey) {
       throw new Error(`Stable ID collision in render adapter: ${stableId}`);
     }
@@ -105,11 +146,11 @@ export class ChunkRenderAdapter {
         stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix,
         parts: [], group, rubbleMesh: null,
       };
-      this.featureInstances.set(stableId, existing);
+      registry.featureInstances.set(stableId, existing);
     }
     existing.parts.push(part);
-    if (!this.chunkFeatureIds.has(chunkKey)) this.chunkFeatureIds.set(chunkKey, new Set());
-    this.chunkFeatureIds.get(chunkKey).add(stableId);
+    if (!registry.chunkFeatureIds.has(chunkKey)) registry.chunkFeatureIds.set(chunkKey, new Set());
+    registry.chunkFeatureIds.get(chunkKey).add(stableId);
     const destroyed = this.isFeatureDestroyed(stableId);
     mesh.setMatrixAt(index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
     fadeMesh?.setMatrixAt(index, this.hiddenFeatureMatrix);
@@ -277,12 +318,14 @@ export class ChunkRenderAdapter {
     if (origin.rebaseCount > this.counts.rebased) this.counts.rebased = origin.rebaseCount;
   }
 
-  #positionGroup(projected) {
+  #positionGroup(projected, origin = null) {
+    const renderOriginChunkX = origin?.renderOriginChunkX ?? this.renderOriginChunkX;
+    const renderOriginChunkZ = origin?.renderOriginChunkZ ?? this.renderOriginChunkZ;
     const position = chunkRenderPosition(
       projected.chunkX,
       projected.chunkZ,
-      this.renderOriginChunkX,
-      this.renderOriginChunkZ,
+      renderOriginChunkX,
+      renderOriginChunkZ,
       this.renderChunkSize,
     );
     projected.group.position.set(position.x, 0, position.z);
@@ -414,26 +457,30 @@ export class ChunkRenderAdapter {
         fadeMesh.instanceMatrix.needsUpdate = true;
         if (attach) group.add(fadeMesh);
         fadeMesh.visible = this.transparencyEnabled;
-        this.transparentMeshes.add(fadeMesh);
+        this.#registry().transparentMeshes.add(fadeMesh);
         meshes.push(fadeMesh);
-        this.occlusionMeshes.push(mesh, fadeMesh);
+        this.#registry().occlusionMeshes.push(mesh, fadeMesh);
       }
     }
     return meshes;
   }
 
-  async projectChunk(chunkData) {
+  async projectChunk(chunkData, origin = null, { deferredRegistration = false } = {}) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
+    if (deferredRegistration && this.projectionStaging !== null) {
+      throw new Error('Chunk projection is already in progress');
+    }
     const { Group, Mesh, InstancedMesh, Object3D } = this.THREE;
     for (const name of ['Group', 'Mesh', 'InstancedMesh', 'Object3D']) {
       requireConstructor(this.THREE, name);
     }
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
+    if (deferredRegistration) this.projectionStaging = this.#createProjectionRegistry();
+    try {
     const layers = chunkData.presentationLayers;
-    const vegetation = layers?.natural?.vegetation
-      ?? chunkData.vegetationCandidates ?? chunkData.vegetationProxies ?? [];
-    const rocks = layers?.natural?.rocks ?? chunkData.rockCandidates ?? chunkData.rockProxies ?? [];
+    const canonicalCandidates = resolveW8CanonicalCandidateSet(chunkData);
+    const { vegetation, rocks } = canonicalCandidates;
     const settlementFeatures = layers?.formal?.roadsAndBuildings ?? chunkData.settlementFeatures ?? [];
     const waterSurfaces = layers?.water ?? chunkData.waterSurfaces ?? [];
     const ambientDetails = layers?.ambientDetails ?? chunkData.ambientDetails ?? [];
@@ -491,8 +538,6 @@ export class ChunkRenderAdapter {
     const vegetationParts = [];
     vegetation.forEach(candidate => {
       const formal = candidate.candidateId !== undefined;
-      if (formal && chunkData.generatorVersion?.major >= 800
-        && !isW8NaturalCandidateVisible(candidate)) return;
       const localX = formal
         ? candidate.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalX;
@@ -719,7 +764,7 @@ export class ChunkRenderAdapter {
         const visualHalfDepthScale = Math.max(...descriptors.map(descriptor => (
           Math.abs(descriptor.position[2]) + descriptor.scale[2] * 0.5
         )));
-        this.cameraCollisionBounds.push(Object.freeze({
+        this.#registry().cameraCollisionBounds.push(Object.freeze({
           chunkKey: key,
           stableId: building.stableId,
           worldX: building.worldPosition.x,
@@ -751,7 +796,7 @@ export class ChunkRenderAdapter {
       );
       waterMesh.name = 'w8-continuous-wetland-water';
       waterMesh.visible = this.transparencyEnabled;
-      this.transparentMeshes.add(waterMesh);
+      this.#registry().transparentMeshes.add(waterMesh);
       waterMesh.count = waterSurfaces.length;
       waterMesh.receiveShadow = true;
       waterSurfaces.forEach((surface, index) => {
@@ -844,18 +889,37 @@ export class ChunkRenderAdapter {
       chunkZ: chunkData.chunkZ,
       group,
       ownedGeometries: naturalTerrain ? [terrainGeometry] : [],
+      registry: this.projectionStaging,
+      lifecycle: 'staged',
     };
-    this.#positionGroup(projected);
+    this.#positionGroup(projected, origin);
     this.counts.projected += 1;
     return projected;
+    } finally {
+      if (deferredRegistration) this.projectionStaging = null;
+    }
   }
 
   async loadProjected(projected) {
     if (!projected?.key || !projected.group) throw new TypeError('invalid projected chunk');
+    if (projected.lifecycle !== 'staged') {
+      throw new Error(`render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`);
+    }
     if (this.loaded.has(projected.key)) throw new Error(`render chunk already loaded: ${projected.key}`);
-    this.worldRoot.add(projected.group);
-    this.loaded.set(projected.key, projected);
-    this.counts.loaded += 1;
+    projected.lifecycle = 'loading';
+    try {
+      this.#positionGroup(projected);
+      this.#commitProjectedRegistry(projected);
+      this.worldRoot.add(projected.group);
+      this.loaded.set(projected.key, projected);
+      projected.lifecycle = 'loaded';
+      this.counts.loaded += 1;
+    } catch (error) {
+      this.worldRoot.remove(projected.group);
+      this.loaded.delete(projected.key);
+      projected.lifecycle = 'staged';
+      throw error;
+    }
   }
 
   setDiagnosticTransparencyEnabled(enabled = true) {
@@ -873,6 +937,7 @@ export class ChunkRenderAdapter {
     this.worldRoot.remove(projected.group);
     for (const geometry of projected.ownedGeometries) {
       geometry.dispose();
+      this.disposedChunkGeometries.add(geometry);
       this.counts.chunkOwnedGeometriesDisposed += 1;
     }
     const occlusionMeshes = new Set(projected.group.children ?? []);
@@ -888,7 +953,53 @@ export class ChunkRenderAdapter {
     }
     this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
+    projected.lifecycle = 'unloaded';
     this.counts.unloaded += 1;
+  }
+
+  async discardProjected(projected) {
+    if (!projected?.group) return false;
+    if (this.loaded.has(projected.key) || ['loading', 'loaded'].includes(projected.lifecycle)) {
+      throw new Error(`cannot discard loaded chunk: ${projected.key}`);
+    }
+    if (projected.lifecycle === 'discarded' || projected.lifecycle === 'unloaded') return false;
+    for (const geometry of projected.ownedGeometries ?? []) {
+      geometry.dispose?.();
+      this.disposedChunkGeometries.add(geometry);
+      this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
+    for (const child of projected.group.children ?? []) child.dispose?.();
+    projected.group.clear?.();
+    projected.lifecycle = 'discarded';
+    return true;
+  }
+
+  renderCoverageSnapshot() {
+    const loadedKeys = [...this.loaded.keys()].sort((left, right) => left.localeCompare(right));
+    const terrainKeys = [];
+    const missingTerrainKeys = [];
+    const disposedTerrainKeys = [];
+    const lifecycleMismatchKeys = [];
+    for (const [key, projected] of this.loaded) {
+      if (projected.lifecycle !== 'loaded') lifecycleMismatchKeys.push(key);
+      const terrain = (projected.group.children ?? []).find(child => (
+        child.name === 'w2-natural-terrain' || child.name === 'w1a-terrain'
+      ));
+      if (!terrain) {
+        missingTerrainKeys.push(key);
+        continue;
+      }
+      terrainKeys.push(key);
+      if (this.disposedChunkGeometries.has(terrain.geometry)) disposedTerrainKeys.push(key);
+    }
+    const sort = values => values.sort((left, right) => left.localeCompare(right));
+    return Object.freeze({
+      loadedKeys: Object.freeze(loadedKeys),
+      terrainKeys: Object.freeze(sort(terrainKeys)),
+      missingTerrainKeys: Object.freeze(sort(missingTerrainKeys)),
+      disposedTerrainKeys: Object.freeze(sort(disposedTerrainKeys)),
+      lifecycleMismatchKeys: Object.freeze(sort(lifecycleMismatchKeys)),
+    });
   }
 
   resourceSnapshot() {
@@ -917,6 +1028,7 @@ export class ChunkRenderAdapter {
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
       )),
+      renderCoverage: this.renderCoverageSnapshot(),
     });
   }
 
