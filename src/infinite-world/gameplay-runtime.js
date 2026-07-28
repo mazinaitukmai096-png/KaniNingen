@@ -980,12 +980,61 @@ export class InfiniteGameplayRuntime {
 
   #refreshSpatialBroadphaseBounds() {
     let maximumRadius = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius);
+    let maximumPlayerBlockingRadiusMeters = 0;
+    let playerBlockingColliderCount = 0;
+    const seenPlayerBlockingStableIds = new Set();
     for (const model of this.spatialChunks.values()) {
       for (const target of model.staticTargets) {
         maximumRadius = Math.max(maximumRadius, finiteWorldUnitsToMeters(target.radius));
+        const collision = target.canonicalObject?.collision;
+        if (collision?.blocksPlayer !== true
+          || seenPlayerBlockingStableIds.has(target.canonicalObject.stableId)) continue;
+        seenPlayerBlockingStableIds.add(target.canonicalObject.stableId);
+        maximumPlayerBlockingRadiusMeters = Math.max(
+          maximumPlayerBlockingRadiusMeters,
+          collision.radiusMeters,
+        );
+        playerBlockingColliderCount += 1;
       }
     }
     this.maximumSpatialTargetRadiusMeters = maximumRadius;
+    this.maximumPlayerBlockingRadiusMeters = maximumPlayerBlockingRadiusMeters;
+    this.playerBlockingColliderCount = playerBlockingColliderCount;
+  }
+
+  *#canonicalPlayerColliders({ minimumX, minimumZ, maximumX, maximumZ }) {
+    const seen = new Set();
+    for (const model of this.#spatialModelsIntersectingAabb(
+      minimumX, minimumZ, maximumX, maximumZ,
+    )) {
+      for (const target of model.staticTargets) {
+        const object = target.canonicalObject;
+        if (object?.collision?.blocksPlayer !== true || seen.has(object.stableId)) continue;
+        const destructionKey = object.destruction?.stateKey ?? object.stableId;
+        if (this.state.isFeatureDestroyed(destructionKey)) continue;
+        seen.add(object.stableId);
+        yield object;
+      }
+    }
+  }
+
+  resolvePlayerHorizontalMovement({
+    startX,
+    startZ,
+    displacementX,
+    displacementZ,
+    playerRadiusMeters,
+  } = {}) {
+    if (this.isShutdown) throw new Error('gameplay runtime is shut down');
+    return resolveCanonicalPlayerMovement({
+      startX,
+      startZ,
+      displacementX,
+      displacementZ,
+      playerRadiusMeters,
+      maximumColliderRadiusMeters: this.maximumPlayerBlockingRadiusMeters,
+      queryColliders: bounds => this.#canonicalPlayerColliders(bounds),
+    });
   }
 
   *#tankShellWorldCandidates(start, end) {

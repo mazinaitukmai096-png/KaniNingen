@@ -12,6 +12,7 @@ import {
 } from './gameplay-contract.js';
 import {
   createPlayerVerticalMovementState,
+  getScalePlayerVerticalMetrics,
   resetPlayerGrounding,
   snapshotPlayerVerticalMovement,
   stepPlayerVerticalMovement,
@@ -51,6 +52,13 @@ export function createInfiniteExperienceShell({
   worldState,
   initialScaleProfile,
   getTerrainHeightMeters,
+  resolvePlayerHorizontalMovement = ({
+    startX, startZ, displacementX, displacementZ,
+  }) => Object.freeze({
+    x: startX + displacementX,
+    z: startZ + displacementZ,
+    collided: false,
+  }),
   onAttack = () => {},
   onCombatCommand = null,
   onSave = () => {},
@@ -72,6 +80,9 @@ export function createInfiniteExperienceShell({
   }
   if (typeof getTerrainHeightMeters !== 'function') {
     throw new TypeError('experience shell requires the formal Terrain height resolver');
+  }
+  if (typeof resolvePlayerHorizontalMovement !== 'function') {
+    throw new TypeError('Player horizontal movement resolver must be a function');
   }
   const byId = id => documentObject?.getElementById?.(id) ?? null;
   const body = documentObject?.body ?? null;
@@ -543,6 +554,7 @@ export function createInfiniteExperienceShell({
       sprint: false,
       scaleStageId: scaleProfile.stage.id,
     });
+    let horizontalCollision = null;
     if (!state.paused && ['intro', 'playing'].includes(state.runPhase)) {
       const keys = input.getInputSnapshot();
       const intro = state.runPhase === 'intro';
@@ -556,13 +568,28 @@ export function createInfiniteExperienceShell({
         const sprint = keys.isPressed('ShiftLeft') || keys.isPressed('ShiftRight');
         const speed = scaleProfile.movementMetersPerSecond
           * (intro ? 0.35 : sprint ? 1.45 : 1) * movementMultiplier;
-        player.x += dx * speed * deltaSeconds;
-        player.z += dz * speed * deltaSeconds;
+        const startX = player.x;
+        const startZ = player.z;
+        horizontalCollision = resolvePlayerHorizontalMovement({
+          startX,
+          startZ,
+          displacementX: dx * speed * deltaSeconds,
+          displacementZ: dz * speed * deltaSeconds,
+          playerRadiusMeters: getScalePlayerVerticalMetrics(scaleProfile).radiusMeters,
+        });
+        if (!Number.isFinite(horizontalCollision?.x) || !Number.isFinite(horizontalCollision?.z)) {
+          throw new Error('Player horizontal movement resolver returned a non-finite position');
+        }
+        player.x = horizontalCollision.x;
+        player.z = horizontalCollision.z;
         player.facingY = Math.atan2(dx, dz);
+        const inverseDelta = deltaSeconds > 0 ? 1 / deltaSeconds : 0;
+        const velocityX = (player.x - startX) * inverseDelta;
+        const velocityZ = (player.z - startZ) * inverseDelta;
         movement = Object.freeze({
-          velocityX: dx * speed,
-          velocityZ: dz * speed,
-          speedMetersPerSecond: speed,
+          velocityX,
+          velocityZ,
+          speedMetersPerSecond: Math.hypot(velocityX, velocityZ),
           sprint,
           scaleStageId: scaleProfile.stage.id,
         });
@@ -586,7 +613,9 @@ export function createInfiniteExperienceShell({
       scaleStageId: scaleProfile.stage.id,
       terrainHeightMeters: vertical.terrainHeightMeters,
     })) : null;
-    return Object.freeze({ moved: !state.paused, vertical, landed, landing, movement });
+    return Object.freeze({
+      moved: !state.paused, vertical, landed, landing, movement, horizontalCollision,
+    });
   }
 
   function updateCamera({

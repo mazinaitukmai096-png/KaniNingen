@@ -1375,6 +1375,7 @@ export async function bootInfiniteWorldSandbox({
       worldState,
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
+      resolvePlayerHorizontalMovement: input => gameplay.resolvePlayerHorizontalMovement(input),
       onAttack: mode => gameplay.attack(mode),
       onCombatCommand: command => gameplay.executeCombatCommand(command),
       onPlayerLanding: input => gameplay.playerLanding(input),

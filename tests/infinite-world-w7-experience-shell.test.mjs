@@ -7,6 +7,7 @@ import {
   createInfiniteExperienceShell,
 } from '../src/infinite-world/experience-shell.js';
 import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
+import { getScalePlayerVerticalMetrics } from '../src/infinite-world/player-vertical-movement.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
@@ -46,6 +47,7 @@ function createFixture({
   runConfiguration = true,
   useCombatCommands = false,
   treeLodDiagnosticsAvailable = false,
+  resolvePlayerHorizontalMovement = undefined,
 } = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
@@ -115,6 +117,7 @@ function createFixture({
     globalObject, documentObject, canvas, camera, playerMarker, worldState,
     initialScaleProfile: getW6ScaleProfile('MAX'),
     getTerrainHeightMeters: (x, z) => 1 + x * 0.01 + z * 0.02,
+    ...(resolvePlayerHorizontalMovement ? { resolvePlayerHorizontalMovement } : {}),
     onAttack: mode => calls.attacks.push(mode),
     onSave: () => { calls.saves += 1; },
     onLoad: () => { calls.loads += 1; },
@@ -494,6 +497,65 @@ test('normal HUD is a read-only adapter and no Boss UI appears without a manual 
   assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
   assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
   assert.equal(fixture.elements.get('atomic-cd-label').textContent, 'SCALE SANDBOX: LOCKED');
+  fixture.shell.dispose();
+});
+
+test('Player movement supplies the formal Tiny, Mid, and Max radius to horizontal collision', () => {
+  for (const stageId of ['TINY', 'MID', 'MAX']) {
+    const collisionInputs = [];
+    const fixture = createFixture({
+      resolvePlayerHorizontalMovement(input) {
+        collisionInputs.push({ ...input });
+        return {
+          x: input.startX + input.displacementX,
+          z: input.startZ + input.displacementZ,
+          collided: false,
+        };
+      },
+    });
+    fixture.elements.get('start-button').dispatch('click');
+    const profile = getW6ScaleProfile(stageId);
+    const player = finishIntro(fixture, { x: 0, z: 0, facingY: 0 }, profile);
+    collisionInputs.length = 0;
+    fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+    fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
+    const input = collisionInputs.at(-1);
+    assert.equal(input.playerRadiusMeters, getScalePlayerVerticalMetrics(profile).radiusMeters);
+    assert.equal(input.displacementX, profile.movementMetersPerSecond / 60);
+    assert.equal(Math.abs(input.displacementZ), 0);
+    fixture.shell.dispose();
+  }
+});
+
+test('horizontal collision preserves Sprint, airborne X/Z, and final terrain sampling', () => {
+  const collisionInputs = [];
+  const fixture = createFixture({
+    resolvePlayerHorizontalMovement(input) {
+      collisionInputs.push({ ...input });
+      return {
+        x: input.startX + input.displacementX * 0.5,
+        z: input.startZ + input.displacementZ * 0.5,
+        collided: true,
+      };
+    },
+  });
+  fixture.elements.get('start-button').dispatch('click');
+  const profile = getW6ScaleProfile('MAX');
+  const player = finishIntro(fixture, { x: 0, z: 0, facingY: 0 }, profile);
+  player.x = 0;
+  player.z = 0;
+  collisionInputs.length = 0;
+  fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+  fixture.globalObject.dispatch('keydown', { code: 'ShiftLeft' });
+  fixture.globalObject.dispatch('keydown', { code: 'Space' });
+  const update = fixture.shell.updatePlayer({ deltaSeconds: 1 / 60, player, scaleProfile: profile });
+  const desiredDistance = profile.movementMetersPerSecond * 1.45 / 60;
+  assert.equal(collisionInputs.at(-1).displacementX, desiredDistance);
+  assert.equal(player.x, desiredDistance * 0.5);
+  assert.equal(update.movement.sprint, true);
+  assert.equal(update.horizontalCollision.collided, true);
+  assert.equal(update.vertical.grounded, false);
+  assert.equal(update.vertical.terrainHeightMeters, 1 + player.x * 0.01);
   fixture.shell.dispose();
 });
 
