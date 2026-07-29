@@ -55,7 +55,23 @@ class FakeWorker {
     }));
   }
   emit(data) { this.listeners.get('message')?.({ data }); }
+  emitError(error = new Error('Worker crashed after initialization')) {
+    this.crashed = true;
+    this.listeners.get('error')?.(error);
+  }
   async terminate() { this.terminated = true; }
+}
+
+async function drainAsyncWork(turns = 8) {
+  for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
+}
+
+async function waitFor(predicate, turns = 64) {
+  for (let turn = 0; turn < turns; turn += 1) {
+    if (predicate()) return;
+    await Promise.resolve();
+  }
+  assert.fail('condition did not become true');
 }
 
 function fixtureChunk(chunkX, chunkZ, revision = 'a') {
@@ -199,6 +215,112 @@ test('Worker constructor and initialize failures fall back once to Inline withou
     assert.match(transport.snapshot().fallbackReason.message, /init failed/);
     await transport.shutdown();
   });
+});
+
+test('a runtime Worker error rejects current requests once and moves later work to Inline', async () => {
+  const fake = new FakeWorker();
+  let fallbackCreations = 0;
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    workerFactory: () => fake,
+    fallbackTransportFactory: async () => {
+      fallbackCreations += 1;
+      return fallbackFactory();
+    },
+  });
+  await transport.initialize();
+  const first = transport.generateChunk({ requestId: 41, chunkX: 4, chunkZ: 1 });
+  const second = transport.generateChunk({ requestId: 42, chunkX: 4, chunkZ: 2 });
+  await drainAsyncWork(2);
+  fake.emitError(new Error('runtime Worker crashed'));
+  await assert.rejects(first, /runtime Worker crashed/);
+  await assert.rejects(second, /runtime Worker crashed/);
+  await drainAsyncWork();
+
+  assert.equal(fake.terminated, true);
+  assert.equal(fallbackCreations, 1);
+  assert.equal(transport.snapshot().mode, 'inline-fallback');
+  assert.equal(transport.snapshot().counts.fallbackCount, 1);
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATED,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 41,
+    serviceGeneration: 1,
+    chunkData: fixtureChunk(4, 1, 'stale-after-crash'),
+    generationMs: 1,
+  });
+  const recovered = await transport.generateChunk({ requestId: 43, chunkX: 7, chunkZ: 8 });
+  assert.equal(recovered.chunkId, fixtureChunk(7, 8).chunkId);
+  assert.equal(transport.snapshot().counts.generated, 0, 'old Worker responses stay detached');
+  await transport.shutdown();
+});
+
+test('ChunkDataService resumes Chunk dispatch through Inline after its Worker crashes', async () => {
+  const fake = new FakeWorker();
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    workerFactory: () => fake,
+    fallbackTransportFactory: async () => fallbackFactory(),
+  });
+  const service = new ChunkDataService({ transport, cacheCapacity: 4 });
+  await service.initialize();
+  const failed = service.requestChunk({
+    chunkX: 20,
+    chunkZ: 3,
+    priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    consumerId: 'runtime-transition',
+    epoch: 1,
+  }).promise;
+  await drainAsyncWork();
+  fake.emitError(new Error('streaming Worker crashed'));
+  await assert.rejects(failed, /streaming Worker crashed/);
+
+  const recovered = await service.requestChunk({
+    chunkX: 21,
+    chunkZ: 3,
+    priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    consumerId: 'runtime-transition',
+    epoch: 2,
+  }).promise;
+  assert.equal(recovered.chunkId, fixtureChunk(21, 3).chunkId);
+  assert.equal(service.snapshot().transport.mode, 'inline-fallback');
+  assert.equal(service.snapshot().counts.transportCalls, 2);
+  await service.shutdown();
+});
+
+test('shutdown during runtime recovery never publishes or retains the fallback', async () => {
+  const fake = new FakeWorker();
+  let releaseFallback;
+  let fallbackStarted = false;
+  let candidate = null;
+  const fallbackGate = new Promise(resolve => { releaseFallback = resolve; });
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    workerFactory: () => fake,
+    fallbackTransportFactory: async () => {
+      fallbackStarted = true;
+      await fallbackGate;
+      candidate = fallbackFactory();
+      return candidate;
+    },
+  });
+  await transport.initialize();
+  fake.emitError(new Error('runtime Worker crashed before shutdown'));
+  await drainAsyncWork();
+  assert.equal(fallbackStarted, true);
+
+  await transport.shutdown();
+  await assert.rejects(
+    transport.generateChunk({ requestId: 44, chunkX: 1, chunkZ: 1 }),
+    /shut down/,
+  );
+  releaseFallback();
+  await waitFor(() => candidate?.snapshot().isShutdown === true);
+  assert.equal(transport.snapshot().isShutdown, true);
+  assert.equal(transport.snapshot().mode, 'shutdown');
+  assert.equal(transport.snapshot().fallbackOccurred, false);
+  assert.equal(transport.snapshot().counts.fallbackCount, 0);
+  assert.equal(candidate.snapshot().isShutdown, true);
 });
 
 test('shutdown rejects a late Worker request and ChunkDataService still rejects identity mismatch', async () => {

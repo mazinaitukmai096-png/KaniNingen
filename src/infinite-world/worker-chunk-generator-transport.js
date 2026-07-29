@@ -63,6 +63,9 @@ export function createWorkerChunkGeneratorTransport({
   let initializeResolve = null;
   let initializeReject = null;
   let initializePromise = null;
+  let fallbackActivationPromise = null;
+  let recoveryPromise = null;
+  let runtimeFailure = null;
   let controlRequestId = 1_000_000_000;
   const pending = new Map();
   const removers = [];
@@ -95,6 +98,8 @@ export function createWorkerChunkGeneratorTransport({
     for (const operation of pending.values()) operation.reject(error);
     pending.clear();
   };
+
+  const shutdownError = () => new Error('Worker ChunkData transport is shut down');
 
   const onMessage = event => {
     const message = event.data;
@@ -162,29 +167,56 @@ export function createWorkerChunkGeneratorTransport({
     counts.workerErrors += 1;
     const normalized = error instanceof Error ? error : new Error(error?.message ?? 'Chunk generator Worker failed');
     if (!initialized) initializeReject?.(normalized);
-    else rejectPending(normalized);
+    else {
+      rejectPending(normalized);
+      runtimeFailure = normalized;
+      if (isShutdown || fallbackTransport || recoveryPromise) return;
+      mode = fallbackTransportFactory === null ? 'failed' : 'recovering';
+      if (fallbackTransportFactory !== null) {
+        recoveryPromise = activateFallback(normalized);
+        void recoveryPromise.catch(() => {});
+      }
+    }
   };
 
   const activateFallback = async error => {
     if (fallbackTransportFactory === null) throw error;
-    await terminateWorker();
-    fallbackReason = Object.freeze({ name: error?.name ?? 'Error', message: error?.message ?? String(error) });
-    fallbackTransport = await fallbackTransportFactory();
-    if (typeof fallbackTransport?.generateChunk !== 'function') {
-      throw new TypeError('fallback transport must provide generateChunk');
-    }
-    metadata = await fallbackTransport.initialize?.() ?? null;
-    lastGeneratorSnapshot = metadata?.generatorSnapshot ?? null;
-    mode = 'inline-fallback';
-    initialized = true;
-    counts.fallbackCount += 1;
-    return metadata;
+    if (fallbackActivationPromise) return fallbackActivationPromise;
+    fallbackActivationPromise = (async () => {
+      await terminateWorker();
+      if (isShutdown) throw shutdownError();
+      const candidate = await fallbackTransportFactory();
+      if (isShutdown) {
+        await candidate?.shutdown?.();
+        throw shutdownError();
+      }
+      if (typeof candidate?.generateChunk !== 'function') {
+        await candidate?.shutdown?.();
+        throw new TypeError('fallback transport must provide generateChunk');
+      }
+      const candidateMetadata = await candidate.initialize?.() ?? null;
+      if (isShutdown) {
+        await candidate.shutdown?.();
+        throw shutdownError();
+      }
+      fallbackReason = Object.freeze({ name: error?.name ?? 'Error', message: error?.message ?? String(error) });
+      fallbackTransport = candidate;
+      metadata = candidateMetadata;
+      lastGeneratorSnapshot = metadata?.generatorSnapshot ?? null;
+      runtimeFailure = null;
+      mode = 'inline-fallback';
+      initialized = true;
+      counts.fallbackCount += 1;
+      return metadata;
+    })();
+    void fallbackActivationPromise.catch(() => {});
+    return fallbackActivationPromise;
   };
 
   const initialize = () => {
-    if (initializePromise) return initializePromise;
+    if (isShutdown) return Promise.reject(shutdownError());
+    if (initializePromise) return recoveryPromise ?? initializePromise;
     initializePromise = (async () => {
-      if (isShutdown) throw new Error('Worker ChunkData transport is shut down');
       try {
         worker = workerFactory();
         removers.push(addWorkerListener(worker, 'message', onMessage));
@@ -206,15 +238,28 @@ export function createWorkerChunkGeneratorTransport({
   };
 
   const requestWorker = request => new Promise((resolve, reject) => {
+    const target = worker;
+    if (!target) {
+      reject(isShutdown
+        ? new Error('Worker ChunkData transport shut down before response')
+        : runtimeFailure ?? new Error('Chunk generator Worker is unavailable'));
+      return;
+    }
     pending.set(request.requestId, { resolve, reject, sentAt: clock() });
-    worker.postMessage(request);
+    try {
+      target.postMessage(request);
+    } catch (error) {
+      pending.delete(request.requestId);
+      reject(error);
+    }
   });
 
   return Object.freeze({
     initialize,
     async generateChunk({ requestId, chunkX, chunkZ, priority } = {}) {
       await initialize();
-      if (isShutdown) throw new Error('Worker ChunkData transport is shut down');
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
         return fallbackTransport.generateChunk({ requestId, chunkX, chunkZ, priority });
       }
@@ -224,6 +269,8 @@ export function createWorkerChunkGeneratorTransport({
     },
     async findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters) {
       await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
         return fallbackTransport.findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters);
       }
@@ -240,6 +287,8 @@ export function createWorkerChunkGeneratorTransport({
     },
     async resolveSettlementPresentationTemplate({ candidate } = {}) {
       await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
         return fallbackTransport.resolveSettlementPresentationTemplate({ candidate });
       }
@@ -284,9 +333,12 @@ export function createWorkerChunkGeneratorTransport({
     async shutdown() {
       if (isShutdown) return;
       isShutdown = true;
-      rejectPending(new Error('Worker ChunkData transport shut down before response'));
-      await fallbackTransport?.shutdown?.();
+      mode = 'shutdown';
+      const error = new Error('Worker ChunkData transport shut down before response');
+      initializeReject?.(error);
+      rejectPending(error);
       await terminateWorker();
+      await fallbackTransport?.shutdown?.();
     },
   });
 }
