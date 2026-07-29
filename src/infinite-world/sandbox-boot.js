@@ -37,6 +37,7 @@ import {
   InfiniteWorldSaveStore,
   InfiniteWorldState,
   createBrowserSaveStorage,
+  isSaveStorageUnavailableError,
 } from './world-state-store.js';
 import { createInfiniteExperienceShell } from './experience-shell.js';
 import { createW8AudioDirector } from './w8-audio.js';
@@ -850,7 +851,18 @@ export async function bootInfiniteWorldSandbox({
         state.saveAvailable = availableSaveSnapshot !== null;
       } catch (error) {
         state.saveAvailable = false;
-        state.saveError = { name: error?.name ?? 'Error', message: error?.message ?? String(error) };
+        state.saveError = {
+          name: error?.name ?? 'Error',
+          message: error?.message ?? String(error),
+          code: error?.code ?? null,
+        };
+      }
+      if (saveStore.snapshot().storage?.mode === 'unavailable' && !state.saveError) {
+        state.saveError = {
+          name: 'SaveStorageUnavailableError',
+          message: 'Infinite World save storage is unavailable',
+          code: 'SAVE_STORAGE_UNAVAILABLE',
+        };
       }
       if (measurementMode) {
         worldState.updateExperience({
@@ -1094,7 +1106,13 @@ export async function bootInfiniteWorldSandbox({
     const directionalPrefetchPending = new Set();
     let transitionError = null;
     let playerRelocationInProgress = false;
-    let saveStatus = state.saveAvailable ? 'available' : state.saveError ? 'invalid' : 'new';
+    const initialSaveStorageMode = saveStore.snapshot().storage?.mode;
+    let saveStatus = initialSaveStorageMode === 'unavailable'
+      || state.saveError?.code === 'SAVE_STORAGE_UNAVAILABLE'
+      ? 'unavailable'
+      : state.saveAvailable
+        ? initialSaveStorageMode === 'legacy-fallback' ? 'fallback' : 'available'
+        : state.saveError ? 'invalid' : 'new';
     let lastFrameAt = clock();
     let latestFrameDurationMs = 0;
     let lastHudAt = 0;
@@ -1345,12 +1363,21 @@ export async function bootInfiniteWorldSandbox({
         lastSavedRevision = saved.revision;
         saveDeferredForStreaming = false;
         state.saveAvailable = true;
+        state.saveError = null;
         experienceShell?.setContinueAvailable?.(true);
-        saveStatus = 'saved';
+        saveStatus = saveStore.snapshot().storage?.mode === 'legacy-fallback'
+          ? 'fallback' : 'saved';
         return saved;
       } catch (error) {
         transitionError = error;
-        saveStatus = 'failed';
+        state.saveError = {
+          name: error?.name ?? 'Error',
+          message: error?.message ?? String(error),
+          code: error?.code ?? null,
+        };
+        saveStatus = isSaveStorageUnavailableError(error)
+          || saveStore.snapshot().storage?.mode === 'unavailable'
+          ? 'unavailable' : 'failed';
       }
     }
     function cancelScheduledSave() {
@@ -1425,12 +1452,21 @@ export async function bootInfiniteWorldSandbox({
           player: logicalPlayer,
           scaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
         });
-        saveStatus = 'loaded';
+        state.saveError = null;
+        saveStatus = saveStore.snapshot().storage?.mode === 'legacy-fallback'
+          ? 'fallback' : 'loaded';
         state.saveLoaded = true;
         return true;
       } catch (error) {
         transitionError = error;
-        saveStatus = 'failed';
+        state.saveError = {
+          name: error?.name ?? 'Error',
+          message: error?.message ?? String(error),
+          code: error?.code ?? null,
+        };
+        saveStatus = isSaveStorageUnavailableError(error)
+          || saveStore.snapshot().storage?.mode === 'unavailable'
+          ? 'unavailable' : 'failed';
         return false;
       } finally {
         playerRelocationInProgress = false;

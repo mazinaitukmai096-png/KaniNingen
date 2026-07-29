@@ -59,7 +59,7 @@ function createFixture({
     'set-quality', 'set-render-distance', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
-    'nuclear-flash',
+    'nuclear-flash', 'save-warning',
   ];
   if (exposeDeveloperTools) ids.push('set-developer-tools', 'developer-tools-section');
   const elements = new Map(ids.map(id => [id, createElement()]));
@@ -498,6 +498,32 @@ test('normal HUD is a read-only adapter and no Boss UI appears without a manual 
   assert.equal(fixture.elements.get('boss-ui').style.display, 'none');
   assert.equal(fixture.elements.get('charge-ui').style.display, 'none');
   assert.equal(fixture.elements.get('atomic-cd-label').textContent, 'SCALE SANDBOX: LOCKED');
+  fixture.shell.dispose();
+});
+
+test('GP-SAVE-04 exposes storage failure in normal UI and keeps fallback Continue available', () => {
+  const html = readFileSync(resolve(repoRoot, 'infinite-world-sandbox.html'), 'utf8');
+  assert.match(html, /<div id="save-warning" role="alert" aria-live="assertive"><\/div>/);
+
+  const fixture = createFixture();
+  const gameplaySnapshot = {
+    state: {
+      player: { hp: 100, maxHp: 100, score: 0 }, activeScaleStageId: 'MAX',
+      destroyedFeatureCount: 0, destroyedEntityCount: 0,
+    },
+    activeSimulationChunkCount: 9, simulatedEntityCount: 0, simulatedStaticTargetCount: 0,
+  };
+  fixture.shell.renderHud({ fps: 60, gameplaySnapshot, saveStatus: 'unavailable' });
+  const warning = fixture.elements.get('save-warning');
+  assert.equal(warning.style.display, 'block');
+  assert.match(warning.textContent, /SAVE UNAVAILABLE/);
+  assert.equal(fixture.elements.get('debug-modal').style.display, 'none');
+
+  fixture.shell.setContinueAvailable(true);
+  fixture.shell.renderHud({ fps: 60, gameplaySnapshot, saveStatus: 'fallback' });
+  assert.equal(fixture.elements.get('continue-button').disabled, false);
+  assert.equal(fixture.elements.get('continue-button').style.display, 'block');
+  assert.equal(warning.style.display, 'none');
   fixture.shell.dispose();
 });
 

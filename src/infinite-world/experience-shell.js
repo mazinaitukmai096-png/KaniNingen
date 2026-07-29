@@ -118,6 +118,7 @@ export function createInfiniteExperienceShell({
     developerTools: byId('set-developer-tools'),
     developerSection: byId('developer-tools-section'),
     nuclearFlash: byId('nuclear-flash'),
+    saveWarning: byId('save-warning'),
     scaleButtons: [...(documentObject?.querySelectorAll?.('[data-scale-stage]') ?? [])],
   };
   const state = {
@@ -762,6 +763,13 @@ export function createInfiniteExperienceShell({
       elements.spawnBoss.textContent = state.bossActive
         ? 'BOSS ACTIVE'
         : developerToolsEnabled() ? 'SPAWN MANUAL BOSS' : 'ENABLE IN SETTINGS';
+    }
+    if (elements.saveWarning) {
+      const message = saveStatus === 'unavailable'
+        ? 'SAVE UNAVAILABLE — PROGRESS WILL NOT BE SAVED'
+        : saveStatus === 'failed' ? 'SAVE FAILED — RETRY PENDING' : '';
+      elements.saveWarning.textContent = message;
+      setVisible(elements.saveWarning, message !== '', 'block');
     }
     syncShellVisibility();
     if (player.hp <= 0 && ['intro', 'playing'].includes(state.runPhase)) {

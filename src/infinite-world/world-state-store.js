@@ -944,15 +944,77 @@ export async function decodeInfiniteWorldSave(serialized, { worldSeedHash } = {}
   return structuredClone(envelope.payload);
 }
 
+const SAVE_STORAGE_FALLBACK_MARKER_KEY = 'KaniNingen:InfiniteWorld:legacy-storage-authority';
+const SAVE_STORAGE_FALLBACK_MARKER_VALUE = 'legacy-authority-v1';
+const INDEXED_DB_PERSISTENT_FAILURE_THRESHOLD = 2;
+
+function storageBackendError(phase, cause, fallbackMessage) {
+  const error = new Error(cause?.message ?? fallbackMessage);
+  error.name = 'SaveStorageBackendError';
+  error.phase = phase;
+  error.cause = cause;
+  return error;
+}
+
+function storageUnavailableError(cause) {
+  const detail = cause?.message ? `: ${cause.message}` : '';
+  const error = new Error(`Infinite World save storage is unavailable${detail}`);
+  error.name = 'SaveStorageUnavailableError';
+  error.code = 'SAVE_STORAGE_UNAVAILABLE';
+  error.cause = cause;
+  return error;
+}
+
+export function isSaveStorageUnavailableError(error) {
+  return error?.code === 'SAVE_STORAGE_UNAVAILABLE'
+    || error?.name === 'SaveStorageUnavailableError';
+}
+
 export function createBrowserSaveStorage({ indexedDB, legacyStorage = null } = {}) {
-  if (!indexedDB?.open) return legacyStorage;
-  const databasePromise = new Promise((resolve, reject) => {
-    const request = indexedDB.open('KaniNingenInfiniteWorld', 1);
+  const usableLegacyStorage = legacyStorage
+    && typeof legacyStorage.getItem === 'function'
+    && typeof legacyStorage.setItem === 'function'
+    ? legacyStorage : null;
+  if (!indexedDB?.open) return usableLegacyStorage;
+
+  let fallbackPinned = false;
+  if (usableLegacyStorage) {
+    try {
+      fallbackPinned = usableLegacyStorage.getItem(SAVE_STORAGE_FALLBACK_MARKER_KEY)
+        === SAVE_STORAGE_FALLBACK_MARKER_VALUE;
+    } catch { /* the real operation will report legacy failure if fallback is needed */ }
+  }
+  let mode = fallbackPinned ? 'legacy-fallback' : 'indexeddb';
+  let backendEpoch = fallbackPinned ? 1 : 0;
+  let consecutiveFailureCount = 0;
+  let fallbackCount = 0;
+  let fallbackReason = fallbackPinned
+    ? Object.freeze({ name: 'LegacyAuthorityMarker', message: 'legacy storage is authoritative' })
+    : null;
+  let fallbackPromise = null;
+  let fallbackMarkerPromise = null;
+  let fallbackMarkerWritten = fallbackPinned;
+  let unavailableError = null;
+  let writeGeneration = 0;
+  let staleIndexedDbResultCount = 0;
+  const latestWriteGenerationByKey = new Map();
+  const knownIndexedDbValues = new Map();
+
+  const databasePromise = fallbackPinned ? null : new Promise((resolve, reject) => {
+    let request;
+    try {
+      request = indexedDB.open('KaniNingenInfiniteWorld', 1);
+    } catch (error) {
+      reject(storageBackendError('open', error, 'IndexedDB open failed'));
+      return;
+    }
     request.onupgradeneeded = () => {
       if (!request.result.objectStoreNames.contains('saves')) request.result.createObjectStore('saves');
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'));
+    request.onerror = () => reject(storageBackendError(
+      'open', request.error, 'IndexedDB open failed',
+    ));
   });
   const transact = async (mode, operation) => {
     const database = await databasePromise;
@@ -975,32 +1037,146 @@ export function createBrowserSaveStorage({ indexedDB, legacyStorage = null } = {
         transaction = database.transaction('saves', mode);
         request = operation(transaction.objectStore('saves'));
       } catch (error) {
-        rejectOnce(error);
+        rejectOnce(storageBackendError('transaction', error, 'IndexedDB transaction failed'));
         return;
       }
       request.onsuccess = () => { requestResult = request.result ?? null; };
-      request.onerror = () => rejectOnce(request.error ?? new Error('IndexedDB request failed'));
+      request.onerror = () => rejectOnce(storageBackendError(
+        'request', request.error, 'IndexedDB request failed',
+      ));
       transaction.oncomplete = resolveOnce;
-      transaction.onerror = () => rejectOnce(
-        transaction.error ?? new Error('IndexedDB transaction failed'),
-      );
-      transaction.onabort = () => rejectOnce(
-        transaction.error ?? new Error('IndexedDB transaction aborted'),
-      );
+      transaction.onerror = () => rejectOnce(storageBackendError(
+        'transaction', transaction.error, 'IndexedDB transaction failed',
+      ));
+      transaction.onabort = () => rejectOnce(storageBackendError(
+        'transaction', transaction.error, 'IndexedDB transaction aborted',
+      ));
     });
   };
+
+  const markUnavailable = cause => {
+    if (!unavailableError) unavailableError = storageUnavailableError(cause);
+    if (mode !== 'unavailable') backendEpoch += 1;
+    mode = 'unavailable';
+    return unavailableError;
+  };
+
+  const legacyOperation = async ({ type, key, value, generation = null }) => {
+    if (!usableLegacyStorage) throw markUnavailable(fallbackReason);
+    try {
+      let result;
+      if (type === 'get') result = await usableLegacyStorage.getItem(key) ?? null;
+      else if (generation >= (latestWriteGenerationByKey.get(key) ?? generation)) {
+        await usableLegacyStorage.setItem(key, value);
+        result = null;
+      } else result = null;
+      if (!fallbackMarkerWritten) {
+        if (!fallbackMarkerPromise) {
+          fallbackMarkerPromise = Promise.resolve().then(() => usableLegacyStorage.setItem(
+            SAVE_STORAGE_FALLBACK_MARKER_KEY,
+            SAVE_STORAGE_FALLBACK_MARKER_VALUE,
+          )).then(() => { fallbackMarkerWritten = true; });
+        }
+        await fallbackMarkerPromise;
+      }
+      return result;
+    } catch (error) {
+      throw markUnavailable(error);
+    }
+  };
+
+  const activateLegacyFallback = reason => {
+    if (mode === 'legacy-fallback') return Promise.resolve();
+    if (mode === 'unavailable') return Promise.reject(unavailableError);
+    if (fallbackPromise) return fallbackPromise;
+    fallbackReason = Object.freeze({
+      name: reason?.name ?? 'Error', message: reason?.message ?? String(reason),
+    });
+    fallbackCount += 1;
+    backendEpoch += 1;
+    mode = 'switching';
+    fallbackPromise = (async () => {
+      if (!usableLegacyStorage) throw markUnavailable(reason);
+      try {
+        for (const [key, record] of knownIndexedDbValues) {
+          if ((record.generation ?? 0) < (latestWriteGenerationByKey.get(key) ?? 0)) continue;
+          await usableLegacyStorage.setItem(key, record.value);
+        }
+        mode = 'legacy-fallback';
+      } catch (error) {
+        throw markUnavailable(error);
+      }
+    })();
+    return fallbackPromise;
+  };
+
+  const runOperation = async operation => {
+    if (mode === 'switching') await fallbackPromise;
+    if (mode === 'legacy-fallback') return legacyOperation(operation);
+    if (mode === 'unavailable') throw unavailableError;
+    const operationEpoch = backendEpoch;
+    try {
+      const result = operation.type === 'get'
+        ? await transact('readonly', store => store.get(operation.key))
+        : await transact('readwrite', store => store.put(operation.value, operation.key));
+      if (operationEpoch !== backendEpoch || mode !== 'indexeddb') {
+        staleIndexedDbResultCount += 1;
+        if (mode === 'switching') await fallbackPromise;
+        if (mode === 'unavailable') throw unavailableError;
+        return legacyOperation(operation);
+      }
+      consecutiveFailureCount = 0;
+      if (operation.type === 'get') {
+        if (result !== null && result !== undefined) {
+          knownIndexedDbValues.set(operation.key, { value: result, generation: 0 });
+        }
+      } else {
+        knownIndexedDbValues.set(operation.key, {
+          value: operation.value, generation: operation.generation,
+        });
+      }
+      return result;
+    } catch (error) {
+      if (operationEpoch !== backendEpoch || mode !== 'indexeddb') {
+        if (mode === 'switching') await fallbackPromise;
+        if (mode === 'unavailable') throw unavailableError;
+        return legacyOperation(operation);
+      }
+      if (error?.phase !== 'open') consecutiveFailureCount += 1;
+      if (error?.phase !== 'open'
+        && consecutiveFailureCount < INDEXED_DB_PERSISTENT_FAILURE_THRESHOLD) throw error;
+      await activateLegacyFallback(error);
+      return legacyOperation(operation);
+    }
+  };
+
+  const createSetOperation = (key, value) => {
+    const generation = ++writeGeneration;
+    latestWriteGenerationByKey.set(key, generation);
+    return { type: 'set', key, value, generation };
+  };
+
   return Object.freeze({
     diagnosticStage: 'indexeddb',
     async getItem(key) {
-      const stored = await transact('readonly', store => store.get(key));
-      if (stored !== null && stored !== undefined) return stored;
-      const legacy = legacyStorage?.getItem?.(key) ?? null;
-      if (legacy !== null) await transact('readwrite', store => store.put(legacy, key));
+      const stored = await runOperation({ type: 'get', key });
+      if (stored !== null || mode !== 'indexeddb' || !usableLegacyStorage) return stored;
+      const legacy = await usableLegacyStorage.getItem(key) ?? null;
+      if (legacy === null) return null;
+      await runOperation(createSetOperation(key, legacy));
       return legacy;
     },
-    async setItem(key, value) {
-      await transact('readwrite', store => store.put(value, key));
-    },
+    setItem(key, value) { return runOperation(createSetOperation(key, value)); },
+    snapshot: () => Object.freeze({
+      mode,
+      backendEpoch,
+      consecutiveFailureCount,
+      fallbackCount,
+      fallbackPinned,
+      fallbackMarkerWritten,
+      staleIndexedDbResultCount,
+      fallbackReason,
+    }),
   });
 }
 
@@ -1155,6 +1331,9 @@ export class InfiniteWorldSaveStore {
       key: this.key,
       persistentStorage: this.storage !== null,
       counts: Object.freeze({ ...this.counts }),
+      storage: this.storage?.snapshot?.() ?? Object.freeze({
+        mode: this.storage ? 'configured' : 'unavailable',
+      }),
       queue: Object.freeze({
         requestedGeneration: this.saveGeneration,
         committedGeneration: this.committedSaveGeneration,

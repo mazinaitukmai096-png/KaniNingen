@@ -13,7 +13,21 @@ import {
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const worldSeedHash = `sha256:${'7'.repeat(64)}`;
 
-function createIndexedDbHarness() {
+class MemoryLegacyStorage {
+  constructor(entries = []) {
+    this.values = new Map(entries);
+    this.writes = [];
+  }
+
+  getItem(key) { return this.values.get(key) ?? null; }
+
+  setItem(key, value) {
+    this.writes.push({ key, value });
+    this.values.set(key, value);
+  }
+}
+
+function createIndexedDbHarness({ legacyStorage = null } = {}) {
   const values = new Map();
   const transactions = [];
   const openRequest = {
@@ -70,10 +84,26 @@ function createIndexedDbHarness() {
       return openRequest;
     },
   };
-  const storage = createBrowserSaveStorage({ indexedDB });
+  const storage = createBrowserSaveStorage({ indexedDB, legacyStorage });
   openRequest.result = database;
   openRequest.onsuccess();
-  return { storage, transactions, values };
+  return { storage, transactions, values, indexedDB, legacyStorage, openRequest };
+}
+
+function createOpenFailureHarness({ legacyStorage = null } = {}) {
+  const openRequest = {
+    error: null,
+    result: null,
+    onerror: null,
+    onsuccess: null,
+    onupgradeneeded: null,
+  };
+  let openCount = 0;
+  const indexedDB = {
+    open() { openCount += 1; return openRequest; },
+  };
+  const storage = createBrowserSaveStorage({ indexedDB, legacyStorage });
+  return { storage, openRequest, get openCount() { return openCount; } };
 }
 
 async function waitForTransaction(harness, index) {
@@ -228,4 +258,180 @@ test('GP-SAVE-02 persistence rejection cannot advance the boot saved revision', 
   const source = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-boot.js'), 'utf8');
   assert.match(source, /const saved = await diagnostics\.measureAsync\([\s\S]*?saveStore\.saveWithMetadata\(worldState\)[\s\S]*?lastSavedRevision = saved\.revision;[\s\S]*?} catch \(error\)/);
   assert.doesNotMatch(source, /catch \(error\)[\s\S]{0,200}lastSavedRevision\s*=/);
+});
+
+test('GP-SAVE-04 falls back to legacy storage when IndexedDB open fails', async () => {
+  const legacyStorage = new MemoryLegacyStorage();
+  const harness = createOpenFailureHarness({ legacyStorage });
+  const saving = harness.storage.setItem('world', 'fallback snapshot');
+  harness.openRequest.error = new Error('IndexedDB blocked');
+  harness.openRequest.onerror();
+
+  await saving;
+  assert.equal(legacyStorage.getItem('world'), 'fallback snapshot');
+  assert.equal(harness.storage.snapshot().mode, 'legacy-fallback');
+  assert.equal(harness.storage.snapshot().fallbackCount, 1);
+});
+
+test('GP-SAVE-04 reports storage unavailable when IndexedDB open fails without fallback', async () => {
+  const harness = createOpenFailureHarness();
+  const saving = harness.storage.setItem('world', 'lost snapshot');
+  harness.openRequest.error = new Error('IndexedDB denied');
+  harness.openRequest.onerror();
+
+  await assert.rejects(saving, error => (
+    error?.code === 'SAVE_STORAGE_UNAVAILABLE' && /IndexedDB denied/.test(error.message)
+  ));
+  assert.equal(harness.storage.snapshot().mode, 'unavailable');
+});
+
+test('GP-SAVE-04 keeps IndexedDB after one transient transaction failure', async () => {
+  const legacyStorage = new MemoryLegacyStorage();
+  const harness = createIndexedDbHarness({ legacyStorage });
+  const failed = harness.storage.setItem('world', 'transient');
+  const failedEntry = await waitForTransaction(harness, 0);
+  failedEntry.transaction.error = new Error('temporary transaction failure');
+  failedEntry.transaction.onerror();
+  await assert.rejects(failed, /temporary transaction failure/);
+
+  const recovered = harness.storage.setItem('world', 'indexeddb recovered');
+  const recoveredEntry = await waitForTransaction(harness, 1);
+  recoveredEntry.request.onsuccess();
+  harness.values.set('world', 'indexeddb recovered');
+  recoveredEntry.transaction.oncomplete();
+  await recovered;
+
+  assert.equal(harness.storage.snapshot().mode, 'indexeddb');
+  assert.equal(harness.storage.snapshot().consecutiveFailureCount, 0);
+  assert.equal(legacyStorage.getItem('world'), null);
+});
+
+test('GP-SAVE-04 preserves legacy import while preferring an existing IndexedDB save', async () => {
+  const legacyStorage = new MemoryLegacyStorage([['world', 'legacy snapshot']]);
+  const migrating = createIndexedDbHarness({ legacyStorage });
+  const loadingLegacy = migrating.storage.getItem('world');
+  const emptyRead = await waitForTransaction(migrating, 0);
+  emptyRead.request.result = null;
+  emptyRead.request.onsuccess();
+  emptyRead.transaction.oncomplete();
+  const migrationWrite = await waitForTransaction(migrating, 1);
+  migrationWrite.request.onsuccess();
+  migrating.values.set('world', 'legacy snapshot');
+  migrationWrite.transaction.oncomplete();
+  assert.equal(await loadingLegacy, 'legacy snapshot');
+  assert.equal(migrating.values.get('world'), 'legacy snapshot');
+
+  const preferringIndexedDb = createIndexedDbHarness({ legacyStorage });
+  const loadingIndexedDb = preferringIndexedDb.storage.getItem('world');
+  const populatedRead = await waitForTransaction(preferringIndexedDb, 0);
+  populatedRead.request.result = 'newer IndexedDB snapshot';
+  populatedRead.request.onsuccess();
+  populatedRead.transaction.oncomplete();
+  assert.equal(await loadingIndexedDb, 'newer IndexedDB snapshot');
+  assert.equal(preferringIndexedDb.transactions.length, 1);
+});
+
+test('GP-SAVE-04 switches once after persistent transaction failure and preserves Save queue latest-wins', async () => {
+  const legacyStorage = new MemoryLegacyStorage();
+  const harness = createIndexedDbHarness({ legacyStorage });
+  const state = createState();
+  const store = new InfiniteWorldSaveStore({ storage: harness.storage, worldSeedHash });
+
+  state.updatePlayer({ score: 100 });
+  const failedSave = store.saveWithMetadata(state);
+  const firstFailure = await waitForTransaction(harness, 0);
+  firstFailure.transaction.error = new Error('persistent failure one');
+  firstFailure.transaction.onerror();
+  await assert.rejects(failedSave, /persistent failure one/);
+
+  state.updatePlayer({ score: 200 });
+  const queuedSave = store.saveWithMetadata(state);
+  state.updatePlayer({ score: 300 });
+  const pagehideSave = store.saveWithMetadata(state);
+  const secondFailure = await waitForTransaction(harness, 1);
+  secondFailure.transaction.error = new Error('persistent failure two');
+  secondFailure.transaction.onerror();
+
+  const [queuedResult, pagehideResult] = await Promise.all([queuedSave, pagehideSave]);
+  assert.equal(queuedResult.generation, 3);
+  assert.equal(pagehideResult.generation, 3);
+  assert.equal(harness.storage.snapshot().mode, 'legacy-fallback');
+  assert.equal(harness.storage.snapshot().fallbackCount, 1);
+  const loaded = await store.loadSnapshot();
+  assert.equal(loaded.player.score, 300);
+  assert.equal(store.snapshot().queue.committedGeneration, 3);
+
+  const bootSource = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-boot.js'), 'utf8');
+  assert.match(bootSource, /handlePageHide\s*=\s*\(\)\s*=>\s*\{\s*void saveForExit\(\);\s*\}/);
+  assert.match(bootSource, /state\.saveAvailable = availableSaveSnapshot !== null/);
+  assert.match(bootSource, /continueAvailable: state\.saveAvailable/);
+  assert.match(bootSource, /setContinueAvailable\?\.\(true\)/);
+});
+
+test('GP-SAVE-04 ignores stale IndexedDB completion after fallback and pins legacy authority', async () => {
+  const legacyStorage = new MemoryLegacyStorage();
+  const harness = createIndexedDbHarness({ legacyStorage });
+  const staleWrite = harness.storage.setItem('world', 'stale IndexedDB snapshot');
+  const staleEntry = await waitForTransaction(harness, 0);
+
+  const firstFailure = harness.storage.setItem('world', 'failed snapshot');
+  const firstFailureEntry = await waitForTransaction(harness, 1);
+  firstFailureEntry.transaction.error = new Error('failure one');
+  firstFailureEntry.transaction.onerror();
+  await assert.rejects(firstFailure, /failure one/);
+
+  const fallbackWrite = harness.storage.setItem('world', 'authoritative fallback snapshot');
+  const fallbackEntry = await waitForTransaction(harness, 2);
+  fallbackEntry.transaction.error = new Error('failure two');
+  fallbackEntry.transaction.onerror();
+  const fallbackOutcome = fallbackWrite.then(
+    value => ({ status: 'fulfilled', value }),
+    error => ({ status: 'rejected', error }),
+  );
+
+  staleEntry.request.onsuccess();
+  harness.values.set('world', 'stale IndexedDB snapshot');
+  staleEntry.transaction.oncomplete();
+  const [staleResult, fallbackResult] = await Promise.allSettled([staleWrite, fallbackWrite]);
+  assert.equal(staleResult.status, 'fulfilled');
+  assert.equal(fallbackResult.status, 'fulfilled', JSON.stringify(await fallbackOutcome));
+  assert.equal(legacyStorage.getItem('world'), 'authoritative fallback snapshot');
+  assert.ok(harness.storage.snapshot().staleIndexedDbResultCount >= 1);
+
+  let reopenedIndexedDbCount = 0;
+  const reopened = createBrowserSaveStorage({
+    indexedDB: { open() { reopenedIndexedDbCount += 1; return {}; } },
+    legacyStorage,
+  });
+  assert.equal(reopenedIndexedDbCount, 0, 'fallback marker must prevent stale IndexedDB reopening');
+  assert.equal(await reopened.getItem('world'), 'authoritative fallback snapshot');
+});
+
+test('GP-SAVE-04 cannot revive storage with a stale IndexedDB completion after fallback fails', async () => {
+  const harness = createIndexedDbHarness();
+  const staleWrite = harness.storage.setItem('world', 'stale snapshot');
+  const staleOutcome = staleWrite.then(
+    value => ({ status: 'fulfilled', value }),
+    error => ({ status: 'rejected', error }),
+  );
+  const staleEntry = await waitForTransaction(harness, 0);
+
+  const firstFailure = harness.storage.setItem('world', 'failure one');
+  const firstFailureEntry = await waitForTransaction(harness, 1);
+  firstFailureEntry.transaction.error = new Error('failure one');
+  firstFailureEntry.transaction.onerror();
+  await assert.rejects(firstFailure, /failure one/);
+
+  const fallbackWrite = harness.storage.setItem('world', 'failure two');
+  const fallbackEntry = await waitForTransaction(harness, 2);
+  fallbackEntry.transaction.error = new Error('failure two');
+  fallbackEntry.transaction.onerror();
+  await assert.rejects(fallbackWrite, error => error?.code === 'SAVE_STORAGE_UNAVAILABLE');
+
+  staleEntry.request.onsuccess();
+  staleEntry.transaction.oncomplete();
+  const result = await staleOutcome;
+  assert.equal(result.status, 'rejected');
+  assert.equal(result.error?.code, 'SAVE_STORAGE_UNAVAILABLE');
+  assert.equal(harness.storage.snapshot().mode, 'unavailable');
 });
