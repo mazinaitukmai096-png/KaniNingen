@@ -48,6 +48,7 @@ function createElement() {
 
 function createFixture({
   exposeDeveloperTools = false,
+  developerToolsEnabled = false,
   runConfiguration = true,
   useCombatCommands = false,
   treeLodDiagnosticsAvailable = false,
@@ -60,7 +61,10 @@ function createFixture({
     'atomic-status', 'atomic-cd-label', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
     'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
-    'debug-close-btn', 'debug-summary', 'debug-runtime-details', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
+    'debug-close-btn', 'debug-summary', 'debug-runtime-details', 'gameplay-diagnostics-hud',
+    'debug-gameplay-diagnostics-off-btn', 'debug-gameplay-diagnostics-on-btn',
+    'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'set-tree-lod-overlay',
+    'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-render-distance', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
@@ -98,7 +102,7 @@ function createFixture({
   const worldState = {
     revision: 0,
     activeScaleStageId: 'MAX',
-    developerTools: false,
+    developerTools: developerToolsEnabled,
     experience: {
       hudHidden: false,
       settings: {
@@ -482,6 +486,8 @@ test('Tree LOD overlay is a diagnostics-only transient toggle independent from t
   assert.equal(dynamic.shell.snapshot().treeLodOverlayEnabled, false);
   assert.deepEqual(dynamic.calls.treeLodOverlays, [true, false]);
   assert.equal(dynamic.elements.get('debug-tree-lod-overlay-on-btn').disabled, true);
+  assert.equal(dynamic.elements.get('set-tree-lod-overlay').checked, false);
+  assert.equal(dynamic.elements.get('set-tree-lod-overlay').disabled, true);
   dynamic.shell.dispose();
 
   const unavailable = createFixture();
@@ -496,6 +502,122 @@ test('Tree LOD overlay is a diagnostics-only transient toggle independent from t
   assert.deepEqual(unavailable.calls.treeLodOverlays, []);
   assert.equal(unavailable.shell.snapshot().treeLodOverlayEnabled, false);
   unavailable.shell.dispose();
+
+  const settingsSync = createFixture({
+    exposeDeveloperTools: true,
+    treeLodDiagnosticsAvailable: true,
+  });
+  const treeLodSetting = settingsSync.elements.get('set-tree-lod-overlay');
+  const settingsOnToggle = settingsSync.elements.get('debug-tree-lod-overlay-on-btn');
+  assert.equal(settingsOnToggle.disabled, false);
+  assert.equal(treeLodSetting.checked, false);
+  assert.equal(settingsOnToggle.disabled, false);
+  settingsOnToggle.dispatch('click');
+  assert.equal(settingsSync.shell.snapshot().treeLodOverlayEnabled, true);
+  assert.equal(treeLodSetting.checked, true);
+  treeLodSetting.checked = false;
+  treeLodSetting.dispatch('change');
+  assert.equal(settingsSync.shell.snapshot().treeLodOverlayEnabled, false);
+  settingsSync.elements.get('debug-tree-lod-overlay-on-btn').dispatch('click');
+  settingsSync.elements.get('debug-tree-lod-overlay-off-btn').dispatch('click');
+  assert.equal(treeLodSetting.checked, false);
+  assert.deepEqual(settingsSync.calls.treeLodOverlays, [true, false, true, false]);
+  settingsSync.shell.dispose();
+
+  const reloaded = createFixture({
+    exposeDeveloperTools: true,
+    developerToolsEnabled: true,
+    treeLodDiagnosticsAvailable: true,
+  });
+  assert.equal(reloaded.elements.get('set-developer-tools').checked, true);
+  assert.equal(reloaded.elements.get('debug-tree-lod-overlay-on-btn').disabled, false);
+  assert.equal(reloaded.shell.snapshot().treeLodOverlayEnabled, false);
+  assert.equal(reloaded.elements.get('set-tree-lod-overlay').checked, false);
+  reloaded.shell.dispose();
+});
+
+test('playing diagnostics HUD stays live after Debug closes without pausing gameplay', () => {
+  const fixture = createFixture({ exposeDeveloperTools: true, developerToolsEnabled: true });
+  const diagnosticsHud = fixture.elements.get('gameplay-diagnostics-hud');
+  const offToggle = fixture.elements.get('debug-gameplay-diagnostics-off-btn');
+  const onToggle = fixture.elements.get('debug-gameplay-diagnostics-on-btn');
+  const revisionBeforeToggle = fixture.worldState.revision;
+  assert.equal(onToggle.listenerCount('click'), 1);
+  assert.equal(fixture.shell.snapshot().gameplayDiagnosticsHudEnabled, false);
+  assert.equal(diagnosticsHud.style.display, 'none');
+  assert.equal(offToggle.getAttribute('aria-pressed'), 'true');
+
+  fixture.elements.get('start-button').dispatch('click');
+  const player = finishIntro(fixture, { x: 193.25, z: -48.5, facingY: 0 });
+  fixture.shell.openDebug();
+  assert.equal(fixture.shell.isPaused(), true);
+  const pausedAt = fixture.shell.snapshot().gameplayTimeMs;
+  onToggle.dispatch('click');
+  assert.equal(fixture.shell.snapshot().gameplayDiagnosticsHudEnabled, true);
+  assert.equal(diagnosticsHud.style.display, 'block');
+  assert.equal(onToggle.getAttribute('aria-pressed'), 'true');
+  assert.equal(fixture.worldState.revision, revisionBeforeToggle);
+
+  fixture.shell.renderHud({
+    fps: 59.6,
+    gameplaySnapshot: {
+      state: {
+        player: { ...player, hp: 64, maxHp: 100, score: 42 }, activeScaleStageId: 'MID',
+        nuclearCooldownMs: 0, manualBoss: null,
+        destroyedFeatureCount: 2, destroyedEntityCount: 3,
+      },
+      activeTankCount: 0, activeSimulationChunkCount: 9,
+      simulatedEntityCount: 4, simulatedStaticTargetCount: 5,
+    },
+    runtimeSnapshot: {
+      centerChunkX: 12, centerChunkZ: -4, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10.25, max: 15 } },
+    },
+    presentationSnapshot: { renderDistancePreset: 'standard' },
+    workerSnapshot: { mode: 'worker', fallbackOccurred: false },
+    saveStatus: 'saved',
+    renderInfo: { drawCalls: 17 },
+    resources: null,
+    debugDetailsEnabled: true,
+    fullDiagnosticHtml: 'FULL DIAGNOSTIC CONTENT MUST NOT LEAK',
+  });
+  const compact = diagnosticsHud.textContent;
+  for (const expected of [
+    'FPS 60', 'Frame p95 10.25 ms', 'Player 193.25', '-48.50', 'Chunk 12,-4',
+    'Scale MID', 'HP 64/100', 'Score 42', 'Worker worker',
+    'Render Distance standard', 'Draw Calls 17',
+  ]) assert.match(compact, new RegExp(expected.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(compact, /FULL DIAGNOSTIC CONTENT MUST NOT LEAK/);
+  assert.doesNotMatch(compact, /Stable destruction|Simulation/);
+
+  fixture.shell.updatePlayer({
+    deltaSeconds: 1,
+    player,
+    scaleProfile: getW6ScaleProfile('MAX'),
+  });
+  assert.equal(fixture.shell.snapshot().gameplayTimeMs, pausedAt);
+  fixture.elements.get('debug-close-btn').dispatch('click');
+  assert.equal(fixture.shell.isPaused(), false);
+  assert.equal(diagnosticsHud.style.display, 'block');
+  fixture.shell.updatePlayer({
+    deltaSeconds: 1,
+    player,
+    scaleProfile: getW6ScaleProfile('MAX'),
+  });
+  assert.equal(fixture.shell.snapshot().gameplayTimeMs, pausedAt + 1_000);
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    fixture.shell.openDebug();
+    fixture.elements.get('debug-close-btn').dispatch('click');
+  }
+  assert.equal(onToggle.listenerCount('click'), 1);
+
+  fixture.shell.openDebug();
+  offToggle.dispatch('click');
+  assert.equal(fixture.shell.snapshot().gameplayDiagnosticsHudEnabled, false);
+  assert.equal(diagnosticsHud.style.display, 'none');
+  assert.equal(diagnosticsHud.textContent, '');
+  assert.equal(fixture.worldState.revision, revisionBeforeToggle);
+  fixture.shell.dispose();
 });
 
 test('normal HUD is a read-only adapter and no Boss UI appears without a manual Boss', () => {

@@ -108,6 +108,10 @@ export function createInfiniteExperienceShell({
     home: byId('set-home-btn'), reset: byId('set-reset-btn'), resume: byId('resume-overlay'),
     debug: byId('debug-modal'), debugClose: byId('debug-close-btn'), debugSummary: byId('debug-summary'),
     debugRuntimeDetails: byId('debug-runtime-details'),
+    gameplayDiagnosticsHud: byId('gameplay-diagnostics-hud'),
+    gameplayDiagnosticsOff: byId('debug-gameplay-diagnostics-off-btn'),
+    gameplayDiagnosticsOn: byId('debug-gameplay-diagnostics-on-btn'),
+    treeLodSetting: byId('set-tree-lod-overlay'),
     treeLodOverlayOff: byId('debug-tree-lod-overlay-off-btn'),
     treeLodOverlayOn: byId('debug-tree-lod-overlay-on-btn'),
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
@@ -128,6 +132,7 @@ export function createInfiniteExperienceShell({
     paused: Boolean(elements.startButton),
     hudHidden: persistedExperience.hudHidden,
     debugOpen: false,
+    gameplayDiagnosticsHudEnabled: false,
     treeLodOverlayEnabled: false,
     settingsOpen: false,
     bossActive: false,
@@ -187,6 +192,7 @@ export function createInfiniteExperienceShell({
     body?.classList?.toggle('experience-ready', true);
     body?.classList?.toggle('hud-hidden', state.hudHidden);
     body?.classList?.toggle('debug-open', state.debugOpen);
+    body?.classList?.toggle('boss-active', state.bossActive);
     setVisible(elements.start, state.mode === 'menu');
     setVisible(elements.ui, state.mode === 'playing', 'block');
     setVisible(elements.crosshair, state.runPhase === 'playing' && !state.paused, 'block');
@@ -194,9 +200,30 @@ export function createInfiniteExperienceShell({
     setVisible(elements.settings, state.settingsOpen);
     setVisible(elements.debug, state.debugOpen);
     setVisible(elements.developerSection, true, 'block');
+    setVisible(elements.gameplayDiagnosticsHud,
+      state.mode === 'playing' && state.gameplayDiagnosticsHudEnabled, 'block');
+    if (!state.gameplayDiagnosticsHudEnabled && elements.gameplayDiagnosticsHud) {
+      elements.gameplayDiagnosticsHud.textContent = '';
+    }
+    for (const [element, selected, label] of [
+      [elements.gameplayDiagnosticsOff, !state.gameplayDiagnosticsHudEnabled, 'OFF'],
+      [elements.gameplayDiagnosticsOn, state.gameplayDiagnosticsHudEnabled, 'ON'],
+    ]) {
+      if (!element) continue;
+      element.textContent = label;
+      element.setAttribute?.('aria-pressed', String(selected));
+      element.classList?.toggle?.('debug-on', selected);
+      setVisible(element, true, 'inline-block');
+    }
     if (!treeLodOverlayAvailable() && state.treeLodOverlayEnabled) {
       state.treeLodOverlayEnabled = false;
       onTreeLodOverlayChanged(false);
+    }
+    if (elements.treeLodSetting) {
+      const available = treeLodOverlayAvailable();
+      elements.treeLodSetting.checked = state.treeLodOverlayEnabled;
+      elements.treeLodSetting.disabled = !available;
+      elements.treeLodSetting.setAttribute?.('aria-disabled', String(!available));
     }
     for (const [element, selected, label] of [
       [elements.treeLodOverlayOff, !state.treeLodOverlayEnabled, 'OFF'],
@@ -213,7 +240,7 @@ export function createInfiniteExperienceShell({
     }
     setVisible(elements.resume, state.mode === 'playing' && state.paused
       && !state.settingsOpen && !state.debugOpen);
-    setVisible(elements.fps, state.settings.showFps, 'block');
+    setVisible(elements.fps, state.settings.showFps && !state.gameplayDiagnosticsHudEnabled, 'block');
     setVisible(elements.boss, state.runPhase === 'playing' && state.bossActive, 'block');
     setVisible(elements.charge, state.runPhase === 'playing' && state.chargeVisible, 'block');
     setVisible(elements.news, state.runPhase === 'playing' && state.newsActive);
@@ -360,6 +387,14 @@ export function createInfiniteExperienceShell({
   listen(elements.settingsClose, 'click', () => (state.mode === 'playing' ? resume() : (state.settingsOpen = false, syncShellVisibility())));
   listen(elements.resume, 'click', resume);
   listen(elements.debugClose, 'click', closeDebug);
+  const setGameplayDiagnosticsHudEnabled = enabled => {
+    const next = enabled === true;
+    if (state.gameplayDiagnosticsHudEnabled === next) return;
+    state.gameplayDiagnosticsHudEnabled = next;
+    syncShellVisibility();
+  };
+  listen(elements.gameplayDiagnosticsOff, 'click', () => setGameplayDiagnosticsHudEnabled(false));
+  listen(elements.gameplayDiagnosticsOn, 'click', () => setGameplayDiagnosticsHudEnabled(true));
   const setTreeLodOverlayEnabled = enabled => {
     if (!treeLodOverlayAvailable() || state.treeLodOverlayEnabled === enabled) return;
     state.treeLodOverlayEnabled = enabled;
@@ -368,6 +403,9 @@ export function createInfiniteExperienceShell({
   };
   listen(elements.treeLodOverlayOff, 'click', () => setTreeLodOverlayEnabled(false));
   listen(elements.treeLodOverlayOn, 'click', () => setTreeLodOverlayEnabled(true));
+  listen(elements.treeLodSetting, 'change', event => {
+    setTreeLodOverlayEnabled(event.target.checked === true);
+  });
   listen(elements.home, 'click', () => { void returnTitle(); });
   listen(elements.restart, 'click', () => { void restart(); });
   listen(elements.spawnBoss, 'click', () => {
@@ -791,6 +829,25 @@ export function createInfiniteExperienceShell({
       elements.saveWarning.textContent = message;
       setVisible(elements.saveWarning, message !== '', 'block');
     }
+    if (state.gameplayDiagnosticsHudEnabled && elements.gameplayDiagnosticsHud) {
+      const frameP95 = runtimeSnapshot?.performance?.frame?.p95;
+      const workerMode = workerSnapshot?.mode ?? workerSnapshot?.kind ?? 'unknown';
+      const fallback = workerSnapshot?.fallbackOccurred ? ' (fallback)' : '';
+      const coordinate = value => Number.isFinite(value) ? value.toFixed(2) : 'n/a';
+      const metric = value => Number.isFinite(value) ? value.toFixed(2) : 'n/a';
+      elements.gameplayDiagnosticsHud.textContent = [
+        `FPS ${Number.isFinite(fps) ? Math.round(fps) : 'n/a'}`,
+        `Frame p95 ${metric(frameP95)} ms`,
+        `Player ${coordinate(player.x)}, ${coordinate(state.playerVertical.rootY)}, ${coordinate(player.z)}`,
+        `Chunk ${runtimeSnapshot?.centerChunkX ?? 'n/a'},${runtimeSnapshot?.centerChunkZ ?? 'n/a'}`,
+        `Scale ${gameplaySnapshot.state.activeScaleStageId ?? 'n/a'}`,
+        `HP ${player.hp ?? 'n/a'}/${player.maxHp ?? 'n/a'}`,
+        `Score ${player.score ?? 'n/a'}`,
+        `Worker ${workerMode}${fallback}`,
+        `Render Distance ${presentationSnapshot?.renderDistancePreset ?? state.settings.renderDistance ?? 'n/a'}`,
+        `Draw Calls ${renderInfo?.drawCalls ?? 'n/a'}`,
+      ].join('\n');
+    }
     syncShellVisibility();
     if (player.hp <= 0 && ['intro', 'playing'].includes(state.runPhase)) {
       state.runPhase = 'dying';
@@ -819,7 +876,7 @@ export function createInfiniteExperienceShell({
       `Stable destruction ${gameplaySnapshot.state.destroyedFeatureCount + gameplaySnapshot.state.destroyedEntityCount}  Save ${saveStatus}`,
       `Worker ${workerSnapshot?.mode ?? workerSnapshot?.kind ?? 'unknown'}  Pending ${workerSnapshot?.pendingCount ?? 0}  Fallback ${workerSnapshot?.fallbackOccurred ? 'yes' : 'no'}`,
       `Render Distance ${presentationSnapshot?.renderDistancePreset ?? state.settings.renderDistance ?? 'current'}`,
-      `Draw ${renderInfo?.drawCalls ?? 'n/a'}  Geometry ${renderInfo?.geometries ?? 'n/a'}  Material ${resources.sharedMaterialCount}`,
+      `Draw ${renderInfo?.drawCalls ?? 'n/a'}  Geometry ${renderInfo?.geometries ?? 'n/a'}  Material ${resources?.sharedMaterialCount ?? 'n/a'}`,
     ];
     if (treeLodOverlayAvailable() && state.treeLodOverlayEnabled) {
       debugSummary.splice(4, 0,
@@ -870,6 +927,7 @@ export function createInfiniteExperienceShell({
       persistentGameplayTimeMs: worldState.gameplayTimeMs ?? state.gameplayTimeMs,
       paused: state.paused,
       hudHidden: state.hudHidden, debugOpen: state.debugOpen,
+      gameplayDiagnosticsHudEnabled: state.gameplayDiagnosticsHudEnabled,
       treeLodOverlayEnabled: state.treeLodOverlayEnabled,
       camera: Object.freeze({ ...state.camera }),
       playerVertical: snapshotPlayerVerticalMovement(state.playerVertical),

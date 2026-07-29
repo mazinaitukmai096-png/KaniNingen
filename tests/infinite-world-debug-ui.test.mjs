@@ -35,11 +35,18 @@ test('Debug panel is bounded and scrollable at low resolution with wrapping diag
   assert.match(html, /@media \(max-width: 600px\), \(max-height: 520px\)/);
   assert.match(html, /\.setting-row, \.debug-row \{ align-items: stretch; flex-direction: column/);
   assert.match(html, /id="debug-runtime-details" class="debug-stats debug-runtime-details"/);
+  assert.match(html, /#gameplay-diagnostics-hud[^}]*position:\s*fixed[^}]*pointer-events:\s*none/s);
+  assert.match(html, /#gameplay-diagnostics-hud[^}]*overflow-x:\s*hidden[^}]*overflow-wrap:\s*anywhere/s);
+  assert.match(html, /body\.boss-active #gameplay-diagnostics-hud[^}]*top:\s*140px/s);
+  assert.match(html, /@media \(max-width: 900px\)[\s\S]*#gameplay-diagnostics-hud/);
 });
 
 test('Debug DOM keeps one instance of every interactive and diagnostic target', () => {
   for (const id of [
     'debug-modal', 'debug-summary', 'debug-runtime-details', 'debug-close-btn',
+    'gameplay-diagnostics-hud',
+    'debug-gameplay-diagnostics-off-btn', 'debug-gameplay-diagnostics-on-btn',
+    'set-tree-lod-overlay',
     'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn',
     'debug-spawn-boss-btn',
   ]) {
@@ -47,4 +54,15 @@ test('Debug DOM keeps one instance of every interactive and diagnostic target', 
   }
   assert.doesNotMatch(html, /body\.experience-ready\.debug-open\s+#hud/);
   assert.match(html, /<details class="debug-details"><summary>FULL RUNTIME DIAGNOSTICS<\/summary>/);
+  assert.match(html, /プレイ中診断HUD/);
+  assert.match(html, /Tree LOD Overlay/);
+});
+
+test('playing diagnostics use the compact data path while full diagnostics remain modal-only', () => {
+  const boot = readFileSync(resolve(repoRoot, 'src/infinite-world/sandbox-boot.js'), 'utf8');
+  assert.match(boot, /experienceSnapshot\.gameplayDiagnosticsHudEnabled === true/);
+  assert.match(boot, /if \(!debugDetailsEnabled\) \{[\s\S]*experienceShell\.renderHud/);
+  assert.match(boot, /treeLodDiagnosticsAvailable:\s*\n\s*typeof distantPresentation\.setTreeLodDiagnosticsEnabled === 'function'/);
+  assert.match(boot, /setTreeLodDiagnosticsEnabled\?\.\(enabled === true\)/);
+  assert.match(boot, /fullDiagnosticHtml/);
 });

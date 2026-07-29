@@ -1510,11 +1510,10 @@ export async function bootInfiniteWorldSandbox({
       onSave: () => { void saveWorld({ force: true }); },
       onLoad: () => { void loadWorld(); },
       continueAvailable: state.saveAvailable,
-      treeLodDiagnosticsAvailable: () => diagnostics.enabled || worldState.developerTools === true,
+      treeLodDiagnosticsAvailable:
+        typeof distantPresentation.setTreeLodDiagnosticsEnabled === 'function',
       onTreeLodOverlayChanged: enabled => {
-        distantPresentation.setTreeLodDiagnosticsEnabled?.(
-          (diagnostics.enabled || worldState.developerTools === true) && enabled === true,
-        );
+        distantPresentation.setTreeLodDiagnosticsEnabled?.(enabled === true);
       },
       onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
         playerRelocationInProgress = true;
@@ -1860,7 +1859,8 @@ export async function bootInfiniteWorldSandbox({
       const experienceSnapshot = experienceShell.snapshot();
       const debugDetailsEnabled = diagnostics.enabled || worldState.developerTools === true
         || experienceSnapshot.debugOpen === true;
-      if (!debugDetailsEnabled) {
+      const gameplayDiagnosticsHudEnabled = experienceSnapshot.gameplayDiagnosticsHudEnabled === true;
+      if (!debugDetailsEnabled && !gameplayDiagnosticsHudEnabled) {
         experienceShell.renderHud({
           fps: latestFrameDurationMs > 0 ? 1000 / latestFrameDurationMs : 0,
           gameplaySnapshot,
@@ -1874,8 +1874,7 @@ export async function bootInfiniteWorldSandbox({
       }
       const runtimeSnapshot = runtime.snapshot();
       distantPresentation.setTreeLodDiagnosticsEnabled?.(
-        (diagnostics.enabled || worldState.developerTools === true)
-          && experienceSnapshot.treeLodOverlayEnabled === true,
+        experienceSnapshot.treeLodOverlayEnabled === true,
       );
       const presentationSnapshot = distantPresentation.snapshot();
       const scenePresentationSnapshot = scenePresentation.snapshot();
@@ -1889,6 +1888,20 @@ export async function bootInfiniteWorldSandbox({
       const transition = runtimeSnapshot.latestTransition;
       const chunkTransportSnapshot = chunkDataService.snapshot().transport;
       const renderInfo = renderer.info;
+      if (!debugDetailsEnabled) {
+        experienceShell.renderHud({
+          fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
+          gameplaySnapshot,
+          runtimeSnapshot,
+          presentationSnapshot,
+          saveStatus,
+          renderInfo: { drawCalls: renderInfo?.render?.calls ?? null },
+          resources: null,
+          workerSnapshot: chunkTransportSnapshot,
+          debugDetailsEnabled: false,
+        });
+        return;
+      }
       const renderResources = renderAdapter.resourceSnapshot();
       const renderedKeySet = new Set(runtimeSnapshot.renderedKeys);
       const loadedKeySet = new Set(renderResources.renderCoverage?.loadedKeys ?? []);
