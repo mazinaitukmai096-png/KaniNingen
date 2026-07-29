@@ -220,6 +220,7 @@ test('official Infinite entry and protected finite regression entry remain disti
   assert.match(infiniteEntry, /sandbox-entry\.js\?v=w8-finite-parity/);
   assert.doesNotMatch(infiniteEntry, /src\/game\.js/);
   assert.match(finiteEntry, /src\/game\.js/);
-  assert.match(runtimeDoc, /schema version 2/);
-  assert.match(runtimeDoc, /read compatibility with W6 saves/);
+  assert.match(runtimeDoc, /current formal schema version 5/);
+  assert.match(runtimeDoc, /W8 schema\s+version 4, W8 schema version 3, and historical W7 and W6 saves/);
+  assert.match(runtimeDoc, /through the existing migration path and are read into schema version 5/);
 });
