@@ -17,6 +17,7 @@ import {
   W8_HUMAN_BEHAVIOR_CONTRACT,
   W8_TANK_LIFECYCLE_CONTRACT,
   finiteFrameChanceProbability,
+  getW6ScaleProfile,
 } from '../src/infinite-world/gameplay-contract.js';
 import {
   InfiniteGameplayRuntime,
@@ -2127,6 +2128,135 @@ test('GP-TANK-01 Tank shell uses swept collision at maximum frame delta and spee
     });
     runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 1 } });
     assert.equal(runtime.projectiles.length, 0);
+    await runtime.shutdown();
+  });
+});
+
+test('GP-COMBAT-01 single Claws follow the protected finite left/right coordinates', async t => {
+  const player = { x: 8, z: 8 };
+  const profile = getW6ScaleProfile('MAX');
+  const centerFor = (facingY, side) => ({
+    x: player.x + profile.attackOffsetXMeters * side * Math.cos(facingY)
+      + profile.attackOffsetZMeters * Math.sin(facingY),
+    z: player.z + profile.attackOffsetZMeters * Math.cos(facingY)
+      - profile.attackOffsetXMeters * side * Math.sin(facingY),
+  });
+  const rockAt = (stableId, position) => ({
+    candidateId: stableId,
+    worldPosition: { ...position, y: 0 },
+    metadata: { candidateRadiusMeters: 0.1 },
+    owningChunkCoordinate: { x: 0, z: 0 },
+  });
+  const chunkWithRocks = rocks => ({
+    ...emptyChunk(0, 0),
+    rockCandidates: rocks,
+  });
+
+  await t.test('finite source and visible Claws define left as local +X and right as local -X', () => {
+    const finiteSource = readFileSync(resolve(repoRoot, 'src/game.js'), 'utf8');
+    const visualSource = readFileSync(
+      resolve(repoRoot, 'src/infinite-world/render/w8-parity-visual-assets.js'),
+      'utf8',
+    );
+    assert.match(
+      finiteSource,
+      /isLeft \? activeScaleStage\.attackOffsetX : -activeScaleStage\.attackOffsetX/,
+    );
+    assert.match(visualSource, /const leftClaw = createClaw\(1\)/);
+    assert.match(visualSource, /const rightClaw = createClaw\(-1\)/);
+  });
+
+  for (const [label, facingY] of [
+    ['0', 0],
+    ['90', Math.PI / 2],
+    ['180', Math.PI],
+    ['270', Math.PI * 1.5],
+  ]) {
+    await t.test(`yaw ${label} hits only the matching equidistant side`, async () => {
+      const leftCenter = centerFor(facingY, 1);
+      const rightCenter = centerFor(facingY, -1);
+      assert.ok(Math.abs(
+        Math.hypot(leftCenter.x - player.x, leftCenter.z - player.z)
+        - Math.hypot(rightCenter.x - player.x, rightCenter.z - player.z),
+      ) < 1e-12);
+      const leftStableId = `wf1:rock:gp-combat-01-left-${label}`;
+      const rightStableId = `wf1:rock:gp-combat-01-right-${label}`;
+      const { runtime, state } = await createRuntime({
+        playerSpawn: player,
+        chunk: chunkWithRocks([
+          rockAt(leftStableId, leftCenter),
+          rockAt(rightStableId, rightCenter),
+        ]),
+        configureState(candidate) { candidate.updatePlayer({ facingY }); },
+      });
+
+      const left = runtime.attack('left', 0);
+      assert.deepEqual(left.hits.map(hit => hit.stableId), [leftStableId]);
+      assert.equal(state.featureDamage.has(rightStableId), false);
+      const right = runtime.attack('right', 1_000);
+      assert.deepEqual(right.hits.map(hit => hit.stableId), [rightStableId]);
+      await runtime.shutdown();
+    });
+  }
+
+  await t.test('a Human on the finite left side is missed by right and hit by left', async () => {
+    const chunk = {
+      ...emptyChunk(0, 0),
+      settlementFeatures: [{
+        stableId: 'settlement-building-v1:gp-combat-01-human-home',
+        featureType: 'settlement-building',
+        buildingType: 'house',
+        radiusMeters: 2,
+        worldPosition: { x: 0, y: 0, z: 0 },
+        owningChunkCoordinate: { x: 0, z: 0 },
+      }],
+    };
+    const { runtime, state } = await createRuntime({ playerSpawn: player, chunk });
+    const human = [...state.entityStates.values()].find(entity => entity.type === 'human');
+    assert.ok(human);
+    Object.assign(human, centerFor(0, 1));
+    assert.equal(runtime.attack('right', 0).hits.some(hit => hit.stableId === human.stableId), false);
+    assert.equal(runtime.attack('left', 1_000).hits.some(hit => hit.stableId === human.stableId), true);
+    await runtime.shutdown();
+  });
+
+  await t.test('a Boss on the finite left side is missed by right and hit by left', async () => {
+    const { runtime, state } = await createRuntime({
+      playerSpawn: player,
+      chunk: emptyChunk(0, 0),
+    });
+    const spawned = await runtime.spawnManualBoss();
+    const boss = state.entityStates.get(spawned.stableId);
+    assert.ok(boss?.alive);
+    Object.assign(boss, centerFor(0, 1));
+    boss.bossBehavior.phase = 'slither';
+    boss.bossBehavior.verticalOffset = 0;
+    const hpBefore = boss.hp;
+    assert.equal(runtime.attack('right', 0).hits.some(hit => hit.stableId === boss.stableId), false);
+    assert.equal(boss.hp, hpBefore);
+    assert.equal(runtime.attack('left', 1_000).hits.some(hit => hit.stableId === boss.stableId), true);
+    assert.ok(boss.hp < hpBefore);
+    await runtime.shutdown();
+  });
+
+  await t.test('double Claw still resolves both finite side centers once', async () => {
+    const leftCenter = centerFor(0, 1);
+    const rightCenter = centerFor(0, -1);
+    const leftStableId = 'wf1:rock:gp-combat-01-double-left';
+    const rightStableId = 'wf1:rock:gp-combat-01-double-right';
+    const { runtime, state } = await createRuntime({
+      playerSpawn: player,
+      chunk: chunkWithRocks([
+        rockAt(leftStableId, leftCenter),
+        rockAt(rightStableId, rightCenter),
+      ]),
+    });
+    const result = runtime.attack('double', 0);
+    assert.deepEqual(
+      result.hits.map(hit => hit.stableId).sort(),
+      [leftStableId, rightStableId].sort(),
+    );
+    assert.equal(state.featureDamage.size, 2);
     await runtime.shutdown();
   });
 });

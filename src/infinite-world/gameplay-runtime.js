@@ -3386,7 +3386,7 @@ export class InfiniteGameplayRuntime {
     const radius = single ? profile.singleAttackRadiusMeters : profile.doubleAttackRadiusMeters;
     const damage = single ? W6_ATTACK_CONTRACT.singleDamage : W6_ATTACK_CONTRACT.doubleDamage;
     const facingY = this.state.player.facingY;
-    const attackSides = mode === 'double' ? [1, -1] : mode === 'left' ? [-1] : [1];
+    const attackSides = mode === 'double' ? [1, -1] : mode === 'right' ? [-1] : [1];
     const attackCenters = attackSides.map(side => {
       const offsetX = profile.attackOffsetXMeters * side;
       const offsetZ = profile.attackOffsetZMeters;
