@@ -636,6 +636,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     t.diagnostic(`active Chunk generation ${snapshot.boot.chunkGenerationMs.toFixed(3)}ms; Settlement generation ${snapshot.boot.settlementGenerationMs.toFixed(3)}ms; projection ${snapshot.boot.renderProjectionMs.toFixed(3)}ms; tracked feature instances ${snapshot.resources.trackedFeatureInstanceCount}`);
     t.diagnostic(`MAJOR Road ${JSON.stringify(snapshot.generator.canonicalMajorRoad)}`);
     t.diagnostic(`Worker ${JSON.stringify({ ...snapshot.chunkDataService.transport, generatorSnapshot: undefined })}`);
+    assert.equal(snapshot.chunkDataService.transport.counts.diagnosticQueries, 1,
+      'boot requests one explicit generator diagnostic snapshot');
     // This wall-clock gate intentionally runs only in a separately invoked
     // single-file process. In the repository-wide parallel run it measures
     // unrelated test-process scheduling contention rather than W5 boot work.

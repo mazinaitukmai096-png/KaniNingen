@@ -10,6 +10,7 @@ import {
   CHUNK_DATA_PRIORITY,
 } from '../src/infinite-world/chunk-data-service-protocol.js';
 import { createInlineChunkGeneratorTransport } from '../src/infinite-world/inline-chunk-generator-transport.js';
+import { createChunkGeneratorWorkerCore } from '../src/infinite-world/chunk-generator-worker-core.js';
 import { createNodeChunkGeneratorWorker } from '../src/infinite-world/node-worker-chunk-generator-adapter.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
 import { createWorkerChunkGeneratorTransport } from '../src/infinite-world/worker-chunk-generator-transport.js';
@@ -51,7 +52,7 @@ class FakeWorker {
       type: CHUNK_GENERATOR_MESSAGE.INITIALIZED,
       protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
       serviceGeneration: message.serviceGeneration,
-      metadata: { worldSeed: seed, generatorSnapshot: null },
+      metadata: { worldSeed: seed },
     }));
   }
   emit(data) { this.listeners.get('message')?.({ data }); }
@@ -96,6 +97,105 @@ function fallbackFactory() {
   return createInlineChunkGeneratorTransport({ generator });
 }
 
+test('Worker core includes the full generator snapshot only in an explicit diagnostics response', async () => {
+  const responses = [];
+  let snapshotCalls = 0;
+  let shutdownCalls = 0;
+  const generator = {
+    worldSeed: seed,
+    worldSeedHash: `sha256:${'2'.repeat(64)}`,
+    generatorVersion: { major: 800, minor: 0, patch: 0 },
+    experienceSpawn: { x: 1, z: 2 },
+    reviewSpawn: { x: 3, z: 4 },
+    distributor: { findSettlementsNear: async () => [{ settlementId: 'settlement:test' }] },
+    resolveSettlementPresentationTemplate: async () => ({ settlementId: 'settlement:test' }),
+    generateChunk: async (chunkX, chunkZ) => fixtureChunk(chunkX, chunkZ),
+    snapshot() {
+      snapshotCalls += 1;
+      return { fullDiagnosticPayload: ['only', 'on', 'request'] };
+    },
+    async shutdown() { shutdownCalls += 1; },
+  };
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    generatorFactory: async () => generator,
+  });
+  const request = (type, requestId, extra = {}) => ({
+    type,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 5,
+    requestId,
+    ...extra,
+  });
+
+  await core.receive(request(CHUNK_GENERATOR_MESSAGE.INITIALIZE, undefined, { worldSeed: seed }));
+  await core.receive(request(CHUNK_GENERATOR_MESSAGE.GENERATE, 1, { chunkX: 2, chunkZ: 3 }));
+  await core.receive(request(CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS, 2, {
+    centerWorldX: 0, centerWorldZ: 0, radiusMeters: 10,
+  }));
+  await core.receive(request(CHUNK_GENERATOR_MESSAGE.RESOLVE_SETTLEMENT_TEMPLATE, 3, {
+    candidate: { settlementId: 'settlement:test' },
+  }));
+
+  assert.equal(snapshotCalls, 0);
+  for (const response of responses) {
+    assert.equal(Object.hasOwn(response, 'generatorSnapshot'), false, response.type);
+    assert.equal(Object.hasOwn(response.metadata ?? {}, 'generatorSnapshot'), false, response.type);
+  }
+
+  await core.receive(request(CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS, 4));
+  assert.equal(snapshotCalls, 1);
+  assert.deepEqual(responses.at(-1), {
+    type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 4,
+    serviceGeneration: 5,
+    generatorSnapshot: { fullDiagnosticPayload: ['only', 'on', 'request'] },
+    operationMs: responses.at(-1).operationMs,
+  });
+  assert.ok(responses.at(-1).operationMs >= 0);
+  await core.shutdown();
+  assert.equal(shutdownCalls, 1);
+});
+
+test('Inline diagnostics are explicit and shutdown waits for active generation before releasing the generator', async () => {
+  let releaseGeneration;
+  let generationFinished = false;
+  let snapshotCalls = 0;
+  let shutdownCalls = 0;
+  const generationGate = new Promise(resolve => { releaseGeneration = resolve; });
+  const generator = {
+    worldSeed: seed,
+    async generateChunk(chunkX, chunkZ) {
+      await generationGate;
+      generationFinished = true;
+      return fixtureChunk(chunkX, chunkZ);
+    },
+    snapshot() { snapshotCalls += 1; return { inlineDiagnostic: true }; },
+    async shutdown() {
+      assert.equal(generationFinished, true);
+      shutdownCalls += 1;
+    },
+  };
+  const transport = createInlineChunkGeneratorTransport({ generator });
+  const metadata = await transport.initialize();
+  assert.equal(Object.hasOwn(metadata, 'generatorSnapshot'), false);
+  assert.equal(transport.snapshot().generatorSnapshot, null);
+  assert.equal(snapshotCalls, 0);
+
+  const generation = transport.generateChunk({ requestId: 1, chunkX: 8, chunkZ: 9 });
+  await drainAsyncWork(2);
+  const shutdown = transport.shutdown();
+  await drainAsyncWork(2);
+  assert.equal(shutdownCalls, 0);
+  releaseGeneration();
+  assert.equal((await generation).chunkId, fixtureChunk(8, 9).chunkId);
+  await shutdown;
+  assert.equal(shutdownCalls, 1);
+  assert.equal(snapshotCalls, 0);
+  await assert.rejects(transport.requestDiagnostics(), /shut down/);
+});
+
 test('real Node module Worker matches Inline W8 identity, owner, terrain, Settlement, presentation and spawn metadata', async () => {
   const inlineGenerator = await createW8ParityChunkGenerator({ worldSeed: seed });
   const inline = createInlineChunkGeneratorTransport({ generator: inlineGenerator });
@@ -104,6 +204,8 @@ test('real Node module Worker matches Inline W8 identity, owner, terrain, Settle
     workerFactory: createNodeChunkGeneratorWorker,
   });
   const [inlineMetadata, workerMetadata] = await Promise.all([inline.initialize(), worker.initialize()]);
+  assert.equal(Object.hasOwn(inlineMetadata, 'generatorSnapshot'), false);
+  assert.equal(Object.hasOwn(workerMetadata, 'generatorSnapshot'), false);
   assert.deepEqual(workerMetadata.experienceSpawn, inlineMetadata.experienceSpawn);
   assert.deepEqual(workerMetadata.generatorVersion, inlineMetadata.generatorVersion);
   assert.equal(workerMetadata.worldSeedHash, inlineMetadata.worldSeedHash);
@@ -152,7 +254,80 @@ test('real Node module Worker matches Inline W8 identity, owner, terrain, Settle
   assert.ok(worker.snapshot().settlementQueryReceiveMsMaximum >= 0);
   assert.ok(worker.snapshot().settlementTemplateMsMaximum > 0);
   assert.ok(worker.snapshot().settlementTemplateReceiveMsMaximum >= 0);
+  assert.equal(inline.snapshot().generatorSnapshot, null);
+  assert.equal(worker.snapshot().generatorSnapshot, null);
+  const [inlineDiagnostics, workerDiagnostics] = await Promise.all([
+    inline.requestDiagnostics(),
+    worker.requestDiagnostics(),
+  ]);
+  assert.equal(workerDiagnostics.schemaVersion, inlineDiagnostics.schemaVersion);
+  assert.equal(workerDiagnostics.warmSourceChunkCacheSize, inlineDiagnostics.warmSourceChunkCacheSize);
+  assert.equal(
+    workerDiagnostics.canonicalMajorRoad.graphCacheSize,
+    inlineDiagnostics.canonicalMajorRoad.graphCacheSize,
+  );
+  assert.equal(worker.snapshot().generatorSnapshot, workerDiagnostics);
+  assert.equal(inline.snapshot().generatorSnapshot, inlineDiagnostics);
+  assert.equal(worker.snapshot().counts.diagnosticQueries, 1);
   await Promise.all([inline.shutdown(), worker.shutdown()]);
+  assert.equal(inline.snapshot().generatorSnapshot, null);
+  assert.equal(worker.snapshot().generatorSnapshot, null);
+  assert.equal(worker.snapshot().timingSampleCount, 0);
+});
+
+test('Worker diagnostics reject stale responses, ignore snapshots attached to normal responses, and stop on shutdown', async () => {
+  const fake = new FakeWorker();
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    serviceGeneration: 7,
+    workerFactory: () => fake,
+  });
+  await transport.initialize();
+  const generated = transport.generateChunk({ requestId: 61, chunkX: 6, chunkZ: 1 });
+  await drainAsyncWork(2);
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATED,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 61,
+    serviceGeneration: 7,
+    chunkData: fixtureChunk(6, 1),
+    generationMs: 1,
+    generatorSnapshot: { mustBeIgnored: true },
+  });
+  await generated;
+  assert.equal(transport.snapshot().generatorSnapshot, null);
+
+  const diagnostics = transport.requestDiagnostics();
+  await drainAsyncWork(2);
+  const requestId = fake.messages.at(-1).requestId;
+  assert.equal(fake.messages.at(-1).type, CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS);
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration: 6,
+    generatorSnapshot: { stale: true },
+    operationMs: 1,
+  });
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration: 7,
+    generatorSnapshot: { current: true },
+    operationMs: 1,
+  });
+  assert.deepEqual(await diagnostics, { current: true });
+  assert.deepEqual(transport.snapshot().generatorSnapshot, { current: true });
+  assert.equal(transport.snapshot().counts.staleGenerationResponses, 1);
+
+  const pendingDiagnostics = transport.requestDiagnostics();
+  await drainAsyncWork(2);
+  await transport.shutdown();
+  await assert.rejects(pendingDiagnostics, /shut down before response/);
+  assert.equal(transport.snapshot().pendingCount, 0);
+  assert.equal(transport.snapshot().generatorSnapshot, null);
+  assert.equal(transport.snapshot().timingSampleCount, 0);
 });
 
 test('Worker transport discards old serviceGeneration and accepts only the current response', async () => {
@@ -198,8 +373,11 @@ test('Worker constructor and initialize failures fall back once to Inline withou
     await transport.initialize();
     const result = await transport.generateChunk({ requestId: 1, chunkX: 1, chunkZ: 1 });
     assert.equal(result.chunkX, 1);
+    assert.deepEqual(await transport.requestDiagnostics(), { fallback: true });
     assert.equal(transport.snapshot().mode, 'inline-fallback');
     assert.equal(transport.snapshot().counts.fallbackCount, 1);
+    assert.equal(transport.snapshot().counts.diagnosticQueries, 1);
+    assert.deepEqual(transport.snapshot().generatorSnapshot, { fallback: true });
     await transport.shutdown();
   });
   await t.test('initialize failure', async () => {

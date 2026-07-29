@@ -66,7 +66,150 @@ export const W8_PARITY_CONTENT = Object.freeze({
       .map(([townType, descriptor]) => [townType, descriptor.landmarkType]),
   )),
 });
+// The 875 m Settlement horizon spans at most 16 of the 768 m Macro Regions;
+// graph history keeps the current and previous footprints. Settlement-derived
+// entries match the W5 template bound, while 256 Road entries exceed one
+// graph's 49-region x 3-edge theoretical working set (147).
+export const W8_PARITY_CACHE_CAPACITIES = Object.freeze({
+  warmSourceChunk: 256,
+  settlementOverlay: 128,
+  settlementDiagnostics: 128,
+  majorRoadGraph: 32,
+  majorRoadRoute: 256,
+  majorRoadObstacle: 128,
+  majorRoadPreparation: 256,
+  majorRoadSourceHash: 128,
+});
+// A service generation owns one seed; fallback reuses that same seed.
+const EXPERIENCE_SPAWN_CACHE_CAPACITY = 1;
 const EXPERIENCE_SPAWN_CACHE = new Map();
+
+function setLruValue(map, key, value, capacity) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > capacity) map.delete(map.keys().next().value);
+  return value;
+}
+
+function getLruValue(map, key) {
+  if (!map.has(key)) return undefined;
+  const value = map.get(key);
+  map.delete(key);
+  map.set(key, value);
+  return value;
+}
+
+export function createPendingSafeLruCache({ capacity, onRemove = null } = {}) {
+  if (!Number.isSafeInteger(capacity) || capacity < 1) {
+    throw new RangeError('pending-safe LRU capacity must be a positive safe integer');
+  }
+  if (onRemove !== null && typeof onRemove !== 'function') {
+    throw new TypeError('pending-safe LRU onRemove must be a function');
+  }
+  const entries = new Map();
+  let closed = false;
+  let evictionCount = 0;
+
+  const removeEntry = (key, reason) => {
+    const entry = entries.get(key);
+    if (!entry) return false;
+    entries.delete(key);
+    if (reason === 'capacity') evictionCount += 1;
+    onRemove?.(key, entry.meta, reason);
+    return true;
+  };
+  const trim = () => {
+    while (entries.size > capacity) {
+      let found = false;
+      let evictionKey;
+      for (const [key, entry] of entries) {
+        if (entry.pending) continue;
+        found = true;
+        evictionKey = key;
+        break;
+      }
+      if (!found) break;
+      removeEntry(evictionKey, 'capacity');
+    }
+  };
+  const get = key => {
+    const entry = entries.get(key);
+    if (!entry) return undefined;
+    entries.delete(key);
+    entries.set(key, entry);
+    return entry.promise;
+  };
+  const getOrCreate = (key, loader, meta = null) => {
+    if (closed) throw new Error('pending-safe LRU cache is closed');
+    if (typeof loader !== 'function') throw new TypeError('pending-safe LRU loader is required');
+    if (entries.has(key)) return get(key);
+    let promise;
+    try {
+      promise = Promise.resolve(loader());
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const entry = { promise, pending: true, meta };
+    entries.set(key, entry);
+    void promise.then(
+      () => {
+        if (closed || entries.get(key) !== entry) return;
+        entry.pending = false;
+        trim();
+      },
+      () => {
+        if (entries.get(key) === entry) removeEntry(key, 'rejected');
+      },
+    );
+    trim();
+    return promise;
+  };
+
+  return Object.freeze({
+    getOrCreate,
+    get,
+    has: key => entries.has(key),
+    delete: key => removeEntry(key, 'deleted'),
+    close() {
+      if (closed) return;
+      closed = true;
+      for (const key of [...entries.keys()]) removeEntry(key, 'closed');
+    },
+    snapshot: () => Object.freeze({
+      capacity,
+      size: entries.size,
+      pendingCount: [...entries.values()].filter(entry => entry.pending).length,
+      evictionCount,
+      closed,
+    }),
+    get capacity() { return capacity; },
+    get size() { return entries.size; },
+    get pendingCount() {
+      return [...entries.values()].filter(entry => entry.pending).length;
+    },
+    get evictionCount() { return evictionCount; },
+    get closed() { return closed; },
+  });
+}
+
+function resolveW8CacheCapacities(overrides) {
+  if (overrides === undefined) return W8_PARITY_CACHE_CAPACITIES;
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    throw new TypeError('cacheCapacities must be an object');
+  }
+  for (const key of Object.keys(overrides)) {
+    if (!Object.hasOwn(W8_PARITY_CACHE_CAPACITIES, key)) {
+      throw new RangeError(`unknown W8 cache capacity: ${key}`);
+    }
+  }
+  const resolved = { ...W8_PARITY_CACHE_CAPACITIES, ...overrides };
+  for (const [key, value] of Object.entries(resolved)) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RangeError(`${key} cache capacity must be a positive safe integer`);
+    }
+  }
+  return Object.freeze(resolved);
+}
 const PROTECTED_SAFE_SPAWN_BOOTSTRAP = Object.freeze({
   worldSeedHash: 'sha256:0ee3540b10572232690cdefc6ee897c8a3a59ffe3ad582617ef0d1c80696c24d',
   x: 549.75,
@@ -871,7 +1014,9 @@ export function validateW8ParityChunkData(chunk) {
 export async function createW8ParityChunkGenerator({
   worldSeed = 'KaniNingen Infinite Natural World',
   baseGeneratorFactory = createDistributedSettlementChunkGenerator,
+  cacheCapacities: cacheCapacityOverrides,
 } = {}) {
+  const cacheCapacities = resolveW8CacheCapacities(cacheCapacityOverrides);
   const base = await baseGeneratorFactory({ worldSeed });
   const naturalPresentationPolicy = await createW8NaturalPresentationPhase1Policy({
     worldSeedHash: base.worldSeedHash,
@@ -879,15 +1024,42 @@ export async function createW8ParityChunkGenerator({
   const seed = textSeed(`${base.worldSeedHash}:${W8_PARITY_CONTENT.schemaVersion}`);
   const warmSourceChunks = new Map();
   const pendingSourceChunks = new Map();
-  const settlementOverlayTemplates = new Map();
   const settlementDiagnostics = new Map();
-  const majorRoadGraphCache = new Map();
-  const majorRoadRouteCache = new Map();
-  const majorRoadObstacleCache = new Map();
-  const majorRoadPreparationCache = new Map();
-  const majorRoadSourceHashCache = new Map();
   const majorRoadRouteKeyByEdge = new Map();
   const majorRoadObstacleKeyBySettlement = new Map();
+  const settlementOverlayTemplates = createPendingSafeLruCache({
+    capacity: cacheCapacities.settlementOverlay,
+    onRemove: settlementId => settlementDiagnostics.delete(settlementId),
+  });
+  const majorRoadGraphCache = createPendingSafeLruCache({
+    capacity: cacheCapacities.majorRoadGraph,
+  });
+  const majorRoadRouteCache = createPendingSafeLruCache({
+    capacity: cacheCapacities.majorRoadRoute,
+    onRemove: (cacheKey, edgeStableId) => {
+      if (majorRoadRouteKeyByEdge.get(edgeStableId) === cacheKey) {
+        majorRoadRouteKeyByEdge.delete(edgeStableId);
+      }
+    },
+  });
+  const majorRoadObstacleCache = createPendingSafeLruCache({
+    capacity: cacheCapacities.majorRoadObstacle,
+    onRemove: (cacheKey, settlementStableId) => {
+      if (majorRoadObstacleKeyBySettlement.get(settlementStableId) === cacheKey) {
+        majorRoadObstacleKeyBySettlement.delete(settlementStableId);
+      }
+    },
+  });
+  const majorRoadPreparationCache = createPendingSafeLruCache({
+    capacity: cacheCapacities.majorRoadPreparation,
+  });
+  const majorRoadSourceHashCache = createPendingSafeLruCache({
+    capacity: cacheCapacities.majorRoadSourceHash,
+  });
+  let isShutdown = false;
+  const assertGeneratorActive = () => {
+    if (isShutdown) throw new Error('W8 parity Chunk generator is shut down');
+  };
   const nowMs = () => globalThis.performance?.now?.() ?? Date.now();
   const majorRoadDiagnostics = {
     graphsBuilt: 0,
@@ -938,13 +1110,14 @@ export async function createW8ParityChunkGenerator({
     obstacleLotCount: 0,
     obstacleLandmarkCount: 0,
   };
-  const warmSourceChunkCapacity = 256;
+  const warmSourceChunkCapacity = cacheCapacities.warmSourceChunk;
   const trimWarmSourceChunks = () => {
     while (warmSourceChunks.size > warmSourceChunkCapacity) {
       warmSourceChunks.delete(warmSourceChunks.keys().next().value);
     }
   };
   const getSourceChunk = async (chunkX, chunkZ) => {
+    if (isShutdown) throw new Error('W8 parity Chunk generator is shut down');
     const key = createChunkKey(chunkX, chunkZ);
     if (warmSourceChunks.has(key)) {
       const cached = warmSourceChunks.get(key);
@@ -956,8 +1129,10 @@ export async function createW8ParityChunkGenerator({
     const pending = Promise.resolve(base.generateChunk(chunkX, chunkZ)).then(
       chunk => {
         pendingSourceChunks.delete(key);
-        warmSourceChunks.set(key, chunk);
-        trimWarmSourceChunks();
+        if (!isShutdown) {
+          warmSourceChunks.set(key, chunk);
+          trimWarmSourceChunks();
+        }
         return chunk;
       },
       error => {
@@ -976,7 +1151,7 @@ export async function createW8ParityChunkGenerator({
       return settlementOverlayTemplates.get(reference.settlementId);
     }
     majorRoadDiagnostics.settlementTemplateCacheMisses += 1;
-    if (!settlementOverlayTemplates.has(reference.settlementId)) {
+    return settlementOverlayTemplates.getOrCreate(reference.settlementId, async () => {
       const startedAt = nowMs();
       const candidate = {
           settlementId: reference.settlementId,
@@ -987,19 +1162,19 @@ export async function createW8ParityChunkGenerator({
           urbanization: reference.urbanization,
           terrainSuitability: reference.terrainSuitability,
       };
-      const pending = (async () => {
-        const sourceStartedAt = nowMs();
-        const sourceTemplate = await base.resolveSettlementTemplate({ candidate });
-        majorRoadDiagnostics.settlementSourceTemplateResolutionMs += nowMs() - sourceStartedAt;
-        const overlayStartedAt = nowMs();
-        const overlay = await createW8SettlementParityOverlay({
-          worldSeedHash: base.worldSeedHash,
-          candidate,
-          sourceTemplate,
-        });
-        majorRoadDiagnostics.settlementOverlayCompositionMs += nowMs() - overlayStartedAt;
-        majorRoadDiagnostics.settlementOverlayGenerationMs += nowMs() - startedAt;
-        settlementDiagnostics.set(reference.settlementId, Object.freeze({
+      const sourceStartedAt = nowMs();
+      const sourceTemplate = await base.resolveSettlementTemplate({ candidate });
+      majorRoadDiagnostics.settlementSourceTemplateResolutionMs += nowMs() - sourceStartedAt;
+      const overlayStartedAt = nowMs();
+      const overlay = await createW8SettlementParityOverlay({
+        worldSeedHash: base.worldSeedHash,
+        candidate,
+        sourceTemplate,
+      });
+      majorRoadDiagnostics.settlementOverlayCompositionMs += nowMs() - overlayStartedAt;
+      majorRoadDiagnostics.settlementOverlayGenerationMs += nowMs() - startedAt;
+      if (!isShutdown) {
+        setLruValue(settlementDiagnostics, reference.settlementId, Object.freeze({
           settlementId: reference.settlementId,
           settlementType: reference.settlementType,
           townType: reference.townType,
@@ -1009,12 +1184,10 @@ export async function createW8ParityChunkGenerator({
           sourceBuildingCount: overlay.sourceBuildingCount,
           overlayBuildingCount: overlay.overlayBuildingCount,
           buildingCount: overlay.sourceBuildingCount + overlay.overlayBuildingCount,
-        }));
-        return overlay;
-      })();
-      settlementOverlayTemplates.set(reference.settlementId, pending);
-    }
-    return settlementOverlayTemplates.get(reference.settlementId);
+        }), cacheCapacities.settlementDiagnostics);
+      }
+      return overlay;
+    });
   };
   const referenceFromGraphNode = node => Object.freeze({
     stableId: `${node.stableId}:reference`,
@@ -1033,31 +1206,27 @@ export async function createW8ParityChunkGenerator({
     if (majorRoadSourceHashCache.has(node.stableId)) {
       return majorRoadSourceHashCache.get(node.stableId);
     }
-    const startedAt = nowMs();
-    const pending = sha256Hex(canonicalizeJson({
-      worldSeedHash: base.worldSeedHash,
-      sourceContractVersion: majorRoadSourceContractVersion,
-      settlementOverlayVersion: W8_PARITY_CONTENT.schemaVersion,
-      surfacePolicyVersion: majorRoadSurfacePolicyVersion,
-      roadContractVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
-      settlement: {
-        stableId: node.stableId,
-        ownerRegion: node.ownerRegion,
-        settlementType: node.settlementType,
-        role: node.role,
-        center: node.center,
-        radiusMeters: node.radiusMeters,
-      },
-    })).then(hash => {
+    return majorRoadSourceHashCache.getOrCreate(node.stableId, async () => {
+      const startedAt = nowMs();
+      const hash = await sha256Hex(canonicalizeJson({
+        worldSeedHash: base.worldSeedHash,
+        sourceContractVersion: majorRoadSourceContractVersion,
+        settlementOverlayVersion: W8_PARITY_CONTENT.schemaVersion,
+        surfacePolicyVersion: majorRoadSurfacePolicyVersion,
+        roadContractVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
+        settlement: {
+          stableId: node.stableId,
+          ownerRegion: node.ownerRegion,
+          settlementType: node.settlementType,
+          role: node.role,
+          center: node.center,
+          radiusMeters: node.radiusMeters,
+        },
+      }));
       majorRoadDiagnostics.sourceContentHashCount += 1;
       majorRoadDiagnostics.sourceContentHashMs += nowMs() - startedAt;
       return `sha256:${hash}`;
-    }).catch(error => {
-      majorRoadSourceHashCache.delete(node.stableId);
-      throw error;
     });
-    majorRoadSourceHashCache.set(node.stableId, pending);
-    return pending;
   };
   const createMajorRoadLandmarkObstacles = reference => {
     const descriptor = W8_SETTLEMENT_ROLE_LANDMARKS[reference.townType];
@@ -1115,7 +1284,7 @@ export async function createW8ParityChunkGenerator({
     }
     majorRoadDiagnostics.obstacleCacheMisses += 1;
     const reference = referenceFromGraphNode(node);
-    const pending = (async () => {
+    return majorRoadObstacleCache.getOrCreate(cacheKey, async () => {
       const sourceStartedAt = nowMs();
       const overlay = await getSettlementOverlay(reference);
       majorRoadDiagnostics.obstacleSourceMs += nowMs() - sourceStartedAt;
@@ -1136,12 +1305,7 @@ export async function createW8ParityChunkGenerator({
         obstacles,
         localRoads: Object.freeze([...presentation.roads]),
       });
-    })().catch(error => {
-      majorRoadObstacleCache.delete(cacheKey);
-      throw error;
-    });
-    majorRoadObstacleCache.set(cacheKey, pending);
-    return pending;
+    }, node.stableId);
   };
   const prepareMajorRoadSource = async ({ edge, graph }) => {
     const preparationKey = canonicalizeJson({
@@ -1155,68 +1319,63 @@ export async function createW8ParityChunkGenerator({
       return majorRoadPreparationCache.get(preparationKey);
     }
     majorRoadDiagnostics.preparationCacheMisses += 1;
-    const pending = (async () => {
-    const nodesById = new Map(graph.nodes.map(node => [node.stableId, node]));
-    const endpoints = edge.settlementIds.map(id => nodesById.get(id));
-    const maximumEndpointRadius = Math.max(...endpoints.map(node => node.radiusMeters));
-    const midpoint = {
-      x: (endpoints[0].center.x + endpoints[1].center.x) / 2,
-      z: (endpoints[0].center.z + endpoints[1].center.z) / 2,
-    };
-    const endpointDistance = Math.hypot(
-      endpoints[1].center.x - endpoints[0].center.x,
-      endpoints[1].center.z - endpoints[0].center.z,
-    );
-    const queryStartedAt = nowMs();
-    majorRoadDiagnostics.settlementCandidateQueryCount += 1;
-    const corridorCandidates = await base.distributor.findSettlementCentersNear(
-      midpoint.x,
-      midpoint.z,
-      endpointDistance / 2 + maximumEndpointRadius * 3
-        + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8,
-    );
-    majorRoadDiagnostics.settlementCandidateQueryMs += nowMs() - queryStartedAt;
-    const relevantNodes = corridorCandidates.filter(candidate => (
-      distanceToSegment(candidate.center, endpoints[0].center, endpoints[1].center)
-        <= candidate.radiusMeters + maximumEndpointRadius * 2
-          + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8
-    )).map(candidate => Object.freeze({
-      stableId: candidate.settlementId,
-      ownerRegion: candidate.macroRegion,
-      settlementType: candidate.settlementType,
-      role: candidate.townType,
-      center: candidate.center,
-      radiusMeters: candidate.radiusMeters,
-    }));
-    const sourceHashes = await Promise.all(
-      relevantNodes.map(getMajorRoadSourceContentHash),
-    );
-    const resolved = await Promise.all(relevantNodes.map((node, index) => (
-      getMajorRoadObstacles(node, sourceHashes[index])
-    )));
-    const sourceContentHashes = relevantNodes.map((node, index) => Object.freeze({
-      settlementStableId: node.stableId,
-      contentHash: sourceHashes[index],
-    }));
-    return Object.freeze({
-      cacheKey: createCanonicalMajorRoadCacheKey({
-        worldSeedHash: base.worldSeedHash,
-        roadEdgeStableId: edge.stableId,
-        sourceContentHashes,
-        surfacePolicyVersion: majorRoadSurfacePolicyVersion,
-        roadContractVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
-      }),
-      obstacles: Object.freeze(resolved.flatMap(value => value.obstacles)
-        .sort((left, right) => left.stableId.localeCompare(right.stableId))),
-      localRoads: Object.freeze(resolved.flatMap(value => value.localRoads)
-        .sort((left, right) => left.stableId.localeCompare(right.stableId))),
+    return majorRoadPreparationCache.getOrCreate(preparationKey, async () => {
+      const nodesById = new Map(graph.nodes.map(node => [node.stableId, node]));
+      const endpoints = edge.settlementIds.map(id => nodesById.get(id));
+      const maximumEndpointRadius = Math.max(...endpoints.map(node => node.radiusMeters));
+      const midpoint = {
+        x: (endpoints[0].center.x + endpoints[1].center.x) / 2,
+        z: (endpoints[0].center.z + endpoints[1].center.z) / 2,
+      };
+      const endpointDistance = Math.hypot(
+        endpoints[1].center.x - endpoints[0].center.x,
+        endpoints[1].center.z - endpoints[0].center.z,
+      );
+      const queryStartedAt = nowMs();
+      majorRoadDiagnostics.settlementCandidateQueryCount += 1;
+      const corridorCandidates = await base.distributor.findSettlementCentersNear(
+        midpoint.x,
+        midpoint.z,
+        endpointDistance / 2 + maximumEndpointRadius * 3
+          + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8,
+      );
+      majorRoadDiagnostics.settlementCandidateQueryMs += nowMs() - queryStartedAt;
+      const relevantNodes = corridorCandidates.filter(candidate => (
+        distanceToSegment(candidate.center, endpoints[0].center, endpoints[1].center)
+          <= candidate.radiusMeters + maximumEndpointRadius * 2
+            + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8
+      )).map(candidate => Object.freeze({
+        stableId: candidate.settlementId,
+        ownerRegion: candidate.macroRegion,
+        settlementType: candidate.settlementType,
+        role: candidate.townType,
+        center: candidate.center,
+        radiusMeters: candidate.radiusMeters,
+      }));
+      const sourceHashes = await Promise.all(
+        relevantNodes.map(getMajorRoadSourceContentHash),
+      );
+      const resolved = await Promise.all(relevantNodes.map((node, index) => (
+        getMajorRoadObstacles(node, sourceHashes[index])
+      )));
+      const sourceContentHashes = relevantNodes.map((node, index) => Object.freeze({
+        settlementStableId: node.stableId,
+        contentHash: sourceHashes[index],
+      }));
+      return Object.freeze({
+        cacheKey: createCanonicalMajorRoadCacheKey({
+          worldSeedHash: base.worldSeedHash,
+          roadEdgeStableId: edge.stableId,
+          sourceContentHashes,
+          surfacePolicyVersion: majorRoadSurfacePolicyVersion,
+          roadContractVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
+        }),
+        obstacles: Object.freeze(resolved.flatMap(value => value.obstacles)
+          .sort((left, right) => left.stableId.localeCompare(right.stableId))),
+        localRoads: Object.freeze(resolved.flatMap(value => value.localRoads)
+          .sort((left, right) => left.stableId.localeCompare(right.stableId))),
+      });
     });
-    })().catch(error => {
-      majorRoadPreparationCache.delete(preparationKey);
-      throw error;
-    });
-    majorRoadPreparationCache.set(preparationKey, pending);
-    return pending;
   };
   const getMajorRoadForEdge = async (edge, graph, preparedSource = null) => {
     majorRoadDiagnostics.routeRequests += 1;
@@ -1248,32 +1407,36 @@ export async function createW8ParityChunkGenerator({
       }
       void details;
     };
-    const pending = createCanonicalMajorRoadNetwork({
-      worldSeedHash: base.worldSeedHash,
-      graph: Object.freeze({ ...graph, edges: Object.freeze([edge]) }),
-      resolveObstacles: () => prepared,
-      timingObserver,
-    }).then(network => {
+    return majorRoadRouteCache.getOrCreate(prepared.cacheKey, async () => {
+      const network = await createCanonicalMajorRoadNetwork({
+        worldSeedHash: base.worldSeedHash,
+        graph: Object.freeze({ ...graph, edges: Object.freeze([edge]) }),
+        resolveObstacles: () => prepared,
+        timingObserver,
+      });
       const road = network.roads[0];
       majorRoadDiagnostics.routesBuilt += 1;
       majorRoadDiagnostics.routeSegmentCount += road.segments.length;
       return road;
-    }).catch(error => {
-      majorRoadRouteCache.delete(prepared.cacheKey);
-      throw error;
-    });
-    majorRoadRouteCache.set(prepared.cacheKey, pending);
-    return pending;
+    }, edge.stableId);
   };
   const getMajorRoads = async (edges, graph) => {
     const preparationStartedAt = nowMs();
     let preparationMissCount = 0;
     const preparedSources = await Promise.all(
-      edges.map(edge => {
+      edges.map(async edge => {
         const cacheKey = majorRoadRouteKeyByEdge.get(edge.stableId);
-        if (cacheKey && majorRoadRouteCache.has(cacheKey)) return null;
+        if (cacheKey && majorRoadRouteCache.has(cacheKey)) {
+          return Object.freeze({
+            cachedRoadPromise: majorRoadRouteCache.get(cacheKey),
+            prepared: null,
+          });
+        }
         preparationMissCount += 1;
-        return prepareMajorRoadSource({ edge, graph });
+        return Object.freeze({
+          cachedRoadPromise: null,
+          prepared: await prepareMajorRoadSource({ edge, graph }),
+        });
       }),
     );
     if (preparationMissCount > 0) {
@@ -1291,13 +1454,13 @@ export async function createW8ParityChunkGenerator({
     // pending caches deduplicate Settlements shared by multiple edges.
     for (let index = 0; index < edges.length; index += 1) {
       const edge = edges[index];
-      const prepared = preparedSources[index];
-      if (!prepared) {
+      const source = preparedSources[index];
+      if (source.cachedRoadPromise) {
         majorRoadDiagnostics.routeRequests += 1;
         majorRoadDiagnostics.routeCacheHits += 1;
-        roads.push(await majorRoadRouteCache.get(majorRoadRouteKeyByEdge.get(edge.stableId)));
+        roads.push(await source.cachedRoadPromise);
       } else {
-        roads.push(await getMajorRoadForEdge(edge, graph, prepared));
+        roads.push(await getMajorRoadForEdge(edge, graph, source.prepared));
       }
     }
     return roads;
@@ -1317,21 +1480,17 @@ export async function createW8ParityChunkGenerator({
       return majorRoadGraphCache.get(key);
     }
     majorRoadDiagnostics.graphCacheMisses += 1;
-    const startedAt = nowMs();
-    const pending = base.distributor.buildConnectivityGraphNear(
-      (regionX + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
-      (regionZ + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
-      majorRoadGraphRadiusMeters,
-    ).then(graph => {
+    return majorRoadGraphCache.getOrCreate(key, async () => {
+      const startedAt = nowMs();
+      const graph = await base.distributor.buildConnectivityGraphNear(
+        (regionX + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
+        (regionZ + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
+        majorRoadGraphRadiusMeters,
+      );
       majorRoadDiagnostics.graphsBuilt += 1;
       majorRoadDiagnostics.graphGenerationMs += nowMs() - startedAt;
       return graph;
-    }).catch(error => {
-      majorRoadGraphCache.delete(key);
-      throw error;
     });
-    majorRoadGraphCache.set(key, pending);
-    return pending;
   };
   const createMajorRoadFeatures = async (chunkX, chunkZ, surfaceBackedChunk) => {
     const resolutionStartedAt = nowMs();
@@ -1360,7 +1519,7 @@ export async function createW8ParityChunkGenerator({
     return Promise.all(squareChunkCoordinates(centerChunkX, centerChunkZ, radius)
       .map(coordinate => getSourceChunk(coordinate.chunkX, coordinate.chunkZ)));
   };
-  let experienceSpawn = EXPERIENCE_SPAWN_CACHE.get(base.worldSeedHash) ?? null;
+  let experienceSpawn = getLruValue(EXPERIENCE_SPAWN_CACHE, base.worldSeedHash) ?? null;
   if (!experienceSpawn) {
     let preparedSpawnSources = null;
     if (base.worldSeedHash === PROTECTED_SAFE_SPAWN_BOOTSTRAP.worldSeedHash) {
@@ -1435,7 +1594,12 @@ export async function createW8ParityChunkGenerator({
           createChunkKey(source.chunkX, source.chunkZ)).sort()),
       }),
     });
-    EXPERIENCE_SPAWN_CACHE.set(base.worldSeedHash, experienceSpawn);
+    setLruValue(
+      EXPERIENCE_SPAWN_CACHE,
+      base.worldSeedHash,
+      experienceSpawn,
+      EXPERIENCE_SPAWN_CACHE_CAPACITY,
+    );
   } else {
     const selectedOwner = decomposeLogicalWorldPosition(experienceSpawn.x, experienceSpawn.z);
     await prepareSourceSquare(
@@ -1453,6 +1617,7 @@ export async function createW8ParityChunkGenerator({
     reviewSpawn: base.reviewSpawn,
     experienceSpawn,
     async auditSettlementsNear(x, z, radiusMeters) {
+      assertGeneratorActive();
       const candidates = await base.distributor.findSettlementsNear(x, z, radiusMeters);
       const overlays = await Promise.all(candidates.map(getSettlementOverlay));
       return Object.freeze(candidates.map((candidate, index) => {
@@ -1481,6 +1646,7 @@ export async function createW8ParityChunkGenerator({
       }));
     },
     async resolveSettlementPresentationTemplate({ candidate } = {}) {
+      assertGeneratorActive();
       return composeW8SettlementPresentationTemplate(await getSettlementOverlay(candidate));
     },
     async resolveCanonicalMajorRoadNetwork({
@@ -1488,6 +1654,7 @@ export async function createW8ParityChunkGenerator({
       centerWorldZ,
       radiusMeters,
     } = {}) {
+      assertGeneratorActive();
       if (![centerWorldX, centerWorldZ, radiusMeters].every(Number.isFinite)
         || radiusMeters < 0) throw new TypeError('valid MAJOR Road query is required');
       const graph = await base.distributor.buildConnectivityGraphNear(
@@ -1645,14 +1812,14 @@ export async function createW8ParityChunkGenerator({
       const settlementLandmarks = distributedLandmarks
         .map(reground).sort((left, right) => left.stableId.localeCompare(right.stableId));
       for (const reference of settlementReferences) {
-        const diagnostic = settlementDiagnostics.get(reference.settlementId);
+        const diagnostic = getLruValue(settlementDiagnostics, reference.settlementId);
         if (!diagnostic) continue;
         const landmarkCount = settlementLandmarks.filter(value =>
           value.parentSettlementId === reference.settlementId).length;
-        settlementDiagnostics.set(reference.settlementId, Object.freeze({
+        setLruValue(settlementDiagnostics, reference.settlementId, Object.freeze({
           ...diagnostic,
           landmarkCount: Math.max(diagnostic.landmarkCount ?? 0, landmarkCount),
-        }));
+        }), cacheCapacities.settlementDiagnostics);
       }
       const streetDetails = streetDetailsRaw.map(reground)
         .sort((left, right) => left.stableId.localeCompare(right.stableId));
@@ -1693,33 +1860,82 @@ export async function createW8ParityChunkGenerator({
       if (!validation.valid) throw new Error(`invalid W8 ChunkData: ${validation.errors.join('; ')}`);
       return chunk;
     },
+    async shutdown() {
+      if (isShutdown) return;
+      isShutdown = true;
+      warmSourceChunks.clear();
+      pendingSourceChunks.clear();
+      settlementOverlayTemplates.close();
+      settlementDiagnostics.clear();
+      majorRoadGraphCache.close();
+      majorRoadRouteCache.close();
+      majorRoadObstacleCache.close();
+      majorRoadPreparationCache.close();
+      majorRoadSourceHashCache.close();
+      majorRoadRouteKeyByEdge.clear();
+      majorRoadObstacleKeyBySettlement.clear();
+      await base.shutdown?.();
+    },
     snapshot: () => {
       const source = base.snapshot?.() ?? null;
+      const overlayCache = settlementOverlayTemplates.snapshot();
+      const graphCache = majorRoadGraphCache.snapshot();
+      const routeCache = majorRoadRouteCache.snapshot();
+      const obstacleCache = majorRoadObstacleCache.snapshot();
+      const preparationCache = majorRoadPreparationCache.snapshot();
+      const sourceHashCache = majorRoadSourceHashCache.snapshot();
+      const observedSettlements = [...settlementDiagnostics.values()]
+        .sort((left, right) => left.settlementId.localeCompare(right.settlementId));
       return Object.freeze({
         ...(source ?? {}),
         schemaVersion: W8_PARITY_CONTENT.schemaVersion,
         source,
+        isShutdown,
         safeSpawnPreparedChunkCount: experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0,
         safeSpawn: experienceSpawn.spawnSafety ?? null,
+        experienceSpawnCacheSize: EXPERIENCE_SPAWN_CACHE.size,
+        experienceSpawnCacheCapacity: EXPERIENCE_SPAWN_CACHE_CAPACITY,
         warmSourceChunkCacheSize: warmSourceChunks.size,
         warmSourceChunkCacheCapacity: warmSourceChunkCapacity,
         warmSourceChunkPendingCount: pendingSourceChunks.size,
+        settlementOverlayCacheSize: overlayCache.size,
+        settlementOverlayCacheCapacity: overlayCache.capacity,
+        settlementOverlayCachePendingCount: overlayCache.pendingCount,
+        settlementOverlayCacheEvictionCount: overlayCache.evictionCount,
+        settlementDiagnosticCacheSize: settlementDiagnostics.size,
+        settlementDiagnosticCacheCapacity: cacheCapacities.settlementDiagnostics,
         canonicalMajorRoad: Object.freeze({
           schemaVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
           widthMeters: W8_CANONICAL_MAJOR_ROAD.widthMeters,
-          graphCacheSize: majorRoadGraphCache.size,
-          routeCacheSize: majorRoadRouteCache.size,
-          obstacleCacheSize: majorRoadObstacleCache.size,
-          preparationCacheSize: majorRoadPreparationCache.size,
-          sourceHashCacheSize: majorRoadSourceHashCache.size,
+          graphCacheSize: graphCache.size,
+          graphCacheCapacity: graphCache.capacity,
+          graphCachePendingCount: graphCache.pendingCount,
+          graphCacheEvictionCount: graphCache.evictionCount,
+          routeCacheSize: routeCache.size,
+          routeCacheCapacity: routeCache.capacity,
+          routeCachePendingCount: routeCache.pendingCount,
+          routeCacheEvictionCount: routeCache.evictionCount,
+          routeKeyIndexSize: majorRoadRouteKeyByEdge.size,
+          obstacleCacheSize: obstacleCache.size,
+          obstacleCacheCapacity: obstacleCache.capacity,
+          obstacleCachePendingCount: obstacleCache.pendingCount,
+          obstacleCacheEvictionCount: obstacleCache.evictionCount,
+          obstacleKeyIndexSize: majorRoadObstacleKeyBySettlement.size,
+          preparationCacheSize: preparationCache.size,
+          preparationCacheCapacity: preparationCache.capacity,
+          preparationCachePendingCount: preparationCache.pendingCount,
+          preparationCacheEvictionCount: preparationCache.evictionCount,
+          sourceHashCacheSize: sourceHashCache.size,
+          sourceHashCacheCapacity: sourceHashCache.capacity,
+          sourceHashCachePendingCount: sourceHashCache.pendingCount,
+          sourceHashCacheEvictionCount: sourceHashCache.evictionCount,
           ...majorRoadDiagnostics,
         }),
-        observedSettlementDiagnostics: Object.freeze([...settlementDiagnostics.values()]
-          .sort((left, right) => left.settlementId.localeCompare(right.settlementId))
+        observedSettlementDiagnostics: Object.freeze(observedSettlements
           .map(value => Object.freeze({
             ...value,
             nearestObservedSettlementDistanceMeters: Math.min(
-              ...[...settlementDiagnostics.values()]
+              ...observedSettlements
                 .filter(other => other.settlementId !== value.settlementId)
                 .map(other => Math.hypot(
                   value.center.x - other.center.x,

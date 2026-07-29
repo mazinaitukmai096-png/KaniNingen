@@ -802,6 +802,7 @@ export async function bootInfiniteWorldSandbox({
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
         resolveSettlementPresentationTemplate: (...args) =>
           workerTransport.resolveSettlementPresentationTemplate(...args),
+        requestDiagnostics: () => workerTransport.requestDiagnostics(),
         snapshot: () => workerTransport.snapshot(),
         shutdown: () => workerTransport.shutdown(),
       });
@@ -822,8 +823,8 @@ export async function bootInfiniteWorldSandbox({
       }),
       resolveSettlementPresentationTemplate: (...args) =>
         chunkGeneratorTransport.resolveSettlementPresentationTemplate(...args),
-      snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot
-        ?? generatorMetadata.generatorSnapshot,
+      requestDiagnostics: () => chunkGeneratorTransport.requestDiagnostics(),
+      snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot,
     });
     experienceSpawn = generator.experienceSpawn ?? generator.reviewSpawn;
     await runStage('Save State', async () => {
@@ -1040,9 +1041,9 @@ export async function bootInfiniteWorldSandbox({
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
 
-    await runStage('Settlement', () => {
+    await runStage('Settlement', async () => {
       const runtimeSnapshot = runtime.snapshot();
-      const generatorSnapshot = generator.snapshot();
+      const generatorSnapshot = await generator.requestDiagnostics();
       const initialSettlementIds = new Set();
       for (const key of runtimeSnapshot.activeDataKeys) {
         const [chunkX, chunkZ] = key.split(',').map(Number);

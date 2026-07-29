@@ -17,6 +17,8 @@ export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   SETTLEMENTS: 'chunk-generator:settlements',
   RESOLVE_SETTLEMENT_TEMPLATE: 'chunk-generator:resolve-settlement-template',
   SETTLEMENT_TEMPLATE: 'chunk-generator:settlement-template',
+  REQUEST_DIAGNOSTICS: 'chunk-generator:request-diagnostics',
+  DIAGNOSTICS: 'chunk-generator:diagnostics',
   ERROR: 'chunk-generator:error',
 });
 

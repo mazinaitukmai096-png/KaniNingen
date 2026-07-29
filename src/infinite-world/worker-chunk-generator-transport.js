@@ -4,6 +4,9 @@ import {
   createChunkGeneratorInitializeRequest,
   createChunkGeneratorRequest,
 } from './chunk-data-service-protocol.js';
+import { MetricSeries } from './runtime-timing.js';
+
+const TRANSPORT_TIMING_SAMPLE_CAPACITY = 4096;
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -69,16 +72,19 @@ export function createWorkerChunkGeneratorTransport({
   let controlRequestId = 1_000_000_000;
   const pending = new Map();
   const removers = [];
-  const generationTimes = [];
-  const receiveTimes = [];
-  const settlementQueryTimes = [];
-  const settlementQueryReceiveTimes = [];
-  const settlementTemplateTimes = [];
-  const settlementTemplateReceiveTimes = [];
+  const generationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const receiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const settlementQueryTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const settlementQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const settlementTemplateTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const settlementTemplateReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const diagnosticTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const diagnosticReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const counts = {
     generated: 0,
     settlementQueries: 0,
     settlementTemplateQueries: 0,
+    diagnosticQueries: 0,
     staleGenerationResponses: 0,
     lateResponses: 0,
     workerErrors: 0,
@@ -114,7 +120,6 @@ export function createWorkerChunkGeneratorTransport({
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.INITIALIZED) {
       metadata = message.metadata;
-      lastGeneratorSnapshot = metadata?.generatorSnapshot ?? null;
       initialized = true;
       mode = 'worker';
       initializeResolve?.(metadata);
@@ -134,12 +139,11 @@ export function createWorkerChunkGeneratorTransport({
       operation.reject(transportError(message));
       return;
     }
-    lastGeneratorSnapshot = message.generatorSnapshot ?? lastGeneratorSnapshot;
     if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED) {
       const receivedMs = Math.max(0, clock() - operation.sentAt);
       const generationMs = Math.max(0, Number(message.generationMs) || 0);
-      generationTimes.push(generationMs);
-      receiveTimes.push(Math.max(0, receivedMs - generationMs));
+      generationTimes.record(generationMs);
+      receiveTimes.record(Math.max(0, receivedMs - generationMs));
       counts.generated += 1;
       operation.resolve(message.chunkData);
       return;
@@ -147,8 +151,8 @@ export function createWorkerChunkGeneratorTransport({
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
       const receivedMs = Math.max(0, clock() - operation.sentAt);
       const operationMs = Math.max(0, Number(message.operationMs) || 0);
-      settlementQueryTimes.push(operationMs);
-      settlementQueryReceiveTimes.push(Math.max(0, receivedMs - operationMs));
+      settlementQueryTimes.record(operationMs);
+      settlementQueryReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.settlementQueries += 1;
       operation.resolve(message.settlements);
       return;
@@ -156,10 +160,20 @@ export function createWorkerChunkGeneratorTransport({
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE) {
       const receivedMs = Math.max(0, clock() - operation.sentAt);
       const operationMs = Math.max(0, Number(message.operationMs) || 0);
-      settlementTemplateTimes.push(operationMs);
-      settlementTemplateReceiveTimes.push(Math.max(0, receivedMs - operationMs));
+      settlementTemplateTimes.record(operationMs);
+      settlementTemplateReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.settlementTemplateQueries += 1;
       operation.resolve(message.template);
+      return;
+    }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const operationMs = Math.max(0, Number(message.operationMs) || 0);
+      diagnosticTimes.record(operationMs);
+      diagnosticReceiveTimes.record(Math.max(0, receivedMs - operationMs));
+      counts.diagnosticQueries += 1;
+      lastGeneratorSnapshot = message.generatorSnapshot ?? null;
+      operation.resolve(lastGeneratorSnapshot);
     }
   };
 
@@ -202,7 +216,7 @@ export function createWorkerChunkGeneratorTransport({
       fallbackReason = Object.freeze({ name: error?.name ?? 'Error', message: error?.message ?? String(error) });
       fallbackTransport = candidate;
       metadata = candidateMetadata;
-      lastGeneratorSnapshot = metadata?.generatorSnapshot ?? null;
+      lastGeneratorSnapshot = null;
       runtimeFailure = null;
       mode = 'inline-fallback';
       initialized = true;
@@ -301,31 +315,57 @@ export function createWorkerChunkGeneratorTransport({
         candidate,
       });
     },
+    async requestDiagnostics() {
+      await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
+      if (fallbackTransport) {
+        if (typeof fallbackTransport.requestDiagnostics !== 'function') {
+          throw new Error('fallback transport does not expose diagnostics');
+        }
+        lastGeneratorSnapshot = await fallbackTransport.requestDiagnostics();
+        counts.diagnosticQueries += 1;
+        return lastGeneratorSnapshot;
+      }
+      const requestId = ++controlRequestId;
+      return requestWorker({
+        type: CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS,
+        protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+        requestId,
+        serviceGeneration,
+      });
+    },
     snapshot() {
-      const sortedGeneration = [...generationTimes].sort((a, b) => a - b);
-      const sortedReceive = [...receiveTimes].sort((a, b) => a - b);
-      const sortedSettlementQuery = [...settlementQueryTimes].sort((a, b) => a - b);
-      const sortedSettlementQueryReceive = [...settlementQueryReceiveTimes].sort((a, b) => a - b);
-      const sortedSettlementTemplate = [...settlementTemplateTimes].sort((a, b) => a - b);
-      const sortedSettlementTemplateReceive = [...settlementTemplateReceiveTimes].sort((a, b) => a - b);
-      const median = values => values.length ? values[Math.floor((values.length - 1) * 0.5)] : 0;
+      const generationTiming = generationTimes.snapshot();
+      const receiveTiming = receiveTimes.snapshot();
+      const settlementQueryTiming = settlementQueryTimes.snapshot();
+      const settlementQueryReceiveTiming = settlementQueryReceiveTimes.snapshot();
+      const settlementTemplateTiming = settlementTemplateTimes.snapshot();
+      const settlementTemplateReceiveTiming = settlementTemplateReceiveTimes.snapshot();
+      const diagnosticTiming = diagnosticTimes.snapshot();
+      const diagnosticReceiveTiming = diagnosticReceiveTimes.snapshot();
       return Object.freeze({
         kind: 'worker', mode, initialized, isShutdown, serviceGeneration,
         protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
         pendingCount: pending.size,
         fallbackOccurred: fallbackTransport !== null,
         fallbackReason,
-        generationMsP50: median(sortedGeneration),
-        generationMsMaximum: sortedGeneration.at(-1) ?? 0,
-        mainThreadReceiveMsP50: median(sortedReceive),
-        mainThreadReceiveMsMaximum: sortedReceive.at(-1) ?? 0,
-        settlementQueryMsP50: median(sortedSettlementQuery),
-        settlementQueryMsMaximum: sortedSettlementQuery.at(-1) ?? 0,
-        settlementQueryReceiveMsMaximum: sortedSettlementQueryReceive.at(-1) ?? 0,
-        settlementTemplateMsP50: median(sortedSettlementTemplate),
-        settlementTemplateMsMaximum: sortedSettlementTemplate.at(-1) ?? 0,
-        settlementTemplateReceiveMsMaximum: sortedSettlementTemplateReceive.at(-1) ?? 0,
-        generatorSnapshot: fallbackTransport?.snapshot?.().generatorSnapshot ?? lastGeneratorSnapshot,
+        timingSampleCapacity: TRANSPORT_TIMING_SAMPLE_CAPACITY,
+        timingSampleCount: generationTiming.sampleCount,
+        generationMsP50: generationTiming.p50,
+        generationMsMaximum: generationTiming.max,
+        mainThreadReceiveMsP50: receiveTiming.p50,
+        mainThreadReceiveMsMaximum: receiveTiming.max,
+        settlementQueryMsP50: settlementQueryTiming.p50,
+        settlementQueryMsMaximum: settlementQueryTiming.max,
+        settlementQueryReceiveMsMaximum: settlementQueryReceiveTiming.max,
+        settlementTemplateMsP50: settlementTemplateTiming.p50,
+        settlementTemplateMsMaximum: settlementTemplateTiming.max,
+        settlementTemplateReceiveMsMaximum: settlementTemplateReceiveTiming.max,
+        diagnosticMsP50: diagnosticTiming.p50,
+        diagnosticMsMaximum: diagnosticTiming.max,
+        diagnosticReceiveMsMaximum: diagnosticReceiveTiming.max,
+        generatorSnapshot: lastGeneratorSnapshot,
         counts: Object.freeze({ ...counts }),
       });
     },
@@ -339,6 +379,17 @@ export function createWorkerChunkGeneratorTransport({
       rejectPending(error);
       await terminateWorker();
       await fallbackTransport?.shutdown?.();
+      lastGeneratorSnapshot = null;
+      for (const series of [
+        generationTimes,
+        receiveTimes,
+        settlementQueryTimes,
+        settlementQueryReceiveTimes,
+        settlementTemplateTimes,
+        settlementTemplateReceiveTimes,
+        diagnosticTimes,
+        diagnosticReceiveTimes,
+      ]) series.reset();
     },
   });
 }

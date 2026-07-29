@@ -16,7 +16,6 @@ function generatorMetadata(generator) {
     generatorVersion: generator.generatorVersion,
     experienceSpawn: generator.experienceSpawn,
     reviewSpawn: generator.reviewSpawn,
-    generatorSnapshot: generator.snapshot?.() ?? null,
   });
 }
 
@@ -73,7 +72,6 @@ export function createChunkGeneratorWorkerCore({
           contentHash: chunkData.contentHash,
           chunkData,
           generationMs: Math.max(0, clock() - startedAt),
-          generatorSnapshot: generator.snapshot?.() ?? null,
         });
         return;
       }
@@ -91,7 +89,6 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           settlements,
           operationMs: Math.max(0, clock() - startedAt),
-          generatorSnapshot: generator.snapshot?.() ?? null,
         });
         return;
       }
@@ -110,7 +107,19 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           template,
           operationMs: Math.max(0, clock() - startedAt),
-          generatorSnapshot: generator.snapshot?.() ?? null,
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS) {
+        const startedAt = clock();
+        const generatorSnapshot = await generator.snapshot?.() ?? null;
+        postMessage({
+          type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
+          protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          serviceGeneration,
+          generatorSnapshot,
+          operationMs: Math.max(0, clock() - startedAt),
         });
         return;
       }
@@ -128,6 +137,7 @@ export function createChunkGeneratorWorkerCore({
     async shutdown() {
       isShutdown = true;
       await operationChain.catch(() => {});
+      await generator?.shutdown?.();
       generator = null;
     },
   });

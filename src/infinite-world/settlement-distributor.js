@@ -218,6 +218,10 @@ export async function createSettlementDistributor({ worldSeedHash }) {
   const rawCache = new Map();
   const acceptedCache = new Map();
   const connectivityNeighborCache = new Map();
+  let isShutdown = false;
+  const assertActive = () => {
+    if (isShutdown) throw new Error('Settlement distributor is shut down');
+  };
   const size = W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters;
   const maximumMinimumDistance = Math.max(...Object.values(
     W5_SETTLEMENT_DISTRIBUTION.minimumDistanceMetersByTypePair,
@@ -225,6 +229,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
   const conflictRegionRadius = Math.ceil((maximumMinimumDistance + size * 0.64) / size);
 
   function rawCandidate(regionX, regionZ, proposalSlot = 0) {
+    assertActive();
     if (!Number.isInteger(proposalSlot)
       || proposalSlot < 0
       || proposalSlot >= W5_SETTLEMENT_DISTRIBUTION.proposalSlotsPerMacroRegion) {
@@ -377,6 +382,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
       settlementType: candidate.settlementType,
       townType: candidate.townType,
     }))).slice(0, 24)}`;
+    if (isShutdown) return Object.freeze({ ...candidate, settlementId });
     return lruSet(acceptedCache, key, Object.freeze({ ...candidate, settlementId }), 4096);
   }
 
@@ -531,6 +537,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
           || first.settlementId.localeCompare(second.settlementId)
         ))
         .slice(0, limit);
+      if (isShutdown) return Object.freeze(selected);
       return lruSet(
         connectivityNeighborCache,
         candidate.settlementId,
@@ -615,7 +622,15 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     findNearestSettlement,
     findHomeSettlement,
     buildConnectivityGraphNear,
+    async shutdown() {
+      if (isShutdown) return;
+      isShutdown = true;
+      rawCache.clear();
+      acceptedCache.clear();
+      connectivityNeighborCache.clear();
+    },
     snapshot: () => Object.freeze({
+      isShutdown,
       rawCacheSize: rawCache.size,
       rawCandidateCount: [...rawCache.values()].filter(Boolean).length,
       rawPrimaryCandidateCount: [...rawCache.values()].filter(value => (

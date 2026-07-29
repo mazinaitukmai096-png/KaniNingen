@@ -198,12 +198,14 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
   const reviewSettlement = await distributor.findHomeSettlement(0, 0);
   const templateCache = new Map();
   const templateCacheCapacity = 128;
+  let isShutdown = false;
   let templatesMaterialized = 0;
   let templateGenerationMs = 0;
   let templateCacheHits = 0;
   let templateCacheMisses = 0;
 
   async function getTemplate(candidate) {
+    if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
     if (templateCache.has(candidate.settlementId)) {
       templateCacheHits += 1;
       const cached = templateCache.get(candidate.settlementId);
@@ -214,6 +216,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     templateCacheMisses += 1;
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
     const template = await createMigratedSettlementTemplate({ candidate });
+    if (isShutdown) return template;
     templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
     templatesMaterialized += 1;
     return lruSet(templateCache, candidate.settlementId, template, templateCacheCapacity);
@@ -231,6 +234,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       return getTemplate(candidate);
     },
     async generateChunk(chunkX, chunkZ) {
+      if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
       const formal = await formalGenerator.generateChunk(chunkX, chunkZ);
       const bounds = chunkBounds(formal.chunkX, formal.chunkZ);
       const chunkCenter = {
@@ -296,7 +300,15 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       if (!validation.valid) throw new Error(`invalid W5 ChunkData: ${validation.errors.join('; ')}`);
       return chunkData;
     },
+    async shutdown() {
+      if (isShutdown) return;
+      isShutdown = true;
+      templateCache.clear();
+      await distributor.shutdown?.();
+      await formalGenerator.shutdown?.();
+    },
     snapshot: () => Object.freeze({
+      isShutdown,
       templateCacheSize: templateCache.size,
       templateCacheCapacity,
       templatesMaterialized,
