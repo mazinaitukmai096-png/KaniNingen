@@ -6,7 +6,10 @@ import {
   createExperienceCameraState,
   createInfiniteExperienceShell,
 } from '../src/infinite-world/experience-shell.js';
-import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
+import {
+  W7_NUCLEAR_CONTRACT,
+  getW6ScaleProfile,
+} from '../src/infinite-world/gameplay-contract.js';
 import { getScalePlayerVerticalMetrics } from '../src/infinite-world/player-vertical-movement.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
@@ -48,6 +51,7 @@ function createFixture({
   useCombatCommands = false,
   treeLodDiagnosticsAvailable = false,
   resolvePlayerHorizontalMovement = undefined,
+  nuclearReleaseResult = undefined,
 } = {}) {
   const ids = [
     'start-screen', 'start-button', 'continue-button', 'lobby-settings-btn', 'ui', 'crosshair', 'compass',
@@ -132,7 +136,7 @@ function createFixture({
         return { accepted: true };
       },
     } : {}),
-    onNuclearRelease: input => { calls.nuclear.push(input); },
+    onNuclearRelease: input => { calls.nuclear.push(input); return nuclearReleaseResult; },
     onPlayerLanding: input => { calls.landings.push(input); },
     onSpawnManualBoss: () => { calls.bossSpawns += 1; },
     treeLodDiagnosticsAvailable,
@@ -148,6 +152,25 @@ function finishIntro(fixture, player = { x: 0, z: 0, facingY: 0 }, profile = get
   fixture.shell.updatePlayer({ deltaSeconds: 6, player, scaleProfile: profile });
   assert.equal(fixture.shell.getRunPhase(), 'playing');
   return player;
+}
+
+function renderAtomicReady(fixture) {
+  fixture.shell.renderHud({
+    fps: 60,
+    gameplaySnapshot: {
+      state: {
+        player: { hp: 100, maxHp: 100, score: 0 }, activeScaleStageId: 'MAX',
+        nuclearCooldownMs: 0, destroyedFeatureCount: 0, destroyedEntityCount: 0,
+      },
+      activeTankCount: 0, activeSimulationChunkCount: 9,
+      simulatedEntityCount: 0, simulatedStaticTargetCount: 0,
+    },
+    runtimeSnapshot: {
+      centerChunkX: 0, centerChunkZ: 0, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 15 } },
+    },
+    saveStatus: 'saved', renderInfo: {}, resources: { sharedMaterialCount: 1 },
+  });
 }
 
 test('W7 camera state is sourced from the protected scale profile', () => {
@@ -862,6 +885,141 @@ test('Atomic charge can start while grounded and retains the airborne release co
     originY: fixture.shell.snapshot().playerVertical.rootY,
   }]);
   fixture.shell.dispose();
+});
+
+test('GP-INPUT-01 charge resolution suppresses the remaining physical mouseup exactly once', async t => {
+  const beginPlaying = (options = {}) => {
+    const fixture = createFixture(options);
+    fixture.elements.get('start-button').dispatch('click');
+    finishIntro(fixture);
+    return fixture;
+  };
+  const pressBoth = fixture => {
+    fixture.globalObject.dispatch('mousedown', { button: 0 });
+    fixture.globalObject.dispatch('mousedown', { button: 2 });
+  };
+
+  for (const [label, releasedButton, remainingButton] of [
+    ['left-first', 0, 2],
+    ['right-first', 2, 0],
+  ]) {
+    await t.test(`${label} Atomic release ignores the other button mouseup`, () => {
+      const fixture = beginPlaying();
+      pressBoth(fixture);
+      fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+      fixture.globalObject.dispatch('mouseup', { button: releasedButton });
+      fixture.globalObject.dispatch('mouseup', { button: remainingButton });
+      assert.equal(fixture.calls.nuclear.length, 1);
+      assert.deepEqual(fixture.calls.attacks, []);
+      fixture.shell.dispose();
+    });
+  }
+
+  await t.test('a rejected Atomic release still suppresses the remaining mouseup', () => {
+    const fixture = beginPlaying({ nuclearReleaseResult: { accepted: false, reason: 'airborne-required' } });
+    pressBoth(fixture);
+    fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.equal(fixture.calls.nuclear.length, 1);
+    assert.deepEqual(fixture.calls.attacks, []);
+    fixture.shell.dispose();
+  });
+
+  await t.test('short charge emits only the double Claw and suppresses the remaining mouseup', () => {
+    const fixture = beginPlaying();
+    pressBoth(fixture);
+    fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs - 1);
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    assert.deepEqual(fixture.calls.attacks, ['double']);
+    assert.deepEqual(fixture.calls.nuclear, []);
+    fixture.shell.dispose();
+  });
+
+  await t.test('normal left and right clicks remain distinct CombatCommands', () => {
+    const fixture = beginPlaying({ useCombatCommands: true });
+    fixture.globalObject.dispatch('mousedown', { button: 0 });
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.globalObject.dispatch('mousedown', { button: 2 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['left-claw', 'right-claw'],
+    );
+    fixture.shell.dispose();
+  });
+
+  await t.test('suppression is consumed once and cannot swallow the next new click', () => {
+    const fixture = beginPlaying({ useCombatCommands: true });
+    renderAtomicReady(fixture);
+    pressBoth(fixture);
+    fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    fixture.globalObject.dispatch('mousedown', { button: 2 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['charge-start', 'right-claw'],
+    );
+    assert.equal(fixture.calls.nuclear.length, 1);
+    fixture.shell.dispose();
+  });
+
+  await t.test('pause clears suppression and an unmatched physical release cannot attack after resume', () => {
+    const fixture = beginPlaying({ useCombatCommands: true });
+    renderAtomicReady(fixture);
+    pressBoth(fixture);
+    fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.shell.openSettings();
+    fixture.shell.resume();
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['charge-start'],
+    );
+    fixture.shell.dispose();
+  });
+
+  await t.test('menu and blur clear suppression before the next click', async () => {
+    for (const transition of ['menu', 'blur']) {
+      const fixture = beginPlaying({ useCombatCommands: true });
+      renderAtomicReady(fixture);
+      pressBoth(fixture);
+      fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+      fixture.globalObject.dispatch('mouseup', { button: 0 });
+      if (transition === 'menu') {
+        await fixture.shell.returnTitle();
+        fixture.shell.start('new');
+        finishIntro(fixture);
+      } else {
+        fixture.globalObject.dispatch('blur');
+      }
+      fixture.globalObject.dispatch('mousedown', { button: 2 });
+      fixture.globalObject.dispatch('mouseup', { button: 2 });
+      assert.deepEqual(
+        fixture.calls.combatCommands.map(command => command.type),
+        ['charge-start', 'right-claw'],
+        transition,
+      );
+      fixture.shell.dispose();
+    }
+  });
+
+  await t.test('Atomic-unavailable fallback emits one double Claw and no release commands', () => {
+    const fixture = beginPlaying({ useCombatCommands: true });
+    pressBoth(fixture);
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['both-claws'],
+    );
+    assert.deepEqual(fixture.calls.nuclear, []);
+    fixture.shell.dispose();
+  });
 });
 
 test('W7B extends the W6 runtime without a second gameplay state, entity registry or save system', () => {

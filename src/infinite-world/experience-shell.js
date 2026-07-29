@@ -173,6 +173,15 @@ export function createInfiniteExperienceShell({
   };
   const leaveLock = () => documentObject?.exitPointerLock?.();
 
+  function resetAttackInputState() {
+    const hadCharge = state.nuclearChargeStartedAt !== null;
+    state.nuclearChargeStartedAt = null;
+    state.attackButtons.clear();
+    state.suppressedMouseUps.clear();
+    state.camera.chargeZoom = 0;
+    if (hadCharge) onChargeEnd();
+  }
+
   function syncShellVisibility() {
     body?.classList?.toggle('experience-ready', true);
     body?.classList?.toggle('hud-hidden', state.hudHidden);
@@ -301,19 +310,15 @@ export function createInfiniteExperienceShell({
     return enterRun(startMode, result && typeof result === 'object' ? result : {});
   }
   function openSettings() {
-    const hadCharge = state.nuclearChargeStartedAt !== null;
     state.paused = state.mode === 'playing'; state.settingsOpen = true; state.debugOpen = false;
-    state.nuclearChargeStartedAt = null;
-    state.attackButtons.clear();
-    state.suppressedMouseUps.clear();
+    resetAttackInputState();
     state.camera.shake = 0;
-    state.camera.chargeZoom = 0;
-    if (hadCharge) onChargeEnd();
     leaveLock(); syncShellVisibility();
   }
   function openDebug() {
     if (state.mode !== 'playing') return;
     state.paused = true; state.debugOpen = true; state.settingsOpen = false;
+    resetAttackInputState();
     leaveLock(); syncShellVisibility();
   }
   function closeDebug() {
@@ -324,6 +329,7 @@ export function createInfiniteExperienceShell({
   async function returnTitle() {
     state.mode = 'menu'; state.runPhase = 'menu'; state.paused = true;
     state.settingsOpen = false; state.debugOpen = false;
+    resetAttackInputState();
     leaveLock(); syncShellVisibility();
     await onReturnTitle();
   }
@@ -476,6 +482,7 @@ export function createInfiniteExperienceShell({
         return;
       }
       if (event.button !== 0 && event.button !== 2) return;
+      state.suppressedMouseUps.delete(event.button);
       state.attackButtons.add(event.button);
       if (state.attackButtons.has(0) && state.attackButtons.has(2)) {
         const chargeEligible = typeof onCombatCommand !== 'function' || state.canNuclearCharge;
@@ -498,8 +505,9 @@ export function createInfiniteExperienceShell({
       const wasCharging = state.nuclearChargeStartedAt !== null;
       const releasedAt = globalObject.performance?.now?.() ?? Date.now();
       const chargeMs = wasCharging ? releasedAt - state.nuclearChargeStartedAt : 0;
-      state.attackButtons.delete(event.button);
+      const releasedButtonWasDown = state.attackButtons.delete(event.button);
       if (wasCharging) {
+        for (const button of state.attackButtons) state.suppressedMouseUps.add(button);
         state.attackButtons.clear();
         state.nuclearChargeStartedAt = null;
         state.camera.chargeZoom = 0;
@@ -516,7 +524,7 @@ export function createInfiniteExperienceShell({
           });
         }
         syncShellVisibility();
-      } else if (state.runPhase === 'playing' && !state.paused) {
+      } else if (releasedButtonWasDown && state.runPhase === 'playing' && !state.paused) {
         emitCombat(event.button === 0
           ? W8_COMBAT_COMMAND_TYPES.LEFT : W8_COMBAT_COMMAND_TYPES.RIGHT, { issuedAt: releasedAt });
       }
@@ -532,6 +540,7 @@ export function createInfiniteExperienceShell({
   if (documentObject && documentObject !== globalObject) {
     listen(documentObject, 'pointerlockchange', handlePointerLockChange);
   }
+  listen(globalObject, 'blur', resetAttackInputState);
 
   function updatePlayer({ deltaSeconds, player, scaleProfile, movementMultiplier = 1 }) {
     const previousStageId = state.lastScaleProfile?.stage?.id;
