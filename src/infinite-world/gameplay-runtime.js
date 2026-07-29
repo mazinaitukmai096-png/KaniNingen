@@ -41,6 +41,9 @@ const TANK_COLLISION_OBSTACLE_TYPES = new Set([
   'house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory',
 ]);
 const TANK_TERRAIN_QUERY_CACHE_CAPACITY = 128;
+const BOSS_TAIL_DIRECTION_EPSILON_METERS_SQUARED = finiteWorldUnitsToMeters(
+  Math.sqrt(0.001),
+) ** 2;
 
 function finitePresentationProfile(target, destroyed) {
   const contract = W8_DESTRUCTION_PRESENTATION_CONTRACT;
@@ -122,6 +125,23 @@ function deterministicUnitFloat(key) {
   hash = Math.imul(hash, 0x7feb352d);
   hash ^= hash >>> 15;
   return (hash >>> 0) / 0x1_0000_0000;
+}
+
+function resolveBossTailKnockbackDirection(boss, player, tailX, tailZ) {
+  const directionX = player.x - tailX;
+  const directionZ = player.z - tailZ;
+  const lengthSquared = directionX ** 2 + directionZ ** 2;
+  if (Number.isFinite(lengthSquared)
+    && lengthSquared >= BOSS_TAIL_DIRECTION_EPSILON_METERS_SQUARED) {
+    return { directionX, directionZ };
+  }
+  const rotationY = Number.isFinite(boss.rotationY)
+    ? boss.rotationY
+    : deterministicUnitFloat(`${boss.stableId}:tail-knockback`) * Math.PI * 2;
+  return {
+    directionX: -Math.sin(rotationY),
+    directionZ: -Math.cos(rotationY),
+  };
 }
 
 function ownerContains(ownerChunkKey, x, z) {
@@ -851,10 +871,12 @@ export class InfiniteGameplayRuntime {
       if (behavior.tailCooldownSeconds <= 0
         && (player.x - tailX) ** 2 + (player.z - tailZ) ** 2
           < finiteWorldUnitsToMeters(contract.tail.hitRadius) ** 2) {
+        const knockbackDirection = resolveBossTailKnockbackDirection(
+          boss, player, tailX, tailZ,
+        );
         this.state.damagePlayer(contract.tail.damage);
         this.applyPlayerKnockback({
-          directionX: player.x - tailX,
-          directionZ: player.z - tailZ,
+          ...knockbackDirection,
           metersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(contract.tail.knockbackPerFiniteFrame),
           decayPerFrame: W7_MANUAL_BOSS_CONTRACT.playerKnockbackDecay,
         });

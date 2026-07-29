@@ -164,6 +164,47 @@ function createRuntime({ active = false, query = syntheticChunk } = {}) {
   return { state, renderer, featureRenderer, runtime, initialize };
 }
 
+async function captureTailKnockback({ rotationY = 0, offsetX = 0, offsetZ = 0 } = {}) {
+  const fixture = createRuntime();
+  try {
+    const spawned = await fixture.runtime.spawnManualBoss();
+    const boss = fixture.state.entityStates.get(spawned.stableId);
+    Object.assign(boss, { x: 0, z: 0, rotationY });
+    Object.assign(boss.bossBehavior, {
+      phase: 'sweep', phaseClock: 0, tailCooldownSeconds: 0,
+    });
+    const tailDistance = finiteWorldUnitsToMeters(
+      W8_BOSS_CONTRACT.tail.segmentSpacing * (W8_BOSS_CONTRACT.segmentCount - 1),
+    );
+    fixture.state.updatePlayer({
+      x: -Math.sin(rotationY) * tailDistance + offsetX,
+      z: -Math.cos(rotationY) * tailDistance + offsetZ,
+    });
+    const hpBefore = fixture.state.player.hp;
+    fixture.runtime.update({ deltaSeconds: Number.EPSILON, player: fixture.state.player });
+    const impactPosition = { x: fixture.state.player.x, z: fixture.state.player.z };
+    const impactHp = fixture.state.player.hp;
+    const impactHitCount = fixture.runtime.snapshot().counts.playerHits;
+    fixture.runtime.update({
+      deltaSeconds: 0.01, player: fixture.state.player, simulationEnabled: false,
+    });
+    return {
+      hpBefore,
+      impactHp,
+      continuationHp: fixture.state.player.hp,
+      impactHitCount,
+      tailCooldownSeconds: boss.bossBehavior.tailCooldownSeconds,
+      displacement: {
+        x: fixture.state.player.x - impactPosition.x,
+        z: fixture.state.player.z - impactPosition.z,
+      },
+      player: { x: fixture.state.player.x, z: fixture.state.player.z },
+    };
+  } finally {
+    await fixture.runtime.shutdown();
+  }
+}
+
 test('W7D Nuclear and manual Boss contracts import every protected finite value', () => {
   assert.deepEqual(W7_NUCLEAR_CONTRACT, {
     allowedScaleStageId: 'MAX',
@@ -454,6 +495,38 @@ test('Boss sweep Tail uses finite radius, damage, knockback and cooldown exactly
   assert.equal(fixture.state.player.hp, 100 - W8_BOSS_CONTRACT.tail.damage,
     'Tail cooldown prevents a second contact hit');
   await fixture.runtime.shutdown();
+});
+
+test('GP-BOSS-01 exact tail-center hit applies one finite deterministic knockback and keeps updating', async () => {
+  const first = await captureTailKnockback({ rotationY: 0 });
+  const repeated = await captureTailKnockback({ rotationY: 0 });
+  assert.equal(first.impactHp, first.hpBefore - W8_BOSS_CONTRACT.tail.damage);
+  assert.equal(first.continuationHp, first.impactHp, 'continuation cannot apply Tail damage twice');
+  assert.equal(first.impactHitCount, 1);
+  assert.ok(first.tailCooldownSeconds > 1.19);
+  assert.ok(first.displacement.z < 0, 'rotation zero pushes outward through the tail');
+  assert.ok(Math.abs(first.displacement.x) < 1e-9);
+  assert.deepEqual(first.displacement, repeated.displacement);
+  assert.ok(Number.isFinite(first.player.x) && Number.isFinite(first.player.z));
+});
+
+test('GP-BOSS-01 epsilon tail distance uses facing fallback while normal distance is unchanged', async () => {
+  const finiteFallbackDistanceMeters = finiteWorldUnitsToMeters(Math.sqrt(0.001));
+  const epsilon = await captureTailKnockback({
+    rotationY: 0,
+    offsetX: finiteFallbackDistanceMeters * 0.5,
+  });
+  assert.ok(epsilon.displacement.z < 0);
+  assert.ok(Math.abs(epsilon.displacement.x) < 1e-9,
+    'finite-compatible epsilon must use the deterministic tail direction');
+
+  const turned = await captureTailKnockback({ rotationY: Math.PI / 2 });
+  assert.ok(turned.displacement.x < 0, 'Boss facing rotates the deterministic fallback');
+  assert.ok(Math.abs(turned.displacement.z) < 1e-9);
+
+  const normal = await captureTailKnockback({ rotationY: 0, offsetX: 0.1 });
+  assert.ok(normal.displacement.x > 0, 'normal separation keeps the contact-vector direction');
+  assert.ok(Math.abs(normal.displacement.z) < 1e-6);
 });
 
 test('Boss Breach landing applies World AoE, Player push, Scar and 15 hyper-rage Acid shots once', async () => {
