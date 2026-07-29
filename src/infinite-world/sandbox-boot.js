@@ -1857,7 +1857,9 @@ export async function bootInfiniteWorldSandbox({
 
     function updateHud(owner) {
       const gameplaySnapshot = gameplay.snapshot();
-      const debugDetailsEnabled = diagnostics.enabled || worldState.developerTools === true;
+      const experienceSnapshot = experienceShell.snapshot();
+      const debugDetailsEnabled = diagnostics.enabled || worldState.developerTools === true
+        || experienceSnapshot.debugOpen === true;
       if (!debugDetailsEnabled) {
         experienceShell.renderHud({
           fps: latestFrameDurationMs > 0 ? 1000 / latestFrameDurationMs : 0,
@@ -1871,7 +1873,6 @@ export async function bootInfiniteWorldSandbox({
         return;
       }
       const runtimeSnapshot = runtime.snapshot();
-      const experienceSnapshot = experienceShell.snapshot();
       distantPresentation.setTreeLodDiagnosticsEnabled?.(
         (diagnostics.enabled || worldState.developerTools === true)
           && experienceSnapshot.treeLodOverlayEnabled === true,
@@ -1920,7 +1921,7 @@ export async function bootInfiniteWorldSandbox({
         cloud.logicalX - logicalPlayer.x,
         cloud.logicalZ - logicalPlayer.z,
       ) <= fogFarMeters).length;
-      hud.innerHTML = `<span id="badge">W8 / FINITE EXPERIENCE PARITY</span>
+      const fullDiagnosticHtml = `W8 / FINITE EXPERIENCE PARITY
 World Seed: ${escapeHtml(generator.worldSeed)}
 Logical Chunk: (${owner.chunkX}, ${owner.chunkZ})  Local: (${number(owner.logicalLocalX)}m, ${number(owner.logicalLocalZ)}m)
 Logical World: (${number(logicalPlayer.x)}m, ${number(logicalPlayer.z)}m)
@@ -1960,7 +1961,7 @@ Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.lo
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
-Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}<span id="error">${escapeHtml(errorText)}</span>`;
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}${escapeHtml(errorText)}`;
       experienceShell.renderHud({
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
@@ -1972,6 +1973,8 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           geometries: renderInfo?.memory?.geometries ?? null,
         },
         resources: renderResources,
+        workerSnapshot: chunkTransportSnapshot,
+        fullDiagnosticHtml,
         measurementReport,
         debugDetailsEnabled: true,
       });

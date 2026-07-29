@@ -29,13 +29,14 @@ class FakeEventTarget {
       preventDefault() {}, target: this, ...event,
     });
   }
+  listenerCount(type) { return (this.listeners.get(type) ?? []).length; }
 }
 
 function createElement() {
   const attributes = new Map();
   const classes = new Set();
   return Object.assign(new FakeEventTarget(), {
-    style: {}, textContent: '', value: '', checked: false, dataset: {},
+    style: {}, textContent: '', innerHTML: '', value: '', checked: false, dataset: {},
     classList: {
       toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
       contains(name) { return classes.has(name); },
@@ -59,7 +60,7 @@ function createFixture({
     'atomic-status', 'atomic-cd-label', 'boss-ui', 'boss-hp-fill', 'boss-hp-damage', 'boss-title',
     'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
-    'debug-close-btn', 'debug-summary', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
+    'debug-close-btn', 'debug-summary', 'debug-runtime-details', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
     'set-quality', 'set-render-distance', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
@@ -95,6 +96,7 @@ function createFixture({
   };
   const playerMarker = { position: { y: 0 } };
   const worldState = {
+    revision: 0,
     activeScaleStageId: 'MAX',
     developerTools: false,
     experience: {
@@ -107,6 +109,7 @@ function createFixture({
     setScaleStage(stageId) { this.activeScaleStageId = stageId; },
     setDeveloperTools(enabled) { this.developerTools = enabled; },
     updateExperience(patch) {
+      this.revision += 1;
       this.experience = {
         ...this.experience,
         ...patch,
@@ -706,6 +709,104 @@ test('debug stays transient while HUD visibility and settings use the existing W
   assert.equal(fixture.calls.returnTitles, 1);
   assert.equal(fixture.calls.homeResets, 0);
   assert.equal(fixture.shell.snapshot().mode, 'menu');
+  fixture.shell.dispose();
+});
+
+test('Debug UI opens repeatedly without duplicate listeners and renders current bounded diagnostics', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  finishIntro(fixture);
+  const mouseUpListeners = fixture.globalObject.listenerCount('mouseup');
+  const keyDownListeners = fixture.globalObject.listenerCount('keydown');
+  const revisionBeforeDebug = fixture.worldState.revision;
+
+  for (let index = 0; index < 5; index += 1) {
+    fixture.shell.openDebug();
+    assert.equal(fixture.elements.get('debug-modal').style.display, 'flex');
+    assert.equal(fixture.shell.isPaused(), true);
+    fixture.elements.get('debug-close-btn').dispatch('click');
+    assert.equal(fixture.elements.get('debug-modal').style.display, 'none');
+  }
+  assert.equal(fixture.globalObject.listenerCount('mouseup'), mouseUpListeners);
+  assert.equal(fixture.globalObject.listenerCount('keydown'), keyDownListeners);
+  assert.equal(fixture.worldState.revision, revisionBeforeDebug);
+
+  const distanceBeforePause = fixture.shell.snapshot().camera.distanceMeters;
+  fixture.shell.openDebug();
+  fixture.globalObject.dispatch('wheel', { deltaY: 100 });
+  assert.equal(fixture.shell.snapshot().camera.distanceMeters, distanceBeforePause);
+  const longDiagnostic = `Stable ID ${'diagnostic-without-breaks-'.repeat(100)}`;
+  const gameplaySnapshot = {
+    state: {
+      player: { hp: 64, maxHp: 100, score: 42 }, activeScaleStageId: 'MAX',
+      nuclearCooldownMs: 0, manualBoss: null,
+      destroyedFeatureCount: 2, destroyedEntityCount: 3,
+    },
+    activeTankCount: 1, activeSimulationChunkCount: 9,
+    simulatedEntityCount: 4, simulatedStaticTargetCount: 5,
+  };
+  fixture.shell.renderHud({
+    fps: 59.6,
+    gameplaySnapshot,
+    runtimeSnapshot: {
+      centerChunkX: 12, centerChunkZ: -8, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 6, p95: 10, max: 15 } },
+    },
+    presentationSnapshot: {
+      midgroundChunkCount: 16, clipmapMeshCount: 1, renderDistancePreset: 'standard',
+    },
+    workerSnapshot: {
+      mode: 'worker', pendingCount: 2, fallbackOccurred: false,
+    },
+    saveStatus: 'saved',
+    renderInfo: { drawCalls: 7, geometries: 8 },
+    resources: { sharedMaterialCount: 9 },
+    fullDiagnosticHtml: longDiagnostic,
+    debugDetailsEnabled: true,
+  });
+  const summary = fixture.elements.get('debug-summary').textContent;
+  assert.match(summary, /FPS 60/);
+  assert.match(summary, /Chunk 12,-8/);
+  assert.match(summary, /Worker worker  Pending 2  Fallback no/);
+  assert.match(summary, /Save saved/);
+  assert.match(summary, /Render Distance standard/);
+  assert.equal(fixture.elements.get('debug-runtime-details').innerHTML, longDiagnostic);
+
+  fixture.shell.renderHud({
+    fps: 30,
+    gameplaySnapshot,
+    runtimeSnapshot: {
+      centerChunkX: -2, centerChunkZ: 4, renderedCount: 9, activeDataCount: 25,
+      performance: { frame: { p50: 20, p95: 30, max: 40 } },
+    },
+    presentationSnapshot: {
+      midgroundChunkCount: 16, clipmapMeshCount: 1, renderDistancePreset: 'short',
+    },
+    workerSnapshot: {
+      mode: 'inline-fallback', pendingCount: 0, fallbackOccurred: true,
+    },
+    saveStatus: 'fallback',
+    renderInfo: { drawCalls: 3, geometries: 4 },
+    resources: { sharedMaterialCount: 5 },
+    fullDiagnosticHtml: 'latest diagnostics',
+    debugDetailsEnabled: true,
+  });
+  assert.match(fixture.elements.get('debug-summary').textContent, /FPS 30/);
+  assert.match(fixture.elements.get('debug-summary').textContent, /Chunk -2,4/);
+  assert.match(fixture.elements.get('debug-summary').textContent, /Worker inline-fallback/);
+  assert.match(fixture.elements.get('debug-summary').textContent, /Save fallback/);
+  assert.match(fixture.elements.get('debug-summary').textContent, /Render Distance short/);
+  assert.equal(fixture.elements.get('debug-runtime-details').innerHTML, 'latest diagnostics');
+
+  fixture.shell.renderHud({
+    fps: 60, gameplaySnapshot, saveStatus: 'saved', debugDetailsEnabled: false,
+  });
+  assert.equal(fixture.elements.get('debug-summary').textContent, 'Runtime diagnostics unavailable');
+  assert.equal(fixture.elements.get('debug-runtime-details').innerHTML, '');
+
+  fixture.elements.get('debug-close-btn').dispatch('click');
+  fixture.globalObject.dispatch('wheel', { deltaY: 100 });
+  assert.notEqual(fixture.shell.snapshot().camera.distanceMeters, distanceBeforePause);
   fixture.shell.dispose();
 });
 

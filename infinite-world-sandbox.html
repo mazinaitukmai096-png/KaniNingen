@@ -5,7 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>&#12459;&#12491;&#20154;&#38291;&#65306;INFINITE CARNAGE</title>
   <style>
-    :root { color-scheme: dark; font-family: "Arial Black", Impact, sans-serif; }
+    :root {
+      color-scheme: dark; font-family: "Arial Black", Impact, sans-serif;
+      --panel-overlay-color: #080a0ddd;
+      --panel-surface-color: #16181a;
+      --panel-border-color: #ff465566;
+      --panel-text-color: #ece8e1;
+      --panel-heading-color: #ff4655;
+      --panel-focus-color: #ffb020;
+      --panel-divider-color: #ffffff18;
+      --panel-radius: 8px;
+      --panel-padding: 26px;
+    }
     * { box-sizing: border-box; }
     html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #5dade2; }
     #viewport { position: fixed; inset: 0; }
@@ -17,7 +28,6 @@
       background: rgba(11,20,25,.88); border: 1px solid rgba(198,231,167,.4); border-radius: 8px;
     }
     body.experience-ready #hud { display: none; }
-    body.experience-ready.debug-open #hud { display: block; top: 70px; left:auto; right:14px; max-height: calc(100vh - 90px); overflow: auto; }
     #badge { color: #bfe58f; font-weight: 700; } #error { color: #ffad9f; }
     #save-warning {
       position: fixed; top: 18px; left: 50%; z-index: 2100; display: none;
@@ -34,10 +44,14 @@
     #start-screen h1 small { display:block; margin-top:14px; color:#ffb020; font:700 clamp(14px,1.5vw,24px) Consolas,monospace; letter-spacing:.24em; }
     .menu-buttons { display: grid; gap: 14px; }
     .menu-btn, .panel-btn {
-      min-width: 300px; padding: 15px 22px; color: #f3ede2; background: transparent;
+      min-width: 300px; padding: 15px 22px; color: var(--panel-text-color); background: transparent;
       border: 2px solid #f3ede266; text-align: left; letter-spacing: .08em; cursor: pointer;
     }
-    .menu-btn:hover, .panel-btn:hover { color: #ffb020; border-color: #ffb020; transform: translateX(6px); }
+    .menu-btn:hover, .panel-btn:hover { color: var(--panel-focus-color); border-color: var(--panel-focus-color); transform: translateX(6px); }
+    .menu-btn:focus-visible, .panel-btn:focus-visible, .panel summary:focus-visible,
+    .panel input:focus-visible, .panel select:focus-visible {
+      outline: 3px solid var(--panel-focus-color); outline-offset: 3px;
+    }
     .menu-btn:disabled, .panel-btn:disabled { opacity: .38; cursor: not-allowed; transform: none; }
     #start-button { background: #ff3b1f; border-color: #ff3b1f; }
     #ui { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); color: #fff; pointer-events: none; user-select: none; z-index: 100; display: none; font-family: 'Arial Black', sans-serif; text-align: center; }
@@ -69,13 +83,22 @@
     #news-ticker { position: fixed; top: 0; left: 0; right: 0; height: 32px; z-index: 1800; display: none; overflow: hidden; color: white; background: #c00; line-height: 32px; }
     #news-ticker-text { white-space: nowrap; padding-left: 100%; animation: ticker 25s linear infinite; } @keyframes ticker { to { transform: translateX(-140%); } }
     #nuclear-flash { position:fixed; inset:0; z-index:1900; pointer-events:none; opacity:0; background:#fff; transition:opacity .15s ease-out; }
-    .overlay { position: fixed; inset: 0; z-index: 3000; display: none; align-items: center; justify-content: center; background: #080a0ddd; backdrop-filter: blur(7px); }
-    .panel { width: min(680px, 92vw); max-height: 90vh; overflow: auto; padding: 26px; color: #ece8e1; background: #16181a; border: 1px solid #ff465566; }
-    .panel h2 { margin-top: 0; color: #ff4655; letter-spacing: .08em; }
-    .setting-row, .debug-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 58px; border-bottom: 1px solid #ffffff18; }
+    .overlay { position: fixed; inset: 0; z-index: 3000; display: none; align-items: center; justify-content: center; padding: 14px; background: var(--panel-overlay-color); backdrop-filter: blur(7px); }
+    .panel {
+      width: min(680px, 100%); max-height: min(90vh, calc(100dvh - 28px)); overflow: auto;
+      padding: var(--panel-padding); color: var(--panel-text-color); background: var(--panel-surface-color);
+      border: 1px solid var(--panel-border-color); border-radius: var(--panel-radius);
+      scrollbar-color: var(--panel-border-color) var(--panel-surface-color); scrollbar-width: thin;
+    }
+    .panel::-webkit-scrollbar { width: 10px; }
+    .panel::-webkit-scrollbar-track { background: var(--panel-surface-color); }
+    .panel::-webkit-scrollbar-thumb { background: var(--panel-border-color); border: 2px solid var(--panel-surface-color); border-radius: var(--panel-radius); }
+    .panel h2 { margin-top: 0; color: var(--panel-heading-color); letter-spacing: .08em; }
+    .setting-row, .debug-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; min-height: 58px; border-bottom: 1px solid var(--panel-divider-color); }
     .setting-row input[type=range], .setting-row select { width: 260px; }
     .panel-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 24px; }
     .panel-btn { min-width: 150px; }
+    .debug-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
     .tree-lod-overlay-controls { display: flex; gap: 8px; }
     .tree-lod-overlay-controls .panel-btn { min-width: 72px; }
     .tree-lod-overlay-controls .panel-btn.debug-on { color: #ffdc4a; border-color: #ffdc4a; }
@@ -83,12 +106,22 @@
     #game-over { flex-direction:column; color:#fff; text-align:center; background:rgba(10,0,0,.92); backdrop-filter:none; }
     #game-over h1 { margin-bottom:10px; color:#ff3300; font-size:60px; text-shadow:3px 3px 0 #000; }
     #restart-button { margin-top:25px; min-width:0; padding:16px 36px; color:#fff; background:#ff4500; border:4px solid #fff; border-radius:15px; font-size:26px; text-align:center; }
-    #debug-modal { z-index:4500; align-items: flex-start; justify-content: flex-start; padding: 14px; background: #12000de8; }
-    #debug-modal .panel { width: min(720px, 94vw); border-color:#ff3fa477; }
-    .debug-stats { color:#7dffb2; font: 12px/1.5 Consolas,monospace; white-space:pre-wrap; }
+    .debug-stats { max-width: 100%; color: var(--panel-text-color); font: 12px/1.5 Consolas,monospace; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+    .debug-details { margin-top: 18px; border-top: 1px solid var(--panel-divider-color); padding-top: 14px; }
+    .debug-details summary { color: var(--panel-heading-color); cursor: pointer; letter-spacing: .06em; }
+    .debug-runtime-details { margin: 12px 0 0; max-height: 42vh; overflow: auto; }
     .inactive { color:#888 !important; }
     [data-scale-stage].debug-on { color:#1a0010; background:#ff3fa4; border-color:#ff3fa4; }
     body.hud-hidden #ui, body.hud-hidden #compass, body.hud-hidden #crosshair, body.hud-hidden #boss-ui, body.hud-hidden #charge-ui, body.hud-hidden #news-ticker { visibility: hidden !important; }
+    @media (max-width: 600px), (max-height: 520px) {
+      :root { --panel-padding: 16px; }
+      .overlay { align-items: stretch; padding: 8px; }
+      .panel { width: 100%; max-height: calc(100dvh - 16px); }
+      .setting-row, .debug-row { align-items: stretch; flex-direction: column; gap: 8px; padding: 12px 0; }
+      .setting-row input[type=range], .setting-row select, .debug-actions { width: 100%; }
+      .debug-actions { justify-content: flex-start; }
+      .panel-btn { min-width: 0; }
+    }
   </style>
 </head>
 <body>
@@ -105,7 +138,7 @@
   <div id="save-warning" role="alert" aria-live="assertive"></div>
   <div id="resume-overlay" class="overlay"><div>&#9654; &#30011;&#38754;&#12434;&#12463;&#12522;&#12483;&#12463;&#12375;&#12390;&#12466;&#12540;&#12512;&#12395;&#25147;&#12427;</div></div>
   <div id="settings-modal" class="overlay"><div class="panel"><h2>&#35373;&#23450;</h2><div class="setting-row"><label>&#12510;&#12454;&#12473;&#24863;&#24230; <span id="val-mouse">1.0</span></label><input id="set-mouse" type="range" min="0.1" max="3" step="0.1" value="1"></div><div class="setting-row"><label>&#12510;&#12473;&#12479;&#12540;&#38899;&#37327; <span id="val-vol">50%</span></label><input id="set-vol" type="range" min="0" max="1" step="0.05" value="0.5"></div><div class="setting-row"><label>&#12464;&#12521;&#12501;&#12451;&#12483;&#12463;&#21697;&#36074;</label><select id="set-quality"><option value="high">&#39640;&#21697;&#36074;</option><option value="medium">&#27161;&#28310;</option><option value="low">&#20302;&#21697;&#36074;</option></select></div><div class="setting-row"><label>&#25551;&#30011;&#36317;&#38626;</label><select id="set-render-distance"><option value="short">Short</option><option value="standard">Standard</option><option value="current" selected>Current</option></select></div><div class="setting-row"><label>&#12450;&#12531;&#12481;&#12456;&#12452;&#12522;&#12450;&#12473; <span id="antialias-note" style="display:none">&#8251;&#12506;&#12540;&#12472;&#12434;&#20877;&#35501;&#12415;&#36796;&#12415;&#12377;&#12427;&#12392;&#21453;&#26144;&#12373;&#12428;&#12414;&#12377;</span></label><input id="set-antialias" type="checkbox" checked></div><div class="setting-row"><label>FPS&#34920;&#31034;</label><input id="set-fps-counter" type="checkbox"></div><div class="setting-row"><label>FPS&#19978;&#38480;</label><select id="set-fps-cap"><option value="0">&#28961;&#21046;&#38480;</option><option value="30">30 FPS</option><option value="60">60 FPS</option><option value="120">120 FPS</option></select></div><div class="setting-row"><label>Camera Shake <span id="val-shake">1.0</span></label><input id="set-shake" type="range" min="0" max="2" step="0.1" value="1"></div><div class="setting-row"><label>Developer Tools</label><input id="set-developer-tools" type="checkbox"></div><div class="panel-actions"><button id="set-home-btn" class="panel-btn">&#12479;&#12452;&#12488;&#12523;&#12408;</button><button id="set-reset-btn" class="panel-btn">&#12507;&#12540;&#12512;&#20301;&#32622;&#12408;</button><button id="settings-close-btn" class="panel-btn">&#38281;&#12376;&#12427;</button></div></div></div>
-  <div id="debug-modal" class="overlay"><div class="panel"><h2>DEVELOPER TOOLS</h2><div id="developer-tools-section"><div id="debug-summary" class="debug-stats">Runtime loading...</div><div class="debug-row"><span>Tree LOD Overlay</span><span class="tree-lod-overlay-controls"><button id="debug-tree-lod-overlay-off-btn" class="panel-btn debug-on" type="button" disabled>OFF</button><button id="debug-tree-lod-overlay-on-btn" class="panel-btn" type="button" disabled>ON</button></span></div><div class="debug-row"><span>Scale Stage</span><span><button class="panel-btn" data-scale-stage="TINY">Tiny</button><button class="panel-btn" data-scale-stage="MID">Mid</button><button class="panel-btn" data-scale-stage="MAX">Max</button></span></div><div class="debug-row"><span>Manual Boss</span><button id="debug-spawn-boss-btn" class="panel-btn" disabled>INITIALIZING</button></div></div><button id="debug-close-btn" class="panel-btn">&#38281;&#12376;&#12427; (Tab)</button></div></div>
+  <div id="debug-modal" class="overlay"><div class="panel"><h2>DEVELOPER TOOLS</h2><div id="developer-tools-section"><div id="debug-summary" class="debug-stats">Runtime loading...</div><div class="debug-row"><span>Tree LOD Overlay</span><span class="tree-lod-overlay-controls"><button id="debug-tree-lod-overlay-off-btn" class="panel-btn debug-on" type="button" disabled>OFF</button><button id="debug-tree-lod-overlay-on-btn" class="panel-btn" type="button" disabled>ON</button></span></div><div class="debug-row"><span>Scale Stage</span><span class="debug-actions"><button class="panel-btn" data-scale-stage="TINY">Tiny</button><button class="panel-btn" data-scale-stage="MID">Mid</button><button class="panel-btn" data-scale-stage="MAX">Max</button></span></div><div class="debug-row"><span>Manual Boss</span><button id="debug-spawn-boss-btn" class="panel-btn" disabled>INITIALIZING</button></div><details class="debug-details"><summary>FULL RUNTIME DIAGNOSTICS</summary><pre id="debug-runtime-details" class="debug-stats debug-runtime-details">Runtime loading...</pre></details></div><div class="panel-actions"><button id="debug-close-btn" class="panel-btn">&#38281;&#12376;&#12427; (Tab)</button></div></div></div>
   <div id="game-over" class="overlay"><h1>CRUSHED...</h1><p>&#26368;&#32066;&#12473;&#12467;&#12450;: <span id="final-score">$0</span></p><button id="restart-button" class="menu-btn">RETRY</button></div>
   <div id="hud"><span id="badge">W8 / FINITE EXPERIENCE PARITY</span>
 &#36215;&#21205;&#20013;: DOMContentLoaded</div>

@@ -107,6 +107,7 @@ export function createInfiniteExperienceShell({
     news: byId('news-ticker'), settings: byId('settings-modal'), settingsClose: byId('settings-close-btn'),
     home: byId('set-home-btn'), reset: byId('set-reset-btn'), resume: byId('resume-overlay'),
     debug: byId('debug-modal'), debugClose: byId('debug-close-btn'), debugSummary: byId('debug-summary'),
+    debugRuntimeDetails: byId('debug-runtime-details'),
     treeLodOverlayOff: byId('debug-tree-lod-overlay-off-btn'),
     treeLodOverlayOn: byId('debug-tree-lod-overlay-on-btn'),
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
@@ -267,6 +268,15 @@ export function createInfiniteExperienceShell({
     state.paused = false; state.settingsOpen = false; state.debugOpen = false;
     syncShellVisibility(); requestLock();
   }
+  function pauseForModal({ settingsOpen, debugOpen }) {
+    state.paused = state.mode === 'playing';
+    state.settingsOpen = settingsOpen;
+    state.debugOpen = debugOpen;
+    resetAttackInputState();
+    state.camera.shake = 0;
+    leaveLock();
+    syncShellVisibility();
+  }
   function resetFiniteGameplayStartCamera({ cameraYaw } = {}) {
     const profile = state.lastScaleProfile ?? initialScaleProfile;
     if (Number.isFinite(cameraYaw)) state.camera.yaw = cameraYaw;
@@ -310,16 +320,11 @@ export function createInfiniteExperienceShell({
     return enterRun(startMode, result && typeof result === 'object' ? result : {});
   }
   function openSettings() {
-    state.paused = state.mode === 'playing'; state.settingsOpen = true; state.debugOpen = false;
-    resetAttackInputState();
-    state.camera.shake = 0;
-    leaveLock(); syncShellVisibility();
+    pauseForModal({ settingsOpen: true, debugOpen: false });
   }
   function openDebug() {
     if (state.mode !== 'playing') return;
-    state.paused = true; state.debugOpen = true; state.settingsOpen = false;
-    resetAttackInputState();
-    leaveLock(); syncShellVisibility();
+    pauseForModal({ settingsOpen: false, debugOpen: true });
   }
   function closeDebug() {
     state.debugOpen = false;
@@ -465,7 +470,7 @@ export function createInfiniteExperienceShell({
       );
     },
     onWheel(event) {
-      if (state.runPhase === 'intro') return;
+      if (state.runPhase !== 'playing' || state.paused) return;
       const profile = state.lastScaleProfile ?? initialScaleProfile;
       state.camera.distanceMeters = clamp(
         state.camera.distanceMeters
@@ -712,7 +717,8 @@ export function createInfiniteExperienceShell({
 
   function renderHud({
     fps, gameplaySnapshot, runtimeSnapshot = null, presentationSnapshot = null,
-    saveStatus, renderInfo, resources, debugDetailsEnabled = false,
+    saveStatus, renderInfo, resources, workerSnapshot = null,
+    fullDiagnosticHtml = '', debugDetailsEnabled = false,
   }) {
     const savedExperience = gameplaySnapshot.state.experience;
     if (savedExperience) {
@@ -800,13 +806,19 @@ export function createInfiniteExperienceShell({
       if (elements.finalScore) elements.finalScore.textContent = money(player.score);
       syncShellVisibility();
     }
-    if (!debugDetailsEnabled || runtimeSnapshot === null) return;
+    if (!debugDetailsEnabled || runtimeSnapshot === null) {
+      if (elements.debugSummary) elements.debugSummary.textContent = 'Runtime diagnostics unavailable';
+      if (elements.debugRuntimeDetails) elements.debugRuntimeDetails.innerHTML = '';
+      return;
+    }
     const debugSummary = [
+      `FPS ${Math.round(fps)}  Frame p50/p95/max ${runtimeSnapshot.performance.frame.p50.toFixed(2)} / ${runtimeSnapshot.performance.frame.p95.toFixed(2)} / ${runtimeSnapshot.performance.frame.max.toFixed(2)} ms`,
       `Chunk ${runtimeSnapshot.centerChunkX},${runtimeSnapshot.centerChunkZ}  Rendered ${runtimeSnapshot.renderedCount}/9  Data ${runtimeSnapshot.activeDataCount}/25`,
       `Midground ${presentationSnapshot?.midgroundChunkCount ?? 0}/16  Clipmap ${presentationSnapshot?.clipmapMeshCount ?? 0}/1`,
       `Simulation ${gameplaySnapshot.activeSimulationChunkCount}/9  Entities ${gameplaySnapshot.simulatedEntityCount}  Targets ${gameplaySnapshot.simulatedStaticTargetCount}`,
       `Stable destruction ${gameplaySnapshot.state.destroyedFeatureCount + gameplaySnapshot.state.destroyedEntityCount}  Save ${saveStatus}`,
-      `Frame p50/p95/max ${runtimeSnapshot.performance.frame.p50.toFixed(2)} / ${runtimeSnapshot.performance.frame.p95.toFixed(2)} / ${runtimeSnapshot.performance.frame.max.toFixed(2)} ms`,
+      `Worker ${workerSnapshot?.mode ?? workerSnapshot?.kind ?? 'unknown'}  Pending ${workerSnapshot?.pendingCount ?? 0}  Fallback ${workerSnapshot?.fallbackOccurred ? 'yes' : 'no'}`,
+      `Render Distance ${presentationSnapshot?.renderDistancePreset ?? state.settings.renderDistance ?? 'current'}`,
       `Draw ${renderInfo?.drawCalls ?? 'n/a'}  Geometry ${renderInfo?.geometries ?? 'n/a'}  Material ${resources.sharedMaterialCount}`,
     ];
     if (treeLodOverlayAvailable() && state.treeLodOverlayEnabled) {
@@ -817,6 +829,7 @@ export function createInfiniteExperienceShell({
       );
     }
     if (elements.debugSummary) elements.debugSummary.textContent = debugSummary.join('\n');
+    if (elements.debugRuntimeDetails) elements.debugRuntimeDetails.innerHTML = fullDiagnosticHtml;
   }
 
   syncSettingsControls();
