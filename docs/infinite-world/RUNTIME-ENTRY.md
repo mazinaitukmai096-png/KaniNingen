@@ -3,7 +3,7 @@
 The official KaniNingen full-experience runtime is `infinite-world-sandbox.html`.
 W8 wraps deterministic W5 terrain and Settlement distribution with the fixed
 finite-World presentation, controls, combat, Boss, effects, procedural audio,
-and schema-v4 save migration. The W5 source ChunkData and content hash remain intact.
+and schema-v5 save migration. The W5 source ChunkData and content hash remain intact.
 
 The finite World remains byte-for-byte protected at `index.html` and continues to
 serve as the regression entry pinned to commit
@@ -18,6 +18,7 @@ Atomic. H hides the HUD and Escape opens settings.
 are accepted only while Developer Tools is enabled in settings. Developer Tools is
 off by default.
 
-W8 saves use schema version 4. Previous W8 schema version 3 and historical W7
-schema version 2 remain readable, with read compatibility with W6 saves. Validation and
+W8 saves use the current formal schema version 5. Previous formats—W8 schema
+version 4, W8 schema version 3, and historical W7 and W6 saves—remain readable
+through the existing migration path and are read into schema version 5. Validation and
 migration complete in a temporary candidate before the existing live World State is changed.
