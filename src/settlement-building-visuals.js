@@ -78,15 +78,21 @@ function requireSettlementType(settlementType) {
 }
 
 export function selectSettlementBuildingType({ settlementType, townId, buildingIndex }) {
+  return createSettlementBuildingTypeSelector({ settlementType, townId })(buildingIndex);
+}
+
+export function createSettlementBuildingTypeSelector({ settlementType, townId }) {
   requireSettlementType(settlementType);
-  if (!Number.isInteger(buildingIndex) || buildingIndex < 1) {
-    throw new RangeError('buildingIndex must be a positive integer');
-  }
   const composition = SETTLEMENT_BUILDING_COMPOSITIONS[settlementType];
   const counts = Object.fromEntries(SETTLEMENT_BUILDING_TYPES.map(type => [type, 0]));
-  let selectedType = SETTLEMENT_BUILDING_TYPES[0];
-
-  for (let sequenceIndex = 1; sequenceIndex <= buildingIndex; sequenceIndex++) {
+  const sequence = [];
+  return buildingIndex => {
+    if (!Number.isInteger(buildingIndex) || buildingIndex < 1) {
+      throw new RangeError('buildingIndex must be a positive integer');
+    }
+    while (sequence.length < buildingIndex) {
+      const sequenceIndex = sequence.length + 1;
+      let selectedType = SETTLEMENT_BUILDING_TYPES[0];
     let selectedScore = -Infinity;
     let selectedTie = -Infinity;
     for (const type of SETTLEMENT_BUILDING_TYPES) {
@@ -99,8 +105,10 @@ export function selectSettlementBuildingType({ settlementType, townId, buildingI
       }
     }
     counts[selectedType]++;
-  }
-  return selectedType;
+      sequence.push(selectedType);
+    }
+    return sequence[buildingIndex - 1];
+  };
 }
 
 export function getTownPaletteTendency({ settlementType, townId, townType }) {
@@ -164,12 +172,14 @@ export function createSettlementBuildingVisual({
   buildingIndex,
   routeId,
   records = [],
+  townPaletteTendency = null,
 }) {
   requireSettlementType(settlementType);
   if (!SETTLEMENT_BUILDING_TYPES.includes(type)) throw new RangeError(`unsupported building type: ${type}`);
   const variants = BUILDING_HEIGHT_VARIANTS[type];
   const palette = SETTLEMENT_BUILDING_PALETTES[settlementType];
-  const tendency = getTownPaletteTendency({ settlementType, townId, townType });
+  const tendency = townPaletteTendency
+    ?? getTownPaletteTendency({ settlementType, townId, townType });
   const identity = [townId, townType, settlementType, type, buildingIndex, routeId];
   let heightVariantIndex = stableHash([...identity, 'height']) % variants.length;
   let roofPaletteIndex = selectPaletteIndex({

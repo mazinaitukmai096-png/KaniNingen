@@ -4,6 +4,8 @@ import assert from 'node:assert/strict';
 import { ChunkRenderAdapter } from '../src/infinite-world/render/chunk-render-adapter.js';
 import { resolveW8RockCanonicalObject } from '../src/infinite-world/rock-canonical-object.js';
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
+import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
+import { hashWorldSeed } from '../src/infinite-world/legacy-core/g0/seed.js';
 
 class Triple {
   constructor() { this.set(0, 0, 0); }
@@ -143,6 +145,44 @@ test('render adapter applies Stable-ID destruction without allocating or leaking
   assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.resourceSnapshot().trackedFeatureInstanceCount, 0);
+  await adapter.shutdown();
+});
+
+test('Near projection renders every canonical River centerline segment with its owner Stable ID', async () => {
+  const { worldSeedHash } = await hashWorldSeed('Near canonical River projection');
+  const projection = await createCanonicalRiverProjection({
+    worldSeedHash,
+    chunkX: 0,
+    chunkZ: 0,
+    sampleSurfaceHeight: () => 0.25,
+  });
+  const river = projection.waterSurface;
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'canonical-river-near-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], ambientDetails: [],
+    settlementFeatures: [], settlementLandmarks: [], streetDetails: [],
+    waterSurfaces: [river],
+  };
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const projected = await adapter.projectChunk(chunk);
+  const riverMesh = projected.group.children.find(child => (
+    child.name === 'w8-canonical-river-water'
+  ));
+  const expectedSegmentCount = river.centerlines.reduce((total, line) => (
+    total + line.length - 1
+  ), 0);
+  assert.ok(riverMesh);
+  assert.equal(riverMesh.count, expectedSegmentCount);
+  assert.equal(riverMesh.userData.waterType, 'river');
+  assert.deepEqual(riverMesh.userData.featureStableIds,
+    Array(expectedSegmentCount).fill(river.stableId));
+  assert.ok(riverMesh.matrices.every(matrix => matrix.scale.x > 0 && matrix.scale.y > 0));
+  assert.ok(riverMesh.matrices.every(matrix => matrix.position.y === 0.25 * 256 + 1.5));
   await adapter.shutdown();
 });
 
@@ -352,5 +392,44 @@ test('Settlement projection preserves finite layer order and renders junction, e
   const lotMesh = projected.group.children[lotIndex];
   assert.deepEqual(lotMesh.userData.surfaceKinds.sort(), ['entrance-path', 'forecourt']);
   assert.equal(lotMesh.count, 2);
+  await adapter.shutdown();
+});
+
+test('canonical MAJOR projection seams do not become artificial road junctions', async () => {
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const segment = (stableId, sourceSegmentStableId, startX, endX) => ({
+    stableId,
+    sourceStableId: 'major-road-v1:seam-test',
+    sourceSegmentStableId,
+    featureType: 'settlement-road',
+    canonicalMajorRoad: true,
+    roadKind: 'MAJOR',
+    widthMeters: 2.25,
+    start: { x: startX, y: 0, z: 8 },
+    end: { x: endX, y: 0, z: 8 },
+    worldPosition: { x: (startX + endX) / 2, y: 0, z: 8 },
+  });
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'major-road-seam-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementLandmarks: [], streetDetails: [],
+    settlementFeatures: [
+      segment('major-segment-a', 'source-segment-a', 2, 6),
+      segment('major-segment-b', 'source-segment-b', 6, 10),
+    ],
+  };
+  const projected = await adapter.projectChunk(chunk);
+  const roadMesh = projected.group.children.find(child => (
+    child.name === 'infinite-settlement-roads'
+  ));
+  assert.equal(roadMesh.count, 2);
+  assert.equal(projected.group.children.some(child => (
+    child.name === 'infinite-settlement-junctions'
+  )), false);
   await adapter.shutdown();
 });

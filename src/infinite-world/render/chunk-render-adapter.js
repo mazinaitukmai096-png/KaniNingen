@@ -16,6 +16,11 @@ import {
 } from './w8-distant-presentation.js';
 import { resolveW8RockCanonicalObject } from '../rock-canonical-object.js';
 import { resolveW8CanonicalWorldObject } from '../world-object-canonical-contract.js';
+import {
+  resolveCanonicalGroundSurface,
+  resolveCanonicalSurfaceColorRgb,
+  sampleW8SurfaceHeightMeters,
+} from '../w8-surface-policy.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
@@ -84,7 +89,7 @@ export class ChunkRenderAdapter {
       terrain: new PlaneGeometry(renderChunkSize, renderChunkSize),
     });
     this.materials = Object.freeze({
-      terrain: new TerrainMaterial({ color: 0x668c54, flatShading: true, shininess: 0 }),
+      terrain: new TerrainMaterial({ color: 0xffffff, vertexColors: true, flatShading: true, shininess: 0 }),
       naturalTerrain: new TerrainMaterial({ vertexColors: true, flatShading: true, shininess: 0 }),
     });
     const hiddenTransform = new Object3D();
@@ -336,9 +341,10 @@ export class ChunkRenderAdapter {
     projected.group.position.set(position.x, 0, position.z);
   }
 
-  #createNaturalTerrainGeometry(terrain) {
+  #createNaturalTerrainGeometry(chunkData) {
     const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
     const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
+    const terrain = chunkData.terrain;
     const width = terrain.resolution.x;
     const depth = terrain.resolution.z;
     const positions = [];
@@ -347,13 +353,19 @@ export class ChunkRenderAdapter {
     for (let z = 0; z < depth; z += 1) {
       for (let x = 0; x < width; x += 1) {
         const index = z * width + x;
-        positions.push(
-          x / (width - 1) * this.renderChunkSize,
-          terrain.heights[index] * terrain.heightUnitMeters * this.unitsPerMeter,
-          z / (depth - 1) * this.renderChunkSize,
-        );
+        const worldX = chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS
+          + x / (width - 1) * LOGICAL_CHUNK_SIZE_METERS;
+        const worldZ = chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+          + z / (depth - 1) * LOGICAL_CHUNK_SIZE_METERS;
+        const surface = resolveCanonicalGroundSurface({ chunkData, worldX, worldZ });
+        positions.push(x / (width - 1) * this.renderChunkSize,
+          surface.heightMeters * this.unitsPerMeter,
+          z / (depth - 1) * this.renderChunkSize);
         const weights = terrain.materialWeights.slice(index * 5, index * 5 + 5);
-        colors.push(...w8TerrainColorFromWeights(weights));
+        const naturalColor = w8TerrainColorFromWeights(weights);
+        colors.push(...resolveCanonicalSurfaceColorRgb({
+          naturalColor, surface, worldX, worldZ,
+        }));
       }
     }
     for (let z = 0; z < depth - 1; z += 1) {
@@ -503,7 +515,7 @@ export class ChunkRenderAdapter {
 
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
     const terrainGeometry = naturalTerrain
-      ? this.#createNaturalTerrainGeometry(chunkData.terrain)
+      ? this.#createNaturalTerrainGeometry(chunkData)
       : this.geometries.terrain;
     const terrain = new Mesh(
       terrainGeometry,
@@ -557,7 +569,11 @@ export class ChunkRenderAdapter {
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
       const groundY = formal
-        ? (canonical?.position.y ?? candidate.worldPosition.y) * this.unitsPerMeter : 0;
+        ? sampleW8SurfaceHeightMeters(
+          chunkData,
+          canonical?.position.x ?? candidate.worldPosition.x,
+          canonical?.position.z ?? candidate.worldPosition.z,
+        ) * this.unitsPerMeter : 0;
       const visual = canonical ? null : resolveW8NaturalCandidateVisual(candidate);
       const dimensions = canonical?.visualBounds ?? {
         width: visual.widthMeters, height: visual.heightMeters, depth: visual.depthMeters,
@@ -606,7 +622,11 @@ export class ChunkRenderAdapter {
         ? (rock?.position.z ?? candidate.worldPosition.z)
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
-      const groundY = formal ? (rock?.position.y ?? candidate.worldPosition.y) * this.unitsPerMeter : 0;
+      const groundY = formal ? sampleW8SurfaceHeightMeters(
+        chunkData,
+        rock?.position.x ?? candidate.worldPosition.x,
+        rock?.position.z ?? candidate.worldPosition.z,
+      ) * this.unitsPerMeter : 0;
       const rockDimensions = rock ? {
         width: rock.widthMeters, height: rock.heightMeters, depth: rock.depthMeters,
       } : {
@@ -676,6 +696,9 @@ export class ChunkRenderAdapter {
 
       const junctions = new Map();
       for (const road of roads) {
+        // Canonical MAJOR routes are split into short, Chunk-owned projection
+        // segments. Their internal joins are continuity seams, not junctions.
+        if (road.canonicalMajorRoad === true) continue;
         for (const point of [road.start, road.end]) {
           const junctionKey = `${Math.round(point.x * 100)},${Math.round(point.z * 100)}`;
           const entry = junctions.get(junctionKey) ?? {
@@ -844,33 +867,70 @@ export class ChunkRenderAdapter {
 
     if (waterSurfaces.length) {
       const resources = this.#ensureSettlementResources();
-      const waterMesh = new InstancedMesh(
-        resources.geometries.road,
-        this.visualAssets.materials.water ?? this.visualAssets.materials.window,
-        waterSurfaces.length,
-      );
-      waterMesh.name = 'w8-continuous-wetland-water';
-      waterMesh.visible = this.transparencyEnabled;
-      this.#registry().transparentMeshes.add(waterMesh);
-      waterMesh.count = waterSurfaces.length;
-      waterMesh.receiveShadow = true;
-      waterSurfaces.forEach((surface, index) => {
-        transform.position.set(
-          (surface.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
-          surface.worldPosition.y * this.unitsPerMeter + 1.5,
-          (surface.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+      const wetlandInstances = waterSurfaces.filter(surface => surface.waterType !== 'river')
+        .map(surface => ({
+          stableId: surface.stableId,
+          x: surface.worldPosition.x,
+          y: surface.worldPosition.y,
+          z: surface.worldPosition.z,
+          rotation: 0,
+          width: surface.widthMeters,
+          depth: surface.depthMeters,
+        }));
+      const riverInstances = waterSurfaces.filter(surface => surface.waterType === 'river')
+        .flatMap(surface => (surface.centerlines ?? []).flatMap(line => line.slice(1).map(
+          (end, index) => {
+            const start = line[index];
+            const dx = end.x - start.x;
+            const dz = end.z - start.z;
+            return {
+              stableId: surface.stableId,
+              x: (start.x + end.x) / 2,
+              y: (start.y + end.y) / 2,
+              z: (start.z + end.z) / 2,
+              rotation: Math.atan2(dz, dx),
+              width: Math.hypot(dx, dz) + 0.01,
+              depth: surface.widthMeters,
+            };
+          },
+        )));
+      const createWaterMesh = (instances, name) => {
+        if (!instances.length) return;
+        const waterMesh = new InstancedMesh(
+          resources.geometries.road,
+          this.visualAssets.materials.water ?? this.visualAssets.materials.window,
+          instances.length,
         );
-        transform.rotation.set(-Math.PI / 2, 0, 0);
-        transform.scale.set(
-          surface.widthMeters * this.unitsPerMeter,
-          surface.depthMeters * this.unitsPerMeter,
-          1,
-        );
-        transform.updateMatrix();
-        waterMesh.setMatrixAt(index, transform.matrix);
-      });
-      waterMesh.instanceMatrix.needsUpdate = true;
-      layerMeshes.water.push(waterMesh);
+        waterMesh.name = name;
+        waterMesh.visible = this.transparencyEnabled;
+        waterMesh.userData = {
+          waterType: name.includes('river') ? 'river' : 'wetland',
+          featureStableIds: [],
+        };
+        this.#registry().transparentMeshes.add(waterMesh);
+        waterMesh.count = instances.length;
+        waterMesh.receiveShadow = true;
+        instances.forEach((instance, index) => {
+          transform.position.set(
+            (instance.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+            instance.y * this.unitsPerMeter + 1.5,
+            (instance.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
+          );
+          transform.rotation.set(-Math.PI / 2, 0, instance.rotation);
+          transform.scale.set(
+            instance.width * this.unitsPerMeter,
+            instance.depth * this.unitsPerMeter,
+            1,
+          );
+          transform.updateMatrix();
+          waterMesh.setMatrixAt(index, transform.matrix);
+          waterMesh.userData.featureStableIds[index] = instance.stableId;
+        });
+        waterMesh.instanceMatrix.needsUpdate = true;
+        layerMeshes.water.push(waterMesh);
+      };
+      createWaterMesh(wetlandInstances, 'w8-continuous-wetland-water');
+      createWaterMesh(riverInstances, 'w8-canonical-river-water');
     }
 
     const formalDetailParts = [];
@@ -1071,6 +1131,40 @@ export class ChunkRenderAdapter {
       disposedTerrainKeys: Object.freeze(sort(disposedTerrainKeys)),
       lifecycleMismatchKeys: Object.freeze(sort(lifecycleMismatchKeys)),
     });
+  }
+
+  visibleStableIdsSnapshot() {
+    return Object.freeze([...this.featureInstances]
+      .filter(([stableId]) => !this.isFeatureDestroyed(stableId))
+      .map(([stableId]) => stableId)
+      .sort((left, right) => left.localeCompare(right)));
+  }
+
+  visibleSettlementStableIdsSnapshot() {
+    return Object.freeze([...this.featureInstances]
+      .filter(([stableId, entry]) => {
+        if (this.isFeatureDestroyed(stableId)) return false;
+        const object = entry.canonicalObject;
+        return typeof (object?.settlementId
+          ?? object?.parentSettlementId
+          ?? object?.extension?.settlementId
+          ?? object?.extension?.parentSettlementId) === 'string';
+      })
+      .map(([stableId]) => stableId)
+      .sort((left, right) => left.localeCompare(right)));
+  }
+
+  visibleSettlementIdsSnapshot() {
+    const settlementIds = new Set();
+    for (const [stableId, entry] of this.featureInstances) {
+      if (this.isFeatureDestroyed(stableId)) continue;
+      const settlementId = entry.canonicalObject?.settlementId
+        ?? entry.canonicalObject?.parentSettlementId
+        ?? entry.canonicalObject?.extension?.settlementId
+        ?? entry.canonicalObject?.extension?.parentSettlementId;
+      if (typeof settlementId === 'string' && settlementId) settlementIds.add(settlementId);
+    }
+    return Object.freeze([...settlementIds].sort((left, right) => left.localeCompare(right)));
   }
 
   resourceSnapshot() {

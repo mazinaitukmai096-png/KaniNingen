@@ -68,9 +68,14 @@ export function createWorkerChunkGeneratorTransport({
   const removers = [];
   const generationTimes = [];
   const receiveTimes = [];
+  const settlementQueryTimes = [];
+  const settlementQueryReceiveTimes = [];
+  const settlementTemplateTimes = [];
+  const settlementTemplateReceiveTimes = [];
   const counts = {
     generated: 0,
     settlementQueries: 0,
+    settlementTemplateQueries: 0,
     staleGenerationResponses: 0,
     lateResponses: 0,
     workerErrors: 0,
@@ -135,8 +140,21 @@ export function createWorkerChunkGeneratorTransport({
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const operationMs = Math.max(0, Number(message.operationMs) || 0);
+      settlementQueryTimes.push(operationMs);
+      settlementQueryReceiveTimes.push(Math.max(0, receivedMs - operationMs));
       counts.settlementQueries += 1;
       operation.resolve(message.settlements);
+      return;
+    }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const operationMs = Math.max(0, Number(message.operationMs) || 0);
+      settlementTemplateTimes.push(operationMs);
+      settlementTemplateReceiveTimes.push(Math.max(0, receivedMs - operationMs));
+      counts.settlementTemplateQueries += 1;
+      operation.resolve(message.template);
     }
   };
 
@@ -220,9 +238,27 @@ export function createWorkerChunkGeneratorTransport({
         radiusMeters,
       });
     },
+    async resolveSettlementPresentationTemplate({ candidate } = {}) {
+      await initialize();
+      if (fallbackTransport) {
+        return fallbackTransport.resolveSettlementPresentationTemplate({ candidate });
+      }
+      const requestId = ++controlRequestId;
+      return requestWorker({
+        type: CHUNK_GENERATOR_MESSAGE.RESOLVE_SETTLEMENT_TEMPLATE,
+        protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+        requestId,
+        serviceGeneration,
+        candidate,
+      });
+    },
     snapshot() {
       const sortedGeneration = [...generationTimes].sort((a, b) => a - b);
       const sortedReceive = [...receiveTimes].sort((a, b) => a - b);
+      const sortedSettlementQuery = [...settlementQueryTimes].sort((a, b) => a - b);
+      const sortedSettlementQueryReceive = [...settlementQueryReceiveTimes].sort((a, b) => a - b);
+      const sortedSettlementTemplate = [...settlementTemplateTimes].sort((a, b) => a - b);
+      const sortedSettlementTemplateReceive = [...settlementTemplateReceiveTimes].sort((a, b) => a - b);
       const median = values => values.length ? values[Math.floor((values.length - 1) * 0.5)] : 0;
       return Object.freeze({
         kind: 'worker', mode, initialized, isShutdown, serviceGeneration,
@@ -234,6 +270,12 @@ export function createWorkerChunkGeneratorTransport({
         generationMsMaximum: sortedGeneration.at(-1) ?? 0,
         mainThreadReceiveMsP50: median(sortedReceive),
         mainThreadReceiveMsMaximum: sortedReceive.at(-1) ?? 0,
+        settlementQueryMsP50: median(sortedSettlementQuery),
+        settlementQueryMsMaximum: sortedSettlementQuery.at(-1) ?? 0,
+        settlementQueryReceiveMsMaximum: sortedSettlementQueryReceive.at(-1) ?? 0,
+        settlementTemplateMsP50: median(sortedSettlementTemplate),
+        settlementTemplateMsMaximum: sortedSettlementTemplate.at(-1) ?? 0,
+        settlementTemplateReceiveMsMaximum: sortedSettlementTemplateReceive.at(-1) ?? 0,
         generatorSnapshot: fallbackTransport?.snapshot?.().generatorSnapshot ?? lastGeneratorSnapshot,
         counts: Object.freeze({ ...counts }),
       });

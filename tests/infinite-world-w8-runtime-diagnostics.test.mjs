@@ -22,6 +22,14 @@ import {
 } from '../src/infinite-world/render/w8-distant-presentation.js';
 import { W6_STATIC_TARGET_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
 import { RENDER_CHUNK_SIZE } from '../src/infinite-world/chunk-coordinates.js';
+import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
+import {
+  W8_FINITE_SETTLEMENT_VIEW_CONTRACT,
+  resolveW8SettlementPresentationPolicy,
+  resolveRemoteHorizonBuildingLimit,
+  selectRemoteHorizonBuildings,
+  selectW8SettlementPresentationCandidates,
+} from '../src/infinite-world/settlement-presentation-policy.js';
 import {
   InfiniteWorldState,
   decodeInfiniteWorldSave,
@@ -177,6 +185,9 @@ function createDistantTestVisualAssets() {
       wetlandTree: [TREE_PART],
       shrub: [SHRUB_PART],
       rock: [ROCK_PART],
+      factory: [CANONICAL_HOUSE_PART],
+      barn: [CANONICAL_HOUSE_PART],
+      militaryBase: [CANONICAL_HOUSE_PART],
     },
     resolveBuildingParts: record =>
       record.buildingType === 'house' ? [CANONICAL_HOUSE_PART] : null,
@@ -1215,6 +1226,156 @@ test('canonical LOD only rewrites dirty buckets', async () => {
   presentation.dispose();
 });
 
+test('canonical MAJOR Road remains eligible across the Far handoff without a representative Settlement proxy', async () => {
+  const majorRoad = Object.freeze({
+    schemaVersion: 'w8-canonical-major-road-chunk-feature-1',
+    stableId: 'major-road-v1:handoff:segment:0:chunk:5:0',
+    sourceStableId: 'major-road-v1:handoff',
+    sourceSegmentStableId: 'major-road-v1:handoff:segment:0',
+    featureType: 'settlement-road',
+    canonicalMajorRoad: true,
+    settlementId: 'settlement-v1:left',
+    settlementIds: Object.freeze(['settlement-v1:left', 'settlement-v1:right']),
+    roadKind: 'MAJOR',
+    widthMeters: 2.25,
+    start: Object.freeze({ x: 84, y: 0, z: 8 }),
+    end: Object.freeze({ x: 92, y: 0, z: 8 }),
+    worldPosition: Object.freeze({ x: 88, y: 0, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+  });
+  const chunk = canonicalChunk(5, 0, [majorRoad]);
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? chunk : null
+    ),
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk,
+    playerLogicalX: 8,
+    quality: 'high',
+  });
+  assert.equal(await presentation.sync(input), true);
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.equal(audit.filter(value => value.identity.stableId === majorRoad.stableId).length, 1);
+  const roadSnapshot = presentation.snapshot();
+  assert.equal(roadSnapshot.canonicalRoadRecordCount, 1);
+  assert.equal(roadSnapshot.canonicalRoadMeshBucketCount, 1);
+  assert.ok(roadSnapshot.canonicalRoadMeshComposeMs >= 0);
+  assert.ok(roadSnapshot.canonicalRoadMatrixComposeMs >= 0);
+
+  // Moving the same owner into Near rendering removes it from Distant rather
+  // than creating a second Road identity; the Near adapter owns that exact
+  // Chunk feature during the handoff.
+  const nearInput = canonicalSyncInput({
+    centerChunkX: 5,
+    activeDataKeys: ['5,0'],
+    renderedKeys: ['5,0'],
+    chunk,
+    playerLogicalX: 88,
+    quality: 'high',
+  });
+  assert.equal(await presentation.sync(nearInput), true);
+  const handedOff = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === majorRoad.stableId
+  ));
+  assert.equal(handedOff.visibleLod, 'near');
+  assert.equal(handedOff.composedInstanceCount, 0);
+  assert.equal(handedOff.ownerRendered, true);
+  presentation.dispose();
+});
+
+test('canonical River keeps the Far owner staged while active ownership hides and restores it atomically', async () => {
+  const scene = new DistantTestGroup();
+  const chunk = canonicalChunk(0, 0, []);
+  const riverProjection = await createCanonicalRiverProjection({
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    chunkX: 0,
+    chunkZ: 0,
+  });
+  chunk.waterSurfaces = [riverProjection.waterSurface];
+  chunk.presentationLayers.water = [riverProjection.waterSurface];
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+  });
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['0,0'],
+    renderedKeys: ['0,0'],
+    chunk,
+    playerLogicalX: 8,
+    quality: 'high',
+  })), true);
+  const generationRoot = scene.children[0].children[0];
+  const riverMesh = generationRoot.children.find(child => (
+    child.name === 'w8-far-canonical-river-water'
+  ));
+  assert.ok(riverMesh);
+  const ownerIndices = riverMesh.userData.ownerKeys
+    .map((ownerKey, index) => ownerKey === '0,0' ? index : -1)
+    .filter(index => index >= 0);
+  assert.ok(ownerIndices.length > 0);
+  assert.ok(ownerIndices.every(index => (
+    riverMesh.matrices[index].value.scale.x === 0
+      && riverMesh.matrices[index].value.scale.y === 0
+      && riverMesh.matrices[index].value.scale.z === 0
+  )), 'Far River is staged but hidden while the same owner is active');
+  const canonicalRiver = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === riverProjection.waterSurface.stableId
+  ));
+  assert.equal(canonicalRiver.visibleLod, 'near');
+
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [],
+    renderedKeys: [],
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1 },
+    quality: 'high',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+  }), true);
+  assert.ok(ownerIndices.every(index => (
+    riverMesh.matrices[index].value.scale.x > 0
+      && riverMesh.matrices[index].value.scale.y > 0
+  )), 'the same staged Far instances return when active ownership ends');
+  assert.equal(presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === riverProjection.waterSurface.stableId
+  )).visibleLod, 'hidden', 'the old active record cannot remain as a second Far River');
+  assert.equal(scene.children[0].children[0], generationRoot,
+    'the complete Far root remains staged throughout the owner handoff');
+
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: ['0,0'],
+    renderedKeys: ['0,0'],
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 2 },
+    quality: 'high',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+  }), true);
+  assert.ok(ownerIndices.every(index => (
+    riverMesh.matrices[index].value.scale.x === 0
+      && riverMesh.matrices[index].value.scale.y === 0
+      && riverMesh.matrices[index].value.scale.z === 0
+  )), 'Near ownership hides the same canonical Far instances again');
+  assert.equal(presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === riverProjection.waterSurface.stableId
+  )).visibleLod, 'near');
+  presentation.dispose();
+});
+
 test('superseded distant sync cancels during owner acquisition and cannot commit an old epoch', async () => {
   let releaseFirstOwner;
   const firstOwner = new Promise(resolve => { releaseFirstOwner = resolve; });
@@ -1368,6 +1529,335 @@ test('High current-Settlement horizon uses canonical Building and Landmark recor
   assert.equal(presentation.snapshot().visibleCanonicalHorizonBuildingCount, 0);
   assert.equal(presentation.snapshot().destroyedHorizonBuildingCount, 1);
   presentation.dispose();
+});
+
+test('Settlement presentation policy uses finite camera range, candidate radius, quality caps, and deterministic order', () => {
+  const candidate = (settlementId, x, settlementType, townType) => Object.freeze({
+    settlementId,
+    settlementType,
+    townType,
+    center: Object.freeze({ x, z: 0 }),
+  });
+  const candidates = [
+    candidate('settlement-v1:current', 0, 'RURAL', 'suburb'),
+    candidate('settlement-v1:radius-included', 950, 'CITY', 'capital'),
+    candidate('settlement-v1:near-remote', 400, 'RURAL', 'residential'),
+    candidate('settlement-v1:town', 520, 'TOWN', 'church_town'),
+    candidate('settlement-v1:city', 650, 'CITY', 'capital'),
+    candidate('settlement-v1:rural', 760, 'RURAL', 'military'),
+    candidate('settlement-v1:outside', 1_000, 'CITY', 'capital'),
+  ];
+  const high = selectW8SettlementPresentationCandidates({
+    candidates, playerX: 0, playerZ: 0, quality: 'high',
+  });
+  assert.equal(W8_FINITE_SETTLEMENT_VIEW_CONTRACT.cameraFarMeters, 875);
+  assert.equal(resolveW8SettlementPresentationPolicy('high').remote.hiddenDistanceMeters, 875);
+  assert.equal(resolveW8SettlementPresentationPolicy('medium').remote.hiddenDistanceMeters, 656.25);
+  assert.equal(resolveW8SettlementPresentationPolicy('low').remote.hiddenDistanceMeters, 0);
+  assert.equal(resolveW8SettlementPresentationPolicy('high').remote.fog, false);
+  assert.equal(high.current.candidate.settlementId, 'settlement-v1:current');
+  assert.equal(high.remote.length, resolveW8SettlementPresentationPolicy('high').remote.settlementLimit);
+  assert.deepEqual(high.remote.map(value => value.candidate.settlementId), [
+    'settlement-v1:near-remote',
+    'settlement-v1:town',
+    'settlement-v1:city',
+    'settlement-v1:rural',
+  ]);
+  assert.deepEqual(selectW8SettlementPresentationCandidates({
+    candidates: [...candidates].reverse(), playerX: 0, playerZ: 0, quality: 'high',
+  }).remote.map(value => value.candidate.settlementId),
+  high.remote.map(value => value.candidate.settlementId));
+  assert.ok(high.ranked.find(value => (
+    value.candidate.settlementId === 'settlement-v1:radius-included'
+  )).boundaryDistanceMeters < W8_FINITE_SETTLEMENT_VIEW_CONTRACT.cameraFarMeters);
+  assert.ok(high.ranked.find(value => (
+    value.candidate.settlementId === 'settlement-v1:outside'
+  )).boundaryDistanceMeters > W8_FINITE_SETTLEMENT_VIEW_CONTRACT.cameraFarMeters);
+  assert.deepEqual(selectW8SettlementPresentationCandidates({
+    candidates: [candidates[0], candidates[1], candidates[6]],
+    playerX: 0, playerZ: 0, quality: 'high',
+  }).remote.map(value => value.candidate.settlementId), ['settlement-v1:radius-included']);
+  const medium = selectW8SettlementPresentationCandidates({
+    candidates, playerX: 0, playerZ: 0, quality: 'medium',
+  });
+  assert.equal(medium.remote.length, 2);
+  assert.deepEqual(medium.remote.map(value => value.candidate.settlementId), [
+    'settlement-v1:near-remote',
+    'settlement-v1:town',
+  ]);
+  const low = selectW8SettlementPresentationCandidates({
+    candidates, playerX: 0, playerZ: 0, quality: 'low',
+  });
+  assert.equal(low.remote.length, 0);
+  const limits = ['CITY', 'TOWN', 'RURAL'].map(settlementType => (
+    resolveRemoteHorizonBuildingLimit({ settlementType, buildingCount: 100, quality: 'high' })
+  ));
+  assert.deepEqual(limits, [100, 100, 100]);
+});
+
+test('remote Settlement Horizon preserves every canonical Building Stable ID and yields per Building to Near ownership', async () => {
+  const settlementId = 'settlement-v1:remote-horizon';
+  const centerX = 401;
+  const candidate = Object.freeze({
+    settlementId,
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: Object.freeze({ x: centerX, z: 8 }),
+  });
+  const buildings = Object.freeze(Array.from({ length: 83 }, (_, index) => Object.freeze({
+    stableId: `${settlementId}:building:${String(index).padStart(2, '0')}`,
+    settlementId,
+    buildingType: 'house',
+    x: centerX - 33 + (index % 12) * 6,
+    z: 8 - 24 + Math.floor(index / 12) * 8,
+    rotationY: index * 0.05,
+    widthMeters: 6,
+    heightMeters: 4,
+    depthMeters: 5,
+  })));
+  const template = Object.freeze({
+    settlementId,
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: candidate.center,
+    buildings,
+    roads: Object.freeze([]),
+  });
+  const selected = selectRemoteHorizonBuildings({ template, quality: 'high' });
+  assert.deepEqual(selected.map(value => value.stableId), buildings.map(value => value.stableId));
+  const centerOwnerX = Math.floor(centerX / LEGACY_CHUNK_SIZE_METERS);
+  const ownerChunk = canonicalChunk(centerOwnerX, 0, []);
+  const factory = Object.freeze({
+    stableId: `${settlementId}:landmark:factory`,
+    parentSettlementId: settlementId,
+    featureType: 'settlement-landmark',
+    landmarkType: 'factory',
+    worldPosition: Object.freeze({ x: centerX, y: 0.4, z: 8 }),
+    rotationY: 0,
+    widthMeters: 9,
+    heightMeters: 8,
+    depthMeters: 8,
+    owningChunkCoordinate: Object.freeze({ x: centerOwnerX, z: 0 }),
+  });
+  ownerChunk.settlementLandmarks = [factory];
+  ownerChunk.presentationLayers.landmarks = [factory];
+  const scene = new DistantTestGroup();
+  let nearStableIds = [];
+  const destroyedStableIds = new Set();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [candidate],
+    resolveTemplate: async () => template,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === centerOwnerX && chunkZ === 0
+        ? ownerChunk : canonicalChunk(chunkX, chunkZ, [])
+    ),
+    getNearVisibleStableIds: () => nearStableIds,
+    isFeatureDestroyed: stableId => destroyedStableIds.has(stableId),
+  });
+  assert.equal(await presentation.sync({
+    activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    centerChunkX: 0, centerChunkZ: 0, quality: 'high',
+    playerLogicalX: 8, playerLogicalZ: 8,
+    includeFarNatural: false, includeUltraNatural: false,
+  }), true);
+  let snapshot = presentation.snapshot();
+  assert.equal(snapshot.currentSettlementId, null);
+  assert.equal(snapshot.queryRemoteCandidateCount, 1);
+  assert.equal(snapshot.queryRemoteSelectedCount, 1);
+  assert.equal(snapshot.queryBuildingOwnerChunkCount, 0);
+  assert.equal(snapshot.queryRemoteHorizonOwnerChunkCount, 1);
+  assert.equal(snapshot.remoteHorizonSettlementCount, 1);
+  assert.equal(snapshot.visibleRemoteHorizonSettlementCount, 1);
+  assert.equal(snapshot.remoteHorizonCanonicalBuildingCount, buildings.length);
+  assert.equal(snapshot.remoteHorizonBuildingCount, selected.length);
+  assert.equal(snapshot.remoteHorizonMissingBuildingCount, 0);
+  assert.equal(snapshot.remoteHorizonLandmarkCount, 1);
+  assert.ok(snapshot.remoteHorizonPartInstanceCount <= snapshot.queryRemotePartLimit);
+  assert.ok(presentation.canonicalAuditSnapshot().every(object => object.remoteHorizon));
+  assert.equal(presentation.canonicalAuditSnapshot().find(object => (
+    object.identity.landmarkType === 'factory'
+  )).identity.dimensions.heightMeters, 8);
+  const remoteMeshes = scene.children[0].children[0].children.filter(child => (
+    child.name.includes('remote-horizon')
+  ));
+  assert.ok(remoteMeshes.length > 0);
+  assert.ok(remoteMeshes.every(mesh => mesh.material.fog === false));
+  const baselineIdentityById = new Map(presentation.canonicalAuditSnapshot()
+    .filter(object => buildings.some(building => building.stableId === object.identity.stableId))
+    .map(object => [object.identity.stableId, object.identity]));
+  assert.equal(new Set([...baselineIdentityById.values()].map(identity => (
+    `${identity.owningChunkCoordinate.x},${identity.owningChunkCoordinate.z}`
+  ))).size > 1, true);
+  let previousVisibleIds = null;
+  for (const distanceMeters of [850, 750, 500, 300, 200, 150, 100, 50]) {
+    presentation.update(centerX - distanceMeters, 8, {
+      renderOriginChunkX: 0,
+      renderOriginChunkZ: 0,
+    });
+    const visible = presentation.canonicalAuditSnapshot().filter(object => (
+      baselineIdentityById.has(object.identity.stableId) && object.composedInstanceCount > 0
+    ));
+    const visibleIds = visible.map(object => object.identity.stableId).sort();
+    assert.deepEqual(visibleIds, buildings.map(building => building.stableId));
+    if (previousVisibleIds) assert.deepEqual(visibleIds, previousVisibleIds);
+    previousVisibleIds = visibleIds;
+    for (const object of visible) {
+      assert.deepEqual(object.identity, baselineIdentityById.get(object.identity.stableId));
+      assert.equal(object.presentationTier, 'remote-horizon');
+    }
+  }
+  nearStableIds = [buildings[0].stableId];
+  presentation.update(centerX - 50, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(presentation.canonicalAuditSnapshot().filter(object => (
+    baselineIdentityById.has(object.identity.stableId) && object.composedInstanceCount > 0
+  )).length, buildings.length - 1);
+  assert.equal(presentation.snapshot().visibleRemoteHorizonSettlementCount, 1);
+  nearStableIds = [];
+  destroyedStableIds.add(buildings[1].stableId);
+  presentation.update(centerX - 50, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(presentation.canonicalAuditSnapshot().find(object => (
+    object.identity.stableId === buildings[1].stableId
+  )).visibleLod, 'destroyed');
+  assert.equal(presentation.canonicalAuditSnapshot().filter(object => (
+    baselineIdentityById.has(object.identity.stableId) && object.composedInstanceCount > 0
+  )).length, buildings.length - 1);
+  destroyedStableIds.clear();
+  nearStableIds = buildings.map(value => value.stableId).concat(factory.stableId);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [`${centerOwnerX},0`],
+    renderedKeys: [`${centerOwnerX},0`],
+    renderOrigin: { renderOriginChunkX: centerOwnerX, renderOriginChunkZ: 0 },
+    quality: 'high', playerLogicalX: centerX, playerLogicalZ: 8,
+  }), true);
+  snapshot = presentation.snapshot();
+  assert.equal(snapshot.visibleRemoteHorizonSettlementCount, 0);
+  assert.ok(snapshot.remoteHorizonSuppressedByNearCount > 0);
+  assert.ok(remoteMeshes.every(mesh => mesh.count === 0));
+  nearStableIds = [];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [], renderedKeys: [],
+    renderOrigin: { renderOriginChunkX: centerOwnerX, renderOriginChunkZ: 0 },
+    quality: 'high', playerLogicalX: 8, playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.snapshot().visibleRemoteHorizonSettlementCount, 1);
+  assert.ok(remoteMeshes.some(mesh => mesh.count > 0));
+  presentation.dispose();
+});
+
+test('Near Stable IDs suppress the matching Distant representation before duplicate composition', async () => {
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [CANONICAL_CANDIDATE],
+    resolveTemplate: async () => CANONICAL_TEMPLATE,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? canonicalChunk() : null
+    ),
+    getNearVisibleStableIds: () => [CANONICAL_BUILDING_ID],
+  });
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 0, activeDataKeys: [], renderedKeys: [], quality: 'medium',
+  })), true);
+  assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
+  assert.deepEqual(presentation.snapshot().duplicateVisibleStableIds, []);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].composedInstanceCount, 0);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: ['5,0'], renderedKeys: ['5,0'],
+    renderOrigin: { renderOriginChunkX: 4, renderOriginChunkZ: 0 },
+    quality: 'medium', playerLogicalX: 72, playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].composedInstanceCount, 0);
+  presentation.dispose();
+});
+
+test('High and Medium keep every remote Building while reducing only silhouette parts', async () => {
+  const settlementId = 'settlement-v1:quality-silhouette';
+  const candidate = Object.freeze({
+    settlementId,
+    settlementType: 'TOWN',
+    townType: 'church_town',
+    center: Object.freeze({ x: 401, z: 8 }),
+  });
+  const buildings = Object.freeze(Array.from({ length: 12 }, (_, index) => Object.freeze({
+    stableId: `${settlementId}:building:${index}`,
+    settlementId,
+    buildingType: 'house',
+    x: 390 + index * 2,
+    z: 8 + index % 3,
+    rotationY: index * 0.1,
+    widthMeters: 6,
+    heightMeters: 4,
+    depthMeters: 5,
+  })));
+  const template = Object.freeze({
+    settlementId,
+    settlementType: 'TOWN',
+    townType: 'church_town',
+    center: candidate.center,
+    buildings,
+    roads: Object.freeze([]),
+  });
+  const roof = Object.freeze({
+    ...CANONICAL_HOUSE_PART,
+    position: Object.freeze([0, 1.1, 0]),
+    scale: Object.freeze([1, 0.25, 1]),
+    materialRole: 'roof',
+  });
+  const run = async quality => {
+    const assets = createDistantTestVisualAssets();
+    assets.featureParts.house = [CANONICAL_HOUSE_PART, roof];
+    assets.resolveBuildingParts = () => [CANONICAL_HOUSE_PART, roof];
+    const presentation = await createW8DistantPresentation({
+      THREE: DISTANT_TEST_THREE,
+      scene: new DistantTestGroup(),
+      worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+      visualAssets: assets,
+      findSettlementsNear: async () => [candidate],
+      resolveTemplate: async () => template,
+      getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(chunkX, chunkZ, []),
+    });
+    await presentation.sync({
+      activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+      renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+      centerChunkX: 0, centerChunkZ: 0, quality,
+      playerLogicalX: 8, playerLogicalZ: 8,
+      includeFarNatural: false, includeUltraNatural: false,
+    });
+    const result = {
+      snapshot: presentation.snapshot(),
+      audit: presentation.canonicalAuditSnapshot(),
+    };
+    presentation.dispose();
+    return result;
+  };
+  const high = await run('high');
+  const medium = await run('medium');
+  const low = await run('low');
+  for (const result of [high, medium]) {
+    assert.equal(result.snapshot.remoteHorizonCanonicalBuildingCount, buildings.length);
+    assert.equal(result.snapshot.remoteHorizonBuildingCount, buildings.length);
+    assert.equal(result.snapshot.remoteHorizonMissingBuildingCount, 0);
+    assert.deepEqual(result.audit.map(object => object.identity.stableId).sort(),
+      buildings.map(building => building.stableId).sort());
+  }
+  assert.equal(high.snapshot.remoteHorizonPartInstanceCount, buildings.length * 2);
+  assert.equal(medium.snapshot.remoteHorizonPartInstanceCount, buildings.length);
+  assert.equal(low.snapshot.remoteHorizonBuildingCount, 0);
+  assert.equal(low.snapshot.remoteHorizonPartInstanceCount, 0);
 });
 
 test('Tree LOD diagnostics are opt-in and mirror canonical full and silhouette tiers', async () => {
@@ -1738,6 +2228,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
   });
   let holdNextQuery = false;
   let releaseHeldQuery = null;
+  let nearVisibleStableIds = [];
   const presentation = await createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene,
@@ -1753,6 +2244,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     getCanonicalChunkData: async (chunkX, chunkZ) =>
       chunkX === 5 && chunkZ === 0 ? canonicalChunk() : null,
     isFeatureDestroyed: stableId => activeState.isFeatureDestroyed(stableId),
+    getNearVisibleStableIds: () => nearVisibleStableIds,
   });
   const expectedIdentity = {
     stableId: CANONICAL_BUILDING_ID,
@@ -1821,11 +2313,13 @@ test('canonical settlement identity hands off exclusively and destruction surviv
   ];
 
   for (const state of states) {
+    nearVisibleStableIds = state.lod === 'near' ? [CANONICAL_BUILDING_ID] : [];
     assert.equal(await presentation.sync(state.input), true);
     const [object] = presentation.canonicalAuditSnapshot();
     assert.deepEqual(object.identity, expectedIdentity);
     assert.equal(object.visibleLod, state.lod);
     assert.equal(object.instanceCount, 1);
+    assert.equal(object.composedInstanceCount, state.lod === 'near' ? 0 : 1);
     assert.equal(object.ownerKey, '5,0');
     assert.equal(object.ownerActive, state.lod !== 'far');
     assert.equal(object.ownerRendered, state.lod === 'near');
@@ -1962,7 +2456,11 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
   assert.equal(ownerPoints.length, 80);
   const candidates = Array.from({ length: 8 }, (_, index) => ({
     settlementId: `settlement-v1:cache-${index}`,
-    worldPosition: ownerPoints[index * 10],
+    settlementType: index === 0 ? 'RURAL' : index % 2 ? 'TOWN' : 'CITY',
+    townType: index === 0 ? 'suburb' : index % 2 ? 'church_town' : 'capital',
+    center: index === 0
+      ? Object.freeze({ x: 8, z: 8 })
+      : Object.freeze({ x: 260 + index * 70, z: 8 }),
   }));
   let providerConcurrency = 0;
   let maximumProviderConcurrency = 0;
@@ -1977,8 +2475,17 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
       const index = Number(candidate.settlementId.split('-').at(-1));
       return {
         settlementId: candidate.settlementId,
-        center: candidate.worldPosition,
-        buildings: ownerPoints.slice(index * 10, index * 10 + 10),
+        settlementType: candidate.settlementType,
+        townType: candidate.townType,
+        center: candidate.center,
+        buildings: ownerPoints.slice(index * 10, index * 10 + 10).map((point, buildingIndex) => ({
+          stableId: `${candidate.settlementId}:building:${buildingIndex}`,
+          settlementId: candidate.settlementId,
+          buildingType: 'house',
+          x: index === 0 ? point.x : candidate.center.x + (buildingIndex - 5) * 2,
+          z: candidate.center.z + (buildingIndex % 3) * 2,
+          widthMeters: 6, heightMeters: 4, depthMeters: 5, rotationY: 0,
+        })),
         roads: [],
       };
     },
@@ -1997,23 +2504,27 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
     renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
     centerChunkX: 0,
     centerChunkZ: 0,
-    quality: 'medium',
+    quality: 'high',
     playerLogicalX: 8,
     playerLogicalZ: 8,
   }), true);
   const snapshot = presentation.snapshot();
   assert.equal(snapshot.queryCandidateCount, 8);
-  assert.equal(snapshot.queryTemplateSuccessCount, 8);
-  assert.ok(snapshot.queryOwnerChunkCount >= 80);
+  assert.equal(snapshot.queryTemplateSuccessCount, 5);
+  assert.equal(snapshot.queryRemoteSelectedCount, 4);
+  assert.ok(snapshot.queryOwnerChunkCount > 4);
   assert.ok(snapshot.queryNaturalOwnerChunkCount > 0);
   assert.equal(snapshot.queryOwnerChunkKeys.length, snapshot.queryOwnerChunkCount);
   assert.equal(snapshot.queryCanonicalChunkSuccessCount, snapshot.queryOwnerChunkCount);
-  assert.equal(snapshot.templateCacheCapacity, 4);
-  assert.equal(snapshot.templateCacheSize, 4);
+  assert.equal(snapshot.templateCacheCapacity, 5);
+  assert.equal(snapshot.templateCacheSize, 5);
   assert.equal(snapshot.farOwnerChunkCacheCapacity, 128);
   assert.equal(
     snapshot.farOwnerChunkCacheSize,
-    Math.min(snapshot.queryOwnerChunkCount, snapshot.farOwnerChunkCacheCapacity),
+    Math.min(
+      snapshot.queryOwnerChunkCount - snapshot.queryUltraOwnerChunkCount,
+      snapshot.farOwnerChunkCacheCapacity,
+    ),
   );
   assert.equal(snapshot.queryConcurrencyLimit, 4);
   assert.equal(snapshot.maximumObservedQueryConcurrency, 4);

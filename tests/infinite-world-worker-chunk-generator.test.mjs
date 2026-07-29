@@ -92,6 +92,20 @@ test('real Node module Worker matches Inline W8 identity, owner, terrain, Settle
   assert.deepEqual(workerMetadata.generatorVersion, inlineMetadata.generatorVersion);
   assert.equal(workerMetadata.worldSeedHash, inlineMetadata.worldSeedHash);
 
+  const [candidate] = await inlineGenerator.distributor.findSettlementsNear(
+    inlineGenerator.reviewSpawn.x,
+    inlineGenerator.reviewSpawn.z,
+    350,
+  );
+  const [inlineTemplate, workerTemplate] = await Promise.all([
+    inline.resolveSettlementPresentationTemplate({ candidate }),
+    worker.resolveSettlementPresentationTemplate({ candidate }),
+  ]);
+  assert.deepEqual(workerTemplate, inlineTemplate);
+  assert.equal(workerTemplate.canonicalBuildingCount, workerTemplate.buildings.length);
+  assert.equal(new Set(workerTemplate.buildings.map(building => building.stableId)).size,
+    workerTemplate.buildings.length);
+
   const coordinates = [[0, 0], [1, -1], [-2, 2]];
   const inlineChunks = [];
   for (const [chunkX, chunkZ] of coordinates.toReversed()) {
@@ -118,6 +132,10 @@ test('real Node module Worker matches Inline W8 identity, owner, terrain, Settle
   assert.equal(worker.snapshot().mode, 'worker');
   assert.equal(worker.snapshot().counts.generated, coordinates.length);
   assert.ok(worker.snapshot().generationMsMaximum > 0);
+  assert.ok(worker.snapshot().settlementQueryMsMaximum >= 0);
+  assert.ok(worker.snapshot().settlementQueryReceiveMsMaximum >= 0);
+  assert.ok(worker.snapshot().settlementTemplateMsMaximum > 0);
+  assert.ok(worker.snapshot().settlementTemplateReceiveMsMaximum >= 0);
   await Promise.all([inline.shutdown(), worker.shutdown()]);
 });
 

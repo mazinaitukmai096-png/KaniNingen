@@ -34,6 +34,13 @@ export function createInlineChunkGeneratorTransport({ generator } = {}) {
       if (isShutdown) throw new Error('inline ChunkData transport is shut down');
       return generator.distributor.findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters);
     },
+    resolveSettlementPresentationTemplate({ candidate } = {}) {
+      if (isShutdown) throw new Error('inline ChunkData transport is shut down');
+      if (typeof generator.resolveSettlementPresentationTemplate !== 'function') {
+        throw new Error('Chunk generator does not expose Settlement presentation templates');
+      }
+      return generator.resolveSettlementPresentationTemplate({ candidate });
+    },
     snapshot() {
       return Object.freeze({
         kind: 'inline', generatedCount, initialized, isShutdown,

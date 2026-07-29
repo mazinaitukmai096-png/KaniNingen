@@ -78,6 +78,7 @@ export function createChunkGeneratorWorkerCore({
         return;
       }
       if (request.type === CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS) {
+        const startedAt = clock();
         const settlements = await generator.distributor.findSettlementsNear(
           request.centerWorldX,
           request.centerWorldZ,
@@ -89,6 +90,26 @@ export function createChunkGeneratorWorkerCore({
           requestId: request.requestId,
           serviceGeneration,
           settlements,
+          operationMs: Math.max(0, clock() - startedAt),
+          generatorSnapshot: generator.snapshot?.() ?? null,
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.RESOLVE_SETTLEMENT_TEMPLATE) {
+        if (typeof generator.resolveSettlementPresentationTemplate !== 'function') {
+          throw new Error('Chunk generator does not expose Settlement presentation templates');
+        }
+        const startedAt = clock();
+        const template = await generator.resolveSettlementPresentationTemplate({
+          candidate: request.candidate,
+        });
+        postMessage({
+          type: CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE,
+          protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          serviceGeneration,
+          template,
+          operationMs: Math.max(0, clock() - startedAt),
           generatorSnapshot: generator.snapshot?.() ?? null,
         });
         return;

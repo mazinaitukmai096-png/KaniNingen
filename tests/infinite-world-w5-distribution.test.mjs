@@ -34,20 +34,25 @@ test('W5 distribution has no fixed total and deterministically yields all Settle
     second.findInMacroRange(-10, 10, -10, 10),
   ]);
   assert.deepEqual(a, b);
-  assert.equal(a.length, 96);
+  assert.equal(a.length, 247);
   assert.deepEqual(Object.fromEntries(Object.entries(Object.groupBy(a, candidate => candidate.settlementType))
-    .map(([type, candidates]) => [type, candidates.length])), { TOWN: 28, RURAL: 58, CITY: 10 });
+    .map(([type, candidates]) => [type, candidates.length])), { TOWN: 149, RURAL: 85, CITY: 13 });
   assert.deepEqual(a[0], {
     schemaVersion: 'w5-settlement-candidate-1',
     macroRegion: { x: -9, z: -10 },
+    proposalKind: 'PRIMARY',
+    proposalSlot: 0,
+    proposalCell: { x: -9, z: -10 },
     center: { x: -6382.448807, z: -7528.114383 },
     settlementType: 'TOWN',
     townType: 'school_town',
+    radiusMeters: 94.5,
     urbanization: 0.57712,
     terrainSuitability: 0.820959,
     proposalPriority: 0.793624,
     selectionScore: 0.792158,
-    minimumDistanceMeters: 960,
+    minimumDistanceMeters: 394.196176,
+    eligibility: { biomeAndSlope: true, regionalUrbanization: true },
     settlementId: 'settlement-v1:bf2eb64de8619688ba55cdcc',
   });
   const expanded = await first.findInMacroRange(-20, 20, -20, 20);
@@ -71,8 +76,11 @@ test('Seed, Macro Region, minimum distance, urbanization, and terrain suitabilit
   for (let firstIndex = 0; firstIndex < candidates.length; firstIndex += 1) {
     for (let secondIndex = firstIndex + 1; secondIndex < candidates.length; secondIndex += 1) {
       const a = candidates[firstIndex]; const b = candidates[secondIndex];
-      const required = Math.max(a.minimumDistanceMeters, b.minimumDistanceMeters);
+      const required = W5_SETTLEMENT_DISTRIBUTION
+        .minimumDistanceMetersByTypePair[a.settlementType][b.settlementType];
       assert.ok(Math.hypot(a.center.x - b.center.x, a.center.z - b.center.z) >= required - 0.000001);
+      assert.ok(Math.hypot(a.center.x - b.center.x, a.center.z - b.center.z)
+        > a.radiusMeters + b.radiusMeters);
       assert.notEqual(a.settlementId, b.settlementId);
     }
   }
@@ -135,10 +143,18 @@ test('W5 review spawn and Chunk identity have fixed golden vectors', async () =>
     z: 472.059306,
     settlementId: 'settlement-v1:6dd64c62b99e2cba5c12b024',
   });
+  const homeChunk = await generator.generateChunk(
+    Math.floor(generator.reviewSpawn.x / 16),
+    Math.floor(generator.reviewSpawn.z / 16),
+  );
+  assert.ok(homeChunk.settlementReferences.some(reference => (
+    reference.settlementId === generator.reviewSpawn.settlementId
+  )));
+  // The Phase 5F distributor retains the pre-existing primary Settlement identity/content.
   const chunk = await generator.generateChunk(24, 29);
   assert.equal(chunk.chunkId, 'chunk-v1:500:f327c7698f52548d6f0b42cb879c405de0eb6c480d6742ff48ec077e304162a3:24:29');
   assert.equal(chunk.contentHash, 'sha256:ce5975036825d64069bb51b7d05d0b0aa9fddf4519fa298d6d1e5197ed56b835');
-  assert.equal(chunk.settlementReferences[0].settlementId, generator.reviewSpawn.settlementId);
+  assert.equal(chunk.settlementReferences[0].settlementId, 'settlement-v1:6dd64c62b99e2cba5c12b024');
   assert.equal(chunk.settlementReferences[0].settlementType, 'RURAL');
   assert.equal(chunk.settlementFeatures.length, 5);
   assert.equal(chunk.settlementFeatures[0].stableId, 'settlement-building-v1:0eb69096eda26365d3144a97');
@@ -187,7 +203,11 @@ test('W5 preserves W3 natural data and filters only conflicting natural Candidat
   const centerX = Math.floor(w5.reviewSpawn.x / 16);
   const centerZ = Math.floor(w5.reviewSpawn.z / 16);
   let removed = 0;
-  for (const [x, z] of [[centerX, centerZ], [centerX + 1, centerZ], [0, 0]]) {
+  const sampleCoordinates = [[0, 0]];
+  for (let z = centerZ - 2; z <= centerZ + 2; z += 1) {
+    for (let x = centerX - 2; x <= centerX + 2; x += 1) sampleCoordinates.push([x, z]);
+  }
+  for (const [x, z] of sampleCoordinates) {
     const [formal, distributed] = await Promise.all([w3.generateChunk(x, z), w5.generateChunk(x, z)]);
     assert.deepEqual(distributed.terrain, formal.terrain);
     assert.deepEqual(distributed.biomeField, formal.biomeField);

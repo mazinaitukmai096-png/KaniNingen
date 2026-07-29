@@ -239,6 +239,49 @@ test('W8 wraps byte-identical W5 output and publishes sorted deterministic overl
   assert.ok(parity.ambientDetails.length > 8);
 });
 
+test('Settlement presentation template exposes the exact multi-owner W8 Building Stable ID set', async () => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
+  const candidates = await generator.distributor.findSettlementsNear(
+    generator.reviewSpawn.x,
+    generator.reviewSpawn.z,
+    350,
+  );
+  const candidate = candidates.find(value => value.settlementId === generator.reviewSpawn.settlementId)
+    ?? candidates[0];
+  assert.ok(candidate);
+  const template = await generator.resolveSettlementPresentationTemplate({ candidate });
+  assert.equal(template.schemaVersion, 'w8-settlement-presentation-template-1');
+  assert.equal(template.canonicalBuildingCount, template.buildings.length);
+  assert.equal(new Set(template.buildings.map(building => building.stableId)).size,
+    template.buildings.length);
+  const owners = new Map(template.buildings.map(building => [
+    `${building.owningChunkCoordinate.x},${building.owningChunkCoordinate.z}`,
+    building.owningChunkCoordinate,
+  ]));
+  assert.ok(owners.size > 1);
+  const chunks = await Promise.all([...owners.values()].map(owner => (
+    generator.generateChunk(owner.x, owner.z)
+  )));
+  const projectedStableIds = chunks.flatMap(chunk => chunk.settlementFeatures)
+    .filter(feature => feature.featureType === 'settlement-building'
+      && feature.settlementId === candidate.settlementId)
+    .map(feature => feature.stableId)
+    .sort();
+  assert.deepEqual(projectedStableIds, template.buildings.map(building => building.stableId).sort());
+  for (const building of template.buildings) {
+    const projected = chunks.flatMap(chunk => chunk.settlementFeatures)
+      .find(feature => feature.stableId === building.stableId);
+    assert.ok(projected);
+    assert.deepEqual(projected.owningChunkCoordinate, building.owningChunkCoordinate);
+    assert.equal(projected.worldPosition.x, building.x);
+    assert.equal(projected.worldPosition.z, building.z);
+    assert.equal(projected.rotationY, building.rotationY);
+    assert.equal(projected.widthMeters, building.widthMeters);
+    assert.equal(projected.heightMeters, building.heightMeters);
+    assert.equal(projected.depthMeters, building.depthMeters);
+  }
+});
+
 test('the reported 31,21 boundary resident has one canonical Gameplay owner', async () => {
   const generator = await createW8ParityChunkGenerator();
   const chunks = await Promise.all([
@@ -258,7 +301,7 @@ test('the reported 31,21 boundary resident has one canonical Gameplay owner', as
   assert.equal(logicalWorldToOwnedChunk(descriptors[0].x, descriptors[0].z).key, '31,21');
 });
 
-test('W8 selects a deterministic pond start and every surface consumer retains the W5 height value and scale', async () => {
+test('W8 selects a deterministic pond start and every surface consumer uses the canonical surface policy', async () => {
   const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
   const owner = logicalWorldToOwnedChunk(generator.experienceSpawn.x, generator.experienceSpawn.z);
   const chunk = await generator.generateChunk(owner.chunkX, owner.chunkZ);
@@ -348,6 +391,11 @@ test('W8 selects a deterministic pond start and every surface consumer retains t
     generator.experienceSpawn.z,
   );
   assert.equal(Number.isFinite(height), true);
+  assert.equal(height, sampleW8SurfaceHeightMeters(
+    chunk,
+    generator.experienceSpawn.x,
+    generator.experienceSpawn.z,
+  ));
   assert.equal(chunk.terrain.heightUnitMeters, chunk.sourceChunkData.terrain.heightUnitMeters);
   assert.equal(chunk.terrain.heights, chunk.sourceChunkData.terrain.heights);
   for (const building of chunk.settlementFeatures.filter(value => value.featureType === 'settlement-building')) {

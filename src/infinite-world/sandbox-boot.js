@@ -20,7 +20,6 @@ import {
   createW8ParityChunkGenerator,
   sampleW8SurfaceHeightMeters,
 } from './w8-parity-chunk-generator.js';
-import { createMigratedSettlementTemplate } from './single-rural-settlement.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
@@ -799,6 +798,8 @@ export async function bootInfiniteWorldSandbox({
           } finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
         },
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
+        resolveSettlementPresentationTemplate: (...args) =>
+          workerTransport.resolveSettlementPresentationTemplate(...args),
         snapshot: () => workerTransport.snapshot(),
         shutdown: () => workerTransport.shutdown(),
       });
@@ -817,6 +818,8 @@ export async function bootInfiniteWorldSandbox({
       distributor: Object.freeze({
         findSettlementsNear: (...args) => chunkGeneratorTransport.findSettlementsNear(...args),
       }),
+      resolveSettlementPresentationTemplate: (...args) =>
+        chunkGeneratorTransport.resolveSettlementPresentationTemplate(...args),
       snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot
         ?? generatorMetadata.generatorSnapshot,
     });
@@ -973,7 +976,7 @@ export async function bootInfiniteWorldSandbox({
       worldSeedHash: generator.worldSeedHash,
       visualAssets,
       findSettlementsNear: generator.distributor.findSettlementsNear,
-      resolveTemplate: createMigratedSettlementTemplate,
+      resolveTemplate: request => generator.resolveSettlementPresentationTemplate(request),
       getCanonicalChunkData: async (chunkX, chunkZ, request = {}) =>
         runtime.getChunkData(chunkX, chunkZ) ?? chunkDataService.requestChunk({
           chunkX,
@@ -984,6 +987,9 @@ export async function bootInfiniteWorldSandbox({
         }).promise,
       cancelCanonicalChunkRequests: options => chunkDataService.cancelConsumer(options),
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
+      getNearVisibleStableIds: () =>
+        renderAdapter.visibleSettlementStableIdsSnapshot?.() ?? [],
+      getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
       measure: (stage, operation) => diagnostics.measure(stage, operation),
     });
     {
@@ -1810,7 +1816,9 @@ Render Coverage Audit: loaded/terrain ${renderResources.renderCoverage?.loadedKe
 Distant: mid ${presentationSnapshot.midgroundChunkCount}  natural ${presentationSnapshot.distantNaturalProxyCount}/${presentationSnapshot.distantNaturalProxyLimit}  town ${presentationSnapshot.distantTownProxyCount}/${presentationSnapshot.distantTownProxyLimit}  water ${presentationSnapshot.distantWaterProxyCount}  boundary RGB ${number(presentationSnapshot.maximumInnerBoundaryColorDifference)}
 Canonical: settlements ${presentationSnapshot.queryCandidateCount}/${presentationSnapshot.queryTemplateSuccessCount} resolved  owner Chunks ${presentationSnapshot.queryCanonicalChunkSuccessCount}/${presentationSnapshot.queryOwnerChunkCount}  records ${presentationSnapshot.canonicalRecordCount} (building ${presentationSnapshot.canonicalBuildingRecordCount}, landmark ${presentationSnapshot.canonicalLandmarkRecordCount}, road ${presentationSnapshot.canonicalRoadRecordCount})  visible Far ${presentationSnapshot.canonicalFarObjectCount} / Mid ${presentationSnapshot.canonicalMidObjectCount} / Near handoff ${presentationSnapshot.canonicalNearObjectCount}
 Tree LOD: full ${presentationSnapshot.visibleCanonicalFullTreeCount}  silhouette ${presentationSnapshot.visibleCanonicalSilhouetteTreeCount}  ultra ${presentationSnapshot.visibleCanonicalUltraTreeCount}  84-124m ${presentationSnapshot.visibleCanonicalTreeUltraInnerBandCount}  124-140m ${presentationSnapshot.visibleCanonicalTreeUltraOuterBandCount}  parts ${presentationSnapshot.visibleCanonicalTreePartInstanceCount}
-Horizon: current Settlement ${escapeHtml(presentationSnapshot.currentSettlementId ?? 'none')}  building ${presentationSnapshot.visibleCanonicalHorizonBuildingCount}  landmark ${presentationSnapshot.visibleCanonicalHorizonLandmarkCount}  parts ${presentationSnapshot.visibleCanonicalHorizonPartInstanceCount}  destroyed ${presentationSnapshot.destroyedHorizonBuildingCount}
+Horizon Local: current ${escapeHtml(presentationSnapshot.currentSettlementId ?? 'none')}  building ${presentationSnapshot.visibleCanonicalHorizonBuildingCount}  landmark ${presentationSnapshot.visibleCanonicalHorizonLandmarkCount}  parts ${presentationSnapshot.visibleCanonicalHorizonPartInstanceCount}  destroyed ${presentationSnapshot.destroyedHorizonBuildingCount}
+Horizon Remote: candidates/selected/materialized/visible ${presentationSnapshot.queryRemoteCandidateCount}/${presentationSnapshot.queryRemoteSelectedCount}/${presentationSnapshot.queryRemoteHorizonMaterializedCount}/${presentationSnapshot.visibleRemoteHorizonSettlementCount}  canonical/represented/missing ${presentationSnapshot.remoteHorizonCanonicalBuildingCount}/${presentationSnapshot.remoteHorizonBuildingCount}/${presentationSnapshot.remoteHorizonMissingBuildingCount}  landmark/parts ${presentationSnapshot.remoteHorizonLandmarkCount}/${presentationSnapshot.remoteHorizonPartInstanceCount}  range ${number(presentationSnapshot.remoteHorizonStartMeters)}..${number(presentationSnapshot.remoteHorizonHiddenDistanceMeters)}m  caps ${presentationSnapshot.queryRemoteSettlementLimit}/${presentationSnapshot.queryRemoteBuildingLimitPerSettlement}/${presentationSnapshot.queryRemotePartLimit}  fog ${presentationSnapshot.remoteHorizonFogEnabled ? 'on' : 'off'}  suppressed ${presentationSnapshot.remoteHorizonSuppressedByNearCount}
+Presentation Identity: distant ${presentationSnapshot.distantVisibleStableIdCount}  duplicate ${presentationSnapshot.duplicateVisibleStableIdCount} ${escapeHtml(presentationSnapshot.duplicateVisibleStableIds.join(',') || 'none')}
 Far Query: ultra owner ${presentationSnapshot.queryUltraOwnerChunkCount}  cache ${presentationSnapshot.queryUltraOwnerChunkCacheHits}/${presentationSnapshot.queryUltraOwnerChunkCacheMisses}/${presentationSnapshot.queryUltraOwnerChunkCacheEvictions}  warm ${number(presentationSnapshot.ultraWarmDurationMs)}ms  building owner ${presentationSnapshot.queryBuildingOwnerChunkCount}  cache ${presentationSnapshot.queryFarOwnerChunkCacheHits}/${presentationSnapshot.queryFarOwnerChunkCacheMisses}/${presentationSnapshot.queryFarOwnerChunkCacheEvictions}  inner warm ${number(presentationSnapshot.innerWarmDurationMs)}ms
 Generated: ${runtimeSnapshot.counts.generated}  Loaded: ${runtimeSnapshot.counts.renderLoaded}  Unloaded: ${runtimeSnapshot.counts.renderUnloaded}  Rebase: ${runtimeSnapshot.renderOrigin.rebaseCount}
 Latest crossing: ${number(transition?.durationMs)}ms  generated Δ${transition?.generatedDelta ?? 0}  load Δ${transition?.renderLoadedDelta ?? 0}  unload Δ${transition?.renderUnloadedDelta ?? 0}

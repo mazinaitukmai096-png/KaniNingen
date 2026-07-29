@@ -11,6 +11,7 @@ import {
   SETTLEMENT_BUILDING_TYPES,
   SETTLEMENT_BUILDING_VISUAL_RESOURCES,
   TOWER_PLACEMENT_LIMITS,
+  createSettlementBuildingTypeSelector,
   createSettlementBuildingVisual,
   createSettlementBuildingVisualSummary,
   getTownPaletteTendency,
@@ -38,6 +39,19 @@ function counts(values) {
     values.filter(value => value === type).length,
   ]));
 }
+
+test('incremental building type selector preserves the canonical scalar sequence', () => {
+  for (const [settlementType, townId] of [
+    [SETTLEMENT_TYPES.CITY, 'selector-city'],
+    [SETTLEMENT_TYPES.TOWN, 'selector-town'],
+    [SETTLEMENT_TYPES.RURAL, 'selector-rural'],
+  ]) {
+    const select = createSettlementBuildingTypeSelector({ settlementType, townId });
+    const incremental = Array.from({ length: 100 }, (_, index) => select(index + 1));
+    assert.deepEqual(incremental, plan(settlementType, townId, 100));
+    assert.equal(select(50), incremental[49], 'cached lookup must not advance or alter the sequence');
+  }
+});
 
 test('CITY, TOWN, and RURAL use distinct normalized building compositions', () => {
   assert.deepEqual(SETTLEMENT_BUILDING_COMPOSITIONS.CITY, { house: 55, tower: 32, school: 8, church: 5 });

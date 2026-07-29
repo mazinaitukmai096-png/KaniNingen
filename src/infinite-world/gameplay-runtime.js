@@ -4,6 +4,7 @@ import {
   logicalWorldToOwnedChunk,
   parseChunkKey,
 } from './chunk-coordinates.js';
+import { sampleW8SurfaceHeightMeters } from './w8-surface-policy.js';
 import {
   W6_ATTACK_CONTRACT,
   W6_ENTITY_CONTRACTS,
@@ -381,7 +382,14 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
       canonical ?? candidate,
       type,
       W6_STATIC_TARGET_CONTRACTS[type],
-      canonical?.position ?? candidate.worldPosition,
+      Object.freeze({
+        ...(canonical?.position ?? candidate.worldPosition),
+        y: usesW8Presentation && chunkData.canonicalSurfacePolicy ? sampleW8SurfaceHeightMeters(
+          chunkData,
+          canonical?.position.x ?? candidate.worldPosition.x,
+          canonical?.position.z ?? candidate.worldPosition.z,
+        ) : (canonical?.position.y ?? candidate.worldPosition.y),
+      }),
       radius,
       canonical ? { canonicalObject: canonical } : undefined,
     ));
@@ -400,7 +408,14 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
       rock ?? candidate,
       type,
       W6_STATIC_TARGET_CONTRACTS[type],
-      rock?.worldPosition ?? candidate.worldPosition,
+      Object.freeze({
+        ...(rock?.worldPosition ?? candidate.worldPosition),
+        y: usesW8Presentation && chunkData.canonicalSurfacePolicy ? sampleW8SurfaceHeightMeters(
+          chunkData,
+          rock?.worldPosition.x ?? candidate.worldPosition.x,
+          rock?.worldPosition.z ?? candidate.worldPosition.z,
+        ) : (rock?.worldPosition.y ?? candidate.worldPosition.y),
+      }),
       radius,
       rock ? {
         canonicalObject: rock,

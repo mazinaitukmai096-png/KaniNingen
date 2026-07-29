@@ -1,7 +1,8 @@
 import { BUILDING_LOT_PROFILES, orientedRectanglesOverlap } from '../building-lot.js';
 import {
+  createSettlementBuildingTypeSelector,
   createSettlementBuildingVisual,
-  selectSettlementBuildingType,
+  getTownPaletteTendency,
 } from '../settlement-building-visuals.js';
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { logicalWorldToOwnedChunk } from './chunk-coordinates.js';
@@ -116,6 +117,18 @@ function nearestPointOnSegment(point, start, end) {
   return { x, z, distance: Math.hypot(point.x - x, point.z - z) };
 }
 
+function roadRectangle(road) {
+  const dx = road.end.x - road.start.x;
+  const dz = road.end.z - road.start.z;
+  return {
+    centerX: (road.start.x + road.end.x) / 2,
+    centerZ: (road.start.z + road.end.z) / 2,
+    rotationY: Math.atan2(dx, dz),
+    width: road.widthMeters,
+    depth: Math.hypot(dx, dz),
+  };
+}
+
 async function overlayStableId({ worldSeedHash, settlementId, type, road, slot, side }) {
   return (await createWorldFeatureId({
     stableIdSchema: 'wf1',
@@ -135,9 +148,13 @@ function targetBuildingCount(template) {
   return Math.round(template.requestedBuildingCount * ratio);
 }
 
-export async function createW8SettlementParityOverlay({ candidate, worldSeedHash } = {}) {
+export async function createW8SettlementParityOverlay({
+  candidate,
+  worldSeedHash,
+  sourceTemplate = null,
+} = {}) {
   if (typeof worldSeedHash !== 'string') throw new TypeError('worldSeedHash is required');
-  const template = await createMigratedSettlementTemplate({ candidate });
+  const template = sourceTemplate ?? await createMigratedSettlementTemplate({ candidate });
   const targetCount = targetBuildingCount(template);
   const additionsRequired = Math.max(0, targetCount - template.buildings.length);
   const lots = template.buildings.map(building => lotRectangle({
@@ -160,6 +177,15 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
     .toSorted((left, right) => left.stableId.localeCompare(right.stableId));
   const spacing = W8_SETTLEMENT_PARITY_DENSITY.roadSlotSpacingMeters[template.settlementType];
   let buildingIndex = template.requestedBuildingCount + 1;
+  const selectBuildingType = createSettlementBuildingTypeSelector({
+    settlementType: template.settlementType,
+    townId: template.settlementId,
+  });
+  const townPaletteTendency = getTownPaletteTendency({
+    settlementType: template.settlementType,
+    townId: template.settlementId,
+    townType: template.townType,
+  });
 
   for (const road of roads) {
     if (buildings.length >= additionsRequired) break;
@@ -180,11 +206,7 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
       };
       for (const side of [-1, 1]) {
         if (buildings.length >= additionsRequired) break;
-        let type = selectSettlementBuildingType({
-          settlementType: template.settlementType,
-          townId: template.settlementId,
-          buildingIndex,
-        });
+        let type = selectBuildingType(buildingIndex);
         const profile = BUILDING_LOT_PROFILES[type];
         const outwardX = normalX * side;
         const outwardZ = normalZ * side;
@@ -209,6 +231,15 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
           frontZ,
         });
         const rectangle = { ...lotRectangle({ ...lot, rotationY }) };
+        const footprint = {
+          centerX: x,
+          centerZ: z,
+          rotationY,
+          width: meters(profile.footprintWidth),
+          depth: meters(profile.footprintDepth),
+        };
+        if (roads.some(other => other.stableId !== road.stableId
+          && orientedRectanglesOverlap(footprint, roadRectangle(other)))) continue;
         if (lots.some(existing => orientedRectanglesOverlap(
           rectangle,
           existing,
@@ -226,6 +257,7 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
           buildingIndex,
           routeId: road.routeId,
           records: visualRecords,
+          townPaletteTendency,
         });
         const stableId = await overlayStableId({
           worldSeedHash,
@@ -303,11 +335,7 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
       }
       if (!nearest || nearest.distance > W8_SETTLEMENT_PARITY_DENSITY.maximumRoadAccessMeters
         || nearest.distance < 1e-6) continue;
-      const type = selectSettlementBuildingType({
-        settlementType: template.settlementType,
-        townId: template.settlementId,
-        buildingIndex,
-      });
+      const type = selectBuildingType(buildingIndex);
       const profile = BUILDING_LOT_PROFILES[type];
       const outwardX = (point.x - nearest.x) / nearest.distance;
       const outwardZ = (point.z - nearest.z) / nearest.distance;
@@ -332,6 +360,15 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
         frontZ,
       });
       const rectangle = { ...lotRectangle({ ...lot, rotationY }) };
+      const footprint = {
+        centerX: x,
+        centerZ: z,
+        rotationY,
+        width: meters(profile.footprintWidth),
+        depth: meters(profile.footprintDepth),
+      };
+      if (roads.some(road => road.stableId !== nearest.road.stableId
+        && orientedRectanglesOverlap(footprint, roadRectangle(road)))) continue;
       if (lots.some(existing => orientedRectanglesOverlap(
         rectangle,
         existing,
@@ -345,6 +382,7 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
         buildingIndex,
         routeId: nearest.road.routeId,
         records: visualRecords,
+        townPaletteTendency,
       });
       const stableId = await overlayStableId({
         worldSeedHash,
@@ -405,8 +443,57 @@ export async function createW8SettlementParityOverlay({ candidate, worldSeedHash
     requestedOpportunityCount: template.requestedBuildingCount,
     targetBuildingCount: targetCount,
     sourceBuildingCount: template.buildings.length,
+    sourceBuildings: template.buildings,
+    sourceTemplate: template,
     overlayBuildingCount: buildings.length,
     shortageCount: Math.max(0, additionsRequired - buildings.length),
     buildings: Object.freeze(buildings.sort((left, right) => left.stableId.localeCompare(right.stableId))),
   });
+}
+
+export function composeW8SettlementPresentationTemplate(overlay) {
+  const sourceTemplate = overlay?.sourceTemplate;
+  if (!sourceTemplate || overlay?.settlementId !== sourceTemplate.settlementId) {
+    throw new TypeError('a canonical W8 Settlement overlay is required');
+  }
+  const buildings = [...overlay.sourceBuildings, ...overlay.buildings]
+    .map(building => {
+      if (building.owningChunkCoordinate) return building;
+      const owner = logicalWorldToOwnedChunk(building.x, building.z);
+      return Object.freeze({
+        ...building,
+        owningChunkCoordinate: Object.freeze({ x: owner.chunkX, z: owner.chunkZ }),
+      });
+    })
+    .sort((left, right) => left.stableId.localeCompare(right.stableId));
+  return Object.freeze({
+    ...sourceTemplate,
+    schemaVersion: 'w8-settlement-presentation-template-1',
+    buildings: Object.freeze(buildings),
+    canonicalBuildingCount: buildings.length,
+    sourceBuildingCount: overlay.sourceBuildingCount,
+    overlayBuildingCount: overlay.overlayBuildingCount,
+    parityTargetBuildingCount: overlay.targetBuildingCount,
+    parityBuildingShortageCount: overlay.shortageCount,
+  });
+}
+
+/**
+ * Read-only presentation view of the exact W8 Settlement Building set.
+ *
+ * ChunkData remains the canonical owner of the projected records.  This view
+ * exists so a distant LOD can preserve every Building Stable ID without
+ * generating every owner Chunk merely to discover the Settlement silhouette.
+ */
+export async function createW8SettlementPresentationTemplate({
+  candidate,
+  worldSeedHash,
+} = {}) {
+  const sourceTemplate = await createMigratedSettlementTemplate({ candidate });
+  const overlay = await createW8SettlementParityOverlay({
+    candidate,
+    worldSeedHash,
+    sourceTemplate,
+  });
+  return composeW8SettlementPresentationTemplate(overlay);
 }

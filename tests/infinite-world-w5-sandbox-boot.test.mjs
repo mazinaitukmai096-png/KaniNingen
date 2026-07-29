@@ -373,7 +373,7 @@ function loadPreModuleBridge() {
   return { bridge: windowObject.__infiniteWorldEntryBridge, listeners, hud, html };
 }
 
-test('browser-equivalent W5 entry resolves every import and completes the real main boot path', async () => {
+test('browser-equivalent W5 entry resolves every import and completes the real main boot path', async t => {
   WebGLRenderer.instances.length = 0;
   Scene.instances.length = 0;
   PerspectiveCamera.instances.length = 0;
@@ -397,9 +397,13 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     const outcome = await globalThis.__infiniteWorldBoot.promise;
     const elapsedMs = performance.now() - startedAt;
     assert.equal(outcome.ok, true);
-    assert.ok(elapsedMs < 5_000);
-
     const snapshot = outcome.sandbox.snapshot();
+    t.diagnostic(`boot ${elapsedMs.toFixed(3)}ms; distant sync ${snapshot.presentation.syncDurationMs.toFixed(3)}ms; root swap ${snapshot.presentation.rootSwapDurationMs.toFixed(3)}ms; remote horizon parts ${snapshot.presentation.remoteHorizonPartInstanceCount}`);
+    t.diagnostic(`settlements queried/templates/remote-visible ${snapshot.presentation.queryCandidateCount}/${snapshot.presentation.queryTemplateSuccessCount}/${snapshot.presentation.visibleRemoteHorizonSettlementCount}; full buildings ${snapshot.presentation.canonicalBuildingRecordCount}; remote building/landmark silhouettes ${snapshot.presentation.remoteHorizonBuildingCount}/${snapshot.presentation.remoteHorizonLandmarkCount}`);
+    t.diagnostic(`active Chunk generation ${snapshot.boot.chunkGenerationMs.toFixed(3)}ms; Settlement generation ${snapshot.boot.settlementGenerationMs.toFixed(3)}ms; projection ${snapshot.boot.renderProjectionMs.toFixed(3)}ms; tracked feature instances ${snapshot.resources.trackedFeatureInstanceCount}`);
+    t.diagnostic(`MAJOR Road ${JSON.stringify(snapshot.generator.canonicalMajorRoad)}`);
+    t.diagnostic(`Worker ${JSON.stringify({ ...snapshot.chunkDataService.transport, generatorSnapshot: undefined })}`);
+    assert.ok(elapsedMs < 5_000);
     assert.equal(snapshot.boot.status, 'ready');
     assert.equal(snapshot.boot.stage, 'Ready');
     assert.equal(snapshot.boot.initializationComplete, true);
@@ -430,8 +434,22 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(snapshot.boot.macroRegionsEvaluated >= 53);
     assert.ok(snapshot.boot.rawSettlementCandidateCount >= 39);
     assert.ok(snapshot.boot.acceptedSettlementCandidateCount >= 1);
-    assert.equal(snapshot.boot.materializedSettlementCount, 1);
-    assert.equal(snapshot.generator.templatesMaterialized, 1);
+    assert.ok(snapshot.boot.materializedSettlementCount
+      >= snapshot.boot.initialSettlementCount + snapshot.presentation.queryRemoteSelectedCount);
+    assert.equal(
+      snapshot.boot.materializedSettlementCount,
+      snapshot.generator.templatesMaterialized,
+    );
+    assert.equal(
+      snapshot.generator.templatesMaterialized,
+      snapshot.generator.source.templateCacheMisses,
+    );
+    assert.ok(snapshot.generator.templatesMaterialized
+      >= snapshot.boot.materializedSettlementCount);
+    assert.equal(
+      snapshot.generator.canonicalMajorRoad.settlementTemplateCacheMisses,
+      snapshot.generator.templatesMaterialized,
+    );
     assert.equal(snapshot.boot.startupSurveyExecuted, false);
     assert.equal(snapshot.boot.startupBenchmarkExecuted, false);
     assert.equal(snapshot.gameplay.activeSimulationChunkCount, 9);
@@ -546,7 +564,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         + snapshot.presentation.canonicalRockRecordCount
         + snapshot.presentation.canonicalLandmarkRecordCount
         + snapshot.presentation.canonicalRoadRecordCount
-        + snapshot.presentation.canonicalWorldDetailRecordCount,
+        + snapshot.presentation.canonicalWorldDetailRecordCount
+        + snapshot.presentation.remoteHorizonSyntheticBuildingCount
+        + snapshot.presentation.remoteHorizonSyntheticLandmarkCount,
       snapshot.presentation.canonicalRecordCount,
     );
     assert.ok(snapshot.presentation.canonicalWorldDetailRecordCount >= 0);
@@ -576,8 +596,18 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.queryNaturalOwnerChunkCount, 0);
     assert.equal(snapshot.presentation.queryNaturalCandidateCount, 0);
     assert.equal(snapshot.presentation.rootAttached, true);
-    assert.equal(snapshot.presentation.templateCacheCapacity, 4);
-    assert.ok(snapshot.presentation.templateCacheSize <= 4);
+    assert.equal(snapshot.presentation.templateCacheCapacity, 5);
+    assert.ok(snapshot.presentation.templateCacheSize <= 5);
+    assert.equal(
+      snapshot.presentation.remoteHorizonCanonicalBuildingCount,
+      snapshot.presentation.remoteHorizonBuildingCount,
+    );
+    assert.equal(snapshot.presentation.remoteHorizonMissingBuildingCount, 0);
+    assert.equal(
+      snapshot.presentation.remoteHorizonMergedBuildingCount,
+      snapshot.presentation.canonicalBuildingRecordCount,
+    );
+    assert.equal(snapshot.presentation.duplicateVisibleStableIdCount, 0);
     assert.equal(snapshot.presentation.farOwnerChunkCacheCapacity, 128);
     assert.ok(snapshot.presentation.farOwnerChunkCacheSize <= 128);
     assert.equal(snapshot.presentation.queryConcurrencyLimit, 4);

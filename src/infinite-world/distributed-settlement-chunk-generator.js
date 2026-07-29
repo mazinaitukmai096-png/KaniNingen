@@ -195,19 +195,23 @@ export function validateW5DistributedChunkData(chunkData) {
 export async function createDistributedSettlementChunkGenerator({ worldSeed = 'KaniNingen Infinite Natural World' } = {}) {
   const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed });
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
-  const reviewSettlement = await distributor.findNearestSettlement(0, 0);
+  const reviewSettlement = await distributor.findHomeSettlement(0, 0);
   const templateCache = new Map();
   const templateCacheCapacity = 128;
   let templatesMaterialized = 0;
   let templateGenerationMs = 0;
+  let templateCacheHits = 0;
+  let templateCacheMisses = 0;
 
   async function getTemplate(candidate) {
     if (templateCache.has(candidate.settlementId)) {
+      templateCacheHits += 1;
       const cached = templateCache.get(candidate.settlementId);
       templateCache.delete(candidate.settlementId);
       templateCache.set(candidate.settlementId, cached);
       return cached;
     }
+    templateCacheMisses += 1;
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
     const template = await createMigratedSettlementTemplate({ candidate });
     templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
@@ -222,6 +226,10 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     generatorVersion: W5_GENERATOR_VERSION,
     distributor,
     reviewSpawn: Object.freeze({ ...reviewSettlement.center, settlementId: reviewSettlement.settlementId }),
+    async resolveSettlementTemplate({ candidate } = {}) {
+      if (!candidate?.settlementId) throw new TypeError('Settlement candidate is required');
+      return getTemplate(candidate);
+    },
     async generateChunk(chunkX, chunkZ) {
       const formal = await formalGenerator.generateChunk(chunkX, chunkZ);
       const bounds = chunkBounds(formal.chunkX, formal.chunkZ);
@@ -293,6 +301,8 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       templateCacheCapacity,
       templatesMaterialized,
       templateGenerationMs,
+      templateCacheHits,
+      templateCacheMisses,
       distributor: distributor.snapshot(),
     }),
   });

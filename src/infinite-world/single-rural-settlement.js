@@ -1,15 +1,16 @@
 import {
+  BUILDING_FRONTAGE_PROFILES,
   buildFrontageAnchorPlan,
-  createFrontageCandidatePlacements,
-  frontageSpotsConflict,
+  getFrontagePairGaps,
   selectFrontageRoad,
 } from '../building-frontage.js';
 import { createBuildingLot, orientedRectanglesOverlap } from '../building-lot.js';
-import { buildRoadHierarchy } from '../road-town-structure.js';
+import { buildRoadHierarchy, ROAD_KINDS } from '../road-town-structure.js';
 import {
+  createSettlementBuildingTypeSelector,
   createSettlementBuildingVisual,
+  getTownPaletteTendency,
   isTowerPlacementAllowed,
-  selectSettlementBuildingType,
 } from '../settlement-building-visuals.js';
 import { SETTLEMENT_TYPES } from '../settlement-type.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
@@ -43,7 +44,133 @@ const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
   return Object.is(rounded, -0) ? 0 : rounded;
 };
+const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 const meters = value => q6(value / FINITE_WORLD_UNITS_PER_METER);
+const frontagePairGaps = Object.freeze(Object.fromEntries(
+  Object.keys(APPROXIMATE_BUILDING_RADIUS).map(firstType => [
+    firstType,
+    Object.freeze(Object.fromEntries(
+      Object.keys(APPROXIMATE_BUILDING_RADIUS).map(secondType => [
+        secondType,
+        getFrontagePairGaps(firstType, secondType),
+      ]),
+    )),
+  ]),
+));
+
+function stableFrontageHash(parts) {
+  const text = parts.join('|');
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function createPreparedFrontageRoute(roads) {
+  const routeRoads = roads
+    .filter(road => road.kind !== ROAD_KINDS.START_APPROACH)
+    .sort((first, second) => first.routeOrder - second.routeOrder
+      || first.roadId.localeCompare(second.roadId));
+  const routeSegments = [];
+  let routeLength = 0;
+  for (const segment of routeRoads) {
+    const length = Math.hypot(segment.end.x - segment.start.x, segment.end.z - segment.start.z);
+    routeSegments.push(Object.freeze({ segment, startDistance: routeLength, length }));
+    routeLength += length;
+  }
+  return Object.freeze({ routeSegments: Object.freeze(routeSegments), routeLength });
+}
+
+function visitPreparedFrontageCandidatePlacements({
+  type,
+  road,
+  preparedRoute,
+  buildingIndex,
+  townId,
+  maximumSlotOffset,
+  placementIdentity,
+  visitor,
+}) {
+  const profile = BUILDING_FRONTAGE_PROFILES[type];
+  const selectedSegment = preparedRoute.routeSegments.find(candidate => (
+    candidate.segment.roadId === road.roadId
+  ));
+  if (!profile || !selectedSegment) return null;
+  const baseDistance = selectedSegment.startDistance + road.roadT * selectedSegment.length;
+  const { primarySide, setback } = placementIdentity;
+  for (let attempt = 0; attempt <= maximumSlotOffset * 2; attempt += 1) {
+    const magnitude = Math.ceil(attempt / 2);
+    const slotOffset = attempt === 0 ? 0 : (attempt % 2 === 1 ? magnitude : -magnitude);
+    const routeDistance = baseDistance + slotOffset * profile.slotSpacing;
+    if (routeDistance < 0 || routeDistance > preparedRoute.routeLength) continue;
+    const located = preparedRoute.routeSegments.find(candidate => (
+      routeDistance <= candidate.startDistance + candidate.length + 1e-9
+    )) ?? preparedRoute.routeSegments[preparedRoute.routeSegments.length - 1];
+    const roadT = clamp((routeDistance - located.startDistance) / located.length, 0, 1);
+    const segment = located.segment;
+    const roadAtSlot = {
+      roadId: segment.roadId,
+      routeId: segment.routeId,
+      kind: segment.kind,
+      width: segment.width,
+      tangentX: segment.tangentX,
+      tangentZ: segment.tangentZ,
+      normalX: segment.normalX,
+      normalZ: segment.normalZ,
+      closestX: segment.start.x + (segment.end.x - segment.start.x) * roadT,
+      closestZ: segment.start.z + (segment.end.z - segment.start.z) * roadT,
+      roadT,
+      roadLength: located.length,
+    };
+    for (let sideAttempt = 0; sideAttempt < 2; sideAttempt += 1) {
+      const side = sideAttempt === 0 ? primarySide : -primarySide;
+      const centerDistance = roadAtSlot.width / 2 + profile.frontExtent + setback;
+      const outwardNormalX = roadAtSlot.normalX * side;
+      const outwardNormalZ = roadAtSlot.normalZ * side;
+      const frontageNormalX = -outwardNormalX;
+      const frontageNormalZ = -outwardNormalZ;
+      const accepted = visitor({
+        x: roadAtSlot.closestX + outwardNormalX * centerDistance,
+        z: roadAtSlot.closestZ + outwardNormalZ * centerDistance,
+        rotationY: Math.atan2(frontageNormalX, frontageNormalZ) + profile.frontRotationOffset,
+        frontageRoadId: roadAtSlot.roadId,
+        frontageRoadKind: roadAtSlot.kind,
+        frontageX: roadAtSlot.closestX,
+        frontageZ: roadAtSlot.closestZ,
+        frontageNormalX,
+        frontageNormalZ,
+        setback,
+        centerDistance,
+        roadT: roadAtSlot.roadT,
+        frontageAlong: routeDistance,
+        side,
+        frontageRouteId: road.routeId,
+        slotOffset,
+        sideAttempt,
+      });
+      if (accepted) return accepted;
+    }
+  }
+  return null;
+}
+
+function migratedFrontageSpotsConflict(candidate, existing) {
+  const gaps = frontagePairGaps[candidate.type][existing.type];
+  const minimumDistance = candidate.radius + existing.radius + gaps.passageGap;
+  if ((candidate.x - existing.x) ** 2 + (candidate.z - existing.z) ** 2
+    < minimumDistance ** 2) return true;
+  const sameRoadOrRoute = candidate.frontageRoadId !== null
+    && (candidate.frontageRoadId === existing.frontageRoadId
+      || (candidate.frontageRouteId
+        && candidate.frontageRouteId === existing.frontageRouteId));
+  return sameRoadOrRoute
+    && Number.isFinite(candidate.frontageAlong)
+    && Number.isFinite(existing.frontageAlong)
+    && Math.abs(candidate.frontageAlong - existing.frontageAlong)
+      < candidate.radius + existing.radius + gaps.alongGap;
+}
 
 async function stableId(prefix, input) {
   return `${prefix}:${(await sha256Hex(canonicalizeJson(input))).slice(0, 24)}`;
@@ -81,6 +208,15 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
   });
   const anchors = [...plan.CORE, ...plan.MIDDLE, ...plan.OUTER];
   const roadsById = new Map(hierarchy.roads.map(road => [road.roadId, road]));
+  const roadsByRoute = new Map();
+  for (const road of hierarchy.roads) {
+    if (!roadsByRoute.has(road.routeId)) roadsByRoute.set(road.routeId, []);
+    roadsByRoute.get(road.routeId).push(road);
+  }
+  const preparedRoutes = new Map([...roadsByRoute].map(([routeId, roads]) => [
+    routeId,
+    createPreparedFrontageRoute(roads),
+  ]));
   const requestedBuildingCount = Math.round((town.coreRadius * town.coreRadius) / 36_000);
   const attemptedBuildingCount = town.settlementType === SETTLEMENT_TYPES.CITY
     ? Math.min(requestedBuildingCount, 64)
@@ -91,24 +227,35 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
   const placed = [];
   const lots = [];
   const visualRecords = [];
-
+  const frontageRoadByAnchor = new Map();
+  const frontagePlacementIdentityCache = new Map();
+  const selectBuildingType = createSettlementBuildingTypeSelector({
+    settlementType: town.settlementType,
+    townId: town.id,
+  });
+  const townPaletteTendency = getTownPaletteTendency({
+    settlementType: town.settlementType,
+    townId: town.id,
+    townType: town.type,
+  });
   for (let buildingIndex = 1; buildingIndex <= attemptedBuildingCount; buildingIndex += 1) {
-    let type = selectSettlementBuildingType({
-      settlementType: town.settlementType,
-      townId: town.id,
-      buildingIndex,
-    });
+    let type = selectBuildingType(buildingIndex);
     let accepted = null;
     let acceptedLot = null;
     let acceptedRouteId = null;
     for (let anchorOffset = 0; anchorOffset < anchorSearchLimit && !accepted; anchorOffset += 1) {
       const anchor = anchors[(buildingIndex * 17 + anchorOffset) % anchors.length];
-      const selectedRoad = selectFrontageRoad({
-        x: anchor.x,
-        z: anchor.z,
-        roads: hierarchy.roads,
-        townId: town.id,
-      });
+      const anchorKey = `${anchor.x},${anchor.z}`;
+      let selectedRoad = frontageRoadByAnchor.get(anchorKey);
+      if (selectedRoad === undefined) {
+        selectedRoad = selectFrontageRoad({
+          x: anchor.x,
+          z: anchor.z,
+          roads: hierarchy.roads,
+          townId: town.id,
+        });
+        frontageRoadByAnchor.set(anchorKey, selectedRoad);
+      }
       if (!selectedRoad) continue;
       if (type === 'tower' && !isTowerPlacementAllowed({
         settlementType: town.settlementType,
@@ -117,44 +264,63 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
         z: anchor.z,
         records: visualRecords,
       })) type = 'house';
-      const candidates = createFrontageCandidatePlacements({
+      const placementIdentityKey = `${buildingIndex}|${type}|${selectedRoad.roadId}`;
+      let placementIdentity = frontagePlacementIdentityCache.get(placementIdentityKey);
+      if (!placementIdentity) {
+        const identity = [town.id, selectedRoad.roadId, type, buildingIndex];
+        const variationUnit = stableFrontageHash([...identity, 'setback']) / 0xffffffff * 2 - 1;
+        placementIdentity = Object.freeze({
+          primarySide: stableFrontageHash([...identity, 'side']) % 2 === 0 ? -1 : 1,
+          setback: clamp(
+            BUILDING_FRONTAGE_PROFILES[type].setback
+              * (1 + variationUnit * BUILDING_FRONTAGE_PROFILES[type].variation),
+            BUILDING_FRONTAGE_PROFILES[type].minSetback,
+            BUILDING_FRONTAGE_PROFILES[type].maxSetback,
+          ),
+        });
+        frontagePlacementIdentityCache.set(placementIdentityKey, placementIdentity);
+      }
+      const acceptedCandidate = visitPreparedFrontageCandidatePlacements({
         type,
         road: selectedRoad,
-        roads: hierarchy.roads,
+        preparedRoute: preparedRoutes.get(selectedRoad.routeId),
         buildingIndex,
         townId: town.id,
         maximumSlotOffset: 8,
-      }).placements;
-      for (const candidate of candidates) {
-        const spot = {
-          ...candidate,
-          radius: APPROXIMATE_BUILDING_RADIUS[type],
-          type,
-          frontageRouteId: candidate.frontageRouteId ?? selectedRoad.routeId,
-        };
-        if (Math.hypot(candidate.x - town.x, candidate.z - town.z)
-          > town.radius - APPROXIMATE_BUILDING_RADIUS[type]) continue;
-        if (placed.some(existing => frontageSpotsConflict(spot, existing))) continue;
-        const road = roadsById.get(candidate.frontageRoadId);
-        let lot;
-        try {
-          lot = createBuildingLot({
-            buildingType: type,
-            buildingIndex,
-            buildingX: candidate.x,
-            buildingZ: candidate.z,
-            rotationY: candidate.rotationY,
-            frontage: candidate,
-            road,
-          });
-        } catch {
-          continue;
-        }
-        if (lots.some(existing => orientedRectanglesOverlap(lot, existing))) continue;
-        accepted = spot;
-        acceptedLot = lot;
-        acceptedRouteId = spot.frontageRouteId;
-        break;
+        placementIdentity,
+        visitor: candidate => {
+          const spot = {
+            ...candidate,
+            radius: APPROXIMATE_BUILDING_RADIUS[type],
+            type,
+            frontageRouteId: candidate.frontageRouteId ?? selectedRoad.routeId,
+          };
+          if (Math.hypot(candidate.x - town.x, candidate.z - town.z)
+            > town.radius - APPROXIMATE_BUILDING_RADIUS[type]) return null;
+          if (placed.some(existing => migratedFrontageSpotsConflict(spot, existing))) return null;
+          const road = roadsById.get(candidate.frontageRoadId);
+          let lot;
+          try {
+            lot = createBuildingLot({
+              buildingType: type,
+              buildingIndex,
+              buildingX: candidate.x,
+              buildingZ: candidate.z,
+              rotationY: candidate.rotationY,
+              frontage: candidate,
+              road,
+            });
+          } catch {
+            return null;
+          }
+          if (lots.some(existing => orientedRectanglesOverlap(lot, existing))) return null;
+          return { spot, lot };
+        },
+      });
+      if (acceptedCandidate) {
+        accepted = acceptedCandidate.spot;
+        acceptedLot = acceptedCandidate.lot;
+        acceptedRouteId = acceptedCandidate.spot.frontageRouteId;
       }
     }
     if (!accepted) continue;
@@ -166,6 +332,7 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
       buildingIndex,
       routeId: acceptedRouteId,
       records: visualRecords,
+      townPaletteTendency,
     });
     const visualRecord = Object.freeze({
       townId: town.id,
@@ -180,7 +347,8 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
       wallPaletteIndex: visual.wallPaletteIndex,
       roofPaletteIndex: visual.roofPaletteIndex,
     });
-    placed.push({ ...accepted, buildingIndex, visual, lot: acceptedLot });
+    const placedRecord = { ...accepted, buildingIndex, visual, lot: acceptedLot };
+    placed.push(placedRecord);
     lots.push(acceptedLot);
     visualRecords.push(visualRecord);
   }
