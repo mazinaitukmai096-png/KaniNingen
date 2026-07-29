@@ -56,7 +56,7 @@ function createFixture({
     'charge-ui', 'charge-bar-fill', 'charge-label', 'news-ticker', 'settings-modal',
     'settings-close-btn', 'set-home-btn', 'set-reset-btn', 'resume-overlay', 'debug-modal',
     'debug-close-btn', 'debug-summary', 'debug-tree-lod-overlay-off-btn', 'debug-tree-lod-overlay-on-btn', 'debug-spawn-boss-btn', 'set-mouse', 'val-mouse', 'set-vol', 'val-vol',
-    'set-quality', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
+    'set-quality', 'set-render-distance', 'set-fps-counter', 'set-fps-cap', 'set-shake', 'val-shake', 'final-score',
     'set-antialias', 'antialias-note',
     'game-over', 'restart-button',
     'nuclear-flash',
@@ -64,6 +64,7 @@ function createFixture({
   if (exposeDeveloperTools) ids.push('set-developer-tools', 'developer-tools-section');
   const elements = new Map(ids.map(id => [id, createElement()]));
   elements.get('set-quality').value = 'high';
+  elements.get('set-render-distance').value = 'current';
   const bodyClasses = new Set();
   const documentObject = new FakeEventTarget();
   Object.assign(documentObject, {
@@ -95,7 +96,7 @@ function createFixture({
     experience: {
       hudHidden: false,
       settings: {
-        mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
+        mouseSensitivity: 1, volume: 0.5, quality: 'high', renderDistance: 'current', showFps: false,
         fpsCap: 0, cameraShake: 1, antialias: true,
       },
     },
@@ -643,6 +644,9 @@ test('debug stays transient while HUD visibility and settings use the existing W
   fixture.elements.get('set-antialias').checked = false;
   fixture.elements.get('set-antialias').dispatch('change');
   assert.equal(fixture.worldState.experience.settings.antialias, false);
+  fixture.elements.get('set-render-distance').value = 'short';
+  fixture.elements.get('set-render-distance').dispatch('change');
+  assert.equal(fixture.worldState.experience.settings.renderDistance, 'short');
   assert.equal(fixture.elements.get('antialias-note').style.display, 'block');
   fixture.globalObject.dispatch('keydown', { code: 'Tab' });
   assert.equal(fixture.shell.snapshot().debugOpen, true);

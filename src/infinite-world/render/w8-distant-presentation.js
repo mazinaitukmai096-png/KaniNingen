@@ -10,13 +10,17 @@ import {
   isW8NaturalCandidateVisible,
 } from '../w8-natural-presentation-policy.js';
 import {
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  W8_RENDER_DISTANCE_PRESETS,
+  normalizeW8RenderDistancePreset,
+  resolveW8RenderDistancePolicy,
+} from '../render-distance-policy.js';
+import {
   resolveW8RockCanonicalObject,
   resolveW8RockVisibilityMeters,
 } from '../rock-canonical-object.js';
 import {
   W8_CANONICAL_VISIBILITY_METERS,
-  W8_HIGH_HORIZON_LOD_METERS,
-  W8_HIGH_TREE_LOD_METERS,
   resolveW8CanonicalWorldObject,
   resolveW8NaturalCandidateVisual,
   resolveW8ObjectVisibilityMeters,
@@ -58,9 +62,9 @@ export {
 } from '../world-object-canonical-contract.js';
 
 const FIVE_BY_FIVE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 2.5;
-const CLIPMAP_EXTENT_METERS = 352;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
+const RIVER_CORRIDOR_WINDOW_CACHE_CAPACITY = 6;
 const DISTANT_ROCK_PROXY_LIMIT = 0;
 const DISTANT_WATER_PROXY_LIMIT = 24;
 const TEMPLATE_CACHE_CAPACITY = 5;
@@ -68,14 +72,6 @@ const FAR_OWNER_CHUNK_CACHE_CAPACITY = 128;
 const ULTRA_OWNER_CHUNK_CACHE_CAPACITY = 256;
 const CANONICAL_QUERY_CONCURRENCY = 4;
 const CANONICAL_QUERY_MARGIN_METERS = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS;
-const NATURAL_QUERY_MARGIN_METERS = LOGICAL_CHUNK_SIZE_METERS / Math.SQRT2;
-const W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS = W8_HIGH_TREE_LOD_METERS.silhouetteVisibility;
-const W8_HIGH_TREE_SILHOUETTE_HANDOFF_METERS = W8_HIGH_TREE_LOD_METERS.fullToSilhouette;
-const W8_HIGH_TREE_ULTRA_HANDOFF_METERS = W8_HIGH_TREE_LOD_METERS.silhouetteToUltra;
-const W8_HIGH_TREE_ULTRA_VISIBILITY_METERS = W8_HIGH_TREE_LOD_METERS.ultraVisibility;
-const W8_HIGH_TREE_ULTRA_FADE_START_METERS = W8_HIGH_TREE_LOD_METERS.ultraFadeStart;
-const W8_HIGH_BUILDING_HORIZON_START_METERS = W8_HIGH_HORIZON_LOD_METERS.start;
-const W8_HIGH_BUILDING_HORIZON_FADE_START_METERS = W8_HIGH_HORIZON_LOD_METERS.fadeStart;
 
 export const W8_PRESENTATION_TERRAIN_PALETTE = Object.freeze([
   Object.freeze([0x7d / 255, 0x8f / 255, 0x4f / 255]),
@@ -117,10 +113,14 @@ export function resolveW8CanonicalCandidateSet(chunkData) {
   });
 }
 
-export function isW8DistantNaturalProxyInRange(distanceMeters) {
+export function isW8DistantNaturalProxyInRange(
+  distanceMeters,
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+) {
+  const extent = resolveW8RenderDistancePolicy(renderDistancePreset).terrainRiverExtentMeters;
   return Number.isFinite(distanceMeters)
     && distanceMeters >= 0
-    && distanceMeters < CLIPMAP_EXTENT_METERS - 12;
+    && distanceMeters < extent - 12;
 }
 
 function requireConstructor(THREE, name) {
@@ -160,22 +160,27 @@ function cellRoll(seed, x, z, salt = 0) {
   return (value >>> 0) / 0x1_0000_0000;
 }
 
-function clipmapAxis() {
+function clipmapAxis(extentMeters) {
   const values = [];
   const addRange = (from, to, step) => {
     for (let value = from; value < to - 1e-9; value += step) values.push(value);
   };
-  addRange(-CLIPMAP_EXTENT_METERS, -192, 16);
+  addRange(-extentMeters, -192, 16);
   addRange(-192, -96, 8);
   addRange(-96, 96, 4);
   addRange(96, 192, 8);
-  addRange(192, CLIPMAP_EXTENT_METERS, 16);
-  values.push(CLIPMAP_EXTENT_METERS);
+  addRange(192, extentMeters, 16);
+  values.push(extentMeters);
   return values;
 }
 
-export function createW8ClipmapTopology() {
-  const axis = clipmapAxis();
+export function createW8ClipmapTopology(
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+) {
+  const extentMeters = resolveW8RenderDistancePolicy(
+    renderDistancePreset,
+  ).terrainRiverExtentMeters;
+  const axis = clipmapAxis(extentMeters);
   const vertices = [];
   const indices = [];
   const vertexByCoordinate = new Map();
@@ -204,12 +209,20 @@ export function createW8ClipmapTopology() {
     }
   }
   return Object.freeze({
+    extentMeters,
     vertices: Object.freeze(vertices),
     indices: Object.freeze(indices),
   });
 }
 
-const CLIPMAP_TOPOLOGY = createW8ClipmapTopology();
+const CLIPMAP_TOPOLOGY_BY_PRESET = new Map();
+const clipmapTopologyFor = renderDistancePreset => {
+  const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
+  if (!CLIPMAP_TOPOLOGY_BY_PRESET.has(presetId)) {
+    CLIPMAP_TOPOLOGY_BY_PRESET.set(presetId, createW8ClipmapTopology(presetId));
+  }
+  return CLIPMAP_TOPOLOGY_BY_PRESET.get(presetId);
+};
 
 export function sampleW8DistantTerrainAt(chunkData, worldX, worldZ) {
   const terrain = chunkData?.terrain;
@@ -309,6 +322,7 @@ export async function createW8DistantPresentation({
   getNearVisibleStableIds = () => [],
   getNearVisibleSettlementIds = () => [],
   measure = (_stage, operation) => operation(),
+  yieldToMainThread = () => new Promise(resolve => globalThis.setTimeout(resolve, 0)),
 } = {}) {
   if (!scene?.add || !scene?.remove) throw new TypeError('a Three.js scene is required');
   if (typeof findSettlementsNear !== 'function'
@@ -448,6 +462,9 @@ export async function createW8DistantPresentation({
   let localTerrainLastMidgroundOwnerCount = 0;
   let localTerrainLastMissingOwnerKeys = Object.freeze([]);
   let localTerrainLastRejectionReason = null;
+  let localTerrainLastSyncDurationMs = 0;
+  let localTerrainLastRootSwapDurationMs = 0;
+  let localTerrainLastMaximumSliceMs = 0;
   let stagingLocalTerrainRootId = null;
   const pendingFarSyncEpochs = new Set();
   let activeQueryCount = 0;
@@ -457,6 +474,7 @@ export async function createW8DistantPresentation({
   const farOwnerChunkCache = new Map();
   const ultraOwnerChunkCache = new Map();
   const clipmapSampleCache = new Map();
+  const riverCorridorWindowCache = new Map();
   let currentCanonicalSurfacePolicy = null;
   const surfacePolicyForChunks = (chunks, additionalRiverCorridors = []) => {
     const regions = new Map();
@@ -480,7 +498,19 @@ export async function createW8DistantPresentation({
         .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))),
     });
   };
-  const riverSurfaceCorridorsForClipmap = (centerChunkX, centerChunkZ, policy) => {
+  const riverSurfaceCorridorsForClipmap = (
+    centerChunkX,
+    centerChunkZ,
+    policy,
+    terrainRiverExtentMeters,
+  ) => {
+    const cacheKey = `${centerChunkX},${centerChunkZ}:${terrainRiverExtentMeters}`;
+    if (riverCorridorWindowCache.has(cacheKey)) {
+      const cached = riverCorridorWindowCache.get(cacheKey);
+      riverCorridorWindowCache.delete(cacheKey);
+      riverCorridorWindowCache.set(cacheKey, cached);
+      return cached;
+    }
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const settlementReferences = (policy?.regions ?? []).map(region => ({
@@ -489,16 +519,16 @@ export async function createW8DistantPresentation({
       radiusMeters: region.flatCoreRadiusMeters + region.transitionWidthMeters,
     }));
     const minimumChunkX = Math.floor(
-      (centerWorldX - CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (centerWorldX - terrainRiverExtentMeters) / LOGICAL_CHUNK_SIZE_METERS,
     );
     const maximumChunkX = Math.floor(
-      (centerWorldX + CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (centerWorldX + terrainRiverExtentMeters) / LOGICAL_CHUNK_SIZE_METERS,
     );
     const minimumChunkZ = Math.floor(
-      (centerWorldZ - CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (centerWorldZ - terrainRiverExtentMeters) / LOGICAL_CHUNK_SIZE_METERS,
     );
     const maximumChunkZ = Math.floor(
-      (centerWorldZ + CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (centerWorldZ + terrainRiverExtentMeters) / LOGICAL_CHUNK_SIZE_METERS,
     );
     const corridors = [];
     for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
@@ -517,7 +547,25 @@ export async function createW8DistantPresentation({
         if (corridor) corridors.push(corridor);
       }
     }
-    return corridors;
+    const result = Object.freeze(corridors);
+    riverCorridorWindowCache.set(cacheKey, result);
+    if (riverCorridorWindowCache.size > RIVER_CORRIDOR_WINDOW_CACHE_CAPACITY) {
+      riverCorridorWindowCache.delete(riverCorridorWindowCache.keys().next().value);
+    }
+    return result;
+  };
+  const rememberRiverCorridorWindow = ({
+    centerChunkX,
+    centerChunkZ,
+    terrainRiverExtentMeters,
+    corridors,
+  }) => {
+    const cacheKey = `${centerChunkX},${centerChunkZ}:${terrainRiverExtentMeters}`;
+    riverCorridorWindowCache.delete(cacheKey);
+    riverCorridorWindowCache.set(cacheKey, Object.freeze([...corridors]));
+    if (riverCorridorWindowCache.size > RIVER_CORRIDOR_WINDOW_CACHE_CAPACITY) {
+      riverCorridorWindowCache.delete(riverCorridorWindowCache.keys().next().value);
+    }
   };
   let clipmapSampleCacheHits = 0;
   let clipmapSampleCacheMisses = 0;
@@ -531,6 +579,7 @@ export async function createW8DistantPresentation({
   let treeLodDiagnosticsEnabled = false;
   let disposed = false;
   const SYNC_CANCELLED = Symbol('w8-distant-sync-cancelled');
+  const LOCAL_SYNC_CANCELLED = Symbol('w8-local-terrain-sync-cancelled');
 
   const acceptCommittedRenderOrigin = renderOrigin => {
     if (!Number.isSafeInteger(renderOrigin?.renderOriginChunkX)
@@ -935,7 +984,7 @@ export async function createW8DistantPresentation({
       ?? parts.find(part => part !== body && /tower|roof/i.test(part.geometry ?? ''))
       ?? parts.find(part => part !== body)
       ?? null;
-    return (quality === 'medium' ? [body] : [body, cap]).filter(Boolean);
+    return (quality === 'high' ? [body, cap] : [body]).filter(Boolean);
   };
 
   const remoteHorizonRecord = ({
@@ -1029,6 +1078,7 @@ export async function createW8DistantPresentation({
     const canonicalBuildings = selectRemoteHorizonBuildings({
       template,
       quality: buildGeneration.quality,
+      renderDistancePreset: buildGeneration.renderDistancePreset,
     });
     const sources = [
       ...canonicalBuildings.map(source => ({ source, kind: 'building' })),
@@ -1244,10 +1294,10 @@ export async function createW8DistantPresentation({
         );
       }
     }
-    if (isHorizonRecord(record) && buildGeneration.quality === 'high') {
+    if (isHorizonRecord(record)) {
       const horizonBucket = record.featureType === 'settlement-building'
         ? 'horizon-building' : 'horizon-landmark';
-      for (const part of canonicalHorizonParts(parts)) {
+      for (const part of canonicalHorizonParts(parts, buildGeneration.quality)) {
         addCanonicalMatrix(
           registration.object,
           part.geometry,
@@ -1316,7 +1366,7 @@ export async function createW8DistantPresentation({
         });
         const rockVisibilityMeters = resolveW8RockVisibilityMeters(
           record,
-          buildGeneration.quality,
+          buildGeneration.renderDistancePreset,
         );
         if (naturalQueryCenter && Math.hypot(
           candidate.worldPosition.x - naturalQueryCenter.x,
@@ -1524,8 +1574,9 @@ export async function createW8DistantPresentation({
       const firstAngle = index / segmentCount * Math.PI * 2;
       const secondAngle = (index + 1) / segmentCount * Math.PI * 2;
       for (const angle of [firstAngle, secondAngle]) {
-        const worldX = generation.playerX + Math.cos(angle) * W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS;
-        const worldZ = generation.playerZ + Math.sin(angle) * W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS;
+        const ringMeters = generation.renderDistancePolicy.treeLod.silhouetteVisibility;
+        const worldX = generation.playerX + Math.cos(angle) * ringMeters;
+        const worldZ = generation.playerZ + Math.sin(angle) * ringMeters;
         positions.push(
           (worldX - originX) * UNITS_PER_METER,
           (baseClipmapSample(worldX, worldZ).height + 0.18) * UNITS_PER_METER,
@@ -1627,7 +1678,11 @@ export async function createW8DistantPresentation({
     });
     const ring = new LineSegments(ringGeometry, ringMaterial);
     ring.name = 'w8-tree-lod-debug-84m-ring';
-    ring.userData = { presentationOnly: true, debugOnly: true, radiusMeters: 84 };
+    ring.userData = {
+      presentationOnly: true,
+      debugOnly: true,
+      radiusMeters: generation.renderDistancePolicy.treeLod.silhouetteVisibility,
+    };
     ring.renderOrder = 10_002;
     ring.frustumCulled = false;
     rootDiagnostic.add(ring);
@@ -1660,26 +1715,32 @@ export async function createW8DistantPresentation({
     generation.treeLodDiagnostics = null;
   };
 
-  const canonicalTreePresentationTier = (object, distanceMeters, quality, visible) => {
+  const canonicalTreePresentationTier = (
+    object,
+    distanceMeters,
+    quality,
+    visible,
+    treeLod,
+  ) => {
     if (!visible) return null;
     if (object.record.featureType !== 'natural-vegetation'
-      || object.record.subtype === 'shrub'
-      || quality !== 'high') return 'full';
-    if (distanceMeters >= W8_HIGH_TREE_ULTRA_VISIBILITY_METERS) return null;
-    if (distanceMeters >= W8_HIGH_TREE_ULTRA_FADE_START_METERS) {
-      const fade = 1 - smoothstep((distanceMeters - W8_HIGH_TREE_ULTRA_FADE_START_METERS)
-        / (W8_HIGH_TREE_ULTRA_VISIBILITY_METERS - W8_HIGH_TREE_ULTRA_FADE_START_METERS));
+      || object.record.subtype === 'shrub') return 'full';
+    if (distanceMeters >= treeLod.ultraVisibility) return null;
+    if (distanceMeters >= treeLod.ultraFadeStart) {
+      const fade = 1 - smoothstep((distanceMeters - treeLod.ultraFadeStart)
+        / (treeLod.ultraVisibility - treeLod.ultraFadeStart));
       const ditherRank = textHash(`${object.stableId}:w8-high-tree-ultra-fade`) / 0x1_0000_0000;
       if (!(ditherRank < fade)) return null;
     }
     const rank = textHash(object.stableId) / 0x1_0000_0000;
-    const fullHandoff = W8_HIGH_TREE_SILHOUETTE_HANDOFF_METERS.minimum
-      + (W8_HIGH_TREE_SILHOUETTE_HANDOFF_METERS.maximum
-        - W8_HIGH_TREE_SILHOUETTE_HANDOFF_METERS.minimum) * rank;
+    const fullHandoff = treeLod.fullToSilhouette.minimum
+      + (treeLod.fullToSilhouette.maximum
+        - treeLod.fullToSilhouette.minimum) * rank;
     if (distanceMeters < fullHandoff) return 'full';
-    const ultraHandoff = W8_HIGH_TREE_ULTRA_HANDOFF_METERS.minimum
-      + (W8_HIGH_TREE_ULTRA_HANDOFF_METERS.maximum
-        - W8_HIGH_TREE_ULTRA_HANDOFF_METERS.minimum) * rank;
+    if (quality !== 'high') return 'silhouette';
+    const ultraHandoff = treeLod.silhouetteToUltra.minimum
+      + (treeLod.silhouetteToUltra.maximum
+        - treeLod.silhouetteToUltra.minimum) * rank;
     return distanceMeters < ultraHandoff ? 'silhouette' : 'ultra';
   };
 
@@ -1689,34 +1750,43 @@ export async function createW8DistantPresentation({
     quality,
     visible,
     currentSettlementId,
+    settlementLod,
   ) => {
     if (!visible) return null;
-    if (!isHorizonRecord(object.record) || quality !== 'high') return 'full';
+    if (!isHorizonRecord(object.record)) return 'full';
     if (!currentSettlementId || object.settlementId !== currentSettlementId) return 'full';
-    if (distanceMeters >= W8_CANONICAL_VISIBILITY_METERS.high) return null;
-    if (distanceMeters >= W8_HIGH_BUILDING_HORIZON_FADE_START_METERS) {
-      const fade = 1 - smoothstep((distanceMeters - W8_HIGH_BUILDING_HORIZON_FADE_START_METERS)
-        / (W8_CANONICAL_VISIBILITY_METERS.high - W8_HIGH_BUILDING_HORIZON_FADE_START_METERS));
+    if (distanceMeters >= settlementLod.visibilityMeters) return null;
+    if (distanceMeters >= settlementLod.fadeStartMeters) {
+      const fade = 1 - smoothstep((distanceMeters - settlementLod.fadeStartMeters)
+        / (settlementLod.visibilityMeters - settlementLod.fadeStartMeters));
       const ditherRank = textHash(`${object.stableId}:w8-high-building-horizon-fade`) / 0x1_0000_0000;
       if (!(ditherRank < fade)) return null;
     }
-    return distanceMeters < W8_HIGH_BUILDING_HORIZON_START_METERS ? 'full' : 'horizon';
+    return distanceMeters < settlementLod.fullDistanceMeters ? 'full' : 'horizon';
   };
 
-  const remoteSettlementPresentationTier = (object, boundaryDistanceMeters, quality, visible) => {
+  const remoteSettlementPresentationTier = (
+    object,
+    boundaryDistanceMeters,
+    quality,
+    renderDistancePreset,
+    visible,
+  ) => {
     if (!visible || !object.remoteHorizon) return null;
-    const policy = resolveW8SettlementPresentationPolicy(quality).remote;
-    if (!policy.settlementLimit && quality === 'low') return null;
+    const policy = resolveW8SettlementPresentationPolicy(
+      quality,
+      renderDistancePreset,
+    ).remote;
     if (boundaryDistanceMeters > policy.hiddenDistanceMeters) return null;
     return 'remote-horizon';
   };
 
   const updateCanonicalVisibility = (generation, playerX, playerZ) => {
     if (!generation) return;
-    const visibility = W8_CANONICAL_VISIBILITY_METERS[generation.quality]
-      ?? W8_CANONICAL_VISIBILITY_METERS.high;
-    const naturalVisibility = W8_NATURAL_CANONICAL_VISIBILITY_METERS[generation.quality]
-      ?? W8_NATURAL_CANONICAL_VISIBILITY_METERS.high;
+    const renderDistancePolicy = generation.renderDistancePolicy
+      ?? resolveW8RenderDistancePolicy(generation.renderDistancePreset);
+    const visibility = renderDistancePolicy.generalObjectVisibilityMeters;
+    const naturalVisibility = renderDistancePolicy.naturalVisibilityMeters;
     let farCount = 0;
     let midCount = 0;
     let nearCount = 0;
@@ -1780,12 +1850,9 @@ export async function createW8DistantPresentation({
       const natural = object.record.featureType === 'natural-vegetation'
         || rock;
       const policyVisibility = object.record.lodPolicy
-        ? resolveW8ObjectVisibilityMeters(object.record, generation.quality)
+        ? resolveW8ObjectVisibilityMeters(object.record, generation.renderDistancePreset)
         : null;
-      const objectNaturalVisibility = policyVisibility ?? (
-        generation.quality === 'high' && tree
-          ? W8_HIGH_TREE_ULTRA_VISIBILITY_METERS : naturalVisibility
-      );
+      const objectNaturalVisibility = policyVisibility ?? naturalVisibility;
       const objectVisibility = policyVisibility ?? visibility;
       const insideNaturalVisibility = generation.quality === 'high' && tree
         ? distanceMeters < objectNaturalVisibility
@@ -1794,6 +1861,7 @@ export async function createW8DistantPresentation({
         object,
         remoteBoundaryDistanceMeters,
         generation.quality,
+        generation.renderDistancePreset,
         !nearVisibleStableIds.has(object.stableId),
       );
       const hasLocalPresentation = object.instances.some(instance => (
@@ -1803,8 +1871,8 @@ export async function createW8DistantPresentation({
       if (object.destructible && isFeatureDestroyed(object.stableId)) {
         nextLod = 'destroyed';
         if (isHorizonRecord(object.record)
-          && distanceMeters >= W8_HIGH_BUILDING_HORIZON_START_METERS
-          && distanceMeters < W8_CANONICAL_VISIBILITY_METERS.high) {
+          && distanceMeters >= renderDistancePolicy.settlementLod.fullDistanceMeters
+          && distanceMeters < renderDistancePolicy.settlementLod.visibilityMeters) {
           destroyedHorizonBuildingCount += 1;
         }
       } else if (nearVisibleStableIds.has(object.stableId)
@@ -1829,6 +1897,7 @@ export async function createW8DistantPresentation({
           distanceMeters,
           generation.quality,
           distantVisible,
+          renderDistancePolicy.treeLod,
         )
         : canonicalSettlementPresentationTier(
           object,
@@ -1836,6 +1905,7 @@ export async function createW8DistantPresentation({
           generation.quality,
           distantVisible,
           generation.currentSettlementId,
+          renderDistancePolicy.settlementLod,
         );
       if (distantVisible && object.remoteHorizon && !hasLocalPresentation) {
         presentationTier = remoteTier;
@@ -1871,20 +1941,20 @@ export async function createW8DistantPresentation({
         else {
           visibleTreeCount += 1;
           if ((nextLod === 'far' || nextLod === 'mid')
-            && distanceMeters >= 56
-            && distanceMeters < W8_HIGH_TREE_ULTRA_HANDOFF_METERS.minimum) {
+            && distanceMeters >= renderDistancePolicy.treeLod.fullToSilhouette.maximum
+            && distanceMeters < renderDistancePolicy.treeLod.silhouetteToUltra.minimum) {
             visibleTreeMidBandCount += 1;
           } else if ((nextLod === 'far' || nextLod === 'mid')
-            && distanceMeters >= W8_HIGH_TREE_ULTRA_HANDOFF_METERS.minimum
-            && distanceMeters < W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS) {
+            && distanceMeters >= renderDistancePolicy.treeLod.silhouetteToUltra.minimum
+            && distanceMeters < renderDistancePolicy.treeLod.silhouetteVisibility) {
             visibleTreeOuterBandCount += 1;
           } else if ((nextLod === 'far' || nextLod === 'mid')
-            && distanceMeters >= W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS
-            && distanceMeters < W8_HIGH_TREE_ULTRA_FADE_START_METERS) {
+            && distanceMeters >= renderDistancePolicy.treeLod.silhouetteVisibility
+            && distanceMeters < renderDistancePolicy.treeLod.ultraFadeStart) {
             visibleTreeUltraInnerBandCount += 1;
           } else if ((nextLod === 'far' || nextLod === 'mid')
-            && distanceMeters >= W8_HIGH_TREE_ULTRA_FADE_START_METERS
-            && distanceMeters < W8_HIGH_TREE_ULTRA_VISIBILITY_METERS) {
+            && distanceMeters >= renderDistancePolicy.treeLod.ultraFadeStart
+            && distanceMeters < renderDistancePolicy.treeLod.ultraVisibility) {
             visibleTreeUltraOuterBandCount += 1;
           }
           const visibleTreeTier = nextLod === 'near'
@@ -1985,20 +2055,29 @@ export async function createW8DistantPresentation({
     if (!activeGeneration) return true;
     activeGeneration.activeKeys = new Set(activeDataKeys);
     activeGeneration.renderedKeys = new Set(renderedKeys);
-    activeGeneration.quality = quality;
     positionGenerationForOrigin(activeGeneration, renderOrigin);
     updateFarRiverVisibility(activeGeneration);
     updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
     return true;
   };
 
-  const createClipmap = ({ centerChunkX, centerChunkZ, activeChunks, origin }) => {
+  const prepareClipmapBuild = ({
+    centerChunkX,
+    centerChunkZ,
+    activeChunks,
+    origin,
+    renderDistancePreset,
+    stats = buildStats,
+    target = buildTarget,
+    ownedGeometries = buildOwnedGeometries,
+  }) => {
+    const topology = clipmapTopologyFor(renderDistancePreset);
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
     const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
     const positions = []; const colors = [];
-    for (const { x, z } of CLIPMAP_TOPOLOGY.vertices) {
+    const sampleVertex = ({ x, z }) => {
       const worldX = centerWorldX + x; const worldZ = centerWorldZ + z;
       const base = baseClipmapSample(worldX, worldZ);
       let height = base.height;
@@ -2018,12 +2097,12 @@ export async function createW8DistantPresentation({
             color[channel] += (actual.color[channel] - boundaryBase.color[channel]) * activeWeight;
           }
           if (Math.abs(distanceOutside) < 1e-9) {
-            buildStats.maximumInnerBoundaryErrorMeters = Math.max(
-              buildStats.maximumInnerBoundaryErrorMeters,
+            stats.maximumInnerBoundaryErrorMeters = Math.max(
+              stats.maximumInnerBoundaryErrorMeters,
               Math.abs(height - actual.height),
             );
-            buildStats.maximumInnerBoundaryColorDifference = Math.max(
-              buildStats.maximumInnerBoundaryColorDifference,
+            stats.maximumInnerBoundaryColorDifference = Math.max(
+              stats.maximumInnerBoundaryColorDifference,
               ...color.map((channel, index) => Math.abs(channel - actual.color[index])),
             );
           }
@@ -2032,19 +2111,58 @@ export async function createW8DistantPresentation({
       positions.push((worldX - originMetersX) * UNITS_PER_METER, height * UNITS_PER_METER,
         (worldZ - originMetersZ) * UNITS_PER_METER);
       colors.push(...color);
-    }
-    const geometry = makeGeometry(THREE, positions, colors, CLIPMAP_TOPOLOGY.indices);
+    };
+    return { topology, positions, colors, sampleVertex, stats, target, ownedGeometries };
+  };
+
+  const finishClipmapBuild = ({
+    topology, positions, colors, stats, target, ownedGeometries,
+  }) => {
+    const geometry = makeGeometry(THREE, positions, colors, topology.indices);
     let checksum = 0x811c9dc5;
     for (const value of [...positions, ...colors]) {
       checksum ^= Math.round(value * 1000);
       checksum = Math.imul(checksum, 0x01000193) >>> 0;
     }
-    buildStats.clipmapDeterministicChecksum = checksum;
-    buildOwnedGeometries.add(geometry);
+    stats.clipmapDeterministicChecksum = checksum;
+    ownedGeometries.add(geometry);
     const mesh = new Mesh(geometry, terrainMaterial);
     mesh.name = 'w8-seeded-macro-terrain-clipmap';
     mesh.castShadow = false; mesh.receiveShadow = false;
-    buildTarget.add(mesh); buildStats.clipmapMeshCount = 1;
+    target.add(mesh); stats.clipmapMeshCount = 1;
+  };
+
+  const createClipmap = input => {
+    const build = prepareClipmapBuild(input);
+    for (const vertex of build.topology.vertices) build.sampleVertex(vertex);
+    finishClipmapBuild(build);
+  };
+
+  const createClipmapIncrementally = async (input, assertCurrent) => {
+    const build = prepareClipmapBuild(input);
+    const verticesPerSlice = 384;
+    let maximumSliceMs = 0;
+    for (let start = 0; start < build.topology.vertices.length; start += verticesPerSlice) {
+      assertCurrent();
+      const sliceStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      const end = Math.min(build.topology.vertices.length, start + verticesPerSlice);
+      for (let index = start; index < end; index += 1) {
+        build.sampleVertex(build.topology.vertices[index]);
+      }
+      maximumSliceMs = Math.max(
+        maximumSliceMs,
+        (globalThis.performance?.now?.() ?? Date.now()) - sliceStartedAt,
+      );
+      if (end < build.topology.vertices.length) await yieldToMainThread();
+    }
+    assertCurrent();
+    const finishStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    finishClipmapBuild(build);
+    maximumSliceMs = Math.max(
+      maximumSliceMs,
+      (globalThis.performance?.now?.() ?? Date.now()) - finishStartedAt,
+    );
+    return maximumSliceMs;
   };
 
   const createFarRiverPresentation = ({ projections, origin: renderOrigin }) => {
@@ -2150,7 +2268,7 @@ export async function createW8DistantPresentation({
   }
 
   const createDistantWaterProxies = ({
-    centerChunkX, centerChunkZ, origin,
+    centerChunkX, centerChunkZ, origin, terrainRiverExtentMeters,
   }) => {
     const seed = textHash(worldSeedHash);
     const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
@@ -2168,10 +2286,10 @@ export async function createW8DistantPresentation({
       - FIVE_BY_FIVE_HALF_EXTENT_METERS
     ) / CLIPMAP_BLEND_METERS);
     const forAnchoredGrid = (spacing, operation) => {
-      const minimumX = Math.floor((centerWorldX - CLIPMAP_EXTENT_METERS) / spacing);
-      const maximumX = Math.ceil((centerWorldX + CLIPMAP_EXTENT_METERS) / spacing);
-      const minimumZ = Math.floor((centerWorldZ - CLIPMAP_EXTENT_METERS) / spacing);
-      const maximumZ = Math.ceil((centerWorldZ + CLIPMAP_EXTENT_METERS) / spacing);
+      const minimumX = Math.floor((centerWorldX - terrainRiverExtentMeters) / spacing);
+      const maximumX = Math.ceil((centerWorldX + terrainRiverExtentMeters) / spacing);
+      const minimumZ = Math.floor((centerWorldZ - terrainRiverExtentMeters) / spacing);
+      const maximumZ = Math.ceil((centerWorldZ + terrainRiverExtentMeters) / spacing);
       for (let cellZ = minimumZ; cellZ <= maximumZ; cellZ += 1) {
         for (let cellX = minimumX; cellX <= maximumX; cellX += 1) operation(cellX, cellZ);
       }
@@ -2182,7 +2300,8 @@ export async function createW8DistantPresentation({
         || cellRoll(seed, cellX, cellZ, 21) > 0.2) return;
       const worldX = (cellX + 0.5) * 64; const worldZ = (cellZ + 0.5) * 64;
       const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
-      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 12 || distance >= CLIPMAP_EXTENT_METERS - 28) return;
+      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 12
+        || distance >= terrainRiverExtentMeters - 28) return;
       const sample = baseClipmapSample(worldX, worldZ);
       if (sample.moisture < 0.61) return;
       const size = 18 + cellRoll(seed, cellX, cellZ, 22) * 26;
@@ -2265,6 +2384,7 @@ export async function createW8DistantPresentation({
     naturalCenterWorldX,
     naturalCenterWorldZ,
     quality,
+    renderDistancePreset,
     activeKeys,
     includeFarNatural,
     includeUltraNatural = true,
@@ -2273,20 +2393,18 @@ export async function createW8DistantPresentation({
   }) => {
     assertCurrent?.();
     const queryStartedAt = globalThis.performance?.now?.() ?? Date.now();
-    const visibilityMeters = W8_CANONICAL_VISIBILITY_METERS[quality]
-      ?? W8_CANONICAL_VISIBILITY_METERS.high;
-    const naturalVisibilityMeters = quality === 'high'
-      ? W8_HIGH_TREE_ULTRA_VISIBILITY_METERS
-      : W8_NATURAL_CANONICAL_VISIBILITY_METERS[quality]
-        ?? W8_NATURAL_CANONICAL_VISIBILITY_METERS.high;
-    // The Chunk AABB test is already conservative at the circle boundary.  High therefore
-    // needs no extra radial expansion to cover every owner containing a visible Tree.
-    const naturalQueryRadius = quality === 'high'
-      ? (includeUltraNatural
-        ? naturalVisibilityMeters
-        : W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS)
-      : naturalVisibilityMeters + NATURAL_QUERY_MARGIN_METERS;
-    const settlementPolicy = resolveW8SettlementPresentationPolicy(quality);
+    const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
+    const visibilityMeters = renderDistancePolicy.generalObjectVisibilityMeters;
+    const naturalVisibilityMeters = renderDistancePolicy.naturalVisibilityMeters;
+    // Chunk AABB coverage is conservative at the circle boundary; no owner-range
+    // expansion is needed beyond the selected preset.
+    const naturalQueryRadius = includeUltraNatural
+      ? naturalVisibilityMeters
+      : renderDistancePolicy.naturalInnerWarmMeters;
+    const settlementPolicy = resolveW8SettlementPresentationPolicy(
+      quality,
+      renderDistancePolicy.id,
+    );
     const localQueryRadius = visibilityMeters + CANONICAL_QUERY_MARGIN_METERS;
     const queryRadius = Math.max(localQueryRadius, settlementPolicy.remote.hiddenDistanceMeters);
     const [candidateResult] = await mapWithQueryConcurrency(
@@ -2308,6 +2426,7 @@ export async function createW8DistantPresentation({
       playerX: centerWorldX,
       playerZ: centerWorldZ,
       quality,
+      renderDistancePreset: renderDistancePolicy.id,
     });
     const selectedEntries = [selection.current, ...selection.remote].filter(Boolean);
     const templateResolutionStartedAt = globalThis.performance?.now?.() ?? Date.now();
@@ -2423,7 +2542,7 @@ export async function createW8DistantPresentation({
             chunkZ,
             naturalCenterWorldX,
             naturalCenterWorldZ,
-            W8_HIGH_TREE_SILHOUETTE_VISIBILITY_METERS,
+            renderDistancePolicy.naturalInnerWarmMeters,
           )) owner.includeNaturalInner = true;
           else owner.includeNaturalUltra = true;
         }
@@ -2507,16 +2626,20 @@ export async function createW8DistantPresentation({
       });
     });
     const minimumRiverChunkX = Math.floor(
-      (naturalCenterWorldX - CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (naturalCenterWorldX - renderDistancePolicy.terrainRiverExtentMeters)
+        / LOGICAL_CHUNK_SIZE_METERS,
     );
     const maximumRiverChunkX = Math.floor(
-      (naturalCenterWorldX + CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (naturalCenterWorldX + renderDistancePolicy.terrainRiverExtentMeters)
+        / LOGICAL_CHUNK_SIZE_METERS,
     );
     const minimumRiverChunkZ = Math.floor(
-      (naturalCenterWorldZ - CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (naturalCenterWorldZ - renderDistancePolicy.terrainRiverExtentMeters)
+        / LOGICAL_CHUNK_SIZE_METERS,
     );
     const maximumRiverChunkZ = Math.floor(
-      (naturalCenterWorldZ + CLIPMAP_EXTENT_METERS) / LOGICAL_CHUNK_SIZE_METERS,
+      (naturalCenterWorldZ + renderDistancePolicy.terrainRiverExtentMeters)
+        / LOGICAL_CHUNK_SIZE_METERS,
     );
     const riverOwnerCoordinates = [];
     for (let chunkZ = minimumRiverChunkZ; chunkZ <= maximumRiverChunkZ; chunkZ += 1) {
@@ -2628,7 +2751,11 @@ export async function createW8DistantPresentation({
       renderOrigin,
       centerChunkX,
       centerChunkZ,
+      renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
     } = {}) {
+      const localSyncStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      localTerrainLastRootSwapDurationMs = 0;
+      localTerrainLastMaximumSliceMs = 0;
       const requestedEpoch = Number(coverageEpoch);
       if (!Number.isSafeInteger(requestedEpoch) || requestedEpoch < 1) {
         throw new TypeError('coverageEpoch must be a positive safe integer');
@@ -2649,6 +2776,8 @@ export async function createW8DistantPresentation({
         localTerrainRejectionCount += 1;
         localTerrainLastRejectionReason = reason;
         localTerrainLastMissingOwnerKeys = Object.freeze(sortedKeyList(missingOwnerKeys));
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+          - localSyncStartedAt;
         return Object.freeze({
           committed: false,
           reused: false,
@@ -2669,6 +2798,7 @@ export async function createW8DistantPresentation({
         return reject('stale-epoch');
       }
       localTerrainSyncEpoch = requestedEpoch;
+      const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
 
       const activeKeys = new Set(activeDataKeys);
       const rendered = new Set(renderedKeys);
@@ -2699,6 +2829,7 @@ export async function createW8DistantPresentation({
           centerChunkX,
           centerChunkZ,
           currentCanonicalSurfacePolicy,
+          renderDistancePolicy.terrainRiverExtentMeters,
         )),
       });
       clipmapSampleCache.clear();
@@ -2709,13 +2840,26 @@ export async function createW8DistantPresentation({
       localTerrainLastMidgroundOwnerCount = midgroundOwnerKeys.size;
       if (midgroundOwnerKeys.size !== 16) return reject('midground-owner-count');
 
+      const reusableMidgroundMesh = activeLocalTerrainGeneration
+        && activeLocalTerrainGeneration.centerChunkX === centerChunkX
+        && activeLocalTerrainGeneration.centerChunkZ === centerChunkZ
+        && equalKeySets(activeLocalTerrainGeneration.activeKeys, activeKeys)
+        && equalKeySets(activeLocalTerrainGeneration.renderedKeys, rendered)
+        ? activeLocalTerrainGeneration.root.children?.find(child => (
+          child.name === 'w8-midground-outer-sixteen-terrain'
+        )) ?? null
+        : null;
+
       if (activeLocalTerrainGeneration
         && activeLocalTerrainGeneration.centerChunkX === centerChunkX
         && activeLocalTerrainGeneration.centerChunkZ === centerChunkZ
+        && activeLocalTerrainGeneration.renderDistancePreset === renderDistancePolicy.id
         && equalKeySets(activeLocalTerrainGeneration.activeKeys, activeKeys)
         && equalKeySets(activeLocalTerrainGeneration.renderedKeys, rendered)) {
         positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
         committedLocalTerrainEpoch = requestedEpoch;
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+          - localSyncStartedAt;
         return Object.freeze({
           committed: true,
           reused: true,
@@ -2728,7 +2872,12 @@ export async function createW8DistantPresentation({
 
       const localRoot = new Group();
       localRoot.name = `w8-local-terrain-coverage-epoch-${requestedEpoch}`;
-      localRoot.userData = { presentationOnly: true, localTerrainCoverage: true, coverageEpoch: requestedEpoch };
+      localRoot.userData = {
+        presentationOnly: true,
+        localTerrainCoverage: true,
+        coverageEpoch: requestedEpoch,
+        renderDistancePreset: renderDistancePolicy.id,
+      };
       stagingLocalTerrainRootId = localRoot.name;
       const generation = {
         epoch: requestedEpoch,
@@ -2741,6 +2890,8 @@ export async function createW8DistantPresentation({
         midgroundOwnerKeys,
         centerChunkX,
         centerChunkZ,
+        renderDistancePreset: renderDistancePolicy.id,
+        renderDistancePolicy,
         buildOriginChunkX: renderOrigin.renderOriginChunkX,
         buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
         currentOriginChunkX: renderOrigin.renderOriginChunkX,
@@ -2755,18 +2906,34 @@ export async function createW8DistantPresentation({
       buildGeneration = generation;
       try {
         buildStats.midgroundChunkCount = midground.length;
-        measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
+        if (reusableMidgroundMesh) {
+          const midgroundMesh = new Mesh(
+            reusableMidgroundMesh.geometry,
+            reusableMidgroundMesh.material,
+          );
+          midgroundMesh.name = reusableMidgroundMesh.name;
+          midgroundMesh.castShadow = reusableMidgroundMesh.castShadow;
+          midgroundMesh.receiveShadow = reusableMidgroundMesh.receiveShadow;
+          midgroundMesh.userData = { ...(reusableMidgroundMesh.userData ?? {}) };
+          localRoot.add(midgroundMesh);
+          generation.reusedMidgroundGeometry = reusableMidgroundMesh.geometry;
+        } else {
+          measure('distant-midground-terrain', () => createMidgroundTerrain(midground, renderOrigin));
+        }
         measure('distant-clipmap', () => createClipmap({
           centerChunkX,
           centerChunkZ,
           activeChunks,
           origin: renderOrigin,
+          renderDistancePreset: renderDistancePolicy.id,
         }));
         positionGenerationForOrigin(generation, renderOrigin);
       } catch (error) {
         disposeGeneration(generation);
         localTerrainRejectionCount += 1;
         localTerrainLastRejectionReason = 'build-error';
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+          - localSyncStartedAt;
         throw error;
       } finally {
         buildTarget = null;
@@ -2781,11 +2948,214 @@ export async function createW8DistantPresentation({
         return reject(disposed ? 'disposed-during-build' : 'stale-after-build');
       }
       const previous = activeLocalTerrainGeneration;
+      if (generation.reusedMidgroundGeometry) {
+        previous?.ownedGeometries.delete(generation.reusedMidgroundGeometry);
+        generation.ownedGeometries.add(generation.reusedMidgroundGeometry);
+      }
+      const localRootSwapStartedAt = globalThis.performance?.now?.() ?? Date.now();
       root.add(generation.root);
       activeLocalTerrainGeneration = generation;
       committedLocalTerrainEpoch = requestedEpoch;
       localTerrainCommitCount += 1;
       disposeGeneration(previous);
+      localTerrainLastRootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+        - localRootSwapStartedAt;
+      localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+        - localSyncStartedAt;
+      return Object.freeze({
+        committed: true,
+        reused: false,
+        coverageEpoch: requestedEpoch,
+        reason: null,
+        missingOwnerKeys: Object.freeze([]),
+        activeRootId: generation.root.name,
+      });
+    },
+    async syncLocalTerrainPreset({
+      coverageEpoch,
+      activeDataKeys,
+      renderedKeys,
+      getChunkData,
+      renderOrigin,
+      centerChunkX,
+      centerChunkZ,
+      renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+    } = {}) {
+      const startedAt = globalThis.performance?.now?.() ?? Date.now();
+      localTerrainLastRootSwapDurationMs = 0;
+      localTerrainLastMaximumSliceMs = 0;
+      const requestedEpoch = Number(coverageEpoch);
+      const reject = (reason, missingOwnerKeys = []) => {
+        localTerrainRejectionCount += 1;
+        localTerrainLastRejectionReason = reason;
+        localTerrainLastMissingOwnerKeys = Object.freeze(sortedKeyList(missingOwnerKeys));
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+        return Object.freeze({
+          committed: false,
+          reused: false,
+          coverageEpoch: requestedEpoch,
+          reason,
+          missingOwnerKeys: localTerrainLastMissingOwnerKeys,
+          activeRootId: activeLocalTerrainGeneration?.root?.name ?? null,
+        });
+      };
+      if (!Number.isSafeInteger(requestedEpoch) || requestedEpoch < 1) {
+        throw new TypeError('coverageEpoch must be a positive safe integer');
+      }
+      if (!Array.isArray(activeDataKeys) || !Array.isArray(renderedKeys)
+        || typeof getChunkData !== 'function') {
+        throw new TypeError('Local terrain preset sync requires active/rendered keys and ChunkData');
+      }
+      localTerrainLastRequestedEpoch = requestedEpoch;
+      localTerrainLastActiveKeyCount = activeDataKeys.length;
+      localTerrainLastRenderedKeyCount = renderedKeys.length;
+      localTerrainLastResolvedChunkCount = 0;
+      localTerrainLastMidgroundOwnerCount = 0;
+      localTerrainLastMissingOwnerKeys = Object.freeze([]);
+      localTerrainLastRejectionReason = null;
+      if (disposed) return reject('disposed');
+      if (!acceptCommittedRenderOrigin(renderOrigin)) return reject('stale-render-origin');
+      if (requestedEpoch < localTerrainSyncEpoch) return reject('stale-epoch');
+      localTerrainSyncEpoch = requestedEpoch;
+      const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
+      const activeKeys = new Set(activeDataKeys);
+      const rendered = new Set(renderedKeys);
+      if (activeDataKeys.length !== 25 || activeKeys.size !== 25) {
+        return reject('active-key-count');
+      }
+      if (renderedKeys.length !== 9 || rendered.size !== 9) {
+        return reject('rendered-key-count');
+      }
+      if ([...rendered].some(key => !activeKeys.has(key))) {
+        return reject('rendered-owner-outside-active');
+      }
+      const activeChunks = new Map();
+      const missingOwnerKeys = [];
+      for (const key of activeDataKeys) {
+        const [chunkX, chunkZ] = key.split(',').map(Number);
+        const chunk = getChunkData(chunkX, chunkZ);
+        if (!chunk || chunk.chunkX !== chunkX || chunk.chunkZ !== chunkZ) {
+          missingOwnerKeys.push(key);
+        } else activeChunks.set(key, chunk);
+      }
+      localTerrainLastResolvedChunkCount = activeChunks.size;
+      if (missingOwnerKeys.length) return reject('missing-chunk-data', missingOwnerKeys);
+      const midgroundOwnerKeys = new Set([...activeKeys].filter(key => !rendered.has(key)));
+      localTerrainLastMidgroundOwnerCount = midgroundOwnerKeys.size;
+      if (midgroundOwnerKeys.size !== 16) return reject('midground-owner-count');
+      const previous = activeLocalTerrainGeneration;
+      if (!previous
+        || previous.centerChunkX !== centerChunkX
+        || previous.centerChunkZ !== centerChunkZ
+        || !equalKeySets(previous.activeKeys, activeKeys)
+        || !equalKeySets(previous.renderedKeys, rendered)) {
+        return reject('coverage-changed-during-preset-sync');
+      }
+      if (previous.renderDistancePreset === renderDistancePolicy.id) {
+        positionGenerationForOrigin(previous, renderOrigin);
+        committedLocalTerrainEpoch = requestedEpoch;
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+        return Object.freeze({
+          committed: true,
+          reused: true,
+          coverageEpoch: requestedEpoch,
+          reason: null,
+          missingOwnerKeys: Object.freeze([]),
+          activeRootId: previous.root.name,
+        });
+      }
+      const reusableMidgroundMesh = previous.root.children?.find(child => (
+        child.name === 'w8-midground-outer-sixteen-terrain'
+      ));
+      if (!reusableMidgroundMesh) return reject('midground-source-missing');
+
+      currentCanonicalSurfacePolicy = surfacePolicyForChunks(activeChunks.values());
+      currentCanonicalSurfacePolicy = Object.freeze({
+        ...currentCanonicalSurfacePolicy,
+        riverCorridors: Object.freeze(riverSurfaceCorridorsForClipmap(
+          centerChunkX,
+          centerChunkZ,
+          currentCanonicalSurfacePolicy,
+          renderDistancePolicy.terrainRiverExtentMeters,
+        )),
+      });
+      clipmapSampleCache.clear();
+      const localRoot = new Group();
+      localRoot.name = `w8-local-terrain-coverage-epoch-${requestedEpoch}`;
+      localRoot.userData = {
+        presentationOnly: true,
+        localTerrainCoverage: true,
+        coverageEpoch: requestedEpoch,
+        renderDistancePreset: renderDistancePolicy.id,
+      };
+      stagingLocalTerrainRootId = localRoot.name;
+      const generation = {
+        epoch: requestedEpoch,
+        root: localRoot,
+        ownedGeometries: new Set(),
+        ownedMaterials: new Set(),
+        stats: createStats(),
+        activeKeys,
+        renderedKeys: rendered,
+        midgroundOwnerKeys,
+        centerChunkX,
+        centerChunkZ,
+        renderDistancePreset: renderDistancePolicy.id,
+        renderDistancePolicy,
+        buildOriginChunkX: renderOrigin.renderOriginChunkX,
+        buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
+        currentOriginChunkX: renderOrigin.renderOriginChunkX,
+        currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
+      };
+      generation.stats.midgroundChunkCount = 16;
+      const midgroundMesh = new Mesh(
+        reusableMidgroundMesh.geometry,
+        reusableMidgroundMesh.material,
+      );
+      midgroundMesh.name = reusableMidgroundMesh.name;
+      midgroundMesh.castShadow = reusableMidgroundMesh.castShadow;
+      midgroundMesh.receiveShadow = reusableMidgroundMesh.receiveShadow;
+      midgroundMesh.userData = { ...(reusableMidgroundMesh.userData ?? {}) };
+      localRoot.add(midgroundMesh);
+      const assertCurrent = () => {
+        if (disposed || requestedEpoch !== localTerrainSyncEpoch) throw LOCAL_SYNC_CANCELLED;
+      };
+      try {
+        localTerrainLastMaximumSliceMs = await createClipmapIncrementally({
+          centerChunkX,
+          centerChunkZ,
+          activeChunks,
+          origin: renderOrigin,
+          renderDistancePreset: renderDistancePolicy.id,
+          stats: generation.stats,
+          target: localRoot,
+          ownedGeometries: generation.ownedGeometries,
+        }, assertCurrent);
+        assertCurrent();
+        positionGenerationForOrigin(generation, renderOrigin);
+      } catch (error) {
+        disposeGeneration(generation);
+        stagingLocalTerrainRootId = null;
+        if (error === LOCAL_SYNC_CANCELLED) {
+          localTerrainStaleDiscardCount += 1;
+          return reject(disposed ? 'disposed-during-build' : 'stale-after-build');
+        }
+        localTerrainLastRejectionReason = 'build-error';
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+        throw error;
+      }
+      stagingLocalTerrainRootId = null;
+      previous.ownedGeometries.delete(reusableMidgroundMesh.geometry);
+      generation.ownedGeometries.add(reusableMidgroundMesh.geometry);
+      const swapStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      root.add(generation.root);
+      activeLocalTerrainGeneration = generation;
+      committedLocalTerrainEpoch = requestedEpoch;
+      localTerrainCommitCount += 1;
+      disposeGeneration(previous);
+      localTerrainLastRootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
+        - swapStartedAt;
+      localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
       return Object.freeze({
         committed: true,
         reused: false,
@@ -2803,6 +3173,7 @@ export async function createW8DistantPresentation({
       centerChunkX,
       centerChunkZ,
       quality = 'high',
+      renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
       playerLogicalX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
       playerLogicalZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
       includeFarNatural = true,
@@ -2810,6 +3181,9 @@ export async function createW8DistantPresentation({
     }) {
       if (disposed) throw new Error('distant presentation is disposed');
       const syncStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      const requestedRenderDistancePreset = normalizeW8RenderDistancePreset(
+        renderDistancePreset,
+      );
       if (!commitRuntimePresentationState({
         activeDataKeys,
         renderedKeys,
@@ -2848,6 +3222,7 @@ export async function createW8DistantPresentation({
           naturalCenterWorldX: playerLogicalX,
           naturalCenterWorldZ: playerLogicalZ,
           quality,
+          renderDistancePreset: requestedRenderDistancePreset,
           activeKeys,
           includeFarNatural,
           includeUltraNatural,
@@ -2873,11 +3248,24 @@ export async function createW8DistantPresentation({
         ...activeChunks.values(),
         ...far.chunks.map(value => value.chunk),
       ], far.riverProjections.map(projection => projection.surfaceCorridor));
+      rememberRiverCorridorWindow({
+        centerChunkX,
+        centerChunkZ,
+        terrainRiverExtentMeters:
+          resolveW8RenderDistancePolicy(requestedRenderDistancePreset).terrainRiverExtentMeters,
+        corridors: far.riverProjections
+          .map(projection => projection.surfaceCorridor)
+          .filter(Boolean),
+      });
       clipmapSampleCache.clear();
 
       const stagingRoot = new Group();
       stagingRoot.name = `w8-distant-presentation-epoch-${epoch}`;
-      stagingRoot.userData = { presentationOnly: true, epoch };
+      stagingRoot.userData = {
+        presentationOnly: true,
+        epoch,
+        renderDistancePreset: requestedRenderDistancePreset,
+      };
       const generation = {
         epoch,
         root: stagingRoot,
@@ -2889,6 +3277,8 @@ export async function createW8DistantPresentation({
         activeKeys,
         renderedKeys: rendered,
         quality,
+        renderDistancePreset: requestedRenderDistancePreset,
+        renderDistancePolicy: resolveW8RenderDistancePolicy(requestedRenderDistancePreset),
         buildOriginChunkX: renderOrigin.renderOriginChunkX,
         buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
         currentOriginChunkX: renderOrigin.renderOriginChunkX,
@@ -2975,7 +3365,10 @@ export async function createW8DistantPresentation({
               naturalQueryCenter: far.naturalQueryCenter,
               queryRadius: far.queryRadius,
               naturalQueryRadius: far.naturalQueryRadius,
-              naturalDetailQueryRadius: resolveW8RockVisibilityMeters(null, quality),
+              naturalDetailQueryRadius: resolveW8RockVisibilityMeters(
+                null,
+                requestedRenderDistancePreset,
+              ),
             });
           }
           for (const remote of far.remoteHorizons) {
@@ -2992,6 +3385,8 @@ export async function createW8DistantPresentation({
             centerChunkX,
             centerChunkZ,
             origin: renderOrigin,
+            terrainRiverExtentMeters:
+              generation.renderDistancePolicy.terrainRiverExtentMeters,
           });
         });
         positionGenerationForOrigin(generation, renderOrigin);
@@ -3040,6 +3435,10 @@ export async function createW8DistantPresentation({
       }
       return treeLodDiagnosticsEnabled;
     },
+    invalidatePendingLocalTerrainSync() {
+      localTerrainSyncEpoch += 1;
+      return localTerrainSyncEpoch;
+    },
     commitRuntimeState(state) {
       if (disposed) return false;
       return commitRuntimePresentationState(state);
@@ -3071,7 +3470,12 @@ export async function createW8DistantPresentation({
         maximumInnerBoundaryErrorMeters: localTerrainStats.maximumInnerBoundaryErrorMeters,
         maximumInnerBoundaryColorDifference: localTerrainStats.maximumInnerBoundaryColorDifference,
         clipmapDeterministicChecksum: localTerrainStats.clipmapDeterministicChecksum,
-        clipmapExtentMeters: CLIPMAP_EXTENT_METERS,
+        clipmapExtentMeters: activeLocalTerrainGeneration?.renderDistancePolicy
+          ?.terrainRiverExtentMeters
+          ?? resolveW8RenderDistancePolicy().terrainRiverExtentMeters,
+        renderDistancePreset: activeGeneration?.renderDistancePreset
+          ?? activeLocalTerrainGeneration?.renderDistancePreset
+          ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
         distantRockProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
@@ -3181,6 +3585,9 @@ export async function createW8DistantPresentation({
         )),
         localTerrainMissingOwnerKeys: localTerrainLastMissingOwnerKeys,
         localTerrainLastRejectionReason,
+        localTerrainLastSyncDurationMs,
+        localTerrainLastRootSwapDurationMs,
+        localTerrainLastMaximumSliceMs,
         activeLocalTerrainRootId: activeLocalTerrainGeneration?.root?.name ?? null,
         stagingLocalTerrainRootId,
         buildOrigin: activeGeneration ? Object.freeze({
@@ -3249,6 +3656,7 @@ export async function createW8DistantPresentation({
       roadGeometry.dispose?.();
       terrainMaterial.dispose?.();
       clipmapSampleCache.clear();
+      riverCorridorWindowCache.clear();
       templateCache.clear();
       farOwnerChunkCache.clear();
       ultraOwnerChunkCache.clear();

@@ -45,6 +45,11 @@ import {
   createW8RuntimeDiagnostics,
   parseW8DiagnosticProfile,
 } from './runtime-diagnostics.js';
+import {
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  normalizeW8RenderDistancePreset,
+  resolveW8RenderDistancePolicy,
+} from './render-distance-policy.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -59,11 +64,7 @@ const FINITE_TO_INFINITE_RENDER_SCALE = UNITS_PER_METER / PRODUCTION_VISUAL_UNIT
 const finiteVisualToRender = value => value * FINITE_TO_INFINITE_RENDER_SCALE;
 const W8_GAMEPLAY_CAMERA_FAR = finiteVisualToRender(35_000);
 const W8_GAMEPLAY_FOG_NEAR = finiteVisualToRender(3_000);
-const W8_GAMEPLAY_FOG_FAR_BY_QUALITY = Object.freeze({
-  high: finiteVisualToRender(12_000),
-  medium: finiteVisualToRender(9_000),
-  low: finiteVisualToRender(6_500),
-});
+const defaultRenderDistancePolicy = resolveW8RenderDistancePolicy();
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -868,7 +869,7 @@ export async function bootInfiniteWorldSandbox({
       nextScene.fog = new THREE.Fog(
         0x5dade2,
         W8_GAMEPLAY_FOG_NEAR,
-        W8_GAMEPLAY_FOG_FAR_BY_QUALITY.high,
+        defaultRenderDistancePolicy.fogFarMeters * UNITS_PER_METER,
       );
       const nextCamera = new THREE.PerspectiveCamera(
         70,
@@ -1002,6 +1003,7 @@ export async function bootInfiniteWorldSandbox({
         renderOrigin: runtimeSnapshot.renderOrigin,
         centerChunkX: runtimeSnapshot.centerChunkX,
         centerChunkZ: runtimeSnapshot.centerChunkZ,
+        renderDistancePreset: worldState.experience.settings.renderDistance,
       });
     }
     if (diagnosticProfile.distant) {
@@ -1014,6 +1016,7 @@ export async function bootInfiniteWorldSandbox({
            centerChunkX: runtimeSnapshot.centerChunkX,
            centerChunkZ: runtimeSnapshot.centerChunkZ,
            quality: worldState.experience.settings.quality,
+           renderDistancePreset: worldState.experience.settings.renderDistance,
            playerLogicalX: logicalPlayer.x,
            playerLogicalZ: logicalPlayer.z,
            includeFarNatural: false,
@@ -1121,6 +1124,10 @@ export async function bootInfiniteWorldSandbox({
       status: measurementMode ? 'warmup' : 'disabled',
     };
     let distantQuality = worldState.experience.settings.quality;
+    let distantRenderDistance = normalizeW8RenderDistancePreset(
+      worldState.experience.settings.renderDistance
+        ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
+    );
     running = true;
 
     const synchronizeDistantPresentation = (runtimeSnapshot, {
@@ -1133,6 +1140,7 @@ export async function bootInfiniteWorldSandbox({
       centerChunkX: runtimeSnapshot.centerChunkX,
       centerChunkZ: runtimeSnapshot.centerChunkZ,
       quality: distantQuality,
+      renderDistancePreset: distantRenderDistance,
       playerLogicalX: logicalPlayer.x,
       playerLogicalZ: logicalPlayer.z,
       includeUltraNatural,
@@ -1146,13 +1154,28 @@ export async function bootInfiniteWorldSandbox({
       renderOrigin: runtimeSnapshot.renderOrigin,
       centerChunkX: runtimeSnapshot.centerChunkX,
       centerChunkZ: runtimeSnapshot.centerChunkZ,
+      renderDistancePreset: distantRenderDistance,
     });
+
+    const synchronizeLocalTerrainPreset = runtimeSnapshot => (
+      distantPresentation.syncLocalTerrainPreset({
+        coverageEpoch: ++localTerrainCoverageEpoch,
+        activeDataKeys: runtimeSnapshot.activeDataKeys,
+        renderedKeys: runtimeSnapshot.renderedKeys,
+        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+        renderOrigin: runtimeSnapshot.renderOrigin,
+        centerChunkX: runtimeSnapshot.centerChunkX,
+        centerChunkZ: runtimeSnapshot.centerChunkZ,
+        renderDistancePreset: distantRenderDistance,
+      })
+    );
 
     const commitDistantRuntimeState = runtimeSnapshot => distantPresentation.commitRuntimeState?.({
       activeDataKeys: runtimeSnapshot.activeDataKeys,
       renderedKeys: runtimeSnapshot.renderedKeys,
       renderOrigin: runtimeSnapshot.renderOrigin,
       quality: distantQuality,
+      renderDistancePreset: distantRenderDistance,
       playerLogicalX: logicalPlayer.x,
       playerLogicalZ: logicalPlayer.z,
     });
@@ -1387,8 +1410,9 @@ export async function bootInfiniteWorldSandbox({
         ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
       renderer.shadowMap.enabled = diagnosticProfile.shadows && settings.quality !== 'low';
       scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
-      scene.fog.far = W8_GAMEPLAY_FOG_FAR_BY_QUALITY[settings.quality]
-        ?? W8_GAMEPLAY_FOG_FAR_BY_QUALITY.high;
+      scene.fog.far = resolveW8RenderDistancePolicy(
+        settings.renderDistance,
+      ).fogFarMeters * UNITS_PER_METER;
       audioDirector.setVolume(settings.volume);
     };
     scenePresentation.cloudRoot.visible = diagnosticProfile.transparency;
@@ -1540,15 +1564,35 @@ export async function bootInfiniteWorldSandbox({
       },
       onSettingsChanged: settings => {
         const qualityChanged = settings.quality !== distantQuality;
+        const nextRenderDistance = normalizeW8RenderDistancePreset(settings.renderDistance);
+        const renderDistanceChanged = nextRenderDistance !== distantRenderDistance;
         distantQuality = settings.quality;
+        distantRenderDistance = nextRenderDistance;
         applyRuntimeSettings(settings);
-        if (qualityChanged && diagnosticProfile.distant) {
+        if ((qualityChanged || renderDistanceChanged) && diagnosticProfile.distant) {
+          if (renderDistanceChanged) {
+            localTerrainCoverageEpoch = Math.max(
+              localTerrainCoverageEpoch,
+              distantPresentation.invalidatePendingLocalTerrainSync?.()
+                ?? localTerrainCoverageEpoch,
+            );
+          }
           const runtimeSnapshot = runtime.snapshot();
           scenePresentation.rebase(runtimeSnapshot.renderOrigin);
           commitDistantRuntimeState(runtimeSnapshot);
           void diagnostics.measureAsync(
             'distant-sync',
-            () => synchronizeDistantPresentation(runtimeSnapshot),
+            async () => {
+              const committed = await synchronizeDistantPresentation(runtimeSnapshot);
+              if (committed && renderDistanceChanged
+                && distantRenderDistance === nextRenderDistance) {
+                await diagnostics.measureAsync(
+                  'distant-local-preset-sync',
+                  () => synchronizeLocalTerrainPreset(runtimeSnapshot),
+                );
+              }
+              return committed;
+            },
           ).catch(error => { transitionError = error; });
         }
         scheduleSave();
@@ -1809,6 +1853,7 @@ Destroyed Stable IDs: ${gameplaySnapshot.state.destroyedFeatureCount + gameplayS
 Controls: WASD / Shift / Space / Left + Right Mouse / Wheel / H / Escape (developer keys isolated)
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
+Render Distance: ${escapeHtml(presentationSnapshot.renderDistancePreset)}  Natural ${number(presentationSnapshot.naturalVisibilityMeters)}m  Terrain/River ${number(presentationSnapshot.clipmapExtentMeters)}m  General ${number(presentationSnapshot.visibilityMeters)}m  Settlement ${number(presentationSnapshot.remoteHorizonHiddenDistanceMeters)}m
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
 Chunk Generator: ${escapeHtml(chunkTransportSnapshot?.mode ?? chunkTransportSnapshot?.kind ?? 'unknown')}  fallback ${chunkTransportSnapshot?.fallbackOccurred ? escapeHtml(chunkTransportSnapshot.fallbackReason?.message ?? 'yes') : 'none'}  worker generation p50/max ${number(chunkTransportSnapshot?.generationMsP50)}/${number(chunkTransportSnapshot?.generationMsMaximum)}ms  receive p50/max ${number(chunkTransportSnapshot?.mainThreadReceiveMsP50)}/${number(chunkTransportSnapshot?.mainThreadReceiveMsMaximum)}ms
 Distant Local Terrain: epoch ${presentationSnapshot.committedLocalTerrainEpoch}/${presentationSnapshot.localTerrainSyncEpoch}  center (${presentationSnapshot.localTerrainCoverageCenter?.chunkX ?? 'n/a'}, ${presentationSnapshot.localTerrainCoverageCenter?.chunkZ ?? 'n/a'})  active/resolved/rendered/mid ${presentationSnapshot.localTerrainActiveKeyCount}/${presentationSnapshot.localTerrainResolvedChunkCount}/${presentationSnapshot.localTerrainRenderedKeyCount}/${presentationSnapshot.localTerrainMidgroundOwnerCount}  commits/rejects ${presentationSnapshot.localTerrainCommitCount}/${presentationSnapshot.localTerrainRejectionCount}  missing ${escapeHtml(presentationSnapshot.localTerrainMissingOwnerKeys.join(',') || 'none')}  far pending ${presentationSnapshot.farSyncPending ? presentationSnapshot.farSyncPendingCount : 0}

@@ -580,15 +580,17 @@ test('natural-object selection has no 12m cluster threshold and canonical visibi
   assert.equal(isW8NaturalCandidateVisible({ ...candidate, variationSeed: 1 }), true);
 
   assert.deepEqual(W8_NATURAL_CANONICAL_VISIBILITY_METERS, {
-    high: 56,
-    medium: 48,
-    low: 40,
+    short: 84,
+    standard: 112,
+    current: 140,
   });
   assert.equal(isW8DistantNaturalProxyInRange(0), true);
   assert.equal(isW8DistantNaturalProxyInRange(24), true);
   assert.equal(isW8DistantNaturalProxyInRange(40), true);
   assert.equal(isW8DistantNaturalProxyInRange(339.999), true);
   assert.equal(isW8DistantNaturalProxyInRange(340), false);
+  assert.equal(isW8DistantNaturalProxyInRange(179.999, 'short'), true);
+  assert.equal(isW8DistantNaturalProxyInRange(180, 'short'), false);
   assert.equal(isW8DistantNaturalProxyInRange(Number.NaN), false);
 });
 
@@ -1117,6 +1119,80 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   presentation.dispose();
 });
 
+test('Render Distance swaps complete Terrain roots without changing Local coverage', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const coverage = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({
+    coverageEpoch: 1,
+    renderDistancePreset: 'current',
+    ...coverage,
+  }).committed, true);
+  const distantRoot = scene.children[0];
+  const currentRoot = distantRoot.children[0];
+  const currentGeometries = currentRoot.children.map(child => child.geometry).filter(Boolean);
+  assert.equal(presentation.snapshot().clipmapExtentMeters, 352);
+
+  const switched = presentation.syncLocalTerrain({
+    coverageEpoch: 2,
+    renderDistancePreset: 'short',
+    ...coverage,
+  });
+  assert.equal(switched.committed, true);
+  assert.equal(switched.reused, false);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], currentRoot);
+  const switchedGeometries = distantRoot.children[0].children
+    .map(child => child.geometry).filter(Boolean);
+  assert.equal(currentGeometries.filter(geometry => switchedGeometries.includes(geometry)).length, 1,
+    'the preset-only swap reuses the unchanged 16-Chunk midground geometry');
+  assert.ok(currentGeometries.filter(geometry => !switchedGeometries.includes(geometry))
+    .every(geometry => geometry.disposed === true));
+  assert.equal(presentation.snapshot().clipmapExtentMeters, 192);
+  assert.equal(presentation.snapshot().renderDistancePreset, 'short');
+  assert.equal(presentation.snapshot().localTerrainActiveKeyCount, 25);
+  assert.equal(presentation.snapshot().localTerrainRenderedKeyCount, 9);
+  assert.equal(presentation.snapshot().localTerrainMidgroundOwnerCount, 16);
+  presentation.dispose();
+});
+
+test('a superseded incremental Terrain preset build cannot publish its stale root', async () => {
+  let releaseSlice;
+  let signalSlice;
+  const sliceStarted = new Promise(resolve => { signalSlice = resolve; });
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => {
+      releaseSlice = resolve;
+      signalSlice();
+    }),
+  });
+  const coverage = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({
+    coverageEpoch: 1,
+    renderDistancePreset: 'current',
+    ...coverage,
+  }).committed, true);
+  const committedRoot = scene.children[0].children[0];
+  const stalePreset = presentation.syncLocalTerrainPreset({
+    coverageEpoch: 2,
+    renderDistancePreset: 'short',
+    ...coverage,
+  });
+  await sliceStarted;
+  assert.equal(scene.children[0].children[0], committedRoot);
+  assert.ok(presentation.invalidatePendingLocalTerrainSync() >= 3);
+  releaseSlice();
+  const staleResult = await stalePreset;
+  assert.equal(staleResult.committed, false);
+  assert.equal(staleResult.reason, 'stale-after-build');
+  assert.equal(scene.children[0].children.length, 1);
+  assert.equal(scene.children[0].children[0], committedRoot);
+  assert.equal(presentation.snapshot().renderDistancePreset, 'current');
+  assert.ok(presentation.snapshot().localTerrainStaleDiscardCount >= 1);
+  presentation.dispose();
+});
+
 test('Local terrain remains current while Far owner generation is unresolved', async () => {
   let releaseOwner;
   const heldOwner = new Promise(resolve => { releaseOwner = resolve; });
@@ -1405,6 +1481,7 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   const firstInput = canonicalSyncInput({
     centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(0, 0, []), quality: 'high',
   });
+  firstInput.renderDistancePreset = 'short';
   firstInput.renderOrigin.rebaseCount = 1;
   const first = presentation.sync(firstInput);
   await firstOwnerStarted;
@@ -1417,6 +1494,7 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   const secondInput = canonicalSyncInput({
     centerChunkX: 1, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(1, 0, []), quality: 'high',
   });
+  secondInput.renderDistancePreset = 'current';
   secondInput.renderOrigin.rebaseCount = 2;
   const second = presentation.sync(secondInput);
   releaseFirstOwner();
@@ -1425,6 +1503,8 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   const snapshot = presentation.snapshot();
   assert.ok(snapshot.staleEpochDiscardCount >= 1);
   assert.equal(snapshot.committedEpoch, snapshot.syncEpoch);
+  assert.equal(snapshot.renderDistancePreset, 'current');
+  assert.equal(snapshot.visibilityMeters, 187.5);
   assert.ok(requestMetadata.every(value => value.consumerId === 'distant-owner-query'
     && Number.isSafeInteger(value.epoch)));
   assert.ok(cancelledConsumers.some(value => value.consumerId === 'distant-owner-query'
@@ -1531,7 +1611,7 @@ test('High current-Settlement horizon uses canonical Building and Landmark recor
   presentation.dispose();
 });
 
-test('Settlement presentation policy uses finite camera range, candidate radius, quality caps, and deterministic order', () => {
+test('Settlement presentation policy separates preset range from quality silhouette detail', () => {
   const candidate = (settlementId, x, settlementType, townType) => Object.freeze({
     settlementId,
     settlementType,
@@ -1552,8 +1632,10 @@ test('Settlement presentation policy uses finite camera range, candidate radius,
   });
   assert.equal(W8_FINITE_SETTLEMENT_VIEW_CONTRACT.cameraFarMeters, 875);
   assert.equal(resolveW8SettlementPresentationPolicy('high').remote.hiddenDistanceMeters, 875);
-  assert.equal(resolveW8SettlementPresentationPolicy('medium').remote.hiddenDistanceMeters, 656.25);
-  assert.equal(resolveW8SettlementPresentationPolicy('low').remote.hiddenDistanceMeters, 0);
+  assert.equal(resolveW8SettlementPresentationPolicy('medium').remote.hiddenDistanceMeters, 875);
+  assert.equal(resolveW8SettlementPresentationPolicy('low').remote.hiddenDistanceMeters, 875);
+  assert.equal(resolveW8SettlementPresentationPolicy('high', 'standard').remote.hiddenDistanceMeters, 656.25);
+  assert.equal(resolveW8SettlementPresentationPolicy('high', 'short').remote.hiddenDistanceMeters, 352);
   assert.equal(resolveW8SettlementPresentationPolicy('high').remote.fog, false);
   assert.equal(high.current.candidate.settlementId, 'settlement-v1:current');
   assert.equal(high.remote.length, resolveW8SettlementPresentationPolicy('high').remote.settlementLimit);
@@ -1580,15 +1662,13 @@ test('Settlement presentation policy uses finite camera range, candidate radius,
   const medium = selectW8SettlementPresentationCandidates({
     candidates, playerX: 0, playerZ: 0, quality: 'medium',
   });
-  assert.equal(medium.remote.length, 2);
-  assert.deepEqual(medium.remote.map(value => value.candidate.settlementId), [
-    'settlement-v1:near-remote',
-    'settlement-v1:town',
-  ]);
+  assert.deepEqual(medium.remote.map(value => value.candidate.settlementId),
+    high.remote.map(value => value.candidate.settlementId));
   const low = selectW8SettlementPresentationCandidates({
     candidates, playerX: 0, playerZ: 0, quality: 'low',
   });
-  assert.equal(low.remote.length, 0);
+  assert.deepEqual(low.remote.map(value => value.candidate.settlementId),
+    high.remote.map(value => value.candidate.settlementId));
   const limits = ['CITY', 'TOWN', 'RURAL'].map(settlementType => (
     resolveRemoteHorizonBuildingLimit({ settlementType, buildingCount: 100, quality: 'high' })
   ));
@@ -1847,7 +1927,11 @@ test('High and Medium keep every remote Building while reducing only silhouette 
   const high = await run('high');
   const medium = await run('medium');
   const low = await run('low');
-  for (const result of [high, medium]) {
+  for (const result of [high, medium, low]) {
+    assert.equal(result.snapshot.renderDistancePreset, 'current');
+    assert.equal(result.snapshot.visibilityMeters, 187.5);
+    assert.equal(result.snapshot.naturalVisibilityMeters, 140);
+    assert.equal(result.snapshot.remoteHorizonHiddenDistanceMeters, 875);
     assert.equal(result.snapshot.remoteHorizonCanonicalBuildingCount, buildings.length);
     assert.equal(result.snapshot.remoteHorizonBuildingCount, buildings.length);
     assert.equal(result.snapshot.remoteHorizonMissingBuildingCount, 0);
@@ -1856,8 +1940,8 @@ test('High and Medium keep every remote Building while reducing only silhouette 
   }
   assert.equal(high.snapshot.remoteHorizonPartInstanceCount, buildings.length * 2);
   assert.equal(medium.snapshot.remoteHorizonPartInstanceCount, buildings.length);
-  assert.equal(low.snapshot.remoteHorizonBuildingCount, 0);
-  assert.equal(low.snapshot.remoteHorizonPartInstanceCount, 0);
+  assert.equal(low.snapshot.remoteHorizonBuildingCount, buildings.length);
+  assert.equal(low.snapshot.remoteHorizonPartInstanceCount, buildings.length);
 });
 
 test('Tree LOD diagnostics are opt-in and mirror canonical full and silhouette tiers', async () => {
@@ -2318,7 +2402,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     const [object] = presentation.canonicalAuditSnapshot();
     assert.deepEqual(object.identity, expectedIdentity);
     assert.equal(object.visibleLod, state.lod);
-    assert.equal(object.instanceCount, 1);
+    assert.equal(object.instanceCount, 2);
     assert.equal(object.composedInstanceCount, state.lod === 'near' ? 0 : 1);
     assert.equal(object.ownerKey, '5,0');
     assert.equal(object.ownerActive, state.lod !== 'far');
@@ -2332,8 +2416,8 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     assert.equal(snapshot.canonicalBuildingRecordCount, 1);
     assert.equal(snapshot.canonicalLandmarkRecordCount, 0);
     assert.equal(snapshot.canonicalRoadRecordCount, 0);
-    assert.equal(snapshot.canonicalMeshCount, 1);
-    assert.equal(snapshot.canonicalVisibleMeshCount, 1);
+    assert.equal(snapshot.canonicalMeshCount, 2);
+    assert.equal(snapshot.canonicalVisibleMeshCount, 2);
     assert.equal(snapshot.queryCandidateCount, 1);
     assert.equal(snapshot.queryTemplateSuccessCount, 1);
     assert.ok(snapshot.queryNaturalOwnerChunkCount > 0);
@@ -2357,7 +2441,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     renderOriginChunkZ: 0,
   });
   assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'far');
-  assert.equal(presentation.snapshot().visibilityMeters, W8_CANONICAL_VISIBILITY_METERS.medium);
+  assert.equal(presentation.snapshot().visibilityMeters, W8_CANONICAL_VISIBILITY_METERS.current);
 
   holdNextQuery = true;
   const staleSync = presentation.sync(canonicalSyncInput({

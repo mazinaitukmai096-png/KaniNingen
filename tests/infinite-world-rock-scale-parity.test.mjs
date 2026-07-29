@@ -146,12 +146,12 @@ test('Rock canonical adapter derives visual, collision, LOD, and interaction fro
   assert.deepEqual(candidate, original, 'adapter does not mutate ChunkData candidate');
 });
 
-test('Rock canonical LOD retains the approved High/Medium/Low distance policy', () => {
+test('Rock canonical LOD follows Render Distance instead of visual quality', () => {
   const record = resolveW8RockCanonicalObject(rockCandidate());
-  assert.deepEqual(record.lodPolicy.visibilityMeters, { high: 56, medium: 48, low: 40 });
-  assert.equal(resolveW8RockVisibilityMeters(record, 'high'), 56);
-  assert.equal(resolveW8RockVisibilityMeters(record, 'medium'), 48);
-  assert.equal(resolveW8RockVisibilityMeters(record, 'low'), 40);
+  assert.equal(record.lodPolicy.visibilityClass, 'natural');
+  assert.equal(resolveW8RockVisibilityMeters(record, 'short'), 84);
+  assert.equal(resolveW8RockVisibilityMeters(record, 'standard'), 112);
+  assert.equal(resolveW8RockVisibilityMeters(record, 'current'), 140);
   assert.equal(record.lodPolicy.proxy, false);
   assert.deepEqual(record.lodPolicy.presentationTiers, ['full']);
 });

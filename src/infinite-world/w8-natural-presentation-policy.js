@@ -1,4 +1,5 @@
 import { deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
+import { W8_RENDER_DISTANCE_PRESETS } from './render-distance-policy.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 const smoothstep = value => {
@@ -15,9 +16,9 @@ export const W8_NATURAL_PRESENTATION_PHASE_1 = Object.freeze({
 });
 
 export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze({
-  high: 56,
-  medium: 48,
-  low: 40,
+  short: W8_RENDER_DISTANCE_PRESETS.short.naturalVisibilityMeters,
+  standard: W8_RENDER_DISTANCE_PRESETS.standard.naturalVisibilityMeters,
+  current: W8_RENDER_DISTANCE_PRESETS.current.naturalVisibilityMeters,
 });
 
 function mix32(value) {

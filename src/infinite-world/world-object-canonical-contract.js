@@ -3,7 +3,12 @@ import {
   W8_WORLD_DETAIL_CONTRACTS,
   finiteWorldUnitsToMeters,
 } from './gameplay-contract.js';
-import { W8_NATURAL_CANONICAL_VISIBILITY_METERS } from './w8-natural-presentation-policy.js';
+import {
+  W8_CURRENT_SETTLEMENT_LOD_METERS,
+  W8_CURRENT_TREE_LOD_METERS,
+  W8_RENDER_DISTANCE_PRESETS,
+  resolveW8RenderDistancePolicy,
+} from './render-distance-policy.js';
 import {
   W8_PARITY_FEATURE_PARTS,
   resolveW8BuildingParts,
@@ -22,23 +27,17 @@ export const W8_RESERVED_WORLD_DETAIL_TYPES = Object.freeze([
 ]);
 
 export const W8_CANONICAL_VISIBILITY_METERS = Object.freeze({
-  high: 187.5,
-  medium: 150,
-  low: 112.5,
+  short: W8_RENDER_DISTANCE_PRESETS.short.generalObjectVisibilityMeters,
+  standard: W8_RENDER_DISTANCE_PRESETS.standard.generalObjectVisibilityMeters,
+  current: W8_RENDER_DISTANCE_PRESETS.current.generalObjectVisibilityMeters,
 });
 
-export const W8_HIGH_TREE_LOD_METERS = Object.freeze({
-  fullToSilhouette: Object.freeze({ minimum: 54, maximum: 58 }),
-  silhouetteToUltra: Object.freeze({ minimum: 76, maximum: 84 }),
-  silhouetteVisibility: 84,
-  ultraFadeStart: 124,
-  ultraVisibility: 140,
-});
+export const W8_HIGH_TREE_LOD_METERS = W8_CURRENT_TREE_LOD_METERS;
 
 export const W8_HIGH_HORIZON_LOD_METERS = Object.freeze({
-  start: 140,
-  fadeStart: 171.5,
-  visibility: W8_CANONICAL_VISIBILITY_METERS.high,
+  start: W8_CURRENT_SETTLEMENT_LOD_METERS.fullDistanceMeters,
+  fadeStart: W8_CURRENT_SETTLEMENT_LOD_METERS.fadeStartMeters,
+  visibility: W8_CURRENT_SETTLEMENT_LOD_METERS.visibilityMeters,
 });
 
 export const W8_FINITE_ROCK_PRESENTATION_METERS = Object.freeze({
@@ -54,7 +53,7 @@ const queriedTier = Object.freeze({ ownerSet: 'queried', presentationTier: 'full
 
 export const W8_ROCK_CANONICAL_LOD_POLICY = Object.freeze({
   schemaVersion: 'w8-rock-lod-policy-1',
-  visibilityMeters: W8_NATURAL_CANONICAL_VISIBILITY_METERS,
+  visibilityClass: 'natural',
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
@@ -64,11 +63,7 @@ export const W8_ROCK_CANONICAL_LOD_POLICY = Object.freeze({
 
 export const W8_TREE_CANONICAL_LOD_POLICY = Object.freeze({
   schemaVersion: 'w8-tree-lod-policy-1',
-  visibilityMeters: Object.freeze({
-    high: W8_HIGH_TREE_LOD_METERS.ultraVisibility,
-    medium: W8_NATURAL_CANONICAL_VISIBILITY_METERS.medium,
-    low: W8_NATURAL_CANONICAL_VISIBILITY_METERS.low,
-  }),
+  visibilityClass: 'natural',
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
@@ -79,7 +74,7 @@ export const W8_TREE_CANONICAL_LOD_POLICY = Object.freeze({
 
 export const W8_SHRUB_CANONICAL_LOD_POLICY = Object.freeze({
   schemaVersion: 'w8-shrub-lod-policy-1',
-  visibilityMeters: W8_NATURAL_CANONICAL_VISIBILITY_METERS,
+  visibilityClass: 'natural',
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
@@ -89,7 +84,7 @@ export const W8_SHRUB_CANONICAL_LOD_POLICY = Object.freeze({
 
 export const W8_SETTLEMENT_CANONICAL_LOD_POLICY = Object.freeze({
   schemaVersion: 'w8-settlement-lod-policy-1',
-  visibilityMeters: W8_CANONICAL_VISIBILITY_METERS,
+  visibilityClass: 'general-object',
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
@@ -100,7 +95,7 @@ export const W8_SETTLEMENT_CANONICAL_LOD_POLICY = Object.freeze({
 
 export const W8_NEAR_ONLY_CANONICAL_LOD_POLICY = Object.freeze({
   schemaVersion: 'w8-near-only-lod-policy-1',
-  visibilityMeters: Object.freeze({ high: 0, medium: 0, low: 0 }),
+  visibilityClass: 'near-only',
   near: nearTier,
   outer: null,
   far: null,
@@ -581,10 +576,15 @@ export function resolveW8CanonicalWorldObject(source) {
     ?? source.landmarkType ?? source.detailType ?? source.candidateType ?? 'unknown'}`);
 }
 
-export function resolveW8ObjectVisibilityMeters(record, quality = 'high') {
-  const visibility = record?.lodPolicy?.visibilityMeters?.[quality];
-  if (Number.isFinite(visibility) && visibility >= 0) return visibility;
-  return 0;
+export function resolveW8ObjectVisibilityMeters(record, renderDistancePreset = 'current') {
+  const policy = resolveW8RenderDistancePolicy(renderDistancePreset);
+  if (record?.lodPolicy?.visibilityClass === 'natural') return policy.naturalVisibilityMeters;
+  if (record?.lodPolicy?.visibilityClass === 'general-object') {
+    return policy.generalObjectVisibilityMeters;
+  }
+  if (record?.lodPolicy?.visibilityClass === 'near-only') return 0;
+  const direct = record?.lodPolicy?.visibilityMeters?.[policy.id];
+  return Number.isFinite(direct) && direct >= 0 ? direct : 0;
 }
 
 export function resolveW8RockCandidateVisual(source) {
@@ -610,6 +610,9 @@ export const resolveW8RockCanonicalObject = source => {
   return record;
 };
 
-export const resolveW8RockVisibilityMeters = (record, quality = 'high') => (
-  resolveW8ObjectVisibilityMeters(record ?? { lodPolicy: W8_ROCK_CANONICAL_LOD_POLICY }, quality)
+export const resolveW8RockVisibilityMeters = (record, renderDistancePreset = 'current') => (
+  resolveW8ObjectVisibilityMeters(
+    record ?? { lodPolicy: W8_ROCK_CANONICAL_LOD_POLICY },
+    renderDistancePreset,
+  )
 );

@@ -30,6 +30,10 @@ import {
   isW6ScaleStageId,
 } from './gameplay-contract.js';
 import { parseChunkKey } from './chunk-coordinates.js';
+import {
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  normalizeW8RenderDistancePreset,
+} from './render-distance-policy.js';
 
 const FEATURE_MAX_HP_VALUES = new Set(
   Object.values(W6_STATIC_TARGET_CONTRACTS).map(contract => contract.maxHp),
@@ -40,6 +44,7 @@ const DEFAULT_EXPERIENCE_STATE = Object.freeze({
     mouseSensitivity: 1,
     volume: 0.5,
     quality: 'high',
+    renderDistance: W8_DEFAULT_RENDER_DISTANCE_PRESET,
     showFps: false,
     fpsCap: 0,
     cameraShake: 1,
@@ -166,6 +171,7 @@ function validateExperience(experience = DEFAULT_EXPERIENCE_STATE) {
       mouseSensitivity: numberInRange(settings.mouseSensitivity, 0.1, 3, 'mouseSensitivity'),
       volume: numberInRange(settings.volume, 0, 1, 'volume'),
       quality: settings.quality,
+      renderDistance: normalizeW8RenderDistancePreset(settings.renderDistance),
       showFps: settings.showFps,
       fpsCap: settings.fpsCap,
       cameraShake: numberInRange(settings.cameraShake, 0, 2, 'cameraShake'),

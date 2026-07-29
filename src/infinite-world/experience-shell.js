@@ -18,6 +18,7 @@ import {
   stepPlayerVerticalMovement,
   tryStartPlayerJump,
 } from './player-vertical-movement.js';
+import { W8_DEFAULT_RENDER_DISTANCE_PRESET } from './render-distance-policy.js';
 import { createFiniteGameplayHudAdapter } from './finite-gameplay-hud.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
@@ -90,6 +91,7 @@ export function createInfiniteExperienceShell({
     hudHidden: false,
     settings: {
       mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
+      renderDistance: W8_DEFAULT_RENDER_DISTANCE_PRESET,
       fpsCap: 0, cameraShake: 1, antialias: true,
     },
   };
@@ -107,7 +109,8 @@ export function createInfiniteExperienceShell({
     treeLodOverlayOff: byId('debug-tree-lod-overlay-off-btn'),
     treeLodOverlayOn: byId('debug-tree-lod-overlay-on-btn'),
     mouse: byId('set-mouse'), mouseValue: byId('val-mouse'), volume: byId('set-vol'), volumeValue: byId('val-vol'),
-    quality: byId('set-quality'), fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
+    quality: byId('set-quality'), renderDistance: byId('set-render-distance'),
+    fpsToggle: byId('set-fps-counter'), fpsCap: byId('set-fps-cap'),
     shake: byId('set-shake'), shakeValue: byId('val-shake'), finalScore: byId('final-score'),
     antialias: byId('set-antialias'), antialiasNote: byId('antialias-note'),
     gameOver: byId('game-over'), restart: byId('restart-button'),
@@ -216,6 +219,10 @@ export function createInfiniteExperienceShell({
     if (elements.volume) elements.volume.value = String(state.settings.volume);
     if (elements.volumeValue) elements.volumeValue.textContent = `${Math.round(state.settings.volume * 100)}%`;
     if (elements.quality) elements.quality.value = state.settings.quality;
+    if (elements.renderDistance) {
+      elements.renderDistance.value = state.settings.renderDistance
+        ?? W8_DEFAULT_RENDER_DISTANCE_PRESET;
+    }
     if (elements.fpsToggle) elements.fpsToggle.checked = state.settings.showFps;
     if (elements.fpsCap) elements.fpsCap.value = String(state.settings.fpsCap);
     if (elements.shake) elements.shake.value = String(state.settings.cameraShake);
@@ -377,6 +384,9 @@ export function createInfiniteExperienceShell({
     state.settings.volume = Number(target.value); if (elements.volumeValue) elements.volumeValue.textContent = `${Math.round(state.settings.volume * 100)}%`;
   });
   setting(elements.quality, 'change', target => { state.settings.quality = target.value; });
+  setting(elements.renderDistance, 'change', target => {
+    state.settings.renderDistance = target.value;
+  });
   setting(elements.fpsToggle, 'change', target => { state.settings.showFps = target.checked === true; });
   setting(elements.fpsCap, 'change', target => { state.settings.fpsCap = Number(target.value); });
   setting(elements.shake, 'input', target => {

@@ -127,7 +127,7 @@ test('an original W6 save migrates atomically with defaults and discards legacy 
   assert.deepEqual(state.experience, {
     hudHidden: false,
     settings: {
-      mouseSensitivity: 1, volume: 0.5, quality: 'high', showFps: false,
+      mouseSensitivity: 1, volume: 0.5, quality: 'high', renderDistance: 'current', showFps: false,
       fpsCap: 0, cameraShake: 1, antialias: true,
     },
   });

@@ -20,6 +20,7 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createW8ParityVisualAssetLibrary,
 } from '../src/infinite-world/render/w8-parity-visual-assets.js';
+import { InfiniteWorldState } from '../src/infinite-world/world-state-store.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 let nodeObjectConstructionCount = 0;
@@ -302,10 +303,21 @@ function installBrowserEquivalentEnvironment() {
   const cancelledFrames = [];
   const listeners = new Map();
   const documentListeners = new Map();
+  const renderDistanceListeners = new Map();
+  const renderDistanceControl = {
+    value: 'current',
+    addEventListener(type, listener) { renderDistanceListeners.set(type, listener); },
+    removeEventListener(type) { renderDistanceListeners.delete(type); },
+    dispatch(type) {
+      renderDistanceListeners.get(type)?.({ target: this, type });
+    },
+  };
   setGlobal('THREE', FakeThree);
   setGlobal('document', {
     readyState: 'complete',
     addEventListener(type, listener) { documentListeners.set(type, listener); },
+    getElementById(id) { return id === 'set-render-distance' ? renderDistanceControl : null; },
+    querySelectorAll() { return []; },
     querySelector(selector) {
       if (selector === '#viewport') return viewport;
       if (selector === '#hud') return hud;
@@ -332,6 +344,7 @@ function installBrowserEquivalentEnvironment() {
     cancelledFrames,
     listeners,
     documentListeners,
+    renderDistanceControl,
     restore() {
       for (const [key, descriptor] of saved) {
         if (descriptor) Object.defineProperty(globalThis, key, descriptor);
@@ -708,6 +721,118 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
   } finally {
     environment.restore();
   }
+});
+
+test('Render Distance presets keep fixed gameplay coverage and resync Distant roots live', async t => {
+  const expected = {
+    short: { natural: 84, terrain: 192, general: 112.5, settlement: 352 },
+    standard: { natural: 112, terrain: 256, general: 150, settlement: 656.25 },
+    current: { natural: 140, terrain: 352, general: 187.5, settlement: 875 },
+  };
+  const results = [];
+  for (const preset of ['current', 'standard', 'short']) {
+    const environment = installBrowserEquivalentEnvironment();
+    try {
+      const bootStartedAt = performance.now();
+      const sandbox = await bootInfiniteWorldSandbox({
+        globalObject: globalThis,
+        THREE: FakeThree,
+        viewport: environment.viewport,
+        hud: environment.hud,
+        requestedSeed: 'KaniNingen Infinite Natural World',
+        worldStateFactory(options) {
+          const state = new InfiniteWorldState(options);
+          state.updateExperience({ settings: { renderDistance: preset } });
+          return state;
+        },
+      });
+      const bootMs = performance.now() - bootStartedAt;
+      const values = expected[preset];
+      const snapshot = sandbox.snapshot();
+      assert.equal(snapshot.runtime.activeDataCount, 25);
+      assert.equal(snapshot.runtime.renderedCount, 9);
+      assert.equal(snapshot.runtime.cacheCapacity, 81);
+      assert.equal(snapshot.presentation.renderDistancePreset, preset);
+      assert.equal(snapshot.presentation.naturalVisibilityMeters, values.natural);
+      assert.equal(snapshot.presentation.clipmapExtentMeters, values.terrain);
+      assert.equal(snapshot.presentation.visibilityMeters, values.general);
+      assert.equal(snapshot.presentation.remoteHorizonHiddenDistanceMeters, values.settlement);
+      results.push({
+        preset,
+        bootMs,
+        distantSyncMs: snapshot.presentation.syncDurationMs,
+        rootSwapMs: snapshot.presentation.rootSwapDurationMs,
+        workerRequests: snapshot.chunkDataService.counts.transportCalls,
+        trackedInstances: snapshot.resources.trackedFeatureInstanceCount,
+        naturalOwners: snapshot.presentation.queryNaturalOwnerChunkCount,
+        settlements: snapshot.presentation.queryCandidateCount,
+        buildings: snapshot.presentation.canonicalBuildingRecordCount
+          + snapshot.presentation.remoteHorizonBuildingCount,
+        riverOwners: snapshot.presentation.visibleFarRiverOwnerCount,
+      });
+
+      await sandbox.shutdown();
+    } finally {
+      environment.restore();
+    }
+  }
+
+  // Keep the live-resync measurement separate from the three boot samples so
+  // its complete Far/Local rebuild and subsequent GC cannot contaminate a
+  // later preset's cold-boot gate.
+  const environment = installBrowserEquivalentEnvironment();
+  try {
+    const sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+    });
+    const before = sandbox.snapshot();
+    const chunkIdentities = before.runtime.activeDataKeys.map(key => {
+      const [chunkX, chunkZ] = key.split(',').map(Number);
+      const chunk = sandbox.runtime.getChunkData(chunkX, chunkZ);
+      return [key, chunk?.chunkId, chunk?.contentHash];
+    });
+    const switchStartedAt = performance.now();
+    environment.renderDistanceControl.value = 'short';
+    environment.renderDistanceControl.dispatch('change');
+    let switched = sandbox.snapshot();
+    for (let attempt = 0; attempt < 500
+      && (switched.presentation.renderDistancePreset !== 'short'
+        || switched.presentation.clipmapExtentMeters !== 192
+        || switched.presentation.farSyncPending);
+      attempt += 1) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+      switched = sandbox.snapshot();
+    }
+    const switchMs = performance.now() - switchStartedAt;
+    assert.equal(switched.presentation.renderDistancePreset, 'short');
+    assert.equal(switched.runtime.activeDataCount, 25);
+    assert.equal(switched.runtime.renderedCount, 9);
+    assert.deepEqual(switched.runtime.activeDataKeys.map(key => {
+      const [chunkX, chunkZ] = key.split(',').map(Number);
+      const chunk = sandbox.runtime.getChunkData(chunkX, chunkZ);
+      return [key, chunk?.chunkId, chunk?.contentHash];
+    }), chunkIdentities, 'preset resync must not regenerate active ChunkData');
+    assert.ok(switched.presentation.rootSwapDurationMs < 100);
+    assert.ok(switched.presentation.localTerrainLastMaximumSliceMs < 100,
+      `Local preset slice ${switched.presentation.localTerrainLastMaximumSliceMs}ms`);
+    assert.ok(switched.presentation.localTerrainLastRootSwapDurationMs < 100,
+      `Local root swap ${switched.presentation.localTerrainLastRootSwapDurationMs}ms`);
+    const currentResult = results.find(result => result.preset === 'current');
+    currentResult.presetSwitchMs = switchMs;
+    currentResult.presetLocalSyncMs = switched.presentation.localTerrainLastSyncDurationMs;
+    currentResult.presetMaximumMainThreadSliceMs =
+      switched.presentation.localTerrainLastMaximumSliceMs;
+    await sandbox.shutdown();
+  } finally {
+    environment.restore();
+  }
+  for (const result of results) t.diagnostic(JSON.stringify(result));
+  assert.ok(results.every(result => result.bootMs < 5_000));
+  assert.ok(results.every(result => result.rootSwapMs < 100));
 });
 
 test('measurement frames pass strict boolean simulation state into Gameplay Runtime', async () => {
