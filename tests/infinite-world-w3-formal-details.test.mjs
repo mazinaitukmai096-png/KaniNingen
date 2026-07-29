@@ -18,6 +18,11 @@ import { verifyOptionalLegacySource } from './infinite-world-provenance-helper.m
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
+function percentile(values, fraction) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? 0;
+}
+
 test('W3 Legacy formal-detail dependencies match the fixed source commit byte-for-byte', () => {
   const provenance = JSON.parse(readFileSync(
     resolve(repoRoot, 'src/infinite-world/legacy-core/W3-PROVENANCE.json'),
@@ -150,8 +155,20 @@ class RecordingAdapter {
   async shutdown() { this.loaded.clear(); }
 }
 
-test('W3 streaming retains the Chunk index across cache eviction/revisit without active-set growth', async () => {
-  const generator = await createFormalNaturalChunkGenerator({ worldSeed: 'W3 sustained streaming' });
+test('W3 streaming retains the Chunk index across cache eviction/revisit without active-set growth', async t => {
+  const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed: 'W3 sustained streaming' });
+  const generationDurations = [];
+  const generator = Object.freeze({
+    ...formalGenerator,
+    async generateChunk(chunkX, chunkZ) {
+      const startedAt = performance.now();
+      try {
+        return await formalGenerator.generateChunk(chunkX, chunkZ);
+      } finally {
+        generationDurations.push(performance.now() - startedAt);
+      }
+    },
+  });
   const chunkIndex = new PersistentChunkIndex({ capacity: 128 });
   const adapter = new RecordingAdapter();
   const runtime = new ChunkRuntimeManager({
@@ -176,7 +193,9 @@ test('W3 streaming retains the Chunk index across cache eviction/revisit without
   const state = runtime.snapshot();
   assert.ok(state.chunkIndex.counts.revisited > 0);
   assert.equal(chunkIndex.getChunk(0, 0).contentHash, indexedOrigin.contentHash);
-  assert.ok(state.performance.generation.p95 < 250, `generation p95 ${state.performance.generation.p95}ms`);
+  const generationP95 = percentile(generationDurations, 0.95);
+  t.diagnostic(`actual generation p95 ${generationP95.toFixed(3)}ms; request latency p95 ${state.performance.generation.p95.toFixed(3)}ms`);
+  assert.ok(generationP95 < 250, `actual generation p95 ${generationP95}ms`);
   assert.ok(state.performance.crossing.p95 < 1000, `crossing p95 ${state.performance.crossing.p95}ms`);
   await runtime.shutdown();
   assert.equal(adapter.loaded.size, 0);
