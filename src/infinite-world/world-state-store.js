@@ -957,11 +957,36 @@ export function createBrowserSaveStorage({ indexedDB, legacyStorage = null } = {
   const transact = async (mode, operation) => {
     const database = await databasePromise;
     return new Promise((resolve, reject) => {
-      const transaction = database.transaction('saves', mode);
-      const request = operation(transaction.objectStore('saves'));
-      request.onsuccess = () => resolve(request.result ?? null);
-      request.onerror = () => reject(request.error ?? new Error('IndexedDB request failed'));
-      transaction.onabort = () => reject(transaction.error ?? new Error('IndexedDB transaction aborted'));
+      let settled = false;
+      let requestResult = null;
+      const resolveOnce = () => {
+        if (settled) return;
+        settled = true;
+        resolve(requestResult);
+      };
+      const rejectOnce = error => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+      let transaction;
+      let request;
+      try {
+        transaction = database.transaction('saves', mode);
+        request = operation(transaction.objectStore('saves'));
+      } catch (error) {
+        rejectOnce(error);
+        return;
+      }
+      request.onsuccess = () => { requestResult = request.result ?? null; };
+      request.onerror = () => rejectOnce(request.error ?? new Error('IndexedDB request failed'));
+      transaction.oncomplete = resolveOnce;
+      transaction.onerror = () => rejectOnce(
+        transaction.error ?? new Error('IndexedDB transaction failed'),
+      );
+      transaction.onabort = () => rejectOnce(
+        transaction.error ?? new Error('IndexedDB transaction aborted'),
+      );
     });
   };
   return Object.freeze({
@@ -1043,6 +1068,7 @@ export class InfiniteWorldSaveStore {
       this.pendingSaveRequest = null;
       this.activeSaveRequest = request;
       try {
+        if (!this.storage) throw new Error('Infinite World save storage is unavailable');
         const serialized = await this.measure(
           'save-serialization',
           () => encodeInfiniteWorldSave(request.snapshot),
@@ -1050,7 +1076,7 @@ export class InfiniteWorldSaveStore {
         if (this.pendingSaveRequest?.generation > request.generation) continue;
         await this.measure(
           `save-${this.storageDiagnosticStage}`,
-          () => this.storage?.setItem(this.key, serialized),
+          () => this.storage.setItem(this.key, serialized),
         );
         this.counts.saved += 1;
         this.committedSaveGeneration = request.generation;
