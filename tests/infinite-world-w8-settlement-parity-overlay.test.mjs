@@ -1,13 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { SETTLEMENT_BUILDING_COMPOSITIONS } from '../src/settlement-building-visuals.js';
+import {
+  SETTLEMENT_BUILDING_COMPOSITIONS,
+  selectSettlementBuildingType,
+} from '../src/settlement-building-visuals.js';
 import {
   W8_SETTLEMENT_PARITY_DENSITY,
   createW8SettlementParityOverlay,
 } from '../src/infinite-world/w8-settlement-parity-overlay.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
 import { logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
+import {
+  createW8SettlementBuildingTypeSelector,
+} from '../src/infinite-world/w8-settlement-building-visual-policy.js';
 
 const worldSeedHash = `sha256:${'6'.repeat(64)}`;
 const fixtures = Object.freeze([
@@ -30,6 +36,24 @@ function candidate(townType, settlementType, index = 0) {
     terrainSuitability: 0.8,
   };
 }
+
+test('W8 cached building type selection preserves the protected finite sequence', () => {
+  for (const [settlementType, townId] of [
+    ['CITY', 'selector-city'],
+    ['TOWN', 'selector-town'],
+    ['RURAL', 'selector-rural'],
+  ]) {
+    const select = createW8SettlementBuildingTypeSelector({ settlementType, townId });
+    const expected = Array.from({ length: 100 }, (_, index) => selectSettlementBuildingType({
+      settlementType,
+      townId,
+      buildingIndex: index + 1,
+    }));
+    const actual = Array.from({ length: 100 }, (_, index) => select(index + 1));
+    assert.deepEqual(actual, expected);
+    assert.equal(select(50), expected[49], 'cached lookup must not alter the sequence');
+  }
+});
 
 test('CITY, TOWN, and RURAL overlays reach finite opportunity density and composition deterministically', async () => {
   for (let index = 0; index < fixtures.length; index += 1) {

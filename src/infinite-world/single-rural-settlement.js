@@ -7,12 +7,11 @@ import {
 import { createBuildingLot, orientedRectanglesOverlap } from '../building-lot.js';
 import { buildRoadHierarchy, ROAD_KINDS } from '../road-town-structure.js';
 import {
-  createSettlementBuildingTypeSelector,
   createSettlementBuildingVisual,
-  getTownPaletteTendency,
   isTowerPlacementAllowed,
 } from '../settlement-building-visuals.js';
 import { SETTLEMENT_TYPES } from '../settlement-type.js';
+import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { sha256Hex } from './legacy-core/g0/sha256.js';
 
@@ -229,14 +228,9 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
   const visualRecords = [];
   const frontageRoadByAnchor = new Map();
   const frontagePlacementIdentityCache = new Map();
-  const selectBuildingType = createSettlementBuildingTypeSelector({
+  const selectBuildingType = createW8SettlementBuildingTypeSelector({
     settlementType: town.settlementType,
     townId: town.id,
-  });
-  const townPaletteTendency = getTownPaletteTendency({
-    settlementType: town.settlementType,
-    townId: town.id,
-    townType: town.type,
   });
   for (let buildingIndex = 1; buildingIndex <= attemptedBuildingCount; buildingIndex += 1) {
     let type = selectBuildingType(buildingIndex);
@@ -332,7 +326,6 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
       buildingIndex,
       routeId: acceptedRouteId,
       records: visualRecords,
-      townPaletteTendency,
     });
     const visualRecord = Object.freeze({
       townId: town.id,

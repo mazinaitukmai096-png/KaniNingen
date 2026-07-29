@@ -1,8 +1,6 @@
 import { BUILDING_LOT_PROFILES, orientedRectanglesOverlap } from '../building-lot.js';
 import {
-  createSettlementBuildingTypeSelector,
   createSettlementBuildingVisual,
-  getTownPaletteTendency,
 } from '../settlement-building-visuals.js';
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { logicalWorldToOwnedChunk } from './chunk-coordinates.js';
@@ -10,6 +8,7 @@ import {
   FINITE_WORLD_UNITS_PER_METER,
   createMigratedSettlementTemplate,
 } from './single-rural-settlement.js';
+import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 
 export const W8_SETTLEMENT_PARITY_DENSITY = Object.freeze({
   schemaVersion: 'w8-settlement-parity-density-1',
@@ -177,14 +176,9 @@ export async function createW8SettlementParityOverlay({
     .toSorted((left, right) => left.stableId.localeCompare(right.stableId));
   const spacing = W8_SETTLEMENT_PARITY_DENSITY.roadSlotSpacingMeters[template.settlementType];
   let buildingIndex = template.requestedBuildingCount + 1;
-  const selectBuildingType = createSettlementBuildingTypeSelector({
+  const selectBuildingType = createW8SettlementBuildingTypeSelector({
     settlementType: template.settlementType,
     townId: template.settlementId,
-  });
-  const townPaletteTendency = getTownPaletteTendency({
-    settlementType: template.settlementType,
-    townId: template.settlementId,
-    townType: template.townType,
   });
 
   for (const road of roads) {
@@ -257,7 +251,6 @@ export async function createW8SettlementParityOverlay({
           buildingIndex,
           routeId: road.routeId,
           records: visualRecords,
-          townPaletteTendency,
         });
         const stableId = await overlayStableId({
           worldSeedHash,
@@ -382,7 +375,6 @@ export async function createW8SettlementParityOverlay({
         buildingIndex,
         routeId: nearest.road.routeId,
         records: visualRecords,
-        townPaletteTendency,
       });
       const stableId = await overlayStableId({
         worldSeedHash,
