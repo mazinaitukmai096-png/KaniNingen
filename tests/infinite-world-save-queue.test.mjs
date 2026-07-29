@@ -305,10 +305,10 @@ test('GP-SAVE-01 routes autosave, manual, pagehide, Boss, Atomic, Retry, and shu
   assert.match(source, /onSave:\s*\(\)\s*=>\s*\{\s*void saveWorld\(\{ force: true \}\)/);
   assert.match(source, /onNuclearRelease:[\s\S]*scheduleSave\(\{ immediate: true \}\)/);
   assert.match(source, /onSpawnManualBoss:[\s\S]*scheduleSave\(\{ immediate: true \}\)/);
-  assert.match(source, /handlePageHide\s*=\s*\(\)\s*=>\s*scheduleSave\(\{ immediate: true, force: true \}\)/);
+  assert.match(source, /handlePageHide\s*=\s*\(\)\s*=>\s*\{\s*void saveForExit\(\);\s*\}/);
   assert.match(source, /worldState\.revision\s*!==\s*lastSavedRevision\) scheduleSave\(\)/);
   assert.match(source, /onRestart:[\s\S]*await saveWorld\(\{ force: true \}\)/);
-  assert.match(source, /if \(runStarted\) await saveWorld\(\{ force: true \}\)/);
+  assert.match(source, /if \(runStarted\) await saveForExit\(\)/);
   assert.match(source, /lastSavedGeneration = saved\.generation/);
   assert.match(source, /lastSavedRevision = saved\.revision/);
 });

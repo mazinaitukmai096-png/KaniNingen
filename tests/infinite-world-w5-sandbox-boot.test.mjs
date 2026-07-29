@@ -20,7 +20,11 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createW8ParityVisualAssetLibrary,
 } from '../src/infinite-world/render/w8-parity-visual-assets.js';
-import { InfiniteWorldState } from '../src/infinite-world/world-state-store.js';
+import {
+  decodeInfiniteWorldSave,
+  InfiniteWorldSaveStore,
+  InfiniteWorldState,
+} from '../src/infinite-world/world-state-store.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const runIsolatedW5BootPerformanceGate = process.env.KANININGEN_RUN_W5_BOOT_PERFORMANCE === '1';
@@ -353,6 +357,180 @@ function installBrowserEquivalentEnvironment() {
       }
     },
   };
+}
+
+function createDeferredValue() {
+  let resolvePromise;
+  const promise = new Promise(resolveValue => { resolvePromise = resolveValue; });
+  return { promise, resolve: resolvePromise };
+}
+
+class ControlledSaveStorage {
+  constructor() {
+    this.values = new Map();
+    this.calls = [];
+    this.deferWrites = false;
+    this.diagnosticStage = 'controlled-storage';
+  }
+
+  getItem(key) { return this.values.get(key) ?? null; }
+
+  async setItem(key, value) {
+    const gate = createDeferredValue();
+    const call = { key, value, gate, released: !this.deferWrites };
+    this.calls.push(call);
+    if (this.deferWrites) await gate.promise;
+    this.values.set(key, value);
+  }
+
+  release(index) {
+    const call = this.calls[index];
+    assert.ok(call, `Save storage call ${index} did not start`);
+    if (call.released) return;
+    call.released = true;
+    call.gate.resolve();
+  }
+
+  releaseAll() {
+    for (let index = 0; index < this.calls.length; index += 1) this.release(index);
+  }
+}
+
+function createHeldBootTimers() {
+  let sequence = 0;
+  const entries = [];
+  return {
+    entries,
+    setTimeoutFn(callback, delayMs) {
+      const entry = { id: ++sequence, callback, delayMs, active: true };
+      entries.push(entry);
+      return entry.id;
+    },
+    clearTimeoutFn(id) {
+      const entry = entries.find(candidate => candidate.id === id);
+      if (entry) entry.active = false;
+    },
+  };
+}
+
+async function waitForSaveCondition(condition, message) {
+  for (let attempt = 0; attempt < 400 && !condition(); attempt += 1) {
+    await new Promise(resolveValue => setImmediate(resolveValue));
+  }
+  assert.equal(condition(), true, message);
+}
+
+async function verifyGpSave03Pagehide() {
+  const environment = installBrowserEquivalentEnvironment();
+  const storage = new ControlledSaveStorage();
+  const timers = createHeldBootTimers();
+  let worldState = null;
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      measurementMode: 'steady',
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      worldStateFactory(options) {
+        worldState = new InfiniteWorldState(options);
+        return worldState;
+      },
+      saveStoreFactory(options) {
+        return new InfiniteWorldSaveStore({ ...options, storage });
+      },
+    });
+    assert.equal(storage.calls.length, 1, 'New Game performs the initial durable Save');
+    storage.deferWrites = true;
+
+    worldState.updatePlayer({ score: 10 });
+    const timerCountBeforePageHide = timers.entries.length;
+    environment.listeners.get('pagehide')({ persisted: true });
+    assert.equal(timers.entries.length, timerCountBeforePageHide,
+      'pagehide must not reserve even a zero-delay timer');
+    assert.equal(sandbox.snapshot().save.queue.requestedGeneration, 2,
+      'pagehide captures snapshot and revision inside the event handler');
+    await waitForSaveCondition(() => storage.calls.length === 2,
+      'pagehide must reach storage without advancing timers');
+
+    environment.listeners.get('pagehide')({ persisted: true });
+    assert.equal(sandbox.snapshot().save.queue.requestedGeneration, 2,
+      'repeated pagehide for one revision must reuse the same completion');
+    worldState.updatePlayer({ score: 20 });
+    environment.listeners.get('pagehide')({ persisted: true });
+    environment.listeners.get('pagehide')({ persisted: true });
+    assert.equal(sandbox.snapshot().save.queue.requestedGeneration, 3,
+      'a newer pagehide snapshot replaces the pending generation exactly once');
+    storage.release(1);
+    await waitForSaveCondition(() => storage.calls.length === 3,
+      'latest pagehide generation must follow the active older Save');
+    const latestPageHide = await decodeInfiniteWorldSave(storage.calls[2].value, {
+      worldSeedHash: worldState.worldSeedHash,
+    });
+    assert.equal(latestPageHide.player.score, 20);
+    storage.release(2);
+    await waitForSaveCondition(
+      () => sandbox.snapshot().save.queue.committedGeneration === 3,
+      'latest pagehide generation must commit',
+    );
+
+    worldState.updatePlayer({ score: 30 });
+    environment.listeners.get('keydown')({ code: 'KeyP', preventDefault() {} });
+    await waitForSaveCondition(() => storage.calls.length === 4,
+      'manual Save must enter the shared queue');
+    worldState.updatePlayer({ score: 40 });
+    environment.listeners.get('pagehide')({ persisted: true });
+    assert.equal(sandbox.snapshot().save.queue.requestedGeneration, 5);
+    storage.release(3);
+    await waitForSaveCondition(() => storage.calls.length === 5,
+      'pagehide must follow an active manual Save');
+    const manualConflictWinner = await decodeInfiniteWorldSave(storage.calls[4].value, {
+      worldSeedHash: worldState.worldSeedHash,
+    });
+    assert.equal(manualConflictWinner.player.score, 40);
+    storage.release(4);
+    await waitForSaveCondition(
+      () => sandbox.snapshot().save.queue.committedGeneration === 5,
+      'pagehide must win the manual Save conflict',
+    );
+
+    worldState.updatePlayer({ score: 50 });
+    environment.rafCallbacks.at(-1)(performance.now() + 100);
+    const autosaveTimer = [...timers.entries].reverse().find(
+      entry => entry.active && entry.delayMs === 5_000,
+    );
+    assert.ok(autosaveTimer, 'dirty state must schedule autosave');
+    environment.listeners.get('pagehide')({ persisted: true });
+    assert.equal(autosaveTimer.active, false, 'pagehide cancels the pending autosave timer');
+    await waitForSaveCondition(() => storage.calls.length === 6,
+      'pagehide must replace a pending autosave without running its timer');
+    storage.release(5);
+    await waitForSaveCondition(
+      () => sandbox.snapshot().save.queue.committedGeneration === 6,
+      'pagehide replacement for autosave must commit',
+    );
+
+    worldState.updatePlayer({ score: 60 });
+    environment.listeners.get('pagehide')({ persisted: true });
+    await waitForSaveCondition(() => storage.calls.length === 7,
+      'final pagehide Save must start');
+    const exitGeneration = sandbox.snapshot().save.queue.requestedGeneration;
+    const shutdown = sandbox.shutdown();
+    assert.equal(sandbox.snapshot().save.queue.requestedGeneration, exitGeneration,
+      'shutdown must await the matching pagehide Save instead of duplicating it');
+    storage.release(6);
+    await shutdown;
+    sandbox = null;
+  } finally {
+    storage.deferWrites = false;
+    storage.releaseAll();
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
 }
 
 function createEntryDocument(readyState) {
@@ -728,6 +906,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.restore();
   }
 });
+
+test('GP-SAVE-03 pagehide directly captures dirty state and coordinates queue conflicts',
+  verifyGpSave03Pagehide);
 
 test('Render Distance presets keep fixed gameplay coverage and resync Distant roots live', async t => {
   const expected = {

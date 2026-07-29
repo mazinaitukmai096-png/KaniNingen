@@ -1105,6 +1105,8 @@ export async function bootInfiniteWorldSandbox({
     let saveIdleCallback = null;
     let lastSavedRevision = -1;
     let lastSavedGeneration = 0;
+    let exitSaveRevision = null;
+    let exitSavePromise = null;
     let runStarted = false;
     let lastRunStartDiagnostics = null;
     let postCommitRequestedEpoch = 0;
@@ -1351,6 +1353,16 @@ export async function bootInfiniteWorldSandbox({
         saveStatus = 'failed';
       }
     }
+    function cancelScheduledSave() {
+      if (saveTimer !== null) {
+        clearTimeoutFn(saveTimer);
+        saveTimer = null;
+      }
+      if (saveIdleCallback !== null) {
+        globalObject.cancelIdleCallback?.(saveIdleCallback);
+        saveIdleCallback = null;
+      }
+    }
     function scheduleSave({ immediate = false, delayMs = 5_000, force = false } = {}) {
       if (!runStarted || !diagnosticProfile.save) return false;
       if (saveTimer !== null) {
@@ -1379,6 +1391,25 @@ export async function bootInfiniteWorldSandbox({
         } else void saveWorld();
       }, delayMs);
       return true;
+    }
+    function saveForExit() {
+      cancelScheduledSave();
+      if (!runStarted || !diagnosticProfile.save) return Promise.resolve(null);
+      const revision = worldState.revision;
+      if (exitSaveRevision === revision) return exitSavePromise ?? Promise.resolve(null);
+      exitSaveRevision = revision;
+      const saving = saveWorld({ force: true });
+      exitSavePromise = saving;
+      void saving.then(saved => {
+        if (exitSavePromise !== saving) return;
+        exitSavePromise = null;
+        if (!saved || saved.revision !== revision) exitSaveRevision = null;
+      }, () => {
+        if (exitSavePromise !== saving) return;
+        exitSavePromise = null;
+        exitSaveRevision = null;
+      });
+      return saving;
     }
     async function loadWorld() {
       playerRelocationInProgress = true;
@@ -1615,7 +1646,7 @@ export async function bootInfiniteWorldSandbox({
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
     }
-    const handlePageHide = () => scheduleSave({ immediate: true, force: true });
+    const handlePageHide = () => { void saveForExit(); };
     function setMeasurementViewport(width, height) {
       if (!Number.isFinite(width) || width <= 0 || !Number.isFinite(height) || height <= 0) {
         throw new RangeError('measurement viewport dimensions must be positive finite numbers');
@@ -2077,15 +2108,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       running = false;
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
       if (postCommitTimer !== null) { clearTimeoutFn(postCommitTimer); postCommitTimer = null; }
-      if (saveTimer !== null) { clearTimeoutFn(saveTimer); saveTimer = null; }
-      if (saveIdleCallback !== null) {
-        globalObject.cancelIdleCallback?.(saveIdleCallback);
-        saveIdleCallback = null;
-      }
+      cancelScheduledSave();
       removeWindowListener('resize', resize);
       removeWindowListener('pagehide', handlePageHide);
       experienceShell.dispose();
-      if (runStarted) await saveWorld({ force: true });
+      if (runStarted) await saveForExit();
       diagnostics.dispose();
       await audioDirector.dispose();
       await gameplay.shutdown();
