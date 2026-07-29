@@ -41,6 +41,8 @@ const TANK_COLLISION_OBSTACLE_TYPES = new Set([
   'house', 'rock', 'pebble', 'tower', 'church', 'school', 'militaryBase', 'barn', 'factory',
 ]);
 const TANK_TERRAIN_QUERY_CACHE_CAPACITY = 128;
+const TANK_PROJECTILE_TERRAIN_SWEEP_STEP_METERS =
+  W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters;
 const BOSS_TAIL_DIRECTION_EPSILON_METERS_SQUARED = finiteWorldUnitsToMeters(
   Math.sqrt(0.001),
 ) ** 2;
@@ -310,6 +312,37 @@ function distanceSquared3D(left, right) {
   return (left.x - right.x) ** 2
     + (left.y - right.y) ** 2
     + (left.z - right.z) ** 2;
+}
+
+function segmentSphereFirstHitT(
+  startX,
+  startY,
+  startZ,
+  endX,
+  endY,
+  endZ,
+  centerX,
+  centerY,
+  centerZ,
+  radius,
+) {
+  const offsetX = startX - centerX;
+  const offsetY = startY - centerY;
+  const offsetZ = startZ - centerZ;
+  const radiusSquared = radius * radius;
+  const startDistanceSquared = offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ;
+  if (startDistanceSquared <= radiusSquared) return 0;
+  const deltaX = endX - startX;
+  const deltaY = endY - startY;
+  const deltaZ = endZ - startZ;
+  const segmentLengthSquared = deltaX * deltaX + deltaY * deltaY + deltaZ * deltaZ;
+  if (segmentLengthSquared <= 1e-12) return Number.POSITIVE_INFINITY;
+  const projection = offsetX * deltaX + offsetY * deltaY + offsetZ * deltaZ;
+  const discriminant = projection * projection
+    - segmentLengthSquared * (startDistanceSquared - radiusSquared);
+  if (discriminant < 0) return Number.POSITIVE_INFINITY;
+  const hitT = (-projection - Math.sqrt(discriminant)) / segmentLengthSquared;
+  return hitT >= 0 && hitT <= 1 ? hitT : Number.POSITIVE_INFINITY;
 }
 
 function tankDistanceSquared3D(entity, tankY, player, playerY) {
@@ -1074,14 +1107,14 @@ export class InfiniteGameplayRuntime {
     });
   }
 
-  *#tankShellWorldCandidates(start, end) {
+  *#tankShellWorldCandidates(startX, startZ, endX, endZ) {
     const padding = this.maximumSpatialTargetRadiusMeters
       + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters;
     for (const model of this.#spatialModelsIntersectingAabb(
-      Math.min(start.x, end.x) - padding,
-      Math.min(start.z, end.z) - padding,
-      Math.max(start.x, end.x) + padding,
-      Math.max(start.z, end.z) + padding,
+      Math.min(startX, endX) - padding,
+      Math.min(startZ, endZ) - padding,
+      Math.max(startX, endX) + padding,
+      Math.max(startZ, endZ) + padding,
     )) {
       yield* model.staticTargets;
       for (const descriptor of model.entityDescriptors) {
@@ -1089,6 +1122,60 @@ export class InfiniteGameplayRuntime {
         yield descriptor;
       }
     }
+  }
+
+  #tankShellTerrainFirstHitT(startX, startY, startZ, endX, endY, endZ, maximumT) {
+    const limitedT = Math.max(0, Math.min(1, maximumT));
+    const deltaX = endX - startX;
+    const deltaY = endY - startY;
+    const deltaZ = endZ - startZ;
+    const segmentLength = Math.hypot(deltaX, deltaY, deltaZ) * limitedT;
+    const stepCount = Math.max(1, Math.ceil(
+      segmentLength / TANK_PROJECTILE_TERRAIN_SWEEP_STEP_METERS,
+    ));
+    let previousT = 0;
+    let previousClearance = null;
+    for (let step = 0; step <= stepCount; step += 1) {
+      const t = limitedT * step / stepCount;
+      const x = startX + deltaX * t;
+      const y = startY + deltaY * t;
+      const z = startZ + deltaZ * t;
+      const terrainHeight = this.#tryTerrainHeightAt(x, z, false);
+      if (terrainHeight === null) {
+        previousT = t;
+        previousClearance = null;
+        continue;
+      }
+      const clearance = y - terrainHeight
+        - W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters;
+      if (clearance <= 0) {
+        if (step === 0 || previousClearance === null || previousClearance <= 0) return t;
+        let clearT = previousT;
+        let blockedT = t;
+        for (let iteration = 0; iteration < 8; iteration += 1) {
+          const midpointT = (clearT + blockedT) / 2;
+          const midpointX = startX + deltaX * midpointT;
+          const midpointY = startY + deltaY * midpointT;
+          const midpointZ = startZ + deltaZ * midpointT;
+          const midpointTerrainHeight = this.#tryTerrainHeightAt(
+            midpointX,
+            midpointZ,
+            false,
+          );
+          if (midpointTerrainHeight === null
+            || midpointY - midpointTerrainHeight
+              > W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters) {
+            clearT = midpointT;
+          } else {
+            blockedT = midpointT;
+          }
+        }
+        return blockedT;
+      }
+      previousT = t;
+      previousClearance = clearance;
+    }
+    return Number.POSITIVE_INFINITY;
   }
 
   #registerSpatialGameplayModel(key, model, { startOccurrences = true } = {}) {
@@ -2896,26 +2983,105 @@ export class InfiniteGameplayRuntime {
             * W7_CORE_COMBAT_CONTRACT.tank.difficultySpeedScoreFactor,
         );
         const projectileSpeed = bulletSpeed * speedMultiplier;
-        const nextX = projectile.x + projectile.directionX * projectileSpeed * boundedDelta;
-        const nextY = projectile.y + projectile.directionY * projectileSpeed * boundedDelta;
-        const nextZ = projectile.z + projectile.directionZ * projectileSpeed * boundedDelta;
-        const terrainHeight = this.#tryTerrainHeightAt(nextX, nextZ, false);
+        const startX = projectile.x;
+        const startY = projectile.y;
+        const startZ = projectile.z;
+        const nextX = startX + projectile.directionX * projectileSpeed * boundedDelta;
+        const nextY = startY + projectile.directionY * projectileSpeed * boundedDelta;
+        const nextZ = startZ + projectile.directionZ * projectileSpeed * boundedDelta;
         projectile.terrainWaitSeconds = 0;
-        projectile.x = nextX;
-        projectile.y = nextY;
-        projectile.z = nextZ;
         projectile.remainingSeconds -= boundedDelta;
-        let hitSomething = false;
-        const playerCenter = {
-          x: this.state.player.x,
-          y: (Number.isFinite(combatPlayer.y)
-            ? combatPlayer.y
-            : this.#terrainHeightAt(this.state.player.x, this.state.player.z)),
-          z: this.state.player.z,
-        };
-        if (this.state.player.hp > 0
-          && distanceSquared3D(playerCenter, projectile)
-            < bulletHitRadius ** 2) {
+        let nearestHitT = Number.POSITIVE_INFINITY;
+        let nearestHitKind = null;
+        let nearestCandidate = null;
+        let nearestEntity = null;
+        const playerCenterY = Number.isFinite(combatPlayer.y)
+          ? combatPlayer.y
+          : this.#terrainHeightAt(this.state.player.x, this.state.player.z);
+        if (this.state.player.hp > 0) {
+          const playerHitT = segmentSphereFirstHitT(
+            startX,
+            startY,
+            startZ,
+            nextX,
+            nextY,
+            nextZ,
+            this.state.player.x,
+            playerCenterY,
+            this.state.player.z,
+            bulletHitRadius,
+          );
+          if (playerHitT < nearestHitT) {
+            nearestHitT = playerHitT;
+            nearestHitKind = 'player';
+          }
+        }
+        for (const candidate of this.#tankShellWorldCandidates(
+          startX,
+          startZ,
+          nextX,
+          nextZ,
+        )) {
+          let entity = null;
+          let centerX;
+          let centerY;
+          let centerZ;
+          let radius;
+          if (candidate.type === 'human') {
+            this.#registerStableId(candidate.stableId, candidate.ownerChunkKey);
+            entity = this.state.ensureEntity(candidate);
+            if (!entity.alive) continue;
+            centerX = entity.x;
+            centerY = this.#terrainHeightAt(entity.x, entity.z);
+            centerZ = entity.z;
+            radius = finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius)
+              + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters;
+          } else {
+            if (this.state.isFeatureDestroyed(candidate.stableId)) continue;
+            centerX = candidate.x;
+            centerY = candidate.y ?? this.#terrainHeightAt(candidate.x, candidate.z);
+            centerZ = candidate.z;
+            radius = finiteWorldUnitsToMeters(candidate.radius)
+              + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters;
+          }
+          const candidateHitT = segmentSphereFirstHitT(
+            startX,
+            startY,
+            startZ,
+            nextX,
+            nextY,
+            nextZ,
+            centerX,
+            centerY,
+            centerZ,
+            radius,
+          );
+          if (candidateHitT >= nearestHitT) continue;
+          nearestHitT = candidateHitT;
+          nearestHitKind = candidate.type === 'human' ? 'entity' : 'feature';
+          nearestCandidate = candidate;
+          nearestEntity = entity;
+        }
+        const terrainHitT = this.#tankShellTerrainFirstHitT(
+          startX,
+          startY,
+          startZ,
+          nextX,
+          nextY,
+          nextZ,
+          Number.isFinite(nearestHitT) ? nearestHitT : 1,
+        );
+        if (terrainHitT < nearestHitT) {
+          nearestHitT = terrainHitT;
+          nearestHitKind = 'terrain';
+          nearestCandidate = null;
+          nearestEntity = null;
+        }
+        const movementT = Number.isFinite(nearestHitT) ? nearestHitT : 1;
+        projectile.x = startX + (nextX - startX) * movementT;
+        projectile.y = startY + (nextY - startY) * movementT;
+        projectile.z = startZ + (nextZ - startZ) * movementT;
+        if (nearestHitKind === 'player') {
           const wasAlive = this.state.player.hp > 0;
           this.state.damagePlayer(W7_CORE_COMBAT_CONTRACT.tank.bulletDamage);
           this.#emitCombatEffect({
@@ -2929,69 +3095,39 @@ export class InfiniteGameplayRuntime {
           });
           this.counts.playerHits += 1;
           if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
-          hitSomething = true;
         }
-        if (!hitSomething) {
-          for (const candidate of this.#tankShellWorldCandidates(projectile, projectile)) {
-            let resolved;
-            let sphere;
-            if (candidate.type === 'human') {
-              this.#registerStableId(candidate.stableId, candidate.ownerChunkKey);
-              const entity = this.state.ensureEntity(candidate);
-              if (!entity.alive) continue;
-              resolved = {
-                kind: 'entity',
-                stableId: entity.stableId,
-                type: entity.type,
-                entity,
-                descriptor: candidate,
-              };
-              sphere = {
-                x: entity.x,
-                y: this.#terrainHeightAt(entity.x, entity.z),
-                z: entity.z,
-                radius: finiteWorldUnitsToMeters(W6_ENTITY_CONTRACTS.human.radius)
-                  + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters,
-              };
-            } else {
-              if (this.state.isFeatureDestroyed(candidate.stableId)) continue;
-              resolved = {
-                kind: 'feature',
-                stableId: candidate.stableId,
-                type: candidate.type,
-                target: candidate,
-              };
-              sphere = {
-                x: candidate.x,
-                y: candidate.y ?? this.#terrainHeightAt(candidate.x, candidate.z),
-                z: candidate.z,
-                radius: finiteWorldUnitsToMeters(candidate.radius)
-                  + W7_CORE_COMBAT_CONTRACT.tank.worldCollisionPaddingMeters,
-              };
+        if (nearestHitKind === 'entity' || nearestHitKind === 'feature') {
+          const resolved = nearestHitKind === 'entity'
+            ? {
+              kind: 'entity',
+              stableId: nearestEntity.stableId,
+              type: nearestEntity.type,
+              entity: nearestEntity,
+              descriptor: nearestCandidate,
             }
-            if (distanceSquared3D(sphere, projectile) >= sphere.radius ** 2) continue;
-            const result = this.applyCombatDamage(
-              resolved,
-              W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
-              { awardPlayerCredit: true },
-            );
-            this.#emitCombatEffect({
-              type: result.justDestroyed
-                ? (resolved.kind === 'feature' ? 'destruction' : 'entity-destruction')
-                : 'tank-impact',
-              x: projectile.x,
-              y: projectile.y,
-              z: projectile.z,
-              durationSeconds: result.justDestroyed ? 0.45 : 0.18,
-              soundCue: result.justDestroyed && resolved.kind !== 'feature' ? 'splat' : 'hit',
-            });
-            hitSomething = true;
-            break;
-          }
+            : {
+              kind: 'feature',
+              stableId: nearestCandidate.stableId,
+              type: nearestCandidate.type,
+              target: nearestCandidate,
+            };
+          const result = this.applyCombatDamage(
+            resolved,
+            W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+            { awardPlayerCredit: true },
+          );
+          this.#emitCombatEffect({
+            type: result.justDestroyed
+              ? (resolved.kind === 'feature' ? 'destruction' : 'entity-destruction')
+              : 'tank-impact',
+            x: projectile.x,
+            y: projectile.y,
+            z: projectile.z,
+            durationSeconds: result.justDestroyed ? 0.45 : 0.18,
+            soundCue: result.justDestroyed && resolved.kind !== 'feature' ? 'splat' : 'hit',
+          });
         }
-        if (!hitSomething && terrainHeight !== null
-          && projectile.y <= terrainHeight
-            + W8_TANK_LIFECYCLE_CONTRACT.terrainHitClearanceMeters) {
+        if (nearestHitKind === 'terrain') {
           this.#emitCombatEffect({
             type: 'tank-impact',
             x: projectile.x,
@@ -3000,9 +3136,10 @@ export class InfiniteGameplayRuntime {
             durationSeconds: 0.18,
             soundCue: 'hit',
           });
-          hitSomething = true;
         }
-        if (hitSomething || projectile.remainingSeconds <= 0) this.projectiles.splice(index, 1);
+        if (nearestHitKind !== null || projectile.remainingSeconds <= 0) {
+          this.projectiles.splice(index, 1);
+        }
         continue;
       }
 
@@ -3041,7 +3178,12 @@ export class InfiniteGameplayRuntime {
         if (wasAlive && this.state.player.hp <= 0) this.counts.playerDeaths += 1;
       }
       if (!hit) {
-        for (const candidate of this.#tankShellWorldCandidates(projectile, projectile)) {
+        for (const candidate of this.#tankShellWorldCandidates(
+          projectile.x,
+          projectile.z,
+          projectile.x,
+          projectile.z,
+        )) {
           if (candidate.type === 'tank' || candidate.type === 'boss'
             || this.state.isFeatureDestroyed(candidate.stableId)) continue;
           const radius = finiteWorldUnitsToMeters(

@@ -1715,7 +1715,7 @@ test('Tank Projectile terrain queries are non-generating without changing combat
       sampleTerrainHeight(x, z, chunkData) {
         if (z > 90) return 0;
         if (!chunkData) return null;
-        if (x > 75) projectileTerrainSamples += 1;
+        if (x >= 75) projectileTerrainSamples += 1;
         return chunkData.testTerrainHeight;
       },
       getChunkDataForQuery(chunkX, chunkZ) {
@@ -1895,6 +1895,238 @@ test('Tank shell keeps finite player, world, terrain, and difficulty-speed colli
     assert.ok(Math.abs(moved.x - (start.x + start.directionX * expectedMeters)) < 1e-9);
     assert.ok(Math.abs(moved.y - (start.y + start.directionY * expectedMeters)) < 1e-9);
     assert.ok(Math.abs(moved.z - (start.z + start.directionZ * expectedMeters)) < 1e-9);
+    await runtime.shutdown();
+  });
+});
+
+test('GP-TANK-01 Tank shell uses swept collision at maximum frame delta and speed', async t => {
+  function addShell(runtime, tank, {
+    id,
+    x,
+    y = 1,
+    z = 0,
+    directionX = 1,
+    directionY = 0,
+    directionZ = 0,
+    remainingSeconds = 2,
+  }) {
+    const occurrence = runtime.activeTankOccurrences.get(tank.stableId);
+    assert.ok(occurrence, 'the shell owner must have an active occurrence');
+    runtime.projectiles.push({
+      id,
+      ownerStableId: tank.stableId,
+      ownerChunkKey: tank.ownerChunkKey,
+      ownerRuntimeGeneration: occurrence.runtimeGeneration,
+      x,
+      y,
+      z,
+      directionX,
+      directionY,
+      directionZ,
+      remainingSeconds,
+      type: 'tank-shell',
+    });
+  }
+
+  async function playerPass(deltaSequence) {
+    const result = await createRuntime({
+      playerSpawn: { x: 7, z: 0 },
+      chunk: tankOnlyChunk(),
+      configureState(state) { state.player.score = 100_000; },
+    });
+    const tank = armTank(
+      result.runtime,
+      result.state,
+      findBaseTank(result.state),
+      { x: 14, z: 14 },
+    );
+    addShell(result.runtime, tank, {
+      id: `${tank.stableId}:swept-player`,
+      x: 3.5,
+    });
+    for (const deltaSeconds of deltaSequence) {
+      result.runtime.update({
+        deltaSeconds,
+        player: { ...result.state.player, y: 1 },
+      });
+    }
+    return result;
+  }
+
+  await t.test('delta 0.05 at the 1.5 speed ceiling hits Player like two 0.025 steps', async () => {
+    const single = await playerPass([0.05]);
+    const split = await playerPass([0.025, 0.025]);
+    assert.equal(single.state.player.hp, single.state.player.maxHp - TANK_BULLET_DAMAGE);
+    assert.equal(single.state.player.hp, split.state.player.hp);
+    assert.equal(single.runtime.snapshot().counts.playerHits, 1);
+    assert.equal(split.runtime.snapshot().counts.playerHits, 1);
+    assert.equal(single.runtime.projectiles.length, 0);
+    assert.equal(split.runtime.projectiles.length, 0);
+    await single.runtime.shutdown();
+    await split.runtime.shutdown();
+  });
+
+  await t.test('a high-speed shell hits a Human crossed between endpoints', async () => {
+    const { runtime, state } = await createRuntime({
+      playerSpawn: { x: 15, z: 15 },
+      chunk: combatChunk(),
+      configureState(candidate) { candidate.player.score = 100_000; },
+    });
+    const human = [...state.entityStates.values()].find(entity => entity.type === 'human');
+    assert.ok(human);
+    Object.assign(human, {
+      x: 7,
+      z: 0,
+      aiState: 'recovering',
+      tripTimer: 10,
+      humanTimer: 10,
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14 });
+    addShell(runtime, tank, { id: `${tank.stableId}:swept-human`, x: 3.5 });
+    runtime.update({ deltaSeconds: 0.05, player: { ...state.player, y: 1 } });
+    assert.equal(human.hp, 0);
+    assert.equal(human.alive, false);
+    assert.equal(runtime.projectiles.length, 0);
+    await runtime.shutdown();
+  });
+
+  await t.test('a high-speed shell hits a small World Object crossed between endpoints', async () => {
+    const targetStableId = 'wf1:rock:gp-tank-01-small';
+    const { runtime, state } = await createRuntime({
+      playerSpawn: { x: 15, z: 15 },
+      chunk: tankOnlyChunk({ rocks: [{
+        candidateId: targetStableId,
+        worldPosition: { x: 7, y: 1, z: 0 },
+        metadata: { candidateRadiusMeters: 0.1 },
+        owningChunkCoordinate: { x: 0, z: 0 },
+      }] }),
+      configureState(candidate) { candidate.player.score = 100_000; },
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14 });
+    addShell(runtime, tank, { id: `${tank.stableId}:swept-small-object`, x: 6.3 });
+    runtime.update({ deltaSeconds: 0.05, player: { ...state.player, y: 1 } });
+    assert.equal(
+      state.featureDamage.get(targetStableId)?.damage,
+      W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+    );
+    assert.equal(runtime.projectiles.length, 0);
+    await runtime.shutdown();
+  });
+
+  await t.test('only the nearest collinear target receives damage regardless of Stable ID order', async () => {
+    const nearStableId = 'wf1:rock:gp-tank-01-z-near';
+    const farStableId = 'wf1:rock:gp-tank-01-a-far';
+    const { runtime, state } = await createRuntime({
+      playerSpawn: { x: 15, z: 15 },
+      chunk: tankOnlyChunk({ rocks: [
+        {
+          candidateId: farStableId,
+          worldPosition: { x: 10, y: 1, z: 0 },
+          metadata: { candidateRadiusMeters: 0.1 },
+          owningChunkCoordinate: { x: 0, z: 0 },
+        },
+        {
+          candidateId: nearStableId,
+          worldPosition: { x: 7, y: 1, z: 0 },
+          metadata: { candidateRadiusMeters: 0.1 },
+          owningChunkCoordinate: { x: 0, z: 0 },
+        },
+      ] }),
+      configureState(candidate) { candidate.player.score = 100_000; },
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14 });
+    addShell(runtime, tank, { id: `${tank.stableId}:swept-nearest`, x: 3 });
+    runtime.update({ deltaSeconds: 0.05, player: { ...state.player, y: 1 } });
+    assert.equal(
+      state.featureDamage.get(nearStableId)?.damage,
+      W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+    );
+    assert.equal(state.featureDamage.has(farStableId), false);
+    assert.equal(runtime.projectiles.length, 0);
+    await runtime.shutdown();
+  });
+
+  await t.test('target and terrain impacts are selected by distance along the segment', async () => {
+    async function runOrderingCase({ terrainStartsAt, targetX, suffix }) {
+      const targetStableId = `wf1:rock:gp-tank-01-${suffix}`;
+      const result = await createRuntime({
+        playerSpawn: { x: 15, z: 15 },
+        chunk: tankOnlyChunk({ rocks: [{
+          candidateId: targetStableId,
+          worldPosition: { x: targetX, y: 1, z: 0 },
+          metadata: { candidateRadiusMeters: 0.1 },
+          owningChunkCoordinate: { x: 0, z: 0 },
+        }] }),
+        sampleTerrainHeight: x => (x >= terrainStartsAt ? 1 : 0),
+        configureState(candidate) { candidate.player.score = 100_000; },
+      });
+      const tank = armTank(
+        result.runtime,
+        result.state,
+        findBaseTank(result.state),
+        { x: 14, z: 14 },
+      );
+      addShell(result.runtime, tank, { id: `${tank.stableId}:${suffix}`, x: 3 });
+      result.runtime.update({
+        deltaSeconds: 0.05,
+        player: { ...result.state.player, y: 1 },
+      });
+      return { ...result, targetStableId };
+    }
+
+    const terrainFirst = await runOrderingCase({
+      terrainStartsAt: 5,
+      targetX: 7,
+      suffix: 'terrain-first',
+    });
+    assert.equal(terrainFirst.state.featureDamage.has(terrainFirst.targetStableId), false);
+    assert.ok(terrainFirst.runtime.consumePresentationEffects().events.some(event =>
+      event.type === 'tank-impact' && event.logicalPosition.x < 7));
+
+    const targetFirst = await runOrderingCase({
+      terrainStartsAt: 9,
+      targetX: 7,
+      suffix: 'target-first',
+    });
+    assert.equal(
+      targetFirst.state.featureDamage.get(targetFirst.targetStableId)?.damage,
+      W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+    );
+    await terrainFirst.runtime.shutdown();
+    await targetFirst.runtime.shutdown();
+  });
+
+  await t.test('a shell starting inside a target hits once and normal lifetime cleanup remains intact', async () => {
+    const targetStableId = 'wf1:rock:gp-tank-01-start-inside';
+    const { runtime, state } = await createRuntime({
+      playerSpawn: { x: 15, z: 15 },
+      chunk: tankOnlyChunk({ rocks: [{
+        candidateId: targetStableId,
+        worldPosition: { x: 7, y: 1, z: 0 },
+        metadata: { candidateRadiusMeters: 0.1 },
+        owningChunkCoordinate: { x: 0, z: 0 },
+      }] }),
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14 });
+    addShell(runtime, tank, { id: `${tank.stableId}:start-inside`, x: 7 });
+    runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 1 } });
+    assert.equal(
+      state.featureDamage.get(targetStableId)?.damage,
+      W7_CORE_COMBAT_CONTRACT.tank.worldCollisionDamage,
+    );
+    assert.equal(runtime.projectiles.length, 0);
+
+    addShell(runtime, tank, {
+      id: `${tank.stableId}:lifetime`,
+      x: 3,
+      y: 5,
+      z: 0,
+      directionX: 0,
+      directionZ: -1,
+      remainingSeconds: 0.01,
+    });
+    runtime.update({ deltaSeconds: 0.01, player: { ...state.player, y: 1 } });
+    assert.equal(runtime.projectiles.length, 0);
     await runtime.shutdown();
   });
 });
