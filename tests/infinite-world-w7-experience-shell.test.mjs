@@ -111,7 +111,7 @@ function createFixture({
     },
   };
   const calls = {
-    attacks: [], saves: 0, loads: 0, homes: 0, restarts: 0,
+    attacks: [], saves: 0, loads: 0, returnTitles: 0, homeResets: 0, restarts: 0,
     nuclear: [], landings: [], bossSpawns: 0, starts: [], combatCommands: [], treeLodOverlays: [],
   };
   const shell = createInfiniteExperienceShell({
@@ -122,7 +122,8 @@ function createFixture({
     onAttack: mode => calls.attacks.push(mode),
     onSave: () => { calls.saves += 1; },
     onLoad: () => { calls.loads += 1; },
-    onHome: () => { calls.homes += 1; },
+    onReturnTitle: () => { calls.returnTitles += 1; },
+    onResetHome: () => { calls.homeResets += 1; },
     onRestart: () => { calls.restarts += 1; },
     onStartRun: mode => { calls.starts.push(mode); return runConfiguration; },
     ...(useCombatCommands ? {
@@ -679,8 +680,28 @@ test('debug stays transient while HUD visibility and settings use the existing W
   assert.equal(fixture.shell.isPaused(), true);
   fixture.elements.get('debug-close-btn').dispatch('click');
   fixture.elements.get('set-home-btn').dispatch('click');
-  assert.equal(fixture.calls.homes, 1);
+  assert.equal(fixture.calls.returnTitles, 1);
+  assert.equal(fixture.calls.homeResets, 0);
   assert.equal(fixture.shell.snapshot().mode, 'menu');
+  fixture.shell.dispose();
+});
+
+test('GP-LIFE-01 routes title and home reset through independent callbacks', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const player = { x: 37, z: -21, facingY: 1.25 };
+  finishIntro(fixture, player);
+  const playerBeforeTitle = { ...player };
+
+  fixture.elements.get('set-home-btn').dispatch('click');
+  assert.equal(fixture.calls.returnTitles, 1);
+  assert.equal(fixture.calls.homeResets, 0);
+  assert.deepEqual(player, playerBeforeTitle);
+  assert.equal(fixture.shell.snapshot().mode, 'menu');
+
+  fixture.elements.get('set-reset-btn').dispatch('click');
+  assert.equal(fixture.calls.returnTitles, 1);
+  assert.equal(fixture.calls.homeResets, 1);
   fixture.shell.dispose();
 });
 

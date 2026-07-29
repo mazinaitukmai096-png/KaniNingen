@@ -1113,6 +1113,7 @@ export async function bootInfiniteWorldSandbox({
       : state.saveAvailable
         ? initialSaveStorageMode === 'legacy-fallback' ? 'fallback' : 'available'
         : state.saveError ? 'invalid' : 'new';
+    let returnTitleSavePromise = null;
     let lastFrameAt = clock();
     let latestFrameDurationMs = 0;
     let lastHudAt = 0;
@@ -1525,6 +1526,7 @@ export async function bootInfiniteWorldSandbox({
         try {
           let synchronized;
           if (startMode === 'continue') {
+            if (returnTitleSavePromise) await returnTitleSavePromise;
             const loaded = await loadWorld();
             if (!loaded) return false;
             const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
@@ -1580,12 +1582,22 @@ export async function bootInfiniteWorldSandbox({
           playerRelocationInProgress = false;
         }
       },
-      onHome: async () => {
+      onReturnTitle: () => {
+        const saving = saveWorld({ force: true });
+        returnTitleSavePromise = saving;
+        void saving.finally(() => {
+          if (returnTitleSavePromise === saving) returnTitleSavePromise = null;
+        });
+        return saving;
+      },
+      onResetHome: async () => {
         playerRelocationInProgress = true;
         try {
-          logicalPlayer.x = experienceSpawn.x;
-          logicalPlayer.z = experienceSpawn.z;
-          logicalPlayer.facingY = experienceSpawn.facingY;
+          worldState.updatePlayer({
+            x: experienceSpawn.x,
+            z: experienceSpawn.z,
+            facingY: experienceSpawn.facingY,
+          });
           await synchronizeRuntimeToLogicalPlayer();
         } catch (error) {
           transitionError = error;

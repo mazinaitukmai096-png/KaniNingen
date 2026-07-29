@@ -64,7 +64,8 @@ export function createInfiniteExperienceShell({
   onCombatCommand = null,
   onSave = () => {},
   onLoad = () => {},
-  onHome = () => {},
+  onReturnTitle = () => {},
+  onResetHome = () => {},
   onRestart = () => {},
   onNuclearRelease = () => {},
   onChargeEnd = () => {},
@@ -320,12 +321,11 @@ export function createInfiniteExperienceShell({
     if (state.mode === 'playing') resume();
     else syncShellVisibility();
   }
-  async function returnHome() {
+  async function returnTitle() {
     state.mode = 'menu'; state.runPhase = 'menu'; state.paused = true;
     state.settingsOpen = false; state.debugOpen = false;
     leaveLock(); syncShellVisibility();
-    await onHome();
-    resetPlayerVerticalMovement();
+    await onReturnTitle();
   }
   async function restart() {
     const runConfiguration = await onRestart();
@@ -357,13 +357,13 @@ export function createInfiniteExperienceShell({
   };
   listen(elements.treeLodOverlayOff, 'click', () => setTreeLodOverlayEnabled(false));
   listen(elements.treeLodOverlayOn, 'click', () => setTreeLodOverlayEnabled(true));
-  listen(elements.home, 'click', () => { void returnHome(); });
+  listen(elements.home, 'click', () => { void returnTitle(); });
   listen(elements.restart, 'click', () => { void restart(); });
   listen(elements.spawnBoss, 'click', () => {
     if (developerToolsEnabled()) void onSpawnManualBoss();
   });
   listen(elements.reset, 'click', () => {
-    void Promise.resolve(onHome()).then(() => {
+    void Promise.resolve(onResetHome()).then(() => {
       resetPlayerVerticalMovement();
       if (state.mode === 'playing') resume();
     });
@@ -827,7 +827,7 @@ export function createInfiniteExperienceShell({
     resume,
     openSettings,
     openDebug,
-    returnHome,
+    returnTitle,
     isPaused: () => state.paused,
     getMode: () => state.mode,
     getRunPhase: () => state.runPhase,

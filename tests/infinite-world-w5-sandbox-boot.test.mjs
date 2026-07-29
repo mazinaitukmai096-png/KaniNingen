@@ -15,6 +15,7 @@ import {
 } from '../src/infinite-world/sandbox-boot.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
 import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
+import { W6_ENTITY_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
 import { UNITS_PER_METER } from '../src/infinite-world/chunk-coordinates.js';
 import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
@@ -413,11 +414,51 @@ function createHeldBootTimers() {
   };
 }
 
+function installExperienceControls() {
+  const createElement = () => {
+    const listeners = new Map();
+    const classes = new Set();
+    return {
+      style: {}, disabled: false, textContent: '', value: '', checked: false,
+      classList: {
+        toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); },
+        contains(name) { return classes.has(name); },
+      },
+      setAttribute() {},
+      addEventListener(type, listener) {
+        if (!listeners.has(type)) listeners.set(type, new Set());
+        listeners.get(type).add(listener);
+      },
+      removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
+      dispatch(type, event = {}) {
+        for (const listener of listeners.get(type) ?? []) listener({ type, target: this, ...event });
+      },
+    };
+  };
+  const elements = new Map([
+    'start-screen', 'start-button', 'continue-button', 'set-home-btn', 'set-reset-btn',
+  ].map(id => [id, createElement()]));
+  const documentObject = globalThis.document;
+  const originalGetElementById = documentObject.getElementById.bind(documentObject);
+  documentObject.getElementById = id => elements.get(id) ?? originalGetElementById(id);
+  documentObject.body = { classList: { toggle() {} } };
+  documentObject.pointerLockElement = null;
+  documentObject.exitPointerLock = () => {};
+  return elements;
+}
+
 async function waitForSaveCondition(condition, message) {
   for (let attempt = 0; attempt < 400 && !condition(); attempt += 1) {
     await new Promise(resolveValue => setImmediate(resolveValue));
   }
   assert.equal(condition(), true, message);
+}
+
+async function waitForLifeCycleCondition(condition, message) {
+  for (let attempt = 0; attempt < 2_000 && !condition(); attempt += 1) {
+    await new Promise(resolveValue => setTimeout(resolveValue, 10));
+  }
+  assert.equal(condition(), true, typeof message === 'function' ? message() : message);
 }
 
 async function verifyGpSave03Pagehide() {
@@ -909,6 +950,151 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
 
 test('GP-SAVE-03 pagehide directly captures dirty state and coordinates queue conflicts',
   verifyGpSave03Pagehide);
+
+test('GP-LIFE-01 title preserves the interrupted World while home reset alone relocates Player', async () => {
+  const environment = installBrowserEquivalentEnvironment();
+  const controls = installExperienceControls();
+  const storage = new ControlledSaveStorage();
+  const timers = createHeldBootTimers();
+  let worldState = null;
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      worldStateFactory(options) {
+        worldState = new InfiniteWorldState(options);
+        return worldState;
+      },
+      saveStoreFactory(options) {
+        return new InfiniteWorldSaveStore({ ...options, storage });
+      },
+    });
+
+    controls.get('start-button').dispatch('click');
+    await waitForLifeCycleCondition(() => sandbox.snapshot().save.queue.committedGeneration === 1,
+      'New Game must complete its initial Save');
+    await waitForLifeCycleCondition(() => (
+      sandbox.snapshot().runStart?.startMode === 'new'
+      && sandbox.snapshot().experience.runPhase === 'intro'
+    ),
+      'New Game preparation must enter the run before lifecycle assertions');
+
+    worldState.updatePlayer({ score: 7700, hp: 61 });
+    let autosaveTimer = null;
+    for (let frameIndex = 0; frameIndex < 3 && !autosaveTimer; frameIndex += 1) {
+      environment.rafCallbacks.at(-1)(performance.now() + 100 + frameIndex * 20);
+      await new Promise(resolveValue => setImmediate(resolveValue));
+      autosaveTimer = [...timers.entries].reverse().find(
+        entry => entry.active && entry.delayMs === 5_000,
+      ) ?? null;
+    }
+    assert.ok(autosaveTimer, 'dirty gameplay must have a pending autosave before title');
+
+    worldState.updatePlayer({ x: 37.25, z: -21.5, facingY: 1.25 });
+    worldState.damageFeature({ stableId: 'wf1:tree:gp-life-01', maxHp: 80 }, 80);
+    const reinforcementSequence = worldState.nextTankReinforcementSequence();
+    worldState.ensureEntity({
+      stableId: 'wf1:tank:gp-life-01', ownerChunkKey: '2,-2', type: 'tank',
+      maxHp: W6_ENTITY_CONTRACTS.tank.maxHp, x: 36, z: -20, rotationY: 0.5,
+      aiState: 'engage', spawned: true, reinforcementSequence,
+    });
+    worldState.ensureEntity({
+      stableId: 'wf1:boss:gp-life-01', ownerChunkKey: '2,-2', type: 'boss',
+      maxHp: W6_ENTITY_CONTRACTS.boss.maxHp, x: 39, z: -23, rotationY: 0.75,
+      aiState: 'slither',
+    });
+    worldState.setManualBoss('wf1:boss:gp-life-01', 1);
+    const interrupted = structuredClone(worldState.createSaveSnapshot());
+    const interruptedChunk = { x: Math.floor(interrupted.player.x / 16), z: Math.floor(interrupted.player.z / 16) };
+
+    controls.get('set-home-btn').dispatch('click');
+    await waitForLifeCycleCondition(() => sandbox.snapshot().save.queue.committedGeneration === 2,
+      'returning to title must flush the interrupted snapshot');
+    assert.deepEqual(worldState.createSaveSnapshot(), interrupted);
+    assert.deepEqual({
+      x: Math.floor(sandbox.logicalPlayer.x / 16), z: Math.floor(sandbox.logicalPlayer.z / 16),
+    }, interruptedChunk);
+
+    autosaveTimer.active = false;
+    autosaveTimer.callback();
+    await new Promise(resolveValue => setImmediate(resolveValue));
+    assert.deepEqual(worldState.createSaveSnapshot(), interrupted,
+      'autosave after title cannot replace the interrupted location');
+
+    const callsBeforePageHide = storage.calls.length;
+    environment.listeners.get('pagehide')({ persisted: true });
+    await waitForLifeCycleCondition(() => storage.calls.length > callsBeforePageHide,
+      'pagehide after title must persist through the shared queue');
+    const pagehideSnapshot = await decodeInfiniteWorldSave(storage.calls.at(-1).value, {
+      worldSeedHash: worldState.worldSeedHash,
+    });
+    assert.deepEqual(pagehideSnapshot, interrupted);
+
+    controls.get('continue-button').dispatch('click');
+    await waitForLifeCycleCondition(
+      () => sandbox.snapshot().runStart?.startMode === 'continue',
+      () => `Continue must load the title-flushed Save: ${JSON.stringify({
+        boot: sandbox.snapshot().boot,
+        experience: sandbox.snapshot().experience,
+        save: sandbox.snapshot().save,
+        runtimeCenter: {
+          x: sandbox.snapshot().runtime.centerChunkX,
+          z: sandbox.snapshot().runtime.centerChunkZ,
+        },
+      })}`,
+    );
+    assert.deepEqual(worldState.createSaveSnapshot(), interrupted);
+    assert.deepEqual(sandbox.snapshot().spatial.playerLogical, {
+      x: interrupted.player.x, z: interrupted.player.z, facingY: interrupted.player.facingY,
+    });
+
+    const persistentBeforeHomeReset = structuredClone(interrupted);
+    const spawnBeforeReset = sandbox.snapshot().spatial.spawn;
+    const terrainBeforeHomeReset = sandbox.snapshot().experience.playerVertical.terrainHeightMeters;
+    controls.get('set-reset-btn').dispatch('click');
+    await waitForLifeCycleCondition(() => (
+      sandbox.logicalPlayer.x === spawnBeforeReset.x
+      && sandbox.logicalPlayer.z === spawnBeforeReset.z
+      && sandbox.snapshot().runtime.centerChunkX === Math.floor(spawnBeforeReset.x / 16)
+      && sandbox.snapshot().runtime.centerChunkZ === Math.floor(spawnBeforeReset.z / 16)
+      && sandbox.snapshot().experience.playerVertical.terrainHeightMeters
+        !== terrainBeforeHomeReset
+    ), 'home reset alone must relocate Player to the formal spawn');
+    assert.equal(sandbox.logicalPlayer.facingY, spawnBeforeReset.facingY);
+    const afterHomeReset = worldState.createSaveSnapshot();
+    assert.deepEqual({ ...afterHomeReset.player, x: 0, z: 0, facingY: 0 }, {
+      ...persistentBeforeHomeReset.player, x: 0, z: 0, facingY: 0,
+    });
+
+    worldState.updatePlayer({ x: -34.5, z: 49.25, facingY: -0.8 });
+    const beforeShutdown = structuredClone(worldState.createSaveSnapshot());
+    controls.get('set-home-btn').dispatch('click');
+    await waitForLifeCycleCondition(() => sandbox.snapshot().save.queue.committedGeneration >= 4,
+      'the second title transition must flush the latest location');
+    await sandbox.shutdown();
+    sandbox = null;
+
+    const restored = new InfiniteWorldState({
+      worldSeed: worldState.worldSeed,
+      worldSeedHash: worldState.worldSeedHash,
+      playerSpawn: { x: 0, z: 0 },
+    });
+    await new InfiniteWorldSaveStore({
+      storage, worldSeedHash: worldState.worldSeedHash,
+    }).loadInto(restored);
+    assert.deepEqual(restored.createSaveSnapshot(), beforeShutdown,
+      'shutdown after title must preserve the latest interrupted snapshot for Continue');
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
 
 test('Render Distance presets keep fixed gameplay coverage and resync Distant roots live', async t => {
   const expected = {
