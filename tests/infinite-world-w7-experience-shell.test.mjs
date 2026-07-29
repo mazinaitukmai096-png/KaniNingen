@@ -1022,6 +1022,90 @@ test('GP-INPUT-01 charge resolution suppresses the remaining physical mouseup ex
   });
 });
 
+test('GP-INPUT-02 settings and Debug cancel attack input until a fresh resumed click', async t => {
+  const beginPlaying = () => {
+    const fixture = createFixture({ useCombatCommands: true });
+    fixture.elements.get('start-button').dispatch('click');
+    finishIntro(fixture);
+    renderAtomicReady(fixture);
+    return fixture;
+  };
+  const pressBoth = fixture => {
+    fixture.globalObject.dispatch('mousedown', { button: 0 });
+    fixture.globalObject.dispatch('mousedown', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['charge-start'],
+    );
+  };
+
+  for (const [label, pause, resume] of [
+    ['settings', fixture => fixture.shell.openSettings(), fixture => fixture.shell.resume()],
+    ['Debug', fixture => fixture.shell.openDebug(), fixture => fixture.shell.resume()],
+  ]) {
+    await t.test(`${label} cancels an Atomic charge and ignores both paused releases`, () => {
+      const fixture = beginPlaying();
+      pressBoth(fixture);
+      pause(fixture);
+      fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+      fixture.globalObject.dispatch('mouseup', { button: 0 });
+      fixture.globalObject.dispatch('mouseup', { button: 2 });
+      assert.equal(fixture.shell.isPaused(), true);
+      assert.deepEqual(
+        fixture.calls.combatCommands.map(command => command.type),
+        ['charge-start'],
+      );
+      assert.deepEqual(fixture.calls.nuclear, []);
+
+      fixture.globalObject.dispatch('mousedown', { button: 0 });
+      fixture.globalObject.dispatch('mouseup', { button: 0 });
+      assert.deepEqual(
+        fixture.calls.combatCommands.map(command => command.type),
+        ['charge-start'],
+      );
+
+      resume(fixture);
+      fixture.globalObject.dispatch('mouseup', { button: 2 });
+      fixture.globalObject.dispatch('mousedown', { button: 0 });
+      fixture.globalObject.dispatch('mouseup', { button: 0 });
+      assert.deepEqual(
+        fixture.calls.combatCommands.map(command => command.type),
+        ['charge-start', 'left-claw'],
+      );
+      fixture.shell.dispose();
+    });
+
+    await t.test(`${label} cancels a short charge without a paused double or single Claw`, () => {
+      const fixture = beginPlaying();
+      pressBoth(fixture);
+      pause(fixture);
+      fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs - 1);
+      fixture.globalObject.dispatch('mouseup', { button: 2 });
+      fixture.globalObject.dispatch('mouseup', { button: 0 });
+      assert.deepEqual(
+        fixture.calls.combatCommands.map(command => command.type),
+        ['charge-start'],
+      );
+      assert.deepEqual(fixture.calls.nuclear, []);
+      fixture.shell.dispose();
+    });
+  }
+
+  await t.test('GP-INPUT-01 release suppression remains correct after resume', () => {
+    const fixture = beginPlaying();
+    pressBoth(fixture);
+    fixture.setNow(W7_NUCLEAR_CONTRACT.chargeThresholdMs + 100);
+    fixture.globalObject.dispatch('mouseup', { button: 0 });
+    fixture.globalObject.dispatch('mouseup', { button: 2 });
+    assert.deepEqual(
+      fixture.calls.combatCommands.map(command => command.type),
+      ['charge-start'],
+    );
+    assert.equal(fixture.calls.nuclear.length, 1);
+    fixture.shell.dispose();
+  });
+});
+
 test('W7B extends the W6 runtime without a second gameplay state, entity registry or save system', () => {
   const source = readFileSync(resolve(repoRoot, 'src/infinite-world/experience-shell.js'), 'utf8');
   assert.match(source, /createInputController/);

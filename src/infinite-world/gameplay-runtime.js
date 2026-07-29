@@ -2857,6 +2857,12 @@ export class InfiniteGameplayRuntime {
     }
     if (!Number.isFinite(deltaSeconds) || deltaSeconds < 0) throw new TypeError('deltaSeconds must be non-negative');
     const boundedDelta = Math.min(deltaSeconds, 0.05);
+    if (simulationEnabled !== true) {
+      this.previousPlayerPosition = { x: player.x, z: player.z };
+      this.#syncTankSandboxState();
+      this.#syncTransientCombat();
+      return;
+    }
     const combatPlayer = Number.isFinite(playerY)
       ? { x: player.x, y: playerY, z: player.z }
       : player;
@@ -2888,11 +2894,6 @@ export class InfiniteGameplayRuntime {
     this.state.tickGameplayTime(boundedDelta * 1000);
     this.state.tickNuclearCooldown(boundedDelta * 1000);
     this.#syncTankSandboxState();
-    if (simulationEnabled !== true) {
-      this.previousPlayerPosition = { x: player.x, z: player.z };
-      this.#syncTransientCombat();
-      return;
-    }
     this.#advanceEntityKnockbacks(boundedDelta);
     for (const model of this.activeChunks.values()) {
       for (const descriptor of model.entityDescriptors) {

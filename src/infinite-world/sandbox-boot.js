@@ -108,8 +108,8 @@ function parseMeasurementMode(value) {
   return value;
 }
 
-export function isW8GameplaySimulationEnabled(measurementMode, runPhase) {
-  return measurementMode !== null || runPhase === 'playing';
+export function isW8GameplaySimulationEnabled(measurementMode, runPhase, paused = false) {
+  return measurementMode !== null || (runPhase === 'playing' && paused !== true);
 }
 
 export function w8CloudDeltaSeconds({
@@ -2115,7 +2115,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             player: logicalPlayer,
             playerY: playerMarker.position.y / UNITS_PER_METER,
             renderOrigin: frameRenderOrigin,
-            simulationEnabled: isW8GameplaySimulationEnabled(measurement.mode, runPhase),
+            simulationEnabled: isW8GameplaySimulationEnabled(
+              measurement.mode,
+              runPhase,
+              experienceShell.isPaused(),
+            ),
           }));
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
         const presentation = diagnostics.measure(

@@ -186,7 +186,7 @@ async function captureTailKnockback({ rotationY = 0, offsetX = 0, offsetZ = 0 } 
     const impactHp = fixture.state.player.hp;
     const impactHitCount = fixture.runtime.snapshot().counts.playerHits;
     fixture.runtime.update({
-      deltaSeconds: 0.01, player: fixture.state.player, simulationEnabled: false,
+      deltaSeconds: Number.EPSILON, player: fixture.state.player, simulationEnabled: true,
     });
     return {
       hpBefore,
@@ -455,6 +455,37 @@ test('manual Boss and Nuclear cooldown round-trip through the existing save syst
   assert.equal(restored.entityStates.get(boss.stableId).hp, 52000);
   assert.equal(restored.nuclearCooldownMs, 4321);
   assert.deepEqual(restored.createSaveSnapshot(), fixture.state.createSaveSnapshot());
+  await fixture.runtime.shutdown();
+});
+
+test('GP-INPUT-02 disabled simulation freezes gameplay clocks, Boss AI and combat effects', async () => {
+  const fixture = createRuntime();
+  const spawned = await fixture.runtime.spawnManualBoss();
+  const boss = fixture.state.entityStates.get(spawned.stableId);
+  Object.assign(boss.bossBehavior, {
+    phase: 'charge',
+    phaseClock: 0.75,
+    tailCooldownSeconds: 0.5,
+  });
+  fixture.state.updatePlayer({ acidDebuffSeconds: 1.1 });
+  fixture.state.tickGameplayTime(1_234);
+  fixture.state.setNuclearCooldown(4_321);
+  await fixture.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
+
+  const stateBefore = fixture.state.createSaveSnapshot();
+  const runtimeBefore = fixture.runtime.snapshot();
+  assert.ok(runtimeBefore.activeCombatEffectCount > 0);
+  fixture.runtime.update({
+    deltaSeconds: 0.05,
+    player: fixture.state.player,
+    simulationEnabled: false,
+  });
+  const runtimeAfter = fixture.runtime.snapshot();
+
+  assert.deepEqual(fixture.state.createSaveSnapshot(), stateBefore);
+  assert.equal(runtimeAfter.activeProjectileCount, runtimeBefore.activeProjectileCount);
+  assert.equal(runtimeAfter.activeCombatEffectCount, runtimeBefore.activeCombatEffectCount);
+  assert.deepEqual(runtimeAfter.counts, runtimeBefore.counts);
   await fixture.runtime.shutdown();
 });
 

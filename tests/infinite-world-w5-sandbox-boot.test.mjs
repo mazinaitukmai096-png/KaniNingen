@@ -1213,11 +1213,12 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
 });
 
 test('measurement frames pass strict boolean simulation state into Gameplay Runtime', async () => {
-  assert.equal(isW8GameplaySimulationEnabled('steady', 'menu'), true);
-  assert.equal(isW8GameplaySimulationEnabled('crossing', 'intro'), true);
-  assert.equal(isW8GameplaySimulationEnabled(null, 'playing'), true);
-  assert.equal(isW8GameplaySimulationEnabled(null, 'menu'), false);
-  assert.equal(isW8GameplaySimulationEnabled(null, 'intro'), false);
+  assert.equal(isW8GameplaySimulationEnabled('steady', 'menu', true), true);
+  assert.equal(isW8GameplaySimulationEnabled('crossing', 'intro', true), true);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'playing', false), true);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'playing', true), false);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'menu', false), false);
+  assert.equal(isW8GameplaySimulationEnabled(null, 'intro', false), false);
 
   for (const measurementMode of ['steady', 'crossing']) {
     const environment = installBrowserEquivalentEnvironment();

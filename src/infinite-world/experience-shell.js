@@ -409,6 +409,7 @@ export function createInfiniteExperienceShell({
   });
 
   function emitCombat(type, options = {}) {
+    if (state.runPhase !== 'playing' || state.paused) return false;
     const aimHeading = Math.atan2(-Math.sin(state.camera.yaw), -Math.cos(state.camera.yaw));
     if (state.lastPlayer) state.lastPlayer.facingY = aimHeading;
     worldState.updatePlayer?.({ facingY: aimHeading });
@@ -498,6 +499,10 @@ export function createInfiniteExperienceShell({
     },
     onMouseUp(event) {
       if (event.button !== 0 && event.button !== 2) return;
+      if (state.runPhase !== 'playing' || state.paused) {
+        resetAttackInputState();
+        return;
+      }
       if (state.suppressedMouseUps.delete(event.button)) {
         state.attackButtons.delete(event.button);
         return;
