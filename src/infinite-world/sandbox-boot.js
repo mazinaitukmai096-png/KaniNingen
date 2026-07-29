@@ -1104,6 +1104,7 @@ export async function bootInfiniteWorldSandbox({
     let saveTimer = null;
     let saveIdleCallback = null;
     let lastSavedRevision = -1;
+    let lastSavedGeneration = 0;
     let runStarted = false;
     let lastRunStartDiagnostics = null;
     let postCommitRequestedEpoch = 0;
@@ -1333,12 +1334,18 @@ export async function bootInfiniteWorldSandbox({
         return;
       }
       try {
-        await diagnostics.measureAsync('save-total', () => saveStore.save(worldState));
-        lastSavedRevision = worldState.revision;
+        const saved = await diagnostics.measureAsync(
+          'save-total',
+          () => saveStore.saveWithMetadata(worldState),
+        );
+        if (saved.generation < lastSavedGeneration) return saved;
+        lastSavedGeneration = saved.generation;
+        lastSavedRevision = saved.revision;
         saveDeferredForStreaming = false;
         state.saveAvailable = true;
         experienceShell?.setContinueAvailable?.(true);
         saveStatus = 'saved';
+        return saved;
       } catch (error) {
         transitionError = error;
         saveStatus = 'failed';
@@ -1473,7 +1480,7 @@ export async function bootInfiniteWorldSandbox({
             await saveWorld({ force: true });
           }
           runStarted = true;
-          lastSavedRevision = worldState.revision;
+          if (startMode === 'continue') lastSavedRevision = worldState.revision;
           const cameraYaw = startMode === 'new'
             ? experienceSpawn.cameraYaw
             : normalizeAngle(logicalPlayer.facingY - Math.PI);

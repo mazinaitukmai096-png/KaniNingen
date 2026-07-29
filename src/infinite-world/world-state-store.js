@@ -991,24 +991,99 @@ export class InfiniteWorldSaveStore {
     this.measure = measure;
     this.key = `KaniNingen:InfiniteWorld:${this.worldSeedHash}`;
     this.counts = { saved: 0, loaded: 0, missing: 0, failed: 0 };
+    this.saveGeneration = 0;
+    this.committedSaveGeneration = 0;
+    this.activeSaveRequest = null;
+    this.pendingSaveRequest = null;
+    this.saveWaiters = [];
+    this.saveDrainPromise = null;
   }
 
   async save(state) {
+    const result = await this.saveWithMetadata(state);
+    return result.serialized;
+  }
+
+  saveWithMetadata(state) {
+    return this.queueSave(state).completion;
+  }
+
+  queueSave(state) {
     if (!(state instanceof InfiniteWorldState) || state.worldSeedHash !== this.worldSeedHash) {
       throw new TypeError('matching InfiniteWorldState is required');
     }
-    const serialized = await this.measure(
-      'save-serialization',
-      () => encodeInfiniteWorldSave(state.createSaveSnapshot()),
-    );
-    try {
-      await this.measure(`save-${this.storageDiagnosticStage}`, () => this.storage?.setItem(this.key, serialized));
-      this.counts.saved += 1;
-      return serialized;
-    } catch (error) {
-      this.counts.failed += 1;
-      throw error;
+
+    const revision = state.revision;
+    const snapshot = structuredClone(state.createSaveSnapshot());
+    const generation = this.saveGeneration + 1;
+    this.saveGeneration = generation;
+    const request = Object.freeze({ generation, revision, snapshot });
+    const completion = new Promise((resolve, reject) => {
+      this.saveWaiters.push({ generation, resolve, reject });
+    });
+    this.pendingSaveRequest = request;
+    this.startSaveDrain();
+    return Object.freeze({ generation, revision, completion });
+  }
+
+  startSaveDrain() {
+    if (this.saveDrainPromise) return;
+    const drain = this.drainSaveQueue();
+    this.saveDrainPromise = drain;
+    const finish = () => {
+      if (this.saveDrainPromise === drain) this.saveDrainPromise = null;
+      if (this.pendingSaveRequest) this.startSaveDrain();
+    };
+    void drain.then(finish, finish);
+  }
+
+  async drainSaveQueue() {
+    while (this.pendingSaveRequest) {
+      const request = this.pendingSaveRequest;
+      this.pendingSaveRequest = null;
+      this.activeSaveRequest = request;
+      try {
+        const serialized = await this.measure(
+          'save-serialization',
+          () => encodeInfiniteWorldSave(request.snapshot),
+        );
+        if (this.pendingSaveRequest?.generation > request.generation) continue;
+        await this.measure(
+          `save-${this.storageDiagnosticStage}`,
+          () => this.storage?.setItem(this.key, serialized),
+        );
+        this.counts.saved += 1;
+        this.committedSaveGeneration = request.generation;
+        this.resolveSaveWaiters(request.generation, Object.freeze({
+          serialized,
+          generation: request.generation,
+          revision: request.revision,
+        }));
+      } catch (error) {
+        this.counts.failed += 1;
+        this.rejectSaveWaiters(request.generation, error);
+      } finally {
+        if (this.activeSaveRequest === request) this.activeSaveRequest = null;
+      }
     }
+  }
+
+  resolveSaveWaiters(generation, result) {
+    const remaining = [];
+    for (const waiter of this.saveWaiters) {
+      if (waiter.generation <= generation) waiter.resolve(result);
+      else remaining.push(waiter);
+    }
+    this.saveWaiters = remaining;
+  }
+
+  rejectSaveWaiters(generation, error) {
+    const remaining = [];
+    for (const waiter of this.saveWaiters) {
+      if (waiter.generation <= generation) waiter.reject(error);
+      else remaining.push(waiter);
+    }
+    this.saveWaiters = remaining;
   }
 
   async loadSnapshot() {
@@ -1054,6 +1129,13 @@ export class InfiniteWorldSaveStore {
       key: this.key,
       persistentStorage: this.storage !== null,
       counts: Object.freeze({ ...this.counts }),
+      queue: Object.freeze({
+        requestedGeneration: this.saveGeneration,
+        committedGeneration: this.committedSaveGeneration,
+        activeGeneration: this.activeSaveRequest?.generation ?? null,
+        pendingGeneration: this.pendingSaveRequest?.generation ?? null,
+        waiterCount: this.saveWaiters.length,
+      }),
     });
   }
 }
