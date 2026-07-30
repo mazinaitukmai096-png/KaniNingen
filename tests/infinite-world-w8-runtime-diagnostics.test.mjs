@@ -35,6 +35,7 @@ import {
   decodeInfiniteWorldSave,
   encodeInfiniteWorldSave,
 } from '../src/infinite-world/world-state-store.js';
+import { createRuntimeTransitionContract } from '../src/infinite-world/runtime-transition-contract.js';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
@@ -1218,6 +1219,99 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   reference.dispose();
 });
 
+test('the committed Local Terrain root hands owners off to the latest rendered ring while its replacement stages', async () => {
+  const pendingYields = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => pendingYields.push(resolve)),
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  const initialContract = createRuntimeTransitionContract({
+    generation: 1,
+    centerChunkX: initial.centerChunkX,
+    centerChunkZ: initial.centerChunkZ,
+    renderedKeys: initial.renderedKeys,
+    activeDataKeys: initial.activeDataKeys,
+  });
+  assert.equal(presentation.syncLocalTerrain({
+    coverageEpoch: 1,
+    transitionContract: initialContract,
+    ...initial,
+  }).committed, true);
+  assert.equal(presentation.commitRuntimeState({
+    transitionContract: initialContract,
+    activeDataKeys: initial.activeDataKeys,
+    renderedKeys: initial.renderedKeys,
+    renderOrigin: initial.renderOrigin,
+  }), true);
+
+  const distantRoot = scene.children[0];
+  const committedRoot = distantRoot.children[0];
+  const committedMidground = committedRoot.children.find(child => (
+    child.name === 'w8-midground-outer-sixteen-terrain'
+  ));
+  const next = localTerrainCoverageFixture(1, 0);
+  const nextContract = createRuntimeTransitionContract({
+    generation: 2,
+    centerChunkX: next.centerChunkX,
+    centerChunkZ: next.centerChunkZ,
+    renderedKeys: next.renderedKeys,
+    activeDataKeys: next.activeDataKeys,
+  });
+  const pending = presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 2,
+    transitionContract: nextContract,
+    ...next,
+  });
+  await waitForControlledYield(pendingYields);
+
+  assert.equal(presentation.commitRuntimeState({
+    transitionContract: nextContract,
+    activeDataKeys: next.activeDataKeys,
+    renderedKeys: next.renderedKeys,
+    renderOrigin: next.renderOrigin,
+  }), true);
+  assert.equal(distantRoot.children[0], committedRoot,
+    'the complete previous Local root remains attached during staging');
+  const expectedVisibleOwners = initial.activeDataKeys
+    .filter(key => !next.renderedKeys.includes(key))
+    .sort();
+  assert.deepEqual(
+    [...committedMidground.userData.visibleOwnerKeys].sort(),
+    expectedVisibleOwners,
+    'the old root must hide owners now rendered by Near and reveal old Near owners now in midground',
+  );
+  assert.equal(
+    committedMidground.geometry.index.length,
+    committedMidground.userData.visibleOwnerIndexCount,
+    'the owner handoff must update the rendered index buffer, not diagnostics alone',
+  );
+  assert.deepEqual(
+    presentation.snapshot().localTerrainHandoffOwnerKeys,
+    expectedVisibleOwners,
+  );
+  assert.equal(presentation.snapshot().localTerrainStoredOwnerCount, 25);
+  assert.ok(initial.renderedKeys.some(key => expectedVisibleOwners.includes(key)),
+    'the transition fixture includes old Near owners that need temporary midground coverage');
+  assert.ok(initial.activeDataKeys.some(key => (
+    !initial.renderedKeys.includes(key) && next.renderedKeys.includes(key)
+  )), 'the transition fixture includes old midground owners that must stop overlapping Near');
+  assert.ok(initial.activeDataKeys.filter(key => !next.activeDataKeys.includes(key))
+    .every(key => expectedVisibleOwners.includes(key)),
+  'old owners outside the new active ring remain until the old clipmap hole is replaced');
+
+  const [result] = await drainControlledYields([pending], pendingYields);
+  assert.equal(result.committed, true);
+  const currentMidground = distantRoot.children[0].children.find(child => (
+    child.name === 'w8-midground-outer-sixteen-terrain'
+  ));
+  assert.deepEqual(
+    [...currentMidground.userData.visibleOwnerKeys].sort(),
+    next.activeDataKeys.filter(key => !next.renderedKeys.includes(key)).sort(),
+  );
+  presentation.dispose();
+});
+
 test('continuous Local Terrain boundaries discard stale builds and shutdown blocks late publication', async () => {
   const pendingYields = [];
   const scene = new DistantTestGroup();
@@ -1267,6 +1361,52 @@ test('continuous Local Terrain boundaries discard stale builds and shutdown bloc
   assert.equal(shutdownResult.committed, false);
   assert.equal(shutdownResult.reason, 'disposed-during-build');
   assert.equal(scene.children.length, 0);
+});
+
+test('an older transition contract cannot roll back Local Terrain coverage or poison its epoch', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const fixture = localTerrainCoverageFixture(0, 0);
+  const contract = generation => createRuntimeTransitionContract({
+    generation,
+    centerChunkX: fixture.centerChunkX,
+    centerChunkZ: fixture.centerChunkZ,
+    renderedKeys: fixture.renderedKeys,
+    activeDataKeys: fixture.activeDataKeys,
+  });
+  const currentContract = contract(2);
+  const current = await presentation.syncLocalTerrainIncrementally({
+    ...fixture,
+    coverageEpoch: 2,
+    transitionContract: currentContract,
+  });
+  assert.equal(current.committed, true);
+  const currentRoot = scene.children[0].children.find(child => (
+    child.name === current.activeRootId
+  ));
+
+  const stale = await presentation.syncLocalTerrainIncrementally({
+    ...fixture,
+    coverageEpoch: 999,
+    transitionContract: contract(1),
+  });
+  assert.equal(stale.committed, false);
+  assert.equal(stale.reason, 'stale-transition');
+  assert.equal(scene.children[0].children.includes(currentRoot), true,
+    'an older transition must leave the complete current root attached');
+  assert.equal(presentation.snapshot().runtimeTransitionGeneration, 2);
+
+  const reused = await presentation.syncLocalTerrainIncrementally({
+    ...fixture,
+    coverageEpoch: 3,
+    transitionContract: currentContract,
+  });
+  assert.equal(reused.committed, true,
+    'the rejected old transition must not advance the independent Local coverage epoch');
+  assert.equal(presentation.snapshot().localTerrainTransitionGeneration, 2);
+  assert.equal(presentation.snapshot().localTerrainCoverageSignature,
+    currentContract.coverageSignature);
+  presentation.dispose();
 });
 
 test('Render Distance swaps complete Terrain roots without changing Local coverage', async () => {
@@ -1599,6 +1739,145 @@ test('canonical River keeps the Far owner staged while active ownership hides an
   assert.equal(presentation.canonicalAuditSnapshot().find(value => (
     value.identity.stableId === riverProjection.waterSurface.stableId
   )).visibleLod, 'near');
+  presentation.dispose();
+});
+
+test('every visible Far water instance retains canonical identity and owner coverage', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const input = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+    chunk: canonicalChunk(0, 0, []),
+    quality: 'high',
+  });
+  assert.equal(await presentation.sync(input), true);
+  const generationRoot = scene.children[0].children[0];
+  const water = generationRoot.children.filter(child => child.material?.name === 'water'
+    || child.name?.includes('water'));
+  assert.ok(water.length > 0, 'the fixture must materialize Far water presentation');
+  assert.deepEqual(water.map(mesh => ({
+    name: mesh.name,
+    count: mesh.count,
+    canonicalStableIdCount: mesh.userData?.canonicalStableIds?.length ?? 0,
+    ownerKeyCount: mesh.userData?.ownerKeys?.length ?? 0,
+  })), water.map(mesh => ({
+    name: mesh.name,
+    count: mesh.count,
+    canonicalStableIdCount: mesh.count,
+    ownerKeyCount: mesh.count,
+  })), 'presentation-only water must still identify canonical water coverage and its owner');
+  const proxy = water.find(mesh => mesh.name === 'w8-distant-water-proxy-__road__-water');
+  assert.equal(proxy.userData.logicalBounds.length, proxy.count);
+  assert.equal(new Set(proxy.userData.canonicalStableIds).size, proxy.count,
+    'anchored Water cells must retain unique deterministic identities');
+  proxy.userData.logicalBounds.forEach(bounds => {
+    assert.ok(Number.isFinite(bounds.minimumX) && Number.isFinite(bounds.maximumX)
+      && Number.isFinite(bounds.minimumZ) && Number.isFinite(bounds.maximumZ));
+    assert.ok(bounds.minimumX < bounds.maximumX && bounds.minimumZ < bounds.maximumZ);
+  });
+  presentation.dispose();
+});
+
+test('an old Far water instance cannot remain visible after its bounds enter the active ring', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const input = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+    chunk: canonicalChunk(0, 0, []),
+    quality: 'high',
+  });
+  input.renderOrigin.rebaseCount = 1;
+  assert.equal(await presentation.sync(input), true);
+  const generationRoot = scene.children[0].children[0];
+  const waterProxy = generationRoot.children.find(child => (
+    child.name === 'w8-distant-water-proxy-__road__-water'
+  ));
+  assert.ok(waterProxy?.count > 0, 'the fixture must materialize a distant Water proxy');
+  const firstProxy = structuredClone(waterProxy.matrices[0].value);
+  const unitsPerMeter = RENDER_CHUNK_SIZE / LEGACY_CHUNK_SIZE_METERS;
+  const proxyWorldX = firstProxy.position.x / unitsPerMeter;
+  const proxyWorldZ = firstProxy.position.z / unitsPerMeter;
+  const targetChunkX = Math.floor(proxyWorldX / LEGACY_CHUNK_SIZE_METERS);
+  const targetChunkZ = Math.floor(proxyWorldZ / LEGACY_CHUNK_SIZE_METERS);
+  const activeDataKeys = [];
+  const renderedKeys = [];
+  for (let chunkZ = targetChunkZ - 2; chunkZ <= targetChunkZ + 2; chunkZ += 1) {
+    for (let chunkX = targetChunkX - 2; chunkX <= targetChunkX + 2; chunkX += 1) {
+      const key = `${chunkX},${chunkZ}`;
+      activeDataKeys.push(key);
+      if (Math.abs(chunkX - targetChunkX) <= 1 && Math.abs(chunkZ - targetChunkZ) <= 1) {
+        renderedKeys.push(key);
+      }
+    }
+  }
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys,
+    renderedKeys,
+    renderOrigin: {
+      renderOriginChunkX: targetChunkX,
+      renderOriginChunkZ: targetChunkZ,
+      rebaseCount: 2,
+    },
+    quality: 'high',
+    playerLogicalX: proxyWorldX,
+    playerLogicalZ: proxyWorldZ,
+  }), true);
+  const proxyRenderX = firstProxy.position.x + generationRoot.position.x;
+  const proxyRenderZ = firstProxy.position.z + generationRoot.position.z;
+  const playerRenderX = (proxyWorldX - targetChunkX * LEGACY_CHUNK_SIZE_METERS)
+    * unitsPerMeter;
+  const playerRenderZ = (proxyWorldZ - targetChunkZ * LEGACY_CHUNK_SIZE_METERS)
+    * unitsPerMeter;
+  assert.ok(Math.abs(proxyRenderX - playerRenderX) < 1e-9
+    && Math.abs(proxyRenderZ - playerRenderZ) < 1e-9,
+  'the old proxy must now overlap the Player in render coordinates');
+  const movedSnapshot = presentation.snapshot();
+  const handedOffProxy = waterProxy.matrices[0].value;
+  assert.equal(
+    handedOffProxy.scale.x === 0
+      && handedOffProxy.scale.y === 0
+      && handedOffProxy.scale.z === 0,
+    true,
+    `a presentation-only Far water proxy must be hidden when it enters active coverage: ${
+      JSON.stringify({
+        proxyWorldX,
+        proxyWorldZ,
+        targetChunkX,
+        targetChunkZ,
+        proxyRenderX,
+        proxyRenderZ,
+        playerRenderX,
+        playerRenderZ,
+        scale: handedOffProxy.scale,
+        meshName: waterProxy.name,
+        userData: waterProxy.userData,
+        far: {
+          committedEpoch: movedSnapshot.committedEpoch,
+          syncEpoch: movedSnapshot.syncEpoch,
+          buildOrigin: movedSnapshot.buildOrigin,
+          currentOrigin: movedSnapshot.currentOrigin,
+          rootAttached: movedSnapshot.rootAttached,
+        },
+      })}`,
+  );
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [],
+    renderedKeys: [],
+    renderOrigin: {
+      renderOriginChunkX: 0,
+      renderOriginChunkZ: 0,
+      rebaseCount: 3,
+    },
+    quality: 'high',
+    playerLogicalX: 0,
+    playerLogicalZ: 0,
+  }), true);
+  assert.deepEqual(waterProxy.matrices[0].value, firstProxy,
+    'the same Far coverage must return without regeneration after active ownership leaves');
   presentation.dispose();
 });
 

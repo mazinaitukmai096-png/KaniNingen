@@ -14,9 +14,15 @@ import {
   w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
-import { InfiniteGameplayRuntime } from '../src/infinite-world/gameplay-runtime.js';
+import {
+  InfiniteGameplayRuntime,
+  createW6ChunkGameplay,
+} from '../src/infinite-world/gameplay-runtime.js';
 import { W6_ENTITY_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
-import { UNITS_PER_METER } from '../src/infinite-world/chunk-coordinates.js';
+import {
+  LOGICAL_CHUNK_SIZE_METERS,
+  UNITS_PER_METER,
+} from '../src/infinite-world/chunk-coordinates.js';
 import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createW8ParityVisualAssetLibrary,
@@ -456,6 +462,18 @@ async function waitForSaveCondition(condition, message) {
 
 async function waitForLifeCycleCondition(condition, message) {
   for (let attempt = 0; attempt < 2_000 && !condition(); attempt += 1) {
+    await new Promise(resolveValue => setTimeout(resolveValue, 10));
+  }
+  assert.equal(condition(), true, typeof message === 'function' ? message() : message);
+}
+
+async function drainHeldZeroDelayTimersUntil(timers, condition, message) {
+  for (let attempt = 0; attempt < 2_000 && !condition(); attempt += 1) {
+    const entry = timers.entries.find(candidate => candidate.active && candidate.delayMs === 0);
+    if (entry) {
+      entry.active = false;
+      entry.callback();
+    }
     await new Promise(resolveValue => setTimeout(resolveValue, 10));
   }
   assert.equal(condition(), true, typeof message === 'function' ? message() : message);
@@ -1281,6 +1299,175 @@ test('normal play skips detailed runtime snapshots and debug HUD writes while di
   }
 });
 
+test('a newly visible full Chunk object is damage-queryable before deferred presentation work', async () => {
+  const environment = installBrowserEquivalentEnvironment();
+  const timers = createHeldBootTimers();
+  let gameplay = null;
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      measurementMode: 'steady',
+      diagnosticProfile: {
+        profileId: 'movement-presentation-regression',
+        save: true,
+        distant: true,
+        shadows: true,
+        transparency: true,
+        gameplaySync: true,
+      },
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      gameplayRuntimeFactory(options) {
+        gameplay = new InfiniteGameplayRuntime(options);
+        return gameplay;
+      },
+    });
+    const initial = sandbox.snapshot();
+    // Move west through three boundaries toward the deterministic Settlement around x=32.
+    // Three transitions are required to expose a rendered Chunk outside the old 5x5 Gameplay set.
+    const targetChunkX = initial.runtime.centerChunkX - 3;
+    const targetChunkZ = initial.runtime.centerChunkZ;
+    for (let offset = 1; offset <= 3; offset += 1) {
+      const nextChunkX = initial.runtime.centerChunkX - offset;
+      sandbox.logicalPlayer.x = (nextChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      sandbox.logicalPlayer.z = (targetChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      environment.rafCallbacks.at(-1)(performance.now() + offset * 100);
+      await waitForLifeCycleCondition(() => {
+        const snapshot = sandbox.snapshot();
+        return snapshot.runtime.centerChunkX === nextChunkX
+          && snapshot.runtime.centerChunkZ === targetChunkZ
+          && timers.entries.some(entry => entry.active && entry.delayMs === 0);
+      }, () => JSON.stringify({
+        nextChunkX,
+        targetChunkZ,
+        runtime: sandbox.snapshot().runtime,
+        spatial: sandbox.snapshot().spatial,
+        timers: timers.entries.map(entry => ({
+          active: entry.active,
+          delayMs: entry.delayMs,
+        })),
+      }));
+    }
+    environment.rafCallbacks.at(-1)(performance.now() + 400);
+
+    await waitForLifeCycleCondition(() => {
+      const snapshot = sandbox.snapshot();
+      return snapshot.gameplay.transitionGeneration
+        === snapshot.runtime.transitionContract.generation
+        && snapshot.gameplay.coverageSignature
+          === snapshot.runtime.transitionContract.coverageSignature;
+    }, () => JSON.stringify({
+      runtime: sandbox.snapshot().runtime.transitionContract,
+      gameplay: sandbox.snapshot().gameplay,
+    }));
+
+    const moved = sandbox.snapshot();
+    const visibleStableIds = new Set(sandbox.renderAdapter.visibleStableIdsSnapshot());
+    const visibleTargets = [];
+    const visibleSettlementBuildingIds = [];
+    for (const key of moved.runtime.renderedKeys) {
+      const [chunkX, chunkZ] = key.split(',').map(Number);
+      const chunkData = sandbox.runtime.getChunkData(chunkX, chunkZ);
+      for (const feature of chunkData.settlementFeatures ?? []) {
+        if (feature.featureType === 'settlement-building'
+          && visibleStableIds.has(feature.stableId)) {
+          visibleSettlementBuildingIds.push(feature.stableId);
+        }
+      }
+      const model = await createW6ChunkGameplay({
+        chunkData,
+        worldSeedHash: sandbox.generator.worldSeedHash,
+        generatorMajor: sandbox.generator.generatorVersion.major,
+      });
+      for (const target of model.staticTargets) {
+        if (visibleStableIds.has(target.stableId)) visibleTargets.push(target);
+      }
+    }
+    assert.ok(visibleTargets.length > 0,
+      'the transition fixture must expose at least one full destructible Object');
+    assert.ok(visibleSettlementBuildingIds.length > 0,
+      'the continuous boundary route must finish while approaching a visible Settlement');
+    const mismatchedDamageTargets = visibleTargets
+      .filter(target => {
+        const resolved = gameplay.resolveCombatTarget(target.stableId);
+        return !resolved?.target
+          || resolved.target.ownerChunkKey !== target.ownerChunkKey
+          || resolved.target.x !== target.x
+          || resolved.target.z !== target.z;
+      })
+      .map(target => ({
+        stableId: target.stableId,
+        ownerChunkKey: target.ownerChunkKey,
+        x: target.x,
+        z: target.z,
+        renderX: (target.x - moved.runtime.renderOrigin.renderOriginChunkX
+          * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
+        renderZ: (target.z - moved.runtime.renderOrigin.renderOriginChunkZ
+          * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
+      }));
+    assert.equal(mismatchedDamageTargets.length, 0,
+      `every visible full Object must enter the Gameplay damage query with the same Stable ID: ${
+        JSON.stringify({
+          runtimeCenter: {
+            chunkX: moved.runtime.centerChunkX,
+            chunkZ: moved.runtime.centerChunkZ,
+          },
+          renderOrigin: moved.runtime.renderOrigin,
+          playerLogical: moved.spatial.playerLogical,
+          playerRender: moved.spatial.playerRender,
+          localTerrain: {
+            epoch: moved.presentation.committedLocalTerrainEpoch,
+            center: moved.presentation.localTerrainCoverageCenter,
+            activeRoot: moved.presentation.activeLocalTerrainRootId,
+            stagingRoot: moved.presentation.stagingLocalTerrainRootId,
+          },
+          far: {
+            epoch: moved.presentation.committedEpoch,
+            syncEpoch: moved.presentation.syncEpoch,
+            buildOrigin: moved.presentation.buildOrigin,
+            currentOrigin: moved.presentation.currentOrigin,
+            pending: moved.presentation.farSyncPending,
+          },
+          gameplayActiveDataKeys: moved.gameplay.activeDataChunkKeys,
+          mismatchCount: mismatchedDamageTargets.length,
+          mismatchSample: mismatchedDamageTargets.slice(0, 5),
+        })}`);
+    assert.equal(moved.gameplay.activeDataSignature,
+      moved.runtime.transitionContract.activeDataSignature);
+    assert.equal(moved.gameplay.renderedSignature,
+      moved.runtime.transitionContract.renderedSignature);
+    const damageTarget = visibleTargets[0];
+    const damageResult = gameplay.applyCombatDamage(damageTarget.stableId, 1);
+    assert.equal(damageResult.stableId, damageTarget.stableId);
+    assert.equal(damageResult.damage, 1,
+      'a visible full Object must accept damage after the transition');
+
+    await drainHeldZeroDelayTimersUntil(timers, () => {
+      const snapshot = sandbox.snapshot();
+      const contract = snapshot.runtime.transitionContract;
+      return snapshot.presentation.presentationCoverageAligned
+        && snapshot.presentation.localTerrainTransitionGeneration === contract.generation
+        && snapshot.presentation.farTransitionGeneration === contract.generation
+        && snapshot.gameplay.transitionGeneration === contract.generation
+        && snapshot.presentation.localTerrainCoverageSignature === contract.coverageSignature
+        && snapshot.presentation.farCoverageSignature === contract.coverageSignature
+        && snapshot.gameplay.coverageSignature === contract.coverageSignature;
+    }, () => JSON.stringify({
+      runtime: sandbox.snapshot().runtime.transitionContract,
+      presentation: sandbox.snapshot().presentation,
+      gameplay: sandbox.snapshot().gameplay,
+    }));
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
+
 test('loading document starts once after DOMContentLoaded and never waits through module evaluation', async () => {
   const documentObject = createEntryDocument('loading');
   const state = createSandboxBootState();
@@ -1436,11 +1623,12 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
-  assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);\s*\n\s*synchronizeLocalTerrain/g) ?? []).length, 1,
-    'explicit runtime relocation keeps the synchronous initial Local Terrain contract');
-  assert.match(boot, /await gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(\);/,
-    'moving Chunk transitions defer Local and Far compose to the coalescing post-commit pump');
-  assert.match(boot, /if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-local-terrain-sync[\s\S]*if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-sync[\s\S]*gameplay-sync/);
+  assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);[\s\S]*?const gameplaySync[\s\S]*?synchronizeLocalTerrain/g) ?? []).length, 1,
+    'explicit runtime relocation starts atomic Gameplay staging before Local/Far compose');
+  assert.match(boot, /const gameplayRebase = gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(nextState\);\s*\n\s*await gameplayRebase;/,
+    'moving Chunk transitions start Gameplay staging before the deferred Local/Far pump');
+  assert.match(boot, /const gameplayWork = gameplaySyncWorkByEpoch[\s\S]*distant-local-terrain-sync[\s\S]*distant-sync[\s\S]*await gameplayWork/,
+    'the pump joins the already-started Gameplay staging after Local/Far compose');
   assert.match(boot, /async function shutdown\(\) \{[\s\S]*running = false;\s*\n\s*distantPresentation\.invalidatePendingLocalTerrainSync\?\.\(\);\s*\n\s*distantPresentation\.invalidatePendingFarSync\?\.\(\);/,
     'shutdown invalidates detached Local and Far builds before awaiting Save or subsystem disposal');
   assert.doesNotMatch(boot, /distantPresentation\.rebase\(runtimeState\.renderOrigin\)[\s\S]*synchronizeLocalTerrain\(runtimeState\)/,

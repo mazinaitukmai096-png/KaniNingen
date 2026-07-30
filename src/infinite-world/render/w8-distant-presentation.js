@@ -3,6 +3,11 @@ import {
   UNITS_PER_METER,
 } from '../chunk-coordinates.js';
 import { determineDetailCandidateOwner } from '../legacy-core/g3/detail-candidates.js';
+import {
+  createChunkCoverageSignature,
+  isRuntimeTransitionContract,
+  sameRuntimeTransitionContract,
+} from '../runtime-transition-contract.js';
 import { createMacroTerrainEvaluator, G5_MACRO_TERRAIN } from '../legacy-core/g5/macro-terrain.js';
 import { createNaturalBiomeEvaluator, naturalMaterialWeights } from '../natural-biome-field.js';
 import {
@@ -88,6 +93,40 @@ const smoothstep = value => {
   const t = clamp(value, 0, 1);
   return t * t * (3 - 2 * t);
 };
+
+function validateTransitionCoverage(
+  transitionContract,
+  { activeDataKeys, renderedKeys, centerChunkX = null, centerChunkZ = null },
+) {
+  if (transitionContract === null || transitionContract === undefined) return null;
+  if (!isRuntimeTransitionContract(transitionContract)) {
+    throw new TypeError('invalid Runtime transition contract');
+  }
+  if (transitionContract.activeDataSignature
+      !== createChunkCoverageSignature(activeDataKeys, 'activeDataKeys')
+    || transitionContract.renderedSignature
+      !== createChunkCoverageSignature(renderedKeys, 'renderedKeys')) {
+    throw new Error('Runtime transition coverage does not match presentation input');
+  }
+  if (centerChunkX !== null && centerChunkZ !== null
+    && (transitionContract.centerChunkX !== centerChunkX
+      || transitionContract.centerChunkZ !== centerChunkZ)) {
+    throw new Error('Runtime transition center does not match presentation input');
+  }
+  return transitionContract;
+}
+
+function assignTransitionContract(generation, transitionContract) {
+  if (!generation || !transitionContract) return;
+  generation.transitionContract = transitionContract;
+  generation.root.userData = {
+    ...(generation.root.userData ?? {}),
+    transitionGeneration: transitionContract.generation,
+    coverageSignature: transitionContract.coverageSignature,
+    renderedSignature: transitionContract.renderedSignature,
+    activeDataSignature: transitionContract.activeDataSignature,
+  };
+}
 
 const chunkAabbIntersectsCircle = (chunkX, chunkZ, centerX, centerZ, radiusMeters) => {
   const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
@@ -443,6 +482,32 @@ export async function createW8DistantPresentation({
   const emptyStats = createStats();
   let activeGeneration = null;
   let activeLocalTerrainGeneration = null;
+  const localTerrainOwnerIndexData = new WeakMap();
+  let committedRuntimeTransitionContract = null;
+  const acceptRuntimeTransitionContract = transitionContract => {
+    if (!transitionContract) return true;
+    if (!committedRuntimeTransitionContract) {
+      committedRuntimeTransitionContract = transitionContract;
+      return true;
+    }
+    if (sameRuntimeTransitionContract(
+      transitionContract,
+      committedRuntimeTransitionContract,
+    )) return true;
+    if (transitionContract.generation < committedRuntimeTransitionContract.generation) {
+      return false;
+    }
+    if (transitionContract.generation === committedRuntimeTransitionContract.generation) {
+      throw new Error('conflicting Runtime transition contracts share one generation');
+    }
+    committedRuntimeTransitionContract = transitionContract;
+    return true;
+  };
+  const transitionIsCurrent = transitionContract => !transitionContract
+    || sameRuntimeTransitionContract(
+      transitionContract,
+      committedRuntimeTransitionContract,
+    );
   let syncEpoch = 0;
   let committedEpoch = 0;
   let staleEpochDiscardCount = 0;
@@ -859,10 +924,17 @@ export async function createW8DistantPresentation({
     return Math.round(naturalHeight * naturalWeight * 1e6) / 1e6;
   };
 
-  const prepareMidgroundTerrainBuild = () => ({ positions: [], colors: [], indices: [] });
+  const prepareMidgroundTerrainBuild = () => ({
+    positions: [],
+    colors: [],
+    indices: [],
+    ownerIndexRanges: new Map(),
+  });
 
   const appendMidgroundTerrainChunk = (build, chunk, origin) => {
-    const { positions, colors, indices } = build;
+    const { positions, colors, indices, ownerIndexRanges } = build;
+      const ownerKey = `${chunk.chunkX},${chunk.chunkZ}`;
+      const ownerIndexStart = indices.length;
       const terrain = chunk.terrain;
       const sampleAxis = length => {
         const values = [];
@@ -904,17 +976,85 @@ export async function createW8DistantPresentation({
         indices.push(northwest, northwest + width, northwest + 1,
           northwest + 1, northwest + width, northwest + width + 1);
       }
+      ownerIndexRanges.set(ownerKey, Object.freeze({
+        start: ownerIndexStart,
+        count: indices.length - ownerIndexStart,
+      }));
   };
 
   const finishMidgroundTerrainBuild = (build, context) => {
-    const { positions, colors, indices } = build;
+    const { positions, colors, indices, ownerIndexRanges } = build;
     if (!positions.length) return;
-    const geometry = makeGeometry(THREE, positions, colors, indices);
+    const allIndices = Object.freeze([...indices]);
+    const initialOwnerKeys = sortedKeyList(context.generation.midgroundOwnerKeys);
+    const initialIndices = [];
+    for (const ownerKey of initialOwnerKeys) {
+      const range = ownerIndexRanges.get(ownerKey);
+      if (!range) continue;
+      initialIndices.push(...allIndices.slice(range.start, range.start + range.count));
+    }
+    const geometry = makeGeometry(THREE, positions, colors, initialIndices);
+    localTerrainOwnerIndexData.set(geometry, Object.freeze({
+      allIndices,
+      ownerIndexRanges,
+      ownerKeys: Object.freeze(sortedKeyList(ownerIndexRanges.keys())),
+    }));
     context.ownedGeometries.add(geometry);
     const mesh = new Mesh(geometry, terrainMaterial);
     mesh.name = 'w8-midground-outer-sixteen-terrain';
     mesh.castShadow = false; mesh.receiveShadow = false;
+    mesh.userData = {
+      presentationOnly: true,
+      localTerrainOwnerHandoff: true,
+      ownerKeys: Object.freeze(sortedKeyList(ownerIndexRanges.keys())),
+      visibleOwnerKeys: Object.freeze(initialOwnerKeys),
+      visibleOwnerIndexCount: initialIndices.length,
+    };
+    context.generation.localTerrainMesh = mesh;
+    context.generation.currentVisibleMidgroundOwnerKeys = new Set(initialOwnerKeys);
     context.target.add(mesh);
+  };
+
+  const applyLocalTerrainOwnerHandoff = (
+    generation,
+    activeDataKeys,
+    renderedKeys,
+  ) => {
+    if (!generation) return false;
+    const mesh = generation.localTerrainMesh ?? generation.root.children?.find(child => (
+      child.name === 'w8-midground-outer-sixteen-terrain'
+    ));
+    const ownerData = mesh ? localTerrainOwnerIndexData.get(mesh.geometry) : null;
+    if (!mesh || !ownerData) return false;
+    generation.localTerrainMesh = mesh;
+    const currentActiveKeys = new Set(activeDataKeys);
+    const currentRenderedKeys = new Set(renderedKeys);
+    const visibleOwnerKeys = ownerData.ownerKeys.filter(ownerKey => (
+      generation.activeKeys.has(ownerKey)
+        && !currentRenderedKeys.has(ownerKey)
+    ));
+    const previousSignature = sortedKeyList(
+      generation.currentVisibleMidgroundOwnerKeys ?? [],
+    ).join('\n');
+    const nextSignature = visibleOwnerKeys.join('\n');
+    if (previousSignature !== nextSignature) {
+      const visibleIndices = [];
+      for (const ownerKey of visibleOwnerKeys) {
+        const range = ownerData.ownerIndexRanges.get(ownerKey);
+        if (!range) continue;
+        visibleIndices.push(...ownerData.allIndices.slice(
+          range.start,
+          range.start + range.count,
+        ));
+      }
+      mesh.geometry.setIndex(visibleIndices);
+      mesh.userData.visibleOwnerIndexCount = visibleIndices.length;
+      generation.currentVisibleMidgroundOwnerKeys = new Set(visibleOwnerKeys);
+    }
+    mesh.userData.visibleOwnerKeys = Object.freeze([...visibleOwnerKeys]);
+    mesh.userData.handoffActiveDataKeys = Object.freeze(sortedKeyList(currentActiveKeys));
+    mesh.userData.handoffRenderedKeys = Object.freeze(sortedKeyList(currentRenderedKeys));
+    return true;
   };
 
   const createMidgroundTerrain = (chunks, origin, context) => {
@@ -2297,6 +2437,7 @@ export async function createW8DistantPresentation({
   };
 
   const commitRuntimePresentationState = ({
+    transitionContract = null,
     activeDataKeys = [],
     renderedKeys = [],
     renderOrigin,
@@ -2305,12 +2446,23 @@ export async function createW8DistantPresentation({
     playerLogicalZ = activeGeneration?.playerZ ?? 0,
   } = {}) => {
     if (!acceptCommittedRenderOrigin(renderOrigin)) return false;
+    const acceptedTransition = validateTransitionCoverage(transitionContract, {
+      activeDataKeys,
+      renderedKeys,
+    });
+    if (!acceptRuntimeTransitionContract(acceptedTransition)) return false;
     positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+    applyLocalTerrainOwnerHandoff(
+      activeLocalTerrainGeneration,
+      activeDataKeys,
+      renderedKeys,
+    );
     if (!activeGeneration) return true;
     activeGeneration.activeKeys = new Set(activeDataKeys);
     activeGeneration.renderedKeys = new Set(renderedKeys);
     positionGenerationForOrigin(activeGeneration, renderOrigin);
     updateFarRiverVisibility(activeGeneration);
+    updateDistantWaterProxyVisibility(activeGeneration);
     updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
     return true;
   };
@@ -2527,6 +2679,47 @@ export async function createW8DistantPresentation({
       generation.stats.canonicalActiveRiverLengthMeters + visibleLengthMeters;
   }
 
+  function updateDistantWaterProxyVisibility(generation) {
+    const presentations = generation?.distantWaterProxyPresentations;
+    if (!presentations?.length) return;
+    const coverageKeys = new Set([
+      ...(generation.activeKeys ?? []),
+      ...(generation.renderedKeys ?? []),
+    ]);
+    const coverageSignature = sortedKeyList(coverageKeys).join('\n');
+    const coverageBounds = [...coverageKeys].map(key => {
+      const [chunkX, chunkZ] = key.split(',').map(Number);
+      return {
+        minimumX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
+        maximumX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
+        minimumZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+        maximumZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
+      };
+    });
+    transform.position.set(0, 0, 0);
+    transform.rotation.set(0, 0, 0);
+    transform.scale.set(0, 0, 0);
+    transform.updateMatrix();
+    const hidden = transform.matrix.clone?.() ?? structuredClone(transform.matrix);
+    for (const presentation of presentations) {
+      if (presentation.coverageSignature === coverageSignature) continue;
+      let visibleCount = 0;
+      presentation.instances.forEach((instance, index) => {
+        const intersectsCurrentCoverage = coverageBounds.some(bounds => (
+          instance.logicalBounds.maximumX >= bounds.minimumX
+          && instance.logicalBounds.minimumX <= bounds.maximumX
+          && instance.logicalBounds.maximumZ >= bounds.minimumZ
+          && instance.logicalBounds.minimumZ <= bounds.maximumZ
+        ));
+        presentation.mesh.setMatrixAt(index, intersectsCurrentCoverage ? hidden : instance.matrix);
+        if (!intersectsCurrentCoverage) visibleCount += 1;
+      });
+      presentation.mesh.instanceMatrix.needsUpdate = true;
+      presentation.coverageSignature = coverageSignature;
+      presentation.visibleCount = visibleCount;
+    }
+  }
+
   const createDistantWaterProxies = async ({
     centerChunkX,
     centerChunkZ,
@@ -2541,10 +2734,13 @@ export async function createW8DistantPresentation({
     const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
     const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
     const buckets = new Map();
-    const push = (geometry, material, name) => {
+    const push = (geometry, material, name, instance) => {
       const key = `${geometry}:${material}:${name}`;
-      if (!buckets.has(key)) buckets.set(key, { geometry, material, name, matrices: [] });
-      buckets.get(key).matrices.push(transform.matrix.clone?.() ?? structuredClone(transform.matrix));
+      if (!buckets.has(key)) buckets.set(key, { geometry, material, name, instances: [] });
+      buckets.get(key).instances.push({
+        ...instance,
+        matrix: transform.matrix.clone?.() ?? structuredClone(transform.matrix),
+      });
     };
     const fadeAt = (worldX, worldZ) => smoothstep((
       Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ))
@@ -2574,14 +2770,30 @@ export async function createW8DistantPresentation({
       const sample = baseClipmapSample(worldX, worldZ, context.surfacePolicy);
       if (sample.moisture < 0.61) return;
       const size = 18 + cellRoll(seed, cellX, cellZ, 22) * 26;
+      const depth = size * 0.58;
+      const rotationZ = cellRoll(seed, cellX, cellZ, 23) * Math.PI;
+      const cosine = Math.abs(Math.cos(rotationZ));
+      const sine = Math.abs(Math.sin(rotationZ));
+      const halfExtentX = (cosine * size + sine * depth) / 2;
+      const halfExtentZ = (sine * size + cosine * depth) / 2;
+      const owner = determineDetailCandidateOwner({ x: worldX, z: worldZ });
       transform.position.set((worldX - originMetersX) * UNITS_PER_METER,
         (sample.height + 0.02) * UNITS_PER_METER,
         (worldZ - originMetersZ) * UNITS_PER_METER);
-      transform.rotation.set(-Math.PI / 2, 0, cellRoll(seed, cellX, cellZ, 23) * Math.PI);
+      transform.rotation.set(-Math.PI / 2, 0, rotationZ);
       transform.scale.set(size * UNITS_PER_METER * fadeAt(worldX, worldZ),
-        size * 0.58 * UNITS_PER_METER * fadeAt(worldX, worldZ), 1);
+        depth * UNITS_PER_METER * fadeAt(worldX, worldZ), 1);
       transform.updateMatrix();
-      push('__road__', 'water', 'water-proxy');
+      push('__road__', 'water', 'water-proxy', {
+        stableId: `water-proxy-v1:${worldSeedHash}:${cellX},${cellZ}`,
+        ownerKey: `${owner.x},${owner.z}`,
+        logicalBounds: Object.freeze({
+          minimumX: worldX - halfExtentX,
+          maximumX: worldX + halfExtentX,
+          minimumZ: worldZ - halfExtentZ,
+          maximumZ: worldZ + halfExtentZ,
+        }),
+      });
       context.stats.distantWaterProxyCount += 1;
     });
 
@@ -2589,19 +2801,33 @@ export async function createW8DistantPresentation({
       const geometry = bucket.geometry === '__road__'
         ? roadGeometry : visualAssets.geometries[bucket.geometry];
       const material = visualAssets.materials[bucket.material];
-      const mesh = new InstancedMesh(geometry, material, Math.max(1, bucket.matrices.length));
+      const mesh = new InstancedMesh(geometry, material, Math.max(1, bucket.instances.length));
       mesh.name = `w8-distant-${bucket.name}-${bucket.geometry}-${bucket.material}`;
-      mesh.count = bucket.matrices.length;
-      for (let index = 0; index < bucket.matrices.length; index += 1) {
-        mesh.setMatrixAt(index, bucket.matrices[index]);
+      mesh.count = bucket.instances.length;
+      for (let index = 0; index < bucket.instances.length; index += 1) {
+        mesh.setMatrixAt(index, bucket.instances[index].matrix);
         const pendingYield = scheduler.checkpoint();
         if (pendingYield) await pendingYield;
       }
       mesh.instanceMatrix.needsUpdate = true;
       mesh.castShadow = false; mesh.receiveShadow = false;
-      mesh.userData = { presentationOnly: true };
+      mesh.userData = {
+        presentationOnly: true,
+        waterType: 'proxy',
+        canonicalStableIds: bucket.instances.map(instance => instance.stableId),
+        ownerKeys: bucket.instances.map(instance => instance.ownerKey),
+        logicalBounds: bucket.instances.map(instance => instance.logicalBounds),
+      };
       context.target.add(mesh); context.stats.distantProxyInstancedMeshCount += 1;
+      context.generation.distantWaterProxyPresentations ??= [];
+      context.generation.distantWaterProxyPresentations.push({
+        mesh,
+        instances: bucket.instances,
+        coverageSignature: null,
+        visibleCount: bucket.instances.length,
+      });
     }
+    updateDistantWaterProxyVisibility(context.generation);
   };
 
   const mapWithQueryConcurrency = async (values, operation, assertCurrent = null) => {
@@ -3017,6 +3243,7 @@ export async function createW8DistantPresentation({
 
   const syncLocalTerrainIncrementally = async ({
     coverageEpoch,
+    transitionContract = null,
     activeDataKeys,
     renderedKeys,
     getChunkData,
@@ -3037,6 +3264,12 @@ export async function createW8DistantPresentation({
       || typeof getChunkData !== 'function') {
       throw new TypeError('Incremental Local terrain sync requires active/rendered keys and ChunkData');
     }
+    const acceptedTransition = validateTransitionCoverage(transitionContract, {
+      activeDataKeys,
+      renderedKeys,
+      centerChunkX,
+      centerChunkZ,
+    });
     localTerrainLastRequestedEpoch = requestedEpoch;
     localTerrainLastActiveKeyCount = activeDataKeys.length;
     localTerrainLastRenderedKeyCount = renderedKeys.length;
@@ -3067,9 +3300,9 @@ export async function createW8DistantPresentation({
       localTerrainStaleDiscardCount += 1;
       return reject('stale-epoch');
     }
-    localTerrainSyncEpoch = requestedEpoch;
     const assertCurrent = () => {
-      if (disposed || requestedEpoch !== localTerrainSyncEpoch) throw LOCAL_SYNC_CANCELLED;
+      if (disposed || requestedEpoch !== localTerrainSyncEpoch
+        || !transitionIsCurrent(acceptedTransition)) throw LOCAL_SYNC_CANCELLED;
     };
     const scheduler = createSliceScheduler({ assertCurrent });
     const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
@@ -3085,6 +3318,11 @@ export async function createW8DistantPresentation({
     if (renderedOutsideActive.length) {
       return reject('rendered-owner-outside-active', renderedOutsideActive);
     }
+    if (!acceptRuntimeTransitionContract(acceptedTransition)) {
+      localTerrainStaleDiscardCount += 1;
+      return reject('stale-transition');
+    }
+    localTerrainSyncEpoch = requestedEpoch;
     const activeChunks = new Map();
     const missingOwnerKeys = [];
     for (const key of activeDataKeys) {
@@ -3143,6 +3381,12 @@ export async function createW8DistantPresentation({
       && equalKeySets(activeLocalTerrainGeneration.activeKeys, activeKeys)
       && equalKeySets(activeLocalTerrainGeneration.renderedKeys, rendered)) {
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+      applyLocalTerrainOwnerHandoff(
+        activeLocalTerrainGeneration,
+        activeDataKeys,
+        renderedKeys,
+      );
+      assignTransitionContract(activeLocalTerrainGeneration, acceptedTransition);
       committedLocalTerrainEpoch = requestedEpoch;
       currentCanonicalSurfacePolicy = surfacePolicy;
       const sliceSnapshot = scheduler.finish();
@@ -3187,6 +3431,7 @@ export async function createW8DistantPresentation({
       currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
       surfacePolicy,
     };
+    assignTransitionContract(generation, acceptedTransition);
     const context = {
       target: localRoot,
       ownedGeometries: generation.ownedGeometries,
@@ -3195,6 +3440,9 @@ export async function createW8DistantPresentation({
       surfacePolicy,
     };
     const midground = [...midgroundOwnerKeys]
+      .map(key => activeChunks.get(key))
+      .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX);
+    const terrainOwners = [...activeKeys]
       .map(key => activeChunks.get(key))
       .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX);
     try {
@@ -3209,12 +3457,16 @@ export async function createW8DistantPresentation({
         midgroundMesh.receiveShadow = reusableMidgroundMesh.receiveShadow;
         midgroundMesh.userData = { ...(reusableMidgroundMesh.userData ?? {}) };
         localRoot.add(midgroundMesh);
+        generation.localTerrainMesh = midgroundMesh;
+        generation.currentVisibleMidgroundOwnerKeys = new Set(
+          midgroundMesh.userData.visibleOwnerKeys ?? [],
+        );
         generation.reusedMidgroundGeometry = reusableMidgroundMesh.geometry;
         const pendingYield = scheduler.checkpoint({ force: true });
         if (pendingYield) await pendingYield;
       } else {
         await createMidgroundTerrainIncrementally(
-          midground,
+          terrainOwners,
           renderOrigin,
           context,
           scheduler,
@@ -3232,6 +3484,7 @@ export async function createW8DistantPresentation({
         ownedGeometries: generation.ownedGeometries,
       }, assertCurrent, scheduler);
       assertCurrent();
+      applyLocalTerrainOwnerHandoff(generation, activeDataKeys, renderedKeys);
       positionGenerationForOrigin(generation, renderOrigin);
       const sliceSnapshot = scheduler.finish();
       localTerrainLastMaximumSliceMs = sliceSnapshot.maximumSliceMs;
@@ -3280,6 +3533,7 @@ export async function createW8DistantPresentation({
     syncLocalTerrainIncrementally,
     syncLocalTerrain({
       coverageEpoch,
+      transitionContract = null,
       activeDataKeys,
       renderedKeys,
       getChunkData,
@@ -3300,6 +3554,12 @@ export async function createW8DistantPresentation({
         || typeof getChunkData !== 'function') {
         throw new TypeError('Local terrain sync requires active/rendered keys and a ChunkData provider');
       }
+      const acceptedTransition = validateTransitionCoverage(transitionContract, {
+        activeDataKeys,
+        renderedKeys,
+        centerChunkX,
+        centerChunkZ,
+      });
       localTerrainLastRequestedEpoch = requestedEpoch;
       localTerrainLastActiveKeyCount = activeDataKeys.length;
       localTerrainLastRenderedKeyCount = renderedKeys.length;
@@ -3333,7 +3593,6 @@ export async function createW8DistantPresentation({
         localTerrainStaleDiscardCount += 1;
         return reject('stale-epoch');
       }
-      localTerrainSyncEpoch = requestedEpoch;
       const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
 
       const activeKeys = new Set(activeDataKeys);
@@ -3346,6 +3605,11 @@ export async function createW8DistantPresentation({
       }
       const renderedOutsideActive = [...rendered].filter(key => !activeKeys.has(key));
       if (renderedOutsideActive.length) return reject('rendered-owner-outside-active', renderedOutsideActive);
+      if (!acceptRuntimeTransitionContract(acceptedTransition)) {
+        localTerrainStaleDiscardCount += 1;
+        return reject('stale-transition');
+      }
+      localTerrainSyncEpoch = requestedEpoch;
 
       const activeChunks = new Map();
       const missingOwnerKeys = [];
@@ -3393,6 +3657,12 @@ export async function createW8DistantPresentation({
         && equalKeySets(activeLocalTerrainGeneration.activeKeys, activeKeys)
         && equalKeySets(activeLocalTerrainGeneration.renderedKeys, rendered)) {
         positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
+        applyLocalTerrainOwnerHandoff(
+          activeLocalTerrainGeneration,
+          activeDataKeys,
+          renderedKeys,
+        );
+        assignTransitionContract(activeLocalTerrainGeneration, acceptedTransition);
         committedLocalTerrainEpoch = requestedEpoch;
         localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
           - localSyncStartedAt;
@@ -3434,7 +3704,11 @@ export async function createW8DistantPresentation({
         currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
         surfacePolicy: currentCanonicalSurfacePolicy,
       };
+      assignTransitionContract(generation, acceptedTransition);
       const midground = [...midgroundOwnerKeys]
+        .map(key => activeChunks.get(key))
+        .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX);
+      const terrainOwners = [...activeKeys]
         .map(key => activeChunks.get(key))
         .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX);
       const context = {
@@ -3456,11 +3730,15 @@ export async function createW8DistantPresentation({
           midgroundMesh.receiveShadow = reusableMidgroundMesh.receiveShadow;
           midgroundMesh.userData = { ...(reusableMidgroundMesh.userData ?? {}) };
           localRoot.add(midgroundMesh);
+          generation.localTerrainMesh = midgroundMesh;
+          generation.currentVisibleMidgroundOwnerKeys = new Set(
+            midgroundMesh.userData.visibleOwnerKeys ?? [],
+          );
           generation.reusedMidgroundGeometry = reusableMidgroundMesh.geometry;
         } else {
           measure(
             'distant-midground-terrain',
-            () => createMidgroundTerrain(midground, renderOrigin, context),
+            () => createMidgroundTerrain(terrainOwners, renderOrigin, context),
           );
         }
         measure('distant-clipmap', () => createClipmap({
@@ -3474,6 +3752,7 @@ export async function createW8DistantPresentation({
           target: localRoot,
           ownedGeometries: generation.ownedGeometries,
         }));
+        applyLocalTerrainOwnerHandoff(generation, activeDataKeys, renderedKeys);
         positionGenerationForOrigin(generation, renderOrigin);
       } catch (error) {
         disposeGeneration(generation);
@@ -3485,7 +3764,8 @@ export async function createW8DistantPresentation({
       } finally {
         stagingLocalTerrainRootId = null;
       }
-      if (disposed || requestedEpoch !== localTerrainSyncEpoch) {
+      if (disposed || requestedEpoch !== localTerrainSyncEpoch
+        || !transitionIsCurrent(acceptedTransition)) {
         disposeGeneration(generation);
         localTerrainStaleDiscardCount += 1;
         return reject(disposed ? 'disposed-during-build' : 'stale-after-build');
@@ -3516,6 +3796,7 @@ export async function createW8DistantPresentation({
     },
     async syncLocalTerrainPreset({
       coverageEpoch,
+      transitionContract = null,
       activeDataKeys,
       renderedKeys,
       getChunkData,
@@ -3550,6 +3831,12 @@ export async function createW8DistantPresentation({
         || typeof getChunkData !== 'function') {
         throw new TypeError('Local terrain preset sync requires active/rendered keys and ChunkData');
       }
+      const acceptedTransition = validateTransitionCoverage(transitionContract, {
+        activeDataKeys,
+        renderedKeys,
+        centerChunkX,
+        centerChunkZ,
+      });
       localTerrainLastRequestedEpoch = requestedEpoch;
       localTerrainLastActiveKeyCount = activeDataKeys.length;
       localTerrainLastRenderedKeyCount = renderedKeys.length;
@@ -3560,7 +3847,6 @@ export async function createW8DistantPresentation({
       if (disposed) return reject('disposed');
       if (!acceptCommittedRenderOrigin(renderOrigin)) return reject('stale-render-origin');
       if (requestedEpoch < localTerrainSyncEpoch) return reject('stale-epoch');
-      localTerrainSyncEpoch = requestedEpoch;
       const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
       const activeKeys = new Set(activeDataKeys);
       const rendered = new Set(renderedKeys);
@@ -3573,6 +3859,11 @@ export async function createW8DistantPresentation({
       if ([...rendered].some(key => !activeKeys.has(key))) {
         return reject('rendered-owner-outside-active');
       }
+      if (!acceptRuntimeTransitionContract(acceptedTransition)) {
+        localTerrainStaleDiscardCount += 1;
+        return reject('stale-transition');
+      }
+      localTerrainSyncEpoch = requestedEpoch;
       const activeChunks = new Map();
       const missingOwnerKeys = [];
       for (const key of activeDataKeys) {
@@ -3597,6 +3888,8 @@ export async function createW8DistantPresentation({
       }
       if (previous.renderDistancePreset === renderDistancePolicy.id) {
         positionGenerationForOrigin(previous, renderOrigin);
+        applyLocalTerrainOwnerHandoff(previous, activeDataKeys, renderedKeys);
+        assignTransitionContract(previous, acceptedTransition);
         committedLocalTerrainEpoch = requestedEpoch;
         localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
         return Object.freeze({
@@ -3652,6 +3945,7 @@ export async function createW8DistantPresentation({
         currentOriginChunkZ: renderOrigin.renderOriginChunkZ,
         surfacePolicy: currentCanonicalSurfacePolicy,
       };
+      assignTransitionContract(generation, acceptedTransition);
       generation.stats.midgroundChunkCount = 16;
       const midgroundMesh = new Mesh(
         reusableMidgroundMesh.geometry,
@@ -3662,8 +3956,14 @@ export async function createW8DistantPresentation({
       midgroundMesh.receiveShadow = reusableMidgroundMesh.receiveShadow;
       midgroundMesh.userData = { ...(reusableMidgroundMesh.userData ?? {}) };
       localRoot.add(midgroundMesh);
+      generation.localTerrainMesh = midgroundMesh;
+      generation.currentVisibleMidgroundOwnerKeys = new Set(
+        midgroundMesh.userData.visibleOwnerKeys ?? [],
+      );
+      applyLocalTerrainOwnerHandoff(generation, activeDataKeys, renderedKeys);
       const assertCurrent = () => {
-        if (disposed || requestedEpoch !== localTerrainSyncEpoch) throw LOCAL_SYNC_CANCELLED;
+        if (disposed || requestedEpoch !== localTerrainSyncEpoch
+          || !transitionIsCurrent(acceptedTransition)) throw LOCAL_SYNC_CANCELLED;
       };
       try {
         localTerrainLastMaximumSliceMs = await createClipmapIncrementally({
@@ -3712,6 +4012,7 @@ export async function createW8DistantPresentation({
       });
     },
     async sync({
+      transitionContract = null,
       activeDataKeys,
       renderedKeys,
       getChunkData,
@@ -3730,7 +4031,14 @@ export async function createW8DistantPresentation({
       const requestedRenderDistancePreset = normalizeW8RenderDistancePreset(
         renderDistancePreset,
       );
+      const acceptedTransition = validateTransitionCoverage(transitionContract, {
+        activeDataKeys,
+        renderedKeys,
+        centerChunkX,
+        centerChunkZ,
+      });
       if (!commitRuntimePresentationState({
+        transitionContract: acceptedTransition,
         activeDataKeys,
         renderedKeys,
         renderOrigin,
@@ -3745,7 +4053,8 @@ export async function createW8DistantPresentation({
         beforeEpoch: epoch,
       });
       const assertCurrent = () => {
-        if (disposed || epoch !== syncEpoch) throw SYNC_CANCELLED;
+        if (disposed || epoch !== syncEpoch
+          || !transitionIsCurrent(acceptedTransition)) throw SYNC_CANCELLED;
       };
       const rendered = new Set(renderedKeys);
       const activeKeys = new Set(activeDataKeys);
@@ -3785,7 +4094,7 @@ export async function createW8DistantPresentation({
         pendingFarSyncEpochs.delete(epoch);
         return false;
       }
-      if (disposed || epoch !== syncEpoch) {
+      if (disposed || epoch !== syncEpoch || !transitionIsCurrent(acceptedTransition)) {
         staleEpochDiscardCount += 1;
         pendingFarSyncEpochs.delete(epoch);
         return false;
@@ -3881,6 +4190,7 @@ export async function createW8DistantPresentation({
         nearVisibleSettlementSignature: '',
         surfacePolicy: currentCanonicalSurfacePolicy,
       };
+      assignTransitionContract(generation, acceptedTransition);
       const context = {
         target: stagingRoot,
         ownedGeometries: generation.ownedGeometries,
@@ -3977,7 +4287,7 @@ export async function createW8DistantPresentation({
         pendingFarSyncEpochs.delete(epoch);
         throw error;
       }
-      if (disposed || epoch !== syncEpoch) {
+      if (disposed || epoch !== syncEpoch || !transitionIsCurrent(acceptedTransition)) {
         disposeGeneration(generation);
         staleEpochDiscardCount += 1;
         pendingFarSyncEpochs.delete(epoch);
@@ -4142,6 +4452,31 @@ export async function createW8DistantPresentation({
         treeLodDiagnosticsEnabled,
         queryConcurrencyLimit: CANONICAL_QUERY_CONCURRENCY,
         maximumObservedQueryConcurrency,
+        runtimeTransitionGeneration:
+          committedRuntimeTransitionContract?.generation ?? null,
+        runtimeCoverageSignature:
+          committedRuntimeTransitionContract?.coverageSignature ?? null,
+        localTerrainTransitionGeneration:
+          activeLocalTerrainGeneration?.transitionContract?.generation ?? null,
+        localTerrainCoverageSignature:
+          activeLocalTerrainGeneration?.transitionContract?.coverageSignature ?? null,
+        farTransitionGeneration:
+          activeGeneration?.transitionContract?.generation ?? null,
+        farCoverageSignature:
+          activeGeneration?.transitionContract?.coverageSignature ?? null,
+        presentationCoverageAligned: Boolean(
+          committedRuntimeTransitionContract
+          && activeLocalTerrainGeneration?.transitionContract
+          && activeGeneration?.transitionContract
+          && committedRuntimeTransitionContract.coverageSignature
+            === activeLocalTerrainGeneration.transitionContract.coverageSignature
+          && committedRuntimeTransitionContract.coverageSignature
+            === activeGeneration.transitionContract.coverageSignature
+          && committedRuntimeTransitionContract.generation
+            === activeLocalTerrainGeneration.transitionContract.generation
+          && committedRuntimeTransitionContract.generation
+            === activeGeneration.transitionContract.generation
+        ),
         syncEpoch,
         committedEpoch,
         staleEpochDiscardCount,
@@ -4166,6 +4501,13 @@ export async function createW8DistantPresentation({
         localTerrainMidgroundOwnerKeys: Object.freeze(sortedKeyList(
           activeLocalTerrainGeneration?.midgroundOwnerKeys ?? [],
         )),
+        localTerrainHandoffOwnerCount:
+          activeLocalTerrainGeneration?.currentVisibleMidgroundOwnerKeys?.size ?? 0,
+        localTerrainHandoffOwnerKeys: Object.freeze(sortedKeyList(
+          activeLocalTerrainGeneration?.currentVisibleMidgroundOwnerKeys ?? [],
+        )),
+        localTerrainStoredOwnerCount:
+          activeLocalTerrainGeneration?.localTerrainMesh?.userData?.ownerKeys?.length ?? 0,
         localTerrainMissingOwnerKeys: localTerrainLastMissingOwnerKeys,
         localTerrainLastRejectionReason,
         localTerrainLastSyncDurationMs,
@@ -4235,6 +4577,7 @@ export async function createW8DistantPresentation({
       activeGeneration = null;
       disposeGeneration(activeLocalTerrainGeneration);
       activeLocalTerrainGeneration = null;
+      committedRuntimeTransitionContract = null;
       pendingFarSyncEpochs.clear();
       scene.remove(root);
       roadGeometry.dispose?.();

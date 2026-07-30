@@ -43,6 +43,7 @@ import {
   InfiniteWorldState,
   decodeInfiniteWorldSave,
 } from '../src/infinite-world/world-state-store.js';
+import { createRuntimeTransitionContract } from '../src/infinite-world/runtime-transition-contract.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
@@ -354,6 +355,336 @@ test('stale post-commit Gameplay sync exits before applying an older render orig
   assert.equal(runtime.activeChunks.size, 0);
   assert.equal(runtime.spatialChunks.size, 0);
   await runtime.shutdown();
+});
+
+test('a Gameplay sync superseded mid-transition keeps the complete previous ownership set', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-stale-ownership-guard', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-stale-ownership-guard',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const chunks = new Map([0, 1, 2].map(chunkX => [
+    `${chunkX},0`,
+    { chunkX, chunkZ: 0 },
+  ]));
+  const getChunkData = (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null;
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['0,0', '1,0'],
+    renderedKeys: ['0,0', '1,0'],
+    getChunkData,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1 },
+  });
+  const previous = runtime.snapshot();
+  let currentChecks = 0;
+  const result = await runtime.syncActiveChunks({
+    activeDataKeys: ['1,0', '2,0'],
+    renderedKeys: ['1,0', '2,0'],
+    getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+    isCurrent: () => ++currentChecks < 3,
+  });
+  assert.equal(result, null);
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys,
+    previous.activeSimulationChunkKeys,
+  'a stale sync must not publish a partially unloaded simulation set');
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, previous.activeDataChunkKeys,
+    'a stale sync must not publish a partial damage-query ownership set');
+  assert.deepEqual([...renderer.loaded.keys()].sort(), previous.activeSimulationChunkKeys,
+    'rendered Gameplay ownership must remain paired with the previous complete state');
+  await runtime.shutdown();
+});
+
+test('only the latest staged Gameplay ownership set commits atomically', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-latest-staging-guard', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-latest-staging-guard',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const chunks = new Map([0, 1, 2].map(chunkX => [
+    `${chunkX},0`,
+    { chunkX, chunkZ: 0 },
+  ]));
+  const getChunkData = (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null;
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['0,0'], renderedKeys: ['0,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1 },
+  });
+
+  let releaseFirstChunk;
+  const firstChunk = new Promise(resolveChunk => { releaseFirstChunk = resolveChunk; });
+  const superseded = runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'],
+    getChunkData: () => firstChunk,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+    transitionContract: createRuntimeTransitionContract({
+      generation: 2,
+      centerChunkX: 1,
+      centerChunkZ: 0,
+      renderedKeys: ['1,0'],
+      activeDataKeys: ['1,0'],
+    }),
+  });
+  await Promise.resolve();
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys, ['0,0']);
+  assert.equal(runtime.snapshot().stagingSyncGeneration, 2);
+  assert.deepEqual([...renderer.loaded.keys()], ['0,0']);
+
+  const latest = await runtime.syncActiveChunks({
+    activeDataKeys: ['2,0'], renderedKeys: ['2,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 2, renderOriginChunkZ: 0, rebaseCount: 3 },
+    transitionContract: createRuntimeTransitionContract({
+      generation: 3,
+      centerChunkX: 2,
+      centerChunkZ: 0,
+      renderedKeys: ['2,0'],
+      activeDataKeys: ['2,0'],
+    }),
+  });
+  assert.deepEqual(latest.activeSimulationChunkKeys, ['2,0']);
+  assert.deepEqual(latest.activeDataChunkKeys, ['2,0']);
+  assert.equal(latest.syncGeneration, 3);
+  assert.equal(latest.stagingSyncGeneration, null);
+  assert.equal(latest.transitionGeneration, 3);
+  assert.equal(latest.renderedSignature, '1:2,0');
+  assert.equal(latest.activeDataSignature, '1:2,0');
+  assert.equal(latest.coverageSignature,
+    'center=2,0;rendered=1:2,0;active=1:2,0');
+
+  releaseFirstChunk(chunks.get('1,0'));
+  assert.equal(await superseded, null);
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys, ['2,0']);
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, ['2,0']);
+  assert.deepEqual([...renderer.loaded.keys()], ['2,0']);
+  assert.equal(runtime.snapshot().transitionGeneration, 3);
+  await runtime.shutdown();
+});
+
+test('a renderer load failure restores previous ownership and the same transition can retry', async () => {
+  const transactionWorldSeedHash = `sha256:${'7'.repeat(64)}`;
+  const state = new InfiniteWorldState({
+    worldSeedHash: transactionWorldSeedHash, playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const originalLoadChunk = renderer.loadChunk.bind(renderer);
+  let failNextChunkKey = null;
+  let failureMode = 'after';
+  renderer.loadChunk = async (key, states) => {
+    if (key === failNextChunkKey && failureMode === 'before') {
+      failNextChunkKey = null;
+      throw new Error('injected renderer load failure before mutation');
+    }
+    await originalLoadChunk(key, states);
+    if (key === failNextChunkKey) {
+      failNextChunkKey = null;
+      throw new Error('injected renderer load failure after mutation');
+    }
+  };
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: transactionWorldSeedHash,
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const chunks = new Map([
+    ['0,0', { chunkX: 0, chunkZ: 0 }],
+    ['1,0', {
+      chunkX: 1,
+      chunkZ: 0,
+      vegetationCandidates: [],
+      rockCandidates: [],
+      settlementFeatures: [{
+        stableId: 'settlement-building-v1:renderer-transaction-house',
+        featureType: 'settlement-building',
+        buildingType: 'house',
+        radiusMeters: 2,
+        widthMeters: 4,
+        heightMeters: 5,
+        depthMeters: 4,
+        rotationY: 0,
+        worldPosition: { x: 20, y: 0, z: 4 },
+        owningChunkCoordinate: { x: 1, z: 0 },
+      }],
+      settlementReferences: [],
+      settlementLandmarks: [],
+    }],
+  ]);
+  const getChunkData = (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null;
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['0,0'], renderedKeys: ['0,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1 },
+  });
+  const previous = runtime.snapshot();
+  const previousRevision = state.revision;
+  const previousEntityIds = [...state.entityStates.keys()];
+  failureMode = 'before';
+  failNextChunkKey = '1,0';
+  await assert.rejects(runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+  }), /injected renderer load failure before mutation/);
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, previous.activeDataChunkKeys);
+  assert.deepEqual([...renderer.loaded.keys()], ['0,0']);
+  assert.equal(state.revision, previousRevision);
+  assert.deepEqual([...state.entityStates.keys()], previousEntityIds);
+
+  failureMode = 'after';
+  failNextChunkKey = '1,0';
+  await assert.rejects(runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+  }), /injected renderer load failure/);
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys,
+    previous.activeSimulationChunkKeys);
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, previous.activeDataChunkKeys);
+  assert.equal(state.revision, previousRevision,
+    'renderer failure must not publish staged entity discovery into the durable Save state');
+  assert.deepEqual([...state.entityStates.keys()], previousEntityIds);
+  assert.deepEqual([...renderer.loaded.keys()], ['0,0'],
+    'renderer rollback must restore exactly the complete previous ownership set');
+
+  const retried = await runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+  });
+  assert.deepEqual(retried.activeSimulationChunkKeys, ['1,0']);
+  assert.deepEqual(retried.activeDataChunkKeys, ['1,0']);
+  assert.deepEqual([...renderer.loaded.keys()], ['1,0']);
+  assert.equal(state.entityStates.size > previousEntityIds.length, true,
+    'the entity-bearing Chunk commits durable entity state only after renderer success');
+  await runtime.shutdown();
+});
+
+test('stale after a successful renderer unload restores the old complete ownership once', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-renderer-stale-rollback', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const originalUnloadChunk = renderer.unloadChunk.bind(renderer);
+  let transitionCurrent = true;
+  let rejectMissingUnload = false;
+  renderer.unloadChunk = async key => {
+    if (rejectMissingUnload && !renderer.loaded.has(key)) {
+      throw new Error(`duplicate rollback unload: ${key}`);
+    }
+    await originalUnloadChunk(key);
+    if (key === '0,0') {
+      transitionCurrent = false;
+      rejectMissingUnload = true;
+    }
+  };
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-renderer-stale-rollback',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const chunks = new Map([0, 1].map(chunkX => [
+    `${chunkX},0`,
+    { chunkX, chunkZ: 0 },
+  ]));
+  const getChunkData = (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null;
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['0,0'], renderedKeys: ['0,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 1 },
+  });
+  const stale = await runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 2 },
+    isCurrent: () => transitionCurrent,
+  });
+  assert.equal(stale, null);
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys, ['0,0']);
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, ['0,0']);
+  assert.deepEqual([...renderer.loaded.keys()], ['0,0']);
+  await runtime.shutdown();
+});
+
+test('a late lower Runtime transition contract cannot roll Gameplay ownership back', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-transition-monotonic-guard', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-transition-monotonic-guard',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  const chunks = new Map([1, 2].map(chunkX => [
+    `${chunkX},0`,
+    { chunkX, chunkZ: 0 },
+  ]));
+  const getChunkData = (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null;
+  const transition = (generation, chunkX) => createRuntimeTransitionContract({
+    generation,
+    centerChunkX: chunkX,
+    centerChunkZ: 0,
+    renderedKeys: [`${chunkX},0`],
+    activeDataKeys: [`${chunkX},0`],
+  });
+  await runtime.syncActiveChunks({
+    activeDataKeys: ['2,0'], renderedKeys: ['2,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 2, renderOriginChunkZ: 0, rebaseCount: 2 },
+    transitionContract: transition(2, 2),
+  });
+  const result = await runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'], getChunkData,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 1 },
+    transitionContract: transition(1, 1),
+  });
+  assert.equal(result, null);
+  assert.deepEqual(runtime.snapshot().activeSimulationChunkKeys, ['2,0']);
+  assert.deepEqual(runtime.snapshot().activeDataChunkKeys, ['2,0']);
+  assert.equal(runtime.snapshot().transitionGeneration, 2);
+  assert.deepEqual([...renderer.loaded.keys()], ['2,0']);
+  await runtime.shutdown();
+});
+
+test('shutdown discards an in-flight Gameplay staging set without publishing it', async () => {
+  const state = new InfiniteWorldState({
+    worldSeedHash: 'gameplay-shutdown-staging-guard', playerSpawn: { x: 0, z: 0 },
+  });
+  const renderer = new FakeGameplayRenderer();
+  const runtime = new InfiniteGameplayRuntime({
+    worldSeedHash: 'gameplay-shutdown-staging-guard',
+    generatorMajor: 800,
+    state,
+    renderAdapter: renderer,
+    featureRenderAdapter: fakeFeatureRenderer(),
+  });
+  let releaseChunk;
+  const chunkGate = new Promise(resolveChunk => { releaseChunk = resolveChunk; });
+  const pending = runtime.syncActiveChunks({
+    activeDataKeys: ['1,0'], renderedKeys: ['1,0'],
+    getChunkData: () => chunkGate,
+    renderOrigin: { renderOriginChunkX: 1, renderOriginChunkZ: 0, rebaseCount: 1 },
+  });
+  await Promise.resolve();
+  assert.equal(runtime.snapshot().stagingSyncGeneration, 1);
+  assert.equal(runtime.snapshot().activeDataChunkCount, 0);
+
+  await runtime.shutdown();
+  releaseChunk({ chunkX: 1, chunkZ: 0 });
+  assert.equal(await pending, null);
+  assert.equal(runtime.activeChunks.size, 0);
+  assert.equal(runtime.spatialChunks.size, 0);
+  assert.equal(renderer.disposed, true);
+  assert.equal(renderer.counts.loaded, 0);
 });
 
 test('real W5 military through W8 parity materializes Tank while capital no longer materializes a natural Boss', async () => {

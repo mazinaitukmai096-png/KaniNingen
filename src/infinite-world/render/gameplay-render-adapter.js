@@ -1281,6 +1281,13 @@ export class GameplayRenderAdapter {
   async loadChunk(key, entityStates) {
     if (this.disposed) throw new Error('gameplay render adapter is shut down');
     if (this.loaded.has(key)) throw new Error(`gameplay chunk already loaded: ${key}`);
+    const incomingIds = new Set();
+    for (const state of entityStates) {
+      if (incomingIds.has(state.stableId) || this.entityMeshes.has(state.stableId)) {
+        throw new Error(`duplicate live gameplay Stable ID: ${state.stableId}`);
+      }
+      incomingIds.add(state.stableId);
+    }
     const { chunkX, chunkZ } = parseChunkKey(key);
     const Group = requireConstructor(this.THREE, 'Group');
     const group = new Group();
@@ -1288,24 +1295,33 @@ export class GameplayRenderAdapter {
     group.userData = { chunkKey: key };
     const entry = { key, chunkX, chunkZ, group, entityIds: new Set() };
     this.#positionGroup(entry);
-    for (const state of entityStates) {
-      this.removeReinforcement(state.stableId);
-      if (this.entityMeshes.has(state.stableId)) throw new Error(`duplicate live gameplay Stable ID: ${state.stableId}`);
-      const mesh = this.visualAssets.createEntityModel(state.type);
-      mesh.name = `production-${state.type}`;
-      mesh.userData = {
-        ...(mesh.userData ?? {}), stableId: state.stableId, ownerChunkKey: key, type: state.type,
-      };
-      this.#scaleMesh(mesh, state);
-      this.#positionMesh(mesh, state, entry);
-      group.add(mesh);
-      entry.entityIds.add(state.stableId);
-      this.entityMeshes.set(state.stableId, { mesh, entry });
-      this.counts.created += 1;
+    try {
+      for (const state of entityStates) {
+        const mesh = this.visualAssets.createEntityModel(state.type);
+        mesh.name = `production-${state.type}`;
+        mesh.userData = {
+          ...(mesh.userData ?? {}), stableId: state.stableId, ownerChunkKey: key, type: state.type,
+        };
+        this.#scaleMesh(mesh, state);
+        this.#positionMesh(mesh, state, entry);
+        group.add(mesh);
+        entry.entityIds.add(state.stableId);
+        this.entityMeshes.set(state.stableId, { mesh, entry });
+        this.counts.created += 1;
+      }
+      for (const state of entityStates) this.removeReinforcement(state.stableId);
+      this.root.add(group);
+      this.loaded.set(createChunkKey(chunkX, chunkZ), entry);
+      this.counts.loaded += 1;
+    } catch (error) {
+      this.root.remove(group);
+      for (const stableId of entry.entityIds) {
+        this.entityMeshes.delete(stableId);
+        this.counts.created = Math.max(0, this.counts.created - 1);
+      }
+      group.clear();
+      throw error;
     }
-    this.root.add(group);
-    this.loaded.set(createChunkKey(chunkX, chunkZ), entry);
-    this.counts.loaded += 1;
   }
 
   syncEntity(state) {

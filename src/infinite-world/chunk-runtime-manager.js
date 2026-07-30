@@ -9,6 +9,7 @@ import { evaluateW1APerformanceWarnings, PerformanceLedger } from './runtime-tim
 import { ChunkDataService } from './chunk-data-service.js';
 import { CHUNK_DATA_PRIORITY } from './chunk-data-service-protocol.js';
 import { createInlineChunkGeneratorTransport } from './inline-chunk-generator-transport.js';
+import { createRuntimeTransitionContract } from './runtime-transition-contract.js';
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -86,6 +87,8 @@ export class ChunkRuntimeManager {
     this.preferredPreparationKey = null;
     this.preparedPlanEpoch = 0;
     this.transitionEpoch = 0;
+    this.committedTransitionGeneration = 0;
+    this.committedTransitionContract = null;
     this.transitionPendingCount = 0;
     this.preparationPendingCount = 0;
     this.renderOrigin = this.floatingOrigin.snapshot();
@@ -461,6 +464,13 @@ export class ChunkRuntimeManager {
     this.centerChunkZ = chunkZ;
     this.activeDataKeyList = Object.freeze(sortedKeys(this.activeDataKeys));
     this.renderedKeyList = Object.freeze(sortedKeys(this.renderedKeys));
+    this.committedTransitionContract = createRuntimeTransitionContract({
+      generation: ++this.committedTransitionGeneration,
+      centerChunkX: chunkX,
+      centerChunkZ: chunkZ,
+      renderedKeys: this.renderedKeyList,
+      activeDataKeys: this.activeDataKeyList,
+    });
     this.#evictInactiveCacheEntries();
     this.#validateRuntimeInvariants();
     this.counts.transitionsPerformed += 1;
@@ -481,6 +491,7 @@ export class ChunkRuntimeManager {
       rebaseDelta: originChange.changed ? 1 : 0,
       prepared: prepared !== null,
       durationMs,
+      transitionContract: this.committedTransitionContract,
     });
     return this.latestTransition;
   }
@@ -607,6 +618,7 @@ export class ChunkRuntimeManager {
       renderOrigin: this.renderOrigin,
       activeDataKeys: this.activeDataKeyList,
       renderedKeys: this.renderedKeyList,
+      transitionContract: this.committedTransitionContract,
     });
   }
 
@@ -645,6 +657,7 @@ export class ChunkRuntimeManager {
       activeDataKeys: this.activeDataKeyList,
       pendingPrefetchKeys: Object.freeze(sortedKeys(this.pendingPrefetchKeys)),
       renderedKeys: this.renderedKeyList,
+      transitionContract: this.committedTransitionContract,
       streaming: this.getStreamingState(),
       counts: Object.freeze({ ...this.counts }),
       latestTransition: this.latestTransition,

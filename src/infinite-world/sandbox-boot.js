@@ -15,6 +15,7 @@ import {
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import { planNextChunkBoundaryPrefetch } from './chunk-streaming-plan.js';
+import { sameRuntimeTransitionContract } from './runtime-transition-contract.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import {
   createW8ParityChunkGenerator,
@@ -1010,6 +1011,7 @@ export async function bootInfiniteWorldSandbox({
       const runtimeSnapshot = runtime.getCommittedChunkState();
       distantPresentation.syncLocalTerrain({
         coverageEpoch: ++localTerrainCoverageEpoch,
+        transitionContract: runtimeSnapshot.transitionContract,
         activeDataKeys: runtimeSnapshot.activeDataKeys,
         renderedKeys: runtimeSnapshot.renderedKeys,
         getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1022,6 +1024,7 @@ export async function bootInfiniteWorldSandbox({
     if (diagnosticProfile.distant) {
       const runtimeSnapshot = runtime.snapshot();
       await diagnostics.measureAsync('distant-sync', () => distantPresentation.sync({
+          transitionContract: runtimeSnapshot.transitionContract,
           activeDataKeys: runtimeSnapshot.activeDataKeys,
           renderedKeys: runtimeSnapshot.renderedKeys,
           getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1092,6 +1095,7 @@ export async function bootInfiniteWorldSandbox({
       const runtimeSnapshot = runtime.snapshot();
       if (diagnosticProfile.gameplaySync) {
         await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          transitionContract: runtimeSnapshot.transitionContract,
           activeDataKeys: runtimeSnapshot.activeDataKeys,
           renderedKeys: runtimeSnapshot.renderedKeys,
           getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1131,8 +1135,11 @@ export async function bootInfiniteWorldSandbox({
     let lastRunStartDiagnostics = null;
     let postCommitRequestedEpoch = 0;
     let postCommitCompletedEpoch = 0;
+    let postCommitFailureCount = 0;
+    let postCommitLastError = null;
     let postCommitPumpActive = false;
     let postCommitTimer = null;
+    const gameplaySyncWorkByEpoch = new Map();
     let saveDeferredForStreaming = false;
     let lastCameraCollision = Object.freeze({
       collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0,
@@ -1156,6 +1163,7 @@ export async function bootInfiniteWorldSandbox({
     const synchronizeDistantPresentation = (runtimeSnapshot, {
       includeUltraNatural = true,
     } = {}) => distantPresentation.sync({
+      transitionContract: runtimeSnapshot.transitionContract,
       activeDataKeys: runtimeSnapshot.activeDataKeys,
       renderedKeys: runtimeSnapshot.renderedKeys,
       getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1171,6 +1179,7 @@ export async function bootInfiniteWorldSandbox({
 
     const synchronizeLocalTerrain = runtimeSnapshot => distantPresentation.syncLocalTerrain({
       coverageEpoch: ++localTerrainCoverageEpoch,
+      transitionContract: runtimeSnapshot.transitionContract,
       activeDataKeys: runtimeSnapshot.activeDataKeys,
       renderedKeys: runtimeSnapshot.renderedKeys,
       getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1183,6 +1192,7 @@ export async function bootInfiniteWorldSandbox({
     const synchronizeLocalTerrainIncrementally = runtimeSnapshot => (
       distantPresentation.syncLocalTerrainIncrementally({
         coverageEpoch: ++localTerrainCoverageEpoch,
+        transitionContract: runtimeSnapshot.transitionContract,
         activeDataKeys: runtimeSnapshot.activeDataKeys,
         renderedKeys: runtimeSnapshot.renderedKeys,
         getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1196,6 +1206,7 @@ export async function bootInfiniteWorldSandbox({
     const synchronizeLocalTerrainPreset = runtimeSnapshot => (
       distantPresentation.syncLocalTerrainPreset({
         coverageEpoch: ++localTerrainCoverageEpoch,
+        transitionContract: runtimeSnapshot.transitionContract,
         activeDataKeys: runtimeSnapshot.activeDataKeys,
         renderedKeys: runtimeSnapshot.renderedKeys,
         getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
@@ -1207,6 +1218,7 @@ export async function bootInfiniteWorldSandbox({
     );
 
     const commitDistantRuntimeState = runtimeSnapshot => distantPresentation.commitRuntimeState?.({
+      transitionContract: runtimeSnapshot.transitionContract,
       activeDataKeys: runtimeSnapshot.activeDataKeys,
       renderedKeys: runtimeSnapshot.renderedKeys,
       renderOrigin: runtimeSnapshot.renderOrigin,
@@ -1219,7 +1231,11 @@ export async function bootInfiniteWorldSandbox({
     const isSameCommittedRuntimeState = (workEpoch, runtimeSnapshot) => {
       if (!running || workEpoch !== postCommitRequestedEpoch) return false;
       const current = runtime.getCommittedChunkState();
-      return current.centerChunkX === runtimeSnapshot.centerChunkX
+      return sameRuntimeTransitionContract(
+        current.transitionContract,
+        runtimeSnapshot.transitionContract,
+      )
+        && current.centerChunkX === runtimeSnapshot.centerChunkX
         && current.centerChunkZ === runtimeSnapshot.centerChunkZ
         && current.renderOrigin.rebaseCount === runtimeSnapshot.renderOrigin.rebaseCount
         && current.renderOrigin.renderOriginChunkX === runtimeSnapshot.renderOrigin.renderOriginChunkX
@@ -1230,17 +1246,47 @@ export async function bootInfiniteWorldSandbox({
       setTimeoutFn(resolve, 0);
     });
 
-    function schedulePostCommitPump() {
+    const startGameplayTransitionSync = (workEpoch, runtimeSnapshot) => {
+      const work = diagnosticProfile.gameplaySync
+        ? diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          transitionContract: runtimeSnapshot.transitionContract,
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+          isCurrent: () => isSameCommittedRuntimeState(workEpoch, runtimeSnapshot),
+        })).then(
+          value => Object.freeze({ ok: true, value }),
+          error => Object.freeze({ ok: false, error }),
+        )
+        : Promise.resolve(Object.freeze({ ok: true, value: null }));
+      gameplaySyncWorkByEpoch.set(workEpoch, work);
+      for (const [epoch, staleWork] of gameplaySyncWorkByEpoch) {
+        if (epoch >= workEpoch) continue;
+        void staleWork.finally(() => {
+          if (gameplaySyncWorkByEpoch.get(epoch) === staleWork) {
+            gameplaySyncWorkByEpoch.delete(epoch);
+          }
+        });
+      }
+      return work;
+    };
+
+    function schedulePostCommitPump(delayMs = 0) {
       if (postCommitPumpActive || postCommitTimer !== null) return;
       postCommitTimer = setTimeoutFn(() => {
         postCommitTimer = null;
         postCommitPumpActive = true;
         void (async () => {
+          let attemptedEpoch = null;
           try {
             await deferToNextTask();
             const committedEpoch = postCommitRequestedEpoch;
+            attemptedEpoch = committedEpoch;
             const runtimeState = runtime.getCommittedChunkState();
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
+            const gameplayWork = gameplaySyncWorkByEpoch.get(committedEpoch)
+              ?? startGameplayTransitionSync(committedEpoch, runtimeState);
             const localTerrainResult = await diagnostics.measureAsync(
               'distant-local-terrain-sync',
               () => synchronizeLocalTerrainIncrementally(runtimeState),
@@ -1256,29 +1302,43 @@ export async function bootInfiniteWorldSandbox({
               );
             }
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
-            if (diagnosticProfile.gameplaySync) {
-              await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
-                activeDataKeys: runtimeState.activeDataKeys,
-                renderedKeys: runtimeState.renderedKeys,
-                getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-                renderOrigin: runtimeState.renderOrigin,
-                isCurrent: () => isSameCommittedRuntimeState(committedEpoch, runtimeState),
-              }));
-            }
+            const gameplayResult = await gameplayWork;
+            if (!gameplayResult.ok) throw gameplayResult.error;
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             postCommitCompletedEpoch = committedEpoch;
+            postCommitFailureCount = 0;
+            if (transitionError === postCommitLastError) transitionError = null;
+            postCommitLastError = null;
+            gameplaySyncWorkByEpoch.delete(committedEpoch);
           } catch (error) {
             transitionError = error;
+            postCommitLastError = error;
+            if (attemptedEpoch !== null) {
+              gameplaySyncWorkByEpoch.delete(attemptedEpoch);
+              if (attemptedEpoch === postCommitRequestedEpoch) postCommitFailureCount += 1;
+            }
           } finally {
             postCommitPumpActive = false;
-            if (running && postCommitCompletedEpoch < postCommitRequestedEpoch) schedulePostCommitPump();
+            if (running
+              && postCommitCompletedEpoch < postCommitRequestedEpoch) {
+              const retryDelayMs = postCommitFailureCount > 0
+                ? Math.min(1_000, 16 * (2 ** Math.min(6, postCommitFailureCount - 1)))
+                : 0;
+              schedulePostCommitPump(retryDelayMs);
+            }
           }
         })();
-      }, 0);
+      }, delayMs);
     }
 
-    function schedulePostCommitWork() {
-      postCommitRequestedEpoch += 1;
+    function schedulePostCommitWork(runtimeSnapshot = runtime.getCommittedChunkState()) {
+      const workEpoch = ++postCommitRequestedEpoch;
+      postCommitFailureCount = 0;
+      if (postCommitTimer !== null) {
+        clearTimeoutFn(postCommitTimer);
+        postCommitTimer = null;
+      }
+      startGameplayTransitionSync(workEpoch, runtimeSnapshot);
       localTerrainCoverageEpoch = Math.max(
         localTerrainCoverageEpoch,
         distantPresentation.invalidatePendingLocalTerrainSync?.()
@@ -1345,6 +1405,19 @@ export async function bootInfiniteWorldSandbox({
       scenePresentation.rebase(runtimeSnapshot.renderOrigin);
       commitDistantRuntimeState(runtimeSnapshot);
       await gameplayRenderAdapter.rebase(runtimeSnapshot.renderOrigin);
+      const gameplaySync = diagnosticProfile.gameplaySync
+        ? diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
+          transitionContract: runtimeSnapshot.transitionContract,
+          activeDataKeys: runtimeSnapshot.activeDataKeys,
+          renderedKeys: runtimeSnapshot.renderedKeys,
+          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+          renderOrigin: runtimeSnapshot.renderOrigin,
+          isCurrent: () => sameRuntimeTransitionContract(
+            runtime.getCommittedChunkState().transitionContract,
+            runtimeSnapshot.transitionContract,
+          ),
+        }))
+        : Promise.resolve(null);
       synchronizeLocalTerrain(runtimeSnapshot);
       if (diagnosticProfile.distant) {
         await diagnostics.measureAsync(
@@ -1352,14 +1425,7 @@ export async function bootInfiniteWorldSandbox({
           () => synchronizeDistantPresentation(runtimeSnapshot),
         );
       }
-      if (diagnosticProfile.gameplaySync) {
-        await diagnostics.measureAsync('gameplay-sync', () => gameplay.syncActiveChunks({
-          activeDataKeys: runtimeSnapshot.activeDataKeys,
-          renderedKeys: runtimeSnapshot.renderedKeys,
-          getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
-          renderOrigin: runtimeSnapshot.renderOrigin,
-        }));
-      }
+      await gameplaySync;
       if (refreshGameplay) {
         await diagnostics.measureAsync(
           'gameplay-refresh',
@@ -1746,8 +1812,9 @@ export async function bootInfiniteWorldSandbox({
           const nextState = runtime.getCommittedChunkState();
           scenePresentation.rebase(nextState.renderOrigin);
           commitDistantRuntimeState(nextState);
-          await gameplayRenderAdapter.rebase(nextState.renderOrigin);
-          schedulePostCommitWork();
+          const gameplayRebase = gameplayRenderAdapter.rebase(nextState.renderOrigin);
+          schedulePostCommitWork(nextState);
+          await gameplayRebase;
         })
         .catch(error => { transitionError = error; })
         .finally(() => { transitionTargetKey = null; });

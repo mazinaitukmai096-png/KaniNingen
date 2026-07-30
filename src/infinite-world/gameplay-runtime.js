@@ -34,6 +34,11 @@ import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js
 import { resolveW8RockCanonicalObject } from './rock-canonical-object.js';
 import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
 import { resolveCanonicalPlayerMovement } from './player-world-collision.js';
+import {
+  createChunkCoverageSignature,
+  isRuntimeTransitionContract,
+  sameRuntimeTransitionContract,
+} from './runtime-transition-contract.js';
 
 const EPSILON_METERS = 0.05;
 const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
@@ -613,6 +618,12 @@ export class InfiniteGameplayRuntime {
     this.clock = clock;
     this.activeChunks = new Map();
     this.spatialChunks = new Map();
+    this.chunkSyncGeneration = 0;
+    this.stagingChunkSyncGeneration = null;
+    this.committedChunkSyncGeneration = 0;
+    this.committedTransitionContract = null;
+    this.latestRequestedTransitionContract = null;
+    this.pendingChunkSyncCommit = null;
     this.maximumSpatialTargetRadiusMeters = finiteWorldUnitsToMeters(
       W6_ENTITY_CONTRACTS.human.radius,
     );
@@ -2497,105 +2508,289 @@ export class InfiniteGameplayRuntime {
     getChunkData,
     renderOrigin,
     isCurrent = null,
+    transitionContract = null,
   } = {}) {
     if (this.isShutdown) throw new Error('gameplay runtime is shut down');
     if (!Array.isArray(renderedKeys) || !Array.isArray(activeDataKeys)
       || typeof getChunkData !== 'function') {
       throw new TypeError('activeDataKeys, renderedKeys and getChunkData are required');
     }
+    if (transitionContract !== null && transitionContract !== undefined) {
+      if (!isRuntimeTransitionContract(transitionContract)) {
+        throw new TypeError('invalid Runtime transition contract');
+      }
+      if (transitionContract.renderedSignature
+          !== createChunkCoverageSignature(renderedKeys, 'renderedKeys')
+        || transitionContract.activeDataSignature
+          !== createChunkCoverageSignature(activeDataKeys, 'activeDataKeys')) {
+        throw new Error('Runtime transition coverage does not match Gameplay input');
+      }
+      const latestContract = this.latestRequestedTransitionContract
+        ?? this.committedTransitionContract;
+      if (latestContract) {
+        if (transitionContract.generation < latestContract.generation) return null;
+        if (transitionContract.generation === latestContract.generation
+          && !sameRuntimeTransitionContract(transitionContract, latestContract)) {
+          throw new Error('conflicting Runtime transition contracts share one generation');
+        }
+      }
+      this.latestRequestedTransitionContract = transitionContract;
+    }
+    const syncGeneration = ++this.chunkSyncGeneration;
+    this.stagingChunkSyncGeneration = syncGeneration;
     const desired = new Set(renderedKeys);
     const desiredSpatial = new Set(activeDataKeys);
-    const stillCurrent = () => typeof isCurrent !== 'function' || isCurrent() === true;
-    if (!stillCurrent()) return null;
-    for (const key of desired) {
-      if (!desiredSpatial.has(key)) {
-        throw new Error(`rendered gameplay Chunk ${key} is outside Active Data`);
+    const stillCurrent = () => !this.isShutdown
+      && syncGeneration === this.chunkSyncGeneration
+      && (typeof isCurrent !== 'function' || isCurrent() === true);
+    try {
+      if (!stillCurrent()) return null;
+      for (const key of desired) {
+        if (!desiredSpatial.has(key)) {
+          throw new Error(`rendered gameplay Chunk ${key} is outside Active Data`);
+        }
       }
-    }
-    for (const key of sorted(this.activeChunks.keys())) {
-      if (!stillCurrent()) return null;
-      if (desired.has(key)) continue;
-      await this.renderAdapter.unloadChunk(key);
-      this.activeChunks.delete(key);
-      this.projectiles = this.projectiles.filter(projectile =>
-        projectile.ownerChunkKey !== key
-        || (projectile.ownerStableId
-          && this.activeTankOccurrences.has(projectile.ownerStableId)));
-      this.counts.chunksUnloaded += 1;
-      if (!stillCurrent()) return null;
-    }
-    for (const key of sorted(this.spatialChunks.keys())) {
-      if (!stillCurrent()) return null;
-      if (!desiredSpatial.has(key)) this.spatialChunks.delete(key);
-    }
-    for (const key of sorted(desiredSpatial)) {
-      if (!stillCurrent()) return null;
-      if (this.spatialChunks.has(key)) continue;
-      const { chunkX, chunkZ } = parseChunkKey(key);
-      const chunkData = await getChunkData(chunkX, chunkZ);
-      if (!stillCurrent()) return null;
-      if (!chunkData) throw new Error(`missing W6 Active Data ChunkData: ${key}`);
-      const model = await createW6ChunkGameplay({
-        chunkData,
-        worldSeedHash: this.worldSeedHash,
-        generatorMajor: this.generatorMajor,
-      });
-      if (!stillCurrent()) return null;
-      this.spatialChunks.set(key, model);
-      this.#registerSpatialGameplayModel(key, model);
-    }
-    this.#reconcileSpatialHumanOwnership();
-    this.#refreshSpatialBroadphaseBounds();
-    for (const key of sorted(desired)) {
-      if (!stillCurrent()) return null;
-      if (this.activeChunks.has(key)) continue;
-      const model = this.spatialChunks.get(key);
-      if (!model) throw new Error(`missing W6 spatial gameplay model: ${key}`);
-      for (const target of model.staticTargets) {
-        this.#registerStableId(target.stableId, target.ownerChunkKey ?? key);
-        if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
+
+      // ChunkData and gameplay model generation may yield. Keep every result private until the
+      // complete target ownership set has been built and the transition is still current.
+      const stagedSpatialChunks = new Map();
+      for (const key of sorted(desiredSpatial)) {
+        if (!stillCurrent()) return null;
+        let model = this.spatialChunks.get(key) ?? null;
+        if (!model) {
+          const { chunkX, chunkZ } = parseChunkKey(key);
+          const chunkData = await getChunkData(chunkX, chunkZ);
+          if (!stillCurrent()) return null;
+          if (!chunkData) throw new Error(`missing W6 Active Data ChunkData: ${key}`);
+          model = await createW6ChunkGameplay({
+            chunkData,
+            worldSeedHash: this.worldSeedHash,
+            generatorMajor: this.generatorMajor,
+          });
+          if (!stillCurrent()) return null;
+        }
+        stagedSpatialChunks.set(key, model);
       }
-      const entityStates = model.entityDescriptors.map(descriptor => {
-        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
-        const existed = this.state.entityStates.has(descriptor.stableId);
-        const entityState = this.state.ensureEntity(descriptor);
-        if (entityState.type === 'tank') {
-          this.#bindTank(entityState, descriptor);
-          if (entityState.alive && entityState.spawned === true) {
-            this.#startTankOccurrence(entityState, { sync: false });
+      const stagedActiveChunks = new Map();
+      for (const key of sorted(desired)) {
+        const model = stagedSpatialChunks.get(key);
+        if (!model) throw new Error(`missing W6 spatial gameplay model: ${key}`);
+        stagedActiveChunks.set(key, model);
+      }
+      const precedingCommit = this.pendingChunkSyncCommit;
+      if (precedingCommit) {
+        try {
+          await precedingCommit;
+        } catch (error) {
+          // The preceding owner restores its renderer state before rejecting. A newer complete
+          // transition may continue from that restored state instead of inheriting the old error.
+          if (error?.rendererOwnershipRestored !== true) throw error;
+        }
+      }
+      if (!stillCurrent()) return null;
+
+      const previousActiveChunks = this.activeChunks;
+      const addedSpatialKeys = sorted(desiredSpatial)
+        .filter(key => !this.spatialChunks.has(key));
+      const removedActiveKeys = sorted(previousActiveChunks.keys())
+        .filter(key => !desired.has(key));
+      const addedActiveKeys = sorted(desired)
+        .filter(key => !previousActiveChunks.has(key));
+
+      const addedEntityRecords = new Map();
+      for (const key of addedActiveKeys) {
+        const model = stagedActiveChunks.get(key);
+        const records = model.entityDescriptors.map(descriptor => {
+          const entityState = this.state.entityStates.get(descriptor.stableId) ?? null;
+          const presentationState = entityState ?? Object.freeze({
+            ...descriptor,
+            hp: descriptor.maxHp,
+            alive: descriptor.maxHp > 0,
+            aiClock: 0,
+            turretRotationY: descriptor.turretRotationY ?? descriptor.rotationY ?? 0,
+            gunPitch: descriptor.gunPitch ?? 0,
+          });
+          return { descriptor, entityState, presentationState, existed: entityState !== null };
+        });
+        addedEntityRecords.set(key, records);
+      }
+      const previousEntityStates = new Map();
+      for (const key of removedActiveKeys) {
+        previousEntityStates.set(key, previousActiveChunks.get(key).entityDescriptors.map(
+          descriptor => this.state.entityStates.get(descriptor.stableId) ?? Object.freeze({
+            ...descriptor,
+            hp: descriptor.maxHp,
+            alive: descriptor.maxHp > 0,
+            aiClock: 0,
+            turretRotationY: descriptor.turretRotationY ?? descriptor.rotationY ?? 0,
+            gunPitch: descriptor.gunPitch ?? 0,
+          }),
+        ));
+      }
+
+      // Renderer ownership is prepared transactionally while the complete previous Gameplay Maps
+      // remain live. Any error or superseding transition restores the renderer before returning.
+      const rendererAddedEntries = [];
+      const rendererRemovedEntries = [];
+      let rendererRollbackAttempted = false;
+      const restorePreviousRendererOwnership = async () => {
+        rendererRollbackAttempted = true;
+        const rollbackErrors = [];
+        for (const entry of [...rendererAddedEntries].reverse()) {
+          const loadedMap = this.renderAdapter.loaded instanceof Map
+            ? this.renderAdapter.loaded : null;
+          if (loadedMap && !loadedMap.has(entry.key)) continue;
+          try { await this.renderAdapter.unloadChunk(entry.key); } catch (error) {
+            if (entry.completed || loadedMap?.has(entry.key)) rollbackErrors.push(error);
           }
         }
-        if (existed) this.counts.revisits += 1;
-        return entityState;
-      });
-      this.activeChunks.set(key, model);
-      await this.renderAdapter.loadChunk(key, entityStates);
-      for (const entityState of entityStates) {
-        if (entityState.type === 'tank') this.#syncTank(entityState);
+        for (const entry of rendererRemovedEntries) {
+          if (!entry.completed) {
+            // A rejecting adapter may have mutated before rejecting. Normalize that uncertain
+            // key first; a missing key is already the desired pre-load state.
+            try { await this.renderAdapter.unloadChunk(entry.key); } catch {}
+          }
+          try {
+            await this.renderAdapter.loadChunk(
+              entry.key,
+              previousEntityStates.get(entry.key),
+            );
+          } catch (error) {
+            rollbackErrors.push(error);
+          }
+        }
+        if (rollbackErrors.length) {
+          throw new AggregateError(rollbackErrors, 'Gameplay renderer ownership rollback failed');
+        }
+      };
+      const renderCommit = (async () => {
+        try {
+          for (const key of addedActiveKeys) {
+            const entry = { key, completed: false };
+            rendererAddedEntries.push(entry);
+            await this.renderAdapter.loadChunk(
+              key,
+              addedEntityRecords.get(key).map(record => record.presentationState),
+            );
+            entry.completed = true;
+            if (!stillCurrent()) {
+              await restorePreviousRendererOwnership();
+              return false;
+            }
+          }
+          for (const key of removedActiveKeys) {
+            const entry = { key, completed: false };
+            rendererRemovedEntries.push(entry);
+            await this.renderAdapter.unloadChunk(key);
+            entry.completed = true;
+            if (!stillCurrent()) {
+              await restorePreviousRendererOwnership();
+              return false;
+            }
+          }
+          if (!stillCurrent()) {
+            await restorePreviousRendererOwnership();
+            return false;
+          }
+          return true;
+        } catch (error) {
+          if (rendererRollbackAttempted) throw error;
+          try {
+            await restorePreviousRendererOwnership();
+          } catch (rollbackError) {
+            throw new AggregateError(
+              [error, rollbackError],
+              'Gameplay renderer ownership commit and rollback failed',
+            );
+          }
+          const restoredError = new Error(error?.message ?? 'Gameplay renderer ownership failed', {
+            cause: error,
+          });
+          restoredError.name = 'GameplayRendererOwnershipCommitError';
+          restoredError.rendererOwnershipRestored = true;
+          throw restoredError;
+        }
+      })();
+      this.pendingChunkSyncCommit = renderCommit;
+      let rendererCommitted;
+      try {
+        rendererCommitted = await renderCommit;
+      } finally {
+        if (this.pendingChunkSyncCommit === renderCommit) this.pendingChunkSyncCommit = null;
       }
-      this.counts.chunksLoaded += 1;
+      if (!rendererCommitted || !stillCurrent()) return null;
+
+      // This is the atomic ownership commit point. Renderer staging has completed, the transition
+      // is still latest, and no await occurs between the final guard and both Map reference swaps.
+      this.spatialChunks = stagedSpatialChunks;
+      this.activeChunks = stagedActiveChunks;
+      this.committedChunkSyncGeneration = syncGeneration;
+      this.committedTransitionContract = transitionContract;
+      if (this.stagingChunkSyncGeneration === syncGeneration) {
+        this.stagingChunkSyncGeneration = null;
+      }
+
+      for (const key of addedSpatialKeys) {
+        this.#registerSpatialGameplayModel(key, stagedSpatialChunks.get(key));
+      }
+      this.#reconcileSpatialHumanOwnership();
+      this.#refreshSpatialBroadphaseBounds();
+      for (const key of addedActiveKeys) {
+        const model = stagedActiveChunks.get(key);
+        for (const target of model.staticTargets) {
+          this.#registerStableId(target.stableId, target.ownerChunkKey ?? key);
+          if (target.type === 'militaryBase') this.state.reconcileFeatureDamage?.(target);
+        }
+        for (const record of addedEntityRecords.get(key)) {
+          const { descriptor, existed } = record;
+          const entityState = record.entityState ?? this.state.ensureEntity(descriptor);
+          this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+          if (entityState.type === 'tank') {
+            this.#bindTank(entityState, descriptor);
+            if (entityState.alive && entityState.spawned === true
+              && !this.activeTankOccurrences.has(entityState.stableId)) {
+              this.#startTankOccurrence(entityState, { sync: false });
+            }
+            this.#syncTank(entityState);
+          } else {
+            this.renderAdapter.syncEntity(entityState);
+          }
+          if (existed) this.counts.revisits += 1;
+        }
+        this.counts.chunksLoaded += 1;
+      }
+      for (const key of removedActiveKeys) {
+        this.projectiles = this.projectiles.filter(projectile =>
+          projectile.ownerChunkKey !== key
+          || (projectile.ownerStableId
+            && this.activeTankOccurrences.has(projectile.ownerStableId)));
+        this.counts.chunksUnloaded += 1;
+      }
+
+      const terrainReadyTankIds = await this.#prepareActiveTankTerrainForPresentation();
       if (!stillCurrent()) return null;
+      for (const stableId of terrainReadyTankIds) {
+        this.#syncTank(this.state.entityStates.get(stableId));
+      }
+      if (!stillCurrent()) return null;
+      await this.renderAdapter.rebase(renderOrigin);
+      if (!stillCurrent()) return null;
+      this.renderAdapter.syncManualBoss?.(
+        this.state.manualBossStableId
+          ? this.state.entityStates.get(this.state.manualBossStableId) ?? null
+          : null,
+      );
+      this.#syncTransientCombat();
+      this.featureRenderAdapter?.refreshFeatureStates?.();
+      if (this.stagingChunkSyncGeneration === syncGeneration) {
+        this.stagingChunkSyncGeneration = null;
+      }
+      return this.snapshot();
+    } finally {
+      if (this.stagingChunkSyncGeneration === syncGeneration) {
+        this.stagingChunkSyncGeneration = null;
+      }
     }
-    if (this.activeChunks.size !== desired.size) throw new Error('gameplay active Chunk set mismatch');
-    if (this.spatialChunks.size !== desiredSpatial.size) {
-      throw new Error('gameplay Active Data Chunk set mismatch');
-    }
-    const terrainReadyTankIds = await this.#prepareActiveTankTerrainForPresentation();
-    if (!stillCurrent()) return null;
-    for (const stableId of terrainReadyTankIds) {
-      this.#syncTank(this.state.entityStates.get(stableId));
-    }
-    if (!stillCurrent()) return null;
-    await this.renderAdapter.rebase(renderOrigin);
-    if (!stillCurrent()) return null;
-    this.renderAdapter.syncManualBoss?.(
-      this.state.manualBossStableId
-        ? this.state.entityStates.get(this.state.manualBossStableId) ?? null
-        : null,
-    );
-    this.#syncTransientCombat();
-    this.featureRenderAdapter?.refreshFeatureStates?.();
-    return this.snapshot();
   }
 
   #moveToward(state, target, speedMetersPerSecond, deltaSeconds, away = false) {
@@ -3898,6 +4093,12 @@ export class InfiniteGameplayRuntime {
     const pendingTankSpawnCount = this.pendingTankSpawnReservations.size;
     return Object.freeze({
       schemaVersion: 'w6-infinite-gameplay-runtime-1',
+      syncGeneration: this.committedChunkSyncGeneration,
+      stagingSyncGeneration: this.stagingChunkSyncGeneration,
+      transitionGeneration: this.committedTransitionContract?.generation ?? null,
+      coverageSignature: this.committedTransitionContract?.coverageSignature ?? null,
+      renderedSignature: this.committedTransitionContract?.renderedSignature ?? null,
+      activeDataSignature: this.committedTransitionContract?.activeDataSignature ?? null,
       activeSimulationChunkCount: this.activeChunks.size,
       activeSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
       activeDataChunkCount: this.spatialChunks.size,
@@ -3937,14 +4138,26 @@ export class InfiniteGameplayRuntime {
   async shutdown() {
     if (this.isShutdown) return;
     this.isShutdown = true;
+    this.chunkSyncGeneration += 1;
+    this.stagingChunkSyncGeneration = null;
+    this.latestRequestedTransitionContract = null;
     this.tankSpawnEpoch += 1;
     this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
     this.pendingTankRuntimeError = null;
     this.#cancelAllPendingTankSpawns();
+    const pendingChunkSyncCommit = this.pendingChunkSyncCommit;
+    if (pendingChunkSyncCommit) {
+      try {
+        await pendingChunkSyncCommit;
+      } catch {
+        // The renderer is shut down below even when the superseded ownership commit failed.
+      }
+    }
     await this.renderAdapter.shutdown();
     this.activeChunks.clear();
     this.spatialChunks.clear();
+    this.committedTransitionContract = null;
     this.stableIdOwners.clear();
     this.activeTankOccurrences.clear();
     this.tankBindings.clear();
