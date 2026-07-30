@@ -1180,6 +1180,19 @@ export async function bootInfiniteWorldSandbox({
       renderDistancePreset: distantRenderDistance,
     });
 
+    const synchronizeLocalTerrainIncrementally = runtimeSnapshot => (
+      distantPresentation.syncLocalTerrainIncrementally({
+        coverageEpoch: ++localTerrainCoverageEpoch,
+        activeDataKeys: runtimeSnapshot.activeDataKeys,
+        renderedKeys: runtimeSnapshot.renderedKeys,
+        getChunkData: (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+        renderOrigin: runtimeSnapshot.renderOrigin,
+        centerChunkX: runtimeSnapshot.centerChunkX,
+        centerChunkZ: runtimeSnapshot.centerChunkZ,
+        renderDistancePreset: distantRenderDistance,
+      })
+    );
+
     const synchronizeLocalTerrainPreset = runtimeSnapshot => (
       distantPresentation.syncLocalTerrainPreset({
         coverageEpoch: ++localTerrainCoverageEpoch,
@@ -1204,7 +1217,7 @@ export async function bootInfiniteWorldSandbox({
     });
 
     const isSameCommittedRuntimeState = (workEpoch, runtimeSnapshot) => {
-      if (workEpoch !== postCommitRequestedEpoch) return false;
+      if (!running || workEpoch !== postCommitRequestedEpoch) return false;
       const current = runtime.getCommittedChunkState();
       return current.centerChunkX === runtimeSnapshot.centerChunkX
         && current.centerChunkZ === runtimeSnapshot.centerChunkZ
@@ -1228,6 +1241,14 @@ export async function bootInfiniteWorldSandbox({
             const committedEpoch = postCommitRequestedEpoch;
             const runtimeState = runtime.getCommittedChunkState();
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
+            const localTerrainResult = await diagnostics.measureAsync(
+              'distant-local-terrain-sync',
+              () => synchronizeLocalTerrainIncrementally(runtimeState),
+            );
+            if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
+            if (!localTerrainResult.committed) {
+              throw new Error(`Incremental Local Terrain rejected: ${localTerrainResult.reason}`);
+            }
             if (diagnosticProfile.distant) {
               await diagnostics.measureAsync(
                 'distant-sync',
@@ -1258,6 +1279,12 @@ export async function bootInfiniteWorldSandbox({
 
     function schedulePostCommitWork() {
       postCommitRequestedEpoch += 1;
+      localTerrainCoverageEpoch = Math.max(
+        localTerrainCoverageEpoch,
+        distantPresentation.invalidatePendingLocalTerrainSync?.()
+          ?? localTerrainCoverageEpoch,
+      );
+      distantPresentation.invalidatePendingFarSync?.();
       schedulePostCommitPump();
     }
 
@@ -1720,7 +1747,6 @@ export async function bootInfiniteWorldSandbox({
           scenePresentation.rebase(nextState.renderOrigin);
           commitDistantRuntimeState(nextState);
           await gameplayRenderAdapter.rebase(nextState.renderOrigin);
-          synchronizeLocalTerrain(nextState);
           schedulePostCommitWork();
         })
         .catch(error => { transitionError = error; })
@@ -1995,6 +2021,12 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
 
     function failRuntimeLoop(error) {
       running = false;
+      localTerrainCoverageEpoch = Math.max(
+        localTerrainCoverageEpoch,
+        distantPresentation.invalidatePendingLocalTerrainSync?.()
+          ?? localTerrainCoverageEpoch,
+      );
+      distantPresentation.invalidatePendingFarSync?.();
       state.status = 'failed';
       state.stage = 'Animation Loop';
       state.bootError = { name: error?.name ?? 'Error', message: error?.message ?? String(error), stage: state.stage };
@@ -2175,6 +2207,8 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     async function shutdown() {
       if (!running && runtime?.snapshot().activeDataCount === 0) return;
       running = false;
+      distantPresentation.invalidatePendingLocalTerrainSync?.();
+      distantPresentation.invalidatePendingFarSync?.();
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
       if (postCommitTimer !== null) { clearTimeoutFn(postCommitTimer); postCommitTimer = null; }
       cancelScheduledSave();

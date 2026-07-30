@@ -1436,9 +1436,13 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
-  assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);\s*\n\s*synchronizeLocalTerrain/g) ?? []).length, 2,
-    'runtime relocation and moving Chunk transitions publish one committed origin before follow-up');
-  assert.match(boot, /if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-sync[\s\S]*if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*gameplay-sync/);
+  assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);\s*\n\s*synchronizeLocalTerrain/g) ?? []).length, 1,
+    'explicit runtime relocation keeps the synchronous initial Local Terrain contract');
+  assert.match(boot, /await gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(\);/,
+    'moving Chunk transitions defer Local and Far compose to the coalescing post-commit pump');
+  assert.match(boot, /if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-local-terrain-sync[\s\S]*if \(!isSameCommittedRuntimeState\(committedEpoch, runtimeState\)\) return;[\s\S]*distant-sync[\s\S]*gameplay-sync/);
+  assert.match(boot, /async function shutdown\(\) \{[\s\S]*running = false;\s*\n\s*distantPresentation\.invalidatePendingLocalTerrainSync\?\.\(\);\s*\n\s*distantPresentation\.invalidatePendingFarSync\?\.\(\);/,
+    'shutdown invalidates detached Local and Far builds before awaiting Save or subsystem disposal');
   assert.doesNotMatch(boot, /distantPresentation\.rebase\(runtimeState\.renderOrigin\)[\s\S]*synchronizeLocalTerrain\(runtimeState\)/,
     'delayed work cannot reapply an origin or rebuild Local terrain from an older snapshot');
   assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w8-finite-parity"><\/script>/);

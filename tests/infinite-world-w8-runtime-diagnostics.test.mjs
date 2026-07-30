@@ -374,6 +374,30 @@ async function createLocalTerrainTestPresentation(scene = new DistantTestGroup()
   });
 }
 
+async function waitForControlledYield(queue, maximumTurns = 2_000) {
+  for (let turn = 0; turn < maximumTurns && !queue.length; turn += 1) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.ok(queue.length, 'incremental compose did not reach a controlled yield');
+}
+
+async function drainControlledYields(promises, queue, {
+  maximumTurns = 20_000,
+  whilePending = null,
+} = {}) {
+  let settled = false;
+  const combined = Promise.all(promises).finally(() => { settled = true; });
+  let turn = 0;
+  while (!settled && turn < maximumTurns) {
+    if (queue.length) queue.shift()();
+    await new Promise(resolve => setImmediate(resolve));
+    if (!settled) whilePending?.();
+    turn += 1;
+  }
+  assert.equal(settled, true, 'incremental compose did not settle while draining yields');
+  return combined;
+}
+
 function legacyClipmapAxis() {
   const values = [];
   const addRange = (from, to, step) => {
@@ -1119,6 +1143,132 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   presentation.dispose();
 });
 
+test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after completion', async () => {
+  const pendingYields = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => pendingYields.push(resolve)),
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  const distantRoot = scene.children[0];
+  const oldRoot = distantRoot.children[0];
+  const oldGeometries = oldRoot.children.map(child => child.geometry).filter(Boolean);
+  const next = localTerrainCoverageFixture(1, 0);
+  const retainedChunks = [...initial.chunks.entries()]
+    .filter(([key]) => next.chunks.has(key))
+    .map(([key, chunk]) => ({
+      key,
+      chunk,
+      chunkId: chunk.chunkId,
+      contentHash: chunk.contentHash,
+    }));
+  for (const retained of retainedChunks) next.chunks.set(retained.key, retained.chunk);
+
+  const pending = presentation.syncLocalTerrainIncrementally({ coverageEpoch: 2, ...next });
+  await waitForControlledYield(pendingYields);
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], oldRoot, 'the committed root remains visible during staging');
+  assert.equal(presentation.snapshot().committedLocalTerrainEpoch, 1);
+  for (let attempt = 0; attempt < 32
+    && !presentation.snapshot().stagingLocalTerrainRootId; attempt += 1) {
+    pendingYields.shift()();
+    await waitForControlledYield(pendingYields);
+    assert.equal(distantRoot.children.length, 1);
+    assert.equal(distantRoot.children[0], oldRoot);
+  }
+  assert.match(presentation.snapshot().stagingLocalTerrainRootId, /coverage-epoch-2/);
+  assert.ok(oldGeometries.every(geometry => geometry.disposed !== true));
+
+  const [result] = await drainControlledYields([pending], pendingYields, {
+    whilePending() {
+      assert.equal(distantRoot.children.length, 1);
+      assert.equal(distantRoot.children[0], oldRoot,
+        'no partially composed Local root may be attached between slices');
+      assert.equal(presentation.snapshot().committedLocalTerrainEpoch, 1);
+    },
+  });
+  assert.equal(result.committed, true);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], oldRoot);
+  assert.ok(oldGeometries.every(geometry => geometry.disposed === true));
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.committedLocalTerrainEpoch, 2);
+  assert.equal(snapshot.localTerrainLastSliceCount > 0, true);
+  assert.equal(snapshot.presentationSliceBudgetMs, 8);
+  assert.equal(snapshot.localTerrainLastMaximumSliceMs >= 0, true);
+  for (const retained of retainedChunks) {
+    assert.equal(next.chunks.get(retained.key), retained.chunk);
+    assert.equal(retained.chunk.chunkId, retained.chunkId);
+    assert.equal(retained.chunk.contentHash, retained.contentHash);
+  }
+
+  const referenceScene = new DistantTestGroup();
+  const reference = await createLocalTerrainTestPresentation(referenceScene);
+  assert.equal(reference.syncLocalTerrain({ coverageEpoch: 1, ...next }).committed, true);
+  assert.equal(
+    snapshot.clipmapDeterministicChecksum,
+    reference.snapshot().clipmapDeterministicChecksum,
+  );
+  assert.deepEqual(
+    snapshot.localTerrainMidgroundOwnerKeys,
+    reference.snapshot().localTerrainMidgroundOwnerKeys,
+  );
+  presentation.dispose();
+  reference.dispose();
+});
+
+test('continuous Local Terrain boundaries discard stale builds and shutdown blocks late publication', async () => {
+  const pendingYields = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => pendingYields.push(resolve)),
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  const distantRoot = scene.children[0];
+  const committedRoot = distantRoot.children[0];
+  const first = presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 2,
+    ...localTerrainCoverageFixture(1, 0),
+  });
+  await waitForControlledYield(pendingYields);
+  const latest = presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 3,
+    ...localTerrainCoverageFixture(2, 0),
+  });
+  const [firstResult, latestResult] = await drainControlledYields(
+    [first, latest],
+    pendingYields,
+    {
+      whilePending() {
+        assert.equal(distantRoot.children.length, 1);
+        assert.equal(distantRoot.children[0], committedRoot,
+          'continuous boundaries retain the last complete Local root');
+      },
+    },
+  );
+  assert.equal(firstResult.committed, false);
+  assert.equal(firstResult.reason, 'stale-after-build');
+  assert.equal(latestResult.committed, true);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], committedRoot);
+  assert.equal(distantRoot.children[0].userData.coverageEpoch, 3);
+  assert.equal(presentation.snapshot().committedLocalTerrainEpoch, 3);
+
+  const shutdownBuild = presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 4,
+    ...localTerrainCoverageFixture(3, 0),
+  });
+  await waitForControlledYield(pendingYields);
+  presentation.dispose();
+  while (pendingYields.length) pendingYields.shift()();
+  const shutdownResult = await shutdownBuild;
+  assert.equal(shutdownResult.committed, false);
+  assert.equal(shutdownResult.reason, 'disposed-during-build');
+  assert.equal(scene.children.length, 0);
+});
+
 test('Render Distance swaps complete Terrain roots without changing Local coverage', async () => {
   const scene = new DistantTestGroup();
   const presentation = await createLocalTerrainTestPresentation(scene);
@@ -1510,6 +1660,147 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   assert.ok(cancelledConsumers.some(value => value.consumerId === 'distant-owner-query'
     && value.beforeEpoch > requestMetadata[0].epoch));
   presentation.dispose();
+});
+
+test('Far canonical records, buckets, and matrices are sliced with latest-only atomic publication', async () => {
+  const pendingYields = [];
+  let holdYields = false;
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(chunkX, chunkZ, []),
+    yieldToMainThread: () => holdYields
+      ? new Promise(resolve => pendingYields.push(resolve))
+      : Promise.resolve(),
+  });
+  const baselineInput = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk: canonicalChunk(),
+  });
+  baselineInput.renderDistancePreset = 'short';
+  assert.equal(await presentation.sync(baselineInput), true);
+  const distantRoot = scene.children[0];
+  const baselineRoot = distantRoot.children[0];
+  const denseRecords = Array.from({ length: 300 }, (_, index) => Object.freeze({
+    ...CANONICAL_BUILDING,
+    stableId: `${CANONICAL_BUILDING_ID}:slice:${index}`,
+    worldPosition: Object.freeze({ x: 80 + (index % 20) * 0.25, y: 0.4, z: 4 + Math.floor(index / 20) * 0.25 }),
+  }));
+  const denseChunk = canonicalChunk(5, 0, denseRecords);
+  holdYields = true;
+  const stale = presentation.sync({
+    ...canonicalSyncInput({
+      centerChunkX: 0,
+      activeDataKeys: ['5,0'],
+      renderedKeys: [],
+      chunk: denseChunk,
+    }),
+    renderDistancePreset: 'short',
+  });
+  await waitForControlledYield(pendingYields);
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], baselineRoot);
+  const latest = presentation.sync({
+    ...canonicalSyncInput({
+      centerChunkX: 1,
+      activeDataKeys: ['5,0'],
+      renderedKeys: [],
+      chunk: denseChunk,
+    }),
+    renderDistancePreset: 'standard',
+  });
+  const [staleResult, latestResult] = await drainControlledYields(
+    [stale, latest],
+    pendingYields,
+    {
+      whilePending() {
+        assert.equal(distantRoot.children.length, 1);
+        assert.equal(distantRoot.children[0], baselineRoot,
+          'Far record, bucket, and matrix slices remain detached until complete');
+      },
+    },
+  );
+  assert.equal(staleResult, false);
+  assert.equal(latestResult, true);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], baselineRoot);
+  const snapshot = presentation.snapshot();
+  assert.equal(distantRoot.children[0].userData.epoch, snapshot.committedEpoch);
+  assert.equal(snapshot.committedEpoch, snapshot.syncEpoch);
+  assert.equal(snapshot.renderDistancePreset, 'standard');
+  assert.deepEqual(snapshot.buildOrigin, {
+    renderOriginChunkX: 1,
+    renderOriginChunkZ: 0,
+  });
+  assert.equal(snapshot.canonicalBuildingRecordCount, denseRecords.length);
+  assert.equal(snapshot.farLastSliceCount > 0, true);
+  assert.equal(snapshot.farLastMaximumSliceMs >= 0, true);
+  assert.deepEqual(
+    presentation.canonicalAuditSnapshot().map(value => value.identity.stableId).sort(),
+    denseRecords.map(value => value.stableId).sort(),
+  );
+
+  const shutdownBuild = presentation.sync({
+    ...canonicalSyncInput({
+      centerChunkX: 0,
+      activeDataKeys: ['5,0'],
+      renderedKeys: [],
+      chunk: denseChunk,
+    }),
+    renderDistancePreset: 'current',
+  });
+  await waitForControlledYield(pendingYields);
+  presentation.dispose();
+  while (pendingYields.length) pendingYields.shift()();
+  assert.equal(await shutdownBuild, false);
+  assert.equal(scene.children.length, 0);
+});
+
+test('time-sliced boundary compose covers representative Current/High, Standard/Medium, and Short/Low modes', async () => {
+  const cases = [
+    { renderDistancePreset: 'current', quality: 'high' },
+    { renderDistancePreset: 'standard', quality: 'medium' },
+    { renderDistancePreset: 'short', quality: 'low' },
+  ];
+  for (const options of cases) {
+    const scene = new DistantTestGroup();
+    const presentation = await createLocalTerrainTestPresentation(scene);
+    const initial = localTerrainCoverageFixture(0, 0);
+    presentation.syncLocalTerrain({
+      coverageEpoch: 1,
+      renderDistancePreset: options.renderDistancePreset,
+      ...initial,
+    });
+    const next = localTerrainCoverageFixture(1, 0);
+    const localResult = await presentation.syncLocalTerrainIncrementally({
+      coverageEpoch: 2,
+      renderDistancePreset: options.renderDistancePreset,
+      ...next,
+    });
+    assert.equal(localResult.committed, true, JSON.stringify(options));
+    assert.equal(await presentation.sync({
+      ...next,
+      quality: options.quality,
+      renderDistancePreset: options.renderDistancePreset,
+      playerLogicalX: 24,
+      playerLogicalZ: 8,
+    }), true, JSON.stringify(options));
+    const snapshot = presentation.snapshot();
+    assert.equal(snapshot.renderDistancePreset, options.renderDistancePreset);
+    assert.equal(snapshot.quality, options.quality);
+    assert.equal(snapshot.localTerrainLastSliceCount > 0, true);
+    assert.equal(snapshot.farLastSliceCount > 0, true);
+    assert.equal(snapshot.localTerrainRootAttached, true);
+    assert.equal(snapshot.rootAttached, true);
+    presentation.dispose();
+  }
 });
 
 test('High current-Settlement horizon uses canonical Building and Landmark records exclusively', async () => {
