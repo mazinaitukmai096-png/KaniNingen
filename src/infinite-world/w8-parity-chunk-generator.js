@@ -29,6 +29,8 @@ import {
 } from './single-rural-settlement.js';
 import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
 import { createHashedW8ForestHorizonManifest } from './forest-horizon-manifest.js';
+import { createCanonicalOwnerCache } from './canonical-owner-cache.js';
+import { createPresentationManifestCache } from './presentation-manifest-cache.js';
 import {
   composeW8SettlementPresentationTemplate,
   createW8SettlementParityOverlay,
@@ -72,6 +74,8 @@ export const W8_PARITY_CONTENT = Object.freeze({
 // entries match the W5 template bound, while 256 Road entries exceed one
 // graph's 49-region x 3-edge theoretical working set (147).
 export const W8_PARITY_CACHE_CAPACITIES = Object.freeze({
+  canonicalOwner: 256,
+  presentationManifest: 320,
   warmSourceChunk: 256,
   settlementOverlay: 128,
   settlementDiagnostics: 128,
@@ -1077,6 +1081,17 @@ export async function createW8ParityChunkGenerator({
   const majorRoadSourceHashCache = createPendingSafeLruCache({
     capacity: cacheCapacities.majorRoadSourceHash,
   });
+  const canonicalSourceRevision = `${base.worldSeedHash}:${W8_PARITY_GENERATOR_VERSION.major}`;
+  const canonicalOwnerCache = createCanonicalOwnerCache({
+    capacity: cacheCapacities.canonicalOwner,
+    identityOf: context => Object.freeze({
+      chunkId: context.chunkId,
+      contentHash: context.sourceChunkData.contentHash,
+    }),
+  });
+  const presentationManifestCache = createPresentationManifestCache({
+    capacity: cacheCapacities.presentationManifest,
+  });
   let isShutdown = false;
   const resourceGenerationCounts = {
     fullChunkRequests: 0,
@@ -1636,7 +1651,7 @@ export async function createW8ParityChunkGenerator({
     );
   }
 
-  const prepareW8CanonicalChunkContext = async (chunkX, chunkZ) => {
+  const buildW8CanonicalChunkContext = async (chunkX, chunkZ) => {
     assertGeneratorActive();
     const sourceChunkData = await getSourceChunk(chunkX, chunkZ);
     const overlayTemplates = await Promise.all(
@@ -1760,6 +1775,12 @@ export async function createW8ParityChunkGenerator({
     });
   };
 
+  const prepareW8CanonicalChunkContext = (chunkX, chunkZ) => canonicalOwnerCache.getOrCreate({
+    ownerKey: createChunkKey(chunkX, chunkZ),
+    sourceRevision: canonicalSourceRevision,
+    load: () => buildW8CanonicalChunkContext(chunkX, chunkZ),
+  });
+
   const prepareW8NaturalPresentation = async (
     context,
     { includeFullPresentation = false } = {},
@@ -1850,69 +1871,87 @@ export async function createW8ParityChunkGenerator({
   };
 
   const generateW8ParityChunk = async (chunkX, chunkZ) => {
+    assertGeneratorActive();
     resourceGenerationCounts.fullChunkRequests += 1;
-    const context = await prepareW8CanonicalChunkContext(chunkX, chunkZ);
-    const presentation = await prepareW8NaturalPresentation(context, {
-      includeFullPresentation: true,
+    const ownerKey = createChunkKey(chunkX, chunkZ);
+    const chunk = await presentationManifestCache.getOrCreate({
+      manifestKind: 'w8-full-chunk',
+      ownerKey,
+      sourceRevision: canonicalSourceRevision,
+      loadCanonical: () => prepareW8CanonicalChunkContext(chunkX, chunkZ),
+      build: async context => {
+        const presentation = await prepareW8NaturalPresentation(context, {
+          includeFullPresentation: true,
+        });
+        const presentationLayers = createPresentationLayers(
+          context.parityGameplayChunk,
+          presentation,
+          experienceSpawn,
+          naturalPresentationPolicy,
+          presentation.natural,
+        );
+        const content = {
+          ...context.parityGameplayChunk,
+          schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,
+          chunkId: context.chunkId,
+          generatorVersion: { ...W8_PARITY_GENERATOR_VERSION },
+          sourceW5ContentHash: context.sourceChunkData.contentHash,
+          sourceChunkData: context.sourceChunkData,
+          settlementOverlayFeatures: context.groundedOverlayFeatures,
+          waterSurfaces: presentation.waterSurfaces,
+          ambientDetails: presentation.ambientDetails,
+          settlementLandmarks: presentation.settlementLandmarks,
+          streetDetails: presentation.streetDetails,
+          riverRoadCrossings: context.riverProjection.roadCrossings,
+          riverPorts: context.riverProjection.ports,
+          presentationLayers,
+          generationProof: Object.freeze({
+            generator: 'w8-finite-experience-parity',
+            sourceW5ContentHash: context.sourceChunkData.contentHash,
+            finiteExperienceSourceCommit: 'f8bc9f80c2af417bb585bff26c99522c4229ab8e',
+            finiteExperienceConnected: true,
+            distributedSettlementSurfacePolicyConnected: true,
+            canonicalRiverCorridorConnected: true,
+          }),
+        };
+        const nextChunk = Object.freeze({
+          ...content,
+          contentHash: await hashW8ParityChunkContent(content),
+        });
+        const validation = validateW8ParityChunkData(nextChunk);
+        if (!validation.valid) {
+          throw new Error(`invalid W8 ChunkData: ${validation.errors.join('; ')}`);
+        }
+        return nextChunk;
+      },
     });
-    const presentationLayers = createPresentationLayers(
-      context.parityGameplayChunk,
-      presentation,
-      experienceSpawn,
-      naturalPresentationPolicy,
-      presentation.natural,
-    );
-    const content = {
-      ...context.parityGameplayChunk,
-      schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,
-      chunkId: context.chunkId,
-      generatorVersion: { ...W8_PARITY_GENERATOR_VERSION },
-      sourceW5ContentHash: context.sourceChunkData.contentHash,
-      sourceChunkData: context.sourceChunkData,
-      settlementOverlayFeatures: context.groundedOverlayFeatures,
-      waterSurfaces: presentation.waterSurfaces,
-      ambientDetails: presentation.ambientDetails,
-      settlementLandmarks: presentation.settlementLandmarks,
-      streetDetails: presentation.streetDetails,
-      riverRoadCrossings: context.riverProjection.roadCrossings,
-      riverPorts: context.riverProjection.ports,
-      presentationLayers,
-      generationProof: Object.freeze({
-        generator: 'w8-finite-experience-parity',
-        sourceW5ContentHash: context.sourceChunkData.contentHash,
-        finiteExperienceSourceCommit: 'f8bc9f80c2af417bb585bff26c99522c4229ab8e',
-        finiteExperienceConnected: true,
-        distributedSettlementSurfacePolicyConnected: true,
-        canonicalRiverCorridorConnected: true,
-      }),
-    };
-    const chunk = Object.freeze({
-      ...content,
-      contentHash: await hashW8ParityChunkContent(content),
-    });
-    const validation = validateW8ParityChunkData(chunk);
-    if (!validation.valid) {
-      throw new Error(`invalid W8 ChunkData: ${validation.errors.join('; ')}`);
-    }
     resourceGenerationCounts.fullChunkCompleted += 1;
     return chunk;
   };
 
   const generateW8ForestHorizonManifest = async (chunkX, chunkZ) => {
+    assertGeneratorActive();
     resourceGenerationCounts.forestHorizonManifestRequests += 1;
-    const context = await prepareW8CanonicalChunkContext(chunkX, chunkZ);
-    const presentation = await prepareW8NaturalPresentation(context);
-    const manifest = await createHashedW8ForestHorizonManifest({
-      chunkId: context.chunkId,
-      chunkX,
-      chunkZ,
-      sourceW5ContentHash: context.sourceChunkData.contentHash,
-      sourceChunkData: context.sourceChunkData,
-      generatorVersion: W8_PARITY_GENERATOR_VERSION,
-      canonicalSurfacePolicy: context.canonicalSurfacePolicy,
-      presentationLayers: Object.freeze({
-        natural: presentation.natural,
-      }),
+    const manifest = await presentationManifestCache.getOrCreate({
+      manifestKind: 'w8-forest-horizon',
+      ownerKey: createChunkKey(chunkX, chunkZ),
+      sourceRevision: canonicalSourceRevision,
+      loadCanonical: () => prepareW8CanonicalChunkContext(chunkX, chunkZ),
+      build: async context => {
+        const presentation = await prepareW8NaturalPresentation(context);
+        return createHashedW8ForestHorizonManifest({
+          chunkId: context.chunkId,
+          chunkX,
+          chunkZ,
+          sourceW5ContentHash: context.sourceChunkData.contentHash,
+          sourceChunkData: context.sourceChunkData,
+          generatorVersion: W8_PARITY_GENERATOR_VERSION,
+          canonicalSurfacePolicy: context.canonicalSurfacePolicy,
+          presentationLayers: Object.freeze({
+            natural: presentation.natural,
+          }),
+        });
+      },
     });
     resourceGenerationCounts.forestHorizonManifestCompleted += 1;
     return manifest;
@@ -1999,6 +2038,8 @@ export async function createW8ParityChunkGenerator({
       majorRoadObstacleCache.close();
       majorRoadPreparationCache.close();
       majorRoadSourceHashCache.close();
+      canonicalOwnerCache.close();
+      presentationManifestCache.close();
       majorRoadRouteKeyByEdge.clear();
       majorRoadObstacleKeyBySettlement.clear();
       await base.shutdown?.();
@@ -2011,6 +2052,8 @@ export async function createW8ParityChunkGenerator({
       const obstacleCache = majorRoadObstacleCache.snapshot();
       const preparationCache = majorRoadPreparationCache.snapshot();
       const sourceHashCache = majorRoadSourceHashCache.snapshot();
+      const canonicalCache = canonicalOwnerCache.snapshot();
+      const manifestCache = presentationManifestCache.snapshot();
       const observedSettlements = [...settlementDiagnostics.values()]
         .sort((left, right) => left.settlementId.localeCompare(right.settlementId));
       return Object.freeze({
@@ -2019,6 +2062,8 @@ export async function createW8ParityChunkGenerator({
         source,
         isShutdown,
         resourceGeneration: Object.freeze({ ...resourceGenerationCounts }),
+        canonicalOwnerCache: canonicalCache,
+        presentationManifestCache: manifestCache,
         safeSpawnPreparedChunkCount: experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0,
         safeSpawn: experienceSpawn.spawnSafety ?? null,
         experienceSpawnCacheSize: EXPERIENCE_SPAWN_CACHE.size,
