@@ -1,10 +1,16 @@
 import { createW8ParityChunkGenerator } from './w8-parity-chunk-generator.js';
 import {
+  CHUNK_DATA_PRIORITY,
   CHUNK_GENERATOR_MESSAGE,
   CHUNK_GENERATOR_PROTOCOL_VERSION,
   createChunkDataRequestKey,
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
+import {
+  createWorldGenerationScheduler,
+  isWorldGenerationCancellation,
+  normalizeWorldGenerationRequestEnvelope,
+} from './world-generation-scheduler.js';
 
 function clock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -35,15 +41,91 @@ function errorResponse(error, request) {
 export function createChunkGeneratorWorkerCore({
   postMessage,
   generatorFactory = createW8ParityChunkGenerator,
+  schedulerOptions = null,
 } = {}) {
   if (typeof postMessage !== 'function') throw new TypeError('postMessage is required');
   let generator = null;
   let serviceGeneration = 0;
-  let operationChain = Promise.resolve();
   let isShutdown = false;
   const forestHorizonCancelledBeforeEpoch = new Map();
+  const scheduler = createWorldGenerationScheduler({
+    clock,
+    ...(schedulerOptions ?? {}),
+  });
 
-  const processMessage = async request => {
+  const schedulerDefaults = request => {
+    if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'chunk',
+        priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: true,
+        createdAtMs: clock(),
+        consumerId: 'chunk-data-service',
+      };
+    }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'forest-horizon',
+        priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+        required: false,
+        createdAtMs: clock(),
+        consumerId: request.consumerId,
+        epoch: request.epoch,
+        target: 'tree',
+        stream: 'distant',
+      };
+    }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'settlement-query',
+        priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: true,
+        createdAtMs: clock(),
+        consumerId: 'settlement-query',
+        target: 'settlement',
+        stream: 'distant',
+      };
+    }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.RESOLVE_SETTLEMENT_TEMPLATE) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'settlement-template',
+        priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+        required: true,
+        createdAtMs: clock(),
+        consumerId: 'settlement-template',
+        target: 'building',
+        stream: 'distant',
+      };
+    }
+    return {
+      requestId: request.requestId,
+      operationKind: 'diagnostics',
+      priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+      required: false,
+      createdAtMs: clock(),
+      consumerId: 'diagnostics',
+    };
+  };
+
+  const schedulerResponse = execution => Object.freeze({
+    schemaVersion: execution.envelope.schemaVersion,
+    operationKind: execution.envelope.operationKind,
+    priority: execution.envelope.priority,
+    effectivePriority: execution.effectivePriority,
+    required: execution.envelope.required,
+    deadlineAtMs: execution.envelope.deadlineAtMs,
+    startedAtMs: execution.startedAtMs,
+    queueTimeMs: execution.queueTimeMs,
+    priorityAgingSteps: execution.priorityAgingSteps,
+    deadlineMiss: execution.deadlineMiss,
+    backlogAtStart: execution.backlogAtStart,
+  });
+
+  const processMessage = async (request, execution = null) => {
     if (isShutdown) return;
     try {
       if (request?.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) {
@@ -61,9 +143,14 @@ export function createChunkGeneratorWorkerCore({
         return;
       }
       if (!generator || request.serviceGeneration !== serviceGeneration) return;
+      execution?.checkpoint();
       if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE) {
         const startedAt = clock();
-        const chunkData = await generator.generateChunk(request.chunkX, request.chunkZ);
+        const chunkData = await generator.generateChunk(request.chunkX, request.chunkZ, {
+          scheduler: execution?.envelope ?? null,
+          checkpoint: execution?.checkpoint ?? null,
+        });
+        execution?.checkpoint();
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.GENERATED,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -74,6 +161,7 @@ export function createChunkGeneratorWorkerCore({
           contentHash: chunkData.contentHash,
           chunkData,
           generationMs: Math.max(0, clock() - startedAt),
+          scheduler: execution ? schedulerResponse(execution) : null,
         });
         return;
       }
@@ -83,10 +171,17 @@ export function createChunkGeneratorWorkerCore({
         }
         const startedAt = clock();
         const manifest = typeof generator.generateForestHorizonManifest === 'function'
-          ? await generator.generateForestHorizonManifest(request.chunkX, request.chunkZ)
+          ? await generator.generateForestHorizonManifest(request.chunkX, request.chunkZ, {
+            scheduler: execution?.envelope ?? null,
+            checkpoint: execution?.checkpoint ?? null,
+          })
           : createW8ForestHorizonManifest(
-            await generator.generateChunk(request.chunkX, request.chunkZ),
+            await generator.generateChunk(request.chunkX, request.chunkZ, {
+              scheduler: execution?.envelope ?? null,
+              checkpoint: execution?.checkpoint ?? null,
+            }),
           );
+        execution?.checkpoint();
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -97,6 +192,7 @@ export function createChunkGeneratorWorkerCore({
           contentHash: manifest.contentHash,
           manifest,
           generationMs: Math.max(0, clock() - startedAt),
+          scheduler: execution ? schedulerResponse(execution) : null,
         });
         return;
       }
@@ -107,6 +203,7 @@ export function createChunkGeneratorWorkerCore({
           request.centerWorldZ,
           request.radiusMeters,
         );
+        execution?.checkpoint();
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.SETTLEMENTS,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -114,6 +211,7 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           settlements,
           operationMs: Math.max(0, clock() - startedAt),
+          scheduler: execution ? schedulerResponse(execution) : null,
         });
         return;
       }
@@ -125,6 +223,7 @@ export function createChunkGeneratorWorkerCore({
         const template = await generator.resolveSettlementPresentationTemplate({
           candidate: request.candidate,
         });
+        execution?.checkpoint();
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -132,30 +231,41 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           template,
           operationMs: Math.max(0, clock() - startedAt),
+          scheduler: execution ? schedulerResponse(execution) : null,
         });
         return;
       }
       if (request.type === CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS) {
         const startedAt = clock();
         const generatorSnapshot = await generator.snapshot?.() ?? null;
+        execution?.checkpoint();
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
           requestId: request.requestId,
           serviceGeneration,
           generatorSnapshot,
+          workerSchedulerSnapshot: scheduler.snapshot(),
           operationMs: Math.max(0, clock() - startedAt),
+          scheduler: execution ? schedulerResponse(execution) : null,
         });
         return;
       }
       throw new Error(`unknown Chunk generator message: ${request.type}`);
     } catch (error) {
+      if (isWorldGenerationCancellation(error)) throw error;
       postMessage(errorResponse(error, request));
     }
   };
 
   return Object.freeze({
     receive(request) {
+      if (request?.type === CHUNK_GENERATOR_MESSAGE.CANCEL_GENERATION
+        && request.protocolVersion === CHUNK_GENERATOR_PROTOCOL_VERSION
+        && request.serviceGeneration === serviceGeneration) {
+        scheduler.cancel({ requestId: request.requestId, reason: request.reason });
+        return Promise.resolve();
+      }
       if (request?.type === CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON
         && request.protocolVersion === CHUNK_GENERATOR_PROTOCOL_VERSION) {
         const beforeEpoch = Number.isSafeInteger(request.beforeEpoch)
@@ -167,14 +277,32 @@ export function createChunkGeneratorWorkerCore({
             beforeEpoch,
           ),
         );
+        scheduler.cancelWhere(envelope => (
+          envelope.operationKind === 'forest-horizon'
+          && envelope.consumerId === request.consumerId
+          && envelope.epoch < beforeEpoch
+        ), 'stale-forest-horizon-epoch');
         return Promise.resolve();
       }
-      operationChain = operationChain.then(() => processMessage(request));
-      return operationChain;
+      if (request?.type === CHUNK_GENERATOR_MESSAGE.INITIALIZE) {
+        return processMessage(request);
+      }
+      if (!request || request.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) {
+        return processMessage(request);
+      }
+      const envelope = normalizeWorldGenerationRequestEnvelope(
+        request.scheduler,
+        schedulerDefaults(request),
+      );
+      const handle = scheduler.schedule({
+        envelope,
+        execute: execution => processMessage(request, execution),
+      });
+      return handle.promise.then(() => undefined);
     },
     async shutdown() {
       isShutdown = true;
-      await operationChain.catch(() => {});
+      await scheduler.shutdown({ reason: 'worker-core-shutdown', cancelInFlight: false });
       await generator?.shutdown?.();
       generator = null;
       forestHorizonCancelledBeforeEpoch.clear();

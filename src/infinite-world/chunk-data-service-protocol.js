@@ -1,3 +1,8 @@
+import {
+  createWorldGenerationRequestEnvelope,
+  normalizeWorldGenerationRequestEnvelope,
+} from './world-generation-scheduler.js';
+
 export const CHUNK_DATA_PRIORITY = Object.freeze({
   PLAYER_DATA: 1,
   PLAYER_RENDER: 2,
@@ -16,6 +21,7 @@ export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   GENERATE_FOREST_HORIZON: 'chunk-generator:generate-forest-horizon',
   GENERATED_FOREST_HORIZON: 'chunk-generator:generated-forest-horizon',
   CANCEL_FOREST_HORIZON: 'chunk-generator:cancel-forest-horizon',
+  CANCEL_GENERATION: 'chunk-generator:cancel-generation',
   FIND_SETTLEMENTS: 'chunk-generator:find-settlements',
   SETTLEMENTS: 'chunk-generator:settlements',
   RESOLVE_SETTLEMENT_TEMPLATE: 'chunk-generator:resolve-settlement-template',
@@ -56,9 +62,68 @@ export function createChunkGeneratorInitializeRequest({ serviceGeneration, world
   });
 }
 
-export function createChunkGeneratorRequest({ requestId, serviceGeneration, chunkX, chunkZ }) {
+export function createChunkGeneratorSchedulerEnvelope({
+  requestId,
+  operationKind,
+  priority,
+  required,
+  createdAtMs,
+  deadlineAtMs = null,
+  consumerId = null,
+  epoch = 0,
+  correlationId = null,
+  target = null,
+  stream = null,
+  scheduler = null,
+} = {}) {
+  return scheduler === null
+    ? createWorldGenerationRequestEnvelope({
+      requestId,
+      operationKind,
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+    })
+    : normalizeWorldGenerationRequestEnvelope(scheduler, {
+      requestId,
+      operationKind,
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+    });
+}
+
+export function createChunkGeneratorRequest({
+  requestId,
+  serviceGeneration,
+  chunkX,
+  chunkZ,
+  priority = CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+  required = priority <= CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+  createdAtMs = 0,
+  deadlineAtMs = null,
+  consumerId = 'chunk-data-service',
+  epoch = 0,
+  correlationId = null,
+  target = null,
+  stream = null,
+  scheduler = null,
+}) {
   if (!Number.isSafeInteger(requestId) || requestId < 1) throw new RangeError('requestId must be positive');
   createChunkDataRequestKey(chunkX, chunkZ);
+  assertChunkDataPriority(priority);
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
     throw new RangeError('serviceGeneration must be positive');
   }
@@ -69,6 +134,20 @@ export function createChunkGeneratorRequest({ requestId, serviceGeneration, chun
     serviceGeneration,
     chunkX,
     chunkZ,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId,
+      operationKind: 'chunk',
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+      scheduler,
+    }),
   });
 }
 
@@ -79,6 +158,14 @@ export function createForestHorizonGeneratorRequest({
   chunkZ,
   consumerId = 'distant-owner-query',
   epoch = 0,
+  priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+  required = false,
+  createdAtMs = 0,
+  deadlineAtMs = null,
+  correlationId = null,
+  target = 'tree',
+  stream = 'distant',
+  scheduler = null,
 }) {
   if (!Number.isSafeInteger(requestId) || requestId < 1) {
     throw new RangeError('requestId must be positive');
@@ -91,6 +178,7 @@ export function createForestHorizonGeneratorRequest({
     || !Number.isSafeInteger(epoch) || epoch < 0) {
     throw new TypeError('Forest horizon request requires a consumerId and non-negative epoch');
   }
+  assertChunkDataPriority(priority);
   return Object.freeze({
     type: CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON,
     protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -100,5 +188,38 @@ export function createForestHorizonGeneratorRequest({
     chunkZ,
     consumerId,
     epoch,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId,
+      operationKind: 'forest-horizon',
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+      scheduler,
+    }),
+  });
+}
+
+export function createChunkGeneratorCancelRequest({
+  requestId,
+  serviceGeneration,
+  reason = 'cancelled',
+} = {}) {
+  if (!Number.isSafeInteger(requestId) || requestId < 1) throw new RangeError('requestId must be positive');
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be positive');
+  }
+  if (typeof reason !== 'string' || !reason) throw new TypeError('cancellation reason is required');
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.CANCEL_GENERATION,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration,
+    reason,
   });
 }

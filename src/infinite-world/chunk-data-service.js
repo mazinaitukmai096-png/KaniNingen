@@ -1,9 +1,14 @@
 import {
   assertChunkDataPriority,
+  createChunkGeneratorSchedulerEnvelope,
   createChunkDataRequestKey,
   CHUNK_DATA_PRIORITY,
 } from './chunk-data-service-protocol.js';
 import { WORLD_STREAMING_EVENT } from './world-streaming-telemetry.js';
+import {
+  compareWorldGenerationRequests,
+  describeWorldGenerationPriority,
+} from './world-generation-scheduler.js';
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -12,10 +17,6 @@ function defaultClock() {
 function scheduleMicrotask(callback) {
   if (typeof globalThis.queueMicrotask === 'function') globalThis.queueMicrotask(callback);
   else Promise.resolve().then(callback);
-}
-
-function compareQueuedRequests(left, right) {
-  return left.priority - right.priority || left.sequence - right.sequence;
 }
 
 function identityOf(chunkData) {
@@ -33,6 +34,7 @@ export class ChunkDataService {
     identityAuditCapacity = 4096,
     clock = defaultClock,
     telemetry = null,
+    agingIntervalMs = 250,
   } = {}) {
     if (typeof transport?.generateChunk !== 'function') {
       throw new TypeError('ChunkData transport.generateChunk is required');
@@ -44,11 +46,15 @@ export class ChunkDataService {
       throw new RangeError('identityAuditCapacity must be at least cacheCapacity');
     }
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+    if (!Number.isFinite(agingIntervalMs) || agingIntervalMs <= 0) {
+      throw new RangeError('agingIntervalMs must be positive');
+    }
     this.transport = transport;
     this.cacheCapacity = cacheCapacity;
     this.identityAuditCapacity = identityAuditCapacity;
     this.clock = clock;
     this.telemetry = telemetry?.enabled === true ? telemetry : null;
+    this.agingIntervalMs = agingIntervalMs;
     this.completed = new Map();
     this.identityAudit = new Map();
     this.pending = new Map();
@@ -74,6 +80,15 @@ export class ChunkDataService {
       identityAuditEvictions: 0,
       identityMismatchCount: 0,
       shutdownLateResultCount: 0,
+      queuedOperationCancels: 0,
+      inFlightOperationCancels: 0,
+      completedOperations: 0,
+      cancelledOperations: 0,
+      failedOperations: 0,
+      deadlineMisses: 0,
+      agedDispatches: 0,
+      priorityAgingSteps: 0,
+      maximumBacklog: 0,
     };
   }
 
@@ -95,11 +110,14 @@ export class ChunkDataService {
     telemetryTarget = 'near',
     telemetryStream = telemetryTarget,
     telemetryCorrelationId: suppliedTelemetryCorrelationId = null,
+    deadlineAtMs = null,
+    required = priority <= CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
   } = {}) {
     const key = createChunkDataRequestKey(chunkX, chunkZ);
     assertChunkDataPriority(priority);
     if (typeof consumerId !== 'string' || !consumerId) throw new TypeError('consumerId is required');
     if (!Number.isSafeInteger(epoch) || epoch < 0) throw new RangeError('epoch must be a non-negative safe integer');
+    const createdAtMs = this.clock();
     const telemetryCorrelationId = suppliedTelemetryCorrelationId
       ?? this.telemetry?.beginRequest({
         target: telemetryTarget,
@@ -107,7 +125,10 @@ export class ChunkDataService {
         resourceKey: key,
         ownerKey: key,
         requestId: `${consumerId}:${epoch}`,
-        metadata: { consumerId, epoch, priority },
+        metadata: {
+          consumerId, epoch, priority, required, deadlineAtMs,
+          backlog: this.queue.length + (this.inFlight ? 1 : 0),
+        },
       })
       ?? null;
     this.counts.requests += 1;
@@ -162,9 +183,18 @@ export class ChunkDataService {
         key, chunkX, chunkZ, priority, sequence: ++this.sequence,
         state: 'queued', subscribers: new Map(), telemetryCorrelationId,
         telemetryTarget, telemetryStream,
+        createdAtMs,
+        deadlineAtMs,
+        required,
+        cancelRequested: false,
       };
+      entry.scheduler = this.#createSchedulerEnvelope(entry, consumerId, epoch);
       this.pending.set(key, entry);
       this.queue.push(entry);
+      this.counts.maximumBacklog = Math.max(
+        this.counts.maximumBacklog,
+        this.queue.length + (this.inFlight ? 1 : 0),
+      );
       this.#recordTelemetry(WORLD_STREAMING_EVENT.CACHE_MISS, {
         correlationId: telemetryCorrelationId,
         target: telemetryTarget,
@@ -186,6 +216,14 @@ export class ChunkDataService {
       if (entry.state === 'queued' && priority < entry.priority) {
         entry.priority = priority;
         this.counts.priorityPromotions += 1;
+      }
+      if (entry.state === 'queued') {
+        entry.required ||= required;
+        if (deadlineAtMs !== null
+          && (entry.deadlineAtMs === null || deadlineAtMs < entry.deadlineAtMs)) {
+          entry.deadlineAtMs = deadlineAtMs;
+        }
+        entry.scheduler = this.#createSchedulerEnvelope(entry, consumerId, epoch);
       }
     }
     const handle = this.#subscribe(entry, {
@@ -216,7 +254,12 @@ export class ChunkDataService {
   }
 
   snapshot() {
-    const queued = [...this.queue].filter(entry => entry.state === 'queued').sort(compareQueuedRequests);
+    const timestamp = this.clock();
+    const queued = [...this.queue].filter(entry => entry.state === 'queued').sort(
+      (left, right) => compareWorldGenerationRequests(left, right, timestamp, {
+        agingIntervalMs: this.agingIntervalMs,
+      }),
+    );
     return Object.freeze({
       cacheCapacity: this.cacheCapacity,
       completedCacheSize: this.completed.size,
@@ -229,10 +272,20 @@ export class ChunkDataService {
       queued: Object.freeze(queued.map(entry => Object.freeze({
         key: entry.key,
         priority: entry.priority,
+        required: entry.required,
+        deadlineAtMs: entry.deadlineAtMs,
+        ...describeWorldGenerationPriority(entry.scheduler, timestamp, {
+          agingIntervalMs: this.agingIntervalMs,
+        }),
         subscriberCount: entry.subscribers.size,
       }))),
       transport: this.transport.snapshot?.() ?? null,
       metadata: this.metadata,
+      scheduler: Object.freeze({
+        workerCount: 1,
+        agingIntervalMs: this.agingIntervalMs,
+        backlog: queued.length + (this.inFlight ? 1 : 0),
+      }),
       isShutdown: this.isShutdown,
       counts: Object.freeze({ ...this.counts }),
     });
@@ -293,11 +346,30 @@ export class ChunkDataService {
       stream: subscriber.telemetryStream,
       resourceKey: entry.key,
       ownerKey: entry.key,
-      metadata: { reason: 'consumer-cancelled', consumerId: subscriber.consumerId },
+      metadata: {
+        reason: 'consumer-cancelled',
+        consumerId: subscriber.consumerId,
+        terminalState: 'cancelled',
+        cancellationReason: 'consumer-cancelled',
+        deadlineMiss: entry.deadlineAtMs !== null && this.clock() > entry.deadlineAtMs,
+        backlog: this.queue.length + (this.inFlight ? 1 : 0),
+      },
     });
     if (entry.state === 'queued' && entry.subscribers.size === 0) {
       this.pending.delete(entry.key);
       this.queue = this.queue.filter(candidate => candidate !== entry);
+      entry.state = 'cancelled';
+      this.counts.queuedOperationCancels += 1;
+      this.counts.cancelledOperations += 1;
+    } else if (entry.state === 'in-flight' && entry.subscribers.size === 0
+      && !entry.cancelRequested) {
+      entry.cancelRequested = true;
+      if (this.transport.cancelGenerationRequest?.({
+        requestId: entry.sequence,
+        reason: 'no-active-subscribers',
+      })) {
+        this.counts.inFlightOperationCancels += 1;
+      }
     }
     return true;
   }
@@ -314,12 +386,24 @@ export class ChunkDataService {
   async #dispatchNext() {
     if (this.isShutdown || this.inFlight) return;
     this.queue = this.queue.filter(entry => entry.state === 'queued' && entry.subscribers.size > 0);
-    this.queue.sort(compareQueuedRequests);
+    const dispatchAtMs = this.clock();
+    this.queue.sort((left, right) => compareWorldGenerationRequests(
+      left,
+      right,
+      dispatchAtMs,
+      { agingIntervalMs: this.agingIntervalMs },
+    ));
     const entry = this.queue.shift();
     if (!entry) return;
     entry.state = 'in-flight';
     this.inFlight = entry;
     this.counts.dispatched += 1;
+    const ranking = describeWorldGenerationPriority(entry.scheduler, dispatchAtMs, {
+      agingIntervalMs: this.agingIntervalMs,
+    });
+    this.counts.priorityAgingSteps += ranking.agingSteps;
+    if (ranking.agingSteps > 0) this.counts.agedDispatches += 1;
+    if (ranking.deadlineMiss) this.counts.deadlineMisses += 1;
     this.#recordTelemetry(WORLD_STREAMING_EVENT.WORKER_START, {
       correlationId: entry.telemetryCorrelationId,
       target: entry.telemetryTarget,
@@ -327,7 +411,18 @@ export class ChunkDataService {
       resourceKey: entry.key,
       ownerKey: entry.key,
       requestId: entry.sequence,
-      metadata: { boundary: 'transport-dispatch', priority: entry.priority },
+      metadata: {
+        boundary: 'transport-dispatch',
+        priority: entry.priority,
+        effectivePriority: ranking.effectivePriority,
+        queueTimeMs: ranking.queueTimeMs,
+        startTimeMs: dispatchAtMs,
+        terminalState: null,
+        cancellationReason: null,
+        deadlineMiss: ranking.deadlineMiss,
+        priorityAging: ranking.agingSteps,
+        backlog: this.queue.length + 1,
+      },
     });
     let chunkData = null;
     let error = null;
@@ -338,29 +433,71 @@ export class ChunkDataService {
         chunkX: entry.chunkX,
         chunkZ: entry.chunkZ,
         priority: entry.priority,
+        required: entry.required,
+        createdAtMs: entry.createdAtMs,
+        deadlineAtMs: entry.deadlineAtMs,
+        consumerId: entry.scheduler.consumerId,
+        epoch: entry.scheduler.epoch,
+        telemetryCorrelationId: entry.telemetryCorrelationId,
+        telemetryTarget: entry.telemetryTarget,
+        telemetryStream: entry.telemetryStream,
+        scheduler: entry.scheduler,
       });
-      this.#recordTelemetry(WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
-        correlationId: entry.telemetryCorrelationId,
-        target: entry.telemetryTarget,
-        stream: entry.telemetryStream,
-        resourceKey: entry.key,
-        ownerKey: entry.key,
-        requestId: entry.sequence,
-        metadata: { boundary: 'transport-receive' },
-      });
-      if (!this.isShutdown) this.#validateAndCache(entry, chunkData);
-      else this.counts.shutdownLateResultCount += 1;
+      if (entry.cancelRequested || chunkData === null) {
+        entry.state = 'cancelled';
+        this.counts.cancelledOperations += 1;
+      } else {
+        entry.state = 'completed';
+        this.counts.completedOperations += 1;
+        this.#recordTelemetry(WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
+          correlationId: entry.telemetryCorrelationId,
+          target: entry.telemetryTarget,
+          stream: entry.telemetryStream,
+          resourceKey: entry.key,
+          ownerKey: entry.key,
+          requestId: entry.sequence,
+          metadata: {
+            boundary: 'transport-receive',
+            queueTimeMs: ranking.queueTimeMs,
+            startTimeMs: dispatchAtMs,
+            terminalState: 'completed',
+            cancellationReason: null,
+            deadlineMiss: entry.deadlineAtMs !== null && this.clock() > entry.deadlineAtMs,
+            priorityAging: ranking.agingSteps,
+            backlog: this.queue.length,
+          },
+        });
+        if (!this.isShutdown) this.#validateAndCache(entry, chunkData);
+        else this.counts.shutdownLateResultCount += 1;
+      }
     } catch (caught) {
-      error = caught;
-      this.#recordTelemetry(WORLD_STREAMING_EVENT.FAILED, {
-        correlationId: entry.telemetryCorrelationId,
-        target: entry.telemetryTarget,
-        stream: entry.telemetryStream,
-        resourceKey: entry.key,
-        ownerKey: entry.key,
-        requestId: entry.sequence,
-        metadata: { name: caught?.name ?? 'Error', message: caught?.message ?? String(caught) },
-      });
+      if (entry.cancelRequested) {
+        entry.state = 'cancelled';
+        this.counts.cancelledOperations += 1;
+      } else {
+        error = caught;
+        entry.state = 'failed';
+        this.counts.failedOperations += 1;
+        this.#recordTelemetry(WORLD_STREAMING_EVENT.FAILED, {
+          correlationId: entry.telemetryCorrelationId,
+          target: entry.telemetryTarget,
+          stream: entry.telemetryStream,
+          resourceKey: entry.key,
+          ownerKey: entry.key,
+          requestId: entry.sequence,
+          metadata: {
+            name: caught?.name ?? 'Error',
+            message: caught?.message ?? String(caught),
+            queueTimeMs: ranking.queueTimeMs,
+            startTimeMs: dispatchAtMs,
+            terminalState: 'failed',
+            cancellationReason: null,
+            deadlineMiss: entry.deadlineAtMs !== null && this.clock() > entry.deadlineAtMs,
+            priorityAging: ranking.agingSteps,
+            backlog: this.queue.length,
+          },
+        });
+      }
     } finally {
       this.pending.delete(entry.key);
       this.inFlight = null;
@@ -392,6 +529,22 @@ export class ChunkDataService {
 
   #recordTelemetry(type, details) {
     return this.telemetry?.record(type, details) ?? null;
+  }
+
+  #createSchedulerEnvelope(entry, consumerId, epoch) {
+    return createChunkGeneratorSchedulerEnvelope({
+      requestId: entry.sequence,
+      operationKind: 'chunk',
+      priority: entry.priority,
+      required: entry.required,
+      createdAtMs: entry.createdAtMs,
+      deadlineAtMs: entry.deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId: null,
+      target: null,
+      stream: null,
+    });
   }
 
   #validateAndCache(entry, chunkData) {

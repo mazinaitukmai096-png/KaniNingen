@@ -15,14 +15,20 @@ function chunk(chunkX, chunkZ, revision = 'a') {
 function deferredTransport() {
   const calls = [];
   const pending = [];
+  const cancelCalls = [];
   return {
     calls,
     pending,
+    cancelCalls,
     async generateChunk(request) {
       calls.push(request);
       return new Promise((resolve, reject) => pending.push({ request, resolve, reject }));
     },
     snapshot: () => Object.freeze({ kind: 'test' }),
+    cancelGenerationRequest(request) {
+      cancelCalls.push(request);
+      return true;
+    },
     async shutdown() {},
   };
 }
@@ -87,10 +93,15 @@ test('ChunkDataService cancels queued and in-flight subscribers without deliveri
   await nextDispatch();
   assert.equal(transport.calls.length, 1);
   assert.equal(inflight.cancel(), true);
+  assert.deepEqual(transport.cancelCalls, [{
+    requestId: 2,
+    reason: 'no-active-subscribers',
+  }]);
   transport.pending.shift().resolve(chunk(2, 2));
   assert.equal(await inflight.promise, null);
   await nextDispatch();
-  assert.equal(service.snapshot().completedCacheSize, 1);
+  assert.equal(service.snapshot().completedCacheSize, 0);
+  assert.equal(service.snapshot().counts.cancelledOperations, 2);
 });
 
 test('ChunkDataService treats consumer epochs as subscriber ownership and shares cache results', async () => {

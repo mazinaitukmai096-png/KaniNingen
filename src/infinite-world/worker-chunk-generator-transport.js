@@ -1,8 +1,11 @@
 import {
+  CHUNK_DATA_PRIORITY,
   CHUNK_GENERATOR_MESSAGE,
   CHUNK_GENERATOR_PROTOCOL_VERSION,
+  createChunkGeneratorCancelRequest,
   createChunkGeneratorInitializeRequest,
   createChunkGeneratorRequest,
+  createChunkGeneratorSchedulerEnvelope,
   createForestHorizonGeneratorRequest,
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
@@ -48,6 +51,7 @@ export function createWorkerChunkGeneratorTransport({
   workerFactory = () => browserWorkerFactory(globalThis),
   fallbackTransportFactory = null,
   clock = defaultClock,
+  onSchedulerEvent = null,
 } = {}) {
   if (typeof worldSeed !== 'string' || !worldSeed) throw new TypeError('worldSeed is required');
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
@@ -58,6 +62,9 @@ export function createWorkerChunkGeneratorTransport({
     throw new TypeError('fallbackTransportFactory must be a function when provided');
   }
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+  if (onSchedulerEvent !== null && typeof onSchedulerEvent !== 'function') {
+    throw new TypeError('onSchedulerEvent must be a function when provided');
+  }
 
   let worker = null;
   let fallbackTransport = null;
@@ -98,6 +105,12 @@ export function createWorkerChunkGeneratorTransport({
   };
   let fallbackReason = null;
   let lastGeneratorSnapshot = null;
+  let lastWorkerSchedulerSnapshot = null;
+
+  const emitSchedulerEvent = event => {
+    if (!onSchedulerEvent) return;
+    try { onSchedulerEvent(Object.freeze(event)); } catch { /* diagnostics are isolated */ }
+  };
 
   const terminateWorker = async () => {
     for (const remove of removers.splice(0)) remove();
@@ -107,7 +120,18 @@ export function createWorkerChunkGeneratorTransport({
   };
 
   const rejectPending = error => {
-    for (const operation of pending.values()) operation.reject(error);
+    for (const operation of pending.values()) {
+      emitSchedulerEvent({
+        type: 'terminal',
+        envelope: operation.request.scheduler ?? null,
+        state: 'failed',
+        terminalAtMs: clock(),
+        cancellationReason: null,
+        error,
+        backlog: Math.max(0, pending.size - 1),
+      });
+      operation.reject(error);
+    }
     pending.clear();
   };
 
@@ -142,9 +166,36 @@ export function createWorkerChunkGeneratorTransport({
     }
     pending.delete(message.requestId);
     if (message.type === CHUNK_GENERATOR_MESSAGE.ERROR) {
+      emitSchedulerEvent({
+        type: 'terminal',
+        envelope: operation.request.scheduler ?? null,
+        state: 'failed',
+        terminalAtMs: clock(),
+        cancellationReason: null,
+        error: transportError(message),
+        backlog: pending.size,
+      });
       operation.reject(transportError(message));
       return;
     }
+    if (message.scheduler) {
+      emitSchedulerEvent({
+        type: 'started',
+        envelope: operation.request.scheduler ?? null,
+        state: 'in-flight',
+        ...message.scheduler,
+        backlog: message.scheduler.backlogAtStart,
+      });
+    }
+    emitSchedulerEvent({
+      type: 'terminal',
+      envelope: operation.request.scheduler ?? null,
+      state: 'completed',
+      terminalAtMs: clock(),
+      cancellationReason: null,
+      scheduler: message.scheduler ?? null,
+      backlog: pending.size,
+    });
     if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED) {
       const receivedMs = Math.max(0, clock() - operation.sentAt);
       const generationMs = Math.max(0, Number(message.generationMs) || 0);
@@ -188,6 +239,7 @@ export function createWorkerChunkGeneratorTransport({
       diagnosticReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.diagnosticQueries += 1;
       lastGeneratorSnapshot = message.generatorSnapshot ?? null;
+      lastWorkerSchedulerSnapshot = message.workerSchedulerSnapshot ?? null;
       operation.resolve(lastGeneratorSnapshot);
     }
   };
@@ -232,6 +284,7 @@ export function createWorkerChunkGeneratorTransport({
       fallbackTransport = candidate;
       metadata = candidateMetadata;
       lastGeneratorSnapshot = null;
+      lastWorkerSchedulerSnapshot = null;
       runtimeFailure = null;
       mode = 'inline-fallback';
       initialized = true;
@@ -275,6 +328,13 @@ export function createWorkerChunkGeneratorTransport({
       return;
     }
     pending.set(request.requestId, { resolve, reject, sentAt: clock(), request });
+    emitSchedulerEvent({
+      type: 'queued',
+      envelope: request.scheduler ?? null,
+      state: 'queued',
+      queuedAtMs: request.scheduler?.createdAtMs ?? clock(),
+      backlog: pending.size,
+    });
     try {
       target.postMessage(request);
     } catch (error) {
@@ -285,15 +345,34 @@ export function createWorkerChunkGeneratorTransport({
 
   return Object.freeze({
     initialize,
-    async generateChunk({ requestId, chunkX, chunkZ, priority } = {}) {
+    async generateChunk({
+      requestId,
+      chunkX,
+      chunkZ,
+      priority = CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+      required = priority <= CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      consumerId = 'chunk-data-service',
+      epoch = 0,
+      telemetryCorrelationId = null,
+      telemetryTarget = null,
+      telemetryStream = null,
+      scheduler = null,
+    } = {}) {
       await initialize();
       if (isShutdown) throw shutdownError();
       if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
-        return fallbackTransport.generateChunk({ requestId, chunkX, chunkZ, priority });
+        return fallbackTransport.generateChunk({
+          requestId, chunkX, chunkZ, priority, required, createdAtMs, deadlineAtMs,
+          consumerId, epoch, telemetryCorrelationId, telemetryTarget, telemetryStream, scheduler,
+        });
       }
       return requestWorker(createChunkGeneratorRequest({
-        requestId, serviceGeneration, chunkX, chunkZ,
+        requestId, serviceGeneration, chunkX, chunkZ, priority, required, createdAtMs,
+        deadlineAtMs, consumerId, epoch, correlationId: telemetryCorrelationId,
+        target: telemetryTarget, stream: telemetryStream, scheduler,
       }));
     },
     async generateForestHorizonManifest({
@@ -301,6 +380,14 @@ export function createWorkerChunkGeneratorTransport({
       chunkZ,
       consumerId = 'distant-owner-query',
       epoch = 0,
+      priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required = false,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      telemetryCorrelationId = null,
+      telemetryTarget = 'tree',
+      telemetryStream = 'distant',
+      scheduler = null,
     } = {}) {
       if (epoch < (forestHorizonCancelledBeforeEpoch.get(consumerId) ?? 0)) return null;
       await initialize();
@@ -310,13 +397,24 @@ export function createWorkerChunkGeneratorTransport({
       if (fallbackTransport) {
         if (typeof fallbackTransport.generateForestHorizonManifest === 'function') {
           return fallbackTransport.generateForestHorizonManifest({
-            chunkX, chunkZ, consumerId, epoch,
+            chunkX, chunkZ, consumerId, epoch, priority, required, createdAtMs,
+            deadlineAtMs, telemetryCorrelationId, telemetryTarget, telemetryStream, scheduler,
           });
         }
         return createW8ForestHorizonManifest(await fallbackTransport.generateChunk({
           requestId: ++controlRequestId,
           chunkX,
           chunkZ,
+          priority,
+          required,
+          createdAtMs,
+          deadlineAtMs,
+          consumerId,
+          epoch,
+          telemetryCorrelationId,
+          telemetryTarget,
+          telemetryStream,
+          scheduler,
         }));
       }
       const requestId = ++controlRequestId;
@@ -327,6 +425,14 @@ export function createWorkerChunkGeneratorTransport({
         chunkZ,
         consumerId,
         epoch,
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs,
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        scheduler,
       }));
     },
     cancelForestHorizonRequests({
@@ -350,6 +456,14 @@ export function createWorkerChunkGeneratorTransport({
         if (request?.type !== CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON
           || request.consumerId !== consumerId || request.epoch >= cutoff) continue;
         pending.delete(requestId);
+        emitSchedulerEvent({
+          type: 'terminal',
+          envelope: request.scheduler ?? null,
+          state: 'cancelled',
+          terminalAtMs: clock(),
+          cancellationReason: 'stale-forest-horizon-epoch',
+          backlog: pending.size,
+        });
         operation.resolve(null);
         cancelled += 1;
       }
@@ -362,16 +476,59 @@ export function createWorkerChunkGeneratorTransport({
           beforeEpoch: cutoff,
         });
       }
+      fallbackTransport?.cancelForestHorizonRequests?.({
+        consumerId,
+        beforeEpoch: cutoff,
+      });
       return cancelled;
     },
-    async findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters) {
+    cancelGenerationRequest({ requestId, reason = 'consumer-cancelled' } = {}) {
+      const operation = pending.get(requestId);
+      let cancelled = false;
+      if (operation) {
+        pending.delete(requestId);
+        emitSchedulerEvent({
+          type: 'terminal',
+          envelope: operation.request.scheduler ?? null,
+          state: 'cancelled',
+          terminalAtMs: clock(),
+          cancellationReason: reason,
+          backlog: pending.size,
+        });
+        operation.resolve(null);
+        cancelled = true;
+      }
+      if (fallbackTransport?.cancelGenerationRequest?.({ requestId, reason })) cancelled = true;
+      if (worker && !isShutdown) {
+        worker.postMessage(createChunkGeneratorCancelRequest({
+          requestId,
+          serviceGeneration,
+          reason,
+        }));
+      }
+      return cancelled;
+    },
+    async findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters, options = {}) {
       await initialize();
       if (isShutdown) throw shutdownError();
       if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
-        return fallbackTransport.findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters);
+        return fallbackTransport.findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters, options);
       }
       const requestId = ++controlRequestId;
+      const scheduler = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'settlement-query',
+        priority: options.priority ?? CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: options.required ?? true,
+        createdAtMs: options.createdAtMs ?? clock(),
+        deadlineAtMs: options.deadlineAtMs ?? null,
+        consumerId: options.consumerId ?? 'settlement-query',
+        correlationId: options.telemetryCorrelationId ?? null,
+        target: options.telemetryTarget ?? 'settlement',
+        stream: options.telemetryStream ?? 'distant',
+        scheduler: options.scheduler ?? null,
+      });
       return requestWorker({
         type: CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS,
         protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -380,25 +537,40 @@ export function createWorkerChunkGeneratorTransport({
         centerWorldX,
         centerWorldZ,
         radiusMeters,
+        scheduler,
       });
     },
-    async resolveSettlementPresentationTemplate({ candidate } = {}) {
+    async resolveSettlementPresentationTemplate({ candidate, ...options } = {}) {
       await initialize();
       if (isShutdown) throw shutdownError();
       if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
       if (fallbackTransport) {
-        return fallbackTransport.resolveSettlementPresentationTemplate({ candidate });
+        return fallbackTransport.resolveSettlementPresentationTemplate({ candidate, ...options });
       }
       const requestId = ++controlRequestId;
+      const scheduler = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'settlement-template',
+        priority: options.priority ?? CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+        required: options.required ?? true,
+        createdAtMs: options.createdAtMs ?? clock(),
+        deadlineAtMs: options.deadlineAtMs ?? null,
+        consumerId: options.consumerId ?? 'settlement-template',
+        correlationId: options.telemetryCorrelationId ?? null,
+        target: options.telemetryTarget ?? 'building',
+        stream: options.telemetryStream ?? 'distant',
+        scheduler: options.scheduler ?? null,
+      });
       return requestWorker({
         type: CHUNK_GENERATOR_MESSAGE.RESOLVE_SETTLEMENT_TEMPLATE,
         protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
         requestId,
         serviceGeneration,
         candidate,
+        scheduler,
       });
     },
-    async requestDiagnostics() {
+    async requestDiagnostics(options = {}) {
       await initialize();
       if (isShutdown) throw shutdownError();
       if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
@@ -406,16 +578,27 @@ export function createWorkerChunkGeneratorTransport({
         if (typeof fallbackTransport.requestDiagnostics !== 'function') {
           throw new Error('fallback transport does not expose diagnostics');
         }
-        lastGeneratorSnapshot = await fallbackTransport.requestDiagnostics();
+        lastGeneratorSnapshot = await fallbackTransport.requestDiagnostics(options);
         counts.diagnosticQueries += 1;
         return lastGeneratorSnapshot;
       }
       const requestId = ++controlRequestId;
+      const scheduler = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'diagnostics',
+        priority: options.priority ?? CHUNK_DATA_PRIORITY.ULTRA_WARM,
+        required: false,
+        createdAtMs: options.createdAtMs ?? clock(),
+        deadlineAtMs: options.deadlineAtMs ?? null,
+        consumerId: 'diagnostics',
+        scheduler: options.scheduler ?? null,
+      });
       return requestWorker({
         type: CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS,
         protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
         requestId,
         serviceGeneration,
+        scheduler,
       });
     },
     snapshot() {
@@ -454,6 +637,7 @@ export function createWorkerChunkGeneratorTransport({
         diagnosticMsMaximum: diagnosticTiming.max,
         diagnosticReceiveMsMaximum: diagnosticReceiveTiming.max,
         generatorSnapshot: lastGeneratorSnapshot,
+        workerSchedulerSnapshot: lastWorkerSchedulerSnapshot,
         counts: Object.freeze({ ...counts }),
       });
     },
@@ -468,6 +652,7 @@ export function createWorkerChunkGeneratorTransport({
       await terminateWorker();
       await fallbackTransport?.shutdown?.();
       lastGeneratorSnapshot = null;
+      lastWorkerSchedulerSnapshot = null;
       forestHorizonCancelledBeforeEpoch.clear();
       for (const series of [
         generationTimes,

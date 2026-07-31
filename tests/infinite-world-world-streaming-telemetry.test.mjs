@@ -175,6 +175,21 @@ test('ChunkDataService emits request, cache, Worker-boundary, completion, and ca
     'request', 'cache-miss', 'worker-start', 'worker-complete',
   ]);
   assert.deepEqual(types.slice(4), ['request', 'cache-hit', 'request', 'cache-miss', 'cancelled']);
+  const events = telemetry.snapshot().events;
+  const workerStart = events.find(event => event.type === WORLD_STREAMING_EVENT.WORKER_START);
+  const workerComplete = events.find(event => event.type === WORLD_STREAMING_EVENT.WORKER_COMPLETE);
+  const cancelledEvent = events.find(event => event.type === WORLD_STREAMING_EVENT.CANCELLED);
+  assert.equal(Number.isFinite(workerStart.metadata.queueTimeMs), true);
+  assert.equal(Number.isFinite(workerStart.metadata.startTimeMs), true);
+  assert.equal(workerStart.metadata.terminalState, null);
+  assert.equal(workerStart.metadata.cancellationReason, null);
+  assert.equal(typeof workerStart.metadata.deadlineMiss, 'boolean');
+  assert.equal(Number.isSafeInteger(workerStart.metadata.priorityAging), true);
+  assert.equal(Number.isSafeInteger(workerStart.metadata.backlog), true);
+  assert.equal(workerComplete.metadata.terminalState, 'completed');
+  assert.equal(workerComplete.metadata.cancellationReason, null);
+  assert.equal(cancelledEvent.metadata.terminalState, 'cancelled');
+  assert.equal(cancelledEvent.metadata.cancellationReason, 'consumer-cancelled');
   await service.shutdown();
 });
 

@@ -810,6 +810,51 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingCoordinator = createWorldStreamingCoordinator({
       registry: worldStreamingPolicyRegistry,
     });
+    const schedulerTerminalCorrelations = new Set();
+    const recordGenerationSchedulerEvent = event => {
+      const envelope = event?.envelope;
+      const correlationId = envelope?.correlationId ?? null;
+      if (!streamingTelemetry.enabled || correlationId === null) return;
+      const details = {
+        correlationId,
+        target: envelope.target,
+        stream: envelope.stream,
+        requestId: envelope.requestId,
+        metadata: event.type === 'started'
+          ? {
+            queueTimeMs: event.queueTimeMs,
+            startTimeMs: event.startedAtMs,
+            terminalState: null,
+            cancellationReason: null,
+            deadlineMiss: event.deadlineMiss,
+            priorityAging: event.priorityAgingSteps,
+            backlog: event.backlog,
+          }
+          : {
+            queueTimeMs: event.scheduler?.queueTimeMs ?? event.queueTimeMs ?? null,
+            startTimeMs: event.scheduler?.startedAtMs ?? event.startedAtMs ?? null,
+            terminalState: event.state,
+            cancellationReason: event.cancellationReason ?? null,
+            deadlineMiss: event.scheduler?.deadlineMiss ?? event.deadlineMiss ?? false,
+            priorityAging: event.scheduler?.priorityAgingSteps
+              ?? event.priorityAgingSteps ?? 0,
+            backlog: event.backlog,
+            name: event.error?.name ?? null,
+            message: event.error?.message ?? null,
+          },
+      };
+      if (event.type === 'started') {
+        streamingTelemetry.record(WORLD_STREAMING_EVENT.WORKER_START, details);
+      } else if (event.type === 'terminal') {
+        schedulerTerminalCorrelations.add(correlationId);
+        const type = event.state === 'completed'
+          ? WORLD_STREAMING_EVENT.WORKER_COMPLETE
+          : event.state === 'cancelled'
+            ? WORLD_STREAMING_EVENT.CANCELLED
+            : WORLD_STREAMING_EVENT.FAILED;
+        streamingTelemetry.record(type, details);
+      }
+    };
     const traceGenerationBoundary = async ({
       target,
       resourceKey,
@@ -824,50 +869,59 @@ export async function bootInfiniteWorldSandbox({
         ownerKey,
         metadata,
       });
-      streamingTelemetry.record(WORLD_STREAMING_EVENT.WORKER_START, {
-        correlationId,
-        target,
-        stream: WORLD_STREAMING_STREAM.DISTANT,
-        resourceKey,
-        ownerKey,
-        metadata: { boundary: 'transport-dispatch' },
-      });
       try {
-        const result = await operation();
-        streamingTelemetry.record(result === null
-          ? WORLD_STREAMING_EVENT.CANCELLED
-          : WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
-          correlationId,
-          target,
-          stream: WORLD_STREAMING_STREAM.DISTANT,
-          resourceKey,
-          ownerKey,
-          metadata: result === null
-            ? { reason: 'transport-cancelled' }
-            : { boundary: 'transport-receive' },
+        const result = await operation({
+          telemetryCorrelationId: correlationId,
+          telemetryTarget: target,
+          telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
         });
+        if (!schedulerTerminalCorrelations.has(correlationId)) {
+          streamingTelemetry.record(result === null
+            ? WORLD_STREAMING_EVENT.CANCELLED
+            : WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
+            correlationId,
+            target,
+            stream: WORLD_STREAMING_STREAM.DISTANT,
+            resourceKey,
+            ownerKey,
+            metadata: result === null
+              ? { terminalState: 'cancelled', cancellationReason: 'transport-cancelled' }
+              : { terminalState: 'completed', cancellationReason: null },
+          });
+        }
         return result;
       } catch (error) {
-        streamingTelemetry.record(WORLD_STREAMING_EVENT.FAILED, {
-          correlationId,
-          target,
-          stream: WORLD_STREAMING_STREAM.DISTANT,
-          resourceKey,
-          ownerKey,
-          metadata: { name: error?.name ?? 'Error', message: error?.message ?? String(error) },
-        });
+        if (!schedulerTerminalCorrelations.has(correlationId)) {
+          streamingTelemetry.record(WORLD_STREAMING_EVENT.FAILED, {
+            correlationId,
+            target,
+            stream: WORLD_STREAMING_STREAM.DISTANT,
+            resourceKey,
+            ownerKey,
+            metadata: {
+              terminalState: 'failed',
+              cancellationReason: null,
+              name: error?.name ?? 'Error',
+              message: error?.message ?? String(error),
+            },
+          });
+        }
         throw error;
+      } finally {
+        schedulerTerminalCorrelations.delete(correlationId);
       }
     };
-
     const generatorMetadata = await runStage('Legacy Core', async () => {
       const workerTransport = createWorkerChunkGeneratorTransport({
         worldSeed: requestedSeed,
         workerFactory: chunkGeneratorWorkerFactory ?? undefined,
         fallbackTransportFactory: async () => createInlineChunkGeneratorTransport({
           generator: await generatorFactory({ worldSeed: requestedSeed }),
+          clock,
+          onSchedulerEvent: recordGenerationSchedulerEvent,
         }),
         clock,
+        onSchedulerEvent: recordGenerationSchedulerEvent,
       });
       chunkGeneratorTransport = Object.freeze({
         initialize: () => workerTransport.initialize(),
@@ -880,6 +934,8 @@ export async function bootInfiniteWorldSandbox({
             );
           } finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
         },
+        cancelGenerationRequest: options =>
+          workerTransport.cancelGenerationRequest(options),
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
         resolveSettlementPresentationTemplate: (...args) =>
           workerTransport.resolveSettlementPresentationTemplate(...args),
@@ -901,10 +957,29 @@ export async function bootInfiniteWorldSandbox({
       experienceSpawn: generatorMetadata.experienceSpawn,
       reviewSpawn: generatorMetadata.reviewSpawn,
       distributor: Object.freeze({
-        findSettlementsNear: (...args) => chunkGeneratorTransport.findSettlementsNear(...args),
+        findSettlementsNear: (centerWorldX, centerWorldZ, radiusMeters) =>
+          traceGenerationBoundary({
+            target: WORLD_STREAMING_TARGET.SETTLEMENT,
+            resourceKey: `settlement-query:${centerWorldX}:${centerWorldZ}:${radiusMeters}`,
+            metadata: { centerWorldX, centerWorldZ, radiusMeters },
+          }, schedulerOptions => chunkGeneratorTransport.findSettlementsNear(
+            centerWorldX,
+            centerWorldZ,
+            radiusMeters,
+            schedulerOptions,
+          )),
       }),
-      resolveSettlementPresentationTemplate: (...args) =>
-        chunkGeneratorTransport.resolveSettlementPresentationTemplate(...args),
+      resolveSettlementPresentationTemplate: request => {
+        const settlementId = request?.candidate?.settlementId ?? request?.settlementId ?? 'unknown';
+        return traceGenerationBoundary({
+          target: WORLD_STREAMING_TARGET.BUILDING,
+          resourceKey: `settlement-template:${settlementId}`,
+          metadata: { settlementId },
+        }, schedulerOptions => chunkGeneratorTransport.resolveSettlementPresentationTemplate({
+          ...request,
+          ...schedulerOptions,
+        }));
+      },
       requestDiagnostics: () => chunkGeneratorTransport.requestDiagnostics(),
       snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot,
     });

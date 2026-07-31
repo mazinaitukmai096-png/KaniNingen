@@ -8,6 +8,7 @@ import {
   CHUNK_GENERATOR_MESSAGE,
   CHUNK_GENERATOR_PROTOCOL_VERSION,
   CHUNK_DATA_PRIORITY,
+  createChunkGeneratorSchedulerEnvelope,
 } from '../src/infinite-world/chunk-data-service-protocol.js';
 import { createInlineChunkGeneratorTransport } from '../src/infinite-world/inline-chunk-generator-transport.js';
 import { createChunkGeneratorWorkerCore } from '../src/infinite-world/chunk-generator-worker-core.js';
@@ -145,15 +146,23 @@ test('Worker core includes the full generator snapshot only in an explicit diagn
 
   await core.receive(request(CHUNK_GENERATOR_MESSAGE.REQUEST_DIAGNOSTICS, 4));
   assert.equal(snapshotCalls, 1);
-  assert.deepEqual(responses.at(-1), {
+  const diagnosticsResponse = responses.at(-1);
+  const { scheduler, workerSchedulerSnapshot, ...diagnosticsPayload } = diagnosticsResponse;
+  assert.deepEqual(diagnosticsPayload, {
     type: CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
     protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
     requestId: 4,
     serviceGeneration: 5,
     generatorSnapshot: { fullDiagnosticPayload: ['only', 'on', 'request'] },
-    operationMs: responses.at(-1).operationMs,
+    operationMs: diagnosticsResponse.operationMs,
   });
-  assert.ok(responses.at(-1).operationMs >= 0);
+  assert.equal(scheduler.operationKind, 'diagnostics');
+  assert.equal(scheduler.priority, CHUNK_DATA_PRIORITY.ULTRA_WARM);
+  assert.equal(scheduler.required, false);
+  assert.equal(workerSchedulerSnapshot.workerCount, 1);
+  assert.equal(workerSchedulerSnapshot.inFlightRequestId, 4);
+  assert.equal(workerSchedulerSnapshot.counts.completed, 3);
+  assert.ok(diagnosticsResponse.operationMs >= 0);
   await core.shutdown();
   assert.equal(shutdownCalls, 1);
 });
@@ -388,6 +397,67 @@ test('Forest horizon Worker requests are epoch-cancelled before stale generation
   await transport.shutdown();
 });
 
+test('Worker transport sends the unified deadline envelope and settles a generic in-flight cancel', async () => {
+  const fake = new FakeWorker();
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    serviceGeneration: 11,
+    workerFactory: () => fake,
+  });
+  await transport.initialize();
+  const pendingChunk = transport.generateChunk({
+    requestId: 77,
+    chunkX: 3,
+    chunkZ: -2,
+    priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    required: true,
+    createdAtMs: 10,
+    deadlineAtMs: 50,
+    consumerId: 'phase-4',
+    epoch: 9,
+  });
+  await drainAsyncWork(2);
+  const request = fake.messages.at(-1);
+  assert.equal(request.type, CHUNK_GENERATOR_MESSAGE.GENERATE);
+  assert.deepEqual(request.scheduler, {
+    schemaVersion: 'world-generation-request-1',
+    requestId: 77,
+    operationKind: 'chunk',
+    priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    required: true,
+    createdAtMs: 10,
+    deadlineAtMs: 50,
+    consumerId: 'phase-4',
+    epoch: 9,
+    correlationId: null,
+    target: null,
+    stream: null,
+  });
+  assert.equal(transport.cancelGenerationRequest({
+    requestId: 77,
+    reason: 'superseded-plan',
+  }), true);
+  assert.equal(await pendingChunk, null);
+  assert.deepEqual(fake.messages.at(-1), {
+    type: CHUNK_GENERATOR_MESSAGE.CANCEL_GENERATION,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 77,
+    serviceGeneration: 11,
+    reason: 'superseded-plan',
+  });
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATED,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 77,
+    serviceGeneration: 11,
+    chunkData: fixtureChunk(3, -2),
+    generationMs: 1,
+  });
+  assert.equal(transport.snapshot().counts.generated, 0);
+  assert.equal(transport.snapshot().counts.lateResponses, 1);
+  await transport.shutdown();
+});
+
 test('Worker core observes Forest horizon cancellation outside its serial generation chain', async () => {
   const responses = [];
   let manifestCalls = 0;
@@ -434,6 +504,158 @@ test('Worker core observes Forest horizon cancellation outside its serial genera
   assert.equal(responses.some(response => (
     response.type === CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON
   )), false);
+  await core.shutdown();
+});
+
+test('Worker core schedules every operation kind through one priority envelope', async () => {
+  const responses = [];
+  const order = [];
+  let releaseBlocker;
+  const blocker = new Promise(resolve => { releaseBlocker = resolve; });
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    schedulerOptions: { agingIntervalMs: 100_000 },
+    generatorFactory: async () => ({
+      worldSeed: seed,
+      worldSeedHash: `sha256:${'4'.repeat(64)}`,
+      generatorVersion: { major: 800, minor: 0, patch: 0 },
+      experienceSpawn: { x: 0, z: 0 },
+      reviewSpawn: { x: 0, z: 0 },
+      async generateChunk(chunkX, chunkZ) {
+        order.push('chunk-blocker');
+        await blocker;
+        return fixtureChunk(chunkX, chunkZ);
+      },
+      async generateForestHorizonManifest(chunkX, chunkZ) {
+        order.push('forest-warm');
+        return {
+          ...fixtureChunk(chunkX, chunkZ),
+          schemaVersion: 'w8-forest-horizon-owner-summary-1',
+        };
+      },
+      distributor: {
+        async findSettlementsNear() {
+          order.push('settlement-required');
+          return [];
+        },
+      },
+    }),
+  });
+  const base = {
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 8,
+  };
+  await core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
+    worldSeed: seed,
+  });
+  const chunkRequest = core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    requestId: 1,
+    chunkX: 0,
+    chunkZ: 0,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId: 1,
+      operationKind: 'chunk',
+      priority: 1,
+      required: true,
+      createdAtMs: 0,
+    }),
+  });
+  await drainAsyncWork(2);
+  const forestRequest = core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON,
+    requestId: 2,
+    chunkX: 1,
+    chunkZ: 0,
+    consumerId: 'forest',
+    epoch: 1,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId: 2,
+      operationKind: 'forest-horizon',
+      priority: 5,
+      required: false,
+      createdAtMs: 0,
+      consumerId: 'forest',
+      epoch: 1,
+    }),
+  });
+  const settlementRequest = core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS,
+    requestId: 3,
+    centerWorldX: 0,
+    centerWorldZ: 0,
+    radiusMeters: 100,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId: 3,
+      operationKind: 'settlement-query',
+      priority: 1,
+      required: true,
+      createdAtMs: 0,
+    }),
+  });
+  releaseBlocker();
+  await Promise.all([chunkRequest, forestRequest, settlementRequest]);
+  assert.deepEqual(order, ['chunk-blocker', 'settlement-required', 'forest-warm']);
+  assert.deepEqual(
+    responses.filter(response => response.requestId).map(response => response.requestId),
+    [1, 3, 2],
+  );
+  await core.shutdown();
+});
+
+test('Worker core suppresses an in-flight result after a generic cooperative cancel checkpoint', async () => {
+  const responses = [];
+  let releaseGeneration;
+  const generationGate = new Promise(resolve => { releaseGeneration = resolve; });
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    generatorFactory: async () => ({
+      worldSeed: seed,
+      worldSeedHash: `sha256:${'5'.repeat(64)}`,
+      generatorVersion: { major: 800, minor: 0, patch: 0 },
+      experienceSpawn: { x: 0, z: 0 },
+      reviewSpawn: { x: 0, z: 0 },
+      distributor: { findSettlementsNear: async () => [] },
+      async generateChunk(chunkX, chunkZ) {
+        await generationGate;
+        return fixtureChunk(chunkX, chunkZ);
+      },
+    }),
+  });
+  const base = {
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 10,
+  };
+  await core.receive({ ...base, type: CHUNK_GENERATOR_MESSAGE.INITIALIZE, worldSeed: seed });
+  const request = core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    requestId: 22,
+    chunkX: 2,
+    chunkZ: 2,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId: 22,
+      operationKind: 'chunk',
+      priority: 1,
+      required: true,
+      createdAtMs: 0,
+    }),
+  });
+  await drainAsyncWork(2);
+  await core.receive({
+    ...base,
+    type: CHUNK_GENERATOR_MESSAGE.CANCEL_GENERATION,
+    requestId: 22,
+    reason: 'superseded-plan',
+  });
+  releaseGeneration();
+  await request;
+  assert.equal(responses.some(response => response.requestId === 22), false);
   await core.shutdown();
 });
 
