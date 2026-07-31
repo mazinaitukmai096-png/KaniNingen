@@ -54,6 +54,12 @@ import {
   createWorldStreamingTelemetry,
 } from './world-streaming-telemetry.js';
 import {
+  LEGACY_RUNTIME_CHUNK_POLICY_KIND,
+  createLegacyRuntimeChunkStreamingPolicy,
+} from './world-streaming-plan.js';
+import { createWorldStreamingPolicyRegistry } from './world-streaming-policy-registry.js';
+import { createWorldStreamingCoordinator } from './world-streaming-coordinator.js';
+import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   W8_RENDER_FOG_COLOR_HEX,
   normalizeW8RenderDistancePreset,
@@ -752,6 +758,7 @@ export async function bootInfiniteWorldSandbox({
   let audioDirector = null;
   let diagnostics = null;
   let streamingTelemetry = null;
+  let worldStreamingCoordinator = null;
   let availableSaveSnapshot = null;
   let experienceSpawn = null;
   let running = false;
@@ -796,6 +803,12 @@ export async function bootInfiniteWorldSandbox({
       enabled: streamingTelemetryEnabled,
       capacity: streamingTelemetryCapacity,
       clock,
+    });
+    const worldStreamingPolicyRegistry = createWorldStreamingPolicyRegistry();
+    worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy());
+    worldStreamingPolicyRegistry.freeze();
+    worldStreamingCoordinator = createWorldStreamingCoordinator({
+      registry: worldStreamingPolicyRegistry,
     });
     const traceGenerationBoundary = async ({
       target,
@@ -2102,6 +2115,21 @@ export async function bootInfiniteWorldSandbox({
         nowMs: clock(),
         enabled: shellSnapshot.runPhase === 'intro',
       });
+      const committedChunkState = runtime.getCommittedChunkState();
+      worldStreamingCoordinator.createShadowPlan({
+        player: { x: logicalPlayer.x, z: logicalPlayer.z },
+        velocity: { x: movement.velocityX, z: movement.velocityZ },
+        renderDistancePreset: distantRenderDistance,
+        stateRevision: worldState.revision,
+        originGeneration: committedChunkState.transitionContract?.generation ?? 0,
+        currentRequests: {
+          [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
+            requiredOwnerKeys: committedChunkState.renderedKeys,
+            requestOwnerKeys: committedChunkState.activeDataKeys,
+            retainedOwnerKeys: committedChunkState.activeDataKeys,
+          },
+        },
+      });
       return owner;
     }
 
@@ -2179,6 +2207,12 @@ export async function bootInfiniteWorldSandbox({
         : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
+      const worldStreamingSnapshot = worldStreamingCoordinator.snapshot();
+      const shadowPolicy = worldStreamingSnapshot.latestPlan?.policyPlans?.[0] ?? null;
+      const shadowComparison = worldStreamingSnapshot.latestComparison?.policies?.[0] ?? null;
+      const shadowDiagnosticText = diagnostics.enabled
+        ? `\nWorld Streaming Shadow: ${escapeHtml(worldStreamingSnapshot.latestPlan?.planId ?? 'none')}  preset ${escapeHtml(worldStreamingSnapshot.latestPlan?.renderDistancePreset ?? 'none')}  match ${shadowComparison?.matches === true ? 'yes' : shadowComparison?.matches === false ? 'no' : 'unobserved'}  required ${shadowPolicy?.requiredOwnerKeys.length ?? 0}/${shadowComparison?.required?.observedCount ?? 0}  request ${shadowPolicy?.requestOwnerKeys.length ?? 0}/${shadowComparison?.requested?.observedCount ?? 0}  retained ${shadowPolicy?.retainedOwnerKeys.length ?? 0}/${shadowComparison?.retained?.observedCount ?? 0}  corridor ${shadowPolicy?.velocityCorridor.ownerKeys.length ?? 0} owner  plan ${number(worldStreamingSnapshot.performance.lastPlanDurationMs)}/${number(worldStreamingSnapshot.performance.p95PlanDurationMs)}/${number(worldStreamingSnapshot.performance.maximumPlanDurationMs)}ms last/p95/max`
+        : '';
       const settlementReference = currentChunk?.settlementReferences?.[0];
       const fogFarMeters = scene.fog.far / UNITS_PER_METER;
       const cloudWithinFogCount = scenePresentationSnapshot.clouds.filter(cloud => Math.hypot(
@@ -2225,7 +2259,7 @@ Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.lo
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
-Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${escapeHtml(warningText)}${escapeHtml(errorText)}`;
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${measurementText}${diagnosticText}${shadowDiagnosticText}${escapeHtml(warningText)}${escapeHtml(errorText)}`;
       experienceShell.renderHud({
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
@@ -2512,6 +2546,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           scenePresentation: scenePresentation.snapshot(),
           measurement: Object.freeze({ ...measurement }),
           streamingTelemetry: streamingTelemetry.snapshot(),
+          worldStreaming: worldStreamingCoordinator.snapshot(),
           diagnostics: diagnostics.snapshot({
             drawCalls: renderer.info?.render?.calls ?? null,
             geometries: renderer.info?.memory?.geometries ?? null,
