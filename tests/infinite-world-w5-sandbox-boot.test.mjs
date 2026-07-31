@@ -1118,9 +1118,18 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
 
 test('Render Distance presets keep fixed gameplay coverage and resync Distant roots live', async t => {
   const expected = {
-    short: { natural: 84, terrain: 192, general: 112.5, settlement: 352 },
-    standard: { natural: 112, terrain: 256, general: 150, settlement: 656.25 },
-    current: { natural: 140, terrain: 352, general: 187.5, settlement: 875 },
+    short: {
+      natural: 84, terrain: 192, general: 112.5,
+      settlementMetadata: 352, settlementRender: 112.5, atmosphere: 'disabled',
+    },
+    standard: {
+      natural: 112, terrain: 256, general: 150,
+      settlementMetadata: 656.25, settlementRender: 150, atmosphere: 'disabled',
+    },
+    current: {
+      natural: 140, terrain: 352, general: 187.5,
+      settlementMetadata: 875, settlementRender: 875, atmosphere: 'manual-fog-blend',
+    },
   };
   const results = [];
   for (const preset of ['current', 'standard', 'short']) {
@@ -1149,7 +1158,13 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       assert.equal(snapshot.presentation.naturalVisibilityMeters, values.natural);
       assert.equal(snapshot.presentation.clipmapExtentMeters, values.terrain);
       assert.equal(snapshot.presentation.visibilityMeters, values.general);
-      assert.equal(snapshot.presentation.remoteHorizonHiddenDistanceMeters, values.settlement);
+      assert.equal(snapshot.presentation.settlementMetadataQueryDistanceMeters,
+        values.settlementMetadata);
+      assert.equal(snapshot.presentation.remoteHorizonHiddenDistanceMeters,
+        values.settlementRender);
+      assert.equal(snapshot.presentation.remoteHorizonFadeEndMeters,
+        values.settlementRender);
+      assert.equal(snapshot.presentation.remoteHorizonAtmosphereMode, values.atmosphere);
       results.push({
         preset,
         bootMs,
@@ -1157,6 +1172,12 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
         rootSwapMs: snapshot.presentation.rootSwapDurationMs,
         workerRequests: snapshot.chunkDataService.counts.transportCalls,
         trackedInstances: snapshot.resources.trackedFeatureInstanceCount,
+        canonicalMeshes: snapshot.presentation.canonicalMeshCount,
+        remoteMeshes: snapshot.presentation.remoteHorizonMeshCount,
+        visibleRemoteMeshes: snapshot.presentation.remoteHorizonVisibleMeshCount,
+        remoteMaterials: snapshot.presentation.remoteHorizonMaterialCount,
+        sceneObjects: snapshot.sceneObjectCount,
+        drawCalls: snapshot.renderInfo.drawCalls,
         naturalOwners: snapshot.presentation.queryNaturalOwnerChunkCount,
         settlements: snapshot.presentation.queryCandidateCount,
         buildings: snapshot.presentation.canonicalBuildingRecordCount

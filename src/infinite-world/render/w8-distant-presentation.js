@@ -19,6 +19,7 @@ import {
   W8_RENDER_DISTANCE_PRESETS,
   normalizeW8RenderDistancePreset,
   resolveW8RenderDistancePolicy,
+  resolveW8SettlementHandoffProgress,
 } from '../render-distance-policy.js';
 import {
   resolveW8RockCanonicalObject,
@@ -43,7 +44,10 @@ import {
   resolveCanonicalRiverBed,
 } from '../canonical-river-realization.js';
 import {
+  W8_SETTLEMENT_SILHOUETTE_COLOR_HEX,
   W8_SETTLEMENT_ROLE_LANDMARKS,
+  resolveW8RemoteSettlementOpacityAtDistance,
+  resolveW8RemoteSettlementAtmosphere,
   resolveW8SettlementPresentationPolicy,
   selectRemoteHorizonBuildings,
   selectW8SettlementPresentationCandidates,
@@ -383,6 +387,7 @@ export async function createW8DistantPresentation({
   const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
   const Object3D = requireConstructor(THREE, 'Object3D');
   const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
+  const Color = requireConstructor(THREE, 'Color');
   const Material = typeof THREE.MeshPhongMaterial === 'function'
     ? THREE.MeshPhongMaterial : requireConstructor(THREE, 'MeshLambertMaterial');
   const macroEvaluator = await createMacroTerrainEvaluator(worldSeedHash);
@@ -1195,6 +1200,10 @@ export async function createW8DistantPresentation({
       farEligible,
       visibleLod: null,
       presentationTier: null,
+      localBuildingHandoff: false,
+      fullPresentationOpacity: 0,
+      horizonPresentationOpacity: 0,
+      remotePresentationOpacity: 0,
       instances: [],
     };
     context.generation.canonicalObjects.set(record.stableId, object);
@@ -1753,27 +1762,208 @@ export async function createW8DistantPresentation({
     }
   };
 
-  const createHorizonSilhouetteMaterial = () => new Material({
-    color: 0x3a3932,
-    flatShading: true,
-    shininess: 0,
-  });
+  const configureLocalHandoffMaterial = (material, mode) => {
+    const sourceTransparent = material.transparent === true;
+    const sourceOpacity = Number.isFinite(material.opacity) ? material.opacity : 1;
+    if (sourceTransparent) {
+      material.transparent = true;
+      material.alphaHash = false;
+    } else {
+      material.transparent = false;
+      material.alphaHash = true;
+      material.depthWrite = true;
+    }
+    material.opacity = sourceOpacity;
+    material.userData = {
+      ...(material.userData ?? {}),
+      localBuildingHandoff: true,
+      localBuildingHandoffMode: 'instance-opacity-shader',
+      localBuildingHandoffTier: mode,
+    };
+    const previousOnBeforeCompile = material.onBeforeCompile;
+    const previousProgramCacheKey = material.customProgramCacheKey?.bind(material);
+    material.onBeforeCompile = shader => {
+      previousOnBeforeCompile?.call(material, shader);
+      const vertexAnchor = '#include <begin_vertex>';
+      const fragmentColor = '#include <color_fragment>';
+      if (!shader.vertexShader.includes(vertexAnchor)
+        || !shader.fragmentShader.includes(fragmentColor)) {
+        throw new Error('local Building handoff shader chunks are unavailable');
+      }
+      shader.vertexShader = [
+        'attribute float w8LocalHandoffOpacity;',
+        'varying float vW8LocalHandoffOpacity;',
+        shader.vertexShader,
+      ].join('\n').replace(
+        vertexAnchor,
+        `${vertexAnchor}\nvW8LocalHandoffOpacity = w8LocalHandoffOpacity;`,
+      );
+      shader.fragmentShader = [
+        'varying float vW8LocalHandoffOpacity;',
+        shader.fragmentShader,
+      ].join('\n').replace(
+        fragmentColor,
+        `${fragmentColor}\ndiffuseColor.a *= vW8LocalHandoffOpacity;`,
+      );
+    };
+    material.customProgramCacheKey = () => [
+      previousProgramCacheKey?.() ?? '',
+      `w8-local-building-handoff-${mode}-v1`,
+    ].join(':');
+    return material;
+  };
 
-  const createRemoteHorizonSilhouetteMaterial = () => new Material({
-    color: 0x3a3932,
-    flatShading: true,
-    shininess: 0,
-    fog: false,
-  });
+  const createHorizonSilhouetteMaterial = ({ handoff = false } = {}) => {
+    const material = new Material({
+      color: W8_SETTLEMENT_SILHOUETTE_COLOR_HEX,
+      flatShading: true,
+      shininess: 0,
+    });
+    return handoff ? configureLocalHandoffMaterial(material, 'horizon') : material;
+  };
+
+  const createRemoteHorizonSilhouetteMaterial = policy => {
+    const uniforms = {
+      w8RemotePlayerLocalXZ: { value: { x: 0, y: 0 } },
+      w8RemoteFadeStart: { value: policy.fadeStartMeters },
+      w8RemoteFogEnd: { value: policy.atmosphere.fogIntegrationEndMeters },
+      w8RemoteFadeEnd: { value: policy.fadeEndMeters },
+      w8RemoteHidden: { value: policy.hiddenDistanceMeters },
+      w8RemoteFogEdgeBlend: { value: policy.atmosphere.fogEdgeBlend },
+      w8RemoteFogEdgeOpacity: { value: policy.atmosphere.fogEdgeOpacity },
+      w8RemoteMaximumFogBlend: { value: policy.atmosphere.maximumFogBlend },
+      w8RemoteSilhouetteColor: {
+        value: new Color(policy.atmosphere.silhouetteColorHex),
+      },
+      w8RemoteFogColor: {
+        value: new Color(policy.atmosphere.fogColorHex),
+      },
+      w8RemoteUnitsPerMeter: { value: UNITS_PER_METER },
+    };
+    const material = new Material({
+      color: 0xffffff,
+      flatShading: true,
+      shininess: 0,
+      fog: false,
+      transparent: false,
+      alphaHash: true,
+      opacity: 1,
+      depthWrite: true,
+    });
+    material.userData = {
+      ...(material.userData ?? {}),
+      remoteBuildingAtmosphere: true,
+      remoteBuildingAtmosphereMode: 'instance-anchor-shader',
+      remoteAtmosphereUniforms: uniforms,
+    };
+    material.onBeforeCompile = shader => {
+      Object.assign(shader.uniforms, uniforms);
+      const vertexAnchor = '#include <begin_vertex>';
+      const fragmentColor = '#include <color_fragment>';
+      if (!shader.vertexShader.includes(vertexAnchor)
+        || !shader.fragmentShader.includes(fragmentColor)) {
+        throw new Error('remote Settlement atmosphere shader chunks are unavailable');
+      }
+      shader.vertexShader = [
+        'uniform vec2 w8RemotePlayerLocalXZ;',
+        'uniform float w8RemoteUnitsPerMeter;',
+        'attribute vec2 w8RemoteAnchorXZ;',
+        'varying float vW8RemoteDistanceMeters;',
+        shader.vertexShader,
+      ].join('\n').replace(
+        vertexAnchor,
+        `${vertexAnchor}\nvW8RemoteDistanceMeters = length(w8RemoteAnchorXZ - w8RemotePlayerLocalXZ) / w8RemoteUnitsPerMeter;`,
+      );
+      shader.fragmentShader = [
+        'uniform float w8RemoteFadeStart;',
+        'uniform float w8RemoteFogEnd;',
+        'uniform float w8RemoteFadeEnd;',
+        'uniform float w8RemoteHidden;',
+        'uniform float w8RemoteFogEdgeBlend;',
+        'uniform float w8RemoteFogEdgeOpacity;',
+        'uniform float w8RemoteMaximumFogBlend;',
+        'uniform vec3 w8RemoteSilhouetteColor;',
+        'uniform vec3 w8RemoteFogColor;',
+        'varying float vW8RemoteDistanceMeters;',
+        shader.fragmentShader,
+      ].join('\n').replace(fragmentColor, [
+        fragmentColor,
+        'float w8RemoteFogProgress = smoothstep(w8RemoteFadeStart, w8RemoteFogEnd, vW8RemoteDistanceMeters);',
+        'float w8RemoteHorizonProgress = smoothstep(w8RemoteFogEnd, w8RemoteFadeEnd, vW8RemoteDistanceMeters);',
+        'float w8RemoteFogBlend = w8RemoteFogEdgeBlend * w8RemoteFogProgress;',
+        'float w8RemoteOpacity = 1.0 - (1.0 - w8RemoteFogEdgeOpacity) * w8RemoteFogProgress;',
+        'if (vW8RemoteDistanceMeters > w8RemoteFogEnd) {',
+        '  w8RemoteFogBlend = mix(w8RemoteFogEdgeBlend, w8RemoteMaximumFogBlend, w8RemoteHorizonProgress);',
+        '  w8RemoteOpacity = w8RemoteFogEdgeOpacity * (1.0 - w8RemoteHorizonProgress);',
+        '}',
+        'if (vW8RemoteDistanceMeters >= w8RemoteHidden) w8RemoteOpacity = 0.0;',
+        'diffuseColor.rgb = mix(w8RemoteSilhouetteColor, w8RemoteFogColor, w8RemoteFogBlend);',
+        'diffuseColor.a *= w8RemoteOpacity;',
+      ].join('\n'));
+    };
+    material.customProgramCacheKey = () => 'w8-remote-building-atmosphere-v1';
+    return material;
+  };
+
+  const createRemoteHorizonGeometry = (sourceGeometry, bucket, context) => {
+    const InstancedBufferAttribute = THREE.InstancedBufferAttribute;
+    const geometry = sourceGeometry?.clone?.();
+    if (!geometry || geometry === sourceGeometry
+      || typeof geometry.setAttribute !== 'function'
+      || typeof InstancedBufferAttribute !== 'function') {
+      throw new Error('remote Settlement atmosphere requires cloned instanced geometry');
+    }
+    const anchorAttribute = new InstancedBufferAttribute(
+      new Float32Array(bucket.items.length * 2),
+      2,
+    );
+    geometry.setAttribute('w8RemoteAnchorXZ', anchorAttribute);
+    bucket.remoteAnchorAttribute = anchorAttribute;
+    context.generation.ownedGeometries.add(geometry);
+    return geometry;
+  };
+
+  const createLocalHandoffGeometry = (sourceGeometry, bucket, context) => {
+    const InstancedBufferAttribute = THREE.InstancedBufferAttribute;
+    const geometry = sourceGeometry?.clone?.();
+    if (!geometry || geometry === sourceGeometry
+      || typeof geometry.setAttribute !== 'function'
+      || typeof InstancedBufferAttribute !== 'function') {
+      throw new Error('local Building handoff requires cloned instanced geometry');
+    }
+    const opacityAttribute = new InstancedBufferAttribute(
+      new Float32Array(bucket.items.length),
+      1,
+    );
+    geometry.setAttribute('w8LocalHandoffOpacity', opacityAttribute);
+    bucket.localHandoffOpacityAttribute = opacityAttribute;
+    context.generation.ownedGeometries.add(geometry);
+    return geometry;
+  };
+
+  const localFullHandoffMaterial = (sourceMaterial, context) => {
+    const cached = context.generation.localFullHandoffMaterials.get(sourceMaterial);
+    if (cached) return cached;
+    const material = sourceMaterial?.clone?.();
+    if (!material || material === sourceMaterial) {
+      throw new Error('local Building handoff requires a cloned source material');
+    }
+    configureLocalHandoffMaterial(material, 'full');
+    context.generation.localFullHandoffMaterials.set(sourceMaterial, material);
+    context.generation.ownedMaterials.add(material);
+    return material;
+  };
 
   const prepareCanonicalBucketMesh = (bucket, context) => {
     if (!bucket.items.length) return null;
     const roadBucketStartedAt = bucket.geometry === '__road__' ? monotonicNow() : null;
-    const geometry = bucket.geometry === '__road__'
+    let geometry = bucket.geometry === '__road__'
       ? roadGeometry : visualAssets.geometries[bucket.geometry];
     const sourceMaterial = visualAssets.materials[bucket.material];
     const localHorizon = bucket.name === 'horizon-building'
       || bucket.name === 'horizon-landmark';
+    const localBuildingHandoff = bucket.name === 'building'
+      || bucket.name === 'horizon-building';
     const remoteHorizon = bucket.name === 'remote-horizon-building'
       || bucket.name === 'remote-horizon-landmark';
     const generatedMaterial = localHorizon || remoteHorizon;
@@ -1782,15 +1972,32 @@ export async function createW8DistantPresentation({
     }
     let material = sourceMaterial;
     if (localHorizon) {
-      material = context.generation.horizonSilhouetteMaterial
-        ?? createHorizonSilhouetteMaterial();
-      context.generation.horizonSilhouetteMaterial = material;
+      if (bucket.name === 'horizon-building') {
+        material = context.generation.horizonBuildingSilhouetteMaterial
+          ?? createHorizonSilhouetteMaterial({ handoff: true });
+        context.generation.horizonBuildingSilhouetteMaterial = material;
+      } else {
+        material = context.generation.horizonSilhouetteMaterial
+          ?? createHorizonSilhouetteMaterial();
+        context.generation.horizonSilhouetteMaterial = material;
+      }
       context.generation.ownedMaterials.add(material);
     } else if (remoteHorizon) {
-      material = context.generation.remoteHorizonSilhouetteMaterial
-        ?? createRemoteHorizonSilhouetteMaterial();
-      context.generation.remoteHorizonSilhouetteMaterial = material;
-      context.generation.ownedMaterials.add(material);
+      material = context.generation.remoteHorizonSilhouetteMaterial;
+      if (!material) {
+        material = createRemoteHorizonSilhouetteMaterial(
+          context.generation.settlementPresentationPolicy.remote,
+        );
+        context.generation.remoteHorizonSilhouetteMaterial = material;
+        context.generation.ownedMaterials.add(material);
+      }
+      geometry = createRemoteHorizonGeometry(geometry, bucket, context);
+    }
+    if (localBuildingHandoff) {
+      if (bucket.name === 'building') {
+        material = localFullHandoffMaterial(sourceMaterial, context);
+      }
+      geometry = createLocalHandoffGeometry(geometry, bucket, context);
     }
     const mesh = new InstancedMesh(geometry, material, bucket.items.length);
     mesh.name = `w8-canonical-lod-${bucket.name}-${bucket.geometry}-${bucket.material}`;
@@ -1802,6 +2009,8 @@ export async function createW8DistantPresentation({
       presentationOnly: true,
       canonicalStableIds: [],
       canonicalObjects: [],
+      canonicalOpacities: [],
+      remoteSettlementIds: [],
     };
     return { mesh, roadBucketStartedAt };
   };
@@ -1845,6 +2054,64 @@ export async function createW8DistantPresentation({
     );
   };
 
+  const remoteAnchorValues = bucket => (
+    bucket.remoteAnchorAttribute?.array ?? bucket.remoteAnchorAttribute?.values ?? null
+  );
+
+  const writeRemoteBuildingAnchor = (bucket, index, object, generation) => {
+    const values = remoteAnchorValues(bucket);
+    if (!values) return;
+    values[index * 2] = (
+      object.worldX - generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
+    ) * UNITS_PER_METER;
+    values[index * 2 + 1] = (
+      object.worldZ - generation.buildOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS
+    ) * UNITS_PER_METER;
+  };
+
+  const finishRemoteBuildingAnchorWrite = (bucket, mesh, canonicalObjects) => {
+    if (!remoteAnchorValues(bucket)) return;
+    bucket.remoteAnchorAttribute.needsUpdate = true;
+    // setMatrixAt() does not invalidate InstancedMesh bounds in Three r160.
+    // Force the renderer to derive bounds from the newly compacted instances.
+    mesh.boundingBox = null;
+    mesh.boundingSphere = null;
+    mesh.userData.remoteSettlementIds = Object.freeze([...new Set(canonicalObjects
+      .map(record => record.settlementId ?? record.parentSettlementId)
+      .filter(Boolean))].sort((left, right) => left.localeCompare(right)));
+  };
+
+  const localHandoffOpacityValues = bucket => (
+    bucket.localHandoffOpacityAttribute?.array
+      ?? bucket.localHandoffOpacityAttribute?.values
+      ?? null
+  );
+
+  const canonicalInstanceOpacity = (object, item) => {
+    if (item.visibilityTiers.includes('remote-horizon')) {
+      return object.presentationTier === 'remote-horizon'
+        ? object.remotePresentationOpacity : 0;
+    }
+    if (object.localBuildingHandoff) {
+      if (item.visibilityTiers.includes('horizon')) {
+        return object.horizonPresentationOpacity;
+      }
+      if (item.visibilityTiers.includes('full')) return object.fullPresentationOpacity;
+    }
+    return object.presentationTier && item.visibilityTiers.includes(object.presentationTier)
+      ? 1 : 0;
+  };
+
+  const writeLocalHandoffOpacity = (bucket, index, opacity) => {
+    const values = localHandoffOpacityValues(bucket);
+    if (values) values[index] = opacity;
+  };
+
+  const finishLocalHandoffOpacityWrite = bucket => {
+    if (!localHandoffOpacityValues(bucket)) return;
+    bucket.localHandoffOpacityAttribute.needsUpdate = true;
+  };
+
   const finishCanonicalCompose = (generation, composed, matrixUpdates) => {
     const nearStableIds = generation.nearVisibleStableIds ?? new Set();
     generation.stats.canonicalComposeCount += 1;
@@ -1880,20 +2147,27 @@ export async function createW8DistantPresentation({
       let count = 0;
       const stableIds = [];
       const canonicalObjects = [];
+      const canonicalOpacities = [];
       for (const item of bucket.items) {
+        const opacity = canonicalInstanceOpacity(item.object, item);
         if (!['mid', 'far'].includes(item.object.visibleLod)
           || (item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
-          || !item.object.presentationTier
-          || !item.visibilityTiers.includes(item.object.presentationTier)) continue;
+          || !(opacity > 0)) continue;
         mesh.setMatrixAt(count, item.matrix);
+        writeRemoteBuildingAnchor(bucket, count, item.object, generation);
+        writeLocalHandoffOpacity(bucket, count, opacity);
         matrixUpdates += 1;
         stableIds.push(item.object.stableId);
         canonicalObjects.push(item.object.record);
+        canonicalOpacities.push(opacity);
         count += 1;
       }
       mesh.count = count;
       mesh.userData.canonicalStableIds = stableIds;
       mesh.userData.canonicalObjects = canonicalObjects;
+      mesh.userData.canonicalOpacities = canonicalOpacities;
+      finishRemoteBuildingAnchorWrite(bucket, mesh, canonicalObjects);
+      finishLocalHandoffOpacityWrite(bucket);
       mesh.instanceMatrix.needsUpdate = true;
       if (roadBucketStartedAt !== null) {
         generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - roadBucketStartedAt;
@@ -1918,15 +2192,19 @@ export async function createW8DistantPresentation({
       let count = 0;
       const stableIds = [];
       const canonicalObjects = [];
+      const canonicalOpacities = [];
       for (const item of bucket.items) {
+        const opacity = canonicalInstanceOpacity(item.object, item);
         if (['mid', 'far'].includes(item.object.visibleLod)
           && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
-          && item.object.presentationTier
-          && item.visibilityTiers.includes(item.object.presentationTier)) {
+          && opacity > 0) {
           mesh.setMatrixAt(count, item.matrix);
+          writeRemoteBuildingAnchor(bucket, count, item.object, generation);
+          writeLocalHandoffOpacity(bucket, count, opacity);
           matrixUpdates += 1;
           stableIds.push(item.object.stableId);
           canonicalObjects.push(item.object.record);
+          canonicalOpacities.push(opacity);
           count += 1;
         }
         const pendingYield = scheduler.checkpoint();
@@ -1935,6 +2213,9 @@ export async function createW8DistantPresentation({
       mesh.count = count;
       mesh.userData.canonicalStableIds = stableIds;
       mesh.userData.canonicalObjects = canonicalObjects;
+      mesh.userData.canonicalOpacities = canonicalOpacities;
+      finishRemoteBuildingAnchorWrite(bucket, mesh, canonicalObjects);
+      finishLocalHandoffOpacityWrite(bucket);
       mesh.instanceMatrix.needsUpdate = true;
       if (roadBucketStartedAt !== null) {
         generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - roadBucketStartedAt;
@@ -2137,12 +2418,12 @@ export async function createW8DistantPresentation({
     distanceMeters,
     quality,
     visible,
-    currentSettlementId,
+    localSettlementIds,
     settlementLod,
   ) => {
     if (!visible) return null;
     if (!isHorizonRecord(object.record)) return 'full';
-    if (!currentSettlementId || object.settlementId !== currentSettlementId) return 'full';
+    if (!localSettlementIds?.has(object.settlementId)) return 'full';
     if (distanceMeters >= settlementLod.visibilityMeters) return null;
     if (distanceMeters >= settlementLod.fadeStartMeters) {
       const fade = 1 - smoothstep((distanceMeters - settlementLod.fadeStartMeters)
@@ -2150,23 +2431,49 @@ export async function createW8DistantPresentation({
       const ditherRank = textHash(`${object.stableId}:w8-high-building-horizon-fade`) / 0x1_0000_0000;
       if (!(ditherRank < fade)) return null;
     }
-    return distanceMeters < settlementLod.fullDistanceMeters ? 'full' : 'horizon';
+    const horizonOpacity = resolveW8SettlementHandoffProgress(distanceMeters, settlementLod);
+    object.localBuildingHandoff = object.record.featureType === 'settlement-building';
+    object.fullPresentationOpacity = Math.round((1 - horizonOpacity) * 1e6) / 1e6;
+    object.horizonPresentationOpacity = horizonOpacity;
+    if (horizonOpacity <= 0) return 'full';
+    if (object.fullPresentationOpacity <= 0) return 'horizon';
+    return 'full-horizon-handoff';
   };
 
   const remoteSettlementPresentationTier = (
     object,
-    boundaryDistanceMeters,
-    quality,
-    renderDistancePreset,
+    buildingDistanceMeters,
+    policy,
     visible,
   ) => {
-    if (!visible || !object.remoteHorizon) return null;
-    const policy = resolveW8SettlementPresentationPolicy(
-      quality,
-      renderDistancePreset,
-    ).remote;
-    if (boundaryDistanceMeters > policy.hiddenDistanceMeters) return null;
+    if (!visible || !object.remoteHorizon) {
+      object.remotePresentationOpacity = 0;
+      return null;
+    }
+    object.remotePresentationOpacity = resolveW8RemoteSettlementOpacityAtDistance(
+      buildingDistanceMeters,
+      policy,
+    );
+    if (object.remotePresentationOpacity <= 0) {
+      return null;
+    }
     return 'remote-horizon';
+  };
+
+  const canonicalBucketVisibilityKey = bucket => (
+    `${bucket.name}:${bucket.geometry}:${bucket.material}`
+  );
+
+  const updateRemoteHorizonPlayerUniform = (generation, playerX, playerZ) => {
+    const playerUniform = generation.remoteHorizonSilhouetteMaterial
+      ?.userData?.remoteAtmosphereUniforms?.w8RemotePlayerLocalXZ?.value;
+    if (!playerUniform) return;
+    playerUniform.x = (
+      playerX - generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
+    ) * UNITS_PER_METER;
+    playerUniform.y = (
+      playerZ - generation.buildOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS
+    ) * UNITS_PER_METER;
   };
 
   const updateCanonicalVisibility = (
@@ -2178,6 +2485,13 @@ export async function createW8DistantPresentation({
     if (!generation) return;
     const renderDistancePolicy = generation.renderDistancePolicy
       ?? resolveW8RenderDistancePolicy(generation.renderDistancePreset);
+    const settlementPresentationPolicy = generation.settlementPresentationPolicy
+      ?? resolveW8SettlementPresentationPolicy(
+        generation.quality,
+        generation.renderDistancePreset,
+      );
+    const remoteSettlementPolicy = settlementPresentationPolicy.remote;
+    updateRemoteHorizonPlayerUniform(generation, playerX, playerZ);
     const visibility = renderDistancePolicy.generalObjectVisibilityMeters;
     const naturalVisibility = renderDistancePolicy.naturalVisibilityMeters;
     let farCount = 0;
@@ -2217,10 +2531,7 @@ export async function createW8DistantPresentation({
       for (const object of generation.canonicalObjects.values()) {
         if (!object.remoteHorizon) continue;
         for (const instance of object.instances) {
-          dirtyBuckets.set(
-            instance.bucket.name + ':' + instance.bucket.geometry + ':' + instance.bucket.material,
-            instance.bucket,
-          );
+          dirtyBuckets.set(canonicalBucketVisibilityKey(instance.bucket), instance.bucket);
         }
       }
       generation.nearVisibleStableSignature = nearStableSignature;
@@ -2228,15 +2539,15 @@ export async function createW8DistantPresentation({
     generation.nearVisibleStableIds = nearVisibleStableIds;
     generation.nearVisibleSettlementIds = nearVisibleSettlementIds;
     for (const object of generation.canonicalObjects.values()) {
+      const previousFullOpacity = object.fullPresentationOpacity;
+      const previousHorizonOpacity = object.horizonPresentationOpacity;
+      const previousRemoteOpacity = object.remotePresentationOpacity;
+      object.localBuildingHandoff = false;
+      object.fullPresentationOpacity = 0;
+      object.horizonPresentationOpacity = 0;
+      object.remotePresentationOpacity = 0;
       let nextLod = 'hidden';
       const distanceMeters = Math.hypot(object.worldX - playerX, object.worldZ - playerZ);
-      const remoteCenterDistanceMeters = object.remoteHorizon ? Math.hypot(
-        object.settlementCenterX - playerX,
-        object.settlementCenterZ - playerZ,
-      ) : distanceMeters;
-      const remoteBoundaryDistanceMeters = object.remoteHorizon
-        ? Math.max(0, remoteCenterDistanceMeters - object.settlementRadiusMeters)
-        : distanceMeters;
       const tree = object.record.featureType === 'natural-vegetation'
         && object.record.subtype !== 'shrub';
       const rock = object.record.featureType === 'natural-rock';
@@ -2252,9 +2563,8 @@ export async function createW8DistantPresentation({
         : distanceMeters <= objectNaturalVisibility;
       const remoteTier = remoteSettlementPresentationTier(
         object,
-        remoteBoundaryDistanceMeters,
-        generation.quality,
-        generation.renderDistancePreset,
+        distanceMeters,
+        remoteSettlementPolicy,
         !nearVisibleStableIds.has(object.stableId),
       );
       const hasLocalPresentation = object.instances.some(instance => (
@@ -2297,7 +2607,7 @@ export async function createW8DistantPresentation({
           distanceMeters,
           generation.quality,
           distantVisible,
-          generation.currentSettlementId,
+          generation.localSettlementIds,
           renderDistancePolicy.settlementLod,
         );
       if (distantVisible && object.remoteHorizon && !hasLocalPresentation) {
@@ -2309,6 +2619,11 @@ export async function createW8DistantPresentation({
       }
       if (nextLod === 'near') {
         presentationTier = object.record.lodPolicy?.outer === null ? null : 'full';
+        object.fullPresentationOpacity = presentationTier ? 1 : 0;
+        object.horizonPresentationOpacity = 0;
+        object.remotePresentationOpacity = 0;
+      } else if (presentationTier !== 'remote-horizon') {
+        object.remotePresentationOpacity = 0;
       }
       if ((tree || isHorizonRecord(object.record) || object.remoteHorizon)
         && distantVisible && !presentationTier) {
@@ -2371,7 +2686,17 @@ export async function createW8DistantPresentation({
         visibleRockCount += 1;
       } else if ((isHorizonRecord(object.record) || object.remoteHorizon)
         && (nextLod === 'far' || nextLod === 'mid' || nextLod === 'near')) {
-        if (presentationTier === 'horizon' || presentationTier === 'remote-horizon') {
+        if (presentationTier === 'full-horizon-handoff') {
+          if (object.record.featureType === 'settlement-building') {
+            visibleHorizonBuildingCount += 1;
+          }
+          visibleBuildingPartInstanceCount += object.instances.filter(instance => (
+            instance.item.visibilityTiers.includes('full')
+          )).length;
+          visibleHorizonPartInstanceCount += object.instances.filter(instance => (
+            instance.item.visibilityTiers.includes('horizon')
+          )).length;
+        } else if (presentationTier === 'horizon' || presentationTier === 'remote-horizon') {
           if (object.record.featureType === 'settlement-building') visibleHorizonBuildingCount += 1;
           else if (!object.remoteHorizon) visibleHorizonLandmarkCount += 1;
           visibleHorizonPartInstanceCount += object.instances.filter(instance => (
@@ -2383,9 +2708,13 @@ export async function createW8DistantPresentation({
           )).length;
         }
       }
-      if (object.visibleLod === nextLod && object.presentationTier === presentationTier) continue;
+      const opacityChanged = previousFullOpacity !== object.fullPresentationOpacity
+        || previousHorizonOpacity !== object.horizonPresentationOpacity
+        || previousRemoteOpacity !== object.remotePresentationOpacity;
+      if (object.visibleLod === nextLod && object.presentationTier === presentationTier
+        && !opacityChanged) continue;
       for (const instance of object.instances) {
-        dirtyBuckets.set(instance.bucket.name + ':' + instance.bucket.geometry + ':' + instance.bucket.material, instance.bucket);
+        dirtyBuckets.set(canonicalBucketVisibilityKey(instance.bucket), instance.bucket);
       }
       object.visibleLod = nextLod;
       object.presentationTier = presentationTier;
@@ -2905,7 +3234,10 @@ export async function createW8DistantPresentation({
       renderDistancePolicy.id,
     );
     const localQueryRadius = visibilityMeters + CANONICAL_QUERY_MARGIN_METERS;
-    const queryRadius = Math.max(localQueryRadius, settlementPolicy.remote.hiddenDistanceMeters);
+    const queryRadius = Math.max(
+      localQueryRadius,
+      settlementPolicy.metadata.queryDistanceMeters,
+    );
     const [candidateResult] = await mapWithQueryConcurrency(
       [{ centerWorldX, centerWorldZ, queryRadius }],
       query => findSettlementsNear(
@@ -2927,7 +3259,7 @@ export async function createW8DistantPresentation({
       quality,
       renderDistancePreset: renderDistancePolicy.id,
     });
-    const selectedEntries = [selection.current, ...selection.remote].filter(Boolean);
+    const selectedEntries = [...selection.local, ...selection.remote];
     const templateResolutionStartedAt = globalThis.performance?.now?.() ?? Date.now();
     const resolvedTemplates = await mapWithQueryConcurrency(selectedEntries, entry => readThroughLru(
       templateCache,
@@ -2942,16 +3274,35 @@ export async function createW8DistantPresentation({
       ...entry,
       template: resolvedTemplates[index],
     })).filter(value => value.template);
-    const currentSelection = selected.find(value => (
-      value.candidate.settlementId === selection.current?.candidate.settlementId
-    )) ?? null;
-    const remoteSelections = selected.filter(value => (
-      value.candidate.settlementId !== currentSelection?.candidate.settlementId
+    const selectedById = new Map(selected.map(value => [value.candidate.settlementId, value]));
+    const localSelections = selection.local.map(value => (
+      selectedById.get(value.candidate.settlementId)
+    )).filter(Boolean);
+    const activeLocalSelection = selection.activeLocal
+      ? selectedById.get(selection.activeLocal.candidate.settlementId) ?? null
+      : null;
+    const additionalLocalSelections = localSelections.filter(value => (
+      value.candidate.settlementId !== activeLocalSelection?.candidate.settlementId
     ));
+    const remoteSelections = selection.remote.map(value => (
+      selectedById.get(value.candidate.settlementId)
+    )).filter(Boolean);
     const horizonSelections = [
-      ...(currentSelection ? [{ ...currentSelection, standby: true }] : []),
+      ...(activeLocalSelection ? [{ ...activeLocalSelection, standby: true }] : []),
       ...remoteSelections.map(value => ({ ...value, standby: false })),
     ];
+    const selectionDiagnostics = selection.ranked.map(value => {
+      const resolved = selectedById.get(value.candidate.settlementId);
+      return Object.freeze({
+        settlementId: value.candidate.settlementId,
+        centerDistanceMeters: value.centerDistanceMeters,
+        boundaryDistanceMeters: value.boundaryDistanceMeters,
+        tier: value.tier,
+        selected: value.selected,
+        selectedReason: value.selectedReason,
+        buildingCount: resolved?.template?.buildings?.length ?? null,
+      });
+    });
     const ownerQueries = new Map();
     const addOwnerCoordinate = (chunkX, chunkZ) => {
       const key = `${chunkX},${chunkZ}`;
@@ -2972,7 +3323,7 @@ export async function createW8DistantPresentation({
       const owner = determineDetailCandidateOwner(point);
       addOwnerCoordinate(owner.x, owner.z).settlementIds.add(settlementId);
     };
-    for (const template of currentSelection ? [currentSelection.template] : []) {
+    for (const { template } of localSelections) {
       assertCurrent?.();
       for (const building of template.buildings) {
         if (Math.hypot(
@@ -3171,7 +3522,13 @@ export async function createW8DistantPresentation({
       naturalVisibilityMeters,
       naturalQueryRadius,
       candidateCount: candidates.length,
-      currentSettlementId: currentSelection?.candidate.settlementId ?? null,
+      activeLocalSettlementId: activeLocalSelection?.candidate.settlementId ?? null,
+      additionalLocalSettlementIds: additionalLocalSelections.map(value => (
+        value.candidate.settlementId
+      )),
+      localSettlementIds: localSelections.map(value => value.candidate.settlementId),
+      localSettlementLimit: settlementPolicy.local.settlementLimit,
+      settlementSelections: Object.freeze(selectionDiagnostics),
       templateSuccessCount: selected.length,
       remoteCandidateCount: selection.remote.length,
       remoteSelectedCount: remoteSelections.length,
@@ -3181,8 +3538,13 @@ export async function createW8DistantPresentation({
       remotePartLimit: settlementPolicy.remote.partLimit,
       remoteHorizonStartMeters: settlementPolicy.remote.horizonStartMeters,
       remoteFadeStartMeters: settlementPolicy.remote.fadeStartMeters,
+      remoteFadeEndMeters: settlementPolicy.remote.fadeEndMeters,
       remoteHiddenDistanceMeters: settlementPolicy.remote.hiddenDistanceMeters,
       remoteFogEnabled: settlementPolicy.remote.fog,
+      remoteAtmosphereMode: settlementPolicy.remote.atmosphere.mode,
+      remoteFogIntegrationEndMeters:
+        settlementPolicy.remote.atmosphere.fogIntegrationEndMeters,
+      settlementMetadataQueryDistanceMeters: settlementPolicy.metadata.queryDistanceMeters,
       ownerChunkCount: owners.length,
       ownerChunkKeys: owners.map(owner => owner.key),
       naturalOwnerChunkCount: owners.filter(owner => (
@@ -3234,7 +3596,7 @@ export async function createW8DistantPresentation({
         (sum, value) => sum + (value.chunk?.settlementLandmarks?.length ?? 0),
         0,
       ),
-      settlementIds: new Set(currentSelection ? [currentSelection.candidate.settlementId] : []),
+      settlementIds: new Set(localSelections.map(value => value.candidate.settlementId)),
       remoteHorizons: Object.freeze(remoteHorizons),
       riverProjections: Object.freeze(riverProjections),
       chunks: chunks.filter(value => value.chunk),
@@ -3527,6 +3889,98 @@ export async function createW8DistantPresentation({
       missingOwnerKeys: Object.freeze([]),
       activeRootId: generation.root.name,
     });
+  };
+
+  const snapshotRemoteHorizonAtmospheres = generation => {
+    if (!generation) return Object.freeze({
+      settlements: Object.freeze({}),
+      buildings: Object.freeze({}),
+    });
+    const settlements = new Map();
+    const buildings = new Map();
+    for (const object of generation.canonicalObjects.values()) {
+      if (!object.remoteHorizon) continue;
+      const buildingDistanceMeters = Math.hypot(
+        object.worldX - generation.playerX,
+        object.worldZ - generation.playerZ,
+      );
+      const atmosphere = resolveW8RemoteSettlementAtmosphere({
+        boundaryDistanceMeters: buildingDistanceMeters,
+        quality: generation.quality,
+        renderDistancePreset: generation.renderDistancePreset,
+      });
+      buildings.set(object.stableId, Object.freeze({
+        settlementId: object.settlementId,
+        distanceMeters: buildingDistanceMeters,
+        worldX: object.worldX,
+        worldZ: object.worldZ,
+        visibleLod: object.visibleLod,
+        presentationTier: object.presentationTier,
+        ...atmosphere,
+      }));
+      if (!settlements.has(object.settlementId)) {
+        const centerDistanceMeters = Math.hypot(
+          object.settlementCenterX - generation.playerX,
+          object.settlementCenterZ - generation.playerZ,
+        );
+        const boundaryDistanceMeters = Math.max(
+          0,
+          centerDistanceMeters - object.settlementRadiusMeters,
+        );
+        settlements.set(object.settlementId, Object.freeze({
+          boundaryDistanceMeters,
+          ...resolveW8RemoteSettlementAtmosphere({
+            boundaryDistanceMeters,
+            quality: generation.quality,
+            renderDistancePreset: generation.renderDistancePreset,
+          }),
+        }));
+      }
+    }
+    const sortedObject = values => Object.freeze(Object.fromEntries(
+      [...values.entries()].sort(([left], [right]) => left.localeCompare(right)),
+    ));
+    return Object.freeze({
+      settlements: sortedObject(settlements),
+      buildings: sortedObject(buildings),
+    });
+  };
+  const emptyRemoteHorizonAtmospheres = Object.freeze({
+    settlements: Object.freeze({}),
+    buildings: Object.freeze({}),
+  });
+
+  const snapshotSettlementSelections = generation => {
+    if (!generation) return Object.freeze([]);
+    const objectsBySettlement = new Map();
+    for (const object of generation.canonicalObjects.values()) {
+      if (!object.settlementId) continue;
+      if (!objectsBySettlement.has(object.settlementId)) {
+        objectsBySettlement.set(object.settlementId, []);
+      }
+      objectsBySettlement.get(object.settlementId).push(object);
+    }
+    return Object.freeze((generation.settlementSelections ?? []).map(selection => {
+      const objects = objectsBySettlement.get(selection.settlementId) ?? [];
+      const stableIdSuppressionCount = objects.filter(object => (
+        generation.nearVisibleStableIds.has(object.stableId)
+      )).length;
+      const visibleInstanceCount = objects.reduce((sum, object) => {
+        if (!['mid', 'far'].includes(object.visibleLod) || !object.presentationTier) return sum;
+        return sum + object.instances.filter(instance => (
+          canonicalInstanceOpacity(object, instance.item) > 0
+        )).length;
+      }, 0);
+      return Object.freeze({
+        ...selection,
+        presentationStableIdCount: objects.length,
+        stableIdSuppressionCount,
+        registeredInstanceCount: objects.reduce((sum, object) => (
+          sum + object.instances.length
+        ), 0),
+        visibleInstanceCount,
+      });
+    }));
   };
 
   return Object.freeze({
@@ -4134,6 +4588,13 @@ export async function createW8DistantPresentation({
         quality,
         renderDistancePreset: requestedRenderDistancePreset,
         renderDistancePolicy: resolveW8RenderDistancePolicy(requestedRenderDistancePreset),
+        settlementPresentationPolicy: resolveW8SettlementPresentationPolicy(
+          quality,
+          requestedRenderDistancePreset,
+        ),
+        localFullHandoffMaterials: new Map(),
+        horizonBuildingSilhouetteMaterial: null,
+        remoteHorizonSilhouetteMaterial: null,
         buildOriginChunkX: renderOrigin.renderOriginChunkX,
         buildOriginChunkZ: renderOrigin.renderOriginChunkZ,
         currentOriginChunkX: renderOrigin.renderOriginChunkX,
@@ -4150,8 +4611,12 @@ export async function createW8DistantPresentation({
         queryRemotePartLimit: far.remotePartLimit,
         remoteHorizonStartMeters: far.remoteHorizonStartMeters,
         remoteHorizonFadeStartMeters: far.remoteFadeStartMeters,
+        remoteHorizonFadeEndMeters: far.remoteFadeEndMeters,
         remoteHorizonHiddenDistanceMeters: far.remoteHiddenDistanceMeters,
         remoteHorizonFogEnabled: far.remoteFogEnabled,
+        remoteHorizonAtmosphereMode: far.remoteAtmosphereMode,
+        remoteHorizonFogIntegrationEndMeters: far.remoteFogIntegrationEndMeters,
+        settlementMetadataQueryDistanceMeters: far.settlementMetadataQueryDistanceMeters,
         queryOwnerChunkCount: far.ownerChunkCount,
         queryOwnerChunkKeys: far.ownerChunkKeys,
         queryNaturalOwnerChunkCount: far.naturalOwnerChunkCount,
@@ -4182,7 +4647,11 @@ export async function createW8DistantPresentation({
         visibilityMeters: far.visibilityMeters,
         naturalVisibilityMeters: far.naturalVisibilityMeters,
         naturalQueryRadius: far.naturalQueryRadius,
-        currentSettlementId: far.currentSettlementId,
+        activeLocalSettlementId: far.activeLocalSettlementId,
+        additionalLocalSettlementIds: Object.freeze([...far.additionalLocalSettlementIds]),
+        localSettlementIds: new Set(far.localSettlementIds),
+        localSettlementLimit: far.localSettlementLimit,
+        settlementSelections: far.settlementSelections,
         remotePartBudgetRemaining: far.remotePartLimit,
         nearVisibleStableIds: new Set(),
         nearVisibleStableSignature: '',
@@ -4348,9 +4817,15 @@ export async function createW8DistantPresentation({
       positionGenerationForOrigin(activeGeneration, renderOrigin);
       return true;
     },
-    snapshot() {
+    snapshot({
+      includeRemoteHorizonAtmospheres = false,
+      includeSettlementSelectionDetails = false,
+    } = {}) {
       const stats = activeGeneration?.stats ?? emptyStats;
       const localTerrainStats = activeLocalTerrainGeneration?.stats ?? emptyStats;
+      const remoteAtmospheres = includeRemoteHorizonAtmospheres
+        ? snapshotRemoteHorizonAtmospheres(activeGeneration)
+        : emptyRemoteHorizonAtmospheres;
       return Object.freeze({
         schemaVersion: 'w8-distant-presentation-snapshot-1',
         ...stats,
@@ -4388,9 +4863,43 @@ export async function createW8DistantPresentation({
           activeGeneration?.queryRemoteHorizonOwnerChunkCount ?? 0,
         remoteHorizonStartMeters: activeGeneration?.remoteHorizonStartMeters ?? null,
         remoteHorizonFadeStartMeters: activeGeneration?.remoteHorizonFadeStartMeters ?? null,
+        remoteHorizonFadeEndMeters: activeGeneration?.remoteHorizonFadeEndMeters ?? null,
         remoteHorizonHiddenDistanceMeters:
           activeGeneration?.remoteHorizonHiddenDistanceMeters ?? null,
         remoteHorizonFogEnabled: activeGeneration?.remoteHorizonFogEnabled ?? null,
+        remoteHorizonAtmosphereMode:
+          activeGeneration?.remoteHorizonAtmosphereMode ?? null,
+        remoteHorizonFogIntegrationEndMeters:
+          activeGeneration?.remoteHorizonFogIntegrationEndMeters ?? null,
+        remoteHorizonSettlementAtmospheres: remoteAtmospheres.settlements,
+        remoteHorizonBuildingAtmospheres: remoteAtmospheres.buildings,
+        remoteHorizonAtmosphereShaderEnabled: Boolean(
+          activeGeneration?.remoteHorizonSilhouetteMaterial
+            ?.userData?.remoteBuildingAtmosphere,
+        ),
+        remoteHorizonPlayerLocalXZ: activeGeneration?.remoteHorizonSilhouetteMaterial
+          ? Object.freeze({
+            ...activeGeneration.remoteHorizonSilhouetteMaterial
+              .userData.remoteAtmosphereUniforms.w8RemotePlayerLocalXZ.value,
+          })
+          : null,
+        remoteHorizonMaterialCount:
+          activeGeneration?.remoteHorizonSilhouetteMaterial ? 1 : 0,
+        remoteHorizonMeshCount: [...(activeGeneration?.canonicalBuckets?.values() ?? [])]
+          .filter(bucket => bucket.name.startsWith('remote-horizon')).length,
+        remoteHorizonVisibleMeshCount: [...(activeGeneration?.canonicalBuckets?.values() ?? [])]
+          .filter(bucket => bucket.name.startsWith('remote-horizon') && bucket.mesh?.count > 0)
+          .length,
+        localBuildingHandoffMaterialCount: [...(activeGeneration?.ownedMaterials ?? [])]
+          .filter(material => material.userData?.localBuildingHandoff === true).length,
+        localBuildingHandoffMeshCount: [...(activeGeneration?.canonicalBuckets?.values() ?? [])]
+          .filter(bucket => bucket.localHandoffOpacityAttribute).length,
+        localBuildingHandoffVisibleMeshCount:
+          [...(activeGeneration?.canonicalBuckets?.values() ?? [])]
+            .filter(bucket => bucket.localHandoffOpacityAttribute && bucket.mesh?.count > 0)
+            .length,
+        settlementMetadataQueryDistanceMeters:
+          activeGeneration?.settlementMetadataQueryDistanceMeters ?? null,
         queryOwnerChunkCount: activeGeneration?.queryOwnerChunkCount ?? 0,
         queryOwnerChunkKeys: Object.freeze([
           ...(activeGeneration?.queryOwnerChunkKeys ?? []),
@@ -4432,9 +4941,21 @@ export async function createW8DistantPresentation({
         querySettlementFeatureCount: activeGeneration?.querySettlementFeatureCount ?? 0,
         queryMajorRoadFeatureCount: activeGeneration?.queryMajorRoadFeatureCount ?? 0,
         queryLandmarkCount: activeGeneration?.queryLandmarkCount ?? 0,
-        currentSettlementId: activeGeneration?.currentSettlementId ?? null,
-        currentSettlementNearVisible: activeGeneration?.currentSettlementId
-          ? activeGeneration.nearVisibleSettlementIds.has(activeGeneration.currentSettlementId)
+        activeLocalSettlementId: activeGeneration?.activeLocalSettlementId ?? null,
+        additionalLocalSettlementIds: Object.freeze([
+          ...(activeGeneration?.additionalLocalSettlementIds ?? []),
+        ]),
+        localSettlementIds: Object.freeze(sortedKeyList(
+          activeGeneration?.localSettlementIds ?? [],
+        )),
+        localSettlementLimit: activeGeneration?.localSettlementLimit ?? null,
+        settlementSelections: includeSettlementSelectionDetails
+          ? snapshotSettlementSelections(activeGeneration)
+          : Object.freeze([]),
+        activeLocalSettlementNearVisible: activeGeneration?.activeLocalSettlementId
+          ? activeGeneration.nearVisibleSettlementIds.has(
+            activeGeneration.activeLocalSettlementId,
+          )
           : false,
         distantVisibleStableIdCount: activeGeneration?.distantVisibleStableIds?.size ?? 0,
         templateCacheSize: templateCache.size,
@@ -4547,26 +5068,59 @@ export async function createW8DistantPresentation({
     canonicalAuditSnapshot() {
       const objects = activeGeneration ? [...activeGeneration.canonicalObjects.values()] : [];
       objects.sort((left, right) => left.stableId.localeCompare(right.stableId));
-      return Object.freeze(objects.map(object => Object.freeze({
-        identity: Object.freeze(structuredClone(object.identity)),
-        visibleLod: object.visibleLod,
-        presentationTier: object.presentationTier,
-        farEligible: object.farEligible,
-        instanceCount: object.instances.length,
-        composedInstanceCount: object.instances.reduce((count, instance) => (
-          count + (instance.bucket.mesh?.userData?.canonicalStableIds ?? [])
-            .filter(stableId => stableId === object.stableId).length
-        ), 0),
-        remoteHorizon: object.remoteHorizon === true,
-        ownerKey: object.ownerKey,
-        ownerActive: activeGeneration.activeKeys.has(object.ownerKey),
-        ownerRendered: activeGeneration.renderedKeys.has(object.ownerKey),
-        distanceMeters: Math.hypot(
+      const composedCountFor = (object, tier) => [...new Set(object.instances
+        .filter(instance => instance.item.visibilityTiers.includes(tier))
+        .map(instance => instance.bucket))].reduce((count, bucket) => (
+        count + (bucket.mesh?.userData?.canonicalStableIds ?? [])
+          .filter(stableId => stableId === object.stableId).length
+      ), 0);
+      return Object.freeze(objects.map(object => {
+        const distanceMeters = Math.hypot(
           object.worldX - activeGeneration.playerX,
           object.worldZ - activeGeneration.playerZ,
-        ),
-        meshVisible: object.instances.every(instance => instance.bucket.mesh?.visible !== false),
-      })));
+        );
+        return Object.freeze({
+          identity: Object.freeze(structuredClone(object.identity)),
+          visibleLod: object.visibleLod,
+          presentationTier: object.presentationTier,
+          farEligible: object.farEligible,
+          instanceCount: object.instances.length,
+          composedInstanceCount: object.instances.reduce((count, instance) => (
+            count + (instance.bucket.mesh?.userData?.canonicalStableIds ?? [])
+              .filter(stableId => stableId === object.stableId).length
+          ), 0),
+          stableIdHandoff: (
+            object.localBuildingHandoff
+              || object.remoteHorizon
+              || (
+                isHorizonRecord(object.record)
+                  && object.record.featureType === 'settlement-building'
+                  && activeGeneration.localSettlementIds.has(object.record.settlementId)
+              )
+          )
+            ? Object.freeze({
+              stableId: object.stableId,
+              distanceMeters,
+              fullOpacity: object.fullPresentationOpacity,
+              horizonOpacity: object.horizonPresentationOpacity,
+              remoteOpacity: object.remotePresentationOpacity,
+              selectedTier: object.presentationTier,
+              fullInstanceCount: composedCountFor(object, 'full'),
+              horizonInstanceCount: composedCountFor(object, 'horizon'),
+              remoteInstanceCount: composedCountFor(object, 'remote-horizon'),
+              owner: object.ownerKey,
+              presentationOnly: true,
+              gameplayRecord: object.record.remotePresentationOnly !== true,
+            })
+            : null,
+          remoteHorizon: object.remoteHorizon === true,
+          ownerKey: object.ownerKey,
+          ownerActive: activeGeneration.activeKeys.has(object.ownerKey),
+          ownerRendered: activeGeneration.renderedKeys.has(object.ownerKey),
+          distanceMeters,
+          meshVisible: object.instances.every(instance => instance.bucket.mesh?.visible !== false),
+        });
+      }));
     },
     dispose() {
       if (disposed) return;

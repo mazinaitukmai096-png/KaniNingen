@@ -1,7 +1,10 @@
 import { SETTLEMENT_TYPES } from '../settlement-type.js';
 import { FINITE_WORLD_UNITS_PER_METER, MIGRATED_SETTLEMENT_PROFILES } from './single-rural-settlement.js';
+import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  W8_RENDER_DISTANCE_PRESET_IDS,
+  W8_RENDER_FOG_COLOR_HEX,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
 
@@ -29,31 +32,83 @@ const MAXIMUM_FINITE_BUILDING_OPPORTUNITIES = Math.max(
   )),
 );
 const MAXIMUM_ROLE_LANDMARKS_PER_SETTLEMENT = 3;
-const maximumSettlementRadiusMeters = Math.max(...Object.values(MIGRATED_SETTLEMENT_PROFILES)
-  .map(profile => profile.radius / FINITE_WORLD_UNITS_PER_METER));
+export const W8_SETTLEMENT_SILHOUETTE_COLOR_HEX = 0x3a3932;
+const REMOTE_SETTLEMENT_MAXIMUM_FOG_BLEND = 0.96;
+const REMOTE_SETTLEMENT_FOG_EDGE_BLEND = 0.72;
+const REMOTE_SETTLEMENT_FOG_EDGE_OPACITY = 0.28;
+const minimumFormalSettlementSeparationMeters = Math.min(
+  ...Object.values(W5_SETTLEMENT_DISTRIBUTION.minimumDistanceMetersByTypePair)
+    .flatMap(byOtherType => Object.values(byOtherType)),
+);
+const maximumLocalSettlementCenterDistanceMeters = (
+  resolveW8RenderDistancePolicy(W8_RENDER_DISTANCE_PRESET_IDS.CURRENT)
+    .generalObjectVisibilityMeters
+  + W5_SETTLEMENT_DISTRIBUTION.maximumInfluenceRadiusMeters
+);
+const formalSettlementPackingRadiusMeters = minimumFormalSettlementSeparationMeters / 2;
+// Treat each formally spaced candidate as a non-overlapping disc. The expanded
+// local selection circle provides a conservative area bound without changing
+// the distribution contract or silently making the selection unbounded.
+export const W8_LOCAL_SETTLEMENT_SELECTION_LIMIT = Math.floor((
+  (maximumLocalSettlementCenterDistanceMeters + formalSettlementPackingRadiusMeters)
+    / formalSettlementPackingRadiusMeters
+) ** 2);
 const qualityPartCount = quality => quality === 'high' ? 2 : 1;
+const q6 = value => Math.round(value * 1e6) / 1e6;
+const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
+const smoothstep = value => {
+  const t = clamp(value, 0, 1);
+  return t * t * (3 - 2 * t);
+};
+
+const mixHexColor = (from, to, ratio) => {
+  const t = clamp(ratio, 0, 1);
+  const mix = shift => Math.round(
+    ((from >> shift) & 0xff) * (1 - t) + ((to >> shift) & 0xff) * t,
+  );
+  return (mix(16) << 16) | (mix(8) << 8) | mix(0);
+};
 
 const buildPresentationPolicy = (quality, renderDistancePreset) => {
   const distance = resolveW8RenderDistancePolicy(renderDistancePreset);
   const partsPerBuilding = qualityPartCount(quality);
+  const remoteEnabled = distance.id === W8_RENDER_DISTANCE_PRESET_IDS.CURRENT;
+  const remoteEndMeters = remoteEnabled
+    ? distance.settlementHorizonMeters
+    : distance.generalObjectVisibilityMeters;
   return Object.freeze({
     quality: ['high', 'medium', 'low'].includes(quality) ? quality : 'high',
     renderDistancePreset: distance.id,
+    metadata: Object.freeze({
+      queryDistanceMeters: distance.settlementHorizonMeters,
+    }),
     local: Object.freeze({
       fullDistanceMeters: distance.settlementLod.fullDistanceMeters,
       horizonStartMeters: distance.settlementLod.fullDistanceMeters,
+      handoffStartMeters: distance.settlementLod.handoffStartMeters,
+      handoffEndMeters: distance.settlementLod.handoffEndMeters,
+      handoffWidthMeters: distance.settlementLod.handoffWidthMeters,
       fadeStartMeters: distance.settlementLod.fadeStartMeters,
       hiddenDistanceMeters: distance.generalObjectVisibilityMeters,
+      settlementLimit: W8_LOCAL_SETTLEMENT_SELECTION_LIMIT,
     }),
     remote: Object.freeze({
+      enabled: remoteEnabled,
       horizonStartMeters: distance.generalObjectVisibilityMeters,
-      fadeStartMeters: Math.max(
-        distance.generalObjectVisibilityMeters,
-        distance.settlementHorizonMeters - maximumSettlementRadiusMeters,
-      ),
-      hiddenDistanceMeters: distance.settlementHorizonMeters,
+      fadeStartMeters: distance.generalObjectVisibilityMeters,
+      fadeEndMeters: remoteEndMeters,
+      hiddenDistanceMeters: remoteEndMeters,
       fog: false,
-      settlementLimit: 4,
+      atmosphere: Object.freeze({
+        mode: remoteEnabled ? 'manual-fog-blend' : 'disabled',
+        silhouetteColorHex: W8_SETTLEMENT_SILHOUETTE_COLOR_HEX,
+        fogColorHex: W8_RENDER_FOG_COLOR_HEX,
+        fogIntegrationEndMeters: distance.fogFarMeters,
+        fogEdgeBlend: REMOTE_SETTLEMENT_FOG_EDGE_BLEND,
+        fogEdgeOpacity: REMOTE_SETTLEMENT_FOG_EDGE_OPACITY,
+        maximumFogBlend: REMOTE_SETTLEMENT_MAXIMUM_FOG_BLEND,
+      }),
+      settlementLimit: remoteEnabled ? 4 : 0,
       buildingLimitPerSettlement: MAXIMUM_FINITE_BUILDING_OPPORTUNITIES,
       partsPerBuilding,
       partLimit: 5 * (MAXIMUM_FINITE_BUILDING_OPPORTUNITIES
@@ -82,6 +137,70 @@ export function resolveW8SettlementPresentationPolicy(
   renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
 ) {
   return buildPresentationPolicy(quality, renderDistancePreset);
+}
+
+export function resolveW8RemoteSettlementOpacityAtDistance(
+  boundaryDistanceMeters,
+  policy,
+) {
+  const distance = Number.isFinite(boundaryDistanceMeters)
+    ? Math.max(0, boundaryDistanceMeters)
+    : Infinity;
+  if (!policy?.enabled || distance >= policy.hiddenDistanceMeters) return 0;
+  const fogRange = policy.atmosphere.fogIntegrationEndMeters - policy.fadeStartMeters;
+  const horizonRange = policy.fadeEndMeters - policy.atmosphere.fogIntegrationEndMeters;
+  const fogProgress = fogRange > 0
+    ? smoothstep((distance - policy.fadeStartMeters) / fogRange)
+    : 1;
+  const horizonProgress = horizonRange > 0
+    ? smoothstep((distance - policy.atmosphere.fogIntegrationEndMeters) / horizonRange)
+    : 1;
+  const opacity = distance > policy.atmosphere.fogIntegrationEndMeters
+    ? policy.atmosphere.fogEdgeOpacity * (1 - horizonProgress)
+    : 1 - (1 - policy.atmosphere.fogEdgeOpacity) * fogProgress;
+  return q6(opacity);
+}
+
+export function resolveW8RemoteSettlementAtmosphere({
+  boundaryDistanceMeters,
+  quality = 'high',
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+} = {}) {
+  const policy = resolveW8SettlementPresentationPolicy(
+    quality,
+    renderDistancePreset,
+  ).remote;
+  const distance = Number.isFinite(boundaryDistanceMeters)
+    ? Math.max(0, boundaryDistanceMeters)
+    : Infinity;
+  const fogRange = policy.atmosphere.fogIntegrationEndMeters - policy.fadeStartMeters;
+  const horizonRange = policy.fadeEndMeters - policy.atmosphere.fogIntegrationEndMeters;
+  const fogProgress = fogRange > 0
+    ? smoothstep((distance - policy.fadeStartMeters) / fogRange)
+    : 1;
+  const horizonProgress = horizonRange > 0
+    ? smoothstep((distance - policy.atmosphere.fogIntegrationEndMeters) / horizonRange)
+    : 1;
+  let fogBlend = policy.enabled
+    ? policy.atmosphere.fogEdgeBlend * fogProgress
+    : 1;
+  if (distance > policy.atmosphere.fogIntegrationEndMeters) {
+    fogBlend = policy.atmosphere.fogEdgeBlend
+      + (policy.atmosphere.maximumFogBlend - policy.atmosphere.fogEdgeBlend) * horizonProgress;
+  }
+  const opacity = resolveW8RemoteSettlementOpacityAtDistance(distance, policy);
+  const colorHex = mixHexColor(
+    policy.atmosphere.silhouetteColorHex,
+    policy.atmosphere.fogColorHex,
+    fogBlend,
+  );
+  return Object.freeze({
+    visible: opacity > 0,
+    opacity,
+    fogBlend: q6(fogBlend),
+    contrast: q6(1 - fogBlend),
+    colorHex,
+  });
 }
 
 export function resolveSettlementCandidateRadiusMeters(candidate) {
@@ -125,19 +244,76 @@ export function selectW8SettlementPresentationCandidates({
         - Number(!W8_SETTLEMENT_ROLE_LANDMARKS[right.candidate.townType])
       || left.candidate.settlementId.localeCompare(right.candidate.settlementId)
   ));
-  const current = ranked.find(value => (
+  const localCandidates = ranked.filter(value => (
     value.boundaryDistanceMeters <= policy.local.hiddenDistanceMeters
-  )) ?? null;
-  const remote = ranked.filter(value => (
-    value.candidate.settlementId !== current?.candidate.settlementId
+  ));
+  const selectedLocalCandidates = localCandidates.slice(0, policy.local.settlementLimit);
+  const activeLocalCandidate = selectedLocalCandidates[0] ?? null;
+  const localCandidateIds = new Set(localCandidates.map(value => value.candidate.settlementId));
+  const selectedLocalIds = new Set(selectedLocalCandidates.map(value => (
+    value.candidate.settlementId
+  )));
+  const remoteCandidates = ranked.filter(value => (
+    policy.remote.enabled
+      && !selectedLocalIds.has(value.candidate.settlementId)
       && value.boundaryDistanceMeters >= policy.remote.horizonStartMeters
       && value.boundaryDistanceMeters <= policy.remote.hiddenDistanceMeters
-  )).slice(0, policy.remote.settlementLimit);
+  ));
+  const selectedRemoteCandidates = remoteCandidates.slice(0, policy.remote.settlementLimit);
+  const remoteCandidateIds = new Set(remoteCandidates.map(value => value.candidate.settlementId));
+  const selectedRemoteIds = new Set(selectedRemoteCandidates.map(value => (
+    value.candidate.settlementId
+  )));
+  const classified = ranked.map(value => {
+    const settlementId = value.candidate.settlementId;
+    let tier = 'excluded';
+    let selectedReason = 'outside-presentation-range';
+    if (settlementId === activeLocalCandidate?.candidate.settlementId) {
+      tier = 'active-local';
+      selectedReason = 'nearest-local';
+    } else if (selectedLocalIds.has(settlementId)) {
+      tier = 'additional-local';
+      selectedReason = 'within-local-band';
+    } else if (selectedRemoteIds.has(settlementId)) {
+      tier = 'remote';
+      selectedReason = 'within-remote-band';
+    } else if (localCandidateIds.has(settlementId)) {
+      selectedReason = 'local-limit';
+    } else if (!policy.remote.enabled
+      && value.boundaryDistanceMeters >= policy.remote.horizonStartMeters
+      && value.boundaryDistanceMeters <= policy.metadata.queryDistanceMeters) {
+      selectedReason = 'remote-disabled';
+    } else if (remoteCandidateIds.has(settlementId)) {
+      selectedReason = 'remote-limit';
+    }
+    return Object.freeze({
+      ...value,
+      tier,
+      selected: tier !== 'excluded',
+      selectedReason,
+    });
+  });
+  const classifiedById = new Map(classified.map(value => [
+    value.candidate.settlementId,
+    value,
+  ]));
+  const local = Object.freeze(selectedLocalCandidates.map(value => (
+    classifiedById.get(value.candidate.settlementId)
+  )));
+  const activeLocal = local[0] ?? null;
+  const additionalLocal = Object.freeze(local.slice(1));
+  const remote = Object.freeze(selectedRemoteCandidates.map(value => (
+    classifiedById.get(value.candidate.settlementId)
+  )));
+  const excluded = Object.freeze(classified.filter(value => !value.selected));
   return Object.freeze({
     policy,
-    current,
-    remote: Object.freeze(remote),
-    ranked: Object.freeze(ranked),
+    activeLocal,
+    additionalLocal,
+    local,
+    remote,
+    excluded,
+    ranked: Object.freeze(classified),
   });
 }
 
