@@ -369,6 +369,7 @@ export async function createW8DistantPresentation({
   resolveTemplate,
   getCanonicalChunkData,
   cancelCanonicalChunkRequests = null,
+  publishStaticOwnerTickets = null,
   isFeatureDestroyed = () => false,
   getNearVisibleStableIds = () => [],
   getNearVisibleSettlementIds = () => [],
@@ -384,6 +385,9 @@ export async function createW8DistantPresentation({
   }
   if (cancelCanonicalChunkRequests !== null && typeof cancelCanonicalChunkRequests !== 'function') {
     throw new TypeError('cancelCanonicalChunkRequests must be a function when provided');
+  }
+  if (publishStaticOwnerTickets !== null && typeof publishStaticOwnerTickets !== 'function') {
+    throw new TypeError('publishStaticOwnerTickets must be a function when provided');
   }
   if (typeof getNearVisibleStableIds !== 'function'
     || typeof getNearVisibleSettlementIds !== 'function') {
@@ -4832,6 +4836,14 @@ export async function createW8DistantPresentation({
         return false;
       }
       const previous = activeGeneration;
+      generation.staticPublicationTickets = publishStaticOwnerTickets?.({
+        ownerKeys: Object.freeze([...new Set([
+          ...(generation.queryNaturalOwnerChunkKeys ?? []),
+          ...(generation.queryForestHorizonOwnerChunkKeys ?? []),
+        ])]),
+        publicationGroup: 'natural-static',
+        epoch,
+      }) ?? Object.freeze([]);
       const rootSwapStartedAt = globalThis.performance?.now?.() ?? Date.now();
       root.add(generation.root);
       activeGeneration = generation;
@@ -4978,6 +4990,8 @@ export async function createW8DistantPresentation({
         queryNaturalOwnerChunkKeys: Object.freeze([
           ...(activeGeneration?.queryNaturalOwnerChunkKeys ?? []),
         ]),
+        staticPublicationTicketCount:
+          activeGeneration?.staticPublicationTickets?.length ?? 0,
         queryInnerNaturalOwnerChunkCount:
           activeGeneration?.queryInnerNaturalOwnerChunkCount ?? 0,
         queryUltraOwnerChunkCount: activeGeneration?.queryUltraOwnerChunkCount ?? 0,

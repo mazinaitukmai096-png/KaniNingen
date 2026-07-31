@@ -13,6 +13,8 @@ export const WORLD_STREAMING_PLAN_SCHEMA = 'world-streaming-plan-1';
 export const LEGACY_RUNTIME_CHUNK_POLICY_KIND = 'runtime-chunk-coverage';
 
 const q6 = value => Math.round(value * 1e6) / 1e6;
+const normalizedOwnerKeyArrayCache = new WeakMap();
+const ownerKeyUnionCache = new WeakMap();
 
 function finite(value, label) {
   if (!Number.isFinite(value)) throw new TypeError(`${label} must be finite`);
@@ -29,6 +31,8 @@ function normalizePosition(value, label) {
 
 function normalizeOwnerKeys(values, label) {
   if (!Array.isArray(values)) throw new TypeError(`${label} must be an array`);
+  const cached = normalizedOwnerKeyArrayCache.get(values);
+  if (cached) return cached;
   const coordinates = new Map();
   for (const value of values) {
     const coordinate = typeof value === 'string'
@@ -37,12 +41,27 @@ function normalizeOwnerKeys(values, label) {
     const key = createChunkKey(coordinate.chunkX, coordinate.chunkZ);
     coordinates.set(key, Object.freeze({ ...coordinate, key }));
   }
-  return Object.freeze([...coordinates.values()]
+  const normalized = Object.freeze([...coordinates.values()]
     .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX)
     .map(value => value.key));
+  if (Object.isFrozen(values)) normalizedOwnerKeyArrayCache.set(values, normalized);
+  return normalized;
 }
 
 function unionOwnerKeys(...sets) {
+  if (sets.length === 1) return sets[0];
+  if (sets.length === 2 && Object.isFrozen(sets[0]) && Object.isFrozen(sets[1])) {
+    let byRight = ownerKeyUnionCache.get(sets[0]);
+    if (!byRight) {
+      byRight = new WeakMap();
+      ownerKeyUnionCache.set(sets[0], byRight);
+    }
+    const cached = byRight.get(sets[1]);
+    if (cached) return cached;
+    const union = normalizeOwnerKeys([...sets[0], ...sets[1]], 'owner key union');
+    byRight.set(sets[1], union);
+    return union;
+  }
   return normalizeOwnerKeys(sets.flat(), 'owner key union');
 }
 
