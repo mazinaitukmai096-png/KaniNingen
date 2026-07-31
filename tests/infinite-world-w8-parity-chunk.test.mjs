@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { LOGICAL_CHUNK_SIZE_METERS, logicalWorldToOwnedChunk } from '../src/infinite-world/chunk-coordinates.js';
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { createW6ChunkGameplay } from '../src/infinite-world/gameplay-runtime.js';
+import { createW8ForestHorizonManifest } from '../src/infinite-world/forest-horizon-manifest.js';
 import {
   W8_NATURAL_PRESENTATION_PHASE_1,
   createW8NaturalPresentationPhase1Policy,
@@ -21,6 +22,35 @@ import {
 } from '../src/infinite-world/w8-parity-chunk-generator.js';
 
 const seed = 'W8 parity golden seed';
+
+test('Forest horizon manifest is a strict Tree projection of the full canonical W8 Chunk', async () => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
+  try {
+    for (const [chunkX, chunkZ] of [[0, 0], [-2, 2], [31, 21]]) {
+      const full = await generator.generateChunk(chunkX, chunkZ);
+      const direct = await generator.generateForestHorizonManifest(chunkX, chunkZ);
+      const projected = createW8ForestHorizonManifest(full);
+      assert.equal(direct.schemaVersion, projected.schemaVersion);
+      assert.equal(direct.chunkId, full.chunkId);
+      assert.equal(direct.sourceW5ContentHash, full.sourceW5ContentHash);
+      assert.deepEqual(direct.generatorVersion, full.generatorVersion);
+      assert.deepEqual(direct.presentationLayers, projected.presentationLayers);
+      assert.equal(Object.hasOwn(direct, 'terrain'), false);
+      assert.equal(Object.hasOwn(direct, 'sourceChunkData'), false);
+      assert.match(direct.contentHash, /^sha256:[0-9a-f]{64}$/);
+      for (const tree of direct.presentationLayers.natural.vegetation) {
+        assert.equal(tree.subtype === 'shrub', false);
+        assert.deepEqual(tree.owningChunkCoordinate, { x: chunkX, z: chunkZ });
+        assert.equal(
+          tree.worldPosition.y,
+          sampleW8SurfaceHeightMeters(full, tree.worldPosition.x, tree.worldPosition.z),
+        );
+      }
+    }
+  } finally {
+    await generator.shutdown();
+  }
+});
 
 function candidateAt({ id, x, z, subtype = 'broadleaf-tree', radius = 2, metadata = {} }) {
   return Object.freeze({

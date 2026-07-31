@@ -28,6 +28,7 @@ import {
   MIGRATED_SETTLEMENT_PROFILES,
 } from './single-rural-settlement.js';
 import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
+import { createHashedW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import {
   composeW8SettlementPresentationTemplate,
   createW8SettlementParityOverlay,
@@ -617,12 +618,17 @@ function conflictsWithPresentation(point, radius, chunk, {
   return false;
 }
 
-function createPresentationLayers(chunk, overlays, experienceSpawn, naturalPresentationPolicy) {
+function createNaturalPresentationLayer(
+  chunk,
+  { waterSurfaces, settlementLandmarks },
+  experienceSpawn,
+  naturalPresentationPolicy,
+) {
   const compatibleVegetation = (chunk.vegetationCandidates ?? []).filter(candidate => !conflictsWithPresentation(
     candidate.worldPosition,
     candidate.metadata?.candidateRadiusMeters ?? 0.625,
     chunk,
-    { ...overlays, experienceSpawn },
+    { waterSurfaces, settlementLandmarks, experienceSpawn },
   ));
   const vegetation = naturalPresentationPolicy.selectVegetation({
     candidates: compatibleVegetation,
@@ -634,8 +640,28 @@ function createPresentationLayers(chunk, overlays, experienceSpawn, naturalPrese
     candidate.worldPosition,
     candidate.metadata?.candidateRadiusMeters ?? 0.45,
     chunk,
-    { ...overlays, experienceSpawn },
+    { waterSurfaces, settlementLandmarks, experienceSpawn },
   ));
+  return Object.freeze({
+    vegetation: Object.freeze(vegetation),
+    rocks: Object.freeze(rocks),
+    excludedVegetationCount: (chunk.vegetationCandidates?.length ?? 0) - vegetation.length,
+    excludedRockCount: (chunk.rockCandidates?.length ?? 0) - rocks.length,
+  });
+}
+
+function createPresentationLayers(
+  chunk,
+  overlays,
+  experienceSpawn,
+  naturalPresentationPolicy,
+  natural = createNaturalPresentationLayer(
+    chunk,
+    overlays,
+    experienceSpawn,
+    naturalPresentationPolicy,
+  ),
+) {
   return Object.freeze({
     schemaVersion: 'w8-presentation-layers-1',
     integrationOrder: Object.freeze([
@@ -655,12 +681,7 @@ function createPresentationLayers(chunk, overlays, experienceSpawn, naturalPrese
     water: Object.freeze(overlays.waterSurfaces),
     landmarks: Object.freeze(overlays.settlementLandmarks),
     streetDetails: Object.freeze(overlays.streetDetails),
-    natural: Object.freeze({
-      vegetation: Object.freeze(vegetation),
-      rocks: Object.freeze(rocks),
-      excludedVegetationCount: (chunk.vegetationCandidates?.length ?? 0) - vegetation.length,
-      excludedRockCount: (chunk.rockCandidates?.length ?? 0) - rocks.length,
-    }),
+    natural,
     ambientDetails: Object.freeze(overlays.ambientDetails),
   });
 }
@@ -1057,6 +1078,12 @@ export async function createW8ParityChunkGenerator({
     capacity: cacheCapacities.majorRoadSourceHash,
   });
   let isShutdown = false;
+  const resourceGenerationCounts = {
+    fullChunkRequests: 0,
+    fullChunkCompleted: 0,
+    forestHorizonManifestRequests: 0,
+    forestHorizonManifestCompleted: 0,
+  };
   const assertGeneratorActive = () => {
     if (isShutdown) throw new Error('W8 parity Chunk generator is shut down');
   };
@@ -1608,6 +1635,289 @@ export async function createW8ParityChunkGenerator({
       W8_SPAWN_SAFETY_CONTRACT.preparedDataRadiusChunks,
     );
   }
+
+  const prepareW8CanonicalChunkContext = async (chunkX, chunkZ) => {
+    assertGeneratorActive();
+    const sourceChunkData = await getSourceChunk(chunkX, chunkZ);
+    const overlayTemplates = await Promise.all(
+      (sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay),
+    );
+    const settlementOverlayFeatures = overlayTemplates.filter(Boolean)
+      .flatMap(template => template.buildings)
+      .filter(building => building.owningChunkCoordinate.x === chunkX
+        && building.owningChunkCoordinate.z === chunkZ)
+      .map(building => Object.freeze({
+        ...building,
+        worldPosition: Object.freeze({
+          x: building.x,
+          y: q6(sampleFormalTerrainHeightMeters(sourceChunkData, building.x, building.z)),
+          z: building.z,
+        }),
+      }))
+      .sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const overlayBySettlement = new Map(overlayTemplates.filter(Boolean)
+      .map(template => [template.settlementId, template]));
+    const settlementReferences = (sourceChunkData.settlementReferences ?? []).map(reference => {
+      const overlay = overlayBySettlement.get(reference.settlementId);
+      return overlay ? Object.freeze({
+        ...reference,
+        parityTargetBuildingCount: overlay.targetBuildingCount,
+        parityOverlayBuildingCount: overlay.overlayBuildingCount,
+        parityBuildingShortageCount: overlay.shortageCount,
+      }) : reference;
+    }).sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const fullSettlementBuildings = overlayTemplates.filter(Boolean).flatMap(template => [
+      ...template.sourceBuildings,
+      ...template.buildings,
+    ]);
+    const sourceFeatures = (sourceChunkData.settlementFeatures ?? []).filter(feature => (
+      feature.featureType !== 'settlement-road'
+      || !fullSettlementBuildings.some(building =>
+        roadIntersectsSettlementBuilding(feature, building))
+    ));
+    const localSettlementFeatures = [
+      ...sourceFeatures,
+      ...settlementOverlayFeatures,
+    ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const settlementSurfacePolicy = createSettlementSurfacePolicy(settlementReferences);
+    const localSurfaceBackedChunk = Object.freeze({
+      ...sourceChunkData,
+      settlementReferences: Object.freeze(settlementReferences),
+      settlementFeatures: Object.freeze(localSettlementFeatures),
+      canonicalSurfacePolicy: settlementSurfacePolicy,
+    });
+    const majorRoadFeatures = await createMajorRoadFeatures(
+      chunkX,
+      chunkZ,
+      localSurfaceBackedChunk,
+    );
+    const settlementFeatures = [
+      ...localSettlementFeatures,
+      ...majorRoadFeatures,
+    ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const riverProjection = await createCanonicalRiverProjection({
+      worldSeedHash: base.worldSeedHash,
+      chunkX,
+      chunkZ,
+      settlementReferences,
+      roads: settlementFeatures,
+      sampleSurfaceHeight: (worldX, worldZ) => sampleW8SurfaceHeightMeters(
+        localSurfaceBackedChunk,
+        worldX,
+        worldZ,
+      ),
+    });
+    const canonicalSurfacePolicy = createSettlementSurfacePolicy(
+      settlementReferences,
+      riverProjection.surfaceCorridor ? [riverProjection.surfaceCorridor] : [],
+    );
+    const surfaceBackedChunk = Object.freeze({
+      ...localSurfaceBackedChunk,
+      settlementFeatures: Object.freeze(settlementFeatures),
+      canonicalSurfacePolicy,
+    });
+    const groundPosition = position => Object.freeze({
+      ...position,
+      y: q6(sampleW8SurfaceHeightMeters(surfaceBackedChunk, position.x, position.z)),
+    });
+    const settlementGroundPosition = position => Object.freeze({
+      ...position,
+      y: q6(sampleW8SurfaceHeightMeters(localSurfaceBackedChunk, position.x, position.z)),
+    });
+    const reground = record => Object.freeze({
+      ...record,
+      worldPosition: groundPosition(record.worldPosition),
+    });
+    const groundedSettlementFeatures = settlementFeatures.map(record => Object.freeze({
+      ...record,
+      worldPosition: settlementGroundPosition(record.worldPosition),
+    }));
+    const parityGameplayChunk = Object.freeze({
+      ...surfaceBackedChunk,
+      vegetationCandidates: surfaceBackedChunk.vegetationCandidates,
+      rockCandidates: surfaceBackedChunk.rockCandidates,
+      settlementFeatures: Object.freeze(groundedSettlementFeatures),
+    });
+    const chunkId = createChunkId({
+      worldSeedHash: base.worldSeedHash,
+      generatorMajor: W8_PARITY_GENERATOR_VERSION.major,
+      chunkCoordinate: { x: chunkX, z: chunkZ },
+    });
+    return Object.freeze({
+      chunkX,
+      chunkZ,
+      chunkId,
+      sourceChunkData,
+      settlementReferences: Object.freeze(settlementReferences),
+      canonicalSurfacePolicy,
+      riverProjection,
+      groundPosition,
+      reground,
+      groundedOverlayFeatures: Object.freeze(
+        groundedSettlementFeatures.filter(feature => feature.parityOverlay),
+      ),
+      parityGameplayChunk,
+    });
+  };
+
+  const prepareW8NaturalPresentation = async (
+    context,
+    { includeFullPresentation = false } = {},
+  ) => {
+    const {
+      parityGameplayChunk,
+      canonicalSurfacePolicy,
+      riverProjection,
+      groundPosition,
+      reground,
+      settlementReferences,
+    } = context;
+    const [naturalWater, ambientDetailsRaw, distributedLandmarks, streetDetailsRaw] =
+      await Promise.all([
+        createWaterSurfaces(parityGameplayChunk, base.worldSeedHash),
+        includeFullPresentation
+          ? createAmbientDetails(parityGameplayChunk, seed, base.worldSeedHash)
+          : Promise.resolve([]),
+        createSettlementLandmarks(parityGameplayChunk, seed, base.worldSeedHash),
+        includeFullPresentation
+          ? createStreetDetails(parityGameplayChunk, base.worldSeedHash)
+          : Promise.resolve([]),
+      ]);
+    const naturalWaterWithoutRiverOverlap = naturalWater.filter(surface => {
+      const river = distanceToCanonicalRiverCenterline(
+        canonicalSurfacePolicy.riverCorridors,
+        surface.worldPosition.x,
+        surface.worldPosition.z,
+      );
+      return !river.corridor
+        || river.distanceMeters > river.corridor.bankExtentMeters;
+    });
+    const waterSurfaces = [
+      ...naturalWaterWithoutRiverOverlap
+        .map(surface => Object.freeze({
+          ...surface,
+          worldPosition: Object.freeze({
+            ...groundPosition(surface.worldPosition),
+            y: q6(groundPosition(surface.worldPosition).y + 0.0125),
+          }),
+        })),
+      ...(riverProjection.waterSurface ? [riverProjection.waterSurface] : []),
+    ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const settlementLandmarks = distributedLandmarks
+      .map(reground).sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const natural = createNaturalPresentationLayer(
+      parityGameplayChunk,
+      { waterSurfaces, settlementLandmarks },
+      experienceSpawn,
+      naturalPresentationPolicy,
+    );
+    if (!includeFullPresentation) {
+      return Object.freeze({
+        waterSurfaces: Object.freeze(waterSurfaces),
+        settlementLandmarks: Object.freeze(settlementLandmarks),
+        natural,
+      });
+    }
+    const ambientDetails = ambientDetailsRaw.filter(detail => {
+      const river = distanceToCanonicalRiverCenterline(
+        canonicalSurfacePolicy.riverCorridors,
+        detail.worldPosition.x,
+        detail.worldPosition.z,
+      );
+      return !river.corridor
+        || river.distanceMeters > river.corridor.widthMeters / 2 + 0.2;
+    }).map(reground)
+      .sort((left, right) => left.stableId.localeCompare(right.stableId));
+    for (const reference of settlementReferences) {
+      const diagnostic = getLruValue(settlementDiagnostics, reference.settlementId);
+      if (!diagnostic) continue;
+      const landmarkCount = settlementLandmarks.filter(value =>
+        value.parentSettlementId === reference.settlementId).length;
+      setLruValue(settlementDiagnostics, reference.settlementId, Object.freeze({
+        ...diagnostic,
+        landmarkCount: Math.max(diagnostic.landmarkCount ?? 0, landmarkCount),
+      }), cacheCapacities.settlementDiagnostics);
+    }
+    const streetDetails = streetDetailsRaw.map(reground)
+      .sort((left, right) => left.stableId.localeCompare(right.stableId));
+    return Object.freeze({
+      waterSurfaces: Object.freeze(waterSurfaces),
+      ambientDetails: Object.freeze(ambientDetails),
+      settlementLandmarks: Object.freeze(settlementLandmarks),
+      streetDetails: Object.freeze(streetDetails),
+      natural,
+    });
+  };
+
+  const generateW8ParityChunk = async (chunkX, chunkZ) => {
+    resourceGenerationCounts.fullChunkRequests += 1;
+    const context = await prepareW8CanonicalChunkContext(chunkX, chunkZ);
+    const presentation = await prepareW8NaturalPresentation(context, {
+      includeFullPresentation: true,
+    });
+    const presentationLayers = createPresentationLayers(
+      context.parityGameplayChunk,
+      presentation,
+      experienceSpawn,
+      naturalPresentationPolicy,
+      presentation.natural,
+    );
+    const content = {
+      ...context.parityGameplayChunk,
+      schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,
+      chunkId: context.chunkId,
+      generatorVersion: { ...W8_PARITY_GENERATOR_VERSION },
+      sourceW5ContentHash: context.sourceChunkData.contentHash,
+      sourceChunkData: context.sourceChunkData,
+      settlementOverlayFeatures: context.groundedOverlayFeatures,
+      waterSurfaces: presentation.waterSurfaces,
+      ambientDetails: presentation.ambientDetails,
+      settlementLandmarks: presentation.settlementLandmarks,
+      streetDetails: presentation.streetDetails,
+      riverRoadCrossings: context.riverProjection.roadCrossings,
+      riverPorts: context.riverProjection.ports,
+      presentationLayers,
+      generationProof: Object.freeze({
+        generator: 'w8-finite-experience-parity',
+        sourceW5ContentHash: context.sourceChunkData.contentHash,
+        finiteExperienceSourceCommit: 'f8bc9f80c2af417bb585bff26c99522c4229ab8e',
+        finiteExperienceConnected: true,
+        distributedSettlementSurfacePolicyConnected: true,
+        canonicalRiverCorridorConnected: true,
+      }),
+    };
+    const chunk = Object.freeze({
+      ...content,
+      contentHash: await hashW8ParityChunkContent(content),
+    });
+    const validation = validateW8ParityChunkData(chunk);
+    if (!validation.valid) {
+      throw new Error(`invalid W8 ChunkData: ${validation.errors.join('; ')}`);
+    }
+    resourceGenerationCounts.fullChunkCompleted += 1;
+    return chunk;
+  };
+
+  const generateW8ForestHorizonManifest = async (chunkX, chunkZ) => {
+    resourceGenerationCounts.forestHorizonManifestRequests += 1;
+    const context = await prepareW8CanonicalChunkContext(chunkX, chunkZ);
+    const presentation = await prepareW8NaturalPresentation(context);
+    const manifest = await createHashedW8ForestHorizonManifest({
+      chunkId: context.chunkId,
+      chunkX,
+      chunkZ,
+      sourceW5ContentHash: context.sourceChunkData.contentHash,
+      sourceChunkData: context.sourceChunkData,
+      generatorVersion: W8_PARITY_GENERATOR_VERSION,
+      canonicalSurfacePolicy: context.canonicalSurfacePolicy,
+      presentationLayers: Object.freeze({
+        natural: presentation.natural,
+      }),
+    });
+    resourceGenerationCounts.forestHorizonManifestCompleted += 1;
+    return manifest;
+  };
+
   return Object.freeze({
     worldSeed: base.worldSeed,
     worldSeedHash: base.worldSeedHash,
@@ -1672,193 +1982,10 @@ export async function createW8ParityChunkGenerator({
       });
     },
     async generateChunk(chunkX, chunkZ) {
-      const sourceChunkData = await getSourceChunk(chunkX, chunkZ);
-      const overlayTemplates = await Promise.all(
-        (sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay),
-      );
-      const settlementOverlayFeatures = overlayTemplates.filter(Boolean)
-        .flatMap(template => template.buildings)
-        .filter(building => building.owningChunkCoordinate.x === chunkX
-          && building.owningChunkCoordinate.z === chunkZ)
-        .map(building => Object.freeze({
-          ...building,
-          worldPosition: Object.freeze({
-            x: building.x,
-            y: q6(sampleFormalTerrainHeightMeters(sourceChunkData, building.x, building.z)),
-            z: building.z,
-          }),
-        }))
-        .sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const overlayBySettlement = new Map(overlayTemplates.filter(Boolean)
-        .map(template => [template.settlementId, template]));
-      const settlementReferences = (sourceChunkData.settlementReferences ?? []).map(reference => {
-        const overlay = overlayBySettlement.get(reference.settlementId);
-        return overlay ? Object.freeze({
-          ...reference,
-          parityTargetBuildingCount: overlay.targetBuildingCount,
-          parityOverlayBuildingCount: overlay.overlayBuildingCount,
-          parityBuildingShortageCount: overlay.shortageCount,
-        }) : reference;
-      }).sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const fullSettlementBuildings = overlayTemplates.filter(Boolean).flatMap(template => [
-        ...template.sourceBuildings,
-        ...template.buildings,
-      ]);
-      const sourceFeatures = (sourceChunkData.settlementFeatures ?? []).filter(feature => (
-        feature.featureType !== 'settlement-road'
-        || !fullSettlementBuildings.some(building =>
-          roadIntersectsSettlementBuilding(feature, building))
-      ));
-      const localSettlementFeatures = [
-        ...sourceFeatures,
-        ...settlementOverlayFeatures,
-      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const settlementSurfacePolicy = createSettlementSurfacePolicy(settlementReferences);
-      const localSurfaceBackedChunk = Object.freeze({
-        ...sourceChunkData,
-        settlementReferences: Object.freeze(settlementReferences),
-        settlementFeatures: Object.freeze(localSettlementFeatures),
-        canonicalSurfacePolicy: settlementSurfacePolicy,
-      });
-      const majorRoadFeatures = await createMajorRoadFeatures(
-        chunkX,
-        chunkZ,
-        localSurfaceBackedChunk,
-      );
-      const settlementFeatures = [
-        ...localSettlementFeatures,
-        ...majorRoadFeatures,
-      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const riverProjection = await createCanonicalRiverProjection({
-        worldSeedHash: base.worldSeedHash,
-        chunkX,
-        chunkZ,
-        settlementReferences,
-        roads: settlementFeatures,
-        sampleSurfaceHeight: (worldX, worldZ) => sampleW8SurfaceHeightMeters(
-          localSurfaceBackedChunk,
-          worldX,
-          worldZ,
-        ),
-      });
-      const canonicalSurfacePolicy = createSettlementSurfacePolicy(
-        settlementReferences,
-        riverProjection.surfaceCorridor ? [riverProjection.surfaceCorridor] : [],
-      );
-      const surfaceBackedChunk = Object.freeze({
-        ...localSurfaceBackedChunk,
-        settlementFeatures: Object.freeze(settlementFeatures),
-        canonicalSurfacePolicy,
-      });
-      const groundPosition = position => Object.freeze({
-        ...position,
-        y: q6(sampleW8SurfaceHeightMeters(surfaceBackedChunk, position.x, position.z)),
-      });
-      const settlementGroundPosition = position => Object.freeze({
-        ...position,
-        y: q6(sampleW8SurfaceHeightMeters(localSurfaceBackedChunk, position.x, position.z)),
-      });
-      const reground = record => Object.freeze({
-        ...record,
-        worldPosition: groundPosition(record.worldPosition),
-      });
-      const groundedSettlementFeatures = settlementFeatures.map(record => Object.freeze({
-        ...record,
-        worldPosition: settlementGroundPosition(record.worldPosition),
-      }));
-      const groundedOverlayFeatures = groundedSettlementFeatures.filter(feature => feature.parityOverlay);
-      const parityGameplayChunk = Object.freeze({
-        ...surfaceBackedChunk,
-        vegetationCandidates: surfaceBackedChunk.vegetationCandidates,
-        rockCandidates: surfaceBackedChunk.rockCandidates,
-        settlementFeatures: Object.freeze(groundedSettlementFeatures),
-      });
-      const [naturalWater, ambientDetailsRaw, distributedLandmarks, streetDetailsRaw] = await Promise.all([
-        createWaterSurfaces(parityGameplayChunk, base.worldSeedHash),
-        createAmbientDetails(parityGameplayChunk, seed, base.worldSeedHash),
-        createSettlementLandmarks(parityGameplayChunk, seed, base.worldSeedHash),
-        createStreetDetails(parityGameplayChunk, base.worldSeedHash),
-      ]);
-      const naturalWaterWithoutRiverOverlap = naturalWater.filter(surface => {
-        const river = distanceToCanonicalRiverCenterline(
-          canonicalSurfacePolicy.riverCorridors,
-          surface.worldPosition.x,
-          surface.worldPosition.z,
-        );
-        return !river.corridor
-          || river.distanceMeters > river.corridor.bankExtentMeters;
-      });
-      const waterSurfaces = [
-        ...naturalWaterWithoutRiverOverlap
-        .map(surface => Object.freeze({
-          ...surface,
-          worldPosition: Object.freeze({
-            ...groundPosition(surface.worldPosition),
-            y: q6(groundPosition(surface.worldPosition).y + 0.0125),
-          }),
-        })),
-        ...(riverProjection.waterSurface ? [riverProjection.waterSurface] : []),
-      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const ambientDetails = ambientDetailsRaw.filter(detail => {
-        const river = distanceToCanonicalRiverCenterline(
-          canonicalSurfacePolicy.riverCorridors,
-          detail.worldPosition.x,
-          detail.worldPosition.z,
-        );
-        return !river.corridor
-          || river.distanceMeters > river.corridor.widthMeters / 2 + 0.2;
-      }).map(reground)
-        .sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const settlementLandmarks = distributedLandmarks
-        .map(reground).sort((left, right) => left.stableId.localeCompare(right.stableId));
-      for (const reference of settlementReferences) {
-        const diagnostic = getLruValue(settlementDiagnostics, reference.settlementId);
-        if (!diagnostic) continue;
-        const landmarkCount = settlementLandmarks.filter(value =>
-          value.parentSettlementId === reference.settlementId).length;
-        setLruValue(settlementDiagnostics, reference.settlementId, Object.freeze({
-          ...diagnostic,
-          landmarkCount: Math.max(diagnostic.landmarkCount ?? 0, landmarkCount),
-        }), cacheCapacities.settlementDiagnostics);
-      }
-      const streetDetails = streetDetailsRaw.map(reground)
-        .sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const chunkId = createChunkId({
-        worldSeedHash: base.worldSeedHash,
-        generatorMajor: W8_PARITY_GENERATOR_VERSION.major,
-        chunkCoordinate: { x: chunkX, z: chunkZ },
-      });
-      const presentationLayers = createPresentationLayers(parityGameplayChunk, {
-        waterSurfaces, ambientDetails, settlementLandmarks, streetDetails,
-      }, experienceSpawn, naturalPresentationPolicy);
-      const content = {
-        ...parityGameplayChunk,
-        schemaVersion: W8_PARITY_CHUNK_DATA_SCHEMA,
-        chunkId,
-        generatorVersion: { ...W8_PARITY_GENERATOR_VERSION },
-        sourceW5ContentHash: sourceChunkData.contentHash,
-        sourceChunkData,
-        settlementOverlayFeatures: Object.freeze(groundedOverlayFeatures),
-        waterSurfaces,
-        ambientDetails,
-        settlementLandmarks,
-        streetDetails,
-        riverRoadCrossings: riverProjection.roadCrossings,
-        riverPorts: riverProjection.ports,
-        presentationLayers,
-        generationProof: Object.freeze({
-          generator: 'w8-finite-experience-parity',
-          sourceW5ContentHash: sourceChunkData.contentHash,
-          finiteExperienceSourceCommit: 'f8bc9f80c2af417bb585bff26c99522c4229ab8e',
-          finiteExperienceConnected: true,
-          distributedSettlementSurfacePolicyConnected: true,
-          canonicalRiverCorridorConnected: true,
-        }),
-      };
-      const chunk = Object.freeze({ ...content, contentHash: await hashW8ParityChunkContent(content) });
-      const validation = validateW8ParityChunkData(chunk);
-      if (!validation.valid) throw new Error(`invalid W8 ChunkData: ${validation.errors.join('; ')}`);
-      return chunk;
+      return generateW8ParityChunk(chunkX, chunkZ);
+    },
+    async generateForestHorizonManifest(chunkX, chunkZ) {
+      return generateW8ForestHorizonManifest(chunkX, chunkZ);
     },
     async shutdown() {
       if (isShutdown) return;
@@ -1891,6 +2018,7 @@ export async function createW8ParityChunkGenerator({
         schemaVersion: W8_PARITY_CONTENT.schemaVersion,
         source,
         isShutdown,
+        resourceGeneration: Object.freeze({ ...resourceGenerationCounts }),
         safeSpawnPreparedChunkCount: experienceSpawn.spawnSafety?.preparedChunkKeys?.length ?? 0,
         safeSpawn: experienceSpawn.spawnSafety ?? null,
         experienceSpawnCacheSize: EXPERIENCE_SPAWN_CACHE.size,

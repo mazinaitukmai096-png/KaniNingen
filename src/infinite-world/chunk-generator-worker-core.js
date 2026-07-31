@@ -4,6 +4,7 @@ import {
   CHUNK_GENERATOR_PROTOCOL_VERSION,
   createChunkDataRequestKey,
 } from './chunk-data-service-protocol.js';
+import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 
 function clock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -40,6 +41,7 @@ export function createChunkGeneratorWorkerCore({
   let serviceGeneration = 0;
   let operationChain = Promise.resolve();
   let isShutdown = false;
+  const forestHorizonCancelledBeforeEpoch = new Map();
 
   const processMessage = async request => {
     if (isShutdown) return;
@@ -71,6 +73,29 @@ export function createChunkGeneratorWorkerCore({
           chunkId: chunkData.chunkId,
           contentHash: chunkData.contentHash,
           chunkData,
+          generationMs: Math.max(0, clock() - startedAt),
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON) {
+        if (request.epoch < (forestHorizonCancelledBeforeEpoch.get(request.consumerId) ?? 0)) {
+          return;
+        }
+        const startedAt = clock();
+        const manifest = typeof generator.generateForestHorizonManifest === 'function'
+          ? await generator.generateForestHorizonManifest(request.chunkX, request.chunkZ)
+          : createW8ForestHorizonManifest(
+            await generator.generateChunk(request.chunkX, request.chunkZ),
+          );
+        postMessage({
+          type: CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON,
+          protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          serviceGeneration,
+          chunkKey: createChunkDataRequestKey(request.chunkX, request.chunkZ),
+          chunkId: manifest.chunkId,
+          contentHash: manifest.contentHash,
+          manifest,
           generationMs: Math.max(0, clock() - startedAt),
         });
         return;
@@ -131,6 +156,19 @@ export function createChunkGeneratorWorkerCore({
 
   return Object.freeze({
     receive(request) {
+      if (request?.type === CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON
+        && request.protocolVersion === CHUNK_GENERATOR_PROTOCOL_VERSION) {
+        const beforeEpoch = Number.isSafeInteger(request.beforeEpoch)
+          ? request.beforeEpoch : Number.MAX_SAFE_INTEGER;
+        forestHorizonCancelledBeforeEpoch.set(
+          request.consumerId,
+          Math.max(
+            forestHorizonCancelledBeforeEpoch.get(request.consumerId) ?? 0,
+            beforeEpoch,
+          ),
+        );
+        return Promise.resolve();
+      }
       operationChain = operationChain.then(() => processMessage(request));
       return operationChain;
     },
@@ -139,6 +177,7 @@ export function createChunkGeneratorWorkerCore({
       await operationChain.catch(() => {});
       await generator?.shutdown?.();
       generator = null;
+      forestHorizonCancelledBeforeEpoch.clear();
     },
   });
 }

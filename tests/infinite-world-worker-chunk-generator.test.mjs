@@ -247,9 +247,22 @@ test('real Node module Worker matches Inline W8 identity, owner, terrain, Settle
     assert.deepEqual(actual.owningChunkCoordinate, expected.owningChunkCoordinate);
     assert.equal(ArrayBuffer.isView(actual.terrain.heights), false);
   }
+  const [inlineForest, workerForest] = await Promise.all([
+    inline.generateForestHorizonManifest({ chunkX: 0, chunkZ: 0 }),
+    worker.generateForestHorizonManifest({ chunkX: 0, chunkZ: 0 }),
+  ]);
+  assert.deepEqual(workerForest, inlineForest);
+  assert.equal(workerForest.schemaVersion, 'w8-forest-horizon-owner-summary-1');
+  assert.equal(Object.hasOwn(workerForest, 'terrain'), false);
+  assert.equal(Object.hasOwn(workerForest, 'sourceChunkData'), false);
+  assert.equal(workerForest.presentationLayers.natural.rocks.length, 0);
   assert.equal(worker.snapshot().mode, 'worker');
   assert.equal(worker.snapshot().counts.generated, coordinates.length);
+  assert.equal(worker.snapshot().counts.forestHorizonGenerated, 1);
+  assert.equal(inline.snapshot().forestHorizonGeneratedCount, 1);
   assert.ok(worker.snapshot().generationMsMaximum > 0);
+  assert.ok(worker.snapshot().forestHorizonGenerationMsMaximum > 0);
+  assert.ok(worker.snapshot().forestHorizonReceiveMsMaximum >= 0);
   assert.ok(worker.snapshot().settlementQueryMsMaximum >= 0);
   assert.ok(worker.snapshot().settlementQueryReceiveMsMaximum >= 0);
   assert.ok(worker.snapshot().settlementTemplateMsMaximum > 0);
@@ -328,6 +341,100 @@ test('Worker diagnostics reject stale responses, ignore snapshots attached to no
   assert.equal(transport.snapshot().pendingCount, 0);
   assert.equal(transport.snapshot().generatorSnapshot, null);
   assert.equal(transport.snapshot().timingSampleCount, 0);
+});
+
+test('Forest horizon Worker requests are epoch-cancelled before stale generation can publish', async () => {
+  const fake = new FakeWorker();
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    serviceGeneration: 9,
+    workerFactory: () => fake,
+  });
+  await transport.initialize();
+  const pendingManifest = transport.generateForestHorizonManifest({
+    chunkX: 11,
+    chunkZ: 4,
+    consumerId: 'distant-owner-query',
+    epoch: 2,
+  });
+  await drainAsyncWork(2);
+  const request = fake.messages.at(-1);
+  assert.equal(request.type, CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON);
+  assert.equal(request.epoch, 2);
+  assert.equal(transport.cancelForestHorizonRequests({
+    consumerId: 'distant-owner-query',
+    beforeEpoch: 3,
+  }), 1);
+  assert.equal(await pendingManifest, null);
+  assert.equal(fake.messages.at(-1).type, CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON);
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: request.requestId,
+    serviceGeneration: 9,
+    manifest: { schemaVersion: 'must-not-publish' },
+    generationMs: 1,
+  });
+  assert.equal(transport.snapshot().counts.forestHorizonGenerated, 0);
+  assert.equal(transport.snapshot().counts.lateResponses, 1);
+  const messageCount = fake.messages.length;
+  assert.equal(await transport.generateForestHorizonManifest({
+    chunkX: 12,
+    chunkZ: 4,
+    consumerId: 'distant-owner-query',
+    epoch: 2,
+  }), null);
+  assert.equal(fake.messages.length, messageCount);
+  await transport.shutdown();
+});
+
+test('Worker core observes Forest horizon cancellation outside its serial generation chain', async () => {
+  const responses = [];
+  let manifestCalls = 0;
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    generatorFactory: async () => ({
+      worldSeed: seed,
+      worldSeedHash: `sha256:${'3'.repeat(64)}`,
+      generatorVersion: { major: 800, minor: 0, patch: 0 },
+      experienceSpawn: { x: 0, z: 0 },
+      reviewSpawn: { x: 0, z: 0 },
+      distributor: { findSettlementsNear: async () => [] },
+      async generateForestHorizonManifest() {
+        manifestCalls += 1;
+        return { schemaVersion: 'must-not-run' };
+      },
+    }),
+  });
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 4,
+    worldSeed: seed,
+  });
+  const queued = core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 1,
+    serviceGeneration: 4,
+    chunkX: 11,
+    chunkZ: 4,
+    consumerId: 'distant-owner-query',
+    epoch: 7,
+  });
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 4,
+    consumerId: 'distant-owner-query',
+    beforeEpoch: 8,
+  });
+  await queued;
+  assert.equal(manifestCalls, 0);
+  assert.equal(responses.some(response => (
+    response.type === CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON
+  )), false);
+  await core.shutdown();
 });
 
 test('Worker transport discards old serviceGeneration and accepts only the current response', async () => {

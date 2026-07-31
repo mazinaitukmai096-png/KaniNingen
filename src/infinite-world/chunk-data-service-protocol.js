@@ -6,13 +6,16 @@ export const CHUNK_DATA_PRIORITY = Object.freeze({
   ULTRA_WARM: 5,
 });
 
-export const CHUNK_GENERATOR_PROTOCOL_VERSION = 1;
+export const CHUNK_GENERATOR_PROTOCOL_VERSION = 2;
 
 export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   INITIALIZE: 'chunk-generator:initialize',
   INITIALIZED: 'chunk-generator:initialized',
   GENERATE: 'chunk-generator:generate',
   GENERATED: 'chunk-generator:generated',
+  GENERATE_FOREST_HORIZON: 'chunk-generator:generate-forest-horizon',
+  GENERATED_FOREST_HORIZON: 'chunk-generator:generated-forest-horizon',
+  CANCEL_FOREST_HORIZON: 'chunk-generator:cancel-forest-horizon',
   FIND_SETTLEMENTS: 'chunk-generator:find-settlements',
   SETTLEMENTS: 'chunk-generator:settlements',
   RESOLVE_SETTLEMENT_TEMPLATE: 'chunk-generator:resolve-settlement-template',
@@ -66,5 +69,36 @@ export function createChunkGeneratorRequest({ requestId, serviceGeneration, chun
     serviceGeneration,
     chunkX,
     chunkZ,
+  });
+}
+
+export function createForestHorizonGeneratorRequest({
+  requestId,
+  serviceGeneration,
+  chunkX,
+  chunkZ,
+  consumerId = 'distant-owner-query',
+  epoch = 0,
+}) {
+  if (!Number.isSafeInteger(requestId) || requestId < 1) {
+    throw new RangeError('requestId must be positive');
+  }
+  createChunkDataRequestKey(chunkX, chunkZ);
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be positive');
+  }
+  if (typeof consumerId !== 'string' || !consumerId
+    || !Number.isSafeInteger(epoch) || epoch < 0) {
+    throw new TypeError('Forest horizon request requires a consumerId and non-negative epoch');
+  }
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration,
+    chunkX,
+    chunkZ,
+    consumerId,
+    epoch,
   });
 }

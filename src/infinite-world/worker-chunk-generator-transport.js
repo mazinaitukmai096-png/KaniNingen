@@ -3,7 +3,9 @@ import {
   CHUNK_GENERATOR_PROTOCOL_VERSION,
   createChunkGeneratorInitializeRequest,
   createChunkGeneratorRequest,
+  createForestHorizonGeneratorRequest,
 } from './chunk-data-service-protocol.js';
+import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import { MetricSeries } from './runtime-timing.js';
 
 const TRANSPORT_TIMING_SAMPLE_CAPACITY = 4096;
@@ -71,9 +73,12 @@ export function createWorkerChunkGeneratorTransport({
   let runtimeFailure = null;
   let controlRequestId = 1_000_000_000;
   const pending = new Map();
+  const forestHorizonCancelledBeforeEpoch = new Map();
   const removers = [];
   const generationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const receiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const forestHorizonGenerationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const forestHorizonReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementTemplateTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
@@ -82,6 +87,7 @@ export function createWorkerChunkGeneratorTransport({
   const diagnosticReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const counts = {
     generated: 0,
+    forestHorizonGenerated: 0,
     settlementQueries: 0,
     settlementTemplateQueries: 0,
     diagnosticQueries: 0,
@@ -146,6 +152,15 @@ export function createWorkerChunkGeneratorTransport({
       receiveTimes.record(Math.max(0, receivedMs - generationMs));
       counts.generated += 1;
       operation.resolve(message.chunkData);
+      return;
+    }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const generationMs = Math.max(0, Number(message.generationMs) || 0);
+      forestHorizonGenerationTimes.record(generationMs);
+      forestHorizonReceiveTimes.record(Math.max(0, receivedMs - generationMs));
+      counts.forestHorizonGenerated += 1;
+      operation.resolve(message.manifest);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
@@ -259,7 +274,7 @@ export function createWorkerChunkGeneratorTransport({
         : runtimeFailure ?? new Error('Chunk generator Worker is unavailable'));
       return;
     }
-    pending.set(request.requestId, { resolve, reject, sentAt: clock() });
+    pending.set(request.requestId, { resolve, reject, sentAt: clock(), request });
     try {
       target.postMessage(request);
     } catch (error) {
@@ -280,6 +295,74 @@ export function createWorkerChunkGeneratorTransport({
       return requestWorker(createChunkGeneratorRequest({
         requestId, serviceGeneration, chunkX, chunkZ,
       }));
+    },
+    async generateForestHorizonManifest({
+      chunkX,
+      chunkZ,
+      consumerId = 'distant-owner-query',
+      epoch = 0,
+    } = {}) {
+      if (epoch < (forestHorizonCancelledBeforeEpoch.get(consumerId) ?? 0)) return null;
+      await initialize();
+      if (isShutdown) throw shutdownError();
+      if (epoch < (forestHorizonCancelledBeforeEpoch.get(consumerId) ?? 0)) return null;
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
+      if (fallbackTransport) {
+        if (typeof fallbackTransport.generateForestHorizonManifest === 'function') {
+          return fallbackTransport.generateForestHorizonManifest({
+            chunkX, chunkZ, consumerId, epoch,
+          });
+        }
+        return createW8ForestHorizonManifest(await fallbackTransport.generateChunk({
+          requestId: ++controlRequestId,
+          chunkX,
+          chunkZ,
+        }));
+      }
+      const requestId = ++controlRequestId;
+      return requestWorker(createForestHorizonGeneratorRequest({
+        requestId,
+        serviceGeneration,
+        chunkX,
+        chunkZ,
+        consumerId,
+        epoch,
+      }));
+    },
+    cancelForestHorizonRequests({
+      consumerId = 'distant-owner-query',
+      epoch = null,
+      beforeEpoch = null,
+    } = {}) {
+      if (typeof consumerId !== 'string' || !consumerId) {
+        throw new TypeError('Forest horizon cancellation requires consumerId');
+      }
+      const cutoff = Number.isSafeInteger(beforeEpoch)
+        ? beforeEpoch
+        : Number.isSafeInteger(epoch) ? epoch + 1 : Number.MAX_SAFE_INTEGER;
+      forestHorizonCancelledBeforeEpoch.set(
+        consumerId,
+        Math.max(forestHorizonCancelledBeforeEpoch.get(consumerId) ?? 0, cutoff),
+      );
+      let cancelled = 0;
+      for (const [requestId, operation] of pending) {
+        const request = operation.request;
+        if (request?.type !== CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON
+          || request.consumerId !== consumerId || request.epoch >= cutoff) continue;
+        pending.delete(requestId);
+        operation.resolve(null);
+        cancelled += 1;
+      }
+      if (worker && !isShutdown) {
+        worker.postMessage({
+          type: CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON,
+          protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+          serviceGeneration,
+          consumerId,
+          beforeEpoch: cutoff,
+        });
+      }
+      return cancelled;
     },
     async findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters) {
       await initialize();
@@ -338,6 +421,8 @@ export function createWorkerChunkGeneratorTransport({
     snapshot() {
       const generationTiming = generationTimes.snapshot();
       const receiveTiming = receiveTimes.snapshot();
+      const forestHorizonGenerationTiming = forestHorizonGenerationTimes.snapshot();
+      const forestHorizonReceiveTiming = forestHorizonReceiveTimes.snapshot();
       const settlementQueryTiming = settlementQueryTimes.snapshot();
       const settlementQueryReceiveTiming = settlementQueryReceiveTimes.snapshot();
       const settlementTemplateTiming = settlementTemplateTimes.snapshot();
@@ -356,6 +441,9 @@ export function createWorkerChunkGeneratorTransport({
         generationMsMaximum: generationTiming.max,
         mainThreadReceiveMsP50: receiveTiming.p50,
         mainThreadReceiveMsMaximum: receiveTiming.max,
+        forestHorizonGenerationMsP50: forestHorizonGenerationTiming.p50,
+        forestHorizonGenerationMsMaximum: forestHorizonGenerationTiming.max,
+        forestHorizonReceiveMsMaximum: forestHorizonReceiveTiming.max,
         settlementQueryMsP50: settlementQueryTiming.p50,
         settlementQueryMsMaximum: settlementQueryTiming.max,
         settlementQueryReceiveMsMaximum: settlementQueryReceiveTiming.max,
@@ -380,9 +468,12 @@ export function createWorkerChunkGeneratorTransport({
       await terminateWorker();
       await fallbackTransport?.shutdown?.();
       lastGeneratorSnapshot = null;
+      forestHorizonCancelledBeforeEpoch.clear();
       for (const series of [
         generationTimes,
         receiveTimes,
+        forestHorizonGenerationTimes,
+        forestHorizonReceiveTimes,
         settlementQueryTimes,
         settlementQueryReceiveTimes,
         settlementTemplateTimes,

@@ -1,3 +1,5 @@
+import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
+
 /**
  * Stage 2B-0 transport.  It deliberately has the same small surface that the
  * module Worker transport will implement in Stage 2B-1.
@@ -8,6 +10,7 @@ export function createInlineChunkGeneratorTransport({ generator } = {}) {
   }
   let isShutdown = false;
   let generatedCount = 0;
+  let forestHorizonGeneratedCount = 0;
   let initialized = false;
   let diagnosticRequestCount = 0;
   let lastGeneratorSnapshot = null;
@@ -42,6 +45,15 @@ export function createInlineChunkGeneratorTransport({ generator } = {}) {
         return generator.generateChunk(chunkX, chunkZ, { requestId, priority });
       });
     },
+    async generateForestHorizonManifest({ chunkX, chunkZ } = {}) {
+      return runOperation(async () => {
+        forestHorizonGeneratedCount += 1;
+        if (typeof generator.generateForestHorizonManifest === 'function') {
+          return generator.generateForestHorizonManifest(chunkX, chunkZ);
+        }
+        return createW8ForestHorizonManifest(await generator.generateChunk(chunkX, chunkZ));
+      });
+    },
     findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters) {
       return runOperation(() => generator.distributor.findSettlementsNear(
         centerWorldX,
@@ -66,7 +78,8 @@ export function createInlineChunkGeneratorTransport({ generator } = {}) {
     },
     snapshot() {
       return Object.freeze({
-        kind: 'inline', generatedCount, diagnosticRequestCount, initialized, isShutdown,
+        kind: 'inline', generatedCount, forestHorizonGeneratedCount,
+        diagnosticRequestCount, initialized, isShutdown,
         generatorSnapshot: lastGeneratorSnapshot,
       });
     },
