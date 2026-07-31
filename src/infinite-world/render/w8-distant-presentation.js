@@ -53,6 +53,12 @@ import {
   selectW8SettlementPresentationCandidates,
   settlementCandidateDistance,
 } from '../settlement-presentation-policy.js';
+import {
+  WORLD_STREAMING_EVENT,
+  WORLD_STREAMING_STREAM,
+  WORLD_STREAMING_TARGET,
+  worldStreamingTargetForCanonicalObject,
+} from '../world-streaming-telemetry.js';
 
 export {
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
@@ -368,6 +374,7 @@ export async function createW8DistantPresentation({
   getNearVisibleSettlementIds = () => [],
   measure = (_stage, operation) => operation(),
   yieldToMainThread = () => new Promise(resolve => globalThis.setTimeout(resolve, 0)),
+  telemetry = null,
 } = {}) {
   if (!scene?.add || !scene?.remove) throw new TypeError('a Three.js scene is required');
   if (typeof findSettlementsNear !== 'function'
@@ -382,6 +389,7 @@ export async function createW8DistantPresentation({
     || typeof getNearVisibleSettlementIds !== 'function') {
     throw new TypeError('Near presentation identity providers must be functions');
   }
+  const streamingTelemetry = telemetry?.enabled === true ? telemetry : null;
   const Group = requireConstructor(THREE, 'Group');
   const Mesh = requireConstructor(THREE, 'Mesh');
   const InstancedMesh = requireConstructor(THREE, 'InstancedMesh');
@@ -486,6 +494,7 @@ export async function createW8DistantPresentation({
   });
   const emptyStats = createStats();
   let activeGeneration = null;
+  let pendingDistantFirstDraw = null;
   let activeLocalTerrainGeneration = null;
   const localTerrainOwnerIndexData = new WeakMap();
   let committedRuntimeTransitionContract = null;
@@ -520,6 +529,66 @@ export async function createW8DistantPresentation({
   let staleRenderOriginRejectCount = 0;
   let localTerrainSyncEpoch = 0;
   let committedLocalTerrainEpoch = 0;
+
+  const recordDistantPublication = generation => {
+    if (!streamingTelemetry) return;
+    const planId = generation.transitionContract?.generation ?? null;
+    const centerOwnerKey = generation.transitionContract?.centerChunkKey ?? null;
+    const summaries = new Map();
+    if (centerOwnerKey) {
+      summaries.set(`${centerOwnerKey}\n${WORLD_STREAMING_TARGET.DISTANT}`, {
+        target: WORLD_STREAMING_TARGET.DISTANT,
+        ownerKey: centerOwnerKey,
+        resourceKey: centerOwnerKey,
+        stableId: null,
+        count: 1,
+      });
+    }
+    for (const object of generation.canonicalObjects.values()) {
+      if (object.visibleLod === 'hidden' || object.visibleLod === 'destroyed'
+        || object.presentationTier === null) continue;
+      const target = worldStreamingTargetForCanonicalObject(object.record);
+      if (target) {
+        const key = `${object.ownerKey}\n${target}`;
+        const current = summaries.get(key) ?? {
+          target,
+          ownerKey: object.ownerKey,
+          resourceKey: object.ownerKey,
+          stableId: object.stableId,
+          count: 0,
+        };
+        current.count += 1;
+        summaries.set(key, current);
+      }
+      if (typeof object.settlementId === 'string' && object.settlementId) {
+        const key = `${object.ownerKey}\n${WORLD_STREAMING_TARGET.SETTLEMENT}`;
+        const current = summaries.get(key) ?? {
+          target: WORLD_STREAMING_TARGET.SETTLEMENT,
+          ownerKey: object.ownerKey,
+          resourceKey: object.ownerKey,
+          stableId: object.settlementId,
+          count: 0,
+        };
+        current.count += 1;
+        summaries.set(key, current);
+      }
+    }
+    const pending = [];
+    for (const summary of summaries.values()) {
+      const details = {
+        target: summary.target,
+        stream: WORLD_STREAMING_STREAM.DISTANT,
+        resourceKey: summary.resourceKey,
+        ownerKey: summary.ownerKey,
+        stableId: summary.stableId,
+        planId,
+        metadata: { instanceCount: summary.count, epoch: generation.epoch },
+      };
+      const published = streamingTelemetry.record(WORLD_STREAMING_EVENT.PUBLISH, details);
+      pending.push({ ...details, correlationId: published?.correlationId ?? null });
+    }
+    pendingDistantFirstDraw = { epoch: generation.epoch, events: pending };
+  };
   let localTerrainCommitCount = 0;
   let localTerrainRejectionCount = 0;
   let localTerrainStaleDiscardCount = 0;
@@ -4767,6 +4836,7 @@ export async function createW8DistantPresentation({
       root.add(generation.root);
       activeGeneration = generation;
       committedEpoch = epoch;
+      recordDistantPublication(generation);
       disposeGeneration(previous);
       generation.rootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
         - rootSwapStartedAt;
@@ -5122,6 +5192,16 @@ export async function createW8DistantPresentation({
         });
       }));
     },
+    markFirstDraw() {
+      if (!streamingTelemetry || !pendingDistantFirstDraw
+        || pendingDistantFirstDraw.epoch !== activeGeneration?.epoch) return 0;
+      for (const details of pendingDistantFirstDraw.events) {
+        streamingTelemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
+      }
+      const recorded = pendingDistantFirstDraw.events.length;
+      pendingDistantFirstDraw = null;
+      return recorded;
+    },
     dispose() {
       if (disposed) return;
       syncEpoch += 1;
@@ -5129,6 +5209,7 @@ export async function createW8DistantPresentation({
       cancelCanonicalChunkRequests?.({ consumerId: 'distant-owner-query' });
       disposeGeneration(activeGeneration);
       activeGeneration = null;
+      pendingDistantFirstDraw = null;
       disposeGeneration(activeLocalTerrainGeneration);
       activeLocalTerrainGeneration = null;
       committedRuntimeTransitionContract = null;

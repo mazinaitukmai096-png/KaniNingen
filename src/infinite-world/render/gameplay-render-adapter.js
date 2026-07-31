@@ -15,6 +15,11 @@ import {
   W8_NUCLEAR_PRESENTATION_CONTRACT,
   finiteWorldUnitsToMeters,
 } from '../gameplay-contract.js';
+import {
+  WORLD_STREAMING_EVENT,
+  WORLD_STREAMING_STREAM,
+  WORLD_STREAMING_TARGET,
+} from '../world-streaming-telemetry.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -44,7 +49,13 @@ function draggedVerticalDistance(initialVelocity, elapsedSeconds, gravity = FINI
 }
 
 export class GameplayRenderAdapter {
-  constructor({ THREE, scene, renderChunkSize = RENDER_CHUNK_SIZE, visualAssets = null } = {}) {
+  constructor({
+    THREE,
+    scene,
+    renderChunkSize = RENDER_CHUNK_SIZE,
+    visualAssets = null,
+    telemetry = null,
+  } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
     }
@@ -62,6 +73,8 @@ export class GameplayRenderAdapter {
     this.scene.add(this.combatRoot);
     this.visualAssets = visualAssets ?? createProductionVisualAssetLibrary({ THREE });
     this.ownsVisualAssets = visualAssets === null;
+    this.telemetry = telemetry?.enabled === true ? telemetry : null;
+    this.pendingFirstDrawByChunk = new Map();
     this.loaded = new Map();
     this.entityMeshes = new Map();
     this.projectileMeshes = new Map();
@@ -1313,6 +1326,24 @@ export class GameplayRenderAdapter {
       this.root.add(group);
       this.loaded.set(createChunkKey(chunkX, chunkZ), entry);
       this.counts.loaded += 1;
+      if (this.telemetry) {
+        const representativeStableId = entityStates.find(state => (
+          typeof state?.stableId === 'string' && state.stableId
+        ))?.stableId ?? null;
+        const details = {
+          target: WORLD_STREAMING_TARGET.GAMEPLAY,
+          stream: WORLD_STREAMING_STREAM.GAMEPLAY,
+          resourceKey: key,
+          ownerKey: key,
+          stableId: representativeStableId,
+          metadata: { entityCount: entityStates.length },
+        };
+        const published = this.telemetry.record(WORLD_STREAMING_EVENT.PUBLISH, details);
+        this.pendingFirstDrawByChunk.set(key, {
+          ...details,
+          correlationId: published?.correlationId ?? null,
+        });
+      }
     } catch (error) {
       this.root.remove(group);
       for (const stableId of entry.entityIds) {
@@ -1322,6 +1353,16 @@ export class GameplayRenderAdapter {
       group.clear();
       throw error;
     }
+  }
+
+  markFirstDraw() {
+    if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
+    for (const details of this.pendingFirstDrawByChunk.values()) {
+      this.telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
+    }
+    const recorded = this.pendingFirstDrawByChunk.size;
+    this.pendingFirstDrawByChunk.clear();
+    return recorded;
   }
 
   syncEntity(state) {
@@ -1335,6 +1376,7 @@ export class GameplayRenderAdapter {
     const entry = this.loaded.get(key);
     if (!entry) throw new Error(`gameplay chunk is not loaded: ${key}`);
     this.root.remove(entry.group);
+    this.pendingFirstDrawByChunk.delete(key);
     for (const stableId of entry.entityIds) {
       this.entityMeshes.delete(stableId);
       this.counts.removed += 1;
@@ -1379,6 +1421,7 @@ export class GameplayRenderAdapter {
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
     this.syncTransientCombat([], []);
     this.syncManualBoss(null);
+    this.pendingFirstDrawByChunk.clear();
     this.clearReinforcements();
     for (const pool of this.effectInstancePools.values()) this.combatRoot.remove(pool.mesh);
     this.effectInstancePools.clear();

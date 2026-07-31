@@ -17,6 +17,12 @@ import {
 import { resolveW8RockCanonicalObject } from '../rock-canonical-object.js';
 import { resolveW8CanonicalWorldObject } from '../world-object-canonical-contract.js';
 import {
+  WORLD_STREAMING_EVENT,
+  WORLD_STREAMING_STREAM,
+  WORLD_STREAMING_TARGET,
+  worldStreamingTargetForCanonicalObject,
+} from '../world-streaming-telemetry.js';
+import {
   resolveCanonicalGroundSurface,
   resolveCanonicalSurfaceColorRgb,
   sampleW8SurfaceHeightMeters,
@@ -36,6 +42,7 @@ export class ChunkRenderAdapter {
     renderChunkSize = RENDER_CHUNK_SIZE,
     isFeatureDestroyed = () => false,
     visualAssets = null,
+    telemetry = null,
   } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
@@ -53,6 +60,8 @@ export class ChunkRenderAdapter {
     this.disposedChunkGeometries = new WeakSet();
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
+    this.telemetry = telemetry?.enabled === true ? telemetry : null;
+    this.pendingFirstDrawByChunk = new Map();
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
     this.occlusionMeshes = [];
@@ -1045,12 +1054,66 @@ export class ChunkRenderAdapter {
       this.loaded.set(projected.key, projected);
       projected.lifecycle = 'loaded';
       this.counts.loaded += 1;
+      this.#recordPublishedChunk(projected.key);
     } catch (error) {
       this.worldRoot.remove(projected.group);
       this.loaded.delete(projected.key);
       projected.lifecycle = 'staged';
       throw error;
     }
+  }
+
+  #recordPublishedChunk(key) {
+    if (!this.telemetry) return;
+    const summaries = new Map([
+      [WORLD_STREAMING_TARGET.NEAR, { count: 1, stableId: null }],
+    ]);
+    for (const stableId of this.chunkFeatureIds.get(key) ?? []) {
+      const canonicalObject = this.featureInstances.get(stableId)?.canonicalObject ?? null;
+      const target = worldStreamingTargetForCanonicalObject(canonicalObject);
+      if (target) {
+        const current = summaries.get(target) ?? { count: 0, stableId };
+        current.count += 1;
+        summaries.set(target, current);
+      }
+      const settlementId = canonicalObject?.settlementId
+        ?? canonicalObject?.parentSettlementId
+        ?? canonicalObject?.extension?.settlementId
+        ?? canonicalObject?.extension?.parentSettlementId;
+      if (typeof settlementId === 'string' && settlementId) {
+        const current = summaries.get(WORLD_STREAMING_TARGET.SETTLEMENT)
+          ?? { count: 0, stableId: settlementId };
+        current.count += 1;
+        summaries.set(WORLD_STREAMING_TARGET.SETTLEMENT, current);
+      }
+    }
+    const pending = [];
+    for (const [target, summary] of summaries) {
+      const details = {
+        target,
+        stream: WORLD_STREAMING_STREAM.NEAR,
+        resourceKey: key,
+        ownerKey: key,
+        stableId: summary.stableId,
+        metadata: { instanceCount: summary.count },
+      };
+      const published = this.telemetry.record(WORLD_STREAMING_EVENT.PUBLISH, details);
+      pending.push({ ...details, correlationId: published?.correlationId ?? null });
+    }
+    this.pendingFirstDrawByChunk.set(key, pending);
+  }
+
+  markFirstDraw() {
+    if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
+    let recorded = 0;
+    for (const pending of this.pendingFirstDrawByChunk.values()) {
+      for (const details of pending) {
+        this.telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
+        recorded += 1;
+      }
+    }
+    this.pendingFirstDrawByChunk.clear();
+    return recorded;
   }
 
   setDiagnosticTransparencyEnabled(enabled = true) {
@@ -1066,6 +1129,7 @@ export class ChunkRenderAdapter {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
     this.worldRoot.remove(projected.group);
+    this.pendingFirstDrawByChunk.delete(key);
     for (const geometry of projected.ownedGeometries) {
       geometry.dispose();
       this.disposedChunkGeometries.add(geometry);
@@ -1209,6 +1273,7 @@ export class ChunkRenderAdapter {
     for (const material of this.fadedMaterials.values()) material.dispose();
     if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.featureInstances.clear();
+    this.pendingFirstDrawByChunk.clear();
     this.chunkFeatureIds.clear();
     this.occlusionMeshes.length = 0;
     this.cameraCollisionBounds.length = 0;

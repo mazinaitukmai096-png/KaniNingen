@@ -3,6 +3,7 @@ import {
   createChunkDataRequestKey,
   CHUNK_DATA_PRIORITY,
 } from './chunk-data-service-protocol.js';
+import { WORLD_STREAMING_EVENT } from './world-streaming-telemetry.js';
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -31,6 +32,7 @@ export class ChunkDataService {
     cacheCapacity = 81,
     identityAuditCapacity = 4096,
     clock = defaultClock,
+    telemetry = null,
   } = {}) {
     if (typeof transport?.generateChunk !== 'function') {
       throw new TypeError('ChunkData transport.generateChunk is required');
@@ -46,6 +48,7 @@ export class ChunkDataService {
     this.cacheCapacity = cacheCapacity;
     this.identityAuditCapacity = identityAuditCapacity;
     this.clock = clock;
+    this.telemetry = telemetry?.enabled === true ? telemetry : null;
     this.completed = new Map();
     this.identityAudit = new Map();
     this.pending = new Map();
@@ -89,16 +92,49 @@ export class ChunkDataService {
     priority = CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
     consumerId = 'anonymous',
     epoch = 0,
+    telemetryTarget = 'near',
+    telemetryStream = telemetryTarget,
+    telemetryCorrelationId: suppliedTelemetryCorrelationId = null,
   } = {}) {
     const key = createChunkDataRequestKey(chunkX, chunkZ);
     assertChunkDataPriority(priority);
     if (typeof consumerId !== 'string' || !consumerId) throw new TypeError('consumerId is required');
     if (!Number.isSafeInteger(epoch) || epoch < 0) throw new RangeError('epoch must be a non-negative safe integer');
+    const telemetryCorrelationId = suppliedTelemetryCorrelationId
+      ?? this.telemetry?.beginRequest({
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        requestId: `${consumerId}:${epoch}`,
+        metadata: { consumerId, epoch, priority },
+      })
+      ?? null;
     this.counts.requests += 1;
-    if (this.isShutdown) return this.#cancelledHandle({ key, consumerId, epoch });
+    if (this.isShutdown) {
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.CANCELLED, {
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        metadata: { reason: 'shutdown' },
+      });
+      return this.#cancelledHandle({ key, consumerId, epoch });
+    }
 
     const knownEpoch = this.consumerEpochs.get(consumerId) ?? -1;
-    if (epoch < knownEpoch) return this.#cancelledHandle({ key, consumerId, epoch });
+    if (epoch < knownEpoch) {
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.CANCELLED, {
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        metadata: { reason: 'stale-consumer-epoch', knownEpoch },
+      });
+      return this.#cancelledHandle({ key, consumerId, epoch });
+    }
     if (epoch > knownEpoch) {
       this.consumerEpochs.set(consumerId, epoch);
       this.cancelConsumer({ consumerId, beforeEpoch: epoch });
@@ -107,6 +143,14 @@ export class ChunkDataService {
     const cached = this.#getCompleted(key);
     if (cached) {
       this.counts.completedCacheHits += 1;
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.CACHE_HIT, {
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        metadata: { cache: 'completed' },
+      });
       return Object.freeze({
         key, consumerId, epoch, cancel: () => false, promise: Promise.resolve(cached),
       });
@@ -116,18 +160,37 @@ export class ChunkDataService {
     if (!entry) {
       entry = {
         key, chunkX, chunkZ, priority, sequence: ++this.sequence,
-        state: 'queued', subscribers: new Map(),
+        state: 'queued', subscribers: new Map(), telemetryCorrelationId,
+        telemetryTarget, telemetryStream,
       };
       this.pending.set(key, entry);
       this.queue.push(entry);
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.CACHE_MISS, {
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        metadata: { cache: 'completed-and-pending' },
+      });
     } else {
       this.counts.pendingDedupeHits += 1;
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.CACHE_HIT, {
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        resourceKey: key,
+        ownerKey: key,
+        metadata: { cache: 'pending-dedupe' },
+      });
       if (entry.state === 'queued' && priority < entry.priority) {
         entry.priority = priority;
         this.counts.priorityPromotions += 1;
       }
     }
-    const handle = this.#subscribe(entry, { consumerId, epoch });
+    const handle = this.#subscribe(entry, {
+      consumerId, epoch, telemetryCorrelationId, telemetryTarget, telemetryStream,
+    });
     this.#scheduleDispatch();
     return handle;
   }
@@ -187,11 +250,20 @@ export class ChunkDataService {
     this.identityAudit.clear();
   }
 
-  #subscribe(entry, { consumerId, epoch }) {
+  #subscribe(entry, {
+    consumerId, epoch, telemetryCorrelationId, telemetryTarget, telemetryStream,
+  }) {
     let resolve;
     const promise = new Promise(nextResolve => { resolve = nextResolve; });
     const subscriber = {
-      id: ++this.subscriberSequence, consumerId, epoch, resolve, cancelled: false,
+      id: ++this.subscriberSequence,
+      consumerId,
+      epoch,
+      resolve,
+      cancelled: false,
+      telemetryCorrelationId,
+      telemetryTarget,
+      telemetryStream,
     };
     entry.subscribers.set(subscriber.id, subscriber);
     return Object.freeze({
@@ -215,6 +287,14 @@ export class ChunkDataService {
     entry.subscribers.delete(subscriber.id);
     subscriber.resolve(null);
     this.counts.subscriberCancels += 1;
+    this.#recordTelemetry(WORLD_STREAMING_EVENT.CANCELLED, {
+      correlationId: subscriber.telemetryCorrelationId,
+      target: subscriber.telemetryTarget,
+      stream: subscriber.telemetryStream,
+      resourceKey: entry.key,
+      ownerKey: entry.key,
+      metadata: { reason: 'consumer-cancelled', consumerId: subscriber.consumerId },
+    });
     if (entry.state === 'queued' && entry.subscribers.size === 0) {
       this.pending.delete(entry.key);
       this.queue = this.queue.filter(candidate => candidate !== entry);
@@ -240,6 +320,15 @@ export class ChunkDataService {
     entry.state = 'in-flight';
     this.inFlight = entry;
     this.counts.dispatched += 1;
+    this.#recordTelemetry(WORLD_STREAMING_EVENT.WORKER_START, {
+      correlationId: entry.telemetryCorrelationId,
+      target: entry.telemetryTarget,
+      stream: entry.telemetryStream,
+      resourceKey: entry.key,
+      ownerKey: entry.key,
+      requestId: entry.sequence,
+      metadata: { boundary: 'transport-dispatch', priority: entry.priority },
+    });
     let chunkData = null;
     let error = null;
     try {
@@ -250,10 +339,28 @@ export class ChunkDataService {
         chunkZ: entry.chunkZ,
         priority: entry.priority,
       });
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
+        correlationId: entry.telemetryCorrelationId,
+        target: entry.telemetryTarget,
+        stream: entry.telemetryStream,
+        resourceKey: entry.key,
+        ownerKey: entry.key,
+        requestId: entry.sequence,
+        metadata: { boundary: 'transport-receive' },
+      });
       if (!this.isShutdown) this.#validateAndCache(entry, chunkData);
       else this.counts.shutdownLateResultCount += 1;
     } catch (caught) {
       error = caught;
+      this.#recordTelemetry(WORLD_STREAMING_EVENT.FAILED, {
+        correlationId: entry.telemetryCorrelationId,
+        target: entry.telemetryTarget,
+        stream: entry.telemetryStream,
+        resourceKey: entry.key,
+        ownerKey: entry.key,
+        requestId: entry.sequence,
+        metadata: { name: caught?.name ?? 'Error', message: caught?.message ?? String(caught) },
+      });
     } finally {
       this.pending.delete(entry.key);
       this.inFlight = null;
@@ -262,6 +369,16 @@ export class ChunkDataService {
       const currentEpoch = this.consumerEpochs.get(subscriber.consumerId) ?? subscriber.epoch;
       if (this.isShutdown || subscriber.cancelled || subscriber.epoch !== currentEpoch) {
         this.counts.staleSubscriberResults += 1;
+        if (!subscriber.cancelled) {
+          this.#recordTelemetry(WORLD_STREAMING_EVENT.CANCELLED, {
+            correlationId: subscriber.telemetryCorrelationId,
+            target: subscriber.telemetryTarget,
+            stream: subscriber.telemetryStream,
+            resourceKey: entry.key,
+            ownerKey: entry.key,
+            metadata: { reason: this.isShutdown ? 'shutdown-late-result' : 'stale-result' },
+          });
+        }
         subscriber.resolve(null);
       } else if (error) {
         subscriber.resolve(Promise.reject(error));
@@ -271,6 +388,10 @@ export class ChunkDataService {
     }
     entry.subscribers.clear();
     this.#scheduleDispatch();
+  }
+
+  #recordTelemetry(type, details) {
+    return this.telemetry?.record(type, details) ?? null;
   }
 
   #validateAndCache(entry, chunkData) {

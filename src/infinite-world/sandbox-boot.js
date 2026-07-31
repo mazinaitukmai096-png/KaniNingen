@@ -48,6 +48,12 @@ import {
   parseW8DiagnosticProfile,
 } from './runtime-diagnostics.js';
 import {
+  WORLD_STREAMING_EVENT,
+  WORLD_STREAMING_STREAM,
+  WORLD_STREAMING_TARGET,
+  createWorldStreamingTelemetry,
+} from './world-streaming-telemetry.js';
+import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   W8_RENDER_FOG_COLOR_HEX,
   normalizeW8RenderDistancePreset,
@@ -699,6 +705,10 @@ export async function bootInfiniteWorldSandbox({
   diagnosticsEnabled = measurementMode !== null
     || new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnostics') === '1'
     || diagnosticProfile.profileId !== 'baseline',
+  streamingTelemetryEnabled = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('streamingTelemetry') === '1',
+  streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
   chunkGeneratorWorkerFactory = null,
@@ -741,6 +751,7 @@ export async function bootInfiniteWorldSandbox({
   let localTerrainCoverageEpoch = 0;
   let audioDirector = null;
   let diagnostics = null;
+  let streamingTelemetry = null;
   let availableSaveSnapshot = null;
   let experienceSpawn = null;
   let running = false;
@@ -781,6 +792,61 @@ export async function bootInfiniteWorldSandbox({
         worldSeed: requestedSeed,
       },
     });
+    streamingTelemetry = createWorldStreamingTelemetry({
+      enabled: streamingTelemetryEnabled,
+      capacity: streamingTelemetryCapacity,
+      clock,
+    });
+    const traceGenerationBoundary = async ({
+      target,
+      resourceKey,
+      ownerKey = null,
+      metadata = null,
+    }, operation) => {
+      if (!streamingTelemetry.enabled) return operation();
+      const correlationId = streamingTelemetry.beginRequest({
+        target,
+        stream: WORLD_STREAMING_STREAM.DISTANT,
+        resourceKey,
+        ownerKey,
+        metadata,
+      });
+      streamingTelemetry.record(WORLD_STREAMING_EVENT.WORKER_START, {
+        correlationId,
+        target,
+        stream: WORLD_STREAMING_STREAM.DISTANT,
+        resourceKey,
+        ownerKey,
+        metadata: { boundary: 'transport-dispatch' },
+      });
+      try {
+        const result = await operation();
+        streamingTelemetry.record(result === null
+          ? WORLD_STREAMING_EVENT.CANCELLED
+          : WORLD_STREAMING_EVENT.WORKER_COMPLETE, {
+          correlationId,
+          target,
+          stream: WORLD_STREAMING_STREAM.DISTANT,
+          resourceKey,
+          ownerKey,
+          metadata: result === null
+            ? { reason: 'transport-cancelled' }
+            : { boundary: 'transport-receive' },
+        });
+        return result;
+      } catch (error) {
+        streamingTelemetry.record(WORLD_STREAMING_EVENT.FAILED, {
+          correlationId,
+          target,
+          stream: WORLD_STREAMING_STREAM.DISTANT,
+          resourceKey,
+          ownerKey,
+          metadata: { name: error?.name ?? 'Error', message: error?.message ?? String(error) },
+        });
+        throw error;
+      }
+    };
+
     const generatorMetadata = await runStage('Legacy Core', async () => {
       const workerTransport = createWorkerChunkGeneratorTransport({
         worldSeed: requestedSeed,
@@ -811,6 +877,7 @@ export async function bootInfiniteWorldSandbox({
       chunkDataService = new ChunkDataService({
         transport: chunkGeneratorTransport,
         cacheCapacity: 81,
+        telemetry: streamingTelemetry,
       });
       return chunkDataService.initialize();
     });
@@ -940,6 +1007,7 @@ export async function bootInfiniteWorldSandbox({
         renderChunkSize: selectedRenderChunkSize,
         isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
         visualAssets,
+        telemetry: streamingTelemetry,
       });
       const chunkIndex = chunkIndexFactory({ capacity: 65_536 });
       const logicalPlayer = worldState.player;
@@ -993,20 +1061,58 @@ export async function bootInfiniteWorldSandbox({
       visualAssets,
       findSettlementsNear: generator.distributor.findSettlementsNear,
       resolveTemplate: request => generator.resolveSettlementPresentationTemplate(request),
-      getCanonicalChunkData: async (chunkX, chunkZ, request = {}) =>
-        runtime.getChunkData(chunkX, chunkZ) ?? chunkDataService.requestChunk({
+      getCanonicalChunkData: async (chunkX, chunkZ, request = {}) => {
+        const ownerKey = `${chunkX},${chunkZ}`;
+        const existing = runtime.getChunkData(chunkX, chunkZ);
+        if (!streamingTelemetry.enabled) {
+          return existing ?? chunkDataService.requestChunk({
+            chunkX,
+            chunkZ,
+            priority: request.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+            consumerId: request.consumerId ?? 'distant-owner-query',
+            epoch: request.epoch ?? 0,
+          }).promise;
+        }
+        const correlationId = streamingTelemetry.beginRequest({
+          target: WORLD_STREAMING_TARGET.DISTANT,
+          stream: WORLD_STREAMING_STREAM.DISTANT,
+          resourceKey: ownerKey,
+          ownerKey,
+          metadata: {
+            consumerId: request.consumerId ?? 'distant-owner-query',
+            epoch: request.epoch ?? 0,
+          },
+        });
+        if (existing) {
+          streamingTelemetry.record(WORLD_STREAMING_EVENT.CACHE_HIT, {
+            correlationId,
+            target: WORLD_STREAMING_TARGET.DISTANT,
+            stream: WORLD_STREAMING_STREAM.DISTANT,
+            resourceKey: ownerKey,
+            ownerKey,
+            metadata: { cache: 'runtime' },
+          });
+          return existing;
+        }
+        return chunkDataService.requestChunk({
           chunkX,
           chunkZ,
           priority: request.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
           consumerId: request.consumerId ?? 'distant-owner-query',
           epoch: request.epoch ?? 0,
-        }).promise,
+          telemetryTarget: WORLD_STREAMING_TARGET.DISTANT,
+          telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
+          telemetryCorrelationId: correlationId,
+        }).promise;
+      },
+
       cancelCanonicalChunkRequests: options => chunkDataService.cancelConsumer(options),
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
       getNearVisibleStableIds: () =>
         renderAdapter.visibleSettlementStableIdsSnapshot?.() ?? [],
       getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
       measure: (stage, operation) => diagnostics.measure(stage, operation),
+      telemetry: streamingTelemetry,
     });
     {
       const runtimeSnapshot = runtime.getCommittedChunkState();
@@ -1072,6 +1178,7 @@ export async function bootInfiniteWorldSandbox({
         scene,
         renderChunkSize: selectedRenderChunkSize,
         visualAssets,
+        telemetry: streamingTelemetry,
       });
       gameplayRenderAdapter.consumePresentationEvents?.([], { playerMarker });
       gameplay = gameplayRuntimeFactory({
@@ -1088,6 +1195,8 @@ export async function bootInfiniteWorldSandbox({
           priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
           consumerId,
           epoch,
+          telemetryTarget: WORLD_STREAMING_TARGET.GAMEPLAY,
+          telemetryStream: WORLD_STREAMING_STREAM.GAMEPLAY,
         }).promise,
         cancelChunkDataQueries: options => chunkDataService.cancelConsumer(options),
         sampleTerrainHeight: sampleCanonicalTerrainHeightMeters,
@@ -1112,6 +1221,54 @@ export async function bootInfiniteWorldSandbox({
     const directionalPrefetchPending = new Set();
     let transitionError = null;
     let playerRelocationInProgress = false;
+    let lastTelemetryArrival = null;
+    const recordPlayerArrival = (owner, arrivedAt) => {
+      if (!streamingTelemetry.enabled || !owner?.key
+        || owner.key === lastTelemetryArrival?.ownerKey) return;
+      const elapsedSeconds = lastTelemetryArrival
+        ? Math.max(0, arrivedAt - lastTelemetryArrival.arrivedAt) / 1000 : 0;
+      const speedMetersPerSecond = elapsedSeconds > 0
+        ? Math.hypot(
+          logicalPlayer.x - lastTelemetryArrival.x,
+          logicalPlayer.z - lastTelemetryArrival.z,
+        ) / elapsedSeconds
+        : 0;
+      const playerLogical = { x: logicalPlayer.x, z: logicalPlayer.z };
+      const targets = [
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.NEAR],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.TREE],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.BUSH],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.GRASS],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.ROCK],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.BUILDING],
+        [WORLD_STREAMING_STREAM.NEAR, WORLD_STREAMING_TARGET.SETTLEMENT],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.DISTANT],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.TREE],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.BUSH],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.GRASS],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.ROCK],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.BUILDING],
+        [WORLD_STREAMING_STREAM.DISTANT, WORLD_STREAMING_TARGET.SETTLEMENT],
+        [WORLD_STREAMING_STREAM.GAMEPLAY, WORLD_STREAMING_TARGET.GAMEPLAY],
+      ];
+      for (const [stream, target] of targets) {
+        streamingTelemetry.record(WORLD_STREAMING_EVENT.PLAYER_ARRIVAL, {
+          target,
+          stream,
+          resourceKey: owner.key,
+          ownerKey: owner.key,
+          playerLogical,
+          speedMetersPerSecond,
+        });
+      }
+      lastTelemetryArrival = {
+        ownerKey: owner.key,
+        arrivedAt,
+        x: logicalPlayer.x,
+        z: logicalPlayer.z,
+      };
+    };
+
     const initialSaveStorageMode = saveStore.snapshot().storage?.mode;
     let saveStatus = initialSaveStorageMode === 'unavailable'
       || state.saveError?.code === 'SAVE_STORAGE_UNAVAILABLE'
@@ -2146,6 +2303,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           );
         }
         renderer.render(scene, camera);
+        if (streamingTelemetry.enabled) {
+          renderAdapter.markFirstDraw?.();
+          distantPresentation.markFirstDraw?.();
+          gameplayRenderAdapter.markFirstDraw?.();
+        }
       });
     }
 
@@ -2247,6 +2409,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         gameplayRenderAdapter.consumePresentationEvents?.(presentation.events, { playerMarker });
         audioDirector.consume(presentation.events);
         renderActiveScene();
+        recordPlayerArrival(owner, frameNow);
         if (frameNow - lastHudAt > 120) {
           diagnostics.measure('hud', () => updateHud(owner));
           lastHudAt = frameNow;
@@ -2260,6 +2423,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     await runStage('Renderer', () => {
       const owner = updatePlayer(0);
       renderActiveScene();
+      recordPlayerArrival(owner, clock());
       state.initialSceneObjectCount = countSceneObjects(scene);
       state.initializationComplete = true;
       state.status = 'ready';
@@ -2285,6 +2449,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       experienceShell.dispose();
       if (runStarted) await saveForExit();
       diagnostics.dispose();
+      streamingTelemetry.dispose();
       await audioDirector.dispose();
       await gameplay.shutdown();
       await runtime.shutdown();
@@ -2346,6 +2511,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           presentation: distantPresentation.snapshot(),
           scenePresentation: scenePresentation.snapshot(),
           measurement: Object.freeze({ ...measurement }),
+          streamingTelemetry: streamingTelemetry.snapshot(),
           diagnostics: diagnostics.snapshot({
             drawCalls: renderer.info?.render?.calls ?? null,
             geometries: renderer.info?.memory?.geometries ?? null,
