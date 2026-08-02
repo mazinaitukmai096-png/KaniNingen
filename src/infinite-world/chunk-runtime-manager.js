@@ -74,6 +74,8 @@ export class ChunkRuntimeManager {
     this.identityAudit = new Map();
     this.activeDataKeys = new Set();
     this.renderedKeys = new Set();
+    this.deferredRenderReleaseKeys = new Set();
+    this.transitionProtectedDataKeys = new Set();
     this.centerChunkX = null;
     this.centerChunkZ = null;
     this.accessTick = 0;
@@ -113,6 +115,8 @@ export class ChunkRuntimeManager {
       maxCacheSize: 0,
       maxActiveDataCount: 0,
       maxRenderedCount: 0,
+      deferredRenderReleases: 0,
+      renderReleaseFailures: 0,
     };
   }
 
@@ -202,6 +206,7 @@ export class ChunkRuntimeManager {
       ready: false,
       discarded: false,
       released: false,
+      committing: false,
       promise: null,
     };
     this.preparedPlanRegistry.add(plan);
@@ -214,7 +219,8 @@ export class ChunkRuntimeManager {
       renderOriginChunkX: chunkX,
       renderOriginChunkZ: chunkZ,
       rebaseCount: this.renderOrigin.rebaseCount
-        + (this.renderOrigin.renderOriginChunkX === chunkX && this.renderOrigin.renderOriginChunkZ === chunkZ ? 0 : 1),
+        + (this.renderOrigin.initialized
+          && (this.renderOrigin.renderOriginChunkX !== chunkX || this.renderOrigin.renderOriginChunkZ !== chunkZ) ? 1 : 0),
     });
   }
 
@@ -262,8 +268,9 @@ export class ChunkRuntimeManager {
     return Object.freeze({ data: prior?.data ?? chunkData, generated: !prior });
   }
 
-  async #discardPreparedTransition(plan) {
+  async #discardPreparedTransition(plan, { force = false } = {}) {
     if (!plan || plan.released) return;
+    if (plan.committing && !force) return;
     plan.discarded = true;
     this.chunkDataService.cancelConsumer({ consumerId: plan.consumerId, epoch: plan.epoch });
     for (const projected of plan.projectedByKey.values()) {
@@ -280,6 +287,7 @@ export class ChunkRuntimeManager {
     const stale = [];
     for (const [key, plan] of this.preparedTransitions) {
       if (key === preferredKey) continue;
+      if (plan.committing) continue;
       plan.discarded = true;
       this.preparedTransitions.delete(key);
       stale.push(plan);
@@ -288,44 +296,55 @@ export class ChunkRuntimeManager {
   }
 
   async #prepareTransitionPlan(plan, { yieldBetweenUnits }) {
-    if (plan.discarded) return null;
-    for (const coordinate of plan.dataCoordinates) {
-      if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
+    try {
+      if (plan.discarded) return null;
+      for (const coordinate of plan.dataCoordinates) {
+        if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
+          await this.#discardPreparedTransition(plan);
+          return null;
+        }
+        const isRenderCoordinate = plan.renderCoordinates.some(value => value.key === coordinate.key);
+        const result = await this.#ensureChunkData(coordinate, {
+          priority: isRenderCoordinate
+            ? CHUNK_DATA_PRIORITY.PLAYER_RENDER : CHUNK_DATA_PRIORITY.PLAYER_DATA,
+          consumerId: plan.consumerId,
+          epoch: plan.epoch,
+        });
+        if (result.cancelled || plan.discarded) {
+          await this.#discardPreparedTransition(plan);
+          return null;
+        }
+        if (yieldBetweenUnits && result.generated) await this.yieldToHost();
+      }
+      const targetOrigin = this.#targetRenderOrigin(plan.chunkX, plan.chunkZ);
+      for (const coordinate of plan.renderCoordinates) {
+        if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
+          await this.#discardPreparedTransition(plan);
+          return null;
+        }
+        const entry = this.cache.get(coordinate.key);
+        if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
+        if (this.renderedKeys.has(coordinate.key) || this.deferredRenderReleaseKeys.has(coordinate.key)) continue;
+        const projectionStartedAt = this.clock();
+        const projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
+          deferredRegistration: true,
+        });
+        this.performance.record('projection', this.clock() - projectionStartedAt);
+        plan.projectedByKey.set(coordinate.key, projected);
+        this.counts.preparedProjections += 1;
+        if (yieldBetweenUnits) await this.yieldToHost();
+      }
+      if (plan.discarded) {
         await this.#discardPreparedTransition(plan);
         return null;
       }
-      const isRenderCoordinate = plan.renderCoordinates.some(value => value.key === coordinate.key);
-      const result = await this.#ensureChunkData(coordinate, {
-        priority: isRenderCoordinate
-          ? CHUNK_DATA_PRIORITY.PLAYER_RENDER : CHUNK_DATA_PRIORITY.PLAYER_DATA,
-        consumerId: plan.consumerId,
-        epoch: plan.epoch,
-      });
-      if (result.cancelled || plan.discarded) return null;
-      if (yieldBetweenUnits && result.generated) await this.yieldToHost();
+      plan.ready = true;
+      this.counts.preparedTransitions += 1;
+      return plan;
+    } catch (error) {
+      await this.#discardPreparedTransition(plan, { force: true });
+      throw error;
     }
-    const targetOrigin = this.#targetRenderOrigin(plan.chunkX, plan.chunkZ);
-    for (const coordinate of plan.renderCoordinates) {
-      if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
-        await this.#discardPreparedTransition(plan);
-        return null;
-      }
-      const entry = this.cache.get(coordinate.key);
-      if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
-      if (this.renderedKeys.has(coordinate.key)) continue;
-      const projectionStartedAt = this.clock();
-      const projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
-        deferredRegistration: true,
-      });
-      this.performance.record('projection', this.clock() - projectionStartedAt);
-      plan.projectedByKey.set(coordinate.key, projected);
-      this.counts.preparedProjections += 1;
-      if (yieldBetweenUnits) await this.yieldToHost();
-    }
-    if (plan.discarded) return null;
-    plan.ready = true;
-    this.counts.preparedTransitions += 1;
-    return plan;
   }
 
   #canPrepareTransition(chunkX, chunkZ) {
@@ -391,6 +410,8 @@ export class ChunkRuntimeManager {
   async #performTransition(chunkX, chunkZ) {
     if (this.isShutdown) throw new Error('chunk runtime manager is shut down');
     if (this.centerChunkX === chunkX && this.centerChunkZ === chunkZ) {
+      await this.#releaseObsoleteRenderOwners(this.renderedKeys, []);
+      this.#validateRuntimeInvariants();
       this.counts.transitionsCoalesced += 1;
       return this.latestTransition;
     }
@@ -405,95 +426,223 @@ export class ChunkRuntimeManager {
     const desiredRenderCoordinates = prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1);
     const desiredRenderKeys = new Set(desiredRenderCoordinates.map(coordinate => coordinate.key));
     if (!prepared) await this.#materializeMissingData(desiredDataCoordinates, { chunkX, chunkZ });
-    const originChange = this.floatingOrigin.setCenterChunk(chunkX, chunkZ);
-    const origin = this.floatingOrigin.snapshot();
-    this.renderOrigin = origin;
-    const rebaseStartedAt = this.clock();
-    await this.renderAdapter.rebase(origin);
-    if (originChange.changed) this.performance.record('rebase', this.clock() - rebaseStartedAt);
-
-    for (const coordinate of desiredDataCoordinates) {
-      const entry = this.cache.get(coordinate.key);
-      if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
-      entry.lastUsed = ++this.accessTick;
-      if (!this.activeDataKeys.has(coordinate.key)) this.counts.dataActivated += 1;
-      else this.counts.cacheHits += 1;
-    }
-    for (const key of this.activeDataKeys) {
-      if (!desiredDataKeys.has(key)) this.counts.dataDeactivated += 1;
-    }
-    this.activeDataKeys = desiredDataKeys;
-
-    for (const key of sortedKeys(this.renderedKeys)) {
-      if (desiredRenderKeys.has(key)) continue;
-      const unloadStartedAt = this.clock();
-      await this.renderAdapter.unloadChunk(key);
-      this.performance.record('unload', this.clock() - unloadStartedAt);
-      this.renderedKeys.delete(key);
-      this.counts.renderUnloaded += 1;
-    }
-    for (const coordinate of desiredRenderCoordinates) {
-      if (this.renderedKeys.has(coordinate.key)) continue;
-      let projected = prepared?.projectedByKey.get(coordinate.key);
-      if (!projected) {
-        const entry = this.cache.get(coordinate.key);
-        const projectionStartedAt = this.clock();
-        projected = await this.renderAdapter.projectChunk(entry.data, origin);
-        this.performance.record('projection', this.clock() - projectionStartedAt);
-      }
-      // Ownership moves out of the prepared plan before scene attachment. A
-      // superseded-plan cleanup can therefore only dispose projections that
-      // are still staged and never a projection being loaded or already live.
-      prepared?.projectedByKey.delete(coordinate.key);
-      const loadStartedAt = this.clock();
-      try {
-        await this.renderAdapter.loadProjected(projected);
-      } catch (error) {
-        if (projected?.lifecycle === 'staged') {
-          await this.renderAdapter.discardProjected?.(projected);
+    const previousOrigin = this.renderOrigin;
+    const targetOrigin = this.#targetRenderOrigin(chunkX, chunkZ);
+    const physicalBefore = this.#physicalRenderKeys();
+    const staged = [];
+    const attached = [];
+    const publicationSequence = [];
+    let replacementCommitted = false;
+    this.transitionProtectedDataKeys = desiredDataKeys;
+    if (prepared) prepared.committing = true;
+    try {
+      for (const coordinate of desiredRenderCoordinates) {
+        if (physicalBefore.has(coordinate.key)) continue;
+        let projected = prepared?.projectedByKey.get(coordinate.key);
+        if (!projected) {
+          const entry = this.cache.get(coordinate.key);
+          if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
+          const projectionStartedAt = this.clock();
+          projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
+            deferredRegistration: true,
+          });
+          this.performance.record('projection', this.clock() - projectionStartedAt);
         }
-        throw error;
+        staged.push({ key: coordinate.key, projected });
+        publicationSequence.push(Object.freeze({ type: 'replacement-prepared', ownerKey: coordinate.key }));
       }
-      this.performance.record('load', this.clock() - loadStartedAt);
-      this.renderedKeys.add(coordinate.key);
-      this.counts.renderLoaded += 1;
-    }
-    if (prepared) await this.#discardPreparedTransition(prepared);
 
-    this.centerChunkX = chunkX;
-    this.centerChunkZ = chunkZ;
-    this.activeDataKeyList = Object.freeze(sortedKeys(this.activeDataKeys));
-    this.renderedKeyList = Object.freeze(sortedKeys(this.renderedKeys));
-    this.committedTransitionContract = createRuntimeTransitionContract({
-      generation: ++this.committedTransitionGeneration,
-      centerChunkX: chunkX,
-      centerChunkZ: chunkZ,
-      renderedKeys: this.renderedKeyList,
-      activeDataKeys: this.activeDataKeyList,
-    });
-    this.#evictInactiveCacheEntries();
-    this.#validateRuntimeInvariants();
-    this.counts.transitionsPerformed += 1;
-    this.counts.maxCacheSize = Math.max(this.counts.maxCacheSize, this.cache.size);
-    this.counts.maxActiveDataCount = Math.max(this.counts.maxActiveDataCount, this.activeDataKeys.size);
-    this.counts.maxRenderedCount = Math.max(this.counts.maxRenderedCount, this.renderedKeys.size);
-    const durationMs = this.clock() - startedAt;
-    if (!initial) this.performance.record('crossing', durationMs);
-    this.latestTransition = Object.freeze({
-      initial,
-      centerChunkX: chunkX,
-      centerChunkZ: chunkZ,
-      generatedDelta: this.counts.generated - before.generated,
-      dataActivatedDelta: this.counts.dataActivated - before.dataActivated,
-      dataDeactivatedDelta: this.counts.dataDeactivated - before.dataDeactivated,
-      renderLoadedDelta: this.counts.renderLoaded - before.renderLoaded,
-      renderUnloadedDelta: this.counts.renderUnloaded - before.renderUnloaded,
-      rebaseDelta: originChange.changed ? 1 : 0,
-      prepared: prepared !== null,
-      durationMs,
-      transitionContract: this.committedTransitionContract,
-    });
-    return this.latestTransition;
+      if (prepared?.discarded || prepared?.released) {
+        throw new Error(`transition preparation was superseded for ${prepared.key}`);
+      }
+      for (const entry of staged) {
+        const loadStartedAt = this.clock();
+        await this.renderAdapter.loadProjected(entry.projected);
+        this.performance.record('load', this.clock() - loadStartedAt);
+        prepared?.projectedByKey.delete(entry.key);
+        attached.push(entry);
+        publicationSequence.push(Object.freeze({ type: 'replacement-attached', ownerKey: entry.key }));
+        this.counts.renderLoaded += 1;
+      }
+
+      this.#validateReplacementRenderCoverage(desiredRenderKeys, attached);
+      publicationSequence.push(Object.freeze({
+        type: 'new-coverage-verified',
+        ownerKeys: Object.freeze(sortedKeys(desiredRenderKeys)),
+      }));
+
+      let dataActivated = 0;
+      let cacheHits = 0;
+      const desiredDataEntries = [];
+      for (const coordinate of desiredDataCoordinates) {
+        const entry = this.cache.get(coordinate.key);
+        if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
+        desiredDataEntries.push(entry);
+        if (!this.activeDataKeys.has(coordinate.key)) dataActivated += 1;
+        else cacheHits += 1;
+      }
+      let dataDeactivated = 0;
+      for (const key of this.activeDataKeys) {
+        if (!desiredDataKeys.has(key)) dataDeactivated += 1;
+      }
+      const activeDataKeyList = Object.freeze(sortedKeys(desiredDataKeys));
+      const renderedKeyList = Object.freeze(sortedKeys(desiredRenderKeys));
+      const transitionGeneration = this.committedTransitionGeneration + 1;
+      const transitionContract = createRuntimeTransitionContract({
+        generation: transitionGeneration,
+        centerChunkX: chunkX,
+        centerChunkZ: chunkZ,
+        renderedKeys: renderedKeyList,
+        activeDataKeys: activeDataKeyList,
+      });
+
+      if (prepared) {
+        prepared.committing = false;
+        await this.#discardPreparedTransition(prepared, { force: true });
+      }
+
+      const rebaseStartedAt = this.clock();
+      await this.renderAdapter.rebase(targetOrigin);
+      const originChange = this.floatingOrigin.setCenterChunk(chunkX, chunkZ);
+      const origin = this.floatingOrigin.snapshot();
+      this.renderOrigin = origin;
+      if (originChange.changed) this.performance.record('rebase', this.clock() - rebaseStartedAt);
+
+      for (const entry of desiredDataEntries) entry.lastUsed = ++this.accessTick;
+
+      for (const key of physicalBefore) {
+        if (!desiredRenderKeys.has(key)) this.deferredRenderReleaseKeys.add(key);
+      }
+      for (const key of desiredRenderKeys) this.deferredRenderReleaseKeys.delete(key);
+      this.activeDataKeys = desiredDataKeys;
+      this.renderedKeys = desiredRenderKeys;
+      this.centerChunkX = chunkX;
+      this.centerChunkZ = chunkZ;
+      this.activeDataKeyList = activeDataKeyList;
+      this.renderedKeyList = renderedKeyList;
+      this.committedTransitionGeneration = transitionGeneration;
+      this.committedTransitionContract = transitionContract;
+      this.counts.dataActivated += dataActivated;
+      this.counts.cacheHits += cacheHits;
+      this.counts.dataDeactivated += dataDeactivated;
+      this.transitionProtectedDataKeys = new Set();
+      replacementCommitted = true;
+
+      await this.#releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence);
+      this.#evictInactiveCacheEntries();
+      this.#validateRuntimeInvariants();
+      this.counts.transitionsPerformed += 1;
+      this.counts.maxCacheSize = Math.max(this.counts.maxCacheSize, this.cache.size);
+      this.counts.maxActiveDataCount = Math.max(this.counts.maxActiveDataCount, this.activeDataKeys.size);
+      this.counts.maxRenderedCount = Math.max(this.counts.maxRenderedCount, this.renderedKeys.size);
+      const durationMs = this.clock() - startedAt;
+      if (!initial) this.performance.record('crossing', durationMs);
+      this.latestTransition = Object.freeze({
+        initial,
+        centerChunkX: chunkX,
+        centerChunkZ: chunkZ,
+        generatedDelta: this.counts.generated - before.generated,
+        dataActivatedDelta: this.counts.dataActivated - before.dataActivated,
+        dataDeactivatedDelta: this.counts.dataDeactivated - before.dataDeactivated,
+        renderLoadedDelta: this.counts.renderLoaded - before.renderLoaded,
+        renderUnloadedDelta: this.counts.renderUnloaded - before.renderUnloaded,
+        rebaseDelta: originChange.changed ? 1 : 0,
+        prepared: prepared !== null,
+        terrainPublicationSequence: Object.freeze(publicationSequence),
+        deferredRenderReleaseKeys: Object.freeze(sortedKeys(this.deferredRenderReleaseKeys)),
+        durationMs,
+        transitionContract: this.committedTransitionContract,
+      });
+      return this.latestTransition;
+    } catch (error) {
+      this.transitionProtectedDataKeys = new Set();
+      if (replacementCommitted) throw error;
+      const rollbackErrors = [];
+      for (const entry of [...attached].reverse()) {
+        try {
+          await this.renderAdapter.unloadChunk(entry.key);
+          this.counts.renderUnloaded += 1;
+        } catch (rollbackError) {
+          this.deferredRenderReleaseKeys.add(entry.key);
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      for (const entry of staged) {
+        if (attached.includes(entry)) continue;
+        try {
+          await this.renderAdapter.discardProjected?.(entry.projected);
+          prepared?.projectedByKey.delete(entry.key);
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      try {
+        await this.renderAdapter.rebase(previousOrigin);
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError);
+      }
+      if (prepared) {
+        prepared.committing = false;
+        try {
+          await this.#discardPreparedTransition(prepared, { force: true });
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
+      if (rollbackErrors.length) {
+        throw new AggregateError([error, ...rollbackErrors], 'Terrain transition failed and rollback was incomplete');
+      }
+      throw error;
+    }
+  }
+
+  #physicalRenderKeys() {
+    return new Set([...this.renderedKeys, ...this.deferredRenderReleaseKeys]);
+  }
+
+  #validateReplacementRenderCoverage(desiredRenderKeys, attached) {
+    const physical = this.#physicalRenderKeys();
+    for (const entry of attached) physical.add(entry.key);
+    for (const key of desiredRenderKeys) {
+      if (!physical.has(key)) throw new Error(`replacement Terrain is not attached: ${key}`);
+    }
+    const coverage = this.renderAdapter.renderCoverageSnapshot?.();
+    if (!coverage) return;
+    const loaded = new Set(coverage.loadedKeys ?? []);
+    const terrain = new Set(coverage.terrainKeys ?? coverage.loadedKeys ?? []);
+    const invalid = new Set([
+      ...(coverage.missingTerrainKeys ?? []),
+      ...(coverage.disposedTerrainKeys ?? []),
+      ...(coverage.lifecycleMismatchKeys ?? []),
+    ]);
+    for (const key of desiredRenderKeys) {
+      if (!loaded.has(key) || !terrain.has(key) || invalid.has(key)) {
+        throw new Error(`replacement Terrain coverage is not renderable: ${key}`);
+      }
+    }
+  }
+
+  async #releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence) {
+    const obsolete = sortedKeys(this.#physicalRenderKeys()).filter(key => !desiredRenderKeys.has(key));
+    for (const key of obsolete) {
+      const unloadStartedAt = this.clock();
+      try {
+        await this.renderAdapter.unloadChunk(key);
+        this.performance.record('unload', this.clock() - unloadStartedAt);
+        this.deferredRenderReleaseKeys.delete(key);
+        this.counts.renderUnloaded += 1;
+        publicationSequence.push(Object.freeze({ type: 'old-owner-released', ownerKey: key }));
+      } catch (error) {
+        this.deferredRenderReleaseKeys.add(key);
+        this.counts.deferredRenderReleases += 1;
+        this.counts.renderReleaseFailures += 1;
+        publicationSequence.push(Object.freeze({
+          type: 'old-owner-release-deferred',
+          ownerKey: key,
+          error: String(error?.message ?? error),
+        }));
+      }
+    }
   }
 
   #registerIdentity(key, chunkData) {
@@ -519,7 +668,7 @@ export class ChunkRuntimeManager {
     }
     const renderCoverage = this.renderAdapter.renderCoverageSnapshot?.();
     if (renderCoverage) {
-      const expected = sortedKeys(this.renderedKeys);
+      const expected = sortedKeys(this.#physicalRenderKeys());
       const compare = (label, actual) => {
         const values = [...(actual ?? [])].sort((left, right) => left.localeCompare(right));
         if (values.length !== expected.length || values.some((key, index) => key !== expected[index])) {
@@ -578,7 +727,9 @@ export class ChunkRuntimeManager {
   #evictInactiveCacheEntries() {
     if (this.cache.size <= this.cacheCapacity) return;
     const candidates = [...this.cache.entries()]
-      .filter(([key]) => !this.activeDataKeys.has(key) && !this.renderedKeys.has(key))
+      .filter(([key]) => !this.activeDataKeys.has(key)
+        && !this.renderedKeys.has(key)
+        && !this.transitionProtectedDataKeys.has(key))
       .sort((a, b) => a[1].lastUsed - b[1].lastUsed
         || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     for (const [key] of candidates) {
@@ -630,6 +781,7 @@ export class ChunkRuntimeManager {
       preparationPending: this.preparationPendingCount > 0,
       pendingPrefetchCount: this.pendingPrefetchKeys.size,
       preparedTransitionCount: this.preparedTransitions.size,
+      deferredRenderReleaseCount: this.deferredRenderReleaseKeys.size,
     });
   }
 
@@ -657,6 +809,7 @@ export class ChunkRuntimeManager {
       activeDataKeys: this.activeDataKeyList,
       pendingPrefetchKeys: Object.freeze(sortedKeys(this.pendingPrefetchKeys)),
       renderedKeys: this.renderedKeyList,
+      deferredRenderReleaseKeys: Object.freeze(sortedKeys(this.deferredRenderReleaseKeys)),
       transitionContract: this.committedTransitionContract,
       streaming: this.getStreamingState(),
       counts: Object.freeze({ ...this.counts }),
@@ -672,13 +825,15 @@ export class ChunkRuntimeManager {
     await this.transitionChain;
     await this.preparationChain;
     for (const plan of [...this.preparedPlanRegistry]) await this.#discardPreparedTransition(plan);
-    for (const key of sortedKeys(this.renderedKeys)) {
+    for (const key of sortedKeys(this.#physicalRenderKeys())) {
       const startedAt = this.clock();
       await this.renderAdapter.unloadChunk(key);
       this.performance.record('unload', this.clock() - startedAt);
       this.counts.renderUnloaded += 1;
     }
     this.renderedKeys.clear();
+    this.deferredRenderReleaseKeys.clear();
+    this.transitionProtectedDataKeys.clear();
     this.activeDataKeys.clear();
     this.cache.clear();
     this.identityAudit.clear();

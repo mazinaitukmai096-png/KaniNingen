@@ -178,7 +178,7 @@ test('W4 runtime indexes projected Settlement features without Stable ID collisi
   const state = runtime.snapshot();
   assert.ok(state.chunkIndex.candidateCount > 0);
   assert.equal(state.chunkIndex.counts.evicted, 0);
-  assert.equal(adapter.maxLoaded, 9);
+  assert.equal(adapter.maxLoaded, 14, 'diagonal replacement Terrain overlaps old coverage during atomic handoff');
   assert.ok(state.performance.generation.p95 < 250);
   assert.ok(state.performance.crossing.p95 < 1000);
   await runtime.shutdown();

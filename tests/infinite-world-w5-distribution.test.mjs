@@ -249,7 +249,7 @@ test('W5 streaming bounds caches, Scene objects, indexes, and performance distri
     assert.equal(adapter.loaded.size, 9);
   }
   const state = runtime.snapshot();
-  assert.equal(adapter.maximum, 9);
+  assert.equal(adapter.maximum, 14, 'diagonal replacement Terrain overlaps old coverage during atomic handoff');
   assert.ok(state.chunkIndex.candidateCount > 0);
   assert.ok(generator.snapshot().templateCacheSize <= generator.snapshot().templateCacheCapacity);
   assert.ok(generator.snapshot().distributor.rawCacheSize <= generator.snapshot().distributor.rawCacheCapacity);

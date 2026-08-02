@@ -81,7 +81,7 @@ test('queued duplicate transitions coalesce without regeneration or render growt
   assert.equal(state.counts.transitionsPerformed, 2);
   assert.equal(state.counts.transitionsCoalesced, 4);
   assert.equal(state.counts.maxRenderedCount, 9);
-  assert.equal(adapter.maxLive, 9);
+  assert.equal(adapter.maxLive, 12, 'replacement column overlaps old coverage until publication is verified');
   await runtime.shutdown();
 });
 
@@ -105,7 +105,7 @@ test('long bidirectional streaming keeps cache, active data, and scene objects b
   assert.equal(state.counts.maxActiveDataCount, 25);
   assert.equal(state.counts.maxRenderedCount, 9);
   assert.equal(adapter.loaded.size, 9);
-  assert.equal(adapter.maxLive, 9);
+  assert.equal(adapter.maxLive, 16, 'replacement coverage overlaps old coverage until publication is verified');
   await runtime.shutdown();
   assert.equal(adapter.loaded.size, 0);
 });

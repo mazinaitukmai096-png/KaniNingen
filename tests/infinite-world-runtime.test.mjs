@@ -11,28 +11,95 @@ import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk
 class RecordingAdapter {
   constructor() {
     this.loaded = new Map();
+    this.staged = new Set();
     this.unloadHistory = [];
     this.publicationHistory = [];
+    this.coverageSamples = [];
+    this.projectAttempts = 0;
+    this.loadAttempts = 0;
+    this.failProjectAt = null;
+    this.failLoadAt = null;
+    this.failUnloadKeys = new Set();
+    this.projectGate = null;
     this.origin = null;
     this.shutdownCalled = false;
   }
 
-  async rebase(origin) { this.origin = origin; }
+  #recordCoverage(stage) {
+    this.coverageSamples.push({ stage, count: this.loaded.size });
+  }
+
+  async rebase(origin) { this.origin = origin; this.#recordCoverage('rebase'); }
   async projectChunk(data) {
     if (!data) throw new TypeError('undefined ChunkData');
-    return { key: `${data.chunkX},${data.chunkZ}`, chunkId: data.chunkId, contentHash: data.contentHash };
+    this.projectAttempts += 1;
+    if (this.projectGate?.attempt === this.projectAttempts) {
+      this.projectGate.startedResolve();
+      await this.projectGate.release;
+      this.projectGate = null;
+    }
+    if (this.failProjectAt === this.projectAttempts) throw new Error('injected Terrain prepare failure');
+    const projected = {
+      key: `${data.chunkX},${data.chunkZ}`,
+      chunkId: data.chunkId,
+      contentHash: data.contentHash,
+      lifecycle: 'staged',
+    };
+    this.staged.add(projected);
+    this.publicationHistory.push({ type: 'replacement-prepared', ownerKey: projected.key });
+    this.#recordCoverage('prepare');
+    return projected;
   }
   async loadProjected(projected) {
+    this.loadAttempts += 1;
+    if (this.failLoadAt === this.loadAttempts) throw new Error('injected Terrain attach failure');
     if (this.loaded.has(projected.key)) throw new Error(`duplicate render load ${projected.key}`);
+    projected.lifecycle = 'loaded';
+    this.staged.delete(projected);
     this.loaded.set(projected.key, projected);
     this.publicationHistory.push({ type: 'replacement-attached', ownerKey: projected.key });
+    this.#recordCoverage('attach');
   }
   async unloadChunk(key) {
+    if (this.failUnloadKeys.has(key)) throw new Error(`injected Terrain release failure ${key}`);
     if (!this.loaded.delete(key)) throw new Error(`missing render unload ${key}`);
     this.unloadHistory.push(key);
     this.publicationHistory.push({ type: 'old-owner-released', ownerKey: key });
+    this.#recordCoverage('release');
   }
-  async shutdown() { this.shutdownCalled = true; this.loaded.clear(); }
+  async discardProjected(projected) {
+    if (projected.lifecycle !== 'staged') throw new Error(`cannot discard ${projected.key}:${projected.lifecycle}`);
+    projected.lifecycle = 'discarded';
+    this.staged.delete(projected);
+    this.#recordCoverage('discard');
+  }
+  renderCoverageSnapshot() {
+    const keys = [...this.loaded.keys()].sort();
+    return {
+      loadedKeys: keys,
+      terrainKeys: keys,
+      missingTerrainKeys: [],
+      disposedTerrainKeys: [],
+      lifecycleMismatchKeys: [],
+    };
+  }
+  gateNextProject() {
+    let startedResolve;
+    let releaseResolve;
+    const started = new Promise(resolve => { startedResolve = resolve; });
+    const release = new Promise(resolve => { releaseResolve = resolve; });
+    this.projectGate = {
+      attempt: this.projectAttempts + 1,
+      startedResolve,
+      release,
+    };
+    return { started, release: releaseResolve };
+  }
+  async shutdown() {
+    this.shutdownCalled = true;
+    this.loaded.clear();
+    this.staged.clear();
+  }
 }
 
 test('runtime maintains 3x3 render and 5x5 data sets and generates only an entering column', async () => {
@@ -51,6 +118,7 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   assert.equal(adapter.loaded.size, 9);
 
   adapter.publicationHistory.length = 0;
+  adapter.coverageSamples.length = 0;
   const east = await runtime.transitionToChunk(1, 0);
   assert.deepEqual({
     generated: east.generatedDelta,
@@ -63,13 +131,30 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   assert.equal(runtime.snapshot().activeDataCount, 25);
   assert.equal(runtime.snapshot().renderedCount, 9);
   assert.deepEqual(adapter.publicationHistory.map(event => event.type), [
-    'old-owner-released',
-    'old-owner-released',
-    'old-owner-released',
+    'replacement-prepared',
+    'replacement-prepared',
+    'replacement-prepared',
     'replacement-attached',
     'replacement-attached',
     'replacement-attached',
-  ], 'Near Terrain currently releases the outgoing column before attaching replacements');
+    'old-owner-released',
+    'old-owner-released',
+    'old-owner-released',
+  ], 'Near Terrain attaches every replacement before releasing the outgoing column');
+  assert.deepEqual(east.terrainPublicationSequence.map(event => event.type), [
+    'replacement-prepared',
+    'replacement-prepared',
+    'replacement-prepared',
+    'replacement-attached',
+    'replacement-attached',
+    'replacement-attached',
+    'new-coverage-verified',
+    'old-owner-released',
+    'old-owner-released',
+    'old-owner-released',
+  ]);
+  assert.equal(Math.min(...adapter.coverageSamples.map(sample => sample.count)), 9,
+    'every async prepare/attach/release boundary retains renderable Terrain coverage');
 
   const revisit = await runtime.transitionToChunk(0, 0);
   assert.equal(revisit.generatedDelta, 0);
@@ -79,6 +164,107 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   await runtime.shutdown();
   assert.equal(adapter.loaded.size, 0);
   assert.equal(adapter.shutdownCalled, true);
+});
+
+test('Terrain prepare failure discards staging and preserves the complete old coverage', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-prepare-rollback' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  const oldKeys = [...adapter.loaded.keys()].sort();
+  adapter.failProjectAt = adapter.projectAttempts + 2;
+  adapter.coverageSamples.length = 0;
+
+  await assert.rejects(runtime.transitionToChunk(1, 0), /injected Terrain prepare failure/);
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldKeys);
+  assert.equal(adapter.staged.size, 0);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().renderedCount, 9);
+  assert.ok(adapter.coverageSamples.every(sample => sample.count === 9));
+  await runtime.shutdown();
+});
+
+test('Terrain attach failure rolls back newly attached owners without releasing old coverage', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-attach-rollback' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  const oldKeys = [...adapter.loaded.keys()].sort();
+  adapter.failLoadAt = adapter.loadAttempts + 2;
+  adapter.publicationHistory.length = 0;
+  adapter.coverageSamples.length = 0;
+
+  await assert.rejects(runtime.transitionToChunk(1, 0), /injected Terrain attach failure/);
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldKeys);
+  assert.equal(adapter.staged.size, 0);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().deferredRenderReleaseKeys.length, 0);
+  assert.ok(adapter.coverageSamples.every(sample => sample.count >= 9));
+  assert.equal(adapter.publicationHistory.some(event => (
+    event.type === 'old-owner-released' && oldKeys.includes(event.ownerKey)
+  )), false);
+  await runtime.shutdown();
+});
+
+test('superseded Terrain preparation cannot attach stale replacement owners', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-stale-rollback' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  const oldKeys = [...adapter.loaded.keys()].sort();
+  const gate = adapter.gateNextProject();
+  adapter.publicationHistory.length = 0;
+  const eastTransition = runtime.transitionToChunk(1, 0);
+  await gate.started;
+  const northPreparation = runtime.prepareTransition(0, -1);
+  gate.release();
+
+  await assert.rejects(eastTransition, /transition preparation was superseded/);
+  await northPreparation;
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldKeys);
+  assert.equal(adapter.publicationHistory.some(event => event.type === 'replacement-attached'), false);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().renderedCount, 9);
+  await runtime.shutdown();
+});
+
+test('Terrain release failure retains both safe roots and retries without orphaning replacement coverage', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-release-retry' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  adapter.failUnloadKeys.add('-1,-1');
+
+  const transition = await runtime.transitionToChunk(1, 0);
+  assert.equal(transition.terrainPublicationSequence.some(event => (
+    event.type === 'old-owner-release-deferred' && event.ownerKey === '-1,-1'
+  )), true);
+  assert.equal(runtime.snapshot().renderedCount, 9);
+  assert.deepEqual(runtime.snapshot().deferredRenderReleaseKeys, ['-1,-1']);
+  assert.equal(adapter.loaded.size, 10, 'failed release keeps old Terrain alongside complete replacement coverage');
+
+  adapter.failUnloadKeys.clear();
+  await runtime.transitionToChunk(1, 0);
+  assert.equal(runtime.snapshot().deferredRenderReleaseKeys.length, 0);
+  assert.equal(adapter.loaded.size, 9);
+  assert.equal(runtime.snapshot().counts.renderReleaseFailures, 1);
+  await runtime.shutdown();
+});
+
+test('round-trip Terrain transitions leave no duplicate, orphan, or double-released owner', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-round-trip' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  await runtime.transitionToChunk(1, 0);
+  await runtime.transitionToChunk(0, 0);
+  const snapshot = runtime.snapshot();
+  assert.equal(snapshot.renderedCount, 9);
+  assert.equal(snapshot.deferredRenderReleaseKeys.length, 0);
+  assert.equal(adapter.loaded.size, 9);
+  assert.equal(adapter.staged.size, 0);
+  assert.equal(new Set(adapter.loaded.keys()).size, adapter.loaded.size);
+  await runtime.shutdown();
 });
 
 test('bounded revisit cache evicts only inactive data and never exceeds its explicit cap', async () => {
