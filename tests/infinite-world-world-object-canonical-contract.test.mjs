@@ -83,7 +83,10 @@ const assertBaseContract = (source, expectedType) => {
   ]) assert.equal(Object.isFrozen(value), true);
   assert.equal(typeof first.collision.shape, 'string');
   assert.equal(typeof first.interaction.enabled, 'boolean');
-  assert.equal(first.destruction.stateKey, first.stableId);
+  assert.equal(
+    first.destruction.stateKey,
+    first.destruction.destructible ? first.stableId : null,
+  );
   assert.ok(first.lodPolicy.near);
   assert.ok(first.presentation.partSetKey);
   assert.ok(first.presentation.parts.length > 0);
@@ -100,10 +103,14 @@ test('Rock, Tree, Building, and Cow share one immutable canonical World Object s
   assert.equal(canonicalRock.collision.shape, 'circle');
   assert.equal(canonicalRock.collision.blocksPlayer, true);
   assert.equal(canonicalRock.interaction.targetType, 'rock');
+  assert.deepEqual(canonicalRock.lodPolicy.presentationTiers, ['full', 'atmospheric']);
   assert.equal(canonicalTree.collision.radiusMeters, 0.32);
   assert.equal(canonicalTree.collision.blocksPlayer, false);
   assert.equal(canonicalTree.interaction.targetType, 'tree');
-  assert.deepEqual(canonicalTree.lodPolicy.presentationTiers, ['full', 'silhouette', 'ultra']);
+  assert.deepEqual(
+    canonicalTree.lodPolicy.presentationTiers,
+    ['full', 'forest', 'atmospheric', 'horizon'],
+  );
   assert.equal(canonicalBuilding.collision.radiusMeters, 4);
   assert.equal(canonicalBuilding.collision.blocksPlayer, false);
   assert.equal(canonicalBuilding.collision.cameraShape, 'oriented-box');
@@ -115,7 +122,7 @@ test('Rock, Tree, Building, and Cow share one immutable canonical World Object s
   assert.deepEqual(canonicalCow.lodPolicy.presentationTiers, ['full', 'horizon']);
 });
 
-test('formal Shrub, Haystack, Street Lamp, and Road Sign use the same base contract', () => {
+test('formal Shrub, ambient Grass/Shrub, Haystack, Street Lamp, and Road Sign share identity', () => {
   const shrub = resolveW8CanonicalWorldObject(Object.freeze({
     ...tree,
     candidateId: 'detail-v1:vegetation:canonical-shrub',
@@ -146,10 +153,33 @@ test('formal Shrub, Haystack, Street Lamp, and Road Sign use the same base contr
     owningChunkCoordinate: owner,
     rotationY: 0,
   }));
+  const grassSource = Object.freeze({
+    stableId: 'wf1:ambient-detail:canonical-grass',
+    detailType: 'grass',
+    worldPosition: position,
+    owningChunkCoordinate: owner,
+    rotationY: 0.25,
+    variation: 1.1,
+  });
+  const ambientShrubSource = Object.freeze({
+    ...grassSource,
+    stableId: 'wf1:ambient-detail:canonical-shrub',
+    detailType: 'shrub',
+  });
+  const grass = assertBaseContract(grassSource, 'grass');
+  const ambientShrub = assertBaseContract(ambientShrubSource, 'shrub');
 
   assert.equal(shrub.objectType, 'shrub');
   assert.equal(shrub.collision.blocksPlayer, false);
   assert.equal(shrub.interaction.targetType, 'tree');
+  assert.equal(shrub.destruction.destructible, true);
+  assert.deepEqual(shrub.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
+  assert.equal(grass.stableId, grassSource.stableId);
+  assert.deepEqual(grass.owner, owner);
+  assert.equal(grass.destruction.destructible, false);
+  assert.deepEqual(grass.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
+  assert.equal(ambientShrub.destruction.destructible, false);
+  assert.deepEqual(ambientShrub.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
   assert.equal(haystack.objectType, 'haystack');
   assert.equal(haystack.collision.blocksPlayer, false);
   assert.equal(haystack.interaction.targetType, 'haystack');
@@ -176,6 +206,7 @@ test('future World Detail categories are reserved without generating new objects
     'bench', 'trashBin', 'planter', 'vendingMachine', 'parkedCar', 'fence',
   ]);
   assert.equal(W8_CANONICAL_WORLD_OBJECT_TYPES.includes('rock'), true);
+  assert.equal(W8_CANONICAL_WORLD_OBJECT_TYPES.includes('grass'), true);
   assert.equal(W8_CANONICAL_WORLD_OBJECT_TYPES.includes('building'), true);
   assert.equal(W8_RESERVED_WORLD_DETAIL_TYPES.every(type => (
     W8_CANONICAL_WORLD_OBJECT_TYPES.includes(type)

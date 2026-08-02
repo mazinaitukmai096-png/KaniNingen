@@ -141,7 +141,7 @@ test('Rock canonical adapter derives visual, collision, LOD, and interaction fro
     'generator placement radius remains an audited source value');
   assert.equal(first.lodPolicy, W8_ROCK_CANONICAL_LOD_POLICY);
   assert.equal(first.presentation.partSetKey, 'rock');
-  assert.deepEqual(first.presentation.tiers, ['full']);
+  assert.deepEqual(first.presentation.tiers, ['full', 'atmospheric']);
   assert.deepEqual(first.presentation.parts, W8_PARITY_FEATURE_PARTS.rock);
   assert.deepEqual(candidate, original, 'adapter does not mutate ChunkData candidate');
 });
@@ -153,7 +153,7 @@ test('Rock canonical LOD follows Render Distance instead of visual quality', () 
   assert.equal(resolveW8RockVisibilityMeters(record, 'standard'), 112);
   assert.equal(resolveW8RockVisibilityMeters(record, 'current'), 140);
   assert.equal(record.lodPolicy.proxy, false);
-  assert.deepEqual(record.lodPolicy.presentationTiers, ['full']);
+  assert.deepEqual(record.lodPolicy.presentationTiers, ['full', 'atmospheric']);
 });
 
 test('W8 Gameplay Rock target consumes canonical collision and interaction instead of generator bounds', async () => {

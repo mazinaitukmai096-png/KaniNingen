@@ -17,7 +17,7 @@ import {
 export const W8_CANONICAL_WORLD_OBJECT_SCHEMA = 'w8-canonical-world-object-1';
 
 export const W8_CANONICAL_WORLD_OBJECT_TYPES = Object.freeze([
-  'rock', 'tree', 'shrub', 'building', 'cow', 'haystack',
+  'rock', 'tree', 'shrub', 'grass', 'building', 'cow', 'haystack',
   'barn', 'factory', 'militaryBase', 'streetLamp', 'roadSign',
   'bench', 'trashBin', 'planter', 'vendingMachine', 'parkedCar', 'fence',
 ]);
@@ -57,7 +57,7 @@ export const W8_ROCK_CANONICAL_LOD_POLICY = Object.freeze({
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
-  presentationTiers: Object.freeze(['full']),
+  presentationTiers: Object.freeze(['full', 'atmospheric']),
   proxy: false,
 });
 
@@ -67,7 +67,7 @@ export const W8_TREE_CANONICAL_LOD_POLICY = Object.freeze({
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
-  presentationTiers: Object.freeze(['full', 'silhouette', 'ultra']),
+  presentationTiers: Object.freeze(['full', 'forest', 'atmospheric', 'horizon']),
   highTiers: W8_HIGH_TREE_LOD_METERS,
   proxy: false,
 });
@@ -78,7 +78,17 @@ export const W8_SHRUB_CANONICAL_LOD_POLICY = Object.freeze({
   near: nearTier,
   outer: activeTier,
   far: queriedTier,
-  presentationTiers: Object.freeze(['full']),
+  presentationTiers: Object.freeze(['full', 'forest', 'atmospheric']),
+  proxy: false,
+});
+
+export const W8_GRASS_CANONICAL_LOD_POLICY = Object.freeze({
+  schemaVersion: 'w8-grass-lod-policy-1',
+  visibilityClass: 'natural',
+  near: nearTier,
+  outer: activeTier,
+  far: queriedTier,
+  presentationTiers: Object.freeze(['full', 'forest', 'atmospheric']),
   proxy: false,
 });
 
@@ -489,6 +499,7 @@ function resolveLandmark(source) {
 }
 
 const detailDimensions = Object.freeze({
+  grass: Object.freeze({ width: 0.45, height: 0.65, depth: 0.45 }),
   shrub: Object.freeze({ width: 0.75, height: 0.7, depth: 0.75 }),
   streetLamp: Object.freeze({ width: 0.45, height: 3.4, depth: 0.45 }),
   roadSign: Object.freeze({ width: 1.2, height: 2.1, depth: 0.25 }),
@@ -502,7 +513,8 @@ const detailDimensions = Object.freeze({
 
 function resolveDetail(source) {
   const detailType = source.detailType;
-  if (!['shrub', 'streetLamp', 'roadSign', ...W8_RESERVED_WORLD_DETAIL_TYPES].includes(detailType)) {
+  if (!['grass', 'shrub', 'streetLamp', 'roadSign', ...W8_RESERVED_WORLD_DETAIL_TYPES]
+    .includes(detailType)) {
     throw new Error(`unsupported Phase 4B World Detail type: ${detailType}`);
   }
   const variation = source.variation ?? 1;
@@ -521,6 +533,10 @@ function resolveDetail(source) {
       heightMeters: visualBounds.height, blocksPlayer: false,
     })
     : noCollision(visualBounds.height);
+  const lodPolicy = detailType === 'grass'
+    ? W8_GRASS_CANONICAL_LOD_POLICY
+    : detailType === 'shrub' ? W8_SHRUB_CANONICAL_LOD_POLICY
+      : W8_NEAR_ONLY_CANONICAL_LOD_POLICY;
   return baseRecord({
     source,
     objectType: detailType,
@@ -533,8 +549,12 @@ function resolveDetail(source) {
     collision,
     interaction: detailInteraction(detailType, radiusMeters),
     destructible,
-    lodPolicy: W8_NEAR_ONLY_CANONICAL_LOD_POLICY,
-    presentation: presentation(detailType, W8_PARITY_FEATURE_PARTS[detailType], W8_NEAR_ONLY_CANONICAL_LOD_POLICY.presentationTiers),
+    lodPolicy,
+    presentation: presentation(
+      detailType,
+      W8_PARITY_FEATURE_PARTS[detailType],
+      lodPolicy.presentationTiers,
+    ),
     extension: {
       sourceKind: source.parentRoadStableId ? 'street-detail' : 'ambient-detail',
       detailType,
@@ -570,7 +590,7 @@ export function resolveW8CanonicalWorldObject(source) {
   if (source.featureType === 'settlement-landmark' || typeof source.landmarkType === 'string') {
     return resolveLandmark(source);
   }
-  if (['shrub', 'streetLamp', 'roadSign', ...W8_RESERVED_WORLD_DETAIL_TYPES]
+  if (['grass', 'shrub', 'streetLamp', 'roadSign', ...W8_RESERVED_WORLD_DETAIL_TYPES]
     .includes(source.detailType)) return resolveDetail(source);
   throw new Error(`unsupported canonical World Object source: ${source.featureType
     ?? source.landmarkType ?? source.detailType ?? source.candidateType ?? 'unknown'}`);
