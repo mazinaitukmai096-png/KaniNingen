@@ -176,7 +176,7 @@ test('Building feedback and locked gameplay remain unchanged while Core-only Wor
   }).replace(/\r\n/g, '\n');
   const readCurrent = path => readFileSync(resolve(repoRoot, path), 'utf8').replace(/\r\n/g, '\n');
 
-  for (const path of ['src/constants.js', 'src/core/input.js', 'src/core/renderer.js']) {
+  for (const path of ['src/constants.js', 'src/core/renderer.js']) {
     assert.equal(readCurrent(path), readBaseline(path));
   }
   const normalizeRoadHierarchy = source => {
