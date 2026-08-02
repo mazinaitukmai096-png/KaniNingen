@@ -659,6 +659,35 @@ test('coverage generation is stable across plan revisions and does not regenerat
   await stream.dispose();
 });
 
+test('retained ready tickets adopt the replacement coverage generation', async () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const plan = createPlanner(runtime.policy);
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  const first = plan({ player: { x: 1, z: 1 } });
+  const replacement = plan({ player: { x: 17, z: 1 } });
+  stream.applyPlan({ plan: first, policyPlan: policyPlan(first) });
+  await waitFor(() => stream.snapshot().backlog === 0, 'first coverage did not settle');
+  const ownerKey = policyPlan(first).requiredOwnerKeys.find(key => (
+    policyPlan(replacement).requiredOwnerKeys.includes(key)
+  ));
+  assert.ok(ownerKey);
+  assert.equal(stream.applyPlan({
+    plan: replacement,
+    policyPlan: policyPlan(replacement),
+  }), true);
+  const snapshot = stream.snapshot();
+  const ticket = snapshot.tickets.find(value => value.ownerKey === ownerKey);
+  assert.equal(ticket.coverageGeneration, snapshot.coverageGeneration);
+  const [published] = stream.publishOwners({ ownerKeys: [ownerKey] });
+  assert.equal(published.coverageGeneration, snapshot.coverageGeneration);
+  assert.equal(snapshot.counts.ticketRejects, 0);
+  await stream.dispose();
+});
+
 test('ready owner pages drain incrementally without waiting for the full coverage set', async () => {
   const runtime = createPolicyRuntime({ horizon: false });
   const plan = createPlanner(runtime.policy)({});

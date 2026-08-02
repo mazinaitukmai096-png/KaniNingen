@@ -82,6 +82,7 @@ export function createNaturalCoverageKey({
   naturalResourceBandRevision = NATURAL_RESOURCE_BAND_REVISION,
   settlementContentHash = null,
   runtimeCoverageSignature,
+  ownerMetadataCache = null,
 } = {}) {
   const registryVersion = nonNegativeSafeInteger(
     policyRegistryVersion,
@@ -105,6 +106,7 @@ export function createNaturalCoverageKey({
   );
   // This signature contains only scalar invalidation inputs. It deliberately
   // never materializes owner arrays or presentation state.
+  ownerMetadataCache?.recordSignature('natural-coverage-key:signature');
   const signature = [
     registryVersion,
     preset,

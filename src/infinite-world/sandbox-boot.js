@@ -12,7 +12,6 @@ import {
   UNITS_PER_METER,
   decomposeLogicalWorldPosition,
   logicalWorldToRenderLocal,
-  parseChunkKey,
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import { planNextChunkBoundaryPrefetch } from './chunk-streaming-plan.js';
@@ -70,6 +69,7 @@ import {
   NATURAL_RESOURCE_BAND_REVISION,
   createNaturalCoverageKey,
 } from './natural-streaming-coverage.js';
+import { createStreamingOwnerMetadataCache } from './streaming-owner-metadata.js';
 import {
   createW8ForestHorizonOwnerPredicate,
 } from './forest-horizon-owner-policy.js';
@@ -850,6 +850,7 @@ export async function bootInfiniteWorldSandbox({
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
+  let streamingOwnerMetadataCache = null;
   let buildingSettlementStream = null;
   let settlementStreamingFrameSequence = 0;
   let latestSettlementStreamingObservation = null;
@@ -963,8 +964,13 @@ export async function bootInfiniteWorldSandbox({
       capacity: streamingTelemetryCapacity,
       clock,
     });
+    streamingOwnerMetadataCache = createStreamingOwnerMetadataCache({
+      diagnosticsEnabled: () => diagnostics.enabled,
+    });
     const worldStreamingPolicyRegistry = createWorldStreamingPolicyRegistry();
-    worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy());
+    worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy({
+      ownerMetadataCache: streamingOwnerMetadataCache,
+    }));
     const staticNaturalKinds = Object.freeze(Object.values(W8_VEGETATION_LOD_KINDS));
     const staticNaturalPolicyRuntimes = new Map(staticNaturalKinds.map(kind => {
       const distanceProfileResolver = renderDistancePreset => (
@@ -990,6 +996,7 @@ export async function bootInfiniteWorldSandbox({
           return forestHorizonOwnerPredicate(coordinates);
         },
         horizonOwnerDensity: kind === W8_VEGETATION_LOD_KINDS.TREE ? 4 : 1,
+        ownerMetadataCache: streamingOwnerMetadataCache,
       });
       worldStreamingPolicyRegistry.register(runtime.policy);
       return [runtime.policy.kind, Object.freeze({ ...runtime, naturalKind: kind })];
@@ -1003,20 +1010,22 @@ export async function bootInfiniteWorldSandbox({
     const resolveNaturalPresentationPolicyCoverage = ({
       plan,
       policyPlans,
+      policyResourceKindEntries,
       coverageGeneration,
     }) => {
       if (naturalPresentationCoverageGeneration === coverageGeneration
         && naturalPresentationCoveragePreset === plan.renderDistancePreset) {
         return naturalPresentationPolicyCoverage;
       }
+      const entriesByPolicy = new Map(policyResourceKindEntries.map(entry => (
+        [entry.policyKind, entry.resourceKindEntries]
+      )));
       naturalPresentationPolicyCoverage = Object.freeze(policyPlans.map(policyPlan => {
         const runtime = staticNaturalPolicyRuntimes.get(policyPlan.kind);
-        const resourceKindEntries = Object.freeze(policyPlan.allOwnerKeys.map(ownerKey => (
-          Object.freeze([
-            ownerKey,
-            runtime.classifyOwner({ ownerKey, plan, policyPlan }),
-          ])
-        )));
+        const resourceKindEntries = entriesByPolicy.get(policyPlan.kind);
+        if (!resourceKindEntries) {
+          throw new Error(`missing parsed owner metadata for ${policyPlan.kind}`);
+        }
         return Object.freeze({
           ...runtime.maximumCoverage(plan.renderDistancePreset),
           schemaVersion: 'static-natural-policy-coverage-1',
@@ -1032,6 +1041,7 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingPolicyRegistry.freeze();
     worldStreamingCoordinator = createWorldStreamingCoordinator({
       registry: worldStreamingPolicyRegistry,
+      ownerMetadataCache: streamingOwnerMetadataCache,
     });
     recordStaticTreeActivationTime('coordinatorCreatedAtMs');
     const schedulerTerminalCorrelations = new Set();
@@ -1441,19 +1451,23 @@ export async function bootInfiniteWorldSandbox({
     naturalStaticStream = createStaticObjectStream({
       policyKind: staticNaturalPolicyKinds[0],
       policyKinds: staticNaturalPolicyKinds,
-      classifyOwner: ({ ownerKey, plan, policyPlans }) => {
-        for (const policyPlan of policyPlans) {
-          if (!policyPlan.allOwnerKeys.includes(ownerKey)) continue;
-          const runtime = staticNaturalPolicyRuntimes.get(policyPlan.kind);
-          if (runtime.classifyOwner({ ownerKey, plan, policyPlan }) === 'canonical') {
-            return 'canonical';
-          }
-        }
-        return 'manifest';
-      },
+      classifyOwner: ({ ownerKey, owner, plan, policyPlan }) => (
+        staticNaturalPolicyRuntimes.get(policyPlan.kind).classifyOwner({
+          ownerKey,
+          owner,
+          plan,
+          policyPlan,
+        })
+      ),
+      combineResourceKinds: ({ resourceKinds }) => (
+        resourceKinds.includes('canonical') ? 'canonical' : 'manifest'
+      ),
+      ownerMetadataCache: streamingOwnerMetadataCache,
       clock,
       requestOwner: ({
         ownerKey,
+        ownerX,
+        ownerZ,
         resourceKind,
         priority,
         required,
@@ -1470,7 +1484,11 @@ export async function bootInfiniteWorldSandbox({
           }, () => {});
           return handle;
         };
-        const { chunkX, chunkZ } = parseChunkKey(ownerKey);
+        const chunkX = ownerX;
+        const chunkZ = ownerZ;
+        if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
+          throw new TypeError(`Static Object Stream missing parsed owner metadata: ${ownerKey}`);
+        }
         const consumerId = `static-object-stream:natural-static:${ownerKey}`;
         if (resourceKind === 'canonical') {
           const existing = runtime.getChunkData(chunkX, chunkZ);
@@ -2938,6 +2956,7 @@ export async function bootInfiniteWorldSandbox({
         runtimeCoverageSignature:
           committedChunkState.transitionContract?.coverageSignature
             ?? `runtime:${committedChunkState.centerChunkX},${committedChunkState.centerChunkZ}`,
+        ownerMetadataCache: streamingOwnerMetadataCache,
       });
       const coverageResolution = diagnosticMeasure(
         'world-streaming-plan',
@@ -3099,6 +3118,7 @@ export async function bootInfiniteWorldSandbox({
             plan: worldStreamingPlan,
             policyPlans: staticNaturalPolicyPlans,
             publicationContext,
+            ownerMetadataRevision: latestNaturalCoverageState.key.signature,
           }));
           recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
         } else naturalStaticStream.updatePublicationContext(publicationContext);
@@ -3111,6 +3131,7 @@ export async function bootInfiniteWorldSandbox({
             policyResourceCoverage: resolveNaturalPresentationPolicyCoverage({
               plan: worldStreamingPlan,
               policyPlans: staticNaturalPolicyPlans,
+              policyResourceKindEntries: naturalStaticStream.policyResourceKindEntries(),
               coverageGeneration: streamControl.coverageGeneration,
             }),
           });
@@ -3406,6 +3427,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (!running) return;
       try {
         settlementStreamingFrameSequence += 1;
+        streamingOwnerMetadataCache?.beginFrame(settlementStreamingFrameSequence);
         const frameNow = Number.isFinite(now) ? now : clock();
         if (!farNaturalWarmStarted && diagnosticProfile.distant
           && pendingRenderDistancePublication === null
@@ -3751,6 +3773,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           }),
           streamingTelemetry: streamingTelemetry.snapshot(),
           worldStreaming: worldStreamingCoordinator.snapshot(),
+          streamingOwnerMetadata: streamingOwnerMetadataCache.snapshot(),
           buildingSettlementShadow: buildingSettlementShadowComparison,
           buildingSettlementStreaming: buildingSettlementStream.snapshot(),
           staticObjectStreaming: naturalStaticStream.snapshot(),

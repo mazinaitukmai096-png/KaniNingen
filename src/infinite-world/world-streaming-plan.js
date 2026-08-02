@@ -29,14 +29,15 @@ function normalizePosition(value, label) {
   });
 }
 
-function normalizeOwnerKeys(values, label) {
+function normalizeOwnerKeys(values, label, ownerMetadataCache = null) {
   if (!Array.isArray(values)) throw new TypeError(`${label} must be an array`);
   const cached = normalizedOwnerKeyArrayCache.get(values);
   if (cached) return cached;
   const coordinates = new Map();
   for (const value of values) {
     const coordinate = typeof value === 'string'
-      ? parseChunkKey(value)
+      ? (ownerMetadataCache?.parse(value, { path: 'world-streaming-plan:normalize' })
+        ?? parseChunkKey(value))
       : { chunkX: value?.chunkX, chunkZ: value?.chunkZ };
     const key = createChunkKey(coordinate.chunkX, coordinate.chunkZ);
     coordinates.set(key, Object.freeze({ ...coordinate, key }));
@@ -63,6 +64,12 @@ function unionOwnerKeys(...sets) {
     return union;
   }
   return normalizeOwnerKeys(sets.flat(), 'owner key union');
+}
+
+function unionOwnerKeysWithMetadata(ownerMetadataCache, ...sets) {
+  if (ownerMetadataCache === null) return unionOwnerKeys(...sets);
+  if (sets.length === 1) return sets[0];
+  return normalizeOwnerKeys(sets.flat(), 'owner key union', ownerMetadataCache);
 }
 
 function differenceOwnerKeys(values, excluded) {
@@ -132,7 +139,7 @@ export function createVelocityCorridor({
   });
 }
 
-export function createLegacyRuntimeChunkStreamingPolicy() {
+export function createLegacyRuntimeChunkStreamingPolicy({ ownerMetadataCache = null } = {}) {
   return Object.freeze({
     schemaVersion: WORLD_STREAMING_POLICY_SCHEMA,
     kind: LEGACY_RUNTIME_CHUNK_POLICY_KIND,
@@ -163,7 +170,9 @@ export function createLegacyRuntimeChunkStreamingPolicy() {
       const prefetched = differenceOwnerKeys(retained, required);
       const velocityPrefetched = [];
       for (const ownerKey of velocityCorridor.ownerKeys.slice(1)) {
-        const owner = parseChunkKey(ownerKey);
+        const owner = ownerMetadataCache?.parse(ownerKey, {
+          path: 'world-streaming-plan:legacy-prefetch',
+        }) ?? parseChunkKey(ownerKey);
         velocityPrefetched.push(...squareChunkCoordinates(
           owner.chunkX,
           owner.chunkZ,
@@ -199,6 +208,7 @@ export function createWorldStreamingPlan({
   stateRevision = 0,
   originGeneration = 0,
   policies,
+  ownerMetadataCache = null,
 } = {}) {
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new RangeError('World Streaming plan sequence must be a positive safe integer');
@@ -231,13 +241,26 @@ export function createWorldStreamingPlan({
       originGeneration,
       policy,
     });
-    const requiredOwnerKeys = normalizeOwnerKeys(resolved?.required ?? [], `${policy.kind}.required`);
+    const requiredOwnerKeys = normalizeOwnerKeys(
+      resolved?.required ?? [],
+      `${policy.kind}.required`,
+      ownerMetadataCache,
+    );
     const prefetchedOwnerKeys = normalizeOwnerKeys(
       resolved?.prefetched ?? [],
       `${policy.kind}.prefetched`,
+      ownerMetadataCache,
     );
-    const retainedOwnerKeys = normalizeOwnerKeys(resolved?.retained ?? [], `${policy.kind}.retained`);
-    const requestOwnerKeys = unionOwnerKeys(requiredOwnerKeys, prefetchedOwnerKeys);
+    const retainedOwnerKeys = normalizeOwnerKeys(
+      resolved?.retained ?? [],
+      `${policy.kind}.retained`,
+      ownerMetadataCache,
+    );
+    const requestOwnerKeys = unionOwnerKeysWithMetadata(
+      ownerMetadataCache,
+      requiredOwnerKeys,
+      prefetchedOwnerKeys,
+    );
     const policyPlan = {
       kind: policy.kind,
       stream: policy.stream,
@@ -248,7 +271,11 @@ export function createWorldStreamingPlan({
       prefetchedOwnerKeys,
       retainedOwnerKeys,
       requestOwnerKeys,
-      allOwnerKeys: unionOwnerKeys(requestOwnerKeys, retainedOwnerKeys),
+      allOwnerKeys: unionOwnerKeysWithMetadata(
+        ownerMetadataCache,
+        requestOwnerKeys,
+        retainedOwnerKeys,
+      ),
       sourceHash: typeof resolved?.sourceHash === 'string' ? resolved.sourceHash : null,
       deadline: Object.freeze({
         requiredAtMs: deadlineAt(
@@ -268,6 +295,7 @@ export function createWorldStreamingPlan({
     });
     return Object.freeze(policyPlan);
   }).sort((left, right) => left.kind.localeCompare(right.kind));
+  ownerMetadataCache?.recordSignature('world-streaming-plan:signature');
   const signature = JSON.stringify({
     player: logicalPlayer,
     velocity: logicalVelocity,
@@ -292,7 +320,10 @@ export function createWorldStreamingPlan({
       return Object.freeze({
         group,
         policyKinds: Object.freeze(members.map(policy => policy.kind)),
-        requiredOwnerKeys: unionOwnerKeys(...members.map(policy => policy.requiredOwnerKeys)),
+        requiredOwnerKeys: unionOwnerKeysWithMetadata(
+          ownerMetadataCache,
+          ...members.map(policy => policy.requiredOwnerKeys),
+        ),
         deadlineAtMs: requiredDeadlines.length ? Math.min(...requiredDeadlines) : null,
       });
     });

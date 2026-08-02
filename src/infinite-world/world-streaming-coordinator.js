@@ -87,7 +87,11 @@ function compareCurrentRequests(plan, currentRequests = {}) {
   });
 }
 
-export function createWorldStreamingCoordinator({ registry, clock = defaultClock } = {}) {
+export function createWorldStreamingCoordinator({
+  registry,
+  clock = defaultClock,
+  ownerMetadataCache = null,
+} = {}) {
   if (!registry?.frozen || typeof registry.list !== 'function') {
     throw new TypeError('World Streaming Coordinator requires a frozen policy registry');
   }
@@ -130,6 +134,7 @@ export function createWorldStreamingCoordinator({ registry, clock = defaultClock
       sequence: candidateSequence,
       generatedAtMs,
       policies: registry.list(),
+      ownerMetadataCache,
     });
     const comparison = compareCurrentRequests(plan, input.currentRequests);
     commitPlan(plan, comparison, Math.max(0, clock() - startedAt), coverageKey);
