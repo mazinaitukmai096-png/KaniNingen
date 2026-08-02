@@ -7988,8 +7988,17 @@ export async function createW8DistantPresentation({
       positionGenerationForOrigin(persistentTreeGeneration, renderOrigin);
       return true;
     },
-    settlementStreamingShadowSnapshot() {
-      const generation = activeGeneration;
+    settlementStreamingShadowSnapshot({
+      renderDistancePreset = null,
+      includePrepared = false,
+    } = {}) {
+      const requestedPreset = renderDistancePreset === null
+        ? null : normalizeW8RenderDistancePreset(renderDistancePreset);
+      const preparedGeneration = preparedRenderDistanceDistant?.generation ?? null;
+      const generation = includePrepared && preparedGeneration
+        && (requestedPreset === null
+          || preparedGeneration.renderDistancePreset === requestedPreset)
+        ? preparedGeneration : activeGeneration;
       if (!generation) return null;
       const records = [...generation.canonicalObjects.values()].filter(object => (
         object.settlementId !== null && object.settlementId !== undefined

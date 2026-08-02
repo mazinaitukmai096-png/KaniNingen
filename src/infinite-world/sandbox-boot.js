@@ -967,7 +967,12 @@ export async function bootInfiniteWorldSandbox({
       return [runtime.policy.kind, Object.freeze({ ...runtime, naturalKind: kind })];
     }));
     for (const policy of createW8BuildingSettlementShadowPolicies({
-      readObservation: () => distantPresentation?.settlementStreamingShadowSnapshot?.() ?? null,
+      readObservation: renderDistancePreset => (
+        distantPresentation?.settlementStreamingShadowSnapshot?.({
+          renderDistancePreset,
+          includePrepared: true,
+        }) ?? null
+      ),
     })) worldStreamingPolicyRegistry.register(policy);
     let naturalPresentationCoverageGeneration = -1;
     let naturalPresentationCoveragePreset = null;
@@ -2320,7 +2325,19 @@ export async function bootInfiniteWorldSandbox({
         || !distantPresentation.isStaticNaturalCoverageReady?.(
           pending.requiredNaturalOwnerKeys,
         )) return false;
+      const settlementTicket = buildingSettlementStream.readyTicket();
+      if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
+        && (!settlementTicket
+          || settlementTicket.renderDistancePreset !== pending.preset
+          || settlementTicket.renderDistanceRevision !== pending.revision)) return false;
       if (!distantPresentation.commitPreparedRenderDistancePreset?.(pending.preset)) return false;
+      if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
+        && !buildingSettlementStream.commit({
+          planId: settlementTicket.planId,
+          renderDistanceRevision: settlementTicket.renderDistanceRevision,
+        })) {
+        throw new Error('Building/Settlement revision publication failed after staging');
+      }
       distantRenderDistance = pending.preset;
       appliedStaticNaturalRetainedOwnerKeys = pending.retainedNaturalOwnerKeys
         ?? appliedStaticNaturalRetainedOwnerKeys;
@@ -2734,7 +2751,10 @@ export async function bootInfiniteWorldSandbox({
       });
       const committedChunkState = runtime.getCommittedChunkState();
       const settlementStreamingObservation =
-        distantPresentation.settlementStreamingShadowSnapshot?.() ?? null;
+        distantPresentation.settlementStreamingShadowSnapshot?.({
+          renderDistancePreset: requestedDistantRenderDistance,
+          includePrepared: true,
+        }) ?? null;
       const worldStreamingPlan = worldStreamingCoordinator.createShadowPlan({
         player: { x: logicalPlayer.x, z: logicalPlayer.z },
         velocity: { x: movement.velocityX, z: movement.velocityZ },
@@ -2779,7 +2799,8 @@ export async function bootInfiniteWorldSandbox({
             observation: settlementStreamingObservation,
             renderDistanceRevision: renderDistanceRequestRevision,
           }).then(stage => {
-            if (stage && settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED) {
+            if (stage && settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
+              && pendingRenderDistancePublication === null) {
               buildingSettlementStream.commit({
                 planId: stage.planId,
                 renderDistanceRevision: stage.renderDistanceRevision,

@@ -41,7 +41,7 @@ function createShadowPolicy({ kind, generatorKind, observedKey, distanceResolver
     }),
     velocityPrefetch: DISABLED_VELOCITY_PREFETCH,
     ownerResolver({ renderDistancePreset }) {
-      const observation = readObservation?.() ?? null;
+      const observation = readObservation?.(renderDistancePreset) ?? null;
       const ownerKeys = observation?.renderDistancePreset === renderDistancePreset
         ? sortedKeys(observation[observedKey]) : Object.freeze([]);
       return { required: ownerKeys, prefetched: [], retained: ownerKeys };

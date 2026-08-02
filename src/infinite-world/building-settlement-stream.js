@@ -172,6 +172,13 @@ export function createBuildingSettlementStream({
       if (published) counts.published += 1;
       return published;
     },
+    readyTicket() {
+      return readyStage ? Object.freeze({
+        planId: readyStage.planId,
+        renderDistancePreset: readyStage.renderDistancePreset,
+        renderDistanceRevision: readyStage.renderDistanceRevision,
+      }) : null;
+    },
     snapshot() {
       return Object.freeze({
         schemaVersion: 'building-settlement-stream-snapshot-1',

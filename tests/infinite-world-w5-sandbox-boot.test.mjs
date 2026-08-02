@@ -1693,6 +1693,10 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
     assert.equal(switched.renderDistanceConsistency.publicationPending, false);
     assert.equal(switched.renderDistanceConsistency.mixed, false);
     assert.equal(switched.renderDistanceConsistency.requestedMismatch, false);
+    assert.equal(switched.buildingSettlementStreaming.readyStage.renderDistanceRevision,
+      switched.renderDistanceConsistency.requestedRevision);
+    assert.equal(switched.buildingSettlementStreaming.readyStage.renderDistancePreset, 'short');
+    assert.equal(switched.buildingSettlementStreaming.counts.published >= 2, true);
     assert.equal(switched.staticObjectStreaming.policyCoverage.every(coverage => (
       coverage.readyRequiredOwnerCount === coverage.requiredOwnerCount
     )), true, 'atomic publication must wait for every required Natural owner');
