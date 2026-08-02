@@ -461,6 +461,10 @@ export async function createW8DistantPresentation({
   yieldToMainThread = () => new Promise(resolve => globalThis.setTimeout(resolve, 0)),
   telemetry = null,
   resolveStaticNaturalCapacity = null,
+  diagnosticsEnabled = false,
+  recordDiagnosticWork = () => null,
+  recordDiagnosticEvent = () => null,
+  getDiagnosticFrameSequence = () => null,
 } = {}) {
   if (!scene?.add || !scene?.remove) throw new TypeError('a Three.js scene is required');
   if (typeof findSettlementsNear !== 'function'
@@ -483,6 +487,14 @@ export async function createW8DistantPresentation({
   }
   if (typeof incrementalStaticTreePages !== 'boolean') {
     throw new TypeError('incrementalStaticTreePages must be boolean');
+  }
+  if (typeof diagnosticsEnabled !== 'boolean') {
+    throw new TypeError('diagnosticsEnabled must be boolean');
+  }
+  if (typeof recordDiagnosticWork !== 'function'
+    || typeof recordDiagnosticEvent !== 'function'
+    || typeof getDiagnosticFrameSequence !== 'function') {
+    throw new TypeError('Distant diagnostic hooks must be functions');
   }
   if (typeof getNearVisibleStableIds !== 'function'
     || typeof getNearVisibleSettlementIds !== 'function') {
@@ -620,6 +632,9 @@ export async function createW8DistantPresentation({
   let settlementMetadataPublicationSource = 'legacy-distant-root';
   let settlementPublicationPlanId = null;
   let settlementPublicationRevision = 0;
+  let settlementShadowSnapshotCount = 0;
+  let settlementShadowCanonicalObjectScanCount = 0;
+  let settlementShadowStableIdMaterializationCount = 0;
   let persistentDistantRoot = null;
   let persistentDistantPublishedGeneration = null;
   const liveDistantEntries = new Map();
@@ -951,6 +966,45 @@ export async function createW8DistantPresentation({
   const LOCAL_SYNC_CANCELLED = Symbol('w8-local-terrain-sync-cancelled');
 
   const monotonicNow = () => globalThis.performance?.now?.() ?? Date.now();
+  const materialColorHex = material => {
+    const color = material?.color;
+    if (typeof color?.getHex === 'function') return color.getHex();
+    if (Number.isFinite(color?.value)) return color.value;
+    if (Number.isFinite(color)) return color;
+    return null;
+  };
+  const snapshotMaterial = (path, material) => Object.freeze({
+    path,
+    materialName: material?.name ?? null,
+    materialType: material?.type ?? material?.constructor?.name ?? null,
+    lightingModel: material?.isMeshPhongMaterial === true
+      || material?.type === 'MeshPhongMaterial'
+      || material?.constructor?.name === 'MeshPhongMaterial'
+      ? 'phong' : material?.isMeshLambertMaterial === true
+        || material?.type === 'MeshLambertMaterial'
+        || material?.constructor?.name === 'MeshLambertMaterial'
+        ? 'lambert' : 'unknown',
+    baseColorHex: materialColorHex(material),
+    vertexColors: material?.vertexColors === true,
+    flatShading: material?.flatShading === true,
+    shininess: Number.isFinite(material?.shininess) ? material.shininess : null,
+    fog: material?.fog !== false,
+    opacity: Number.isFinite(material?.opacity) ? material.opacity : null,
+    transparent: material?.transparent === true,
+    alphaTest: Number.isFinite(material?.alphaTest) ? material.alphaTest : null,
+    alphaHash: material?.alphaHash === true,
+    toneMapped: material?.toneMapped !== false,
+    depthWrite: material?.depthWrite !== false,
+    mapColorSpace: material?.map?.colorSpace ?? null,
+    naturalLodMode: material?.userData?.naturalLodMode ?? null,
+    naturalLodKind: material?.userData?.naturalLodKind ?? null,
+    sourceTinted: material?.userData?.naturalLodSourceTinted ?? null,
+    customProgramCacheKey: typeof material?.customProgramCacheKey === 'function'
+      ? material.customProgramCacheKey() : null,
+    customAtmosphericFogBlend: ['atmospheric', 'horizon'].includes(
+      material?.userData?.naturalLodMode,
+    ),
+  });
   const createSliceScheduler = ({
     assertCurrent,
     budgetMs = PRESENTATION_SLICE_BUDGET_MS,
@@ -1713,6 +1767,7 @@ export async function createW8DistantPresentation({
   const finishMidgroundTerrainBuild = (build, context) => {
     const { positions, colors, indices, ownerIndexRanges } = build;
     if (!positions.length) return;
+    const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
     const allIndices = Object.freeze([...indices]);
     const initialOwnerKeys = sortedKeyList(context.generation.midgroundOwnerKeys);
     const initialIndices = [];
@@ -1741,6 +1796,14 @@ export async function createW8DistantPresentation({
     context.generation.localTerrainMesh = mesh;
     context.generation.currentVisibleMidgroundOwnerKeys = new Set(initialOwnerKeys);
     context.target.add(mesh);
+    if (diagnosticsEnabled) recordDiagnosticWork('local-terrain-build', {
+      calls: 1,
+      owners: ownerIndexRanges.size,
+      vertices: positions.length / 3,
+      indices: initialIndices.length,
+      allocatedBytes: (positions.length + colors.length + initialIndices.length) * 4,
+      maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+    });
   };
 
   const applyLocalTerrainOwnerHandoff = (
@@ -1766,6 +1829,7 @@ export async function createW8DistantPresentation({
     ).join('\n');
     const nextSignature = visibleOwnerKeys.join('\n');
     if (previousSignature !== nextSignature) {
+      const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
       const visibleIndices = [];
       for (const ownerKey of visibleOwnerKeys) {
         const range = ownerData.ownerIndexRanges.get(ownerKey);
@@ -1778,6 +1842,13 @@ export async function createW8DistantPresentation({
       mesh.geometry.setIndex(visibleIndices);
       mesh.userData.visibleOwnerIndexCount = visibleIndices.length;
       generation.currentVisibleMidgroundOwnerKeys = new Set(visibleOwnerKeys);
+      if (diagnosticsEnabled) recordDiagnosticWork('local-terrain-index-handoff', {
+        calls: 1,
+        owners: visibleOwnerKeys.length,
+        rebuiltIndices: visibleIndices.length,
+        uploadBytes: visibleIndices.length * 4,
+        maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+      });
     }
     mesh.userData.visibleOwnerKeys = Object.freeze([...visibleOwnerKeys]);
     mesh.userData.handoffActiveDataKeys = Object.freeze(sortedKeyList(currentActiveKeys));
@@ -3967,6 +4038,7 @@ export async function createW8DistantPresentation({
     { compose = true, objectStableIds = null, updateStats = objectStableIds === null } = {},
   ) => {
     if (!generation) return;
+    const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
     const renderDistancePolicy = generation.renderDistancePolicy
       ?? resolveW8RenderDistancePolicy(generation.renderDistancePreset);
     const settlementPresentationPolicy = generation.settlementPresentationPolicy
@@ -4332,6 +4404,20 @@ export async function createW8DistantPresentation({
     } else if (generation.treeLodDiagnostics) {
       updateTreeLodDiagnostics(generation);
     }
+    if (diagnosticsEnabled) recordDiagnosticWork(
+      generation.persistentNatural === true
+        ? 'persistent-natural-visibility'
+        : 'legacy-distant-visibility',
+      {
+        calls: 1,
+        canonicalObjectsScanned: selectedObjects.length,
+        nearIdentityObjectsScanned: objectStableIds === null
+          && generation.persistentTree !== true ? generation.canonicalObjects.size : 0,
+        dirtyBuckets: dirtyBuckets.size,
+        visibleObjects: visibleCount,
+        maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+      },
+    );
     return dirtyBuckets;
   };
 
@@ -5048,7 +5134,7 @@ export async function createW8DistantPresentation({
     if (admittedOwners > STATIC_TREE_OWNER_ADMISSION_LIMIT) {
       persistentTreeAdmissionLimitViolationCount += 1;
     }
-    const frameSample = streamingTelemetry ? {
+    const frameSample = streamingTelemetry || diagnosticsEnabled ? {
       frameSequence: ++persistentTreeFrameSequence,
       startedAtMs: frameStartedAt,
       budgetMs: frameBudgetMs,
@@ -5087,6 +5173,32 @@ export async function createW8DistantPresentation({
       frameSample.disposeBacklogAfter = persistentTreeDisposeOwners.length;
       frameSample.totalMs = monotonicNow() - frameSample.startedAtMs;
       recordPersistentTreeFrameSample(frameSample);
+      if (diagnosticsEnabled) recordDiagnosticWork('persistent-natural-frame', {
+        calls: 1,
+        admittedOwners: frameSample.admittedOwners,
+        publishedOwners: frameSample.publishedOwners,
+        builtOwners: frameSample.builtOwners,
+        disposedOwners: frameSample.disposedOwners,
+        residentOwners: frameSample.residentAfter,
+        pendingPages: frameSample.pendingPagesAfter,
+        pendingPublications: frameSample.pendingPublicationsAfter,
+        disposeBacklog: frameSample.disposeBacklogAfter,
+        compactionMoves: frameSample.compactionMoves,
+        visibilityMatrixInvalidations: frameSample.visibilityMatrixInvalidations,
+        matrixUpdates: frameSample.matrixUpdates,
+        attributeUpdates: frameSample.attributeUpdates,
+        bufferRangeUpdates: frameSample.bufferRangeUpdates,
+        bufferUploadBytes: frameSample.bufferUploadBytes,
+        allocatedObjects: frameSample.allocatedObjects,
+        allocatedInstances: frameSample.allocatedInstances,
+        allocatedBuckets: frameSample.allocatedBuckets,
+        visibilityMs: frameSample.visibilityMs,
+        composeMs: frameSample.composeMs,
+        disposeMs: frameSample.disposeMs,
+        buildMs: frameSample.buildMs,
+        buildMaximumSliceMs: frameSample.buildMaximumSliceMs,
+        totalMs: frameSample.totalMs,
+      });
     };
 
     const compactionBefore = persistentTreeCompactionMoveCount;
@@ -5112,7 +5224,8 @@ export async function createW8DistantPresentation({
     }
     const dirtySlotCount = () => [...persistentTreeGeneration.canonicalBuckets.values()]
       .reduce((sum, bucket) => sum + (bucket.dirtySlots?.size ?? 0), 0);
-    const dirtyBeforeVisibility = streamingTelemetry ? dirtySlotCount() : 0;
+    const dirtyBeforeVisibility = streamingTelemetry || diagnosticsEnabled
+      ? dirtySlotCount() : 0;
     const visibilityStartedAt = monotonicNow();
     if (withinBudget()) {
       if (persistentTreeVisibilityDirty) {
@@ -5132,7 +5245,7 @@ export async function createW8DistantPresentation({
       }
     }
     const visibilityMs = monotonicNow() - visibilityStartedAt;
-    const visibilityInvalidations = streamingTelemetry
+    const visibilityInvalidations = streamingTelemetry || diagnosticsEnabled
       ? Math.max(0, dirtySlotCount() - dirtyBeforeVisibility)
       : 0;
     persistentTreeVisibilityMatrixInvalidationCount += visibilityInvalidations;
@@ -5238,11 +5351,28 @@ export async function createW8DistantPresentation({
 
   const processRuntimePresentationHandoff = () => {
     const handoff = pendingRuntimePresentationHandoff;
-    if (!handoff) return Object.freeze({ processed: false, durationMs: 0 });
+    if (!handoff) return Object.freeze({
+      processed: false,
+      durationMs: 0,
+      meshUpdates: 0,
+      matrixUpdates: 0,
+      bufferUpdates: 0,
+      uploadBytes: 0,
+      localTerrainHandoffs: 0,
+    });
     if (pendingDistantPublication?.generation === handoff.targetGeneration) {
-      return Object.freeze({ processed: false, durationMs: 0, meshUpdates: 0, uploadBytes: 0 });
+      return Object.freeze({
+        processed: false,
+        durationMs: 0,
+        meshUpdates: 0,
+        matrixUpdates: 0,
+        bufferUpdates: 0,
+        uploadBytes: 0,
+        localTerrainHandoffs: 0,
+      });
     }
     const startedAt = monotonicNow();
+    const localTerrainHandoffsBefore = runtimePresentationHandoffLocalTerrainCount;
     let frameMatrixUpdates = 0;
     let frameBufferUpdates = 0;
     let frameUploadBytes = 0;
@@ -5337,7 +5467,11 @@ export async function createW8DistantPresentation({
       processed: true,
       durationMs,
       meshUpdates: Number(frameBufferUpdates > 0),
+      matrixUpdates: frameMatrixUpdates,
+      bufferUpdates: frameBufferUpdates,
       uploadBytes: frameUploadBytes,
+      localTerrainHandoffs:
+        runtimePresentationHandoffLocalTerrainCount - localTerrainHandoffsBefore,
     });
   };
 
@@ -5442,6 +5576,7 @@ export async function createW8DistantPresentation({
   const finishClipmapBuild = ({
     topology, positions, colors, stats, target, ownedGeometries,
   }) => {
+    const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
     const geometry = makeGeometry(THREE, positions, colors, topology.indices);
     let checksum = 0x811c9dc5;
     for (const value of [...positions, ...colors]) {
@@ -5454,6 +5589,13 @@ export async function createW8DistantPresentation({
     mesh.name = 'w8-seeded-macro-terrain-clipmap';
     mesh.castShadow = false; mesh.receiveShadow = false;
     target.add(mesh); stats.clipmapMeshCount = 1;
+    if (diagnosticsEnabled) recordDiagnosticWork('terrain-clipmap-build', {
+      calls: 1,
+      vertices: positions.length / 3,
+      indices: topology.indices.length,
+      allocatedBytes: (positions.length + colors.length + topology.indices.length) * 4,
+      maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+    });
   };
 
   const createClipmap = input => {
@@ -6288,6 +6430,15 @@ export async function createW8DistantPresentation({
       centerChunkX,
       centerChunkZ,
     });
+    recordDiagnosticEvent('terrain-replacement-requested', {
+      coverageEpoch: requestedEpoch,
+      transitionGeneration: acceptedTransition?.generation ?? null,
+      centerChunkX,
+      centerChunkZ,
+      renderDistancePreset: normalizeW8RenderDistancePreset(renderDistancePreset),
+      oldRootId: activeLocalTerrainGeneration?.root?.name ?? null,
+      oldRootAttached: activeLocalTerrainGeneration?.root?.parent === root,
+    });
     localTerrainLastRequestedEpoch = requestedEpoch;
     localTerrainLastActiveKeyCount = activeDataKeys.length;
     localTerrainLastRenderedKeyCount = renderedKeys.length;
@@ -6407,6 +6558,12 @@ export async function createW8DistantPresentation({
       assignTransitionContract(activeLocalTerrainGeneration, acceptedTransition);
       committedLocalTerrainEpoch = requestedEpoch;
       currentCanonicalSurfacePolicy = surfacePolicy;
+      recordDiagnosticEvent('terrain-replacement-reused', {
+        coverageEpoch: requestedEpoch,
+        transitionGeneration: acceptedTransition?.generation ?? null,
+        rootId: activeLocalTerrainGeneration.root.name,
+        rootAttached: activeLocalTerrainGeneration.root.parent === root,
+      });
       const sliceSnapshot = scheduler.finish();
       localTerrainLastMaximumSliceMs = sliceSnapshot.maximumSliceMs;
       localTerrainLastSliceCount = sliceSnapshot.sliceCount;
@@ -6524,6 +6681,15 @@ export async function createW8DistantPresentation({
     if (stagingLocalTerrainRootId === localRoot.name) stagingLocalTerrainRootId = null;
     assertCurrent();
     const previous = activeLocalTerrainGeneration;
+    recordDiagnosticEvent('terrain-replacement-ready', {
+      coverageEpoch: requestedEpoch,
+      transitionGeneration: acceptedTransition?.generation ?? null,
+      rootId: generation.root.name,
+      rootAttached: generation.root.parent === root,
+      geometryCount: generation.ownedGeometries.size,
+      oldRootId: previous?.root?.name ?? null,
+      oldRootAttached: previous?.root?.parent === root,
+    });
     if (generation.reusedMidgroundGeometry) {
       previous?.ownedGeometries.delete(generation.reusedMidgroundGeometry);
       generation.ownedGeometries.add(generation.reusedMidgroundGeometry);
@@ -6531,10 +6697,26 @@ export async function createW8DistantPresentation({
     const swapStartedAt = monotonicNow();
     root.add(generation.root);
     activeLocalTerrainGeneration = generation;
+    recordDiagnosticEvent('terrain-replacement-attached', {
+      coverageEpoch: requestedEpoch,
+      transitionGeneration: acceptedTransition?.generation ?? null,
+      rootId: generation.root.name,
+      rootAttached: generation.root.parent === root,
+      oldRootId: previous?.root?.name ?? null,
+      oldRootAttached: previous?.root?.parent === root,
+    });
     committedLocalTerrainEpoch = requestedEpoch;
     localTerrainCommitCount += 1;
     currentCanonicalSurfacePolicy = surfacePolicy;
     retireGeneration(previous);
+    recordDiagnosticEvent('terrain-old-released', {
+      coverageEpoch: requestedEpoch,
+      transitionGeneration: acceptedTransition?.generation ?? null,
+      newRootId: generation.root.name,
+      newRootAttached: generation.root.parent === root,
+      oldRootId: previous?.root?.name ?? null,
+      oldRootAttached: previous?.root?.parent === root,
+    });
     localTerrainLastRootSwapDurationMs = monotonicNow() - swapStartedAt;
     localTerrainLastSyncDurationMs = monotonicNow() - startedAt;
     return Object.freeze({
@@ -6733,6 +6915,119 @@ export async function createW8DistantPresentation({
         coverageGenerations: Object.freeze([...entry.coverageGenerations]),
       });
     }));
+  };
+
+  const snapshotTreeMaterials = () => {
+    const source = ['treeLeaves', 'treeLeavesForest', 'treeLeavesMeadow']
+      .filter(key => visualAssets.materials?.[key])
+      .map(key => snapshotMaterial(`exact:${key}`, visualAssets.materials[key]));
+    const generated = [];
+    const seen = new Set();
+    for (const [generationPath, generation] of [
+      ['legacy-distant', activeGeneration],
+      ['persistent-natural', persistentTreeGeneration],
+    ]) {
+      for (const material of generation?.naturalLodMaterials?.values?.() ?? []) {
+        if (material?.userData?.naturalLodKind !== W8_VEGETATION_LOD_KINDS.TREE
+          || seen.has(material)) continue;
+        seen.add(material);
+        generated.push(snapshotMaterial(
+          `${generationPath}:${material.userData?.naturalLodMode ?? 'unknown'}`,
+          material,
+        ));
+      }
+    }
+    return Object.freeze({
+      schemaVersion: 'w8-tree-material-audit-1',
+      source: Object.freeze(source),
+      generated: Object.freeze(generated.sort((left, right) => (
+        left.path.localeCompare(right.path)
+      ))),
+    });
+  };
+
+  const snapshotVisibleRootRevisions = () => Object.freeze([
+    Object.freeze({
+      role: 'distant',
+      rootName: activeGeneration?.root?.name ?? null,
+      attached: activeGeneration?.root?.parent === root,
+      visible: activeGeneration?.root?.visible !== false,
+      renderDistancePreset: activeGeneration?.renderDistancePreset ?? null,
+      transitionGeneration: activeGeneration?.transitionContract?.generation ?? null,
+      coverageSignature: activeGeneration?.transitionContract?.coverageSignature ?? null,
+      publicationPlanId: settlementPublicationPlanId,
+      publicationRevision: settlementPublicationRevision,
+    }),
+    Object.freeze({
+      role: 'local-terrain',
+      rootName: activeLocalTerrainGeneration?.root?.name ?? null,
+      attached: activeLocalTerrainGeneration?.root?.parent === root,
+      visible: activeLocalTerrainGeneration?.root?.visible !== false,
+      renderDistancePreset: activeLocalTerrainGeneration?.renderDistancePreset ?? null,
+      transitionGeneration:
+        activeLocalTerrainGeneration?.transitionContract?.generation ?? null,
+      coverageSignature:
+        activeLocalTerrainGeneration?.transitionContract?.coverageSignature ?? null,
+      coverageEpoch: committedLocalTerrainEpoch,
+    }),
+    Object.freeze({
+      role: 'persistent-natural',
+      rootName: persistentTreeGeneration?.root?.name ?? null,
+      attached: persistentTreeGeneration?.root?.parent === scene,
+      visible: persistentTreeGeneration?.root?.visible !== false,
+      renderDistancePreset: persistentTreeGeneration?.renderDistancePreset ?? null,
+      planId: persistentTreePlanId,
+      coverageGeneration: persistentTreeCoverageGeneration,
+      planRevision: persistentTreePlanRevision,
+    }),
+    Object.freeze({
+      role: 'prepared-distant',
+      rootName: preparedRenderDistanceDistant?.generation?.root?.name ?? null,
+      attached: preparedRenderDistanceDistant?.generation?.root?.parent === root,
+      visible: preparedRenderDistanceDistant?.generation?.root?.visible !== false,
+      renderDistancePreset:
+        preparedRenderDistanceDistant?.generation?.renderDistancePreset ?? null,
+      transitionGeneration:
+        preparedRenderDistanceDistant?.generation?.transitionContract?.generation ?? null,
+    }),
+    Object.freeze({
+      role: 'prepared-local-terrain',
+      rootName: preparedRenderDistanceLocalTerrain?.generation?.root?.name ?? null,
+      attached: preparedRenderDistanceLocalTerrain?.generation?.root?.parent === root,
+      visible: preparedRenderDistanceLocalTerrain?.generation?.root?.visible !== false,
+      renderDistancePreset:
+        preparedRenderDistanceLocalTerrain?.generation?.renderDistancePreset ?? null,
+      transitionGeneration:
+        preparedRenderDistanceLocalTerrain?.generation?.transitionContract?.generation ?? null,
+    }),
+  ]);
+
+  const snapshotPresenterAudit = () => {
+    const visibleStableIds = generation => new Set([
+      ...(generation?.canonicalObjects?.values?.() ?? []),
+    ].filter(object => (
+      !['hidden', 'destroyed'].includes(object.visibleLod)
+      && object.presentationTier !== null
+      && object.instances.some(instance => (
+        instance.bucket?.mesh?.visible !== false
+        && canonicalInstanceOpacity(object, instance.item) > 0
+      ))
+    )).map(object => object.stableId));
+    const legacy = visibleStableIds(activeGeneration);
+    const persistent = visibleStableIds(persistentTreeGeneration);
+    const overlaps = [...persistent].filter(stableId => legacy.has(stableId)).sort();
+    return Object.freeze({
+      schemaVersion: 'w8-presenter-audit-1',
+      legacyDistantVisibleStableIdCount: legacy.size,
+      persistentNaturalVisibleStableIdCount: persistent.size,
+      legacyDistantVisibleStableIds: Object.freeze([...legacy].sort()),
+      persistentNaturalVisibleStableIds: Object.freeze([...persistent].sort()),
+      duplicatePresenterCount: overlaps.length,
+      duplicateStableIds: Object.freeze(overlaps),
+      buildingPublicationSource,
+      settlementRoadPublicationSource,
+      settlementMetadataPublicationSource,
+    });
   };
 
   return Object.freeze({
@@ -7269,6 +7564,14 @@ export async function createW8DistantPresentation({
         centerChunkX,
         centerChunkZ,
       });
+      recordDiagnosticEvent('distant-sync-requested', {
+        syncEpoch: syncEpoch + 1,
+        transitionGeneration: acceptedTransition?.generation ?? null,
+        renderDistancePreset: requestedRenderDistancePreset,
+        includeFarNatural,
+        includeUltraNatural,
+        preserveStaticNatural,
+      });
       if (!commitRuntimePresentationState({
         transitionContract: acceptedTransition,
         activeDataKeys,
@@ -7315,6 +7618,25 @@ export async function createW8DistantPresentation({
           includeUltraNatural,
           consumerEpoch: epoch,
           assertCurrent,
+        });
+        recordDiagnosticEvent('distant-query-ready', {
+          syncEpoch: epoch,
+          transitionGeneration: acceptedTransition?.generation ?? null,
+          renderDistancePreset: requestedRenderDistancePreset,
+          naturalOwnerCount: far.naturalOwnerChunkCount,
+          naturalCandidateCount: far.naturalCandidateCount,
+          buildingOwnerCount: far.buildingOwnerChunkCount,
+          settlementCandidateCount: far.candidateCount,
+          naturalWillBeExcludedFromDistantRoot: incrementalStaticTreePages,
+        });
+        if (diagnosticsEnabled) recordDiagnosticWork('legacy-distant-query', {
+          calls: 1,
+          naturalOwnersQueried: far.naturalOwnerChunkCount,
+          naturalCandidatesEnumerated: far.naturalCandidateCount,
+          buildingOwnersQueried: far.buildingOwnerChunkCount,
+          settlementCandidatesEnumerated: far.candidateCount,
+          naturalCandidatesDiscardedByPersistentPath: incrementalStaticTreePages
+            ? far.naturalCandidateCount : 0,
         });
       } catch (error) {
         if (error !== SYNC_CANCELLED) {
@@ -7704,6 +8026,15 @@ export async function createW8DistantPresentation({
       }
       generation.rootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
         - rootSwapStartedAt;
+      recordDiagnosticEvent('distant-publication-queued', {
+        syncEpoch: epoch,
+        transitionGeneration: acceptedTransition?.generation ?? null,
+        renderDistancePreset: requestedRenderDistancePreset,
+        persistentPublication: incrementalStaticTreePages && previous && persistentDistantRoot
+          ? true : false,
+        rootAttached: generation.root.parent === root,
+        naturalExcluded: generation.excludeNatural === true,
+      });
       generation.syncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - syncStartedAt;
       pendingFarSyncEpochs.delete(epoch);
       return true;
@@ -7943,6 +8274,14 @@ export async function createW8DistantPresentation({
       const publicationFrame = handoffFrame.meshUpdates > 0
         ? Object.freeze({ admissions: 0, bytes: 0 })
         : processPersistentDistantPublication(remainingFrameBudgetMs());
+      if (diagnosticsEnabled) recordDiagnosticWork('runtime-presentation-handoff', {
+        calls: 1,
+        meshUpdates: handoffFrame.meshUpdates,
+        bufferUpdates: handoffFrame.bufferUpdates,
+        localTerrainHandoffs: handoffFrame.localTerrainHandoffs,
+        distantAdmissions: publicationFrame.admissions,
+        distantUploadBytes: publicationFrame.bytes,
+      });
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
       if (activeGeneration) {
         positionGenerationForOrigin(activeGeneration, renderOrigin);
@@ -7979,6 +8318,11 @@ export async function createW8DistantPresentation({
         runtimePresentationHandoffMaximumDisposePerFrame,
         disposedResources,
       );
+      if (diagnosticsEnabled) recordDiagnosticWork('deferred-resource-dispose', {
+        calls: 1,
+        disposedResources,
+        backlog: deferredGenerationDisposals.length,
+      });
       return true;
     },
     rebase(renderOrigin) {
@@ -8000,10 +8344,14 @@ export async function createW8DistantPresentation({
           || preparedGeneration.renderDistancePreset === requestedPreset)
         ? preparedGeneration : activeGeneration;
       if (!generation) return null;
+      const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
+      settlementShadowSnapshotCount += 1;
+      settlementShadowCanonicalObjectScanCount += generation.canonicalObjects.size;
       const records = [...generation.canonicalObjects.values()].filter(object => (
         object.settlementId !== null && object.settlementId !== undefined
       ));
       const stableIds = records.map(object => object.stableId).sort();
+      settlementShadowStableIdMaterializationCount += stableIds.length;
       const settlementIds = [...new Set(records.map(object => object.settlementId))].sort();
       const settlementIdSet = new Set(settlementIds);
       const roadLinkages = records.filter(object => (
@@ -8026,6 +8374,16 @@ export async function createW8DistantPresentation({
         ...buildingOwnerKeys,
         ...records.map(object => object.ownerKey),
       ])].sort());
+      if (diagnosticsEnabled) recordDiagnosticWork('settlement-shadow-observation', {
+        calls: 1,
+        canonicalObjectsScanned: generation.canonicalObjects.size,
+        settlementRecordsMaterialized: records.length,
+        stableIdsMaterialized: stableIds.length,
+        ownerKeysMaterialized: buildingOwnerKeys.length + settlementOwnerKeys.length,
+        roadLinkagesMaterialized: roadLinkages.length,
+        damageStatesMaterialized: damageStates.length,
+        maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+      });
       return Object.freeze({
         schemaVersion: 'legacy-building-settlement-observation-1',
         publicationSource: new Set([
@@ -8053,6 +8411,8 @@ export async function createW8DistantPresentation({
         invalidRoadLinkageCount: roadLinkages.filter(
           linkage => !settlementIdSet.has(linkage.settlementId),
         ).length,
+        canonicalObjectScanCount: generation.canonicalObjects.size,
+        settlementRecordCount: records.length,
       });
     },
     claimBuildingSettlementPublication(stage, {
@@ -8357,6 +8717,9 @@ export async function createW8DistantPresentation({
         settlementMetadataPublicationSource,
         settlementPublicationPlanId,
         settlementPublicationRevision,
+        settlementShadowSnapshotCount,
+        settlementShadowCanonicalObjectScanCount,
+        settlementShadowStableIdMaterializationCount,
         quality: activeGeneration?.quality ?? null,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
@@ -8676,6 +9039,9 @@ export async function createW8DistantPresentation({
       });
     },
     treePathAuditSnapshot: snapshotTreeRenderPaths,
+    treeMaterialAuditSnapshot: snapshotTreeMaterials,
+    visibleRootRevisionSnapshot: snapshotVisibleRootRevisions,
+    presenterAuditSnapshot: snapshotPresenterAudit,
     canonicalAuditSnapshot() {
       const objects = [
         ...(activeGeneration ? [...activeGeneration.canonicalObjects.values()] : []),

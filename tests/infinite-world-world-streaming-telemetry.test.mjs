@@ -167,10 +167,13 @@ test('Natural acceptance correlates one shared owner request with every Object p
   }
   const metrics = collectWorldStreamingAcceptanceMetrics(telemetry.snapshot());
   assert.deepEqual(Object.keys(metrics.byTarget), ['tree', 'bush', 'grass', 'rock']);
+  assert.equal(metrics.natural.requestToReadyCount, 4);
+  assert.equal(metrics.natural.requestToReadyP95Ms, 10);
   assert.equal(metrics.natural.workerToPublishCount, 4);
   assert.equal(metrics.natural.requestToFirstDrawCount, 4);
   assert.equal(metrics.natural.playerArrivalMissingCount, 0);
   assert.equal(metrics.byTarget.grass.playerArrivalMissingCount, 0);
+  assert.equal(metrics.byTarget.grass.requestToReadyP95Ms, 10);
   assert.equal(metrics.workerToPublishCount, 1, 'legacy top-level aliases remain Tree-only');
 });
 

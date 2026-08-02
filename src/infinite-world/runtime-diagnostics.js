@@ -1,5 +1,7 @@
 const DEFAULT_SAMPLE_LIMIT = 7_200;
 const DEFAULT_HITCH_LIMIT = 256;
+const DEFAULT_FRAME_DETAIL_LIMIT = 512;
+const DEFAULT_EVENT_LIMIT = 2_048;
 
 /**
  * @typedef {object} MeasurementReport
@@ -54,6 +56,31 @@ function distribution(values) {
     max: ordered.at(-1),
     mean: sum / ordered.length,
   });
+}
+
+function workDistributions(frameRecords) {
+  const samples = new Map();
+  for (const frame of frameRecords) {
+    for (const [route, metrics] of Object.entries(frame.work ?? {})) {
+      for (const [metric, value] of Object.entries(metrics)) {
+        if (!Number.isFinite(value)) continue;
+        const key = `${route}\n${metric}`;
+        if (!samples.has(key)) samples.set(key, []);
+        samples.get(key).push(value);
+      }
+    }
+  }
+  const result = {};
+  for (const [key, values] of [...samples].sort(([left], [right]) => (
+    left.localeCompare(right)
+  ))) {
+    const [route, metric] = key.split('\n');
+    result[route] ??= {};
+    result[route][metric] = distribution(values);
+  }
+  return Object.freeze(Object.fromEntries(Object.entries(result).map(([route, metrics]) => (
+    [route, Object.freeze(metrics)]
+  ))));
 }
 
 function median(values) {
@@ -192,8 +219,10 @@ export function createW8RuntimeDiagnostics({
   const performanceObject = globalObject.performance ?? null;
   const stageSamples = new Map();
   const frameSamples = [];
+  const frameRecords = [];
   const hitches = [];
   const longTasks = [];
+  const events = [];
   let currentFrame = null;
   let frameSequence = 0;
   let markSequence = 0;
@@ -265,8 +294,45 @@ export function createW8RuntimeDiagnostics({
     },
     startFrame(frameNow = clock()) {
       if (!enabled) return null;
-      currentFrame = { sequence: ++frameSequence, startedAt: frameNow, stages: {} };
+      currentFrame = {
+        sequence: ++frameSequence,
+        startedAt: frameNow,
+        stages: {},
+        work: {},
+      };
       return currentFrame.sequence;
+    },
+    currentFrameSequence() {
+      return enabled ? currentFrame?.sequence ?? frameSequence : null;
+    },
+    recordWork(route, values = { count: 1 }) {
+      if (!enabled || !currentFrame) return null;
+      if (typeof route !== 'string' || !route) throw new TypeError('diagnostic work route is required');
+      if (!values || typeof values !== 'object' || Array.isArray(values)) {
+        throw new TypeError('diagnostic work values must be an object');
+      }
+      const target = currentFrame.work[route] ??= {};
+      for (const [metric, value] of Object.entries(values)) {
+        if (!Number.isFinite(value)) continue;
+        target[metric] = (target[metric] ?? 0) + value;
+      }
+      return Object.freeze({ frameSequence: currentFrame.sequence, route });
+    },
+    recordEvent(type, details = {}) {
+      if (!enabled) return null;
+      if (typeof type !== 'string' || !type) throw new TypeError('diagnostic event type is required');
+      if (!details || typeof details !== 'object' || Array.isArray(details)) {
+        throw new TypeError('diagnostic event details must be an object');
+      }
+      const event = Object.freeze({
+        sequence: events.length ? events.at(-1).sequence + 1 : 1,
+        type,
+        timestampMs: clock(),
+        frameSequence: currentFrame?.sequence ?? frameSequence,
+        ...details,
+      });
+      pushBounded(events, event, DEFAULT_EVENT_LIMIT);
+      return event;
     },
     finishFrame(durationMs, frameNow = clock()) {
       if (!enabled) return null;
@@ -275,8 +341,12 @@ export function createW8RuntimeDiagnostics({
         startedAt: currentFrame?.startedAt ?? frameNow - durationMs,
         durationMs,
         stages: Object.freeze({ ...(currentFrame?.stages ?? {}) }),
+        work: Object.freeze(Object.fromEntries(Object.entries(currentFrame?.work ?? {}).map(
+          ([route, values]) => [route, Object.freeze({ ...values })],
+        ))),
       });
       pushBounded(frameSamples, durationMs, sampleLimit);
+      pushBounded(frameRecords, record, DEFAULT_FRAME_DETAIL_LIMIT);
       if (durationMs > hitchThresholdMs) pushBounded(hitches, record, hitchLimit);
       currentFrame = null;
       return record;
@@ -284,8 +354,10 @@ export function createW8RuntimeDiagnostics({
     reset() {
       stageSamples.clear();
       frameSamples.length = 0;
+      frameRecords.length = 0;
       hitches.length = 0;
       longTasks.length = 0;
+      events.length = 0;
       currentFrame = null;
     },
     snapshot(resources = {}) {
@@ -304,8 +376,17 @@ export function createW8RuntimeDiagnostics({
         hitchThresholdMs,
         hitchRatio: frame.count ? hitches.length / frame.count : 0,
         hitches: Object.freeze(hitches.map(value => Object.freeze({
-          ...value, stages: Object.freeze({ ...value.stages }),
+          ...value,
+          stages: Object.freeze({ ...value.stages }),
+          work: Object.freeze({ ...value.work }),
         }))),
+        frames: Object.freeze(frameRecords.map(value => Object.freeze({
+          ...value,
+          stages: Object.freeze({ ...value.stages }),
+          work: Object.freeze({ ...value.work }),
+        }))),
+        work: workDistributions(frameRecords),
+        events: Object.freeze([...events]),
         stages: Object.freeze(stages),
         longTasks: Object.freeze([...longTasks]),
         resources: Object.freeze({ ...resources }),

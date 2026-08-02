@@ -930,6 +930,9 @@ export async function bootInfiniteWorldSandbox({
         worldSeed: requestedSeed,
       },
     });
+    const diagnosticMeasure = diagnostics.enabled
+      ? (stage, operation) => diagnostics.measure(stage, operation)
+      : (_stage, operation) => operation();
     streamingTelemetry = createWorldStreamingTelemetry({
       enabled: streamingTelemetryEnabled,
       capacity: streamingTelemetryCapacity,
@@ -1307,24 +1310,62 @@ export async function bootInfiniteWorldSandbox({
       const logicalPlayer = worldState.player;
       const initialOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       let renderProjectionMs = 0;
+      const nearTerrainDiagnosticContext = () => {
+        if (!diagnostics.enabled || !runtime) return {};
+        const snapshot = runtime.getCommittedChunkState?.() ?? runtime.snapshot?.();
+        return {
+          transitionGeneration: snapshot?.transitionContract?.generation ?? null,
+          coverageSignature: snapshot?.transitionContract?.coverageSignature ?? null,
+          centerChunkX: snapshot?.centerChunkX ?? null,
+          centerChunkZ: snapshot?.centerChunkZ ?? null,
+          renderOriginRevision: snapshot?.renderOrigin?.rebaseCount ?? null,
+        };
+      };
       const measuredRenderAdapter = {
         rebase: origin => diagnostics.measure('chunk-rebase', () => renderAdapter.rebase(origin)),
         async projectChunk(chunkData, origin, options) {
           const startedAt = clock();
           try {
-            return await diagnostics.measureAsync(
+            const projected = await diagnostics.measureAsync(
               'chunk-projection',
               () => renderAdapter.projectChunk(chunkData, origin, options),
             );
+            diagnostics.recordEvent('near-terrain-replacement-ready', {
+              ...nearTerrainDiagnosticContext(),
+              ownerKey: projected?.key ?? null,
+              rootName: projected?.group?.name ?? null,
+              sceneAttached: projected?.group?.parent !== null,
+            });
+            return projected;
           }
           finally { renderProjectionMs += Math.max(0, clock() - startedAt); }
         },
-        loadProjected: projected => diagnostics.measure(
-          'chunk-load', () => renderAdapter.loadProjected(projected),
-        ),
-        unloadChunk: key => diagnostics.measure(
-          'chunk-unload', () => renderAdapter.unloadChunk(key),
-        ),
+        loadProjected: projected => {
+          const result = diagnostics.measure(
+            'chunk-load', () => renderAdapter.loadProjected(projected),
+          );
+          diagnostics.recordEvent('near-terrain-replacement-attached', {
+            ...nearTerrainDiagnosticContext(),
+            ownerKey: projected?.key ?? null,
+            rootName: projected?.group?.name ?? null,
+            sceneAttached: projected?.group?.parent !== null,
+          });
+          return result;
+        },
+        unloadChunk: key => {
+          diagnostics.recordEvent('near-terrain-old-release-requested', {
+            ...nearTerrainDiagnosticContext(),
+            ownerKey: key,
+          });
+          const result = diagnostics.measure(
+            'chunk-unload', () => renderAdapter.unloadChunk(key),
+          );
+          diagnostics.recordEvent('near-terrain-old-released', {
+            ...nearTerrainDiagnosticContext(),
+            ownerKey: key,
+          });
+          return result;
+        },
         discardProjected: projected => diagnostics.measure(
           'chunk-discard', () => renderAdapter.discardProjected?.(projected),
         ),
@@ -1553,6 +1594,10 @@ export async function bootInfiniteWorldSandbox({
       getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
       measure: (stage, operation) => diagnostics.measure(stage, operation),
       telemetry: streamingTelemetry,
+      diagnosticsEnabled: diagnostics.enabled,
+      recordDiagnosticWork: (route, values) => diagnostics.recordWork(route, values),
+      recordDiagnosticEvent: (type, details) => diagnostics.recordEvent(type, details),
+      getDiagnosticFrameSequence: () => diagnostics.currentFrameSequence(),
     });
     recordStaticTreeActivationTime('distantPresentationCreatedAtMs');
     const recordDistantTreeVisibility = () => {
@@ -1560,7 +1605,10 @@ export async function bootInfiniteWorldSandbox({
       const treePaths = distantPresentation.treePathAuditSnapshot?.() ?? [];
       const visiblePaths = treePaths.filter(path => path.active && path.instanceCount > 0);
       if (visiblePaths.length === 0) return false;
-      const presentationSnapshot = distantPresentation.snapshot();
+      const presentationSnapshot = diagnosticMeasure(
+        'distant-diagnostics-snapshot',
+        () => distantPresentation.snapshot(),
+      );
       recordStaticTreeActivationTime('firstDistantTreeVisibleAtMs');
       staticTreeActivationTimeline.firstDistantTreeVisiblePathIds = Object.freeze(
         visiblePaths.map(path => path.pathId),
@@ -2750,12 +2798,16 @@ export async function bootInfiniteWorldSandbox({
         enabled: shellSnapshot.runPhase === 'intro',
       });
       const committedChunkState = runtime.getCommittedChunkState();
-      const settlementStreamingObservation =
-        distantPresentation.settlementStreamingShadowSnapshot?.({
+      const settlementStreamingObservation = diagnosticMeasure(
+        'settlement-shadow-observation',
+        () => distantPresentation.settlementStreamingShadowSnapshot?.({
           renderDistancePreset: requestedDistantRenderDistance,
           includePrepared: true,
-        }) ?? null;
-      const worldStreamingPlan = worldStreamingCoordinator.createShadowPlan({
+        }) ?? null,
+      );
+      const worldStreamingPlan = diagnosticMeasure(
+        'world-streaming-plan',
+        () => worldStreamingCoordinator.createShadowPlan({
         player: { x: logicalPlayer.x, z: logicalPlayer.z },
         velocity: { x: movement.velocityX, z: movement.velocityZ },
         renderDistancePreset: requestedDistantRenderDistance,
@@ -2780,18 +2832,47 @@ export async function bootInfiniteWorldSandbox({
             },
           } : {}),
         },
+      }),
+      );
+      if (diagnostics.enabled) diagnostics.recordWork('world-streaming-plan', {
+        calls: 1,
+        policies: worldStreamingPlan.policyPlans.length,
+        requiredOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+          (sum, policy) => sum + policy.requiredOwnerKeys.length, 0,
+        ),
+        prefetchedOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+          (sum, policy) => sum + policy.prefetchedOwnerKeys.length, 0,
+        ),
+        retainedOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+          (sum, policy) => sum + policy.retainedOwnerKeys.length, 0,
+        ),
       });
-      buildingSettlementShadowComparison = compareW8BuildingSettlementShadow({
-        plan: worldStreamingPlan,
-        observation: settlementStreamingObservation,
+      buildingSettlementShadowComparison = diagnosticMeasure(
+        'settlement-shadow-compare',
+        () => compareW8BuildingSettlementShadow({
+          plan: worldStreamingPlan,
+          observation: settlementStreamingObservation,
+        }),
+      );
+      if (diagnostics.enabled) diagnostics.recordWork('building-settlement-route', {
+        shadowComparisons: 1,
+        legacyPublisher: settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY
+          ? 1 : 0,
+        sharedPublisher: settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
+          ? 1 : 0,
+        observedStableIds: settlementStreamingObservation?.stableIds?.length ?? 0,
+        observedOwners: settlementStreamingObservation?.settlementOwnerKeys?.length ?? 0,
       });
       if (buildingSettlementShadowComparison.matches && settlementStreamingObservation) {
-        const stagingSignature = JSON.stringify({
-          preset: worldStreamingPlan.renderDistancePreset,
-          owners: settlementStreamingObservation.settlementOwnerKeys,
-          stableIds: settlementStreamingObservation.stableIds,
-          damage: settlementStreamingObservation.damageStates,
-        });
+        const stagingSignature = diagnosticMeasure(
+          'settlement-staging-signature',
+          () => JSON.stringify({
+            preset: worldStreamingPlan.renderDistancePreset,
+            owners: settlementStreamingObservation.settlementOwnerKeys,
+            stableIds: settlementStreamingObservation.stableIds,
+            damage: settlementStreamingObservation.damageStates,
+          }),
+        );
         if (stagingSignature !== buildingSettlementStagingSignature) {
           buildingSettlementStagingSignature = stagingSignature;
           void buildingSettlementStream.applyShadowPlan({
@@ -2814,15 +2895,29 @@ export async function bootInfiniteWorldSandbox({
         }
       }
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
-      const staticNaturalPolicyPlans = worldStreamingPlan.policyPlans.filter(
-        policy => staticNaturalPolicyRuntimes.has(policy.kind),
-      );
-      const requestedNaturalRequiredOwnerKeys = Object.freeze([
-        ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.requiredOwnerKeys)),
-      ]);
-      const requestedNaturalRetainedOwnerKeys = Object.freeze([
-        ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.allOwnerKeys)),
-      ]);
+      const naturalOwnerPlan = diagnosticMeasure('natural-policy-plan', () => {
+        const policyPlans = worldStreamingPlan.policyPlans.filter(
+          policy => staticNaturalPolicyRuntimes.has(policy.kind),
+        );
+        return Object.freeze({
+          policyPlans,
+          requiredOwnerKeys: Object.freeze([
+            ...new Set(policyPlans.flatMap(policy => policy.requiredOwnerKeys)),
+          ]),
+          retainedOwnerKeys: Object.freeze([
+            ...new Set(policyPlans.flatMap(policy => policy.allOwnerKeys)),
+          ]),
+        });
+      });
+      const staticNaturalPolicyPlans = naturalOwnerPlan.policyPlans;
+      const requestedNaturalRequiredOwnerKeys = naturalOwnerPlan.requiredOwnerKeys;
+      const requestedNaturalRetainedOwnerKeys = naturalOwnerPlan.retainedOwnerKeys;
+      if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
+        calls: 1,
+        policies: staticNaturalPolicyPlans.length,
+        requiredOwners: requestedNaturalRequiredOwnerKeys.length,
+        retainedOwners: requestedNaturalRetainedOwnerKeys.length,
+      });
       if (pendingRenderDistancePublication) {
         pendingRenderDistancePublication.requiredNaturalOwnerKeys =
           requestedNaturalRequiredOwnerKeys;
@@ -2843,13 +2938,24 @@ export async function bootInfiniteWorldSandbox({
         activateNaturalStaticStream('first-shadow-plan');
       }
       if (naturalStaticStreamActivated && naturalStaticStreamCanApply) {
-        naturalStaticStream.applyPlan({
+        diagnosticMeasure('static-natural-apply-plan', () => naturalStaticStream.applyPlan({
           plan: worldStreamingPlan,
           policyPlans: staticNaturalPolicyPlans,
-        });
+        }));
         recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
         const streamControl = naturalStaticStream.diagnostics();
         if (!disablePersistentTreePublication) {
+          const readyPages = diagnosticMeasure(
+            'static-natural-ready-admission',
+            () => naturalStaticStream.drainReadyOwnerPages({ limit: 1 }),
+          );
+          if (diagnostics.enabled) diagnostics.recordWork('static-natural-ready-admission', {
+            calls: 1,
+            admittedOwners: readyPages.length,
+            readyRequiredOwners: streamControl.readyRequiredOwnerCount,
+            missingRequiredOwners: streamControl.missingRequiredOwnerCount,
+            requestBacklog: streamControl.backlog,
+          });
           distantPresentation.applyStaticNaturalPlan?.({
             coverageGeneration: streamControl.coverageGeneration,
             planRevision: streamControl.planRevision,
@@ -2876,7 +2982,7 @@ export async function bootInfiniteWorldSandbox({
             // Admission is deliberately one owner per animation frame. The
             // presentation coordinator shares one budget across dispose,
             // visibility, compose, upload marking, build, and publication.
-            readyPages: naturalStaticStream.drainReadyOwnerPages({ limit: 1 }),
+            readyPages,
           });
         }
       }
@@ -2905,7 +3011,10 @@ export async function bootInfiniteWorldSandbox({
       distantPresentation.setTreeLodDiagnosticsEnabled?.(
         experienceSnapshot.treeLodOverlayEnabled === true,
       );
-      const presentationSnapshot = distantPresentation.snapshot();
+      const presentationSnapshot = diagnosticMeasure(
+        'distant-diagnostics-snapshot',
+        () => distantPresentation.snapshot(),
+      );
       const scenePresentationSnapshot = scenePresentation.snapshot();
       const renderOrigin = runtimeSnapshot.renderOrigin;
       const cameraLogicalX = renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS
@@ -2938,13 +3047,16 @@ export async function bootInfiniteWorldSandbox({
         ...runtimeSnapshot.renderedKeys.filter(key => !loadedKeySet.has(key)),
         ...(renderResources.renderCoverage?.loadedKeys ?? []).filter(key => !renderedKeySet.has(key)),
       ].sort();
-      const measurementReport = diagnostics.snapshot({
-        drawCalls: renderInfo?.render?.calls ?? null,
-        triangles: renderInfo?.render?.triangles ?? null,
-        geometries: renderInfo?.memory?.geometries ?? null,
-        materials: renderResources.sharedMaterialCount,
-        sceneObjects: countSceneObjects(scene),
-      });
+      const measurementReport = diagnosticMeasure(
+        'diagnostics-snapshot',
+        () => diagnostics.snapshot({
+          drawCalls: renderInfo?.render?.calls ?? null,
+          triangles: renderInfo?.render?.triangles ?? null,
+          geometries: renderInfo?.memory?.geometries ?? null,
+          materials: renderResources.sharedMaterialCount,
+          sceneObjects: countSceneObjects(scene),
+        }),
+      );
       const stageP95 = stage => number(measurementReport.stages[stage]?.p95);
       const longTaskMaximum = measurementReport.longTasks.reduce(
         (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
@@ -3330,6 +3442,17 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const renderOrigin = runtimeSnapshot.renderOrigin;
         const experienceSnapshot = experienceShell.snapshot();
         const presentationSnapshot = distantPresentation.snapshot();
+        const distantPresenterAudit = distantPresentation.presenterAuditSnapshot?.() ?? null;
+        const nearVisibleStableIds = new Set(
+          renderAdapter.visibleStableIdsSnapshot?.() ?? [],
+        );
+        const distantVisibleStableIds = new Set([
+          ...(distantPresenterAudit?.legacyDistantVisibleStableIds ?? []),
+          ...(distantPresenterAudit?.persistentNaturalVisibleStableIds ?? []),
+        ]);
+        const nearDistantDuplicateStableIds = [...nearVisibleStableIds]
+          .filter(stableId => distantVisibleStableIds.has(stableId))
+          .sort();
         const fogRenderDistancePreset = Object.keys(W8_RENDER_DISTANCE_PRESETS).find(preset => (
           Math.abs(
             resolveW8RenderDistancePolicy(preset).fogFarMeters * UNITS_PER_METER
@@ -3383,6 +3506,40 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           save: saveStore.snapshot(),
           audio: audioDirector.snapshot(),
           presentation: presentationSnapshot,
+          presentationDiagnostics: Object.freeze({
+            schemaVersion: 'w8-browser-acceptance-diagnostics-1',
+            browserAcceptance: 'FAIL',
+            presenterAudit: distantPresenterAudit,
+            nearVisibleStableIdCount: nearVisibleStableIds.size,
+            nearDistantDuplicatePresenterCount: nearDistantDuplicateStableIds.length,
+            nearDistantDuplicateStableIds: Object.freeze(nearDistantDuplicateStableIds),
+            visibleRootRevisions:
+              distantPresentation.visibleRootRevisionSnapshot?.() ?? Object.freeze([]),
+            treeMaterials: Object.freeze({
+              ...(distantPresentation.treeMaterialAuditSnapshot?.() ?? {}),
+              rendererOutputColorSpace: renderer.outputColorSpace ?? null,
+              sceneFogColorHex: typeof scene.fog?.color?.getHex === 'function'
+                ? scene.fog.color.getHex() : null,
+              sceneFogNear: scene.fog?.near ?? null,
+              sceneFogFar: scene.fog?.far ?? null,
+            }),
+            lifecycleByObject: collectWorldStreamingAcceptanceMetrics(
+              streamingTelemetry.snapshot(),
+              {
+                targets: Object.freeze([
+                  WORLD_STREAMING_TARGET.TREE,
+                  WORLD_STREAMING_TARGET.BUSH,
+                  WORLD_STREAMING_TARGET.GRASS,
+                  WORLD_STREAMING_TARGET.ROCK,
+                  WORLD_STREAMING_TARGET.BUILDING,
+                  WORLD_STREAMING_TARGET.SETTLEMENT,
+                  WORLD_STREAMING_TARGET.NEAR,
+                  WORLD_STREAMING_TARGET.DISTANT,
+                  WORLD_STREAMING_TARGET.GAMEPLAY,
+                ]),
+              },
+            ),
+          }),
           renderDistanceConsistency: Object.freeze({
             schemaVersion: 'render-distance-consistency-observation-1',
             requestedPreset: requestedDistantRenderDistance,

@@ -663,6 +663,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
   Fog.instances.length = 0;
   const environment = installBrowserEquivalentEnvironment();
   try {
+    globalThis.location.search = '?diagnostics=1&streamingTelemetry=1';
     const startedAt = performance.now();
     const entryUrl = new URL(`../src/infinite-world/sandbox-main.js?boot-smoke=${Date.now()}`, import.meta.url);
     let importTimeout = null;
@@ -1028,6 +1029,28 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     }));
     assert.ok(warmed.presentation.queryNaturalOwnerChunkCount >= 83);
     assert.ok(warmed.presentation.queryNaturalOwnerChunkCount <= 100);
+    environment.rafCallbacks.at(-1)(performance.now() + 116);
+    const browserAcceptanceDiagnosticFrameCount = 1;
+    warmed = outcome.sandbox.snapshot();
+    assert.equal(warmed.presentationDiagnostics.browserAcceptance, 'FAIL');
+    assert.equal(warmed.presentationDiagnostics.presenterAudit.duplicatePresenterCount, 0);
+    assert.equal(
+      warmed.presentationDiagnostics.nearDistantDuplicatePresenterCount,
+      warmed.presentationDiagnostics.nearDistantDuplicateStableIds.length,
+    );
+    t.diagnostic(`Near/Distant presenter overlap ${JSON.stringify(
+      warmed.presentationDiagnostics.nearDistantDuplicateStableIds,
+    )}`);
+    assert.ok(warmed.presentationDiagnostics.visibleRootRevisions.some(root => (
+      root.role === 'persistent-natural' && root.attached
+    )));
+    assert.ok(
+      warmed.diagnostics.work['settlement-shadow-observation'].calls.max >= 3,
+      'one frame materializes the direct observation plus Building and Settlement owner reads',
+    );
+    assert.ok(warmed.presentation.settlementShadowSnapshotCount >= 3);
+    assert.ok(warmed.presentation.settlementShadowCanonicalObjectScanCount
+      >= warmed.presentation.settlementShadowSnapshotCount);
     assert.ok(warmed.presentation.canonicalVegetationRecordCount >= warmed.presentation.visibleCanonicalVegetationCount);
     assert.ok(warmed.presentation.visibleCanonicalVegetationCount > 0);
     assert.ok(warmed.presentation.visibleCanonicalTreeCount > 0);
@@ -1084,6 +1107,26 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     t.diagnostic(`Static Tree activation timeline (first draw) ${JSON.stringify(
       firstDraw.treePathAudit.activationTimeline,
     )}`);
+    t.diagnostic(`Browser Acceptance diagnostic frame ${JSON.stringify({
+      frame: firstDraw.diagnostics.frame,
+      stages: Object.fromEntries([
+        'world-streaming-plan',
+        'settlement-shadow-observation',
+        'settlement-shadow-compare',
+        'settlement-staging-signature',
+        'natural-policy-plan',
+        'static-natural-apply-plan',
+        'static-natural-ready-admission',
+        'player-update',
+        'distant-update',
+        'render',
+        'hud',
+        'distant-diagnostics-snapshot',
+        'diagnostics-snapshot',
+      ].map(stage => [stage, firstDraw.diagnostics.stages[stage] ?? null])),
+      work: firstDraw.diagnostics.work,
+      lifecycle: firstDraw.presentationDiagnostics.lifecycleByObject.byTarget,
+    })}`);
     let outerCompleted = firstDraw;
     for (let attempt = 0; attempt < 1_000
       && outerCompleted.treePathAudit.activationTimeline.outerWarmCompletedAtMs === null;
@@ -1176,7 +1219,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.deepEqual(
       environment.rafInitializationStates,
       Array.from({
-        length: 2 + activationDiagnosticFrameCount + inputDiagnosticFrameCount,
+        length: 2 + activationDiagnosticFrameCount + inputDiagnosticFrameCount
+          + browserAcceptanceDiagnosticFrameCount,
       }, () => true),
     );
     const expectedCancelledFrameId = environment.rafInitializationStates.length;

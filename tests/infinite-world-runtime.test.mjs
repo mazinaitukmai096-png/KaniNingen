@@ -12,6 +12,7 @@ class RecordingAdapter {
   constructor() {
     this.loaded = new Map();
     this.unloadHistory = [];
+    this.publicationHistory = [];
     this.origin = null;
     this.shutdownCalled = false;
   }
@@ -24,10 +25,12 @@ class RecordingAdapter {
   async loadProjected(projected) {
     if (this.loaded.has(projected.key)) throw new Error(`duplicate render load ${projected.key}`);
     this.loaded.set(projected.key, projected);
+    this.publicationHistory.push({ type: 'replacement-attached', ownerKey: projected.key });
   }
   async unloadChunk(key) {
     if (!this.loaded.delete(key)) throw new Error(`missing render unload ${key}`);
     this.unloadHistory.push(key);
+    this.publicationHistory.push({ type: 'old-owner-released', ownerKey: key });
   }
   async shutdown() { this.shutdownCalled = true; this.loaded.clear(); }
 }
@@ -47,6 +50,7 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   assert.equal(runtime.snapshot().renderedCount, 9);
   assert.equal(adapter.loaded.size, 9);
 
+  adapter.publicationHistory.length = 0;
   const east = await runtime.transitionToChunk(1, 0);
   assert.deepEqual({
     generated: east.generatedDelta,
@@ -58,6 +62,14 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   }, { generated: 5, activated: 5, deactivated: 5, loaded: 3, unloaded: 3, rebase: 1 });
   assert.equal(runtime.snapshot().activeDataCount, 25);
   assert.equal(runtime.snapshot().renderedCount, 9);
+  assert.deepEqual(adapter.publicationHistory.map(event => event.type), [
+    'old-owner-released',
+    'old-owner-released',
+    'old-owner-released',
+    'replacement-attached',
+    'replacement-attached',
+    'replacement-attached',
+  ], 'Near Terrain currently releases the outgoing column before attaching replacements');
 
   const revisit = await runtime.transitionToChunk(0, 0);
   assert.equal(revisit.generatedDelta, 0);

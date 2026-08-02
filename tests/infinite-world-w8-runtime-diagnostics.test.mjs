@@ -72,10 +72,12 @@ const distantTestSrgbToLinear = value => (
 class DistantTestColor {
   constructor(hex = 0xffffff) {
     this.isColor = true;
+    this.hex = hex;
     this.r = distantTestSrgbToLinear(((hex >> 16) & 0xff) / 255);
     this.g = distantTestSrgbToLinear(((hex >> 8) & 0xff) / 255);
     this.b = distantTestSrgbToLinear((hex & 0xff) / 255);
   }
+  getHex() { return this.hex; }
 }
 
 class DistantTestMatrix {
@@ -260,12 +262,15 @@ const SILHOUETTE_CONIFER_PART = Object.freeze({
 
 function createSilhouetteTestVisualAssets() {
   const geometry = new DistantTestGeometry();
-  const material = () => new DistantTestMaterial();
+  const material = color => new DistantTestMaterial(
+    Number.isFinite(color) ? { color } : {},
+  );
   return {
     geometries: { box: geometry, sphere: geometry, cone: geometry },
     materials: {
       houseWall: material(), road: material(), lotResidential: material(), lotCivic: material(),
-      water: material(), bush: material(), treeTrunk: material(), treeLeaves: material(),
+      water: material(), bush: material(), treeTrunk: material(), treeLeaves: material(0x2e7d32),
+      treeLeavesForest: material(0x1b5e20), treeLeavesMeadow: material(0x7cb342),
       wetlandLeaves: material(),
     },
     featureParts: {
@@ -689,6 +694,14 @@ test('MeasurementReport correlates stage samples with hitch frames and reports p
   });
   diagnostics.startFrame(0);
   diagnostics.measure('render', () => { now += 12; });
+  diagnostics.recordWork('settlement-shadow-observation', {
+    calls: 3,
+    canonicalObjectsScanned: 900,
+  });
+  diagnostics.recordEvent('terrain-old-released', {
+    ownerKey: '0,0',
+    coverageGeneration: 7,
+  });
   await diagnostics.measureAsync('save-serialization', async () => { now += 44; });
   diagnostics.finishFrame(56, now);
   now += 1;
@@ -703,6 +716,18 @@ test('MeasurementReport correlates stage samples with hitch frames and reports p
   assert.equal(report.frame.p95, 56);
   assert.equal(report.hitchRatio, 0.5);
   assert.equal(report.hitches[0].stages['save-serialization'], 44);
+  assert.equal(report.hitches[0].work['settlement-shadow-observation'].calls, 3);
+  assert.equal(report.frames[0].work['settlement-shadow-observation']
+    .canonicalObjectsScanned, 900);
+  assert.equal(report.work['settlement-shadow-observation'].calls.max, 3);
+  assert.deepEqual(report.events[0], {
+    sequence: 1,
+    type: 'terrain-old-released',
+    timestampMs: 12,
+    frameSequence: 1,
+    ownerKey: '0,0',
+    coverageGeneration: 7,
+  });
   assert.equal(report.stages.render.count, 2);
   assert.equal(report.resources.geometries, 7);
   diagnostics.dispose();
@@ -1223,6 +1248,41 @@ test('Tree full, Forest, and Atmospheric tiers cross-fade by exact logical dista
   assert.equal(normal.snapshot.naturalLodDrawCallEquivalent, 10);
   assert.equal(normal.snapshot.forestHorizonMaterialCount, 1);
   assert.equal(normal.snapshot.forestHorizonMeshCount, 2);
+  const treeMaterials = normal.presentation.treeMaterialAuditSnapshot();
+  assert.equal(treeMaterials.source.find(material => (
+    material.path === 'exact:treeLeaves'
+  )).baseColorHex, 0x2e7d32);
+  assert.equal(treeMaterials.source.find(material => (
+    material.path === 'exact:treeLeavesForest'
+  )).baseColorHex, 0x1b5e20);
+  assert.equal(treeMaterials.source.find(material => (
+    material.path === 'exact:treeLeavesMeadow'
+  )).baseColorHex, 0x7cb342);
+  const forestMaterial = treeMaterials.generated.find(material => (
+    material.path === 'legacy-distant:forest'
+  ));
+  const atmosphericMaterial = treeMaterials.generated.find(material => (
+    material.path === 'legacy-distant:atmospheric'
+  ));
+  const horizonMaterial = treeMaterials.generated.find(material => (
+    material.path === 'legacy-distant:horizon'
+  ));
+  assert.deepEqual({
+    color: forestMaterial.baseColorHex,
+    flatShading: forestMaterial.flatShading,
+    shininess: forestMaterial.shininess,
+    fog: forestMaterial.fog,
+  }, { color: 0x28512f, flatShading: true, shininess: 0, fog: true });
+  assert.deepEqual({
+    color: atmosphericMaterial.baseColorHex,
+    fog: atmosphericMaterial.fog,
+    customAtmosphericFogBlend: atmosphericMaterial.customAtmosphericFogBlend,
+  }, { color: 0x49674f, fog: false, customAtmosphericFogBlend: true });
+  assert.deepEqual({
+    color: horizonMaterial.baseColorHex,
+    fog: horizonMaterial.fog,
+    customAtmosphericFogBlend: horizonMaterial.customAtmosphericFogBlend,
+  }, { color: 0x49674f, fog: false, customAtmosphericFogBlend: true });
   const broadleafSilhouette = candidates[1];
   const broadleafAudit = normal.audit.find(value => (
     value.identity.stableId === broadleafSilhouette.candidateId
@@ -2099,6 +2159,44 @@ test('an older transition contract cannot roll back Local Terrain coverage or po
   assert.equal(presentation.snapshot().localTerrainTransitionGeneration, 2);
   assert.equal(presentation.snapshot().localTerrainCoverageSignature,
     currentContract.coverageSignature);
+  presentation.dispose();
+});
+
+test('Local Terrain diagnostics prove replacement attachment precedes old-root release', async () => {
+  const scene = new DistantTestGroup();
+  const events = [];
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    diagnosticsEnabled: true,
+    recordDiagnosticEvent(type, details) {
+      events.push({ type, ...details });
+    },
+  });
+  assert.equal((await presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 1,
+    ...localTerrainCoverageFixture(0, 0),
+  })).committed, true);
+  events.length = 0;
+  assert.equal((await presentation.syncLocalTerrainIncrementally({
+    coverageEpoch: 2,
+    ...localTerrainCoverageFixture(1, 0),
+  })).committed, true);
+  const ordered = events.map(event => event.type);
+  assert.ok(ordered.indexOf('terrain-replacement-ready')
+    < ordered.indexOf('terrain-replacement-attached'));
+  assert.ok(ordered.indexOf('terrain-replacement-attached')
+    < ordered.indexOf('terrain-old-released'));
+  const ready = events.find(event => event.type === 'terrain-replacement-ready');
+  const attached = events.find(event => event.type === 'terrain-replacement-attached');
+  const released = events.find(event => event.type === 'terrain-old-released');
+  assert.equal(ready.rootAttached, false);
+  assert.equal(ready.oldRootAttached, true);
+  assert.equal(attached.rootAttached, true);
+  assert.equal(attached.oldRootAttached, true);
+  assert.equal(released.newRootAttached, true);
+  assert.equal(released.oldRootAttached, false);
+  const roots = presentation.visibleRootRevisionSnapshot();
+  assert.equal(roots.find(root => root.role === 'local-terrain').coverageEpoch, 2);
+  assert.equal(roots.find(root => root.role === 'local-terrain').attached, true);
   presentation.dispose();
 });
 

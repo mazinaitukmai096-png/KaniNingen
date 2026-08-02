@@ -543,3 +543,18 @@ Browser連携が利用できない場合は、
 - `3441dbb feat: publish buildings through shared streaming plans`
 - `fd39e6b feat: publish settlements and roads through shared streaming plans`
 - `a25dd41 feat: join settlements to render distance revision publication`
+
+## 23. W8 Browser Acceptance FAIL（2026-08-02）
+
+自動Acceptanceの暫定合格を撤回し、Browser AcceptanceをFAILとする。
+
+実機で、初期Tree warm遅延、継続的なframe stall、Terrain欠落、Buildingの
+めり込み・ちらつき、Natural／Road／Settlementのpublication timing不一致、
+exact TreeとHorizon Treeの色差を確認した。旧Building／Settlement経路は削除せず、
+`?settlementStreaming=legacy` rollbackを維持する。
+
+本調査ではproduction挙動を変更しない。`?diagnostics=1&streamingTelemetry=1`で、
+frame stage／経路別work量、Terrain replacement時系列、Object別lifecycle、
+visible root revision、Tree Material値、duplicate presenterを取得する。
+
+Browser Acceptanceが再合格するまで、旧経路削除と次の機能Phaseを禁止する。

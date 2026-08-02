@@ -88,9 +88,14 @@ const percentileOf = (values, ratio) => {
 };
 
 function summarizeAcceptanceSamples(samples) {
+  const requestToReady = samples.map(sample => sample.requestToReadyMs).filter(Number.isFinite);
   const workerToPublish = samples.map(sample => sample.workerToPublishMs).filter(Number.isFinite);
   const requestToFirstDraw = samples.map(sample => sample.requestToFirstDrawMs).filter(Number.isFinite);
   return Object.freeze({
+    requestToReadyCount: requestToReady.length,
+    requestToReadyP50Ms: percentileOf(requestToReady, 0.5),
+    requestToReadyP95Ms: percentileOf(requestToReady, 0.95),
+    requestToReadyMaximumMs: Math.max(0, ...requestToReady),
     workerToPublishCount: workerToPublish.length,
     workerToPublishP50Ms: percentileOf(workerToPublish, 0.5),
     workerToPublishP95Ms: percentileOf(workerToPublish, 0.95),
@@ -116,12 +121,16 @@ export function collectWorldStreamingAcceptanceMetrics(snapshot, {
     if (event.stream !== stream || typeof event.resourceKey !== 'string') continue;
     let shared = sharedByResource.get(event.resourceKey);
     if (!shared) {
-      shared = { requestAtMs: null, workerCompleteAtMs: null };
+      shared = { requestAtMs: null, readyAtMs: null, workerCompleteAtMs: null };
       sharedByResource.set(event.resourceKey, shared);
     }
     if (event.type === WORLD_STREAMING_EVENT.REQUEST) shared.requestAtMs = event.timestampMs;
+    if (event.type === WORLD_STREAMING_EVENT.CACHE_HIT && shared.readyAtMs === null) {
+      shared.readyAtMs = event.timestampMs;
+    }
     if (event.type === WORLD_STREAMING_EVENT.WORKER_COMPLETE) {
       shared.workerCompleteAtMs = event.timestampMs;
+      shared.readyAtMs = event.timestampMs;
     }
     if (!targetSet.has(event.target)) continue;
     const sampleKey = `${event.target}\n${event.resourceKey}`;
@@ -130,6 +139,7 @@ export function collectWorldStreamingAcceptanceMetrics(snapshot, {
       sample = {
         resourceKey: event.resourceKey,
         requestAtMs: shared.requestAtMs,
+        readyAtMs: shared.readyAtMs,
         workerCompleteAtMs: shared.workerCompleteAtMs,
         publishAtMs: event.timestampMs,
         firstDrawAtMs: null,
@@ -146,6 +156,7 @@ export function collectWorldStreamingAcceptanceMetrics(snapshot, {
         sample = {
           resourceKey: event.resourceKey,
           requestAtMs: shared.requestAtMs,
+          readyAtMs: shared.readyAtMs,
           workerCompleteAtMs: shared.workerCompleteAtMs,
           publishAtMs: null,
           firstDrawAtMs: null,
@@ -159,6 +170,9 @@ export function collectWorldStreamingAcceptanceMetrics(snapshot, {
   }
   const resolvedByTarget = Object.freeze(Object.fromEntries(targets.map(target => {
     const resolved = samplesByTarget.get(target).map(sample => Object.freeze({
+        requestToReadyMs: Number.isFinite(sample.requestAtMs)
+          && Number.isFinite(sample.readyAtMs)
+          ? Math.max(0, sample.readyAtMs - sample.requestAtMs) : null,
         workerToPublishMs: Number.isFinite(sample.workerCompleteAtMs)
           && Number.isFinite(sample.publishAtMs)
           ? Math.max(0, sample.publishAtMs - sample.workerCompleteAtMs) : null,
@@ -175,6 +189,9 @@ export function collectWorldStreamingAcceptanceMetrics(snapshot, {
   for (const target of targets) {
     for (const sample of samplesByTarget.get(target)) {
       aggregateSamples.push({
+        requestToReadyMs: Number.isFinite(sample.requestAtMs)
+          && Number.isFinite(sample.readyAtMs)
+          ? Math.max(0, sample.readyAtMs - sample.requestAtMs) : null,
         workerToPublishMs: Number.isFinite(sample.workerCompleteAtMs)
           && Number.isFinite(sample.publishAtMs)
           ? Math.max(0, sample.publishAtMs - sample.workerCompleteAtMs) : null,
