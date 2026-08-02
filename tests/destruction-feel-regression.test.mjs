@@ -37,6 +37,7 @@ function listFiniteCheckpointFiles() {
     .filter(path => ![
       'src/core/input.js',
       'tests/destruction-feel-regression.test.mjs',
+      'tests/runtime-stability.test.mjs',
     ].includes(path));
 }
 
