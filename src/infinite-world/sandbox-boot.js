@@ -79,6 +79,12 @@ import {
   normalizeW8RenderDistancePreset,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
+import {
+  W8_BUILDING_STREAM_POLICY_KIND,
+  W8_SETTLEMENT_STREAM_POLICY_KIND,
+  compareW8BuildingSettlementShadow,
+  createW8BuildingSettlementShadowPolicies,
+} from './settlement-stream-policy.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -950,6 +956,9 @@ export async function bootInfiniteWorldSandbox({
       worldStreamingPolicyRegistry.register(runtime.policy);
       return [runtime.policy.kind, Object.freeze({ ...runtime, naturalKind: kind })];
     }));
+    for (const policy of createW8BuildingSettlementShadowPolicies({
+      readObservation: () => distantPresentation?.settlementStreamingShadowSnapshot?.() ?? null,
+    })) worldStreamingPolicyRegistry.register(policy);
     let naturalPresentationCoverageGeneration = -1;
     let naturalPresentationCoveragePreset = null;
     let naturalPresentationPolicyCoverage = Object.freeze([]);
@@ -1759,6 +1768,7 @@ export async function bootInfiniteWorldSandbox({
     let renderDistanceRequestRevision = 0;
     let pendingRenderDistancePublication = null;
     let appliedStaticNaturalRetainedOwnerKeys = Object.freeze([]);
+    let buildingSettlementShadowComparison = null;
     running = true;
 
     const synchronizeDistantPresentation = (runtimeSnapshot, {
@@ -2684,6 +2694,8 @@ export async function bootInfiniteWorldSandbox({
         enabled: shellSnapshot.runPhase === 'intro',
       });
       const committedChunkState = runtime.getCommittedChunkState();
+      const settlementStreamingObservation =
+        distantPresentation.settlementStreamingShadowSnapshot?.() ?? null;
       const worldStreamingPlan = worldStreamingCoordinator.createShadowPlan({
         player: { x: logicalPlayer.x, z: logicalPlayer.z },
         velocity: { x: movement.velocityX, z: movement.velocityZ },
@@ -2696,7 +2708,23 @@ export async function bootInfiniteWorldSandbox({
             requestOwnerKeys: committedChunkState.activeDataKeys,
             retainedOwnerKeys: committedChunkState.activeDataKeys,
           },
+          ...(settlementStreamingObservation ? {
+            [W8_BUILDING_STREAM_POLICY_KIND]: {
+              requiredOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+              requestOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+              retainedOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+            },
+            [W8_SETTLEMENT_STREAM_POLICY_KIND]: {
+              requiredOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+              requestOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+              retainedOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+            },
+          } : {}),
         },
+      });
+      buildingSettlementShadowComparison = compareW8BuildingSettlementShadow({
+        plan: worldStreamingPlan,
+        observation: settlementStreamingObservation,
       });
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
       const staticNaturalPolicyPlans = worldStreamingPlan.policyPlans.filter(
@@ -3293,6 +3321,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           }),
           streamingTelemetry: streamingTelemetry.snapshot(),
           worldStreaming: worldStreamingCoordinator.snapshot(),
+          buildingSettlementShadow: buildingSettlementShadowComparison,
           staticObjectStreaming: naturalStaticStream.snapshot(),
           treePathAudit: Object.freeze({
             treeStaticStreamActivated: naturalStaticStreamActivated,

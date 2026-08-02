@@ -7980,6 +7980,55 @@ export async function createW8DistantPresentation({
       positionGenerationForOrigin(persistentTreeGeneration, renderOrigin);
       return true;
     },
+    settlementStreamingShadowSnapshot() {
+      const generation = activeGeneration;
+      if (!generation) return null;
+      const records = [...generation.canonicalObjects.values()].filter(object => (
+        object.settlementId !== null && object.settlementId !== undefined
+      ));
+      const stableIds = records.map(object => object.stableId).sort();
+      const settlementIds = [...new Set(records.map(object => object.settlementId))].sort();
+      const settlementIdSet = new Set(settlementIds);
+      const roadLinkages = records.filter(object => (
+        object.record?.featureType === 'settlement-road'
+      )).map(object => Object.freeze({
+        stableId: object.stableId,
+        settlementId: object.settlementId,
+        ownerKey: object.ownerKey,
+      })).sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const damageStates = records.filter(object => object.destructible).map(object => (
+        Object.freeze({
+          stableId: object.stableId,
+          destroyed: isFeatureDestroyed(object.stableId) === true,
+        })
+      )).sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const buildingOwnerKeys = Object.freeze([
+        ...new Set(generation.queryBuildingOwnerChunkKeys ?? []),
+      ].sort());
+      const settlementOwnerKeys = Object.freeze([...new Set([
+        ...buildingOwnerKeys,
+        ...records.map(object => object.ownerKey),
+      ])].sort());
+      return Object.freeze({
+        schemaVersion: 'legacy-building-settlement-observation-1',
+        publicationSource: 'legacy-distant-root',
+        renderDistancePreset: generation.renderDistancePreset,
+        quality: generation.quality,
+        generalVisibilityMeters: generation.visibilityMeters,
+        metadataQueryDistanceMeters: generation.settlementMetadataQueryDistanceMeters,
+        buildingOwnerKeys,
+        settlementOwnerKeys,
+        stableIds: Object.freeze(stableIds),
+        settlementIds: Object.freeze(settlementIds),
+        roadLinkages: Object.freeze(roadLinkages),
+        damageStates: Object.freeze(damageStates),
+        duplicateStableIdCount: stableIds.length - new Set(stableIds).size,
+        duplicateSettlementIdCount: 0,
+        invalidRoadLinkageCount: roadLinkages.filter(
+          linkage => !settlementIdSet.has(linkage.settlementId),
+        ).length,
+      });
+    },
     snapshot({
       includeRemoteHorizonAtmospheres = false,
       includeSettlementSelectionDetails = false,
