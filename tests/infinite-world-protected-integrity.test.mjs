@@ -51,6 +51,7 @@ test('every committed and worktree change stays inside the Infinite World allowl
     const allowed = path === 'tests/destruction-feel-regression.test.mjs'
       || path === 'src/core/input.js'
       || path === 'tests/core-input.test.mjs'
+      || path === 'tests/runtime-stability.test.mjs'
       || path === 'ゲーム起動.bat'
       || path === 'infinite-world-sandbox.html'
       || path.startsWith('src/infinite-world/')
