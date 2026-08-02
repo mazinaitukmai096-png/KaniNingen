@@ -144,8 +144,12 @@ export function compareW8BuildingSettlementShadow({ plan, observation } = {}) {
   const identityMatches = observation.duplicateStableIdCount === 0
     && observation.duplicateSettlementIdCount === 0
     && observation.invalidRoadLinkageCount === 0;
-  const sharedSnapshotIdentity = buildingPlan.sourceSnapshot === observation
-    && settlementPlan.sourceSnapshot === observation;
+  const sourceCoverageHash = buildingPlan.sourceSnapshot?.coverageContentHash ?? null;
+  const sharedSnapshotIdentity = (buildingPlan.sourceSnapshot === observation
+      && settlementPlan.sourceSnapshot === observation)
+    || (sourceCoverageHash !== null
+      && sourceCoverageHash === observation.coverageContentHash
+      && settlementPlan.sourceSnapshot?.coverageContentHash === sourceCoverageHash);
   return Object.freeze({
     schemaVersion: 'building-settlement-shadow-comparison-1',
     matches: buildingOwners.matches && settlementOwners.matches

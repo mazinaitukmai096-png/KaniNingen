@@ -62,9 +62,14 @@ import {
 import { createWorldStreamingPolicyRegistry } from './world-streaming-policy-registry.js';
 import { createWorldStreamingCoordinator } from './world-streaming-coordinator.js';
 import {
+  STATIC_OBJECT_STREAM_VELOCITY_PREFETCH,
   createCircularStaticStreamingPolicy,
   createStaticObjectStream,
 } from './static-object-stream.js';
+import {
+  NATURAL_RESOURCE_BAND_REVISION,
+  createNaturalCoverageKey,
+} from './natural-streaming-coverage.js';
 import {
   createW8ForestHorizonOwnerPredicate,
 } from './forest-horizon-owner-policy.js';
@@ -851,6 +856,7 @@ export async function bootInfiniteWorldSandbox({
   let renderDistanceRequestRevision = 0;
   let naturalStaticStreamActivated = false;
   let naturalStaticStreamSuspended = false;
+  let latestNaturalCoverageState = null;
   let canonicalWorldSeedHash = null;
   let forestHorizonOwnerPredicate = null;
   let availableSaveSnapshot = null;
@@ -906,6 +912,11 @@ export async function bootInfiniteWorldSandbox({
       staticTreeActivationTimeline.activationRunPhase = experienceShell?.getRunPhase?.() ?? null;
       staticTreeActivationTimeline.activationPaused = experienceShell?.isPaused?.() ?? null;
     }
+  };
+  const invalidateNaturalStreamingCoverage = reason => {
+    latestNaturalCoverageState = null;
+    worldStreamingCoordinator?.invalidateCoverage?.(reason);
+    return naturalStaticStream?.invalidate?.(reason) ?? 0;
   };
 
   const startStage = stage => {
@@ -2266,7 +2277,7 @@ export async function bootInfiniteWorldSandbox({
     async function loadWorld() {
       playerRelocationInProgress = true;
       naturalStaticStreamSuspended = true;
-      naturalStaticStream.invalidate('load-world');
+      invalidateNaturalStreamingCoverage('load-world');
       try {
         const loaded = await saveStore.loadInto(worldState);
         if (!loaded) {
@@ -2416,6 +2427,15 @@ export async function bootInfiniteWorldSandbox({
       distantRenderDistance = pending.preset;
       appliedStaticNaturalRetainedOwnerKeys = pending.retainedNaturalOwnerKeys
         ?? appliedStaticNaturalRetainedOwnerKeys;
+      distantPresentation.releaseStaticNaturalRetainedOwners?.(
+        appliedStaticNaturalRetainedOwnerKeys,
+      );
+      if (latestNaturalCoverageState) {
+        latestNaturalCoverageState = Object.freeze({
+          ...latestNaturalCoverageState,
+          presentedRetainedOwnerKeys: appliedStaticNaturalRetainedOwnerKeys,
+        });
+      }
       applyRenderDistanceFog(distantRenderDistance);
       pendingRenderDistancePublication = null;
       return true;
@@ -2459,7 +2479,7 @@ export async function bootInfiniteWorldSandbox({
       onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
         playerRelocationInProgress = true;
         naturalStaticStreamSuspended = true;
-        naturalStaticStream.invalidate(`start-run:${startMode}`);
+        invalidateNaturalStreamingCoverage(`start-run:${startMode}`);
         const phaseBefore = experienceShell?.getRunPhase?.() ?? 'menu';
         const gameplayTimeBeforeMs = worldState.gameplayTimeMs;
         const playerBefore = Object.freeze({ ...logicalPlayer });
@@ -2528,7 +2548,7 @@ export async function bootInfiniteWorldSandbox({
       },
       onReturnTitle: () => {
         naturalStaticStreamSuspended = true;
-        naturalStaticStream.invalidate('return-title');
+        invalidateNaturalStreamingCoverage('return-title');
         const saving = saveWorld({ force: true });
         returnTitleSavePromise = saving;
         void saving.finally(() => {
@@ -2539,7 +2559,7 @@ export async function bootInfiniteWorldSandbox({
       onResetHome: async () => {
         playerRelocationInProgress = true;
         naturalStaticStreamSuspended = true;
-        naturalStaticStream.invalidate('reset-home');
+        invalidateNaturalStreamingCoverage('reset-home');
         try {
           worldState.updatePlayer({
             x: experienceSpawn.x,
@@ -2557,7 +2577,7 @@ export async function bootInfiniteWorldSandbox({
       onRestart: async () => {
         playerRelocationInProgress = true;
         naturalStaticStreamSuspended = true;
-        naturalStaticStream.invalidate('restart');
+        invalidateNaturalStreamingCoverage('restart');
         try {
           await gameplay.restart({
             playerSpawn: experienceSpawn,
@@ -2830,49 +2850,80 @@ export async function bootInfiniteWorldSandbox({
         () => readSettlementStreamingObservation(requestedDistantRenderDistance),
       );
       latestSettlementStreamingObservation = settlementStreamingObservation;
-      const worldStreamingPlan = diagnosticMeasure(
-        'world-streaming-plan',
-        () => worldStreamingCoordinator.createShadowPlan({
+      const destructionRevision = [...(worldState.featureDamage?.entries?.() ?? [])]
+        .filter(([, value]) => value?.destroyed === true)
+        .map(([stableId]) => stableId)
+        .sort((left, right) => left.localeCompare(right))
+        .join('\n');
+      const publicationContext = worldStreamingCoordinator.createPublicationContext({
+        generatedAtMs: clock(),
+        stateRevision: worldState.revision,
+        destructionRevision,
+        originGeneration: committedChunkState.transitionContract?.generation ?? 0,
+      });
+      const naturalCoverageKey = createNaturalCoverageKey({
+        policyRegistryVersion: worldStreamingPolicyRegistry.version,
+        renderDistancePreset: requestedDistantRenderDistance,
         player: { x: logicalPlayer.x, z: logicalPlayer.z },
         velocity: { x: movement.velocityX, z: movement.velocityZ },
-        renderDistancePreset: requestedDistantRenderDistance,
-        stateRevision: worldState.revision,
-        originGeneration: committedChunkState.transitionContract?.generation ?? 0,
-        currentRequests: {
-          [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
-            requiredOwnerKeys: committedChunkState.renderedKeys,
-            requestOwnerKeys: committedChunkState.activeDataKeys,
-            retainedOwnerKeys: committedChunkState.activeDataKeys,
-          },
-          ...(settlementStreamingObservation ? {
-            [W8_BUILDING_STREAM_POLICY_KIND]: {
-              sourceSnapshot: settlementStreamingObservation,
-              requiredOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
-              requestOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
-              retainedOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+        velocityPrefetch: STATIC_OBJECT_STREAM_VELOCITY_PREFETCH,
+        naturalResourceBandRevision: NATURAL_RESOURCE_BAND_REVISION,
+        settlementContentHash:
+          settlementStreamingObservation?.coverageContentHash ?? null,
+        runtimeCoverageSignature:
+          committedChunkState.transitionContract?.coverageSignature
+            ?? `runtime:${committedChunkState.centerChunkX},${committedChunkState.centerChunkZ}`,
+      });
+      const coverageResolution = diagnosticMeasure(
+        'world-streaming-plan',
+        () => worldStreamingCoordinator.resolveCoveragePlan({
+          coverageKey: naturalCoverageKey,
+          publicationContext,
+          createPlanInput: () => ({
+            player: { x: logicalPlayer.x, z: logicalPlayer.z },
+            velocity: { x: movement.velocityX, z: movement.velocityZ },
+            renderDistancePreset: requestedDistantRenderDistance,
+            currentRequests: {
+              [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
+                requiredOwnerKeys: committedChunkState.renderedKeys,
+                requestOwnerKeys: committedChunkState.activeDataKeys,
+                retainedOwnerKeys: committedChunkState.activeDataKeys,
+              },
+              ...(settlementStreamingObservation ? {
+                [W8_BUILDING_STREAM_POLICY_KIND]: {
+                  sourceSnapshot: settlementStreamingObservation,
+                  requiredOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+                  requestOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+                  retainedOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
+                },
+                [W8_SETTLEMENT_STREAM_POLICY_KIND]: {
+                  sourceSnapshot: settlementStreamingObservation,
+                  requiredOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+                  requestOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+                  retainedOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
+                },
+              } : {}),
             },
-            [W8_SETTLEMENT_STREAM_POLICY_KIND]: {
-              sourceSnapshot: settlementStreamingObservation,
-              requiredOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
-              requestOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
-              retainedOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
-            },
-          } : {}),
-        },
-      }),
+          }),
+        }),
       );
+      const worldStreamingPlan = coverageResolution.plan;
       if (diagnostics.enabled) diagnostics.recordWork('world-streaming-plan', {
-        calls: 1,
-        policies: worldStreamingPlan.policyPlans.length,
-        requiredOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+        calls: Number(coverageResolution.regenerated),
+        fastPathHits: Number(!coverageResolution.regenerated),
+        policies: coverageResolution.regenerated ? worldStreamingPlan.policyPlans.length : 0,
+        requiredOwnerKeys: coverageResolution.regenerated
+          ? worldStreamingPlan.policyPlans.reduce(
           (sum, policy) => sum + policy.requiredOwnerKeys.length, 0,
-        ),
-        prefetchedOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+          ) : 0,
+        prefetchedOwnerKeys: coverageResolution.regenerated
+          ? worldStreamingPlan.policyPlans.reduce(
           (sum, policy) => sum + policy.prefetchedOwnerKeys.length, 0,
-        ),
-        retainedOwnerKeys: worldStreamingPlan.policyPlans.reduce(
+          ) : 0,
+        retainedOwnerKeys: coverageResolution.regenerated
+          ? worldStreamingPlan.policyPlans.reduce(
           (sum, policy) => sum + policy.retainedOwnerKeys.length, 0,
-        ),
+          ) : 0,
       });
       buildingSettlementShadowComparison = diagnosticMeasure(
         'settlement-shadow-compare',
@@ -2918,55 +2969,87 @@ export async function bootInfiniteWorldSandbox({
         }
       }
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
-      const naturalOwnerPlan = diagnosticMeasure('natural-policy-plan', () => {
-        const policyPlans = worldStreamingPlan.policyPlans.filter(
-          policy => staticNaturalPolicyRuntimes.has(policy.kind),
-        );
-        return Object.freeze({
-          policyPlans,
-          requiredOwnerKeys: Object.freeze([
-            ...new Set(policyPlans.flatMap(policy => policy.requiredOwnerKeys)),
-          ]),
-          retainedOwnerKeys: Object.freeze([
-            ...new Set(policyPlans.flatMap(policy => policy.allOwnerKeys)),
-          ]),
+      if (coverageResolution.regenerated || latestNaturalCoverageState === null) {
+        const naturalOwnerPlan = diagnosticMeasure('natural-policy-plan', () => {
+          const policyPlans = worldStreamingPlan.policyPlans.filter(
+            policy => staticNaturalPolicyRuntimes.has(policy.kind),
+          );
+          return Object.freeze({
+            policyPlans,
+            requiredOwnerKeys: Object.freeze([
+              ...new Set(policyPlans.flatMap(policy => policy.requiredOwnerKeys)),
+            ]),
+            retainedOwnerKeys: Object.freeze([
+              ...new Set(policyPlans.flatMap(policy => policy.allOwnerKeys)),
+            ]),
+          });
         });
+        const requestedNaturalRequiredOwnerKeys = naturalOwnerPlan.requiredOwnerKeys;
+        const requestedNaturalRetainedOwnerKeys = naturalOwnerPlan.retainedOwnerKeys;
+        if (pendingRenderDistancePublication) {
+          pendingRenderDistancePublication.requiredNaturalOwnerKeys =
+            requestedNaturalRequiredOwnerKeys;
+          pendingRenderDistancePublication.retainedNaturalOwnerKeys =
+            requestedNaturalRetainedOwnerKeys;
+        } else {
+          appliedStaticNaturalRetainedOwnerKeys = requestedNaturalRetainedOwnerKeys;
+        }
+        const presentedNaturalRetainedOwnerKeys = pendingRenderDistancePublication
+          ? Object.freeze([...new Set([
+            ...appliedStaticNaturalRetainedOwnerKeys,
+            ...requestedNaturalRetainedOwnerKeys,
+          ])])
+          : requestedNaturalRetainedOwnerKeys;
+        latestNaturalCoverageState = Object.freeze({
+          key: naturalCoverageKey,
+          plan: worldStreamingPlan,
+          policyPlans: naturalOwnerPlan.policyPlans,
+          requiredOwnerKeys: requestedNaturalRequiredOwnerKeys,
+          retainedOwnerKeys: requestedNaturalRetainedOwnerKeys,
+          presentedRetainedOwnerKeys: presentedNaturalRetainedOwnerKeys,
+          streamApplied: false,
+          resourceKindEntries: Object.freeze([]),
+          policyResourceCoverage: Object.freeze([]),
+        });
+        if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
+          calls: 1,
+          policies: naturalOwnerPlan.policyPlans.length,
+          requiredOwners: requestedNaturalRequiredOwnerKeys.length,
+          retainedOwners: requestedNaturalRetainedOwnerKeys.length,
+        });
+      } else if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
+        calls: 0,
+        fastPathHits: 1,
       });
-      const staticNaturalPolicyPlans = naturalOwnerPlan.policyPlans;
-      const requestedNaturalRequiredOwnerKeys = naturalOwnerPlan.requiredOwnerKeys;
-      const requestedNaturalRetainedOwnerKeys = naturalOwnerPlan.retainedOwnerKeys;
-      if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
-        calls: 1,
-        policies: staticNaturalPolicyPlans.length,
-        requiredOwners: requestedNaturalRequiredOwnerKeys.length,
-        retainedOwners: requestedNaturalRetainedOwnerKeys.length,
-      });
-      if (pendingRenderDistancePublication) {
-        pendingRenderDistancePublication.requiredNaturalOwnerKeys =
-          requestedNaturalRequiredOwnerKeys;
-        pendingRenderDistancePublication.retainedNaturalOwnerKeys =
-          requestedNaturalRetainedOwnerKeys;
-      } else {
-        appliedStaticNaturalRetainedOwnerKeys = requestedNaturalRetainedOwnerKeys;
-      }
-      const presentedNaturalRetainedOwnerKeys = pendingRenderDistancePublication
-        ? Object.freeze([...new Set([
-          ...appliedStaticNaturalRetainedOwnerKeys,
-          ...requestedNaturalRetainedOwnerKeys,
-        ])])
-        : requestedNaturalRetainedOwnerKeys;
+      const staticNaturalPolicyPlans = latestNaturalCoverageState.policyPlans;
       const naturalStaticStreamCanApply = !naturalStaticStreamSuspended
         && !playerRelocationInProgress;
       if (!naturalStaticStreamActivated && naturalStaticStreamCanApply) {
         activateNaturalStaticStream('first-shadow-plan');
       }
       if (naturalStaticStreamActivated && naturalStaticStreamCanApply) {
-        diagnosticMeasure('static-natural-apply-plan', () => naturalStaticStream.applyPlan({
-          plan: worldStreamingPlan,
-          policyPlans: staticNaturalPolicyPlans,
-        }));
-        recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
+        const coverageNeedsApply = !latestNaturalCoverageState.streamApplied;
+        if (coverageNeedsApply) {
+          diagnosticMeasure('static-natural-apply-plan', () => naturalStaticStream.applyPlan({
+            plan: worldStreamingPlan,
+            policyPlans: staticNaturalPolicyPlans,
+            publicationContext,
+          }));
+          recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
+        } else naturalStaticStream.updatePublicationContext(publicationContext);
         const streamControl = naturalStaticStream.diagnostics();
+        if (coverageNeedsApply) {
+          latestNaturalCoverageState = Object.freeze({
+            ...latestNaturalCoverageState,
+            streamApplied: true,
+            resourceKindEntries: naturalStaticStream.resourceKindEntries(),
+            policyResourceCoverage: resolveNaturalPresentationPolicyCoverage({
+              plan: worldStreamingPlan,
+              policyPlans: staticNaturalPolicyPlans,
+              coverageGeneration: streamControl.coverageGeneration,
+            }),
+          });
+        }
         if (!disablePersistentTreePublication) {
           const readyPages = diagnosticMeasure(
             'static-natural-ready-admission',
@@ -2979,34 +3062,33 @@ export async function bootInfiniteWorldSandbox({
             missingRequiredOwners: streamControl.missingRequiredOwnerCount,
             requestBacklog: streamControl.backlog,
           });
-          distantPresentation.applyStaticNaturalPlan?.({
+          const presentationInput = {
             coverageGeneration: streamControl.coverageGeneration,
             planRevision: streamControl.planRevision,
             planId: worldStreamingPlan.planId,
-            destructionRevision: [...(worldState.featureDamage?.entries?.() ?? [])]
-              .filter(([, value]) => value?.destroyed === true)
-              .map(([stableId]) => stableId)
-              .sort((left, right) => left.localeCompare(right))
-              .join('\n'),
-            quality: distantQuality,
-            renderDistancePreset: distantRenderDistance,
-            renderOrigin: committedChunkState.renderOrigin,
+            destructionRevision,
             playerLogicalX: logicalPlayer.x,
             playerLogicalZ: logicalPlayer.z,
             activeDataKeys: committedChunkState.activeDataKeys,
             renderedKeys: committedChunkState.renderedKeys,
-            retainedOwnerKeys: presentedNaturalRetainedOwnerKeys,
-            resourceKindEntries: naturalStaticStream.resourceKindEntries(),
-            policyResourceCoverage: resolveNaturalPresentationPolicyCoverage({
-              plan: worldStreamingPlan,
-              policyPlans: staticNaturalPolicyPlans,
-              coverageGeneration: streamControl.coverageGeneration,
-            }),
             // Admission is deliberately one owner per animation frame. The
             // presentation coordinator shares one budget across dispose,
             // visibility, compose, upload marking, build, and publication.
             readyPages,
-          });
+          };
+          if (coverageNeedsApply) {
+            distantPresentation.applyStaticNaturalPlan?.({
+              ...presentationInput,
+              quality: distantQuality,
+              renderDistancePreset: distantRenderDistance,
+              renderOrigin: committedChunkState.renderOrigin,
+              retainedOwnerKeys: latestNaturalCoverageState.presentedRetainedOwnerKeys,
+              resourceKindEntries: latestNaturalCoverageState.resourceKindEntries,
+              policyResourceCoverage: latestNaturalCoverageState.policyResourceCoverage,
+            });
+          } else {
+            distantPresentation.advanceStaticNaturalFrame?.(presentationInput);
+          }
         }
       }
       return owner;

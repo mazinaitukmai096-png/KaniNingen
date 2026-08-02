@@ -12,6 +12,7 @@ import { validateWorldStreamingPolicy } from '../src/infinite-world/world-stream
 
 const observation = Object.freeze({
   contentHash: 'settlement-stream:1:0:4',
+  coverageContentHash: 'settlement-coverage:1:0',
   frameSequence: 1,
   presentationRevision: 1,
   renderDistanceRevision: 0,
@@ -78,6 +79,23 @@ test('Settlement shadow parity covers owner, identity, Road, damage, and Current
   assert.equal(comparison.presetBoundaryMatches, true);
   assert.equal(comparison.identityMatches, true);
   assert.equal(comparison.roadLinkageCount, 1);
+  assert.equal(comparison.damageStateCount, 1);
+});
+
+test('damage-only observation revisions retain shared immutable coverage identity', () => {
+  const damaged = Object.freeze({
+    ...observation,
+    contentHash: 'settlement-stream:1:0:5',
+    stateRevision: 5,
+    damageStates: Object.freeze([Object.freeze({
+      stableId: 'building:a', destroyed: true,
+    })]),
+  });
+  const comparison = compareW8BuildingSettlementShadow({
+    plan: planFor(), observation: damaged,
+  });
+  assert.equal(comparison.matches, true);
+  assert.equal(comparison.sharedSnapshotIdentity, true);
   assert.equal(comparison.damageStateCount, 1);
 });
 

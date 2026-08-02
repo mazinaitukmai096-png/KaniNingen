@@ -5957,37 +5957,29 @@ test('persistent Static Natural pages incrementally publish Tree, Bush, Grass, a
   assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
   const bushId = audit.find(object => object.naturalLod.kind === 'bush').identity.stableId;
   destroyed.add(bushId);
-  presentation.applyStaticNaturalPlan({
+  presentation.advanceStaticNaturalFrame({
     coverageGeneration: 1,
-    planRevision: 2,
-    planId: 'static-natural-destruction',
+    planRevision: 1,
+    planId: 'static-natural-all-kinds',
     destructionRevision: bushId,
-    quality: 'high',
-    renderDistancePreset: 'current',
-    renderOrigin: input.renderOrigin,
     playerLogicalX: input.playerLogicalX,
     playerLogicalZ: input.playerLogicalZ,
     activeDataKeys: input.activeDataKeys,
     renderedKeys: input.renderedKeys,
-    retainedOwnerKeys: ['5,0'],
   });
   presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
   assert.equal(presentation.canonicalAuditSnapshot()
     .find(object => object.identity.stableId === bushId).visibleLod, 'destroyed');
   destroyed.clear();
-  presentation.applyStaticNaturalPlan({
+  presentation.advanceStaticNaturalFrame({
     coverageGeneration: 1,
-    planRevision: 3,
-    planId: 'static-natural-retry',
+    planRevision: 1,
+    planId: 'static-natural-all-kinds',
     destructionRevision: 'none',
-    quality: 'high',
-    renderDistancePreset: 'current',
-    renderOrigin: input.renderOrigin,
     playerLogicalX: input.playerLogicalX,
     playerLogicalZ: input.playerLogicalZ,
     activeDataKeys: input.activeDataKeys,
     renderedKeys: input.renderedKeys,
-    retainedOwnerKeys: ['5,0'],
     readyPages: [{
       ownerKey: '5,0', resourceKind: 'canonical', value: chunk,
       readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
@@ -5999,6 +5991,8 @@ test('persistent Static Natural pages incrementally publish Tree, Bush, Grass, a
     'destroyed');
   assert.equal(presentation.snapshot().staticTreeOwnerReuseCount > 0, true);
   assert.equal(presentation.snapshot().staticTreeDuplicatePageQueueCount, 0);
+  assert.equal(presentation.snapshot().staticNaturalCoverageApplyCount, 1);
+  assert.equal(presentation.snapshot().staticNaturalFrameAdvanceCount >= 3, true);
   presentation.dispose();
 });
 

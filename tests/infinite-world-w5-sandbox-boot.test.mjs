@@ -1044,12 +1044,18 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(warmed.presentationDiagnostics.visibleRootRevisions.some(root => (
       root.role === 'persistent-natural' && root.attached
     )));
+    assert.ok(warmed.worldStreaming.counts.coveragePlanReuses > 0,
+      'unchanged boot frames must reuse the immutable World plan');
+    assert.ok(warmed.presentation.staticNaturalCoverageApplyCount
+      < warmed.presentation.staticNaturalFrameAdvanceCount,
+    'ready admission must advance on frames that skip Natural coverage application');
     assert.equal(
       warmed.diagnostics.work['settlement-shadow-observation'].calls.max,
       1,
       'one frame materializes one canonical Settlement snapshot',
     );
-    assert.ok(warmed.diagnostics.work['settlement-shadow-observation'].cacheHits.max >= 2);
+    assert.ok((warmed.diagnostics.work['settlement-shadow-observation'].cacheHits?.max ?? 0) <= 2,
+      'cached World plans must not re-read Settlement policy snapshots every frame');
     assert.ok(warmed.presentation.settlementShadowSnapshotRequestCount >= 3);
     assert.ok(warmed.presentation.settlementShadowSnapshotReuseCount > 0);
     assert.ok(warmed.presentation.settlementShadowSnapshotCount
@@ -1851,7 +1857,8 @@ test('normal play skips detailed runtime snapshots and debug HUD writes while di
       .settlementStreamingSnapshotCache.counts;
     assert.equal(settlementCacheAfterFrame.materialized
       - settlementCacheBeforeFrame.materialized, 1);
-    assert.ok(settlementCacheAfterFrame.reused - settlementCacheBeforeFrame.reused >= 2);
+    assert.equal(settlementCacheAfterFrame.reused - settlementCacheBeforeFrame.reused, 0,
+      'fast-path frames must not re-read Building/Settlement policy snapshots');
     assert.equal(afterFrame.diagnostics.work['settlement-shadow-observation'], undefined,
       'diagnostics-off play must not allocate Settlement diagnostic aggregates');
     await sandbox.shutdown();

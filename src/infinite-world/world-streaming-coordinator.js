@@ -1,4 +1,10 @@
 import { createWorldStreamingPlan } from './world-streaming-plan.js';
+import {
+  NATURAL_COVERAGE_KEY_SCHEMA,
+  WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA,
+  createWorldStreamingPublicationContext,
+  sameNaturalCoverageKey,
+} from './natural-streaming-coverage.js';
 
 export const WORLD_STREAMING_COORDINATOR_MODE = Object.freeze({ SHADOW: 'shadow' });
 const PLAN_DURATION_SAMPLE_CAPACITY = 256;
@@ -87,38 +93,130 @@ export function createWorldStreamingCoordinator({ registry, clock = defaultClock
   }
   if (typeof clock !== 'function') throw new TypeError('Coordinator clock must be a function');
   let sequence = 0;
+  let publicationSequence = 0;
   let latestPlan = null;
+  let latestCoverageKey = null;
+  let latestPublicationContext = null;
   let latestComparison = null;
   let lastPlanDurationMs = 0;
   let maximumPlanDurationMs = 0;
   const planDurationSamples = [];
+  const counts = {
+    coveragePlanBuilds: 0,
+    coveragePlanReuses: 0,
+    coverageInvalidations: 0,
+    coverageBuildFailures: 0,
+    corruptCacheFallbacks: 0,
+    publicationContextUpdates: 0,
+  };
+  const commitPlan = (plan, comparison, durationMs, coverageKey = null) => {
+    sequence = plan.sequence;
+    latestPlan = plan;
+    latestCoverageKey = coverageKey;
+    latestComparison = comparison;
+    lastPlanDurationMs = durationMs;
+    maximumPlanDurationMs = Math.max(maximumPlanDurationMs, lastPlanDurationMs);
+    planDurationSamples.push(lastPlanDurationMs);
+    if (planDurationSamples.length > PLAN_DURATION_SAMPLE_CAPACITY) {
+      planDurationSamples.shift();
+    }
+  };
+  const buildPlan = (input, coverageKey = null) => {
+    const startedAt = clock();
+    const generatedAtMs = input.generatedAtMs ?? startedAt;
+    const candidateSequence = sequence + 1;
+    const plan = createWorldStreamingPlan({
+      ...input,
+      sequence: candidateSequence,
+      generatedAtMs,
+      policies: registry.list(),
+    });
+    const comparison = compareCurrentRequests(plan, input.currentRequests);
+    commitPlan(plan, comparison, Math.max(0, clock() - startedAt), coverageKey);
+    return plan;
+  };
   return Object.freeze({
     mode: WORLD_STREAMING_COORDINATOR_MODE.SHADOW,
     createShadowPlan(input = {}) {
-      const startedAt = clock();
-      const generatedAtMs = input.generatedAtMs ?? startedAt;
-      const plan = createWorldStreamingPlan({
+      return buildPlan(input);
+    },
+    createPublicationContext(input = {}) {
+      const context = createWorldStreamingPublicationContext({
         ...input,
-        sequence: ++sequence,
-        generatedAtMs,
-        policies: registry.list(),
+        sequence: ++publicationSequence,
+        generatedAtMs: input.generatedAtMs ?? clock(),
       });
-      latestPlan = plan;
-      latestComparison = compareCurrentRequests(plan, input.currentRequests);
-      lastPlanDurationMs = Math.max(0, clock() - startedAt);
-      maximumPlanDurationMs = Math.max(maximumPlanDurationMs, lastPlanDurationMs);
-      planDurationSamples.push(lastPlanDurationMs);
-      if (planDurationSamples.length > PLAN_DURATION_SAMPLE_CAPACITY) {
-        planDurationSamples.shift();
+      latestPublicationContext = context;
+      counts.publicationContextUpdates += 1;
+      return context;
+    },
+    resolveCoveragePlan({
+      coverageKey,
+      publicationContext,
+      createPlanInput = null,
+      ...input
+    } = {}) {
+      if (coverageKey?.schemaVersion !== NATURAL_COVERAGE_KEY_SCHEMA) {
+        throw new TypeError(`coverageKey must be ${NATURAL_COVERAGE_KEY_SCHEMA}`);
       }
-      return plan;
+      if (publicationContext?.schemaVersion
+        !== WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA) {
+        throw new TypeError(
+          `publicationContext must be ${WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA}`,
+        );
+      }
+      if (createPlanInput !== null && typeof createPlanInput !== 'function') {
+        throw new TypeError('createPlanInput must be a function when provided');
+      }
+      latestPublicationContext = publicationContext;
+      const cachedPlanValid = latestPlan?.schemaVersion === 'world-streaming-plan-1'
+        && latestCoverageKey?.schemaVersion === NATURAL_COVERAGE_KEY_SCHEMA;
+      if (sameNaturalCoverageKey(latestCoverageKey, coverageKey) && cachedPlanValid) {
+        counts.coveragePlanReuses += 1;
+        return Object.freeze({
+          plan: latestPlan,
+          coverageKey: latestCoverageKey,
+          publicationContext,
+          regenerated: false,
+        });
+      }
+      if (sameNaturalCoverageKey(latestCoverageKey, coverageKey) && !cachedPlanValid) {
+        counts.corruptCacheFallbacks += 1;
+      }
+      try {
+        const planInput = createPlanInput?.() ?? input;
+        const plan = buildPlan({
+          ...planInput,
+          generatedAtMs: publicationContext.generatedAtMs,
+          stateRevision: publicationContext.stateRevision,
+          originGeneration: publicationContext.originGeneration,
+        }, coverageKey);
+        counts.coveragePlanBuilds += 1;
+        return Object.freeze({
+          plan,
+          coverageKey,
+          publicationContext,
+          regenerated: true,
+        });
+      } catch (error) {
+        counts.coverageBuildFailures += 1;
+        throw error;
+      }
+    },
+    invalidateCoverage() {
+      latestCoverageKey = null;
+      counts.coverageInvalidations += 1;
+      return true;
     },
     snapshot() {
       return Object.freeze({
         schemaVersion: 'world-streaming-coordinator-snapshot-1',
         mode: WORLD_STREAMING_COORDINATOR_MODE.SHADOW,
         planCount: sequence,
+        publicationSequence,
         latestPlan,
+        latestCoverageKey,
+        latestPublicationContext,
         latestComparison,
         policyRegistry: registry.snapshot(),
         performance: Object.freeze({
@@ -128,6 +226,7 @@ export function createWorldStreamingCoordinator({ registry, clock = defaultClock
           p95PlanDurationMs: percentile(planDurationSamples, 0.95),
           maximumPlanDurationMs,
         }),
+        counts: Object.freeze({ ...counts }),
         ownership: Object.freeze({
           mesh: false,
           material: false,

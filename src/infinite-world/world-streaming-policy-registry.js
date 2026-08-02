@@ -167,6 +167,8 @@ function assertAcyclicPublicationGroups(policies) {
 export function createWorldStreamingPolicyRegistry() {
   const policies = new Map();
   let frozen = false;
+  let version = 0;
+  let frozenPolicies = null;
   return Object.freeze({
     register(input) {
       if (frozen) throw new Error('World Streaming policy registry is frozen');
@@ -175,11 +177,14 @@ export function createWorldStreamingPolicyRegistry() {
         throw new Error(`duplicate World Streaming policy: ${policy.kind}`);
       }
       policies.set(policy.kind, policy);
+      version += 1;
       return policy;
     },
     freeze() {
       if (!frozen) {
         assertAcyclicPublicationGroups([...policies.values()]);
+        frozenPolicies = Object.freeze([...policies.values()]
+          .sort((left, right) => left.kind.localeCompare(right.kind)));
         frozen = true;
       }
       return this;
@@ -188,17 +193,19 @@ export function createWorldStreamingPolicyRegistry() {
       return policies.get(kind) ?? null;
     },
     list() {
-      return Object.freeze([...policies.values()]
+      return frozenPolicies ?? Object.freeze([...policies.values()]
         .sort((left, right) => left.kind.localeCompare(right.kind)));
     },
     snapshot() {
       return Object.freeze({
         schemaVersion: 'world-streaming-policy-registry-snapshot-1',
         frozen,
+        version,
         policyCount: policies.size,
         policyKinds: Object.freeze([...policies.keys()].sort()),
       });
     },
     get frozen() { return frozen; },
+    get version() { return version; },
   });
 }

@@ -718,6 +718,10 @@ test('ready, queue, ticket, and Worker bounds are explicit and enforced', () => 
   assert.equal(snapshot.readyCacheCapacity, 2);
   assert.equal(snapshot.ticketCapacity, 2);
   assert.equal(snapshot.counts.queueOverflows, 1);
+  assert.equal(snapshot.backlog, 0);
+  assert.equal(snapshot.ticketCount, 0);
+  assert.equal(snapshot.coverageGeneration, 0,
+    'capacity failure must not publish a partial coverage generation');
 });
 
 test('the shared Static Object Stream contains no Tree-specific scheduling branch', async () => {

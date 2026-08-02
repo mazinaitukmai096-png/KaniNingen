@@ -4447,6 +4447,7 @@ export async function createW8DistantPresentation({
   const persistentTreePublishedOwners = new Set();
   const persistentTreeDisposeOwners = [];
   const persistentTreeDesiredResourceKinds = new Map();
+  let persistentTreeRetainedOwnerKeys = new Set();
   let persistentTreeBuildActive = false;
   let persistentTreeBuildQueuedCount = 0;
   let persistentTreeBuildTail = Promise.resolve();
@@ -4484,6 +4485,8 @@ export async function createW8DistantPresentation({
   let persistentTreeAdmissionLimitViolationCount = 0;
   let persistentTreeCompactionMoveCount = 0;
   let persistentTreeVisibilityMatrixInvalidationCount = 0;
+  let persistentNaturalCoverageApplyCount = 0;
+  let persistentNaturalFrameAdvanceCount = 0;
   let pendingRuntimePresentationHandoff = null;
   let runtimePresentationHandoffSequence = 0;
   let runtimePresentationHandoffRequestedCount = 0;
@@ -4532,6 +4535,8 @@ export async function createW8DistantPresentation({
       canonicalObjects: new Map(),
       activeKeys: new Set(),
       renderedKeys: new Set(),
+      activeDataKeysIdentity: null,
+      renderedKeysIdentity: null,
       quality,
       renderDistancePreset,
       renderDistancePolicy: resolveW8RenderDistancePolicy(renderDistancePreset),
@@ -4645,6 +4650,82 @@ export async function createW8DistantPresentation({
         generation.naturalKindsByOwner.get(ownerKey).add(entry.naturalKind);
       }
     }
+  };
+
+  const advancePersistentNaturalFrame = ({
+    coverageGeneration,
+    planRevision,
+    planId,
+    destructionRevision = null,
+    playerLogicalX,
+    playerLogicalZ,
+    activeDataKeys = [],
+    renderedKeys = [],
+    readyPages = [],
+  } = {}) => {
+    if (!persistentTreeGeneration || disposed
+      || coverageGeneration !== persistentTreeCoverageGeneration
+      || planRevision !== persistentTreePlanRevision
+      || planId !== persistentTreePlanId) return false;
+    if (persistentTreeStateRevision !== destructionRevision) {
+      persistentTreeVisibilityDirty = true;
+    }
+    persistentTreeStateRevision = destructionRevision;
+    persistentTreeGeneration.playerX = playerLogicalX;
+    persistentTreeGeneration.playerZ = playerLogicalZ;
+    if (persistentTreeGeneration.activeDataKeysIdentity !== activeDataKeys) {
+      persistentTreeGeneration.activeDataKeysIdentity = activeDataKeys;
+      persistentTreeGeneration.activeKeys = new Set(activeDataKeys);
+    }
+    if (persistentTreeGeneration.renderedKeysIdentity !== renderedKeys) {
+      persistentTreeGeneration.renderedKeysIdentity = renderedKeys;
+      persistentTreeGeneration.renderedKeys = new Set(renderedKeys);
+    }
+    const retained = persistentTreeRetainedOwnerKeys;
+    for (const page of readyPages) {
+      if (!retained.has(page.ownerKey)) continue;
+      const desiredResourceKind = persistentTreeDesiredResourceKinds.get(page.ownerKey);
+      if (desiredResourceKind && desiredResourceKind !== page.resourceKind) {
+        persistentTreeStalePageDiscardCount += 1;
+        continue;
+      }
+      persistentTreeAdmissionsSinceFrame += 1;
+      if (Number.isSafeInteger(page.coverageGeneration)
+        && page.coverageGeneration < coverageGeneration) {
+        persistentTreeOlderCoveragePageCount += 1;
+      }
+      const existing = persistentTreePages.get(page.ownerKey);
+      if (existing?.resourceKind === page.resourceKind
+        && existing.contentHash === (page.value?.contentHash ?? null)) {
+        persistentTreeOwnerReuseCount += 1;
+        if (persistentTreePublishedOwners.has(page.ownerKey)) {
+          publishStaticOwnerTickets?.({
+            ownerKeys: Object.freeze([page.ownerKey]),
+            publicationGroup: 'natural-static',
+            coverageGeneration,
+            planRevision,
+          });
+        } else {
+          pendingPersistentTreePublications.set(page.ownerKey, {
+            page: Object.freeze({ ...page, planId, coverageGeneration, planRevision }),
+            stableIds: existing.stableIds,
+          });
+        }
+        continue;
+      }
+      if (existing) persistentTreeOwnerRebuildCount += 1;
+      if (pendingPersistentTreePages.has(page.ownerKey)) {
+        persistentTreeDuplicatePageQueueCount += 1;
+      }
+      pendingPersistentTreePages.set(page.ownerKey, Object.freeze({
+        ...page,
+        planId,
+        coverageGeneration,
+        planRevision,
+      }));
+    }
+    persistentNaturalFrameAdvanceCount += 1;
+    return true;
   };
 
   const naturalKindFilterForPage = (generation, page) => {
@@ -8179,25 +8260,19 @@ export async function createW8DistantPresentation({
         persistentTreePublishedOwners.clear();
         persistentTreeDisposeOwners.length = 0;
         persistentTreeDesiredResourceKinds.clear();
+        persistentTreeRetainedOwnerKeys = new Set();
         persistentTreeVisibilityDirty = true;
         persistentTreeRootResetCount += 1;
-      }
-      if (persistentTreeStateRevision !== destructionRevision) {
-        persistentTreeVisibilityDirty = true;
       }
       persistentTreeCoverageGeneration = coverageGeneration;
       persistentTreePlanRevision = planRevision;
       persistentTreePlanId = planId;
-      persistentTreeStateRevision = destructionRevision;
-      persistentTreeGeneration.playerX = playerLogicalX;
-      persistentTreeGeneration.playerZ = playerLogicalZ;
-      persistentTreeGeneration.activeKeys = new Set(activeDataKeys);
-      persistentTreeGeneration.renderedKeys = new Set(renderedKeys);
       applyPersistentNaturalPolicyCoverage(
         persistentTreeGeneration,
         policyResourceCoverage,
       );
       const retained = new Set(retainedOwnerKeys);
+      persistentTreeRetainedOwnerKeys = retained;
       persistentTreeDesiredResourceKinds.clear();
       for (const entry of resourceKindEntries) {
         if (!Array.isArray(entry) || entry.length !== 2 || !retained.has(entry[0])) continue;
@@ -8223,52 +8298,44 @@ export async function createW8DistantPresentation({
           persistentTreeStalePageDiscardCount += 1;
         }
       }
-      for (const page of readyPages) {
-        if (!retained.has(page.ownerKey)) continue;
-        const desiredResourceKind = persistentTreeDesiredResourceKinds.get(page.ownerKey);
-        if (desiredResourceKind && desiredResourceKind !== page.resourceKind) {
-          persistentTreeStalePageDiscardCount += 1;
-          continue;
-        }
-        persistentTreeAdmissionsSinceFrame += 1;
-        if (Number.isSafeInteger(page.coverageGeneration)
-          && page.coverageGeneration < coverageGeneration) {
-          persistentTreeOlderCoveragePageCount += 1;
-        }
-        const existing = persistentTreePages.get(page.ownerKey);
-        if (existing?.resourceKind === page.resourceKind
-          && existing.contentHash === (page.value?.contentHash ?? null)) {
-          persistentTreeOwnerReuseCount += 1;
-          if (persistentTreePublishedOwners.has(page.ownerKey)) {
-            publishStaticOwnerTickets?.({
-              ownerKeys: Object.freeze([page.ownerKey]),
-              publicationGroup: 'natural-static',
-              coverageGeneration,
-              planRevision,
-            });
-          } else {
-            pendingPersistentTreePublications.set(page.ownerKey, {
-              page: Object.freeze({ ...page, planId, coverageGeneration, planRevision }),
-              stableIds: existing.stableIds,
-            });
-          }
-          continue;
-        }
-        if (existing) persistentTreeOwnerRebuildCount += 1;
-        if (pendingPersistentTreePages.has(page.ownerKey)) {
-          persistentTreeDuplicatePageQueueCount += 1;
-        }
-        pendingPersistentTreePages.set(page.ownerKey, Object.freeze({
-          ...page,
-          planId,
-          coverageGeneration,
-          planRevision,
-        }));
-      }
-      return true;
+      persistentNaturalCoverageApplyCount += 1;
+      return advancePersistentNaturalFrame({
+        coverageGeneration,
+        planRevision,
+        planId,
+        destructionRevision,
+        playerLogicalX,
+        playerLogicalZ,
+        activeDataKeys,
+        renderedKeys,
+        readyPages,
+      });
     },
     applyStaticNaturalPlan(options) {
       return this.applyStaticTreePlan(options);
+    },
+    advanceStaticNaturalFrame(options) {
+      return advancePersistentNaturalFrame(options);
+    },
+    releaseStaticNaturalRetainedOwners(ownerKeys = []) {
+      if (!persistentTreeGeneration || !Array.isArray(ownerKeys)) return false;
+      const retained = new Set(ownerKeys);
+      persistentTreeRetainedOwnerKeys = retained;
+      for (const ownerKey of persistentTreeDesiredResourceKinds.keys()) {
+        if (!retained.has(ownerKey)) persistentTreeDesiredResourceKinds.delete(ownerKey);
+      }
+      for (const ownerKey of persistentTreePages.keys()) {
+        if (!retained.has(ownerKey) && !persistentTreeDisposeOwners.includes(ownerKey)) {
+          persistentTreeDisposeOwners.push(ownerKey);
+        }
+      }
+      for (const ownerKey of pendingPersistentTreePages.keys()) {
+        if (!retained.has(ownerKey)) {
+          pendingPersistentTreePages.delete(ownerKey);
+          persistentTreeStalePageDiscardCount += 1;
+        }
+      }
+      return true;
     },
     commitRuntimeState(state) {
       if (disposed) return false;
@@ -8412,25 +8479,29 @@ export async function createW8DistantPresentation({
           (count, linkage) => count + Number(!settlementIdSet.has(linkage.settlementId)),
           0,
         );
-        let snapshotHash = appendSettlementSnapshotHash(0x811c9dc5, generation.epoch);
-        snapshotHash = appendSettlementSnapshotHash(snapshotHash, generation.renderDistancePreset);
+        let coverageHash = appendSettlementSnapshotHash(0x811c9dc5, generation.epoch);
+        coverageHash = appendSettlementSnapshotHash(
+          coverageHash,
+          generation.renderDistancePreset,
+        );
         for (const ownerKey of buildingOwnerKeys) {
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, ownerKey);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, ownerKey);
         }
         for (const ownerKey of settlementOwnerKeys) {
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, ownerKey);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, ownerKey);
         }
         for (const stableId of stableIds) {
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, stableId);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, stableId);
         }
         for (const settlementId of settlementIds) {
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, settlementId);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, settlementId);
         }
         for (const linkage of roadLinkages) {
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.stableId);
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.settlementId);
-          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.ownerKey);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, linkage.stableId);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, linkage.settlementId);
+          coverageHash = appendSettlementSnapshotHash(coverageHash, linkage.ownerKey);
         }
+        let snapshotHash = coverageHash;
         for (const damageState of damageStates) {
           snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.stableId);
           snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.destroyed ? 1 : 0);
@@ -8451,6 +8522,8 @@ export async function createW8DistantPresentation({
         return Object.freeze({
           schemaVersion: 'legacy-building-settlement-observation-1',
           contentHash: `settlement-stream:${snapshotHash.toString(16).padStart(8, '0')}`,
+          coverageContentHash:
+            `settlement-coverage:${coverageHash.toString(16).padStart(8, '0')}`,
           frameSequence,
           presentationRevision: generation.epoch,
           renderDistanceRevision,
@@ -8709,6 +8782,8 @@ export async function createW8DistantPresentation({
         incrementalStaticNaturalPages: incrementalStaticTreePages,
         staticNaturalCoverageGeneration: persistentTreeCoverageGeneration,
         staticNaturalPlanRevision: persistentTreePlanRevision,
+        staticNaturalCoverageApplyCount: persistentNaturalCoverageApplyCount,
+        staticNaturalFrameAdvanceCount: persistentNaturalFrameAdvanceCount,
         staticNaturalCurrentPublishedOwnerCount: persistentTreePublishedOwners.size,
         staticNaturalResidentOwnerCount: persistentTreePages.size,
         staticNaturalPendingOwnerCount: pendingPersistentTreePages.size
@@ -9301,6 +9376,7 @@ export async function createW8DistantPresentation({
       pendingPersistentTreePublications.clear();
       persistentTreePublishedOwners.clear();
       persistentTreePages.clear();
+      persistentTreeRetainedOwnerKeys.clear();
       pendingStaticTreeFirstDraw.length = 0;
       pendingRuntimePresentationHandoff = null;
       while (deferredGenerationDisposals.length) {
