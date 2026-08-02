@@ -52,6 +52,9 @@ import {
   WORLD_STREAMING_TARGET,
   createWorldStreamingTelemetry,
 } from '../src/infinite-world/world-streaming-telemetry.js';
+import {
+  evaluateNodeStreamingBenchmark,
+} from './infinite-world-streaming-performance-benchmark-helper.mjs';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
@@ -5418,7 +5421,32 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   assert.equal(new Set(publishedOwners).size, ownerCount + ownerCount / 2);
   assert.equal(lifecycleSnapshot.lifecycles.every(value => value.firstDrawAtMs !== null), true);
   assert.equal(snapshot.staticTreeFrameSamples.length <= snapshot.staticTreeFrameSampleCapacity, true);
+  const nodeBenchmark = evaluateNodeStreamingBenchmark({
+    requiredOwnerMissingCount: lifecycleSnapshot.lifecycles.filter(value => (
+      value.firstDrawAtMs === null
+    )).length,
+    duplicateQueueCount: snapshot.staticTreeDuplicatePageQueueCount,
+    stalePublicationCount: snapshot.staticTreeStalePageDiscardCount,
+    orphanResourceCount: snapshot.staticNaturalOrphanObjectCount
+      + snapshot.staticNaturalOrphanSlotCount,
+    admissionMaximumPerFrame: snapshot.staticTreeMaximumAdmissionsPerFrame,
+    configuredAdmissionLimit: snapshot.staticTreeOwnerAdmissionLimit,
+    observedWork: {
+      matrixUpdates: accelerated.matrixUpdateCount,
+      bufferUpdates: accelerated.bufferUpdateCount,
+      uploadBytes: accelerated.bufferUploadBytes,
+      allocations: accelerated.allocatedObjects + accelerated.allocatedInstances
+        + accelerated.allocatedBuckets,
+      compactionMoves: accelerated.compactionMoveCount,
+    },
+  });
+  assert.equal(nodeBenchmark.deterministicPass, true);
+  assert.equal(nodeBenchmark.admissionLimitChangeRequired, false);
+  assert.equal(nodeBenchmark.productionBudgetChangeRequired, false);
+  assert.equal(nodeBenchmark.configuredAdmissionLimit, 1);
+  assert.equal(nodeBenchmark.browserFrameGate, 'pending');
   t.diagnostic(JSON.stringify({
+    acceptance: nodeBenchmark,
     moving: { frames: 24, ...movingState, work: moving },
     stopped: { frames: stopFrames, ...stoppedState, work: stopped },
     reaccelerated: {
