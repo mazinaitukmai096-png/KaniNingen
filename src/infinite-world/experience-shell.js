@@ -188,6 +188,12 @@ export function createInfiniteExperienceShell({
     if (hadCharge) onChargeEnd();
   }
 
+  function resetPlayerInputState() {
+    state.jumpHeld = false;
+    resetAttackInputState();
+    input?.clearPressedKeys?.();
+  }
+
   function syncShellVisibility() {
     body?.classList?.toggle('experience-ready', true);
     body?.classList?.toggle('hud-hidden', state.hudHidden);
@@ -299,7 +305,7 @@ export function createInfiniteExperienceShell({
     state.paused = state.mode === 'playing';
     state.settingsOpen = settingsOpen;
     state.debugOpen = debugOpen;
-    resetAttackInputState();
+    resetPlayerInputState();
     state.camera.shake = 0;
     leaveLock();
     syncShellVisibility();
@@ -314,6 +320,7 @@ export function createInfiniteExperienceShell({
     state.camera.chargeZoom = 0;
   }
   function enterRun(startMode, runConfiguration = {}) {
+    resetPlayerInputState();
     state.mode = 'playing';
     state.runPhase = 'intro';
     state.runStartMode = startMode;
@@ -361,7 +368,7 @@ export function createInfiniteExperienceShell({
   async function returnTitle() {
     state.mode = 'menu'; state.runPhase = 'menu'; state.paused = true;
     state.settingsOpen = false; state.debugOpen = false;
-    resetAttackInputState();
+    resetPlayerInputState();
     leaveLock(); syncShellVisibility();
     await onReturnTitle();
   }
@@ -373,6 +380,7 @@ export function createInfiniteExperienceShell({
     state.gameplayTimeMs = 0;
     state.deathStartedAtMs = null;
     state.paused = false;
+    resetPlayerInputState();
     resetPlayerVerticalMovement();
     resetFiniteGameplayStartCamera(
       runConfiguration && typeof runConfiguration === 'object' ? runConfiguration : {},
@@ -578,6 +586,10 @@ export function createInfiniteExperienceShell({
       }
     },
     onPointerLockChange: handlePointerLockChange,
+    onBlur() {
+      state.jumpHeld = false;
+      resetAttackInputState();
+    },
   });
 
   function handlePointerLockChange() {
@@ -588,8 +600,6 @@ export function createInfiniteExperienceShell({
   if (documentObject && documentObject !== globalObject) {
     listen(documentObject, 'pointerlockchange', handlePointerLockChange);
   }
-  listen(globalObject, 'blur', resetAttackInputState);
-
   function updatePlayer({ deltaSeconds, player, scaleProfile, movementMultiplier = 1 }) {
     const previousStageId = state.lastScaleProfile?.stage?.id;
     state.lastPlayer = player;

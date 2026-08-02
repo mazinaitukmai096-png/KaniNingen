@@ -10,9 +10,14 @@ export function createInputController({
   onMouseDown = NOOP,
   onMouseUp = NOOP,
   onPointerLockChange = NOOP,
+  onBlur = NOOP,
 } = {}) {
   const keys = Object.create(null);
   let disposed = false;
+
+  function clearPressedKeys() {
+    for (const code of Object.keys(keys)) delete keys[code];
+  }
 
   const inputSnapshot = Object.freeze({
     isPressed(code) {
@@ -44,6 +49,10 @@ export function createInputController({
     pointerlockchange(event) {
       onPointerLockChange(event);
     },
+    blur(event) {
+      clearPressedKeys();
+      onBlur(event);
+    },
     contextmenu(event) {
       event.preventDefault();
     },
@@ -57,11 +66,13 @@ export function createInputController({
   documentTarget.addEventListener('mouseup', handlers.mouseup);
   documentTarget.addEventListener('pointerlockchange', handlers.pointerlockchange);
   windowTarget.addEventListener('contextmenu', handlers.contextmenu);
+  windowTarget.addEventListener('blur', handlers.blur);
 
   return Object.freeze({
     getInputSnapshot() {
       return inputSnapshot;
     },
+    clearPressedKeys,
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -74,8 +85,9 @@ export function createInputController({
       documentTarget.removeEventListener('mouseup', handlers.mouseup);
       documentTarget.removeEventListener('pointerlockchange', handlers.pointerlockchange);
       windowTarget.removeEventListener('contextmenu', handlers.contextmenu);
+      windowTarget.removeEventListener('blur', handlers.blur);
 
-      for (const code of Object.keys(keys)) delete keys[code];
+      clearPressedKeys();
     },
   });
 }

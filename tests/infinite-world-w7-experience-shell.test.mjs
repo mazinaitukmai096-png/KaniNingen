@@ -398,6 +398,26 @@ test('Boss Acid movement multiplier scales normal and sprint movement without ch
   fixture.shell.dispose();
 });
 
+test('window blur clears movement, sprint, and held jump before input resumes', () => {
+  const fixture = createFixture();
+  fixture.elements.get('start-button').dispatch('click');
+  const profile = getW6ScaleProfile('MAX');
+  const player = finishIntro(fixture, { x: 0, z: 0, facingY: 0 }, profile);
+
+  fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
+  fixture.globalObject.dispatch('keydown', { code: 'ShiftLeft' });
+  fixture.globalObject.dispatch('keydown', { code: 'Space' });
+  fixture.globalObject.dispatch('blur');
+
+  const before = { x: player.x, z: player.z };
+  const result = fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
+  assert.deepEqual({ x: player.x, z: player.z }, before);
+  assert.equal(result.movement.speedMetersPerSecond, 0);
+  assert.equal(result.movement.sprint, false);
+
+  fixture.shell.dispose();
+});
+
 test('finite Scale movement ratios remain 0.5, 0.75, and 1 while Shift sprint remains 1.45', () => {
   for (const [stageId, ratio] of [['TINY', 0.5], ['MID', 0.75], ['MAX', 1]]) {
     const fixture = createFixture();

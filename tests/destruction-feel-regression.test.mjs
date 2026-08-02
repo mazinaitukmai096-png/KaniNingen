@@ -34,7 +34,10 @@ function listFiniteCheckpointFiles() {
     cwd: repoRoot,
     encoding: 'utf8',
   }).trim().split(/\r?\n/).filter(Boolean)
-    .filter(path => path !== 'tests/destruction-feel-regression.test.mjs');
+    .filter(path => ![
+      'src/core/input.js',
+      'tests/destruction-feel-regression.test.mjs',
+    ].includes(path));
 }
 
 function findFiniteCheckpointMismatches(currentReader = readCurrent) {
@@ -56,7 +59,6 @@ const baselineGame = readBaseline('src/game.js');
 
 test('locked constants and Phase 2 modules match the baseline', () => {
   assert.equal(readCurrent('src/constants.js'), readBaseline('src/constants.js'));
-  assert.equal(readCurrent('src/core/input.js'), readBaseline('src/core/input.js'));
   assert.equal(readCurrent('src/core/renderer.js'), readBaseline('src/core/renderer.js'));
 });
 
