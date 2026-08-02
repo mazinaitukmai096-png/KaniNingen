@@ -703,6 +703,12 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.boot.loopStarted, true);
     assert.equal(snapshot.treePathAudit.treeStaticStreamActivated, true);
     assert.equal(snapshot.staticObjectStreaming.counts.plans > 0, true);
+    assert.deepEqual(new Set(snapshot.staticObjectStreaming.policyKinds), new Set([
+      'natural-tree',
+      'natural-bush',
+      'natural-grass',
+      'natural-rock',
+    ]));
     assert.equal(
       snapshot.treePathAudit.activationTimeline.activationSource,
       'first-shadow-plan',
@@ -898,6 +904,20 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         + snapshot.presentation.remoteHorizonSyntheticBuildingCount
         + snapshot.presentation.remoteHorizonSyntheticLandmarkCount,
       snapshot.presentation.canonicalRecordCount,
+      JSON.stringify({
+        building: snapshot.presentation.canonicalBuildingRecordCount,
+        vegetation: snapshot.presentation.canonicalVegetationRecordCount,
+        rock: snapshot.presentation.canonicalRockRecordCount,
+        landmark: snapshot.presentation.canonicalLandmarkRecordCount,
+        road: snapshot.presentation.canonicalRoadRecordCount,
+        detail: snapshot.presentation.canonicalWorldDetailRecordCount,
+        remoteBuilding: snapshot.presentation.remoteHorizonSyntheticBuildingCount,
+        remoteLandmark: snapshot.presentation.remoteHorizonSyntheticLandmarkCount,
+        total: snapshot.presentation.canonicalRecordCount,
+        activeNatural: snapshot.presentation.staticNaturalActiveLegacyRecordCount,
+        persistentNatural: snapshot.presentation.staticNaturalPersistentRecordCount,
+        overlappingNatural: snapshot.presentation.staticNaturalOverlappingStableIdCount,
+      }),
     );
     assert.ok(snapshot.presentation.canonicalWorldDetailRecordCount >= 0);
     assert.ok(snapshot.presentation.canonicalFarObjectCount >= 0);
@@ -910,6 +930,13 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         + snapshot.presentation.canonicalHiddenObjectCount
         + snapshot.presentation.canonicalDestroyedObjectCount,
       snapshot.presentation.canonicalRecordCount,
+      JSON.stringify({
+        activeNatural: snapshot.presentation.staticNaturalActiveLegacyRecordCount,
+        persistentNatural: snapshot.presentation.staticNaturalPersistentRecordCount,
+        overlappingNatural: snapshot.presentation.staticNaturalOverlappingStableIdCount,
+        river: snapshot.presentation.canonicalRiverRecordCount,
+        activeRiver: snapshot.presentation.canonicalActiveRiverRecordCount,
+      }),
     );
     assert.equal(
       snapshot.presentation.queryTemplateSuccessCount,
@@ -1015,20 +1042,11 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(warmed.presentation.distantTreeProxyCount, 0);
     assert.equal(warmed.treePathAudit.treeStaticStreamActivated, true);
     assert.equal(warmed.staticObjectStreaming.counts.plans > 0, true);
-    assert.equal(
-      warmed.treePathAudit.activationTimeline.staticStreamActivatedAtMs
-        < warmed.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs,
-      true,
-    );
-    assert.equal(warmed.treePathAudit.distant.some(path => (
-      path.pathId === 'distant-static-tree'
-        && path.rootCount === 1
-        && path.planIds.length > 0
-    )), true);
     let firstDraw = warmed;
     let activationDiagnosticFrameCount = 0;
     for (let attempt = 0; attempt < 100
-      && firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs === null;
+      && (firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs === null
+        || firstDraw.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs === null);
       attempt += 1) {
       environment.rafCallbacks.at(-1)(performance.now() + 120 + attempt);
       activationDiagnosticFrameCount += 1;
@@ -1045,6 +1063,17 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       null,
     );
     assert.notEqual(firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs, null);
+    assert.equal(
+      firstDraw.treePathAudit.activationTimeline.staticStreamActivatedAtMs
+        < firstDraw.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs,
+      true,
+      JSON.stringify(firstDraw.treePathAudit.activationTimeline),
+    );
+    assert.equal(firstDraw.treePathAudit.distant.some(path => (
+      path.pathId === 'distant-static-tree'
+        && path.rootCount === 1
+        && path.planIds.length > 0
+    )), true);
     assert.equal(
       firstDraw.treePathAudit.activationTimeline.outerWarmCompletedAtMs === null
         || firstDraw.treePathAudit.activationTimeline.firstPersistentTreePublishAtMs

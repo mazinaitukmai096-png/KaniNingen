@@ -12,6 +12,14 @@ import {
   createW8ForestHorizonOwnerPredicate,
   isW8ForestHorizonOwner,
 } from '../src/infinite-world/forest-horizon-owner-policy.js';
+import {
+  W8_RENDER_DISTANCE_PRESETS,
+  resolveW8RenderDistancePolicy,
+} from '../src/infinite-world/render-distance-policy.js';
+import {
+  W8_VEGETATION_LOD_KINDS,
+  resolveW8VegetationLodPolicy,
+} from '../src/infinite-world/vegetation-lod-policy.js';
 
 const POLICY_KIND = 'test-static-object';
 
@@ -91,6 +99,66 @@ test('a high-speed turn replaces the prefetched corridor while retaining current
   assert.ok(north.prefetchedOwnerKeys.some(key => Number(key.split(',')[1]) < -1));
 });
 
+test('Current stationary and MAX corridors remain inside policy-derived owner capacity', () => {
+  const worldSeedHash = 'static-natural-capacity-policy';
+  const horizonPredicate = createW8ForestHorizonOwnerPredicate(worldSeedHash);
+  const runtimes = Object.values(W8_VEGETATION_LOD_KINDS).map(kind => (
+    createCircularStaticStreamingPolicy({
+      kind: `natural-${kind}`,
+      publicationGroup: 'natural-static',
+      maximumRequiredDistanceMeters: Math.max(
+        ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(preset => (
+          kind === W8_VEGETATION_LOD_KINDS.TREE
+            ? resolveW8RenderDistancePolicy(preset).fogFarMeters
+            : resolveW8VegetationLodPolicy(kind, preset).visibilityMeters
+        )),
+      ),
+      distanceProfileResolver: preset => ({
+        exactDistanceMeters: resolveW8VegetationLodPolicy(kind, preset).visibilityMeters,
+        horizonDistanceMeters: kind === W8_VEGETATION_LOD_KINDS.TREE
+          ? resolveW8RenderDistancePolicy(preset).fogFarMeters : null,
+      }),
+      horizonOwnerPredicate: coordinates => kind === W8_VEGETATION_LOD_KINDS.TREE
+        && horizonPredicate(coordinates),
+      horizonOwnerDensity: kind === W8_VEGETATION_LOD_KINDS.TREE ? 4 : 1,
+    })
+  ));
+  const registry = createWorldStreamingPolicyRegistry();
+  for (const runtime of runtimes) registry.register(runtime.policy);
+  registry.freeze();
+  const coordinator = createWorldStreamingCoordinator({ registry, clock: () => 1_000 });
+  for (const velocity of [{ x: 0, z: 0 }, { x: 10_000, z: 0 }]) {
+    const plan = coordinator.createShadowPlan({
+      player: { x: 549.75, z: 431.25 },
+      velocity,
+      renderDistancePreset: 'current',
+      stateRevision: 0,
+      originGeneration: 0,
+    });
+    for (const runtime of runtimes) {
+      const policyPlan = plan.policyPlans.find(value => value.kind === runtime.policy.kind);
+      const classified = policyPlan.allOwnerKeys.map(ownerKey => runtime.classifyOwner({
+        ownerKey,
+        plan,
+        policyPlan,
+      }));
+      const capacity = runtime.maximumCoverage('current');
+      assert.equal(
+        classified.filter(kind => kind === 'canonical').length
+          <= capacity.maximumCanonicalOwnerCount,
+        true,
+      );
+      if (runtime.policy.kind === 'natural-tree') {
+        assert.equal(
+          classified.filter(kind => kind === 'manifest').length
+            <= capacity.maximumManifestOwnerCount,
+          true,
+        );
+      }
+    }
+  }
+});
+
 test('owner data is requested once and reused by the renderer provider', async () => {
   const runtime = createPolicyRuntime({ horizon: false });
   const plan = createPlanner(runtime.policy)({ velocity: { x: 16, z: 0 } });
@@ -119,6 +187,56 @@ test('owner data is requested once and reused by the renderer provider', async (
   assert.ok(requests.some(request => request.required && request.priority === 3));
   assert.ok(requests.some(request => !request.required && request.priority === 5));
   assert.ok(stream.snapshot().counts.readyHits >= 1);
+  await stream.dispose();
+});
+
+test('one Static Object Stream merges registered object policies and requests each owner once', async () => {
+  const createObjectPolicy = (kind, exactDistanceMeters) => createCircularStaticStreamingPolicy({
+    kind,
+    publicationGroup: 'shared-natural-static',
+    maximumRequiredDistanceMeters: exactDistanceMeters,
+    distanceProfileResolver: () => Object.freeze({
+      exactDistanceMeters,
+      horizonDistanceMeters: null,
+    }),
+  });
+  const first = createObjectPolicy('test-static-first', 16);
+  const second = createObjectPolicy('test-static-second', 48);
+  const registry = createWorldStreamingPolicyRegistry();
+  registry.register(first.policy);
+  registry.register(second.policy);
+  registry.freeze();
+  const coordinator = createWorldStreamingCoordinator({ registry, clock: () => 2_000 });
+  const plan = coordinator.createShadowPlan({
+    player: { x: 8, z: 8 },
+    velocity: { x: 32, z: 0 },
+    renderDistancePreset: 'current',
+  });
+  const plans = plan.policyPlans.filter(value => value.publicationGroup === 'shared-natural-static');
+  const requests = [];
+  const stream = createStaticObjectStream({
+    policyKind: first.policy.kind,
+    policyKinds: [first.policy.kind, second.policy.kind],
+    classifyOwner: () => 'canonical',
+    requestOwner: request => {
+      requests.push(request);
+      return Promise.resolve(Object.freeze({ ownerKey: request.ownerKey }));
+    },
+  });
+
+  stream.applyPlan({ plan, policyPlans: plans });
+  await waitFor(() => stream.snapshot().backlog === 0, 'merged owner requests did not settle');
+  const expectedOwners = new Set(plans.flatMap(value => value.requestOwnerKeys));
+  assert.equal(requests.length, expectedOwners.size);
+  assert.equal(new Set(requests.map(value => value.ownerKey)).size, requests.length);
+  assert.deepEqual(stream.snapshot().policyKinds,
+    [first.policy.kind, second.policy.kind]);
+  assert.deepEqual(stream.snapshot().policyCoverage.map(value => value.kind),
+    [first.policy.kind, second.policy.kind]);
+  assert.equal(stream.snapshot().requiredOwnerCount,
+    new Set(plans.flatMap(value => value.requiredOwnerKeys)).size);
+  assert.equal(stream.snapshot().prefetchedOwnerCount > 0, true);
+  assert.equal(stream.snapshot().retainedOwnerCount >= stream.snapshot().requiredOwnerCount, true);
   await stream.dispose();
 });
 
@@ -230,6 +348,105 @@ test('late in-flight completion outside stable coverage is cached but not publis
   assert.equal(stream.snapshot().counts.readyHits > 0, true);
   assert.equal(stream.drainReadyOwnerPages({ limit: 32 })
     .some(page => page.ownerKey === staleOwner), true);
+  await stream.dispose();
+});
+
+test('manifest to canonical coverage rejects queued and late obsolete resource pages', async () => {
+  const ownerKey = '0,0';
+  const deferred = new Map();
+  const makePlan = (stateRevision, resourceKind) => Object.freeze({
+    schemaVersion: 'world-streaming-plan-1',
+    planId: `resource-plan-${stateRevision}`,
+    renderDistancePreset: 'current',
+    stateRevision,
+    originGeneration: 0,
+    player: Object.freeze({ x: 0, z: 0 }),
+    velocityCorridor: Object.freeze({ endpoint: Object.freeze({ x: 0, z: 0 }) }),
+    resourceKind,
+  });
+  const makePolicyPlan = plan => Object.freeze({
+    kind: POLICY_KIND,
+    publicationGroup: 'test-static-publication',
+    requiredOwnerKeys: Object.freeze([ownerKey]),
+    prefetchedOwnerKeys: Object.freeze([]),
+    retainedOwnerKeys: Object.freeze([ownerKey]),
+    requestOwnerKeys: Object.freeze([ownerKey]),
+    allOwnerKeys: Object.freeze([ownerKey]),
+    velocityCorridor: plan.velocityCorridor,
+    deadline: Object.freeze({ requiredAtMs: 1_000, prefetchedAtMs: 2_000 }),
+  });
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: ({ plan }) => plan.resourceKind,
+    maximumConcurrentRequests: 1,
+    requestOwner: request => {
+      let resolve;
+      const promise = new Promise(nextResolve => { resolve = nextResolve; });
+      deferred.set(request.resourceKind, { request, resolve });
+      return { promise, cancel: () => false };
+    },
+  });
+
+  const manifestPlan = makePlan(0, 'manifest');
+  stream.applyPlan({ plan: manifestPlan, policyPlan: makePolicyPlan(manifestPlan) });
+  await waitFor(() => deferred.has('manifest'), 'manifest request did not start');
+  const canonicalPlan = makePlan(1, 'canonical');
+  stream.applyPlan({ plan: canonicalPlan, policyPlan: makePolicyPlan(canonicalPlan) });
+  deferred.get('manifest').resolve(Object.freeze({ contentHash: 'manifest-payload' }));
+  await waitFor(() => deferred.has('canonical'), 'canonical request did not replace manifest');
+  deferred.get('canonical').resolve(Object.freeze({ contentHash: 'canonical-payload' }));
+  await waitFor(() => stream.snapshot().backlog === 0, 'replacement requests did not settle');
+
+  const pages = stream.drainReadyOwnerPages({ limit: 8 });
+  assert.deepEqual(pages.map(page => page.resourceKind), ['canonical']);
+  assert.deepEqual(stream.resourceKindEntries(), [[ownerKey, 'canonical']]);
+  assert.equal(stream.snapshot().counts.staleResultDiscards > 0, true);
+  assert.equal(stream.publishOwners({ ownerKeys: [ownerKey] })[0].resourceKind, 'canonical');
+  await stream.dispose();
+});
+
+test('retained owner drops an already-ready page when its resource kind changes', async () => {
+  const ownerKey = '0,0';
+  const makePlan = (stateRevision, resourceKind) => ({
+    schemaVersion: 'world-streaming-plan-1',
+    planId: `ready-kind-${stateRevision}`,
+    renderDistancePreset: 'current',
+    stateRevision,
+    originGeneration: 0,
+    player: { x: 0, z: 0 },
+    velocityCorridor: { endpoint: { x: 0, z: 0 } },
+    resourceKind,
+  });
+  const makePolicyPlan = plan => ({
+    kind: POLICY_KIND,
+    publicationGroup: 'test-static-publication',
+    requiredOwnerKeys: [ownerKey],
+    prefetchedOwnerKeys: [],
+    retainedOwnerKeys: [ownerKey],
+    requestOwnerKeys: [ownerKey],
+    allOwnerKeys: [ownerKey],
+    velocityCorridor: plan.velocityCorridor,
+    deadline: { requiredAtMs: 1_000, prefetchedAtMs: 2_000 },
+  });
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: ({ plan }) => plan.resourceKind,
+    requestOwner: request => Promise.resolve(Object.freeze({
+      ownerKey: request.ownerKey,
+      resourceKind: request.resourceKind,
+    })),
+  });
+  const manifestPlan = makePlan(0, 'manifest');
+  stream.applyPlan({ plan: manifestPlan, policyPlan: makePolicyPlan(manifestPlan) });
+  await waitFor(() => stream.snapshot().readyPageQueueCount === 1,
+    'manifest page did not become ready');
+
+  const canonicalPlan = makePlan(1, 'canonical');
+  stream.applyPlan({ plan: canonicalPlan, policyPlan: makePolicyPlan(canonicalPlan) });
+  await waitFor(() => stream.snapshot().backlog === 0, 'canonical replacement did not settle');
+  const pages = stream.drainReadyOwnerPages({ limit: 8 });
+  assert.deepEqual(pages.map(page => page.resourceKind), ['canonical']);
+  assert.equal(stream.snapshot().counts.staleResultDiscards > 0, true);
   await stream.dispose();
 });
 

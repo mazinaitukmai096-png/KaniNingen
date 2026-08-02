@@ -68,6 +68,10 @@ import {
   createW8ForestHorizonOwnerPredicate,
 } from './forest-horizon-owner-policy.js';
 import {
+  W8_VEGETATION_LOD_KINDS,
+  resolveW8VegetationLodPolicy,
+} from './vegetation-lod-policy.js';
+import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   W8_RENDER_FOG_COLOR_HEX,
   W8_RENDER_DISTANCE_PRESETS,
@@ -824,9 +828,9 @@ export async function bootInfiniteWorldSandbox({
   let diagnostics = null;
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
-  let treeStaticStream = null;
-  let treeStaticStreamActivated = false;
-  let treeStaticStreamSuspended = false;
+  let naturalStaticStream = null;
+  let naturalStaticStreamActivated = false;
+  let naturalStaticStreamSuspended = false;
   let canonicalWorldSeedHash = null;
   let forestHorizonOwnerPredicate = null;
   let availableSaveSnapshot = null;
@@ -865,8 +869,8 @@ export async function bootInfiniteWorldSandbox({
     }
     return staticTreeActivationTimeline[field];
   };
-  const activateTreeStaticStream = source => {
-    treeStaticStreamActivated = true;
+  const activateNaturalStaticStream = source => {
+    naturalStaticStreamActivated = true;
     if (staticTreeActivationTimeline.staticStreamActivatedAtMs === null) {
       recordStaticTreeActivationTime('staticStreamActivatedAtMs');
       staticTreeActivationTimeline.activationSource = source;
@@ -916,27 +920,71 @@ export async function bootInfiniteWorldSandbox({
     });
     const worldStreamingPolicyRegistry = createWorldStreamingPolicyRegistry();
     worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy());
-    const treeStaticPolicyRuntime = createCircularStaticStreamingPolicy({
-      kind: 'natural-tree',
-      publicationGroup: 'natural-static',
-      maximumRequiredDistanceMeters: Math.max(
-        ...Object.values(W8_RENDER_DISTANCE_PRESETS).map(policy => policy.fogFarMeters),
-      ),
-      distanceProfileResolver: renderDistancePreset => {
-        const policy = resolveW8RenderDistancePolicy(renderDistancePreset);
+    const staticNaturalKinds = Object.freeze(Object.values(W8_VEGETATION_LOD_KINDS));
+    const staticNaturalPolicyRuntimes = new Map(staticNaturalKinds.map(kind => {
+      const runtime = createCircularStaticStreamingPolicy({
+        kind: `natural-${kind}`,
+        publicationGroup: 'natural-static',
+        maximumRequiredDistanceMeters: Math.max(
+          ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(renderDistancePreset => (
+            kind === W8_VEGETATION_LOD_KINDS.TREE
+              ? resolveW8RenderDistancePolicy(renderDistancePreset).fogFarMeters
+              : resolveW8VegetationLodPolicy(kind, renderDistancePreset).visibilityMeters
+          )),
+        ),
+        distanceProfileResolver: renderDistancePreset => {
+          const renderPolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
+          const lodPolicy = resolveW8VegetationLodPolicy(kind, renderDistancePreset);
+          return Object.freeze({
+            exactDistanceMeters: lodPolicy.visibilityMeters,
+            horizonDistanceMeters: kind === W8_VEGETATION_LOD_KINDS.TREE
+              ? renderPolicy.fogFarMeters : null,
+          });
+        },
+        horizonOwnerPredicate: coordinates => {
+          if (kind !== W8_VEGETATION_LOD_KINDS.TREE) return false;
+          forestHorizonOwnerPredicate ??= createW8ForestHorizonOwnerPredicate(
+            canonicalWorldSeedHash,
+          );
+          return forestHorizonOwnerPredicate(coordinates);
+        },
+        horizonOwnerDensity: kind === W8_VEGETATION_LOD_KINDS.TREE ? 4 : 1,
+      });
+      worldStreamingPolicyRegistry.register(runtime.policy);
+      return [runtime.policy.kind, Object.freeze({ ...runtime, naturalKind: kind })];
+    }));
+    let naturalPresentationCoverageGeneration = -1;
+    let naturalPresentationCoveragePreset = null;
+    let naturalPresentationPolicyCoverage = Object.freeze([]);
+    const resolveNaturalPresentationPolicyCoverage = ({
+      plan,
+      policyPlans,
+      coverageGeneration,
+    }) => {
+      if (naturalPresentationCoverageGeneration === coverageGeneration
+        && naturalPresentationCoveragePreset === plan.renderDistancePreset) {
+        return naturalPresentationPolicyCoverage;
+      }
+      naturalPresentationPolicyCoverage = Object.freeze(policyPlans.map(policyPlan => {
+        const runtime = staticNaturalPolicyRuntimes.get(policyPlan.kind);
+        const resourceKindEntries = Object.freeze(policyPlan.allOwnerKeys.map(ownerKey => (
+          Object.freeze([
+            ownerKey,
+            runtime.classifyOwner({ ownerKey, plan, policyPlan }),
+          ])
+        )));
         return Object.freeze({
-          exactDistanceMeters: policy.naturalVisibilityMeters,
-          horizonDistanceMeters: policy.fogFarMeters,
+          ...runtime.maximumCoverage(plan.renderDistancePreset),
+          schemaVersion: 'static-natural-policy-coverage-1',
+          policyKind: policyPlan.kind,
+          naturalKind: runtime.naturalKind,
+          resourceKindEntries,
         });
-      },
-      horizonOwnerPredicate: coordinates => {
-        forestHorizonOwnerPredicate ??= createW8ForestHorizonOwnerPredicate(
-          canonicalWorldSeedHash,
-        );
-        return forestHorizonOwnerPredicate(coordinates);
-      },
-    });
-    worldStreamingPolicyRegistry.register(treeStaticPolicyRuntime.policy);
+      }));
+      naturalPresentationCoverageGeneration = coverageGeneration;
+      naturalPresentationCoveragePreset = plan.renderDistancePreset;
+      return naturalPresentationPolicyCoverage;
+    };
     worldStreamingPolicyRegistry.freeze();
     worldStreamingCoordinator = createWorldStreamingCoordinator({
       registry: worldStreamingPolicyRegistry,
@@ -1279,9 +1327,20 @@ export async function bootInfiniteWorldSandbox({
 
     await runStage('Terrain', () => runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ));
     scenePresentation.rebase(runtime.snapshot().renderOrigin);
-    treeStaticStream = createStaticObjectStream({
-      policyKind: treeStaticPolicyRuntime.policy.kind,
-      classifyOwner: treeStaticPolicyRuntime.classifyOwner,
+    const staticNaturalPolicyKinds = Object.freeze([...staticNaturalPolicyRuntimes.keys()]);
+    naturalStaticStream = createStaticObjectStream({
+      policyKind: staticNaturalPolicyKinds[0],
+      policyKinds: staticNaturalPolicyKinds,
+      classifyOwner: ({ ownerKey, plan, policyPlans }) => {
+        for (const policyPlan of policyPlans) {
+          if (!policyPlan.allOwnerKeys.includes(ownerKey)) continue;
+          const runtime = staticNaturalPolicyRuntimes.get(policyPlan.kind);
+          if (runtime.classifyOwner({ ownerKey, plan, policyPlan }) === 'canonical') {
+            return 'canonical';
+          }
+        }
+        return 'manifest';
+      },
       clock,
       requestOwner: ({
         ownerKey,
@@ -1302,7 +1361,7 @@ export async function bootInfiniteWorldSandbox({
           return handle;
         };
         const { chunkX, chunkZ } = parseChunkKey(ownerKey);
-        const consumerId = `static-object-stream:${treeStaticPolicyRuntime.policy.kind}:${ownerKey}`;
+        const consumerId = `static-object-stream:natural-static:${ownerKey}`;
         if (resourceKind === 'canonical') {
           const existing = runtime.getChunkData(chunkX, chunkZ);
           if (existing) return observeReady(Object.freeze({
@@ -1356,6 +1415,12 @@ export async function bootInfiniteWorldSandbox({
       scene,
       worldSeedHash: generator.worldSeedHash,
       visualAssets,
+      resolveStaticNaturalCapacity: renderDistancePreset => Object.freeze(
+        [...staticNaturalPolicyRuntimes.values()].map(runtime => Object.freeze({
+          naturalKind: runtime.naturalKind,
+          ...runtime.maximumCoverage(renderDistancePreset),
+        })),
+      ),
       findSettlementsNear: generator.distributor.findSettlementsNear,
       resolveTemplate: request => generator.resolveSettlementPresentationTemplate(request),
       getCanonicalChunkData: async (chunkX, chunkZ, request = {}) => {
@@ -1403,8 +1468,8 @@ export async function bootInfiniteWorldSandbox({
           telemetryCorrelationId: correlationId,
         }).promise;
         };
-        if (treeStaticStreamSuspended) return fallback();
-        return treeStaticStream.requestOrReuse({
+        if (naturalStaticStreamSuspended) return fallback();
+        return naturalStaticStream.requestOrReuse({
           ownerKey,
           resourceKind: 'canonical',
           fallback,
@@ -1428,8 +1493,8 @@ export async function bootInfiniteWorldSandbox({
             epoch: request.epoch ?? 0,
             ...schedulerOptions,
           }));
-        if (treeStaticStreamSuspended) return fallback();
-        return treeStaticStream.requestOrReuse({
+        if (naturalStaticStreamSuspended) return fallback();
+        return naturalStaticStream.requestOrReuse({
           ownerKey,
           resourceKind: 'manifest',
           fallback,
@@ -1441,10 +1506,10 @@ export async function bootInfiniteWorldSandbox({
         return cancelled;
       },
       publishStaticOwnerTickets: ({ ownerKeys }) => {
-        const published = treeStaticStream.publishOwners({ ownerKeys });
+        const published = naturalStaticStream.publishOwners({ ownerKeys });
         if (published.length > 0) {
           recordStaticTreeActivationTime('firstPersistentTreePublishAtMs');
-          activateTreeStaticStream('publication-ticket');
+          activateNaturalStaticStream('publication-ticket');
         }
         return published;
       },
@@ -2091,8 +2156,8 @@ export async function bootInfiniteWorldSandbox({
     }
     async function loadWorld() {
       playerRelocationInProgress = true;
-      treeStaticStreamSuspended = true;
-      treeStaticStream.invalidate('load-world');
+      naturalStaticStreamSuspended = true;
+      naturalStaticStream.invalidate('load-world');
       try {
         const loaded = await saveStore.loadInto(worldState);
         if (!loaded) {
@@ -2122,7 +2187,7 @@ export async function bootInfiniteWorldSandbox({
           ? 'unavailable' : 'failed';
         return false;
       } finally {
-        treeStaticStreamSuspended = false;
+        naturalStaticStreamSuspended = false;
         playerRelocationInProgress = false;
       }
     }
@@ -2181,8 +2246,8 @@ export async function bootInfiniteWorldSandbox({
       },
       onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
         playerRelocationInProgress = true;
-        treeStaticStreamSuspended = true;
-        treeStaticStream.invalidate(`start-run:${startMode}`);
+        naturalStaticStreamSuspended = true;
+        naturalStaticStream.invalidate(`start-run:${startMode}`);
         const phaseBefore = experienceShell?.getRunPhase?.() ?? 'menu';
         const gameplayTimeBeforeMs = worldState.gameplayTimeMs;
         const playerBefore = Object.freeze({ ...logicalPlayer });
@@ -2245,13 +2310,13 @@ export async function bootInfiniteWorldSandbox({
           });
           return Object.freeze({ cameraYaw });
         } finally {
-          treeStaticStreamSuspended = false;
+          naturalStaticStreamSuspended = false;
           playerRelocationInProgress = false;
         }
       },
       onReturnTitle: () => {
-        treeStaticStreamSuspended = true;
-        treeStaticStream.invalidate('return-title');
+        naturalStaticStreamSuspended = true;
+        naturalStaticStream.invalidate('return-title');
         const saving = saveWorld({ force: true });
         returnTitleSavePromise = saving;
         void saving.finally(() => {
@@ -2261,8 +2326,8 @@ export async function bootInfiniteWorldSandbox({
       },
       onResetHome: async () => {
         playerRelocationInProgress = true;
-        treeStaticStreamSuspended = true;
-        treeStaticStream.invalidate('reset-home');
+        naturalStaticStreamSuspended = true;
+        naturalStaticStream.invalidate('reset-home');
         try {
           worldState.updatePlayer({
             x: experienceSpawn.x,
@@ -2273,14 +2338,14 @@ export async function bootInfiniteWorldSandbox({
         } catch (error) {
           transitionError = error;
         } finally {
-          treeStaticStreamSuspended = false;
+          naturalStaticStreamSuspended = false;
           playerRelocationInProgress = false;
         }
       },
       onRestart: async () => {
         playerRelocationInProgress = true;
-        treeStaticStreamSuspended = true;
-        treeStaticStream.invalidate('restart');
+        naturalStaticStreamSuspended = true;
+        naturalStaticStream.invalidate('restart');
         try {
           await gameplay.restart({
             playerSpawn: experienceSpawn,
@@ -2292,7 +2357,7 @@ export async function bootInfiniteWorldSandbox({
           await saveWorld({ force: true });
           return Object.freeze({ cameraYaw: experienceSpawn.cameraYaw });
         } finally {
-          treeStaticStreamSuspended = false;
+          naturalStaticStreamSuspended = false;
           playerRelocationInProgress = false;
         }
       },
@@ -2575,20 +2640,23 @@ export async function bootInfiniteWorldSandbox({
         },
       });
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
-      const treePolicyPlan = worldStreamingPlan.policyPlans.find(
-        policy => policy.kind === treeStaticPolicyRuntime.policy.kind,
+      const staticNaturalPolicyPlans = worldStreamingPlan.policyPlans.filter(
+        policy => staticNaturalPolicyRuntimes.has(policy.kind),
       );
-      const treeStaticStreamCanApply = !treeStaticStreamSuspended
+      const naturalStaticStreamCanApply = !naturalStaticStreamSuspended
         && !playerRelocationInProgress;
-      if (!treeStaticStreamActivated && treeStaticStreamCanApply) {
-        activateTreeStaticStream('first-shadow-plan');
+      if (!naturalStaticStreamActivated && naturalStaticStreamCanApply) {
+        activateNaturalStaticStream('first-shadow-plan');
       }
-      if (treeStaticStreamActivated && treeStaticStreamCanApply) {
-        treeStaticStream.applyPlan({ plan: worldStreamingPlan, policyPlan: treePolicyPlan });
+      if (naturalStaticStreamActivated && naturalStaticStreamCanApply) {
+        naturalStaticStream.applyPlan({
+          plan: worldStreamingPlan,
+          policyPlans: staticNaturalPolicyPlans,
+        });
         recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
-        const streamControl = treeStaticStream.diagnostics();
+        const streamControl = naturalStaticStream.diagnostics();
         if (!disablePersistentTreePublication) {
-          distantPresentation.applyStaticTreePlan?.({
+          distantPresentation.applyStaticNaturalPlan?.({
             coverageGeneration: streamControl.coverageGeneration,
             planRevision: streamControl.planRevision,
             planId: worldStreamingPlan.planId,
@@ -2604,11 +2672,19 @@ export async function bootInfiniteWorldSandbox({
             playerLogicalZ: logicalPlayer.z,
             activeDataKeys: committedChunkState.activeDataKeys,
             renderedKeys: committedChunkState.renderedKeys,
-            retainedOwnerKeys: treePolicyPlan.allOwnerKeys,
+            retainedOwnerKeys: Object.freeze([
+              ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.allOwnerKeys)),
+            ]),
+            resourceKindEntries: naturalStaticStream.resourceKindEntries(),
+            policyResourceCoverage: resolveNaturalPresentationPolicyCoverage({
+              plan: worldStreamingPlan,
+              policyPlans: staticNaturalPolicyPlans,
+              coverageGeneration: streamControl.coverageGeneration,
+            }),
             // Admission is deliberately one owner per animation frame. The
             // presentation coordinator shares one budget across dispose,
             // visibility, compose, upload marking, build, and publication.
-            readyPages: treeStaticStream.drainReadyOwnerPages({ limit: 1 }),
+            readyPages: naturalStaticStream.drainReadyOwnerPages({ limit: 1 }),
           });
         }
       }
@@ -2693,7 +2769,7 @@ export async function bootInfiniteWorldSandbox({
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const worldStreamingSnapshot = worldStreamingCoordinator.snapshot();
-      const staticTreeStreaming = treeStaticStream.diagnostics();
+      const staticTreeStreaming = naturalStaticStream.diagnostics();
       const shadowPolicy = worldStreamingSnapshot.latestPlan?.policyPlans?.find(
         policy => policy.kind === LEGACY_RUNTIME_CHUNK_POLICY_KIND,
       ) ?? null;
@@ -2973,6 +3049,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           logicalPlayer.z,
           frameRenderOrigin,
         ));
+        recordDistantTreeVisibility();
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
         const presentation = diagnostics.measure(
           'presentation-effects', () => gameplay.consumePresentationEffects(),
@@ -3028,7 +3105,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       await gameplay.shutdown();
       await runtime.shutdown();
       distantPresentation.dispose();
-      await treeStaticStream.dispose();
+      await naturalStaticStream.dispose();
       await chunkDataService.shutdown();
       scenePresentation.dispose();
       visualAssets.dispose();
@@ -3094,10 +3171,10 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           }),
           streamingTelemetry: streamingTelemetry.snapshot(),
           worldStreaming: worldStreamingCoordinator.snapshot(),
-          staticObjectStreaming: treeStaticStream.snapshot(),
+          staticObjectStreaming: naturalStaticStream.snapshot(),
           treePathAudit: Object.freeze({
-            treeStaticStreamActivated,
-            treeStaticStreamSuspended,
+            treeStaticStreamActivated: naturalStaticStreamActivated,
+            treeStaticStreamSuspended: naturalStaticStreamSuspended,
             farNaturalWarmStarted,
             ultraNaturalWarmStarted,
             naturalWarmRetryAt,
@@ -3128,7 +3205,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       distantPresentation?.dispose?.();
-      await treeStaticStream?.dispose?.();
+      await naturalStaticStream?.dispose?.();
       await chunkDataService?.shutdown?.();
       scenePresentation?.dispose?.();
       visualAssets?.dispose?.();

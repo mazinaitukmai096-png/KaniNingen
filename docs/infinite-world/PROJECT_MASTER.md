@@ -204,11 +204,11 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 **Branch:** `feature/infinite-chunk-sandbox-w1a`
 **最新実装commit:** `fac3f5a fix: gate player movement on terrain coverage`
 **Origin差:** pushなし / behind 0
-**現在Phase:** Phase 5A-2正式完了、Phase 5B開始前
+**現在Phase:** Phase 5B進行中
 **Phase 4:** 完了・commit済み
 **Phase 5A:** Phase 5A-2のincremental publication、persistent bucket、terrain coverage gateまで完了
 **Vegetation LOD:** `1a0a32a`でcommit済み
-**現在の目的:** Phase 5B開始前で停止し、次回承認後にBush / Rock / Grassを共通Static Streamへ移行する。
+**現在の目的:** Bush / Rock / GrassをObject別LODのまま共通Static Object Streamへ移行し、Harnessと回帰testで検証する。
 
 ---
 
@@ -220,7 +220,7 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 - [x] Phase 2: World Streaming Plan / Policy Registry
 - [x] Phase 3: Canonical Owner Cache
 - [x] Phase 4: Worker Scheduler
-- [ ] Phase 5: Static Object Stream（Phase 5A-2完了、Phase 5B未着手）
+- [ ] Phase 5: Static Object Stream（Phase 5A-2完了、Phase 5B進行中）
 - [ ] Phase 6: Building / Settlement
 - [ ] Phase 7: Publication Coordination
 - [ ] Phase 8: Dynamic Entity Stream
@@ -248,7 +248,8 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 Phase 5Aの以前の受入れ判定は取り消した。ready-setがReadyでも、Distant rootの
 全owner compose完了までpublishされず、高速移動時のTree遅延とmain-thread freezeが残っていた。
 Phase 5A-2ではowner/page単位publication、persistent bucket、dirty range更新、
-frame-budget upload/disposeへの移行を完了した。Phase 5Bには進んでいない。
+frame-budget upload/disposeへの移行を完了した。Phase 5BではBush / Rock / Grassを
+Object別policy登録から同じowner/page publicationとpersistent Natural bucketへ接続している。
 
 Phase 5A-2の停止→密度回復→再加速Harnessで、次の集中要因を確定した。
 
@@ -308,7 +309,7 @@ Browser Current / High:
 - Distant outer warmはStatic Streamのactivation条件にせず、独立した初期表示warmとして継続する。
 - Static Stream activationは最初の有効なshadow planで一度だけ行い、suspend / relocation中は適用しない。
 - Gameplay requestをStatic presentationより優先する。
-- Phase 5A-2はユーザー実機確認まで合格。次回承認後にのみBush / Rock / Grassへ進む。
+- Phase 5A-2はユーザー実機確認まで合格。Phase 5Bは明示承認を受けて進行中。
 - Tree専用prefetchやObject名分岐は作らない。
 - Worker Poolは現時点で採用しない。
 
@@ -324,7 +325,7 @@ Browser Current / High:
 
 ### Priority B
 
-- Bush / Rock / GrassのStatic Stream移行
+- Bush / Rock / GrassのStatic Stream移行とHarness検証（進行中）
 - Building / Settlementの共通Plan接続
 - owner/page単位Publication Coordination
 
@@ -338,11 +339,10 @@ Browser Current / High:
 
 ## 15. 次にやること
 
-1. Phase 5A-2完了状態を維持する。
-2. Phase 5B開始の明示承認を待つ。
-3. 承認後、Bush / Rock / Grassを同じStatic Stream基盤へ順次移行する。
-4. Object別のready-set、owner reuse、publication、Stable ID、destructionを比較する。
-5. Phase 11で正式5-run、長時間soak、generation p95を再評価する。
+1. Bush / Rock / GrassのObject別policyと共有owner coverageを検証する。
+2. incremental publication、frame budget、stale cancellationの共通利用を検証する。
+3. Stable ID、destruction、Continue / Retry、Floating Originの回帰を確認する。
+4. Phase 11で正式5-run、長時間soak、generation p95を再評価する。
 
 ---
 

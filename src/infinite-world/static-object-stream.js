@@ -19,6 +19,20 @@ export const STATIC_OBJECT_STREAM_VELOCITY_PREFETCH = Object.freeze({
   sampleIntervalSeconds: 0.25,
 });
 
+function maximumCorridorOwnerCount(radiusMeters, corridorLengthMeters) {
+  if (!Number.isFinite(radiusMeters) || radiusMeters < 0
+    || !Number.isFinite(corridorLengthMeters) || corridorLengthMeters < 0) {
+    throw new RangeError('Static coverage capacity requires finite non-negative distances');
+  }
+  const columns = Math.ceil(
+    (corridorLengthMeters + radiusMeters * 2) / LOGICAL_CHUNK_SIZE_METERS,
+  ) + 1;
+  const rows = Math.ceil(
+    radiusMeters * 2 / LOGICAL_CHUNK_SIZE_METERS,
+  ) + 1;
+  return Object.freeze({ columns, rows, ownerCount: columns * rows });
+}
+
 const defaultClock = () => globalThis.performance?.now?.() ?? Date.now();
 export function staticChunkAabbIntersectsCircle(
   chunkX,
@@ -145,6 +159,7 @@ export function createCircularStaticStreamingPolicy({
   generatorKind = 'canonical-chunk',
   exactResourceKind = 'canonical',
   horizonResourceKind = 'manifest',
+  horizonOwnerDensity = 1,
 } = {}) {
   if (typeof kind !== 'string' || !kind) throw new TypeError('static policy kind is required');
   if (typeof publicationGroup !== 'string' || !publicationGroup) {
@@ -159,6 +174,9 @@ export function createCircularStaticStreamingPolicy({
   if (!Number.isFinite(maximumRequiredDistanceMeters)
     || maximumRequiredDistanceMeters <= 0) {
     throw new RangeError('maximumRequiredDistanceMeters must be positive');
+  }
+  if (!Number.isSafeInteger(horizonOwnerDensity) || horizonOwnerDensity < 1) {
+    throw new RangeError('horizonOwnerDensity must be a positive safe integer');
   }
   const requiredRadiusChunks = Math.ceil(
     maximumRequiredDistanceMeters / LOGICAL_CHUNK_SIZE_METERS,
@@ -246,20 +264,93 @@ export function createCircularStaticStreamingPolicy({
     );
     return exact ? exactResourceKind : horizonResourceKind;
   };
-  return Object.freeze({ policy, classifyOwner });
+  const maximumCoverage = renderDistancePreset => {
+    const profile = distanceProfileResolver(renderDistancePreset);
+    const corridorLengthMeters = velocityPrefetch.enabled
+      ? velocityPrefetch.maximumDistanceMeters : 0;
+    const canonical = maximumCorridorOwnerCount(
+      profile.exactDistanceMeters,
+      corridorLengthMeters,
+    );
+    const horizon = profile.horizonDistanceMeters === null
+      ? Object.freeze({ columns: 0, rows: 0, ownerCount: 0 })
+      : maximumCorridorOwnerCount(profile.horizonDistanceMeters, corridorLengthMeters);
+    // The horizon predicate is a world-fixed lattice. One boundary row/column
+    // is retained in the bound so every player alignment remains covered.
+    const maximumManifestOwnerCount = horizon.ownerCount === 0 ? 0 : Math.min(
+      horizon.ownerCount,
+      Math.ceil(horizon.ownerCount / horizonOwnerDensity)
+        + Math.max(horizon.columns, horizon.rows),
+    );
+    return Object.freeze({
+      schemaVersion: 'static-policy-capacity-1',
+      maximumCanonicalOwnerCount: canonical.ownerCount,
+      maximumManifestOwnerCount,
+    });
+  };
+  return Object.freeze({ policy, classifyOwner, maximumCoverage });
 }
 
-function coverageSignature(plan, policyPlan) {
+function coverageSignature(plan, policyPlan, resourceKinds) {
   return JSON.stringify({
     renderDistancePreset: plan.renderDistancePreset,
     required: policyPlan.requiredOwnerKeys,
     prefetched: policyPlan.prefetchedOwnerKeys,
     retained: policyPlan.retainedOwnerKeys,
+    resourceKinds,
+  });
+}
+
+function mergePolicyPlanCoverage(policyKind, policyKinds, policyPlans) {
+  if (!Array.isArray(policyPlans) || policyPlans.length !== policyKinds.length) {
+    throw new TypeError('Static Object Stream requires one plan coverage per policy kind');
+  }
+  const plansByKind = new Map(policyPlans.map(value => [value?.kind, value]));
+  const ordered = policyKinds.map(kind => {
+    const value = plansByKind.get(kind);
+    if (!value) throw new TypeError(`Static Object Stream requires ${kind} plan coverage`);
+    return value;
+  });
+  const publicationGroups = new Set(ordered.map(value => value.publicationGroup));
+  if (publicationGroups.size !== 1) {
+    throw new Error('Static Object Stream policy group must share one publicationGroup');
+  }
+  const union = field => sorted(ordered.flatMap(value => value[field]));
+  const finiteDeadline = field => {
+    const values = ordered.map(value => value.deadline[field]).filter(Number.isFinite);
+    return values.length ? Math.min(...values) : null;
+  };
+  const requiredOwnerKeys = union('requiredOwnerKeys');
+  const prefetchedOwnerKeys = union('prefetchedOwnerKeys')
+    .filter(ownerKey => !requiredOwnerKeys.includes(ownerKey));
+  const retainedOwnerKeys = union('retainedOwnerKeys');
+  const requestOwnerKeys = sorted([...requiredOwnerKeys, ...prefetchedOwnerKeys]);
+  return Object.freeze({
+    kind: policyKind,
+    policyKinds,
+    memberPolicyPlans: Object.freeze(ordered),
+    stream: ordered[0].stream,
+    generatorKind: ordered[0].generatorKind,
+    publicationGroup: ordered[0].publicationGroup,
+    publicationDependencies: Object.freeze([
+      ...new Set(ordered.flatMap(value => value.publicationDependencies)),
+    ].sort()),
+    requiredOwnerKeys,
+    prefetchedOwnerKeys: Object.freeze(prefetchedOwnerKeys),
+    retainedOwnerKeys,
+    requestOwnerKeys,
+    allOwnerKeys: sorted([...requestOwnerKeys, ...retainedOwnerKeys]),
+    deadline: Object.freeze({
+      requiredAtMs: finiteDeadline('requiredAtMs'),
+      prefetchedAtMs: finiteDeadline('prefetchedAtMs'),
+    }),
+    velocityCorridor: ordered[0].velocityCorridor,
   });
 }
 
 export function createStaticObjectStream({
   policyKind,
+  policyKinds = null,
   classifyOwner,
   requestOwner,
   cancelRequests = null,
@@ -272,6 +363,14 @@ export function createStaticObjectStream({
   ticketCapacity = 4096,
 } = {}) {
   if (typeof policyKind !== 'string' || !policyKind) throw new TypeError('policyKind is required');
+  const memberPolicyKinds = Object.freeze(policyKinds === null
+    ? [policyKind]
+    : [...new Set(policyKinds)]);
+  if (memberPolicyKinds.length === 0
+    || memberPolicyKinds.some(kind => typeof kind !== 'string' || !kind)
+    || !memberPolicyKinds.includes(policyKind)) {
+    throw new TypeError('policyKinds must contain policyKind and non-empty string keys');
+  }
   if (typeof classifyOwner !== 'function') throw new TypeError('classifyOwner is required');
   if (typeof requestOwner !== 'function') throw new TypeError('requestOwner is required');
   if (cancelRequests !== null && typeof cancelRequests !== 'function') {
@@ -300,6 +399,8 @@ export function createStaticObjectStream({
   let latestPlan = null;
   let latestPolicyPlan = null;
   let latestCoverageSignature = null;
+  let latestResourceKindEntries = Object.freeze([]);
+  let latestResourceKindByOwner = new Map();
   let disposed = false;
   const readyPageQueue = new Map();
   const counts = {
@@ -325,6 +426,14 @@ export function createStaticObjectStream({
   };
 
   const taskKey = (ownerKey, resourceKind) => `${resourceKind}\n${ownerKey}`;
+  const classify = (ownerKey, plan = latestPlan, policyPlan = latestPolicyPlan) => (
+    classifyOwner({
+      ownerKey,
+      plan,
+      policyPlan,
+      policyPlans: policyPlan?.memberPolicyPlans ?? Object.freeze([policyPlan]),
+    })
+  );
   const promoteQueuedTask = task => {
     if (task?.state !== 'queued') return false;
     const index = queue.indexOf(task);
@@ -352,6 +461,10 @@ export function createStaticObjectStream({
   };
   const queueReadyPage = resource => {
     if (!resource || !latestPolicyPlan?.allOwnerKeys.includes(resource.ownerKey)) return;
+    if (latestResourceKindByOwner.get(resource.ownerKey) !== resource.resourceKind) {
+      counts.staleResultDiscards += 1;
+      return;
+    }
     const required = latestPolicyPlan.requiredOwnerKeys.includes(resource.ownerKey);
     readyPageQueue.set(taskKey(resource.ownerKey, resource.resourceKind), Object.freeze({
       ...resource,
@@ -380,6 +493,7 @@ export function createStaticObjectStream({
       planRevision,
       coverageGeneration,
       policyKind,
+      policyKinds: memberPolicyKinds,
       publicationGroup: latestPolicyPlan.publicationGroup,
       stateRevision: latestPlan.stateRevision,
       originGeneration: latestPlan.originGeneration,
@@ -410,7 +524,7 @@ export function createStaticObjectStream({
     if (state === 'ready') {
       const readyAtMs = clock();
       const retainedByLatestCoverage = latestPolicyPlan?.allOwnerKeys.includes(task.ownerKey)
-        === true;
+        === true && latestResourceKindByOwner.get(task.ownerKey) === task.resourceKind;
       ready.set(task.key, Object.freeze({
         ownerKey: task.ownerKey,
         resourceKind: task.resourceKind,
@@ -546,16 +660,29 @@ export function createStaticObjectStream({
     });
   };
 
-  const applyPlan = ({ plan, policyPlan } = {}) => {
+  const applyPlan = ({ plan, policyPlan, policyPlans = null } = {}) => {
     if (disposed) return false;
-    if (plan?.schemaVersion !== 'world-streaming-plan-1' || policyPlan?.kind !== policyKind) {
+    if (plan?.schemaVersion !== 'world-streaming-plan-1') {
       throw new TypeError(`Static Object Stream requires ${policyKind} plan coverage`);
     }
-    const nextSignature = coverageSignature(plan, policyPlan);
+    const selectedPolicyPlans = policyPlans ?? (policyPlan ? [policyPlan] : []);
+    const mergedPolicyPlan = mergePolicyPlanCoverage(
+      policyKind,
+      memberPolicyKinds,
+      selectedPolicyPlans,
+    );
+    policyPlan = mergedPolicyPlan;
+    const nextResourceKindEntries = Object.freeze(policyPlan.allOwnerKeys.map(ownerKey => (
+      Object.freeze([ownerKey, classify(ownerKey, plan, policyPlan)])
+    )));
+    const nextResourceKindByOwner = new Map(nextResourceKindEntries);
+    const nextSignature = coverageSignature(plan, policyPlan, nextResourceKindEntries);
     planRevision += 1;
     const cancelOutsideCoverage = ({ retained, stableCoverage }) => {
       for (const task of [...tasks.values()]) {
-        if (retained.has(task.ownerKey)) {
+        const retainedWithCurrentKind = retained.has(task.ownerKey)
+          && latestResourceKindByOwner.get(task.ownerKey) === task.resourceKind;
+        if (retainedWithCurrentKind) {
           task.stalePlanCount = 0;
           continue;
         }
@@ -580,6 +707,8 @@ export function createStaticObjectStream({
     if (nextSignature === latestCoverageSignature) {
       latestPlan = plan;
       latestPolicyPlan = policyPlan;
+      latestResourceKindEntries = nextResourceKindEntries;
+      latestResourceKindByOwner = nextResourceKindByOwner;
       cancelOutsideCoverage({
         retained: new Set(policyPlan.allOwnerKeys),
         stableCoverage: true,
@@ -599,11 +728,16 @@ export function createStaticObjectStream({
     latestPlan = plan;
     latestPolicyPlan = policyPlan;
     latestCoverageSignature = nextSignature;
+    latestResourceKindEntries = nextResourceKindEntries;
+    latestResourceKindByOwner = nextResourceKindByOwner;
     counts.plans += 1;
     const retained = new Set(policyPlan.allOwnerKeys);
     cancelOutsideCoverage({ retained, stableCoverage: false });
     for (const [key, ticket] of tickets) {
-      if (!retained.has(ticket.ownerKey)) tickets.delete(key);
+      if (!retained.has(ticket.ownerKey)
+        || latestResourceKindByOwner.get(ticket.ownerKey) !== ticket.resourceKind) {
+        tickets.delete(key);
+      }
       else {
         ticket.planId = plan.planId;
         ticket.planRevision = planRevision;
@@ -612,7 +746,11 @@ export function createStaticObjectStream({
       }
     }
     for (const [key, resource] of readyPageQueue) {
-      if (!retained.has(resource.ownerKey)) readyPageQueue.delete(key);
+      if (!retained.has(resource.ownerKey)
+        || latestResourceKindByOwner.get(resource.ownerKey) !== resource.resourceKind) {
+        readyPageQueue.delete(key);
+        counts.staleResultDiscards += 1;
+      }
     }
     const required = new Set(policyPlan.requiredOwnerKeys);
     const requestedOwnerKeys = [
@@ -632,7 +770,7 @@ export function createStaticObjectStream({
     });
     const requested = requestedOwnerKeys.map(ownerKey => ({
       ownerKey,
-      resourceKind: classifyOwner({ ownerKey, plan, policyPlan }),
+      resourceKind: classify(ownerKey, plan, policyPlan),
       required: required.has(ownerKey),
       deadlineAtMs: required.has(ownerKey)
         ? policyPlan.deadline.requiredAtMs : policyPlan.deadline.prefetchedAtMs,
@@ -686,11 +824,7 @@ export function createStaticObjectStream({
     const published = [];
     const ownerSet = new Set(ownerKeys);
     for (const ownerKey of ownerSet) {
-      createTicket(ownerKey, classifyOwner({
-        ownerKey,
-        plan: latestPlan,
-        policyPlan: latestPolicyPlan,
-      }));
+      createTicket(ownerKey, classify(ownerKey));
     }
     for (const ticket of tickets.values()) {
       if (!ownerSet.has(ticket.ownerKey) || ticket.state !== 'ready') continue;
@@ -722,6 +856,10 @@ export function createStaticObjectStream({
     for (const [key, resource] of prioritized) {
       if (pages.length >= limit) break;
       readyPageQueue.delete(key);
+      if (latestResourceKindByOwner.get(resource.ownerKey) !== resource.resourceKind) {
+        counts.staleResultDiscards += 1;
+        continue;
+      }
       pages.push(Object.freeze({
         ownerKey: resource.ownerKey,
         resourceKind: resource.resourceKind,
@@ -743,15 +881,26 @@ export function createStaticObjectStream({
     const prefetched = new Set(latestPolicyPlan?.prefetchedOwnerKeys ?? []);
     const ownerReady = ownerKey => ready.has(taskKey(
       ownerKey,
-      classifyOwner({ ownerKey, plan: latestPlan, policyPlan: latestPolicyPlan }),
+      classify(ownerKey),
     ));
     const readyOwnerKeys = new Set([
       ...required,
       ...prefetched,
     ].filter(ownerReady));
+    const policyCoverage = Object.freeze((latestPolicyPlan?.memberPolicyPlans ?? [])
+      .map(member => Object.freeze({
+        kind: member.kind,
+        requiredOwnerCount: member.requiredOwnerKeys.length,
+        prefetchedOwnerCount: member.prefetchedOwnerKeys.length,
+        retainedOwnerCount: member.retainedOwnerKeys.length,
+        readyRequiredOwnerCount: member.requiredOwnerKeys.filter(ownerReady).length,
+        readyPrefetchedOwnerCount: member.prefetchedOwnerKeys.filter(ownerReady).length,
+      })));
     return Object.freeze({
       schemaVersion: STATIC_OBJECT_STREAM_SCHEMA,
       policyKind,
+      policyKinds: memberPolicyKinds,
+      policyCoverage,
       workerCount: 1,
       epoch,
       coverageGeneration,
@@ -794,7 +943,7 @@ export function createStaticObjectStream({
     const prefetchedOwnerKeys = latestPolicyPlan?.prefetchedOwnerKeys ?? [];
     const isReady = ownerKey => ready.has(taskKey(
       ownerKey,
-      classifyOwner({ ownerKey, plan: latestPlan, policyPlan: latestPolicyPlan }),
+      classify(ownerKey),
     ));
     let readyRequiredOwnerCount = 0;
     let readyPrefetchedOwnerCount = 0;
@@ -806,6 +955,7 @@ export function createStaticObjectStream({
     }
     return Object.freeze({
       policyKind,
+      policyKinds: memberPolicyKinds,
       workerCount: 1,
       coverageGeneration,
       planRevision,
@@ -830,8 +980,11 @@ export function createStaticObjectStream({
     if (disposed) return 0;
     epoch += 1;
     latestCoverageSignature = null;
+    latestResourceKindEntries = Object.freeze([]);
+    latestResourceKindByOwner = new Map();
     tickets.clear();
     ready.clear();
+    readyPageQueue.clear();
     counts.invalidations += 1;
     let cancelled = 0;
     for (const task of [...tasks.values()]) {
@@ -868,6 +1021,7 @@ export function createStaticObjectStream({
     requestOrReuse,
     publishOwners,
     drainReadyOwnerPages,
+    resourceKindEntries: () => latestResourceKindEntries,
     invalidate,
     diagnostics,
     snapshot,

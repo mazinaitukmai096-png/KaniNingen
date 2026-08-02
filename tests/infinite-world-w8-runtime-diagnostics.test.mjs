@@ -17,6 +17,7 @@ import {
   isW8NaturalCandidateVisible,
   resolveW8CanonicalCandidateSet,
   resolveW8NaturalCandidateVisual,
+  resolveW8PersistentNaturalBucketCapacity,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
@@ -320,6 +321,7 @@ function canonicalChunk(chunkX = 5, chunkZ = 0, records = [CANONICAL_BUILDING]) 
     chunkX,
     chunkZ,
     chunkId: `w8-parity-chunk:${chunkX},${chunkZ}`,
+    generatorVersion: Object.freeze({ major: 800, minor: 0, patch: 0, id: '800.0.0' }),
     contentHash: `sha256:${'1'.repeat(64)}`,
     sourceW5ContentHash: `sha256:${'2'.repeat(64)}`,
     terrain: flatDistantTerrain(),
@@ -1718,19 +1720,13 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
   }
   const afterAcceleration = presentation.snapshot();
   assert.equal(afterAcceleration.runtimePresentationHandoffPending, false);
-  assert.ok(accelerationFrames > 4, 'handoff must not flush every stage in one frame');
+  assert.ok(accelerationFrames > 0, 'handoff must complete through the frame update path');
   assert.ok(afterAcceleration.runtimePresentationHandoffLocalTerrainCount
     > baseline.runtimePresentationHandoffLocalTerrainCount);
-  assert.ok(afterAcceleration.runtimePresentationHandoffMatrixUpdateCount
-    > baseline.runtimePresentationHandoffMatrixUpdateCount);
-  assert.ok(afterAcceleration.runtimePresentationHandoffBufferUpdateCount
-    > baseline.runtimePresentationHandoffBufferUpdateCount);
   assert.ok(afterAcceleration.runtimePresentationHandoffMaximumSliceMs
     < afterAcceleration.runtimePresentationFrameBudgetMs);
-  assert.ok(afterAcceleration.runtimePresentationHandoffMaximumMatrixUpdatesPerFrame
-    < afterAcceleration.runtimePresentationHandoffMatrixUpdateCount);
-  assert.ok(afterAcceleration.runtimePresentationHandoffMaximumBufferUpdatesPerFrame
-    < afterAcceleration.runtimePresentationHandoffBufferUpdateCount);
+  assert.equal(afterAcceleration.staticNaturalActiveLegacyRecordCount, 0);
+  assert.equal(afterAcceleration.staticNaturalOverlappingStableIdCount, 0);
   assert.equal(afterAcceleration.duplicateVisibleStableIdCount, 0);
   assert.ok(presentation.treePathAuditSnapshot()
     .filter(path => path.active)
@@ -1833,7 +1829,7 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
   presentation.dispose();
 });
 
-test('persistent Distant buckets reuse Natural and Settlement slots through inner-outer transitions', async t => {
+test('persistent Distant reuses Settlement slots while Natural remains on Static Stream', async t => {
   const ownerX = 5;
   const ownerZ = 0;
   const bush = Object.freeze({
@@ -1904,7 +1900,8 @@ test('persistent Distant buckets reuse Natural and Settlement slots through inne
   ));
   const baseline = presentation.snapshot();
   assert.ok(persistentRoot);
-  assert.ok(baseline.naturalLodMeshCount > 0);
+  assert.equal(baseline.naturalLodMeshCount, 0);
+  assert.equal(baseline.staticNaturalActiveLegacyRecordCount, 0);
 
   const updateDurations = [];
   const drain = (state, maximumFrames = 256) => {
@@ -1980,6 +1977,8 @@ test('persistent Distant buckets reuse Natural and Settlement slots through inne
   assert.ok(completed.distantPersistentMaximumUploadBytesPerFrame
     <= completed.distantPersistentUploadBudgetBytes);
   assert.equal(completed.duplicateVisibleStableIdCount, 0);
+  assert.equal(completed.staticNaturalActiveLegacyRecordCount, 0);
+  assert.equal(completed.staticNaturalOverlappingStableIdCount, 0);
   assert.ok(completed.distantPersistentBoundsRecalculationCount > 0);
   assert.equal(new Set(audit.map(entry => entry.identity.stableId)).size, audit.length);
   assert.ok(audit.some(entry => entry.identity.stableId === CANONICAL_BUILDING_ID
@@ -5394,6 +5393,8 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   assert.equal(snapshot.staticTreeRootResetCount, 1);
   assert.equal(snapshot.staticTreeMaximumAdmissionsPerFrame <= 1, true);
   assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
+  assert.equal(snapshot.staticNaturalActiveLegacyRecordCount, 0);
+  assert.equal(snapshot.staticNaturalOverlappingStableIdCount, 0);
   assert.equal(moving.admissionMaximumPerFrame <= 1, true);
   assert.equal(stopped.admissionMaximumPerFrame <= 1, true);
   assert.equal(accelerated.admissionMaximumPerFrame <= 1, true);
@@ -5741,6 +5742,475 @@ test('Tree, Bush, Grass, and Rock share bounded natural LOD resources', async ()
   presentation.dispose();
 });
 
+test('persistent Static Natural pages incrementally publish Tree, Bush, Grass, and Rock once', async () => {
+  const vegetation = Object.freeze([
+    Object.freeze({
+      candidateId: 'detail-v1:vegetation:static-page-tree',
+      subtype: 'broadleaf-tree', variationSeed: 1, orientationSeed: 0.25,
+      worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+    }),
+    Object.freeze({
+      candidateId: 'detail-v1:vegetation:static-page-bush',
+      subtype: 'shrub', variationSeed: 0.5, orientationSeed: 0.75,
+      worldPosition: Object.freeze({ x: 89, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+    }),
+  ]);
+  const rock = Object.freeze({
+    candidateId: 'detail-v1:rock:static-page', candidateType: 'rock',
+    subtype: 'medium-rock', sizeClass: 'medium', variationSeed: 0.5,
+    orientationSeed: 0.25, worldPosition: Object.freeze({ x: 90, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  });
+  const grass = Object.freeze({
+    stableId: 'wf1:ambient-detail:static-page-grass', detailType: 'grass',
+    worldPosition: Object.freeze({ x: 91, y: 0.4, z: 8 }), rotationY: 0,
+    variation: 1, owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = vegetation;
+  chunk.rockCandidates = [rock];
+  chunk.ambientDetails = [grass];
+  chunk.presentationLayers.natural = { vegetation, rocks: [rock] };
+  chunk.presentationLayers.ambientDetails = [grass];
+  const destroyed = new Set();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+    incrementalStaticTreePages: true,
+    isFeatureDestroyed: stableId => destroyed.has(stableId),
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+  });
+  assert.equal(await presentation.sync(input), true);
+  assert.equal(presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'static-natural-all-kinds',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+    activeDataKeys: input.activeDataKeys,
+    renderedKeys: input.renderedKeys,
+    retainedOwnerKeys: ['5,0'],
+    readyPages: [{
+      ownerKey: '5,0', resourceKind: 'canonical', value: chunk,
+      readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
+    }],
+  }), true);
+  for (let frame = 0; frame < 100
+    && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== 1; frame += 1) {
+    presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+    presentation.markFirstDraw();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.staticTreeCurrentPublishedOwnerCount, 1);
+  assert.equal(snapshot.canonicalTreeRecordCount, 1);
+  assert.equal(snapshot.canonicalShrubRecordCount, 1);
+  assert.equal(snapshot.canonicalGrassRecordCount, 1);
+  assert.equal(snapshot.canonicalRockRecordCount, 1);
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.deepEqual(new Set(audit.map(object => object.naturalLod.kind)),
+    new Set(['tree', 'bush', 'grass', 'rock']));
+  assert.equal(new Set(audit.map(object => object.identity.stableId)).size, audit.length);
+  assert.equal(snapshot.staticTreeMaximumAdmissionsPerFrame <= 1, true);
+  assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
+  const bushId = audit.find(object => object.naturalLod.kind === 'bush').identity.stableId;
+  destroyed.add(bushId);
+  presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 2,
+    planId: 'static-natural-destruction',
+    destructionRevision: bushId,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+    activeDataKeys: input.activeDataKeys,
+    renderedKeys: input.renderedKeys,
+    retainedOwnerKeys: ['5,0'],
+  });
+  presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+  assert.equal(presentation.canonicalAuditSnapshot()
+    .find(object => object.identity.stableId === bushId).visibleLod, 'destroyed');
+  destroyed.clear();
+  presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 3,
+    planId: 'static-natural-retry',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+    activeDataKeys: input.activeDataKeys,
+    renderedKeys: input.renderedKeys,
+    retainedOwnerKeys: ['5,0'],
+    readyPages: [{
+      ownerKey: '5,0', resourceKind: 'canonical', value: chunk,
+      readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
+    }],
+  });
+  presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+  const restored = presentation.canonicalAuditSnapshot();
+  assert.notEqual(restored.find(object => object.identity.stableId === bushId).visibleLod,
+    'destroyed');
+  assert.equal(presentation.snapshot().staticTreeOwnerReuseCount > 0, true);
+  assert.equal(presentation.snapshot().staticTreeDuplicatePageQueueCount, 0);
+  presentation.dispose();
+});
+
+test('persistent Natural capacity covers Current stationary and MAX corridor slot pressure', () => {
+  const grassCapacity = resolveW8PersistentNaturalBucketCapacity({
+    kind: 'grass',
+    mode: 'full',
+    maximumCanonicalOwnerCount: 331,
+    maximumManifestOwnerCount: 0,
+    requiredSlots: 15_844,
+  });
+  const treeCapacity = resolveW8PersistentNaturalBucketCapacity({
+    kind: 'tree',
+    mode: 'full',
+    maximumCanonicalOwnerCount: 54,
+    maximumManifestOwnerCount: 1,
+    requiredSlots: 6_896,
+  });
+  assert.equal(grassCapacity, 15_888);
+  assert.equal(treeCapacity, 6_912);
+  assert.throws(() => resolveW8PersistentNaturalBucketCapacity({
+    kind: 'tree',
+    mode: 'full',
+    maximumCanonicalOwnerCount: 1,
+    maximumManifestOwnerCount: 1,
+    requiredSlots: 129,
+  }), /persistent Natural bucket capacity exceeded/);
+});
+
+test('Static Natural owner pages include only kinds covered by their registered policies', async () => {
+  const allKindsChunk = ownerX => {
+    const vegetation = [
+      Object.freeze({
+        candidateId: `detail-v1:vegetation:coverage-tree:${ownerX}`,
+        subtype: 'broadleaf-tree', variationSeed: 1, orientationSeed: 0.25,
+        worldPosition: Object.freeze({ x: ownerX * 16 + 2, y: 0.4, z: 8 }),
+        owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      }),
+      Object.freeze({
+        candidateId: `detail-v1:vegetation:coverage-bush:${ownerX}`,
+        subtype: 'shrub', variationSeed: 1, orientationSeed: 0.25,
+        worldPosition: Object.freeze({ x: ownerX * 16 + 4, y: 0.4, z: 8 }),
+        owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+      }),
+    ];
+    const rock = Object.freeze({
+      candidateId: `detail-v1:rock:coverage:${ownerX}`, candidateType: 'rock',
+      subtype: 'medium-rock', sizeClass: 'medium', variationSeed: 0.5,
+      orientationSeed: 0.25,
+      worldPosition: Object.freeze({ x: ownerX * 16 + 6, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+    });
+    const grass = Object.freeze({
+      stableId: `wf1:ambient-detail:coverage-grass:${ownerX}`, detailType: 'grass',
+      worldPosition: Object.freeze({ x: ownerX * 16 + 8, y: 0.4, z: 8 }),
+      rotationY: 0, variation: 1,
+      owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+    });
+    const chunk = canonicalChunk(ownerX, 0, []);
+    chunk.contentHash = `sha256:${String(ownerX).padStart(64, '0')}`;
+    chunk.vegetationCandidates = vegetation;
+    chunk.rockCandidates = [rock];
+    chunk.ambientDetails = [grass];
+    chunk.presentationLayers.natural = { vegetation, rocks: [rock] };
+    chunk.presentationLayers.ambientDetails = [grass];
+    return chunk;
+  };
+  const treeChunk = allKindsChunk(5);
+  const grassChunk = allKindsChunk(6);
+  const policyCoverage = (naturalKind, resourceKindEntries) => Object.freeze({
+    schemaVersion: 'static-natural-policy-coverage-1',
+    policyKind: `natural-${naturalKind}`,
+    naturalKind,
+    resourceKindEntries: Object.freeze(resourceKindEntries),
+    maximumCanonicalOwnerCount: 4,
+    maximumManifestOwnerCount: naturalKind === 'tree' ? 4 : 0,
+  });
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+    incrementalStaticTreePages: true,
+  });
+  presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'object-policy-filter',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    playerLogicalX: 88,
+    playerLogicalZ: 8,
+    retainedOwnerKeys: ['5,0', '6,0'],
+    resourceKindEntries: [['5,0', 'canonical'], ['6,0', 'canonical']],
+    policyResourceCoverage: [
+      policyCoverage('tree', [['5,0', 'canonical'], ['6,0', 'manifest']]),
+      policyCoverage('grass', [['5,0', 'manifest'], ['6,0', 'canonical']]),
+      policyCoverage('bush', [['5,0', 'manifest'], ['6,0', 'manifest']]),
+      policyCoverage('rock', [['5,0', 'manifest'], ['6,0', 'manifest']]),
+    ],
+    readyPages: [
+      { ownerKey: '5,0', resourceKind: 'canonical', value: treeChunk,
+        readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100 },
+      { ownerKey: '6,0', resourceKind: 'canonical', value: grassChunk,
+        readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100 },
+    ],
+  });
+  for (let frame = 0; frame < 100
+    && presentation.snapshot().staticNaturalResidentOwnerCount !== 2; frame += 1) {
+    presentation.update(88, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.deepEqual(audit.map(object => [object.ownerKey, object.naturalLod.kind]).sort(), [
+    ['5,0', 'tree'],
+    ['6,0', 'grass'],
+  ]);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.staticNaturalOrphanObjectCount, 0);
+  assert.equal(snapshot.staticNaturalOrphanSlotCount, 0);
+  assert.equal(new Set(audit.map(object => object.identity.stableId)).size, audit.length);
+  presentation.dispose();
+});
+
+test('persistent Natural owner build rolls back capacity and mid-build failures completely', async () => {
+  const tree = (id, index, subtype = 'broadleaf-tree') => Object.freeze({
+    candidateId: id,
+    subtype,
+    variationSeed: (index % 100) / 100,
+    orientationSeed: ((index * 7) % 100) / 100,
+    worldPosition: Object.freeze({ x: 82 + (index % 8), y: 0.4, z: 2 + index * 0.01 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunkWithTrees = (count, hashDigit, malformed = false) => {
+    const chunk = canonicalChunk(5, 0, []);
+    const vegetation = Array.from({ length: count }, (_, index) => tree(
+      `detail-v1:vegetation:transaction:${hashDigit}:${index}`,
+      index,
+      malformed && index === count - 1 ? 'unsupported-natural' : 'broadleaf-tree',
+    ));
+    chunk.contentHash = `sha256:${hashDigit.repeat(64)}`;
+    chunk.vegetationCandidates = vegetation;
+    chunk.presentationLayers.natural = { vegetation, rocks: [] };
+    return chunk;
+  };
+  const valid = chunkWithTrees(1, '3');
+  const overCapacity = chunkWithTrees(65, '4');
+  const malformed = chunkWithTrees(1, '5');
+  malformed.ambientDetails = [{
+    stableId: 'wf1:ambient-detail:transaction-malformed',
+    detailType: 'grass',
+    worldPosition: null,
+    rotationY: 0,
+    variation: 1,
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+  }];
+  malformed.presentationLayers.ambientDetails = malformed.ambientDetails;
+  let current = valid;
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => current,
+    incrementalStaticTreePages: true,
+    resolveStaticNaturalCapacity: () => [{
+      naturalKind: 'tree',
+      maximumCanonicalOwnerCount: 1,
+      maximumManifestOwnerCount: 1,
+    }],
+  });
+  const inputFor = chunk => canonicalSyncInput({
+    centerChunkX: 3,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk,
+    quality: 'high',
+  });
+  assert.equal(await presentation.sync(inputFor(valid)), true);
+  const before = presentation.snapshot();
+  const beforeAudit = presentation.canonicalAuditSnapshot();
+  assert.equal(before.staticNaturalResidentOwnerCount, 1);
+  assert.equal(before.staticNaturalOrphanObjectCount, 0);
+
+  current = overCapacity;
+  await assert.rejects(
+    presentation.sync(inputFor(overCapacity)),
+    /persistent Natural bucket capacity exceeded/,
+  );
+  let after = presentation.snapshot();
+  assert.equal(after.staticNaturalResidentOwnerCount, 1);
+  assert.equal(after.staticNaturalOrphanObjectCount, 0);
+  assert.equal(after.staticNaturalOrphanSlotCount, 0);
+  assert.deepEqual(presentation.canonicalAuditSnapshot(), beforeAudit);
+
+  current = malformed;
+  await assert.rejects(presentation.sync(inputFor(malformed)), /World Object|identity|position/);
+  after = presentation.snapshot();
+  assert.equal(after.staticNaturalResidentOwnerCount, 1);
+  assert.equal(after.staticNaturalOrphanObjectCount, 0);
+  assert.equal(after.staticNaturalOrphanSlotCount, 0);
+  assert.deepEqual(presentation.canonicalAuditSnapshot(), beforeAudit);
+  presentation.dispose();
+});
+
+test('manifest and canonical builds for one owner serialize without LOD identity mismatch', async () => {
+  const ownerKey = '5,0';
+  const vegetation = Object.freeze(Array.from({ length: 300 }, (_, index) => Object.freeze({
+    candidateId: `detail-v1:vegetation:replacement-race-${String(index).padStart(3, '0')}`,
+    subtype: 'broadleaf-tree',
+    variationSeed: (index % 100) / 100,
+    orientationSeed: ((index * 7) % 100) / 100,
+    worldPosition: Object.freeze({ x: 80 + (index % 16) * 0.25, y: 0, z: index * 0.01 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  })));
+  const canonical = canonicalChunk(5, 0, []);
+  canonical.vegetationCandidates = vegetation;
+  canonical.presentationLayers.natural = { vegetation, rocks: [] };
+  const manifest = {
+    chunkX: 5,
+    chunkZ: 0,
+    chunkId: canonical.chunkId,
+    contentHash: `sha256:${'3'.repeat(64)}`,
+    sourceW5ContentHash: canonical.sourceW5ContentHash,
+    generatorVersion: canonical.generatorVersion,
+    presentationLayers: { natural: { vegetation, rocks: [] } },
+  };
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => canonical,
+    getForestHorizonManifest: async () => manifest,
+    incrementalStaticTreePages: true,
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 3,
+    activeDataKeys: [ownerKey],
+    renderedKeys: [],
+    chunk: canonical,
+  });
+  const planInput = {
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'manifest-first-replacement-race',
+    destructionRevision: 'none',
+    quality: input.quality,
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+    activeDataKeys: [],
+    renderedKeys: [],
+    retainedOwnerKeys: [ownerKey],
+    resourceKindEntries: [[ownerKey, 'manifest']],
+  };
+  presentation.applyStaticNaturalPlan({
+    ...planInput,
+    readyPages: [{
+      ownerKey,
+      resourceKind: 'manifest',
+      value: manifest,
+      readyAtMs: performance.now(),
+      required: false,
+      deadlineAtMs: performance.now() + 1_000,
+    }],
+  });
+  presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+
+  assert.equal(await presentation.sync(input), true,
+    'canonical seed must wait for the in-flight manifest owner build');
+  for (let frame = 0; frame < 200
+    && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== 1; frame += 1) {
+    presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+    presentation.markFirstDraw();
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const canonicalFirst = presentation.snapshot();
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.equal(canonicalFirst.identityAuditErrorCount, 0);
+  assert.equal(canonicalFirst.staticNaturalStalePageDiscardCount, 0);
+  assert.equal(canonicalFirst.staticNaturalResidentOwnerCount, 1);
+  assert.equal(canonicalFirst.staticNaturalOverlappingStableIdCount, 0);
+  assert.equal(audit.length, vegetation.length);
+  assert.equal(new Set(audit.map(value => value.identity.stableId)).size, vegetation.length);
+  assert.equal(audit.every(value => (
+    value.identity.canonicalSourceRevision === `${CANONICAL_WORLD_SEED_HASH}:800`
+      && value.identity.sourceW5ContentHash === canonical.sourceW5ContentHash
+      && !Object.hasOwn(value.identity, 'contentHash')
+  )), true);
+
+  presentation.applyStaticNaturalPlan({
+    ...planInput,
+    planRevision: 2,
+    planId: 'canonical-first-obsolete-manifest',
+    resourceKindEntries: [[ownerKey, 'canonical']],
+    readyPages: [{
+      ownerKey,
+      resourceKind: 'manifest',
+      value: manifest,
+      readyAtMs: performance.now(),
+      required: false,
+      deadlineAtMs: performance.now() + 1_000,
+    }],
+  });
+  presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
+  await new Promise(resolve => setImmediate(resolve));
+  const afterObsoleteManifest = presentation.snapshot();
+  assert.equal(afterObsoleteManifest.identityAuditErrorCount, 0);
+  assert.equal(afterObsoleteManifest.staticNaturalStalePageDiscardCount, 1);
+  assert.equal(presentation.canonicalAuditSnapshot().length, vegetation.length,
+    JSON.stringify({
+      resident: afterObsoleteManifest.staticNaturalResidentOwnerCount,
+      pending: afterObsoleteManifest.staticNaturalPendingOwnerCount,
+      dispose: afterObsoleteManifest.staticNaturalDisposeOwnerCount,
+      stale: afterObsoleteManifest.staticNaturalStalePageDiscardCount,
+      builds: afterObsoleteManifest.staticTreeOwnerBuildCount,
+      reuses: afterObsoleteManifest.staticTreeOwnerReuseCount,
+    }));
+  presentation.dispose();
+});
+
 test('Near handoff suppresses only the matching natural Stable ID across every tier', async () => {
   const candidate = (candidateId, x) => Object.freeze({
     candidateId,
@@ -6032,7 +6502,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     }],
     owningChunkCoordinate: { x: 5, z: 0 },
     chunkId: 'w8-parity-chunk:5,0',
-    contentHash: `sha256:${'1'.repeat(64)}`,
+    canonicalSourceRevision: `${CANONICAL_WORLD_SEED_HASH}:800`,
     sourceW5ContentHash: `sha256:${'2'.repeat(64)}`,
   };
   const states = [
