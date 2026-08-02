@@ -9,6 +9,7 @@ import {
   createSandboxBootState,
   createSandboxEntryController,
   createW8ScenePresentation,
+  gatePlayerMovementByTerrainCoverage,
   isW8GameplaySimulationEnabled,
   recordSandboxBootFailure,
   w8CloudDeltaSeconds,
@@ -18,7 +19,10 @@ import {
   InfiniteGameplayRuntime,
   createW6ChunkGameplay,
 } from '../src/infinite-world/gameplay-runtime.js';
-import { W6_ENTITY_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
+import {
+  W6_ENTITY_CONTRACTS,
+  getW6ScaleProfile,
+} from '../src/infinite-world/gameplay-contract.js';
 import {
   LOGICAL_CHUNK_SIZE_METERS,
   UNITS_PER_METER,
@@ -36,6 +40,34 @@ import {
 const repoRoot = resolve(import.meta.dirname, '..');
 const runIsolatedW5BootPerformanceGate = process.env.KANININGEN_RUN_W5_BOOT_PERFORMANCE === '1';
 let nodeObjectConstructionCount = 0;
+
+test('Player terrain coverage gate retains the last formal position and height until ready', () => {
+  const samples = [];
+  const blocked = gatePlayerMovementByTerrainCoverage({
+    horizontalMovement: Object.freeze({ x: 48.25, z: -3, collided: false }),
+    startX: 47.75,
+    startZ: -3,
+    sampleCanonicalTerrainHeight(x, z) {
+      samples.push([x, z]);
+      return x === 47.75 ? 12.5 : null;
+    },
+  });
+  assert.deepEqual(samples, [[48.25, -3], [47.75, -3]]);
+  assert.equal(blocked.terrainCoverageBlocked, true);
+  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 47.75, z: -3 });
+  assert.equal(blocked.terrainHeightMeters, 12.5);
+  assert.equal(blocked.terrainCoverageOwner.key, '3,-1');
+
+  const ready = gatePlayerMovementByTerrainCoverage({
+    horizontalMovement: Object.freeze({ x: 48.25, z: -3, collided: false }),
+    startX: 47.75,
+    startZ: -3,
+    sampleCanonicalTerrainHeight: () => 14.25,
+  });
+  assert.equal(ready.terrainCoverageBlocked, false);
+  assert.deepEqual({ x: ready.x, z: ready.z }, { x: 48.25, z: -3 });
+  assert.equal(ready.terrainHeightMeters, 14.25);
+});
 
 class Triple {
   constructor() { this.set(0, 0, 0); }
@@ -1188,6 +1220,152 @@ test('persistent Tree publication A/B flag preserves Near and Distant warm while
         path.pathId === 'distant-legacy-tree' && path.instanceCount > 0
       )), false);
     } finally {
+      if (sandbox) await sandbox.shutdown();
+      environment.restore();
+    }
+  });
+
+test('MAX Player movement waits for formal destination Terrain and resumes after transition',
+  async () => {
+    const environment = installBrowserEquivalentEnvironment();
+    const controls = installExperienceControls();
+    const transitionGate = createDeferredValue();
+    const prepareRequests = [];
+    const transitionRequests = [];
+    let runtime = null;
+    let blockedOwnerKey = null;
+    let holdDestination = false;
+    let sandbox = null;
+    try {
+      sandbox = await bootInfiniteWorldSandbox({
+        globalObject: globalThis,
+        THREE: FakeThree,
+        viewport: environment.viewport,
+        hud: environment.hud,
+        requestedSeed: 'KaniNingen Infinite Natural World',
+        runtimeFactory(options) {
+          runtime = new ChunkRuntimeManager(options);
+          const getChunkData = runtime.getChunkData.bind(runtime);
+          const prepareTransition = runtime.prepareTransition.bind(runtime);
+          const transitionToChunk = runtime.transitionToChunk.bind(runtime);
+          runtime.getChunkData = (chunkX, chunkZ) => (
+            holdDestination && `${chunkX},${chunkZ}` === blockedOwnerKey
+              ? null : getChunkData(chunkX, chunkZ)
+          );
+          runtime.prepareTransition = (chunkX, chunkZ) => {
+            if (holdDestination) prepareRequests.push(`${chunkX},${chunkZ}`);
+            return prepareTransition(chunkX, chunkZ);
+          };
+          runtime.transitionToChunk = (chunkX, chunkZ) => {
+            const key = `${chunkX},${chunkZ}`;
+            if (holdDestination && key === blockedOwnerKey) {
+              transitionRequests.push(key);
+              return transitionGate.promise.then(() => transitionToChunk(chunkX, chunkZ));
+            }
+            return transitionToChunk(chunkX, chunkZ);
+          };
+          return runtime;
+        },
+      });
+
+      controls.get('start-button').dispatch('click');
+      await waitForLifeCycleCondition(() => (
+        sandbox.snapshot().runStart?.startMode === 'new'
+        && sandbox.snapshot().experience.runPhase === 'intro'
+      ), 'MAX coverage test must enter the run');
+      let frameNow = performance.now();
+      for (let frameIndex = 0; frameIndex < 130
+        && sandbox.snapshot().experience.runPhase !== 'playing'; frameIndex += 1) {
+        frameNow += 50;
+        environment.rafCallbacks.at(-1)(frameNow);
+        await new Promise(resolveValue => setImmediate(resolveValue));
+      }
+      assert.equal(
+        sandbox.snapshot().experience.runPhase,
+        'playing',
+        JSON.stringify({
+          boot: sandbox.snapshot().boot,
+          experience: sandbox.snapshot().experience,
+          runtime: sandbox.snapshot().runtime,
+        }),
+      );
+      await waitForLifeCycleCondition(() => {
+        const streaming = sandbox.snapshot().runtime.streaming;
+        return streaming.transitionPending === false && streaming.preparationPending === false;
+      }, 'intro coverage work must settle before the blocked MAX step');
+      await new Promise(resolveValue => setImmediate(resolveValue));
+      environment.listeners.get('keydown')({ code: 'Digit3', preventDefault() {} });
+      assert.equal(sandbox.snapshot().gameplay.state.activeScaleStageId, 'MAX');
+
+      const before = sandbox.snapshot();
+      const yaw = before.experience.camera.yaw;
+      const directionX = Math.cos(yaw);
+      const directionZ = -Math.sin(yaw);
+      const chunkSize = LOGICAL_CHUNK_SIZE_METERS;
+      const centerX = before.runtime.centerChunkX;
+      const centerZ = before.runtime.centerChunkZ;
+      sandbox.logicalPlayer.x = directionX >= 0
+        ? (centerX + 1) * chunkSize - 0.05 : centerX * chunkSize + 0.05;
+      sandbox.logicalPlayer.z = directionZ >= 0
+        ? (centerZ + 1) * chunkSize - 0.05 : centerZ * chunkSize + 0.05;
+
+      frameNow += 50;
+      environment.rafCallbacks.at(-1)(frameNow);
+      const retainedPosition = Object.freeze({
+        x: sandbox.logicalPlayer.x,
+        z: sandbox.logicalPlayer.z,
+      });
+      const retainedHeight = sandbox.snapshot().experience.playerVertical.terrainHeightMeters;
+      const maxStepMeters = getW6ScaleProfile('MAX').movementMetersPerSecond * 1.45 * 0.05;
+      const candidateX = retainedPosition.x + directionX * maxStepMeters;
+      const candidateZ = retainedPosition.z + directionZ * maxStepMeters;
+      const candidateChunkX = Math.floor(candidateX / chunkSize);
+      const candidateChunkZ = Math.floor(candidateZ / chunkSize);
+      blockedOwnerKey = `${candidateChunkX},${candidateChunkZ}`;
+      assert.notEqual(blockedOwnerKey, `${centerX},${centerZ}`);
+
+      holdDestination = true;
+      environment.listeners.get('keydown')({ code: 'KeyD', preventDefault() {} });
+      environment.listeners.get('keydown')({ code: 'ShiftLeft', preventDefault() {} });
+      const frameCountBeforeBlockedMove = environment.rafCallbacks.length;
+      frameNow += 50;
+      environment.rafCallbacks.at(-1)(frameNow);
+
+      assert.deepEqual({ x: sandbox.logicalPlayer.x, z: sandbox.logicalPlayer.z }, retainedPosition);
+      assert.equal(
+        sandbox.snapshot().experience.playerVertical.terrainHeightMeters,
+        retainedHeight,
+      );
+      assert.deepEqual(prepareRequests, [blockedOwnerKey]);
+      assert.deepEqual(transitionRequests, [blockedOwnerKey]);
+      assert.equal(sandbox.snapshot().boot.status, 'ready');
+      assert.equal(environment.rafCallbacks.length, frameCountBeforeBlockedMove + 1,
+        'a blocked Terrain candidate must not stop the animation loop');
+
+      holdDestination = false;
+      transitionGate.resolve();
+      await waitForLifeCycleCondition(() => (
+        runtime.isCenteredAt(candidateChunkX, candidateChunkZ)
+      ), 'destination transition must complete after canonical Terrain becomes ready');
+      frameNow += 50;
+      environment.rafCallbacks.at(-1)(frameNow);
+      environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
+      environment.listeners.get('keyup')({ code: 'ShiftLeft', preventDefault() {} });
+      assert.equal(
+        Math.hypot(
+          sandbox.logicalPlayer.x - retainedPosition.x,
+          sandbox.logicalPlayer.z - retainedPosition.z,
+        ) > 0,
+        true,
+        'MAX movement must resume once destination canonical Terrain is ready',
+      );
+      assert.equal(Number.isFinite(
+        sandbox.snapshot().experience.playerVertical.terrainHeightMeters,
+      ), true);
+      assert.equal(sandbox.snapshot().boot.status, 'ready');
+    } finally {
+      holdDestination = false;
+      transitionGate.resolve();
       if (sandbox) await sandbox.shutdown();
       environment.restore();
     }

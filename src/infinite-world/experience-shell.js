@@ -668,9 +668,11 @@ export function createInfiniteExperienceShell({
       tryStartPlayerJump(state.playerVertical, scaleProfile);
     }
     const wasGrounded = state.playerVertical.grounded;
+    const resolvedTerrainHeightMeters = horizontalCollision?.terrainHeightMeters;
     const vertical = stepPlayerVerticalMovement(state.playerVertical, {
       deltaSeconds: state.paused ? 0 : deltaSeconds,
-      terrainHeightMeters: getTerrainHeightMeters(player.x, player.z),
+      terrainHeightMeters: Number.isFinite(resolvedTerrainHeightMeters)
+        ? resolvedTerrainHeightMeters : getTerrainHeightMeters(player.x, player.z),
       scaleProfile,
     });
     const landed = !wasGrounded && vertical.grounded

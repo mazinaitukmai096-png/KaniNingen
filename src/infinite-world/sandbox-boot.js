@@ -139,6 +139,48 @@ function parseMeasurementQuality(value) {
   return value;
 }
 
+export function gatePlayerMovementByTerrainCoverage({
+  horizontalMovement,
+  startX,
+  startZ,
+  sampleCanonicalTerrainHeight,
+}) {
+  if (!Number.isFinite(horizontalMovement?.x) || !Number.isFinite(horizontalMovement?.z)) {
+    throw new Error('Player horizontal movement resolver returned a non-finite position');
+  }
+  if (typeof sampleCanonicalTerrainHeight !== 'function') {
+    throw new TypeError('Player terrain coverage gate requires a canonical Terrain sampler');
+  }
+  const owner = decomposeLogicalWorldPosition(horizontalMovement.x, horizontalMovement.z);
+  const candidateTerrainHeightMeters = sampleCanonicalTerrainHeight(
+    horizontalMovement.x,
+    horizontalMovement.z,
+  );
+  if (Number.isFinite(candidateTerrainHeightMeters)) {
+    return Object.freeze({
+      ...horizontalMovement,
+      terrainHeightMeters: candidateTerrainHeightMeters,
+      terrainCoverageBlocked: false,
+      terrainCoverageOwner: owner,
+    });
+  }
+  const retainedTerrainHeightMeters = sampleCanonicalTerrainHeight(startX, startZ);
+  if (!Number.isFinite(retainedTerrainHeightMeters)) {
+    const retainedOwner = decomposeLogicalWorldPosition(startX, startZ);
+    throw new Error(`formal Terrain is not active for Player Chunk ${retainedOwner.key}`);
+  }
+  return Object.freeze({
+    ...horizontalMovement,
+    x: startX,
+    z: startZ,
+    terrainHeightMeters: retainedTerrainHeightMeters,
+    terrainCoverageBlocked: true,
+    terrainCoverageOwner: owner,
+    blockedCandidateX: horizontalMovement.x,
+    blockedCandidateZ: horizontalMovement.z,
+  });
+}
+
 export function isW8GameplaySimulationEnabled(measurementMode, runPhase, paused = false) {
   return measurementMode !== null || (runPhase === 'playing' && paused !== true);
 }
@@ -2113,7 +2155,19 @@ export async function bootInfiniteWorldSandbox({
       worldState,
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
-      resolvePlayerHorizontalMovement: input => gameplay.resolvePlayerHorizontalMovement(input),
+      resolvePlayerHorizontalMovement: input => {
+        const horizontalMovement = gameplay.resolvePlayerHorizontalMovement(input);
+        const gatedMovement = gatePlayerMovementByTerrainCoverage({
+          horizontalMovement,
+          startX: input.startX,
+          startZ: input.startZ,
+          sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+        });
+        if (gatedMovement.terrainCoverageBlocked) {
+          requestPlayerTerrainCoverage(gatedMovement.terrainCoverageOwner);
+        }
+        return gatedMovement;
+      },
       onAttack: mode => gameplay.attack(mode),
       onCombatCommand: command => gameplay.executeCombatCommand(command),
       onPlayerLanding: input => gameplay.playerLanding(input),
@@ -2348,6 +2402,19 @@ export async function bootInfiniteWorldSandbox({
         .finally(() => { transitionTargetKey = null; });
     }
 
+    function requestPlayerTerrainCoverage(owner) {
+      if (!owner || (transitionTargetKey && transitionTargetKey !== owner.key)) return;
+      if (transitionTargetKey !== owner.key && !directionalPrefetchPending.has(owner.key)) {
+        directionalPrefetchPending.add(owner.key);
+        void diagnostics.measureAsync(
+          'chunk-prefetch',
+          () => runtime.prepareTransition(owner.chunkX, owner.chunkZ),
+        ).catch(error => { transitionError = error; })
+          .finally(() => directionalPrefetchPending.delete(owner.key));
+      }
+      requestTransition(owner);
+    }
+
     function requestDirectionalPrefetch(movement) {
       const streaming = runtime.getStreamingState();
       if (streaming.centerChunkX === null || transitionTargetKey || movement.speedMetersPerSecond <= 0) return;
@@ -2385,12 +2452,32 @@ export async function bootInfiniteWorldSandbox({
         scaleStageId: scaleProfile.stage.id,
       });
       if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
-        logicalPlayer.x += scaleProfile.movementMetersPerSecond * deltaSeconds;
-        logicalPlayer.facingY = Math.PI / 2;
+        const startX = logicalPlayer.x;
+        const startZ = logicalPlayer.z;
+        const intendedVelocityX = scaleProfile.movementMetersPerSecond;
+        const gatedMovement = gatePlayerMovementByTerrainCoverage({
+          horizontalMovement: Object.freeze({
+            x: startX + intendedVelocityX * deltaSeconds,
+            z: startZ,
+            collided: false,
+          }),
+          startX,
+          startZ,
+          sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+        });
+        logicalPlayer.x = gatedMovement.x;
+        logicalPlayer.z = gatedMovement.z;
+        if (gatedMovement.terrainCoverageBlocked) {
+          requestPlayerTerrainCoverage(gatedMovement.terrainCoverageOwner);
+        } else {
+          logicalPlayer.facingY = Math.PI / 2;
+        }
+        const inverseDelta = deltaSeconds > 0 ? 1 / deltaSeconds : 0;
+        const velocityX = (logicalPlayer.x - startX) * inverseDelta;
         movement = Object.freeze({
-          velocityX: scaleProfile.movementMetersPerSecond,
+          velocityX,
           velocityZ: 0,
-          speedMetersPerSecond: scaleProfile.movementMetersPerSecond,
+          speedMetersPerSecond: Math.abs(velocityX),
           sprint: false,
           scaleStageId: scaleProfile.stage.id,
         });
