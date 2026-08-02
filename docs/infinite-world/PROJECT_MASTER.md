@@ -482,3 +482,64 @@ Browser連携が利用できない場合は、
 - Harness／Telemetryで代替可能な範囲だけ確認
 
 とする。
+
+---
+
+## 22. W8 操作・Streaming・描画整合性（2026-08-02）
+
+この節を本プロジェクトの最新状態とする。旧節の記録は履歴として保持する。
+
+### 完了
+
+- Phase A: focus loss、Title、Retry、Continue、modal遷移時の入力解除を共通化
+- Phase B: Tree / Bush / Grass / Rockの距離契約とObject別Telemetryを共通policyへ集約
+- Phase C: Node / FakeThree benchmarkを追加。既存の1 owner/frame上限を維持
+- Phase D: Preset revision混在を計測で確認し、Terrain / River / Natural / Fog / Distant rootを
+  required owner ready後の同一publication frameで切替
+- Phase E1: Building / Settlementをread-only shadow planへ登録
+- Phase E2: owner / Stable ID / Settlement ID / Road / damageを検証するtransactional stagingを追加
+- Phase E3: Building、Settlement、Road、remote metadataをshared planへ排他的にhandoff
+- Phase E4: Building / Settlement stageをPreset revision fenceへ参加
+
+### 維持した契約
+
+- Tree / Bush / Rock: Short 84m、Standard 112m、Current 140m
+- Grass: Short 64m、Standard 67.2m、Current 84m
+- Current Settlement metadata: 875m
+- Fog、Object密度、Object固有LOD / Mesh / Material / Shaderは変更なし
+- Stable ID、Save v5、Continue / Retry、Floating Origin、PLAY-SYNCを維持
+- Workerは1本、Natural admissionは1 owner/frameを維持
+- `?settlementStreaming=legacy`で旧Building / Settlement publisherへrollback可能
+
+### Acceptance
+
+- 全repository serial suite: 740/740 PASS
+- Render Distance統合: Current / Standard / Short PASS
+- Building / Settlement shadow parity: owner、Stable ID、Settlement ID、Road、damage、境界 PASS
+- duplicate publisher / duplicate Stable ID / orphan staging / stale revision publication: 0
+- deterministic Node / FakeThree benchmark: PASS
+- admission最大: 1 owner/frame
+- required first draw missing: 0
+- 50ms超Harness処理: 0
+- Node値はwork量・同期slice・allocation回帰判定専用であり、Browser frame値ではない
+
+### 暫定・未完了
+
+- Edge / Chrome連携が利用不能のため、frame p50 / p95 / max、50ms超率、目視pop-in、
+  10～15分soakは未実施
+- 性能・目視Acceptanceは暫定合格。Browser復旧後の実測で最終判定する
+- legacy Building / Settlement経路の削除はBrowser Acceptance合格後の独立commitまで禁止
+- 現在はsharedが既定publisherだが、legacy rollback adapterを保持する
+
+### この計画のcommit
+
+- `1ab621a fix: clear player input state on focus loss`
+- `4045f0d refactor: define natural visibility contracts by policy`
+- `5719241 test: benchmark world streaming transition workloads`
+- `6d84850 test: measure render distance revision consistency`
+- `181dc72 feat: coordinate render distance revision publication`
+- `669d779 feat: shadow building and settlement streaming plans`
+- `13126f0 feat: stage building and settlement presentation transactionally`
+- `3441dbb feat: publish buildings through shared streaming plans`
+- `fd39e6b feat: publish settlements and roads through shared streaming plans`
+- `a25dd41 feat: join settlements to render distance revision publication`
