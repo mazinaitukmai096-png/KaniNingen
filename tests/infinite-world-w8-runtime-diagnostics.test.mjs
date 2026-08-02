@@ -40,6 +40,17 @@ import {
 import { createRuntimeTransitionContract } from '../src/infinite-world/runtime-transition-contract.js';
 import { createMacroTerrainEvaluator } from '../src/infinite-world/legacy-core/g5/macro-terrain.js';
 import { determineDetailCandidateOwner } from '../src/infinite-world/legacy-core/g3/detail-candidates.js';
+import {
+  isW8ForestHorizonOwner,
+  resolveW8VegetationLodBlend,
+  resolveW8VegetationLodPolicy,
+} from '../src/infinite-world/vegetation-lod-policy.js';
+import {
+  WORLD_STREAMING_EVENT,
+  WORLD_STREAMING_STREAM,
+  WORLD_STREAMING_TARGET,
+  createWorldStreamingTelemetry,
+} from '../src/infinite-world/world-streaming-telemetry.js';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
@@ -207,6 +218,7 @@ function createDistantTestVisualAssets() {
       broadleafTree: [TREE_PART],
       wetlandTree: [TREE_PART],
       shrub: [SHRUB_PART],
+      grass: [SHRUB_PART],
       rock: [ROCK_PART],
       factory: [CANONICAL_HOUSE_PART],
       barn: [CANONICAL_HOUSE_PART],
@@ -800,7 +812,7 @@ test('shrub visuals remain aligned across mid and near LOD', async () => {
   })), true);
   const generationRoot = scene.children[0].children[0];
   const shrubMesh = generationRoot.children.find(child => (
-    child.name === 'w8-canonical-lod-natural-box-bush'
+    child.name === 'w8-canonical-lod-natural-full-bush-box-bush'
   ));
   assert.ok(shrubMesh);
   assert.equal(shrubMesh.count, 1);
@@ -865,7 +877,10 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
     assert.deepEqual(object.identity, identity);
     assert.equal(object.visibleLod, state.lod);
     assert.equal(object.ownerKey, '5,0');
-    assert.equal(object.instanceCount, 1);
+    assert.equal(object.instanceCount, 3);
+    assert.equal(object.naturalLod.kind, 'tree');
+    assert.equal(object.naturalLod.owner, object.ownerKey);
+    assert.equal(object.naturalLod.distanceSource, 'logical-object-position');
     const snapshot = presentation.snapshot();
     assert.equal(snapshot.canonicalVegetationRecordCount, 1);
     assert.equal(snapshot.distantTreeProxyCount, 0);
@@ -955,6 +970,91 @@ test('Near, Outer, and Far use one canonical natural candidate set', async () =>
   presentation.dispose();
 });
 
+test('natural streaming preserves existing Outer Stable IDs and reveals only new Far instances', async () => {
+  const tree = (candidateId, chunkX, x) => Object.freeze({
+    candidateId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: chunkX, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const existingTree = tree('detail-v1:vegetation:stream-existing', 2, 40);
+  const newFarTree = tree('detail-v1:vegetation:stream-new-far', 4, 72);
+  const chunkWith = candidate => {
+    const chunk = canonicalChunk(candidate.owningChunkCoordinate.x, 0, []);
+    chunk.vegetationCandidates = [candidate];
+    chunk.presentationLayers.natural = { vegetation: [candidate], rocks: [] };
+    return chunk;
+  };
+  const activeChunk = chunkWith(existingTree);
+  const farChunk = chunkWith(newFarTree);
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 4 && chunkZ === 0 ? farChunk : null
+    ),
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['2,0'],
+    renderedKeys: [],
+    chunk: activeChunk,
+    playerLogicalX: 8,
+    quality: 'high',
+  });
+  assert.equal(await presentation.sync({
+    ...input,
+    includeFarNatural: false,
+  }), true);
+  assert.equal(presentation.snapshot().naturalLodReveal, 1);
+  assert.equal(presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === existingTree.candidateId
+  ))?.visibleLod, 'mid');
+
+  assert.equal(await presentation.sync({
+    ...input,
+    includeFarNatural: true,
+    includeUltraNatural: false,
+    revealNatural: true,
+    naturalRevealInnerMeters: 0,
+  }), true);
+  const generationRoot = scene.children[0].children[0];
+  const revealValuesFor = stableId => generationRoot.children.flatMap(mesh => {
+    const index = mesh.userData?.canonicalStableIds?.indexOf(stableId) ?? -1;
+    if (index < 0) return [];
+    const attribute = mesh.geometry?.attributes?.w8NaturalInitialReveal;
+    const values = attribute?.array ?? attribute?.values;
+    return values ? [values[index]] : [];
+  });
+  assert.deepEqual([...new Set(revealValuesFor(existingTree.candidateId))], [1]);
+  assert.deepEqual([...new Set(revealValuesFor(newFarTree.candidateId))], [0]);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.naturalLodReveal, 0);
+  assert.equal(snapshot.naturalLodRevealPreservedStableIdCount >= 1, true);
+  const material = generationRoot.children.find(mesh => (
+    mesh.material?.userData?.naturalLod === true
+  )).material;
+  assert.equal(material.userData.naturalLodUniforms.w8NaturalReveal.value, 0);
+  const shader = {
+    uniforms: {},
+    vertexShader: '#include <begin_vertex>',
+    fragmentShader: '#include <color_fragment>',
+  };
+  material.onBeforeCompile(shader);
+  assert.match(shader.vertexShader, /attribute float w8NaturalInitialReveal/);
+  assert.match(shader.fragmentShader, /max\(vW8NaturalInitialReveal, w8NaturalReveal\)/);
+  assert.doesNotMatch(shader.fragmentShader, /w8NaturalRevealInner/);
+  presentation.dispose();
+});
+
 test('committed runtime state updates Near/Outer exclusion immediately and rejects an older origin', async () => {
   const tree = Object.freeze({
     candidateId: 'detail-v1:vegetation:origin-handoff',
@@ -1008,7 +1108,13 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
   presentation.dispose();
 });
 
-test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, exclusive, and deterministic', async () => {
+test('Tree full, Forest, and Atmospheric tiers cross-fade by exact logical distance', async () => {
+  const forestHorizonSeed = `sha256:${'0'.repeat(63)}3`;
+  assert.equal(isW8ForestHorizonOwner({
+    worldSeedHash: forestHorizonSeed,
+    chunkX: 5,
+    chunkZ: 0,
+  }), true);
   const candidate = (candidateId, subtype, x) => Object.freeze({
     candidateId,
     subtype,
@@ -1024,7 +1130,7 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
     candidate('detail-v1:vegetation:silhouette-wetland', 'wetland-tree', 80),
     candidate('detail-v1:vegetation:silhouette-conifer', 'conifer-tree', 80),
     candidate('detail-v1:vegetation:ultra-tree', 'broadleaf-tree', 92),
-    candidate('detail-v1:vegetation:hidden-tree', 'broadleaf-tree', 153),
+    candidate('detail-v1:vegetation:hidden-tree', 'broadleaf-tree', 200),
   ]);
   const makeChunk = vegetation => {
     const chunk = canonicalChunk(5, 0, []);
@@ -1038,7 +1144,7 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
     const presentation = await createW8DistantPresentation({
       THREE: DISTANT_TEST_THREE,
       scene,
-      worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+      worldSeedHash: forestHorizonSeed,
       visualAssets: createSilhouetteTestVisualAssets(),
       findSettlementsNear: async () => [],
       resolveTemplate: async () => null,
@@ -1084,6 +1190,7 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
       position: value.identity.worldPosition,
       rotationY: value.identity.rotationY,
       visibleLod: value.visibleLod,
+      naturalLod: value.naturalLod,
       instances: value.instanceCount,
       occurrences: result.occurrences[value.identity.stableId],
     },
@@ -1091,19 +1198,26 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
   assert.deepEqual(auditById(normal), auditById(reverse));
   assert.deepEqual(auditById(normal), auditById(parallel));
   assert.deepEqual(normal.occurrences, {
-    'detail-v1:vegetation:full-broadleaf': 3,
-    'detail-v1:vegetation:silhouette-broadleaf': 1,
-    'detail-v1:vegetation:silhouette-wetland': 1,
-    'detail-v1:vegetation:silhouette-conifer': 1,
-    'detail-v1:vegetation:ultra-tree': 1,
-    'detail-v1:vegetation:hidden-tree': 0,
+    'detail-v1:vegetation:full-broadleaf': 6,
+    'detail-v1:vegetation:silhouette-broadleaf': 6,
+    'detail-v1:vegetation:silhouette-wetland': 6,
+    'detail-v1:vegetation:silhouette-conifer': 5,
+    'detail-v1:vegetation:ultra-tree': 6,
+    'detail-v1:vegetation:hidden-tree': 6,
   });
-  assert.equal(normal.snapshot.visibleCanonicalTreeCount, 5);
+  assert.equal(normal.snapshot.visibleCanonicalTreeCount, 6);
   assert.equal(normal.snapshot.visibleCanonicalFullTreeCount, 1);
   assert.equal(normal.snapshot.visibleCanonicalSilhouetteTreeCount, 3);
-  assert.equal(normal.snapshot.visibleCanonicalUltraTreeCount, 1);
-  assert.equal(normal.snapshot.visibleCanonicalTreePartInstanceCount, 7);
+  assert.equal(normal.snapshot.visibleCanonicalUltraTreeCount, 2);
+  assert.equal(normal.snapshot.visibleCanonicalTreePartInstanceCount, 35);
   assert.equal(normal.snapshot.distantTreeProxyCount, 0);
+  assert.equal(normal.snapshot.naturalLodShaderEnabled, true);
+  assert.equal(normal.snapshot.naturalLodMaterialCount, 6);
+  assert.equal(normal.snapshot.naturalLodMeshCount, 10);
+  assert.equal(normal.snapshot.naturalLodGeometryCount, 10);
+  assert.equal(normal.snapshot.naturalLodDrawCallEquivalent, 10);
+  assert.equal(normal.snapshot.forestHorizonMaterialCount, 1);
+  assert.equal(normal.snapshot.forestHorizonMeshCount, 2);
   const broadleafSilhouette = candidates[1];
   const broadleafAudit = normal.audit.find(value => (
     value.identity.stableId === broadleafSilhouette.candidateId
@@ -1113,17 +1227,17 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
   assert.deepEqual(broadleafAudit.identity.owningChunkCoordinate, { x: 5, z: 0 });
   assert.equal(broadleafAudit.identity.rotationY, Math.PI / 2);
   const broadleafMesh = normal.meshes.find(mesh => (
-    mesh.name === 'w8-canonical-lod-natural-silhouette-sphere-treeLeaves'
+    mesh.name === 'w8-canonical-lod-natural-forest-tree-sphere-__natural-silhouette__'
   ));
   assert.ok(broadleafMesh);
   const broadleafMatrix = broadleafMesh.matrices[broadleafMesh.userData.canonicalStableIds.indexOf(
     broadleafSilhouette.candidateId,
   )].value;
   const visual = resolveW8NaturalCandidateVisual(broadleafSilhouette);
-  const fullScale = {
-    x: visual.widthMeters * 256 * 0.82,
-    y: visual.heightMeters * 256 * 0.72,
-    z: visual.depthMeters * 256 * 0.82,
+  const forestScale = {
+    x: visual.widthMeters * 256 * 0.82 * 1.28,
+    y: visual.heightMeters * 256 * 0.72 * (0.94 + (1.28 - 1) * 0.35),
+    z: visual.depthMeters * 256 * 0.82 * 1.28,
   };
   const canonicalBroadleafMatrix = {
     position: {
@@ -1132,7 +1246,7 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
       z: broadleafSilhouette.worldPosition.z * 256,
     },
     rotation: { x: 0, y: Math.PI / 2, z: 0 },
-    scale: fullScale,
+    scale: forestScale,
   };
   assert.deepEqual(broadleafMatrix, canonicalBroadleafMatrix);
   const canonicalTreeMatrix = (tree, part) => {
@@ -1154,35 +1268,68 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
   const matrixFor = (mesh, stableId) => mesh.matrices[mesh.userData.canonicalStableIds.indexOf(
     stableId,
   )].value;
-  const wetlandMesh = normal.meshes.find(mesh => (
-    mesh.name === 'w8-canonical-lod-natural-silhouette-sphere-wetlandLeaves'
-  ));
+  const wetlandMesh = broadleafMesh;
   const coniferMesh = normal.meshes.find(mesh => (
-    mesh.name === 'w8-canonical-lod-natural-silhouette-cone-treeLeaves'
+    mesh.name === 'w8-canonical-lod-natural-forest-tree-cone-__natural-silhouette__'
   ));
   assert.ok(wetlandMesh);
   assert.ok(coniferMesh);
   assert.deepEqual(
     matrixFor(wetlandMesh, candidates[2].candidateId),
-    canonicalTreeMatrix(candidates[2], SILHOUETTE_WETLAND_PRIMARY_PART),
+    canonicalTreeMatrix(candidates[2], {
+      ...SILHOUETTE_WETLAND_PRIMARY_PART,
+      scale: [0.78 * 1.28, 0.68 * (0.94 + (1.28 - 1) * 0.35), 0.78 * 1.28],
+    }),
   );
   assert.deepEqual(
     matrixFor(coniferMesh, candidates[3].candidateId),
-    canonicalTreeMatrix(candidates[3], SILHOUETTE_CONIFER_PART),
+    canonicalTreeMatrix(candidates[3], {
+      ...SILHOUETTE_CONIFER_PART,
+      scale: [0.76 * 1.28, 0.78 * (0.94 + (1.28 - 1) * 0.35), 0.76 * 1.28],
+    }),
   );
-  assert.equal(broadleafMesh.material.flatShading, undefined);
-  assert.equal(broadleafMesh.material.shininess, undefined);
-  const ultraMesh = normal.meshes.find(mesh => (
-    mesh.name === 'w8-canonical-lod-natural-ultra-sphere-treeLeaves'
+  assert.equal(broadleafMesh.material.flatShading, true);
+  assert.equal(broadleafMesh.material.shininess, 0);
+  assert.equal(broadleafMesh.material.transparent, false);
+  assert.equal(broadleafMesh.material.alphaHash, true);
+  assert.equal(broadleafMesh.material.userData.naturalLodDistanceSource, 'instance-anchor');
+  const atmosphericMesh = normal.meshes.find(mesh => (
+    mesh.name === 'w8-canonical-lod-natural-atmospheric-tree-sphere-__natural-silhouette__'
   ));
-  assert.ok(ultraMesh);
-  assert.equal(ultraMesh.material, broadleafMesh.material);
+  assert.ok(atmosphericMesh);
+  assert.notEqual(atmosphericMesh.material, broadleafMesh.material);
+  assert.equal(new Set(normal.meshes.filter(mesh => (
+    mesh.name.includes('natural-forest-tree')
+  )).map(mesh => mesh.material)).size, 1);
+  assert.equal(new Set(normal.meshes.filter(mesh => (
+    mesh.name.includes('natural-atmospheric-tree')
+  )).map(mesh => mesh.material)).size, 1);
+  const horizonMesh = normal.meshes.find(mesh => (
+    mesh.name === 'w8-canonical-lod-natural-horizon-tree-sphere-__natural-silhouette__'
+  ));
+  assert.ok(horizonMesh);
+  assert.notEqual(horizonMesh.material, atmosphericMesh.material);
+  assert.equal(horizonMesh.material.userData.naturalLodMode, 'horizon');
+  assert.equal(new Set(normal.meshes.filter(mesh => (
+    mesh.name.includes('natural-horizon-tree')
+  )).map(mesh => mesh.material)).size, 1);
+  const horizonTree = candidates[5];
+  const horizonMatrix = matrixFor(horizonMesh, horizonTree.candidateId);
+  const horizonVisual = resolveW8NaturalCandidateVisual(horizonTree);
+  assert.equal(horizonMatrix.scale.x, horizonVisual.widthMeters * 256 * 0.82 * 2.84);
+  assert.equal(horizonMatrix.scale.z, horizonVisual.depthMeters * 256 * 0.82 * 2.84);
+  const horizonAudit = normal.audit.find(value => (
+    value.identity.stableId === horizonTree.candidateId
+  ));
+  assert.equal(horizonAudit.naturalLod.horizonOpacity, 1);
+  assert.equal(horizonAudit.naturalLod.horizonInstanceCount, 1);
+  assert.equal(horizonAudit.naturalLod.distanceSource, 'logical-object-position');
   const ultraTree = candidates[4];
-  const ultraMatrix = ultraMesh.matrices[ultraMesh.userData.canonicalStableIds.indexOf(
+  const ultraMatrix = atmosphericMesh.matrices[atmosphericMesh.userData.canonicalStableIds.indexOf(
     ultraTree.candidateId,
   )].value;
   const ultraVisual = resolveW8NaturalCandidateVisual(ultraTree);
-  assert.deepEqual(ultraMatrix, {
+  const expectedUltraMatrix = {
     position: {
       x: ultraTree.worldPosition.x * 256,
       y: ultraTree.worldPosition.y * 256 + ultraVisual.heightMeters * 256 * 0.64,
@@ -1190,29 +1337,51 @@ test('high-quality Tree full, silhouette, and Ultra tiers remain canonical, excl
     },
     rotation: { x: 0, y: Math.PI / 2, z: 0 },
     scale: {
-      x: ultraVisual.widthMeters * 256 * 0.82,
-      y: ultraVisual.heightMeters * 256 * 0.72,
-      z: ultraVisual.depthMeters * 256 * 0.82,
+      x: ultraVisual.widthMeters * 256 * 0.82 * 1.42,
+      y: ultraVisual.heightMeters * 256 * 0.72 * (0.94 + (1.42 - 1) * 0.35),
+      z: ultraVisual.depthMeters * 256 * 0.82 * 1.42,
     },
-  });
-  normal.presentation.update(32, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
-  assert.equal(normal.presentation.canonicalAuditSnapshot().find(value => (
-    value.identity.stableId === broadleafSilhouette.candidateId
-  )).presentationTier, 'full');
-  const fullMatrix = broadleafMesh.matrices[broadleafMesh.userData.canonicalStableIds.indexOf(
+  };
+  assert.deepEqual(ultraMatrix.position, expectedUltraMatrix.position);
+  assert.deepEqual(ultraMatrix.rotation, expectedUltraMatrix.rotation);
+  assert.equal(ultraMatrix.scale.x, expectedUltraMatrix.scale.x);
+  assert.ok(Math.abs(ultraMatrix.scale.y - expectedUltraMatrix.scale.y) < 1e-9);
+  assert.equal(ultraMatrix.scale.z, expectedUltraMatrix.scale.z);
+  const anchorIndex = broadleafMesh.userData.canonicalStableIds.indexOf(
     broadleafSilhouette.candidateId,
-  )].value;
-  normal.presentation.update(-12, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
-  assert.equal(normal.presentation.canonicalAuditSnapshot().find(value => (
+  );
+  assert.deepEqual(
+    [...broadleafMesh.geometry.attributes.w8NaturalAnchorXZ.values]
+      .slice(anchorIndex * 2, anchorIndex * 2 + 2),
+    [broadleafSilhouette.worldPosition.x * 256, broadleafSilhouette.worldPosition.z * 256],
+  );
+  const composeBeforeGpuFade = normal.presentation.snapshot().canonicalComposeCount;
+  normal.presentation.update(0, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+  const transitioned = normal.presentation.canonicalAuditSnapshot();
+  const fullForestBlend = transitioned.find(value => (
+    value.identity.stableId === candidates[0].candidateId
+  )).naturalLod;
+  const forestAtmosphericBlend = transitioned.find(value => (
     value.identity.stableId === broadleafSilhouette.candidateId
-  )).presentationTier, 'ultra');
-  const switchedUltraMatrix = ultraMesh.matrices[ultraMesh.userData.canonicalStableIds.indexOf(
-    broadleafSilhouette.candidateId,
-  )].value;
-  assert.deepEqual(fullMatrix, canonicalBroadleafMatrix);
-  assert.deepEqual(switchedUltraMatrix, canonicalBroadleafMatrix);
-  /* Full, silhouette, and Ultra share the authored canonical transform; LOD only reduces parts. */
-  assert.deepEqual(broadleafAudit.identity.worldPosition, broadleafSilhouette.worldPosition);
+  )).naturalLod;
+  assert.deepEqual(
+    [fullForestBlend.fullOpacity, fullForestBlend.forestOpacity,
+      fullForestBlend.atmosphericOpacity, fullForestBlend.totalOpacity],
+    [0.5, 0.5, 0, 1],
+  );
+  assert.deepEqual(
+    [forestAtmosphericBlend.fullOpacity, forestAtmosphericBlend.forestOpacity,
+      forestAtmosphericBlend.atmosphericOpacity, forestAtmosphericBlend.totalOpacity],
+    [0, 0.5, 0.5, 1],
+  );
+  assert.equal(normal.presentation.snapshot().canonicalComposeCount, composeBeforeGpuFade,
+    'distance-only cross-fade updates uniforms without CPU instance compaction');
+  assert.deepEqual(normal.presentation.snapshot().naturalLodPlayerLocalXZ, { x: 0, y: 2048 });
+  const blendBeforeRebase = forestAtmosphericBlend;
+  normal.presentation.update(0, 8, { renderOriginChunkX: 1, renderOriginChunkZ: 0 });
+  assert.deepEqual(normal.presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === broadleafSilhouette.candidateId
+  )).naturalLod, blendBeforeRebase, 'Floating Origin cannot change logical-object distance');
   normal.presentation.dispose();
   reverse.presentation.dispose();
   parallel.presentation.dispose();
@@ -1453,6 +1622,387 @@ test('the committed Local Terrain root hands owners off to the latest rendered r
   presentation.dispose();
 });
 
+test('runtime presentation handoff slices stop-reaccelerate and continuous crossings through one frame budget', async t => {
+  const trees = Object.freeze(Array.from({ length: 96 }, (_, index) => Object.freeze({
+    candidateId: `detail-v1:vegetation:runtime-handoff:${index}`,
+    subtype: index % 3 === 0 ? 'conifer-tree' : 'broadleaf-tree',
+    variationSeed: (index % 11) / 11,
+    orientationSeed: (index % 13) / 13,
+    worldPosition: Object.freeze({
+      x: 80 + (index % 14),
+      y: 0.4,
+      z: 1 + (Math.floor(index / 14) % 14),
+    }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  })));
+  const bushes = Object.freeze(Array.from({ length: 32 }, (_, index) => Object.freeze({
+    candidateId: `detail-v1:vegetation:runtime-handoff:bush:${index}`,
+    subtype: 'shrub',
+    variationSeed: (index % 7) / 7,
+    orientationSeed: (index % 9) / 9,
+    worldPosition: Object.freeze({ x: 80 + index % 14, y: 0.4, z: 2 + index % 12 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+  })));
+  const rocks = Object.freeze(Array.from({ length: 32 }, (_, index) => Object.freeze({
+    candidateId: `detail-v1:rock:runtime-handoff:${index}`,
+    candidateType: 'rock',
+    subtype: 'medium-rock',
+    sizeClass: 'medium',
+    variationSeed: (index % 7) / 7,
+    orientationSeed: (index % 9) / 9,
+    worldPosition: Object.freeze({ x: 80 + index % 14, y: 0.4, z: 3 + index % 12 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  })));
+  const grass = Object.freeze(Array.from({ length: 32 }, (_, index) => Object.freeze({
+    stableId: `wf1:ambient-detail:runtime-handoff:grass:${index}`,
+    detailType: 'grass',
+    worldPosition: Object.freeze({ x: 80 + index % 14, y: 0.4, z: 4 + index % 12 }),
+    rotationY: index / 8,
+    variation: index % 3,
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+  })));
+  const naturalChunk = canonicalChunk(5, 0, []);
+  naturalChunk.vegetationCandidates = Object.freeze([...trees, ...bushes]);
+  naturalChunk.rockCandidates = rocks;
+  naturalChunk.ambientDetails = grass;
+  naturalChunk.presentationLayers.natural = {
+    vegetation: naturalChunk.vegetationCandidates,
+    rocks,
+  };
+  naturalChunk.presentationLayers.ambientDetails = grass;
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    incrementalStaticTreePages: true,
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+  });
+  const initial = localTerrainCoverageFixture(4, 0);
+  initial.chunks.set('5,0', naturalChunk);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  assert.equal(await presentation.sync({
+    ...initial,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  for (let frame = 0; frame < 64
+    && presentation.snapshot().runtimePresentationHandoffPending; frame += 1) {
+    presentation.update(72, 8, initial.renderOrigin);
+  }
+  presentation.markFirstDraw();
+  const baseline = presentation.snapshot();
+  assert.equal(baseline.runtimePresentationHandoffPending, false);
+  assert.ok(baseline.canonicalShrubRecordCount >= bushes.length);
+  assert.ok(baseline.canonicalGrassRecordCount >= grass.length);
+  assert.ok(baseline.canonicalRockRecordCount >= rocks.length);
+
+  const reaccelerated = localTerrainCoverageFixture(3, 0);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: reaccelerated.activeDataKeys,
+    renderedKeys: reaccelerated.renderedKeys,
+    renderOrigin: reaccelerated.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.snapshot().runtimePresentationHandoffPending, true);
+  let accelerationFrames = 0;
+  while (presentation.snapshot().runtimePresentationHandoffPending
+    && accelerationFrames < 128) {
+    presentation.update(56, 8, reaccelerated.renderOrigin);
+    presentation.markFirstDraw();
+    accelerationFrames += 1;
+  }
+  const afterAcceleration = presentation.snapshot();
+  assert.equal(afterAcceleration.runtimePresentationHandoffPending, false);
+  assert.ok(accelerationFrames > 4, 'handoff must not flush every stage in one frame');
+  assert.ok(afterAcceleration.runtimePresentationHandoffLocalTerrainCount
+    > baseline.runtimePresentationHandoffLocalTerrainCount);
+  assert.ok(afterAcceleration.runtimePresentationHandoffMatrixUpdateCount
+    > baseline.runtimePresentationHandoffMatrixUpdateCount);
+  assert.ok(afterAcceleration.runtimePresentationHandoffBufferUpdateCount
+    > baseline.runtimePresentationHandoffBufferUpdateCount);
+  assert.ok(afterAcceleration.runtimePresentationHandoffMaximumSliceMs
+    < afterAcceleration.runtimePresentationFrameBudgetMs);
+  assert.ok(afterAcceleration.runtimePresentationHandoffMaximumMatrixUpdatesPerFrame
+    < afterAcceleration.runtimePresentationHandoffMatrixUpdateCount);
+  assert.ok(afterAcceleration.runtimePresentationHandoffMaximumBufferUpdatesPerFrame
+    < afterAcceleration.runtimePresentationHandoffBufferUpdateCount);
+  assert.equal(afterAcceleration.duplicateVisibleStableIdCount, 0);
+  assert.ok(presentation.treePathAuditSnapshot()
+    .filter(path => path.active)
+    .every(path => path.firstDrawAtMs !== null));
+
+  for (const centerChunkX of [2, 1, 0]) {
+    const crossing = localTerrainCoverageFixture(centerChunkX, 0);
+    assert.equal(presentation.commitRuntimeState({
+      activeDataKeys: crossing.activeDataKeys,
+      renderedKeys: crossing.renderedKeys,
+      renderOrigin: crossing.renderOrigin,
+      quality: 'high',
+      playerLogicalX: centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+      playerLogicalZ: 8,
+    }), true);
+    presentation.update(
+      centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+      8,
+      crossing.renderOrigin,
+    );
+  }
+  const finalCrossing = localTerrainCoverageFixture(0, 0);
+  let crossingDrainFrames = 0;
+  while (presentation.snapshot().runtimePresentationHandoffPending
+    && crossingDrainFrames < 128) {
+    presentation.update(8, 8, finalCrossing.renderOrigin);
+    presentation.markFirstDraw();
+    crossingDrainFrames += 1;
+  }
+  const crossed = presentation.snapshot();
+  assert.equal(crossed.runtimePresentationHandoffPending, false);
+  assert.ok(crossed.runtimePresentationHandoffSupersededCount >= 2);
+  assert.equal(crossed.duplicateVisibleStableIdCount, 0);
+  assert.ok(crossed.runtimePresentationHandoffMaximumSliceMs
+    < crossed.runtimePresentationFrameBudgetMs);
+
+  const replacement = localTerrainCoverageFixture(0, 0);
+  replacement.chunks.set('5,0', naturalChunk);
+  assert.equal(await presentation.sync({
+    ...replacement,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+  }), true);
+  let disposeFrames = 0;
+  while ((presentation.snapshot().deferredGenerationDisposeCount > 0
+      || presentation.snapshot().runtimePresentationHandoffPending
+      || presentation.snapshot().distantPersistentPublicationPending)
+    && disposeFrames < 128) {
+    presentation.update(8, 8, replacement.renderOrigin);
+    presentation.markFirstDraw();
+    disposeFrames += 1;
+  }
+  const disposed = presentation.snapshot();
+  assert.equal(disposed.deferredGenerationDisposeCount, 0);
+  assert.equal(disposed.distantPersistentPublicationPending, false);
+  assert.ok(disposed.distantPersistentPublicationCount > 0);
+  assert.ok(disposed.distantPersistentRemovedMeshCount > 0);
+  assert.equal(disposed.distantPersistentNewCanonicalMeshCount, 0);
+  assert.equal(disposed.distantPersistentAdmissionLimitViolationCount, 0);
+  assert.equal(disposed.distantPersistentOverBudgetUploadCount, 0);
+  assert.ok(disposed.distantPersistentMaximumMeshAdmissionsPerFrame <= 1);
+  assert.ok(disposed.distantPersistentMaximumUploadBytesPerFrame
+    <= disposed.distantPersistentUploadBudgetBytes);
+  assert.ok(disposed.runtimePresentationHandoffMaximumDisposePerFrame <= 1);
+  assert.equal(disposed.duplicateVisibleStableIdCount, 0);
+  t.diagnostic(JSON.stringify({
+    stopReaccelerate: {
+      frames: accelerationFrames,
+      maximumSliceMs: afterAcceleration.runtimePresentationHandoffMaximumSliceMs,
+      matrixUpdates: afterAcceleration.runtimePresentationHandoffMatrixUpdateCount
+        - baseline.runtimePresentationHandoffMatrixUpdateCount,
+      bufferUpdates: afterAcceleration.runtimePresentationHandoffBufferUpdateCount
+        - baseline.runtimePresentationHandoffBufferUpdateCount,
+      localTerrainHandoffs: afterAcceleration.runtimePresentationHandoffLocalTerrainCount
+        - baseline.runtimePresentationHandoffLocalTerrainCount,
+    },
+    continuousCrossing: {
+      drainFrames: crossingDrainFrames,
+      superseded: crossed.runtimePresentationHandoffSupersededCount,
+      duplicateStableIds: crossed.duplicateVisibleStableIdCount,
+    },
+    dispose: {
+      frames: disposeFrames,
+      resources: disposed.runtimePresentationHandoffDisposeCount,
+      maximumPerFrame: disposed.runtimePresentationHandoffMaximumDisposePerFrame,
+    },
+    persistentDistant: {
+      publications: disposed.distantPersistentPublicationCount,
+      reusedMeshes: disposed.distantPersistentReusedMeshCount,
+      newCanonicalMeshes: disposed.distantPersistentNewCanonicalMeshCount,
+      newAuxiliaryMeshes: disposed.distantPersistentNewAuxiliaryMeshCount,
+      matrixUpdates: disposed.distantPersistentMatrixUpdateCount,
+      bufferUpdates: disposed.distantPersistentBufferUpdateCount,
+      uploadBytesMaximumPerFrame: disposed.distantPersistentMaximumUploadBytesPerFrame,
+      boundsRecalculations: disposed.distantPersistentBoundsRecalculationCount,
+    },
+  }));
+  presentation.dispose();
+});
+
+test('persistent Distant buckets reuse Natural and Settlement slots through inner-outer transitions', async t => {
+  const ownerX = 5;
+  const ownerZ = 0;
+  const bush = Object.freeze({
+    candidateId: 'detail-v1:vegetation:persistent-distant:bush',
+    subtype: 'shrub',
+    variationSeed: 0.25,
+    orientationSeed: 0.5,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 10 }),
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: ownerZ }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+  });
+  const rock = Object.freeze({
+    candidateId: 'detail-v1:rock:persistent-distant',
+    candidateType: 'rock',
+    subtype: 'medium-rock',
+    sizeClass: 'medium',
+    variationSeed: 0.4,
+    orientationSeed: 0.6,
+    worldPosition: Object.freeze({ x: 89, y: 0.4, z: 10 }),
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: ownerZ }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  });
+  const grass = Object.freeze({
+    stableId: 'wf1:ambient-detail:persistent-distant:grass',
+    detailType: 'grass',
+    worldPosition: Object.freeze({ x: 90, y: 0.4, z: 10 }),
+    rotationY: 0.2,
+    variation: 1,
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: ownerZ }),
+  });
+  const source = canonicalChunk(ownerX, ownerZ, [CANONICAL_BUILDING]);
+  source.vegetationCandidates = Object.freeze([bush]);
+  source.rockCandidates = Object.freeze([rock]);
+  source.ambientDetails = Object.freeze([grass]);
+  source.presentationLayers.natural = {
+    vegetation: source.vegetationCandidates,
+    rocks: source.rockCandidates,
+  };
+  source.presentationLayers.ambientDetails = source.ambientDetails;
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    incrementalStaticTreePages: true,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === ownerX && chunkZ === ownerZ
+        ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has(`${ownerX},${ownerZ}`)) {
+      result.chunks.set(`${ownerX},${ownerZ}`, source);
+    }
+    return result;
+  };
+  const initial = coverage(4);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  assert.equal(await presentation.sync({
+    ...initial,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  presentation.markFirstDraw();
+  const persistentRoot = scene.children[0].children.find(child => (
+    /^w8-distant-presentation-epoch-/.test(child.name)
+  ));
+  const baseline = presentation.snapshot();
+  assert.ok(persistentRoot);
+  assert.ok(baseline.naturalLodMeshCount > 0);
+
+  const updateDurations = [];
+  const drain = (state, maximumFrames = 256) => {
+    let frames = 0;
+    while (presentation.snapshot().distantPersistentPublicationPending
+      && frames < maximumFrames) {
+      const startedAt = performance.now();
+      presentation.update(
+        state.centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+        8,
+        state.renderOrigin,
+      );
+      updateDurations.push(performance.now() - startedAt);
+      presentation.markFirstDraw();
+      frames += 1;
+    }
+    assert.equal(presentation.snapshot().distantPersistentPublicationPending, false);
+    return frames;
+  };
+
+  const outer = coverage(3);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: outer.activeDataKeys,
+    renderedKeys: outer.renderedKeys,
+    renderOrigin: outer.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(await presentation.sync({
+    ...outer,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  const innerToOuterFrames = drain(outer);
+  const afterOuter = presentation.snapshot();
+  assert.equal(scene.children[0].children.includes(persistentRoot), true);
+  assert.ok(afterOuter.distantPersistentReusedMeshCount > 0);
+  assert.equal(afterOuter.distantPersistentNewCanonicalMeshCount, 0);
+
+  for (let frame = 0; frame < 8; frame += 1) {
+    const startedAt = performance.now();
+    presentation.update(56, 8, outer.renderOrigin);
+    updateDurations.push(performance.now() - startedAt);
+    presentation.markFirstDraw();
+  }
+  const backInner = coverage(4);
+  assert.equal(await presentation.sync({
+    ...backInner,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  const supersedingOuter = coverage(3);
+  assert.equal(await presentation.sync({
+    ...supersedingOuter,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  const reaccelerateFrames = drain(supersedingOuter);
+  const completed = presentation.snapshot();
+  const audit = presentation.canonicalAuditSnapshot();
+  const maximumUpdateMs = Math.max(...updateDurations);
+  assert.equal(scene.children[0].children.includes(persistentRoot), true);
+  assert.equal(completed.distantPersistentAdmissionLimitViolationCount, 0);
+  assert.equal(completed.distantPersistentOverBudgetUploadCount, 0);
+  assert.ok(completed.distantPersistentMaximumMeshAdmissionsPerFrame <= 1);
+  assert.ok(completed.distantPersistentMaximumUploadBytesPerFrame
+    <= completed.distantPersistentUploadBudgetBytes);
+  assert.equal(completed.duplicateVisibleStableIdCount, 0);
+  assert.ok(completed.distantPersistentBoundsRecalculationCount > 0);
+  assert.equal(new Set(audit.map(entry => entry.identity.stableId)).size, audit.length);
+  assert.ok(audit.some(entry => entry.identity.stableId === CANONICAL_BUILDING_ID
+    && entry.composedInstanceCount > 0));
+  assert.ok(maximumUpdateMs < 50);
+  t.diagnostic(JSON.stringify({
+    innerToOuterFrames,
+    stopFrames: 8,
+    reaccelerateFrames,
+    persistentRootReused: true,
+    newCanonicalMeshes: completed.distantPersistentNewCanonicalMeshCount,
+    newAuxiliaryMeshes: completed.distantPersistentNewAuxiliaryMeshCount,
+    uploadBytesPerFrameMax: completed.distantPersistentMaximumUploadBytesPerFrame,
+    uploadBudgetBytes: completed.distantPersistentUploadBudgetBytes,
+    boundsRecalculations: completed.distantPersistentBoundsRecalculationCount,
+    matrixUpdates: completed.distantPersistentMatrixUpdateCount,
+    bufferUpdates: completed.distantPersistentBufferUpdateCount,
+    maximumUpdateMs,
+    duplicateStableIds: completed.duplicateVisibleStableIdCount,
+  }));
+  presentation.dispose();
+});
+
 test('continuous Local Terrain boundaries discard stale builds and shutdown blocks late publication', async () => {
   const pendingYields = [];
   const scene = new DistantTestGroup();
@@ -1682,7 +2232,7 @@ test('Local terrain build failure never replaces or disposes the complete old ro
   presentation.dispose();
 });
 
-test('canonical LOD only rewrites dirty buckets', async () => {
+test('canonical natural LOD moves cross-fade distance on the GPU without bucket rewrites', async () => {
   const candidates = Object.freeze([
     Object.freeze({
       candidateId: 'detail-v1:dirty-full', subtype: 'broadleaf-tree', variationSeed: 1,
@@ -1724,8 +2274,11 @@ test('canonical LOD only rewrites dirty buckets', async () => {
   const reused = unchanged;
   presentation.update(32, 8, input.renderOrigin);
   const changed = presentation.snapshot();
-  assert.ok(changed.canonicalComposeCount > reused.canonicalComposeCount);
-  assert.ok(changed.canonicalDirtyBucketCount - reused.canonicalDirtyBucketCount < changed.canonicalMeshCount);
+  assert.equal(changed.canonicalComposeCount, reused.canonicalComposeCount);
+  assert.equal(changed.canonicalMatrixUpdateCount, reused.canonicalMatrixUpdateCount);
+  assert.equal(changed.canonicalNeedsUpdateCount, reused.canonicalNeedsUpdateCount);
+  assert.equal(changed.canonicalDirtyBucketCount, reused.canonicalDirtyBucketCount);
+  assert.deepEqual(changed.naturalLodPlayerLocalXZ, { x: 8192, y: 2048 });
   assert.equal(changed.distantTreeProxyCount, 0);
   const audit = presentation.canonicalAuditSnapshot();
   assert.deepEqual(audit.map(value => value.ownerKey).sort(), ['5,0', '5,0']);
@@ -2028,6 +2581,7 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   let signalFirstOwner;
   const firstOwnerStarted = new Promise(resolve => { signalFirstOwner = resolve; });
   let ownerCalls = 0;
+  let firstOwnerKey = null;
   const requestMetadata = [];
   const cancelledConsumers = [];
   const presentation = await createW8DistantPresentation({
@@ -2038,15 +2592,21 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
     findSettlementsNear: async () => [],
     resolveTemplate: async () => null,
     getCanonicalChunkData: async (chunkX, chunkZ, metadata) => {
-      requestMetadata.push(metadata);
+      requestMetadata.push({ ...metadata, chunkX, chunkZ });
       ownerCalls += 1;
       if (ownerCalls === 1) {
+        firstOwnerKey = `${chunkX},${chunkZ}`;
         signalFirstOwner();
-        await firstOwner;
+        return firstOwner;
       }
       return canonicalChunk(chunkX, chunkZ, []);
     },
-    cancelCanonicalChunkRequests: options => cancelledConsumers.push(options),
+    cancelCanonicalChunkRequests: options => {
+      cancelledConsumers.push(options);
+      if (requestMetadata[0] && options.beforeEpoch > requestMetadata[0].epoch) {
+        releaseFirstOwner(null);
+      }
+    },
   });
   const firstInput = canonicalSyncInput({
     centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk: canonicalChunk(0, 0, []), quality: 'high',
@@ -2067,7 +2627,6 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   secondInput.renderDistancePreset = 'current';
   secondInput.renderOrigin.rebaseCount = 2;
   const second = presentation.sync(secondInput);
-  releaseFirstOwner();
   assert.equal(await first, false);
   assert.equal(await second, true);
   const snapshot = presentation.snapshot();
@@ -2079,6 +2638,14 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
     && Number.isSafeInteger(value.epoch)));
   assert.ok(cancelledConsumers.some(value => value.consumerId === 'distant-owner-query'
     && value.beforeEpoch > requestMetadata[0].epoch));
+  assert.equal(requestMetadata.filter(value => (
+    `${value.chunkX},${value.chunkZ}` === firstOwnerKey
+  )).length >= 2, true, 'the new epoch must re-request an owner cancelled to null');
+  assert.equal(snapshot.queryCanonicalChunkSuccessCount, snapshot.queryOwnerChunkCount);
+  const callsBeforeCacheReuse = ownerCalls;
+  assert.equal(await presentation.sync(secondInput), true);
+  assert.equal(ownerCalls, callsBeforeCacheReuse,
+    'a successful replacement request remains reusable after the cancelled null');
   presentation.dispose();
 });
 
@@ -3869,7 +4436,7 @@ test('High and Medium keep every remote Building while reducing only silhouette 
   assert.equal(low.snapshot.remoteHorizonPartInstanceCount, buildings.length);
 });
 
-test('Tree LOD diagnostics are opt-in and mirror canonical full and silhouette tiers', async () => {
+test('Tree LOD diagnostics are opt-in and mirror full, Forest, and Atmospheric tiers', async () => {
   const candidates = Object.freeze([
     Object.freeze({
       candidateId: 'detail-v1:debug-full-tree', subtype: 'broadleaf-tree', variationSeed: 1,
@@ -3917,16 +4484,19 @@ test('Tree LOD diagnostics are opt-in and mirror canonical full and silhouette t
   const overlays = diagnostic.children.filter(child => child.userData?.treeLodTier);
   assert.equal(overlays.filter(child => child.userData.treeLodTier === 'full')
     .reduce((sum, child) => sum + child.count, 0), before.visibleCanonicalFullTreeCount);
-  assert.equal(overlays.filter(child => child.userData.treeLodTier === 'silhouette')
+  assert.equal(overlays.filter(child => child.userData.treeLodTier === 'forest')
     .reduce((sum, child) => sum + child.count, 0), before.visibleCanonicalSilhouetteTreeCount);
-  assert.equal(overlays.filter(child => child.userData.treeLodTier === 'ultra')
+  assert.equal(overlays.filter(child => child.userData.treeLodTier === 'atmospheric')
     .reduce((sum, child) => sum + child.count, 0), before.visibleCanonicalUltraTreeCount);
   assert.equal(overlays.every(child => child.material.depthTest === false
     && child.material.depthWrite === false && child.renderOrder >= 10_000), true);
-  const ring = diagnostic.children.find(child => child.name === 'w8-tree-lod-debug-84m-ring');
+  const ring = diagnostic.children.find(child => (
+    child.name === 'w8-tree-lod-debug-atmospheric-fade-ring'
+  ));
   assert.ok(ring);
+  assert.equal(ring.userData.radiusMeters, 140);
   assert.equal(ring.material.depthTest, false);
-  assert.equal(ring.renderOrder, 10_002);
+  assert.equal(ring.renderOrder, 10_003);
   assert.equal(presentation.setTreeLodDiagnosticsEnabled(false), false);
   assert.equal(generationRoot.children.some(child => child.name === 'w8-tree-lod-diagnostics'), false);
   assert.deepEqual(presentation.snapshot().visibleCanonicalTreeCount, before.visibleCanonicalTreeCount);
@@ -3934,9 +4504,180 @@ test('Tree LOD diagnostics are opt-in and mirror canonical full and silhouette t
   presentation.dispose();
 });
 
-test('High circular natural-owner query covers the 140m Ultra Tree circle without duplicate active or inner owners', async () => {
+test('Tree path audit isolates legacy-only, static-only, and dual-root rendering', async t => {
+  const candidate = (ownerX, suffix, x) => Object.freeze({
+    candidateId: `detail-v1:path-audit:${ownerX}:${suffix}`,
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.75,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const createTreeChunk = (ownerX, trees) => {
+    const chunk = canonicalChunk(ownerX, 0, []);
+    chunk.vegetationCandidates = Object.freeze(trees);
+    chunk.presentationLayers.natural = { vegetation: chunk.vegetationCandidates, rocks: [] };
+    return chunk;
+  };
+  const firstChunk = createTreeChunk(5, [
+    candidate(5, 'full', 56),
+    candidate(5, 'forest', 80),
+    candidate(5, 'ultra', 92),
+  ]);
+  const secondChunk = createTreeChunk(6, [candidate(6, 'replacement', 104)]);
+  const chunks = new Map([['5,0', firstChunk], ['6,0', secondChunk]]);
+  const scene = new DistantTestGroup();
+  const createPresentation = incrementalStaticTreePages => createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunks.get(`${chunkX},${chunkZ}`) ?? canonicalChunk(chunkX, chunkZ, [])
+    ),
+    incrementalStaticTreePages,
+  });
+  const syncInput = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk: firstChunk,
+    playerLogicalX: 8,
+    quality: 'high',
+  });
+  const legacy = await createPresentation(false);
+  assert.equal(await legacy.sync(syncInput), true);
+  legacy.markFirstDraw();
+  const legacyAudit = Object.fromEntries(legacy.treePathAuditSnapshot().map(path => (
+    [path.pathId, path]
+  )));
+  assert.equal(legacyAudit['distant-legacy-tree'].active, true);
+  assert.equal(legacyAudit['distant-legacy-tree'].instanceCount > 0, true);
+  assert.equal(legacyAudit['distant-static-tree'].instanceCount, 0);
+
+  const shared = await createPresentation(true);
+  assert.equal(await shared.sync(syncInput), true);
+  let coverageGeneration = 1;
+  let planRevision = 1;
+  const apply = ({ retainedOwnerKeys, readyPages = [] }) => shared.applyStaticTreePlan({
+    coverageGeneration,
+    planRevision,
+    planId: `path-audit:${coverageGeneration}:${planRevision}`,
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: syncInput.renderOrigin,
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    retainedOwnerKeys,
+    readyPages,
+  });
+  const drive = async predicate => {
+    for (let frame = 0; frame < 100 && !predicate(); frame += 1) {
+      shared.update(8, 8, syncInput.renderOrigin);
+      shared.markFirstDraw();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(predicate(), true);
+  };
+  apply({
+    retainedOwnerKeys: ['5,0'],
+    readyPages: [{
+      ownerKey: '5,0', resourceKind: 'canonical', value: firstChunk,
+      readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
+    }],
+  });
+  await drive(() => shared.snapshot().staticTreeCurrentPublishedOwnerCount === 1);
+  const sharedAudit = Object.fromEntries(shared.treePathAuditSnapshot().map(path => (
+    [path.pathId, path]
+  )));
+  assert.equal(sharedAudit['distant-static-tree'].active, true);
+  assert.equal(sharedAudit['distant-static-tree'].instanceCount > 0, true);
+  assert.equal(sharedAudit['distant-legacy-tree'].instanceCount, 0);
+  assert.deepEqual(sharedAudit['distant-static-tree'].publicationSources,
+    ['static-owner-page-ticket']);
+  assert.deepEqual(sharedAudit['distant-static-tree'].coverageGenerations, [1]);
+
+  const dualRootCount = legacyAudit['distant-legacy-tree'].rootCount
+    + sharedAudit['distant-static-tree'].rootCount;
+  const dualInstanceCount = legacyAudit['distant-legacy-tree'].instanceCount
+    + sharedAudit['distant-static-tree'].instanceCount;
+  assert.equal(dualRootCount, 2);
+  assert.equal(dualInstanceCount > sharedAudit['distant-static-tree'].instanceCount, true);
+
+  coverageGeneration += 1;
+  planRevision += 1;
+  apply({
+    retainedOwnerKeys: ['5,0', '6,0'],
+    readyPages: [{
+      ownerKey: '6,0', resourceKind: 'canonical', value: secondChunk,
+      readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
+    }],
+  });
+  await drive(() => shared.snapshot().staticTreeResidentOwnerCount === 2
+    && shared.snapshot().staticTreePendingOwnerCount === 0
+    && shared.snapshot().staticTreeCurrentPublishedOwnerCount === 2);
+  const moving = shared.treePathAuditSnapshot();
+  coverageGeneration += 1;
+  planRevision += 1;
+  apply({ retainedOwnerKeys: ['5,0'] });
+  await drive(() => shared.snapshot().staticTreeDisposeOwnerCount === 0
+    && shared.snapshot().staticTreeResidentOwnerCount === 1);
+  const stopped = shared.treePathAuditSnapshot();
+  coverageGeneration += 1;
+  planRevision += 1;
+  apply({
+    retainedOwnerKeys: ['5,0', '6,0'],
+    readyPages: [{
+      ownerKey: '6,0', resourceKind: 'canonical', value: secondChunk,
+      readyAtMs: performance.now(), required: true, deadlineAtMs: performance.now() + 100,
+    }],
+  });
+  await drive(() => shared.snapshot().staticTreeResidentOwnerCount === 2
+    && shared.snapshot().staticTreePendingOwnerCount === 0
+    && shared.snapshot().staticTreeCurrentPublishedOwnerCount === 2);
+  const reaccelerated = shared.treePathAuditSnapshot();
+  const activeTreeInstanceCount = audit => audit
+    .filter(path => path.pathId !== 'distant-legacy-tree')
+    .reduce((sum, path) => sum + path.instanceCount, 0);
+  for (const audit of [moving, stopped, reaccelerated]) {
+    const staticPath = audit.find(path => path.pathId === 'distant-static-tree');
+    assert.equal(staticPath.rootCount, 1);
+    assert.equal(audit.find(path => path.pathId === 'distant-legacy-tree').rootCount, 0);
+  }
+  assert.equal(activeTreeInstanceCount(moving) > activeTreeInstanceCount(stopped), true);
+  assert.equal(activeTreeInstanceCount(reaccelerated), activeTreeInstanceCount(moving));
+  t.diagnostic(JSON.stringify({
+    legacyOnly: legacyAudit,
+    staticOnly: sharedAudit,
+    bothEnabled: { rootCount: dualRootCount, instanceCount: dualInstanceCount },
+    moving: {
+      instanceCount: activeTreeInstanceCount(moving),
+      paths: moving.filter(path => path.active),
+    },
+    stopped: {
+      instanceCount: activeTreeInstanceCount(stopped),
+      paths: stopped.filter(path => path.active),
+    },
+    reaccelerated: {
+      instanceCount: activeTreeInstanceCount(reaccelerated),
+      paths: reaccelerated.filter(path => path.active),
+    },
+  }));
+  legacy.dispose();
+  shared.dispose();
+});
+
+test('Current natural query covers exact 140m Trees plus sparse canonical Forest horizon to Fog', async () => {
   const chunkSize = 16;
   const queryRadius = 140;
+  const horizonRadius = resolveW8VegetationLodPolicy('tree', 'current')
+    .horizonVisibilityMeters;
   const innerRadius = 84;
   const intersects = (chunkX, chunkZ, playerX, playerZ, radius) => {
     const nearestX = Math.max(chunkX * chunkSize, Math.min(playerX, (chunkX + 1) * chunkSize));
@@ -3954,6 +4695,8 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
     }
     const activeKeys = new Set(activeDataKeys);
     const chunks = new Map();
+    const exactProviderCalls = [];
+    const horizonProviderCalls = [];
     const getChunk = (chunkX, chunkZ) => {
       const key = `${chunkX},${chunkZ}`;
       if (!chunks.has(key)) chunks.set(key, canonicalChunk(chunkX, chunkZ, []));
@@ -3966,7 +4709,14 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
       visualAssets: createSilhouetteTestVisualAssets(),
       findSettlementsNear: async () => [],
       resolveTemplate: async () => null,
-      getCanonicalChunkData: async (chunkX, chunkZ) => getChunk(chunkX, chunkZ),
+      getCanonicalChunkData: async (chunkX, chunkZ) => {
+        exactProviderCalls.push(`${chunkX},${chunkZ}`);
+        return getChunk(chunkX, chunkZ);
+      },
+      getForestHorizonManifest: async (chunkX, chunkZ) => {
+        horizonProviderCalls.push(`${chunkX},${chunkZ}`);
+        return getChunk(chunkX, chunkZ);
+      },
     });
     const syncInput = {
       activeDataKeys,
@@ -3981,6 +4731,8 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
     };
     assert.equal(await presentation.sync(syncInput), true);
     const first = presentation.snapshot();
+    const firstExactProviderCalls = [...exactProviderCalls];
+    const firstHorizonProviderCalls = [...horizonProviderCalls];
     assert.equal(await presentation.sync(syncInput), true);
     const second = presentation.snapshot();
     const transitionedActiveDataKeys = activeDataKeys.map(key => {
@@ -3995,34 +4747,52 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
       playerLogicalX: playerLogicalX + chunkSize,
     }), true);
     const transition = presentation.snapshot();
-    const expected = [];
+    const expectedExact = [];
+    const expectedHorizon = [];
     const innerCircle = [];
     const ultraCircle = [];
-    for (let chunkZ = Math.floor((playerLogicalZ - queryRadius) / chunkSize);
-      chunkZ <= Math.floor((playerLogicalZ + queryRadius) / chunkSize); chunkZ += 1) {
-      for (let chunkX = Math.floor((playerLogicalX - queryRadius) / chunkSize);
-        chunkX <= Math.floor((playerLogicalX + queryRadius) / chunkSize); chunkX += 1) {
+    for (let chunkZ = Math.floor((playerLogicalZ - horizonRadius) / chunkSize);
+      chunkZ <= Math.floor((playerLogicalZ + horizonRadius) / chunkSize); chunkZ += 1) {
+      for (let chunkX = Math.floor((playerLogicalX - horizonRadius) / chunkSize);
+        chunkX <= Math.floor((playerLogicalX + horizonRadius) / chunkSize); chunkX += 1) {
         const key = `${chunkX},${chunkZ}`;
         if (intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, queryRadius)
-          && !activeKeys.has(key)) expected.push(key);
+          && !activeKeys.has(key)) expectedExact.push(key);
+        if (intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, horizonRadius)
+          && isW8ForestHorizonOwner({
+            worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+            chunkX,
+            chunkZ,
+          }) && !activeKeys.has(key)) expectedHorizon.push(key);
         if (intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, innerRadius)) innerCircle.push(key);
         else if (intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, queryRadius)) ultraCircle.push(key);
       }
     }
-    expected.sort();
+    const expected = [...new Set([...expectedExact, ...expectedHorizon])].sort();
+    const expectedHorizonOnly = expectedHorizon.filter(key => !expectedExact.includes(key)).sort();
+    assert.deepEqual([...firstHorizonProviderCalls].sort(), expectedHorizonOnly);
+    assert.equal(firstExactProviderCalls.some(key => expectedHorizonOnly.includes(key)), false);
     assert.deepEqual([...first.queryNaturalOwnerChunkKeys].sort(), expected);
     assert.equal(first.queryNaturalOwnerChunkCount, expected.length);
+    assert.deepEqual([...first.queryForestHorizonOwnerChunkKeys].sort(), expectedHorizon.sort());
+    assert.equal(first.queryForestHorizonOnlyOwnerChunkCount, expectedHorizonOnly.length);
     assert.equal(first.queryExcludedActiveNaturalOwnerCount, 25);
     assert.equal(first.queryInnerNaturalOwnerChunkCount, innerCircle.filter(key => !activeKeys.has(key)).length);
     assert.equal(first.queryUltraOwnerChunkCount, ultraCircle.filter(key => !activeKeys.has(key)).length);
     assert.equal(first.queryFarOwnerChunkCacheMisses, first.queryInnerNaturalOwnerChunkCount);
     assert.equal(first.queryUltraOwnerChunkCacheMisses, first.queryUltraOwnerChunkCount);
+    assert.equal(first.queryForestHorizonOwnerChunkCacheMisses,
+      first.queryForestHorizonOnlyOwnerChunkCount);
     assert.equal(first.queryFarOwnerChunkCacheEvictions, 0);
     assert.equal(first.queryUltraOwnerChunkCacheEvictions, 0);
+    assert.equal(first.queryForestHorizonOwnerChunkCacheEvictions, 0);
     assert.equal(second.queryFarOwnerChunkCacheHits, second.queryInnerNaturalOwnerChunkCount);
     assert.equal(second.queryFarOwnerChunkCacheMisses, 0);
     assert.equal(second.queryUltraOwnerChunkCacheHits, second.queryUltraOwnerChunkCount);
     assert.equal(second.queryUltraOwnerChunkCacheMisses, 0);
+    assert.equal(second.queryForestHorizonOwnerChunkCacheHits,
+      second.queryForestHorizonOnlyOwnerChunkCount);
+    assert.equal(second.queryForestHorizonOwnerChunkCacheMisses, 0);
     assert.equal(second.queryFarOwnerChunkCacheEvictions, 0);
     assert.equal(second.queryUltraOwnerChunkCacheEvictions, 0);
     assert.ok(transition.queryFarOwnerChunkCacheMisses > 0);
@@ -4031,16 +4801,27 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
     assert.ok(transition.queryPreparationDurationMs >= 0);
     assert.ok(second.innerWarmDurationMs >= 0);
     assert.ok(second.ultraWarmDurationMs >= 0);
+    assert.ok(second.forestHorizonWarmDurationMs >= 0);
     assert.equal(second.queryConcurrencyLimit, 4);
     assert.ok(second.maximumObservedQueryConcurrency <= 4);
     assert.equal(second.ultraOwnerChunkCacheCapacity, 256);
+    assert.equal(second.forestHorizonOwnerChunkCacheCapacity, 320);
     for (const key of [...innerCircle, ...ultraCircle]) {
       assert.equal(activeKeys.has(key) || first.queryNaturalOwnerChunkKeys.includes(key), true);
     }
     for (const key of first.queryNaturalOwnerChunkKeys) {
       const [chunkX, chunkZ] = key.split(',').map(Number);
       assert.equal(activeKeys.has(key), false);
-      assert.equal(intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, queryRadius), true);
+      assert.equal(
+        intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, queryRadius)
+          || (intersects(chunkX, chunkZ, playerLogicalX, playerLogicalZ, horizonRadius)
+            && isW8ForestHorizonOwner({
+              worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+              chunkX,
+              chunkZ,
+            })),
+        true,
+      );
     }
     presentation.dispose();
   };
@@ -4049,7 +4830,643 @@ test('High circular natural-owner query covers the 140m Ultra Tree circle withou
   await run(15.75, 15.75);
 });
 
-test('High Tree silhouette-to-Ultra handoff and 124m to 140m Ultra fade are deterministic', async () => {
+test('a real horizon-only owner keeps canonical Tree identity through rebase, destruction, and Continue', async () => {
+  const owner = Object.freeze({ x: 11, z: 4 });
+  assert.equal(isW8ForestHorizonOwner({
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    chunkX: owner.x,
+    chunkZ: owner.z,
+  }), true);
+  const tree = Object.freeze({
+    candidateId: 'detail-v1:vegetation:canonical-horizon-only-tree',
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.75,
+    orientationSeed: 0.25,
+    // Intentionally wrong source Y: the horizon summary must bake the same
+    // canonical sloped Terrain surface as the exact presentation path.
+    worldPosition: Object.freeze({ x: 184, y: -99, z: 72 }),
+    owningChunkCoordinate: owner,
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(owner.x, owner.z, []);
+  chunk.terrain = {
+    ...flatDistantTerrain(),
+    heights: [0, 16_000, 0, 16_000],
+  };
+  chunk.canonicalSurfacePolicy = Object.freeze({
+    schemaVersion: 'w8-settlement-surface-policy-1',
+    regions: Object.freeze([]),
+    riverCorridors: Object.freeze([]),
+  });
+  chunk.vegetationCandidates = [tree];
+  chunk.presentationLayers.natural = { vegetation: [tree], rocks: [] };
+  let state = new InfiniteWorldState({
+    worldSeed: 'forest-horizon-continue',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  const createPresentation = scene => createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === owner.x && chunkZ === owner.z ? chunk : null
+    ),
+    isFeatureDestroyed: stableId => state.isFeatureDestroyed(stableId),
+  });
+  const syncInput = {
+    activeDataKeys: [],
+    renderedKeys: [],
+    getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    centerChunkX: 0,
+    centerChunkZ: 0,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+  };
+  const scene = new DistantTestGroup();
+  const presentation = await createPresentation(scene);
+  assert.equal(await presentation.sync(syncInput), true);
+  presentation.markFirstDraw();
+  const horizonPath = presentation.treePathAuditSnapshot().find(path => (
+    path.pathId === 'forest-horizon-tree'
+  ));
+  assert.equal(horizonPath.active, true);
+  assert.equal(horizonPath.instanceCount, 1);
+  assert.equal(horizonPath.stableIdCount, 1);
+  assert.deepEqual(horizonPath.publicationSources, ['distant-atomic-root']);
+  assert.equal(horizonPath.meshes.every(mesh => mesh.mode === 'horizon'), true);
+  const initial = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.ok(initial);
+  assert.deepEqual(initial.identity.owningChunkCoordinate, owner);
+  assert.deepEqual(initial.identity.worldPosition, { x: 184, y: 8, z: 72 });
+  assert.equal(initial.naturalLod.naturalHorizonOnly, true);
+  assert.equal(initial.naturalLod.forestHorizonEligible, true);
+  assert.equal(initial.naturalLod.fullInstanceCount, 0);
+  assert.equal(initial.naturalLod.forestInstanceCount, 0);
+  assert.equal(initial.naturalLod.atmosphericInstanceCount, 0);
+  assert.equal(initial.naturalLod.horizonInstanceCount, 1);
+  assert.equal(initial.visibleLod, 'far');
+  assert.equal(initial.distanceMeters > 140 && initial.distanceMeters < 234, true);
+
+  presentation.update(15.75, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+    rebaseCount: 0,
+  });
+  const beforeBoundary = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  presentation.update(16.25, 8, {
+    renderOriginChunkX: 1,
+    renderOriginChunkZ: 0,
+    rebaseCount: 1,
+  });
+  const afterBoundary = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.deepEqual(afterBoundary.identity, beforeBoundary.identity);
+  assert.equal(afterBoundary.visibleLod, 'far');
+  assert.equal(Math.abs(
+    afterBoundary.naturalLod.horizonOpacity - beforeBoundary.naturalLod.horizonOpacity
+  ) < 0.02, true);
+  assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
+
+  const identityBeforeRebase = initial.identity;
+  presentation.update(8, 8, {
+    renderOriginChunkX: 9,
+    renderOriginChunkZ: -4,
+    rebaseCount: 2,
+  });
+  const rebased = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.deepEqual(rebased.identity, identityBeforeRebase);
+  assert.equal(rebased.distanceMeters, initial.distanceMeters);
+  assert.equal(rebased.naturalLod.horizonOpacity, initial.naturalLod.horizonOpacity);
+  assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
+
+  presentation.update(-83, 72, {
+    renderOriginChunkX: -6,
+    renderOriginChunkZ: 3,
+    rebaseCount: 3,
+  });
+  let moved = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.equal(moved.distanceMeters, 267);
+  assert.equal(moved.naturalLod.horizonOpacity, 0.5);
+  presentation.update(-116, 72, {
+    renderOriginChunkX: -8,
+    renderOriginChunkZ: 3,
+    rebaseCount: 4,
+  });
+  moved = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.equal(moved.distanceMeters, 300);
+  assert.equal(moved.naturalLod.horizonOpacity, 0);
+  assert.equal(moved.visibleLod, 'hidden');
+  presentation.update(8, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+    rebaseCount: 5,
+  });
+
+  state.damageFeature({ stableId: tree.candidateId, maxHp: 1 }, 1);
+  presentation.update(8, 8, {
+    renderOriginChunkX: 0,
+    renderOriginChunkZ: 0,
+    rebaseCount: 5,
+  });
+  const destroyed = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.equal(destroyed.visibleLod, 'destroyed');
+  assert.equal(destroyed.naturalLod.horizonInstanceCount, 0);
+  presentation.dispose();
+
+  const encoded = await encodeInfiniteWorldSave(state.createSaveSnapshot());
+  const decoded = await decodeInfiniteWorldSave(encoded, {
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+  });
+  state = new InfiniteWorldState({
+    worldSeed: 'forest-horizon-continue',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  state.restoreSaveSnapshot(decoded);
+  const restoredScene = new DistantTestGroup();
+  const restored = await createPresentation(restoredScene);
+  assert.equal(await restored.sync(syncInput), true);
+  const continued = restored.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === tree.candidateId
+  ));
+  assert.equal(continued.visibleLod, 'destroyed');
+  assert.equal(continued.naturalLod.horizonInstanceCount, 0);
+  assert.equal(restored.snapshot().visibleCanonicalForestHorizonInstanceCount, 0);
+  restored.dispose();
+});
+
+test('incremental Tree pages publish per owner within dirty-range frame budgets', async t => {
+  const tree = (candidateId, ownerX, x) => Object.freeze({
+    candidateId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.75,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const page = (ownerX, candidate) => {
+    const chunk = canonicalChunk(ownerX, 0, []);
+    chunk.vegetationCandidates = [candidate];
+    chunk.presentationLayers.natural = { vegetation: [candidate], rocks: [] };
+    return Object.freeze({
+      ownerKey: `${ownerX},0`,
+      resourceKind: 'canonical',
+      value: chunk,
+      readyAtMs: performance.now(),
+    });
+  };
+  const firstTree = tree('detail-v1:vegetation:incremental-tree-a', 5, 88);
+  const secondTree = tree('detail-v1:vegetation:incremental-tree-b', 6, 104);
+  const publications = [];
+  const telemetry = createWorldStreamingTelemetry({
+    enabled: true,
+    capacity: 64,
+    sessionId: 'incremental-tree-harness',
+  });
+  for (const ownerKey of ['5,0', '6,0']) {
+    const details = {
+      target: WORLD_STREAMING_TARGET.TREE,
+      stream: WORLD_STREAMING_STREAM.DISTANT,
+      resourceKey: ownerKey,
+      ownerKey,
+    };
+    const correlationId = telemetry.beginRequest(details);
+    telemetry.record(WORLD_STREAMING_EVENT.WORKER_START, { ...details, correlationId });
+    telemetry.record(WORLD_STREAMING_EVENT.WORKER_COMPLETE, { ...details, correlationId });
+  }
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+    incrementalStaticTreePages: true,
+    telemetry,
+    publishStaticOwnerTickets: input => {
+      publications.push(Object.freeze({ ...input, atMs: performance.now() }));
+      return Object.freeze(input.ownerKeys.map(ownerKey => Object.freeze({ ownerKey })));
+    },
+  });
+  const basePlan = {
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'incremental-tree-plan:1',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+    activeDataKeys: [],
+    renderedKeys: [],
+    retainedOwnerKeys: ['5,0', '6,0'],
+  };
+  const driveUntil = async predicate => {
+    const frameDurations = [];
+    for (let frame = 0; frame < 200 && !predicate(); frame += 1) {
+      const startedAt = performance.now();
+      presentation.update(8, 8, basePlan.renderOrigin);
+      frameDurations.push(performance.now() - startedAt);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(predicate(), true, 'incremental Tree owner did not publish');
+    return frameDurations;
+  };
+
+  presentation.applyStaticTreePlan({ ...basePlan, readyPages: [page(5, firstTree)] });
+  const firstFrames = await driveUntil(() => publications.length === 1);
+  let snapshot = presentation.snapshot();
+  assert.equal(publications[0].ownerKeys[0], '5,0');
+  assert.equal(snapshot.staticTreeCurrentPublishedOwnerCount, 1);
+  assert.equal(snapshot.staticTreeResidentOwnerCount, 1);
+
+  presentation.applyStaticTreePlan({
+    ...basePlan,
+    planRevision: 2,
+    planId: 'incremental-tree-plan:2',
+    readyPages: [page(6, secondTree)],
+  });
+  const secondFrames = await driveUntil(() => publications.length === 2);
+  presentation.markFirstDraw();
+  snapshot = presentation.snapshot();
+  const lifecycleSnapshot = telemetry.snapshot();
+  const publishLatencies = lifecycleSnapshot.lifecycles
+    .map(value => value.workerCompleteToPublishMs)
+    .filter(Number.isFinite);
+  const updateMaximumMs = Math.max(...firstFrames, ...secondFrames);
+
+  assert.deepEqual(publications.map(value => value.ownerKeys[0]), ['5,0', '6,0']);
+  assert.equal(snapshot.staticTreeCoverageGeneration, 1);
+  assert.equal(snapshot.staticTreePlanRevision, 2);
+  assert.equal(snapshot.staticTreeCurrentPublishedOwnerCount, 2);
+  assert.equal(snapshot.staticTreeResidentOwnerCount, 2);
+  assert.equal(snapshot.staticTreePendingOwnerCount, 0);
+  assert.equal(snapshot.staticTreeMatrixUpdateCount > 0, true);
+  assert.equal(snapshot.staticTreeAttributeUpdateCount > 0, true);
+  assert.equal(snapshot.staticTreeMaximumSliceMs < 50, true);
+  assert.equal(updateMaximumMs < 50, true);
+  assert.equal(lifecycleSnapshot.lifecycles.every(value => value.firstDrawAtMs !== null), true);
+  assert.equal(publishLatencies.length, 2);
+  t.diagnostic(JSON.stringify({
+    workerCompleteToPublishMs: publishLatencies,
+    publicationWaitingMaximumMs: snapshot.staticTreeMaximumPublicationWaitMs,
+    dirtyMatrixUpdates: snapshot.staticTreeMatrixUpdateCount,
+    bufferUpdates: snapshot.staticTreeAttributeUpdateCount,
+    composeMaximumSliceMs: snapshot.staticTreeMaximumSliceMs,
+    updateMaximumMs,
+  }));
+  presentation.dispose();
+});
+
+test('incremental Tree stop-drain-reaccelerate harness enforces unified per-frame work limits', async t => {
+  const ownerCount = 160;
+  const treesPerOwner = 8;
+  const createPage = ownerX => {
+    const vegetation = Object.freeze(Array.from({ length: treesPerOwner }, (_, index) => (
+      Object.freeze({
+        candidateId: `detail-v1:vegetation:stream-harness:${ownerX}:${index}`,
+        subtype: 'broadleaf-tree',
+        variationSeed: (index + 1) / (treesPerOwner + 1),
+        orientationSeed: index / treesPerOwner,
+        worldPosition: Object.freeze({
+          x: ownerX * LEGACY_CHUNK_SIZE_METERS + 2 + index,
+          y: 0.4,
+          z: 8,
+        }),
+        owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      })
+    )));
+    const chunk = canonicalChunk(ownerX, 0, []);
+    chunk.vegetationCandidates = vegetation;
+    chunk.presentationLayers.natural = { vegetation, rocks: [] };
+    return Object.freeze({
+      ownerKey: `${ownerX},0`,
+      resourceKind: 'canonical',
+      value: chunk,
+      readyAtMs: performance.now(),
+      required: ownerX % 4 === 0,
+      deadlineAtMs: performance.now() + (ownerX % 4 === 0 ? 100 : 1_000),
+    });
+  };
+  const initialPages = Object.freeze(Array.from({ length: ownerCount }, (_, index) => (
+    createPage(index + 1)
+  )));
+  const replacementPages = Object.freeze(Array.from({ length: ownerCount / 2 }, (_, index) => (
+    createPage(ownerCount + index + 1)
+  )));
+  const initialOwnerKeys = Object.freeze(initialPages.map(page => page.ownerKey));
+  const retainedAfterAcceleration = Object.freeze([
+    ...initialOwnerKeys.slice(ownerCount / 2),
+    ...replacementPages.map(page => page.ownerKey),
+  ]);
+  const telemetry = createWorldStreamingTelemetry({
+    enabled: true,
+    capacity: 4096,
+    sessionId: 'tree-stop-drain-reaccelerate',
+  });
+  const publishedOwners = [];
+  const publishedAtByOwner = new Map();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+    incrementalStaticTreePages: true,
+    telemetry,
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+    publishStaticOwnerTickets: input => {
+      publishedOwners.push(...input.ownerKeys);
+      for (const ownerKey of input.ownerKeys) publishedAtByOwner.set(ownerKey, performance.now());
+      return Object.freeze(input.ownerKeys.map(ownerKey => Object.freeze({ ownerKey })));
+    },
+  });
+  const renderOrigin = { renderOriginChunkX: 0, renderOriginChunkZ: 0 };
+  const plan = ({ coverageGeneration, planRevision, retainedOwnerKeys, readyPages }) => ({
+    coverageGeneration,
+    planRevision,
+    planId: `tree-stream-harness:${coverageGeneration}:${planRevision}`,
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin,
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+    activeDataKeys: [],
+    renderedKeys: [],
+    retainedOwnerKeys,
+    readyPages,
+  });
+  const updateDurations = [];
+  const admissionBacklogs = [];
+  const prioritizeReadyPages = pages => [...pages].sort((left, right) => (
+    Number(right.required) - Number(left.required)
+      || left.deadlineAtMs - right.deadlineAtMs
+      || left.readyAtMs - right.readyAtMs
+      || left.ownerKey.localeCompare(right.ownerKey)
+  ));
+  let activeCoverageGeneration = 1;
+  let activeRetainedOwnerKeys = initialOwnerKeys;
+  let sourceReadyPages = prioritizeReadyPages(initialPages);
+  let planRevision = 0;
+  const updateOnce = async () => {
+    const readyPages = sourceReadyPages.splice(0, 1);
+    presentation.applyStaticTreePlan(plan({
+      coverageGeneration: activeCoverageGeneration,
+      planRevision: ++planRevision,
+      retainedOwnerKeys: activeRetainedOwnerKeys,
+      readyPages,
+    }));
+    const startedAt = performance.now();
+    presentation.update(8, 8, renderOrigin);
+    updateDurations.push(performance.now() - startedAt);
+    presentation.markFirstDraw();
+    const state = presentation.snapshot();
+    admissionBacklogs.push(
+      sourceReadyPages.length
+        + state.staticTreePendingOwnerCount
+        + state.staticTreeDisposeOwnerCount,
+    );
+    await new Promise(resolve => setImmediate(resolve));
+  };
+  const driveUntil = async (predicate, maximumFrames = 1_000) => {
+    let frames = 0;
+    while (!predicate() && frames < maximumFrames) {
+      await updateOnce();
+      frames += 1;
+    }
+    assert.equal(predicate(), true, 'Tree presentation backlog did not drain');
+    return frames;
+  };
+  const percentile = (values, ratio) => {
+    if (!values.length) return 0;
+    const ordered = [...values].sort((left, right) => left - right);
+    return ordered[Math.min(ordered.length - 1, Math.floor(ordered.length * ratio))];
+  };
+  const summarize = samples => ({
+    frameCount: samples.length,
+    publishedOwnerCount: samples.reduce((sum, sample) => sum + sample.publishedOwners, 0),
+    admittedOwnerCount: samples.reduce((sum, sample) => sum + sample.admittedOwners, 0),
+    admissionMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.admittedOwners)),
+    publishOwnerMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.publishedOwners)),
+    builtOwnerCount: samples.reduce((sum, sample) => sum + sample.builtOwners, 0),
+    disposedOwnerCount: samples.reduce((sum, sample) => sum + sample.disposedOwners, 0),
+    disposeOwnerMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.disposedOwners)),
+    compactionMoveCount: samples.reduce((sum, sample) => sum + sample.compactionMoves, 0),
+    compactionMoveMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.compactionMoves)),
+    visibilityMatrixInvalidationCount: samples.reduce((sum, sample) => (
+      sum + sample.visibilityMatrixInvalidations
+    ), 0),
+    matrixUpdateCount: samples.reduce((sum, sample) => sum + sample.matrixUpdates, 0),
+    matrixUpdateMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.matrixUpdates)),
+    bufferUpdateCount: samples.reduce((sum, sample) => sum + sample.attributeUpdates, 0),
+    bufferUpdateMaximumPerFrame: Math.max(0, ...samples.map(sample => sample.attributeUpdates)),
+    bufferRangeUpdateCount: samples.reduce((sum, sample) => (
+      sum + sample.bufferRangeUpdates
+    ), 0),
+    bufferRangeUpdateMaximumPerFrame: Math.max(
+      0,
+      ...samples.map(sample => sample.bufferRangeUpdates),
+    ),
+    bufferUploadBytes: samples.reduce((sum, sample) => sum + sample.bufferUploadBytes, 0),
+    bufferUploadMaximumBytesPerFrame: Math.max(
+      0,
+      ...samples.map(sample => sample.bufferUploadBytes),
+    ),
+    visibilityMaximumMs: Math.max(0, ...samples.map(sample => sample.visibilityMs)),
+    composeMaximumMs: Math.max(0, ...samples.map(sample => sample.composeMs)),
+    disposeMaximumMs: Math.max(0, ...samples.map(sample => sample.disposeMs)),
+    buildMaximumSliceMs: Math.max(0, ...samples.map(sample => sample.buildMaximumSliceMs)),
+    sampleTotalP95Ms: percentile(samples.map(sample => sample.totalMs), 0.95),
+    sampleTotalMaximumMs: Math.max(0, ...samples.map(sample => sample.totalMs)),
+    residentMaximum: Math.max(0, ...samples.map(sample => sample.residentAfter)),
+    pendingMaximum: Math.max(0, ...samples.map(sample => (
+      sample.pendingPagesBefore + sample.pendingPublicationsBefore
+    ))),
+    allocatedObjects: samples.reduce((sum, sample) => sum + sample.allocatedObjects, 0),
+    allocatedInstances: samples.reduce((sum, sample) => sum + sample.allocatedInstances, 0),
+    allocatedBuckets: samples.reduce((sum, sample) => sum + sample.allocatedBuckets, 0),
+  });
+
+  const heapBefore = process.memoryUsage().heapUsed;
+  for (let frame = 0; frame < 24; frame += 1) await updateOnce();
+  let snapshot = presentation.snapshot();
+  const movingSequence = snapshot.staticTreeFrameSamples.at(-1)?.frameSequence ?? 0;
+  const moving = summarize(snapshot.staticTreeFrameSamples);
+  const movingState = {
+    resident: snapshot.staticTreeResidentOwnerCount,
+    pending: snapshot.staticTreePendingOwnerCount,
+    published: snapshot.staticTreeCurrentPublishedOwnerCount,
+  };
+
+  const stopFrames = await driveUntil(() => {
+    const state = presentation.snapshot();
+    return sourceReadyPages.length === 0
+      && state.staticTreePendingOwnerCount === 0
+      && state.staticTreeCurrentPublishedOwnerCount === ownerCount;
+  });
+  snapshot = presentation.snapshot();
+  const stoppedSequence = snapshot.staticTreeFrameSamples.at(-1)?.frameSequence ?? movingSequence;
+  const stopped = summarize(snapshot.staticTreeFrameSamples.filter(sample => (
+    sample.frameSequence > movingSequence && sample.frameSequence <= stoppedSequence
+  )));
+  const stoppedState = {
+    resident: snapshot.staticTreeResidentOwnerCount,
+    pending: snapshot.staticTreePendingOwnerCount,
+    published: snapshot.staticTreeCurrentPublishedOwnerCount,
+  };
+
+  const replacementReadyAtMs = performance.now();
+  const accelerationPages = replacementPages.map(page => Object.freeze({
+    ...page,
+    readyAtMs: replacementReadyAtMs,
+  }));
+  activeCoverageGeneration = 2;
+  activeRetainedOwnerKeys = retainedAfterAcceleration;
+  sourceReadyPages = prioritizeReadyPages(accelerationPages);
+  const accelerationUpdateStart = updateDurations.length;
+  const accelerationBacklogStart = admissionBacklogs.length;
+  const accelerationFrames = await driveUntil(() => {
+    const state = presentation.snapshot();
+    return sourceReadyPages.length === 0
+      && state.staticTreePendingOwnerCount === 0
+      && state.staticTreeDisposeOwnerCount === 0
+      && state.staticTreeCurrentPublishedOwnerCount === ownerCount;
+  });
+  snapshot = presentation.snapshot();
+  const accelerated = summarize(snapshot.staticTreeFrameSamples.filter(sample => (
+    sample.frameSequence > stoppedSequence
+  )));
+  const accelerationUpdateDurations = updateDurations.slice(accelerationUpdateStart);
+  const accelerationBacklogs = admissionBacklogs.slice(accelerationBacklogStart);
+  const accelerationPublicationWaits = accelerationPages.map(page => (
+    publishedAtByOwner.get(page.ownerKey) - page.readyAtMs
+  ));
+  const requiredPublicationWaits = accelerationPages.filter(page => page.required).map(page => (
+    publishedAtByOwner.get(page.ownerKey) - page.readyAtMs
+  ));
+  const prefetchedPublicationWaits = accelerationPages.filter(page => !page.required).map(page => (
+    publishedAtByOwner.get(page.ownerKey) - page.readyAtMs
+  ));
+  const heapAfter = process.memoryUsage().heapUsed;
+  const lifecycleSnapshot = telemetry.snapshot();
+  const maximumBacklogDrop = Math.max(0, ...accelerationBacklogs.slice(1).map((value, index) => (
+    accelerationBacklogs[index] - value
+  )));
+
+  assert.equal(movingState.resident < ownerCount, true);
+  assert.equal(movingState.pending > 0, true);
+  assert.deepEqual(stoppedState, { resident: ownerCount, pending: 0, published: ownerCount });
+  assert.equal(snapshot.staticTreeResidentOwnerCount, ownerCount);
+  assert.equal(snapshot.staticTreeCurrentPublishedOwnerCount, ownerCount);
+  assert.equal(snapshot.staticTreePendingOwnerCount, 0);
+  assert.equal(snapshot.staticTreeDisposeOwnerCount, 0);
+  assert.equal(snapshot.staticTreeOwnerDisposeCount, ownerCount / 2);
+  assert.equal(snapshot.staticTreeDuplicatePageQueueCount, 0);
+  assert.equal(snapshot.staticTreeOwnerRebuildCount, 0);
+  assert.equal(snapshot.staticTreeStalePageDiscardCount, 0);
+  assert.equal(snapshot.staticTreeRootResetCount, 1);
+  assert.equal(snapshot.staticTreeMaximumAdmissionsPerFrame <= 1, true);
+  assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
+  assert.equal(moving.admissionMaximumPerFrame <= 1, true);
+  assert.equal(stopped.admissionMaximumPerFrame <= 1, true);
+  assert.equal(accelerated.admissionMaximumPerFrame <= 1, true);
+  assert.equal(accelerated.publishOwnerMaximumPerFrame <= 1, true);
+  assert.equal(accelerated.disposeOwnerMaximumPerFrame <= 1, true);
+  assert.equal(accelerated.disposedOwnerCount, ownerCount / 2);
+  assert.equal(accelerated.frameCount > accelerated.disposedOwnerCount, true);
+  assert.equal(maximumBacklogDrop <= 2, true);
+  assert.equal(accelerated.visibilityMatrixInvalidationCount, 0);
+  assert.equal(snapshot.staticTreeVisibilityMatrixInvalidationCount, 0);
+  assert.equal(accelerated.visibilityMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
+  assert.equal(accelerated.composeMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
+  assert.equal(accelerated.disposeMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
+  assert.equal(accelerated.buildMaximumSliceMs < snapshot.staticTreeFrameBudgetMs, true);
+  assert.equal(accelerated.matrixUpdateMaximumPerFrame <= 512, true);
+  assert.equal(accelerated.bufferUpdateMaximumPerFrame <= 512, true);
+  assert.equal(percentile(requiredPublicationWaits, 0.95)
+    < percentile(prefetchedPublicationWaits, 0.95), true);
+  assert.equal(Math.max(...accelerationUpdateDurations) < 50, true);
+  assert.equal(accelerated.sampleTotalMaximumMs < 50, true);
+  assert.equal(new Set(publishedOwners).size, ownerCount + ownerCount / 2);
+  assert.equal(lifecycleSnapshot.lifecycles.every(value => value.firstDrawAtMs !== null), true);
+  assert.equal(snapshot.staticTreeFrameSamples.length <= snapshot.staticTreeFrameSampleCapacity, true);
+  t.diagnostic(JSON.stringify({
+    moving: { frames: 24, ...movingState, work: moving },
+    stopped: { frames: stopFrames, ...stoppedState, work: stopped },
+    reaccelerated: {
+      frames: accelerationFrames,
+      resident: snapshot.staticTreeResidentOwnerCount,
+      pending: snapshot.staticTreePendingOwnerCount,
+      published: snapshot.staticTreeCurrentPublishedOwnerCount,
+      work: accelerated,
+      updateP95Ms: percentile(accelerationUpdateDurations, 0.95),
+      updateMaximumMs: Math.max(...accelerationUpdateDurations),
+      publicationWaitP95Ms: percentile(accelerationPublicationWaits, 0.95),
+      publicationWaitMaximumMs: Math.max(...accelerationPublicationWaits),
+      requiredPublicationWaitP95Ms: percentile(requiredPublicationWaits, 0.95),
+      prefetchedPublicationWaitP95Ms: percentile(prefetchedPublicationWaits, 0.95),
+      maximumBacklogDrop,
+      backlogStart: accelerationBacklogs[0],
+      backlogEnd: accelerationBacklogs.at(-1),
+      over50MsHarnessCount: accelerationUpdateDurations.filter(value => value > 50).length,
+      firstDrawMissing: lifecycleSnapshot.lifecycles.filter(value => (
+        value.firstDrawAtMs === null
+      )).length,
+    },
+    totals: {
+      ownerBuildCount: snapshot.staticTreeOwnerBuildCount,
+      ownerReuseCount: snapshot.staticTreeOwnerReuseCount,
+      ownerRebuildCount: snapshot.staticTreeOwnerRebuildCount,
+      ownerDisposeCount: snapshot.staticTreeOwnerDisposeCount,
+      duplicatePageQueueCount: snapshot.staticTreeDuplicatePageQueueCount,
+      stalePageDiscardCount: snapshot.staticTreeStalePageDiscardCount,
+      olderCoveragePageCount: snapshot.staticTreeOlderCoveragePageCount,
+      rootResetCount: snapshot.staticTreeRootResetCount,
+      admissionMaximumPerFrame: snapshot.staticTreeMaximumAdmissionsPerFrame,
+      admissionLimitViolations: snapshot.staticTreeAdmissionLimitViolationCount,
+      compactionMoveCount: snapshot.staticTreeCompactionMoveCount,
+      visibilityMatrixInvalidationCount:
+        snapshot.staticTreeVisibilityMatrixInvalidationCount,
+      maximumVisibilitySliceMs: snapshot.staticTreeMaximumVisibilitySliceMs,
+      maximumDisposeSliceMs: snapshot.staticTreeMaximumDisposeSliceMs,
+      maximumComposeSliceMs: snapshot.staticTreeMaximumSliceMs,
+      allocatedObjects: snapshot.staticTreeAllocatedObjectCount,
+      allocatedInstances: snapshot.staticTreeAllocatedInstanceCount,
+      allocatedBuckets: snapshot.staticTreeAllocatedBucketCount,
+      heapDeltaBytes: heapAfter - heapBefore,
+    },
+  }));
+  presentation.dispose();
+});
+
+test('Tree Forest-to-Atmospheric-to-Horizon cross-fades remain continuous through Fog', async () => {
   const candidate = (candidateId, x) => Object.freeze({
     candidateId,
     subtype: 'broadleaf-tree',
@@ -4090,13 +5507,16 @@ test('High Tree silhouette-to-Ultra handoff and 124m to 140m Ultra fade are dete
       quality: 'high',
     })), true);
     const visibleByDistance = new Map();
+    const opacityByDistance = new Map();
     for (const object of presentation.canonicalAuditSnapshot()) {
       const distance = Math.round(object.distanceMeters);
       visibleByDistance.set(distance, (visibleByDistance.get(distance) ?? 0)
         + (object.visibleLod === 'hidden' ? 0 : 1));
+      opacityByDistance.set(distance, object.naturalLod.totalOpacity);
     }
     const result = {
       visibleByDistance: Object.fromEntries(visibleByDistance),
+      opacityByDistance: Object.fromEntries(opacityByDistance),
       stableIds: presentation.canonicalAuditSnapshot().filter(object => object.visibleLod !== 'hidden')
         .map(object => object.identity.stableId),
       snapshot: presentation.snapshot(),
@@ -4109,22 +5529,30 @@ test('High Tree silhouette-to-Ultra handoff and 124m to 140m Ultra fade are dete
   ]);
   assert.deepEqual(normal.visibleByDistance, reverse.visibleByDistance);
   assert.deepEqual(normal.visibleByDistance, parallel.visibleByDistance);
+  assert.deepEqual(normal.opacityByDistance, reverse.opacityByDistance);
+  assert.deepEqual(normal.opacityByDistance, parallel.opacityByDistance);
   assert.deepEqual(normal.stableIds, reverse.stableIds);
   assert.deepEqual(normal.stableIds, parallel.stableIds);
   assert.equal(normal.visibleByDistance[76], 64);
   assert.equal(normal.visibleByDistance[80], 64);
   assert.equal(normal.visibleByDistance[84], 64);
   assert.equal(normal.visibleByDistance[124], 64);
-  assert.ok(normal.visibleByDistance[124] > normal.visibleByDistance[132]);
-  assert.ok(normal.visibleByDistance[132] > normal.visibleByDistance[138]);
-  assert.ok(normal.visibleByDistance[138] > 0);
-  assert.equal(normal.visibleByDistance[140], 0);
+  assert.equal(normal.visibleByDistance[132], 64);
+  assert.equal(normal.visibleByDistance[138], 64);
+  assert.equal(normal.visibleByDistance[140], 16);
+  assert.equal(normal.opacityByDistance[124], 1);
+  assert.equal(normal.opacityByDistance[132], 1);
+  assert.equal(normal.opacityByDistance[138], 1);
+  assert.equal(normal.opacityByDistance[140], 1);
   assert.equal(normal.snapshot.visibleCanonicalFullTreeCount, 0);
   assert.equal(
     normal.snapshot.visibleCanonicalSilhouetteTreeCount + normal.snapshot.visibleCanonicalUltraTreeCount,
     normal.visibleByDistance[76] + normal.visibleByDistance[80] + normal.visibleByDistance[84]
-      + normal.visibleByDistance[124] + normal.visibleByDistance[132] + normal.visibleByDistance[138],
+      + normal.visibleByDistance[124] + normal.visibleByDistance[132]
+      + normal.visibleByDistance[138] + normal.visibleByDistance[140],
   );
+  assert.equal(normal.snapshot.visibleCanonicalNaturalCrossFadeCount, 192);
+  assert.equal(normal.snapshot.visibleCanonicalForestHorizonInstanceCount, 144);
   assert.equal(normal.snapshot.distantTreeProxyCount, 0);
   normal.presentation.dispose();
   reverse.presentation.dispose();
@@ -4226,6 +5654,335 @@ test('clipmap topology and terrain sampling remain Float32-identical to the pre-
     clipmapChecksum(actualPositions, actualColors),
     clipmapChecksum(legacyPositions, legacyColors),
   );
+});
+
+test('Tree, Bush, Grass, and Rock share bounded natural LOD resources', async () => {
+  const vegetation = Object.freeze([
+    Object.freeze({
+      candidateId: 'detail-v1:vegetation:all-kinds-tree',
+      subtype: 'broadleaf-tree', variationSeed: 1, orientationSeed: 0.25,
+      worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+    }),
+    Object.freeze({
+      candidateId: 'detail-v1:vegetation:all-kinds-formal-shrub',
+      subtype: 'shrub', variationSeed: 1, orientationSeed: 0.25,
+      worldPosition: Object.freeze({ x: 89, y: 0.4, z: 8 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+      metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+    }),
+  ]);
+  const rock = Object.freeze({
+    candidateId: 'detail-v1:rock:all-kinds', candidateType: 'rock',
+    subtype: 'medium-rock', sizeClass: 'medium', variationSeed: 0.5,
+    orientationSeed: 0.25, worldPosition: Object.freeze({ x: 90, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  });
+  const ambient = Object.freeze([
+    Object.freeze({
+      stableId: 'wf1:ambient-detail:all-kinds-grass', detailType: 'grass',
+      worldPosition: Object.freeze({ x: 91, y: 0.4, z: 8 }), rotationY: 0,
+      variation: 1, owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    }),
+    Object.freeze({
+      stableId: 'wf1:ambient-detail:all-kinds-shrub', detailType: 'shrub',
+      worldPosition: Object.freeze({ x: 92, y: 0.4, z: 8 }), rotationY: 0,
+      variation: 1, owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    }),
+  ]);
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = vegetation;
+  chunk.rockCandidates = [rock];
+  chunk.ambientDetails = ambient;
+  chunk.presentationLayers.natural = { vegetation, rocks: [rock] };
+  chunk.presentationLayers.ambientDetails = ambient;
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+  });
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+  })), true);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.canonicalTreeRecordCount, 1);
+  assert.equal(snapshot.canonicalShrubRecordCount, 2);
+  assert.equal(snapshot.canonicalGrassRecordCount, 1);
+  assert.equal(snapshot.canonicalRockRecordCount, 1);
+  assert.equal(snapshot.visibleCanonicalTreeCount, 1);
+  assert.equal(snapshot.visibleCanonicalShrubCount, 2);
+  assert.equal(snapshot.visibleCanonicalGrassCount, 1);
+  assert.equal(snapshot.visibleCanonicalRockCount, 1);
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.deepEqual(new Set(audit.map(object => object.naturalLod.kind)),
+    new Set(['tree', 'bush', 'grass', 'rock']));
+  assert.equal(audit.every(object => (
+    object.naturalLod.distanceSource === 'logical-object-position'
+      && object.naturalLod.owner === object.ownerKey
+  )), true);
+  const naturalMeshes = scene.children[0].children[0].children.filter(mesh => (
+    mesh.material?.userData?.naturalLod === true
+  ));
+  const rockAtmosphere = naturalMeshes.find(mesh => (
+    mesh.material.userData.naturalLodKind === 'rock'
+      && mesh.material.userData.naturalLodMode === 'atmospheric'
+  ));
+  assert.ok(rockAtmosphere);
+  assert.equal(rockAtmosphere.material.userData.naturalLodSourceTinted, true,
+    'Rock retains its neutral source tint instead of becoming vegetation green');
+  assert.equal(naturalMeshes.every(mesh => mesh.geometry.attributes.w8NaturalAnchorXZ), true);
+  presentation.dispose();
+});
+
+test('Near handoff suppresses only the matching natural Stable ID across every tier', async () => {
+  const candidate = (candidateId, x) => Object.freeze({
+    candidateId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const trees = Object.freeze([
+    candidate('detail-v1:vegetation:near-handoff:a', 88),
+    candidate('detail-v1:vegetation:near-handoff:b', 90),
+  ]);
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = trees;
+  chunk.presentationLayers.natural.vegetation = trees;
+  let nearIds = [];
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+    getNearVisibleStableIds: () => nearIds,
+  });
+  const input = canonicalSyncInput({
+    centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+  });
+  assert.equal(await presentation.sync(input), true);
+  nearIds = [trees[0].candidateId];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: input.activeDataKeys,
+    renderedKeys: input.renderedKeys,
+    renderOrigin: input.renderOrigin,
+    quality: 'high',
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+  }), true);
+  let audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
+    [value.identity.stableId, value]
+  )));
+  assert.equal(audit[trees[0].candidateId].visibleLod, 'near');
+  assert.deepEqual([
+    audit[trees[0].candidateId].naturalLod.fullInstanceCount,
+    audit[trees[0].candidateId].naturalLod.forestInstanceCount,
+    audit[trees[0].candidateId].naturalLod.atmosphericInstanceCount,
+  ], [0, 0, 0]);
+  assert.equal(audit[trees[1].candidateId].visibleLod, 'mid');
+  assert.deepEqual([
+    audit[trees[1].candidateId].naturalLod.fullInstanceCount,
+    audit[trees[1].candidateId].naturalLod.forestInstanceCount,
+    audit[trees[1].candidateId].naturalLod.atmosphericInstanceCount,
+  ], [1, 1, 1]);
+  assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
+
+  nearIds = [];
+  presentation.commitRuntimeState({
+    activeDataKeys: input.activeDataKeys,
+    renderedKeys: input.renderedKeys,
+    renderOrigin: input.renderOrigin,
+    quality: 'high',
+    playerLogicalX: input.playerLogicalX,
+    playerLogicalZ: input.playerLogicalZ,
+  });
+  audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
+    [value.identity.stableId, value]
+  )));
+  assert.equal(audit[trees[0].candidateId].visibleLod, 'mid');
+  assert.deepEqual([
+    audit[trees[0].candidateId].naturalLod.fullInstanceCount,
+    audit[trees[0].candidateId].naturalLod.forestInstanceCount,
+    audit[trees[0].candidateId].naturalLod.atmosphericInstanceCount,
+  ], [1, 1, 1]);
+  assert.equal(audit[trees[0].candidateId].ownerKey, '5,0');
+  presentation.dispose();
+});
+
+test('Tree, Bush, and Rock destruction removes every tier and survives Save Continue', async () => {
+  const tree = Object.freeze({
+    candidateId: 'detail-v1:vegetation:destroy-continue',
+    subtype: 'broadleaf-tree', variationSeed: 1, orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const rock = Object.freeze({
+    candidateId: 'detail-v1:rock:destroy-continue',
+    candidateType: 'rock', subtype: 'medium-rock', sizeClass: 'medium',
+    variationSeed: 0.5, orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 90, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
+  });
+  const bush = Object.freeze({
+    candidateId: 'detail-v1:vegetation:shrub:destroy-continue',
+    candidateType: 'vegetation',
+    subtype: 'shrub', variationSeed: 0.5, orientationSeed: 0.75,
+    worldPosition: Object.freeze({ x: 89, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = [tree, bush];
+  chunk.rockCandidates = [rock];
+  chunk.presentationLayers.natural = { vegetation: [tree, bush], rocks: [rock] };
+  let activeState = new InfiniteWorldState({
+    worldSeed: 'vegetation-continue',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+    isFeatureDestroyed: stableId => activeState.isFeatureDestroyed(stableId),
+  });
+  const midInput = canonicalSyncInput({
+    centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+  });
+  assert.equal(await presentation.sync(midInput), true);
+  for (const [record, type] of [[tree, 'tree'], [bush, 'tree'], [rock, 'rock']]) {
+    const contract = W6_STATIC_TARGET_CONTRACTS[type];
+    activeState.damageFeature(
+      { stableId: record.candidateId, maxHp: contract.maxHp },
+      contract.maxHp,
+    );
+  }
+  presentation.update(8, 8, midInput.renderOrigin);
+  for (const object of presentation.canonicalAuditSnapshot()) {
+    assert.equal(object.visibleLod, 'destroyed');
+    assert.equal(object.naturalLod.fullInstanceCount, 0);
+    assert.equal(object.naturalLod.forestInstanceCount, 0);
+    assert.equal(object.naturalLod.atmosphericInstanceCount, 0);
+    assert.equal(object.ownerKey, '5,0');
+  }
+  assert.equal(presentation.snapshot().naturalLodVisibleInstanceCount, 0);
+
+  const serialized = await encodeInfiniteWorldSave(activeState.createSaveSnapshot());
+  const decoded = await decodeInfiniteWorldSave(serialized, {
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+  });
+  const restored = new InfiniteWorldState({
+    worldSeed: 'vegetation-continue',
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    playerSpawn: { x: 8, z: 8 },
+  });
+  restored.restoreSaveSnapshot(decoded);
+  activeState = restored;
+  for (const input of [
+    canonicalSyncInput({ centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk }),
+    canonicalSyncInput({
+      centerChunkX: 4, activeDataKeys: ['5,0'], renderedKeys: ['5,0'], chunk,
+    }),
+    canonicalSyncInput({ centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk }),
+  ]) {
+    assert.equal(await presentation.sync(input), true);
+    assert.equal(presentation.canonicalAuditSnapshot().every(object => (
+      object.visibleLod === 'destroyed'
+        && activeState.isFeatureDestroyed(object.identity.stableId)
+    )), true);
+    assert.equal(presentation.snapshot().naturalLodVisibleInstanceCount, 0);
+  }
+  presentation.dispose();
+});
+
+test('Vegetation density 2x, 5x, and 10x keeps Material, Mesh, Geometry, and Draw fixed', async t => {
+  const rows = [];
+  const baseCount = 8;
+  for (const multiplier of [1, 2, 5, 10]) {
+    const trees = Object.freeze(Array.from({ length: baseCount * multiplier }, (_, index) => (
+      Object.freeze({
+        candidateId: `detail-v1:vegetation:density-${multiplier}:${index}`,
+        subtype: 'broadleaf-tree', variationSeed: (index % 7) / 7,
+        orientationSeed: (index % 11) / 11,
+        worldPosition: Object.freeze({
+          x: 82 + (index % 12), y: 0.4, z: 1 + (Math.floor(index / 12) % 14),
+        }),
+        owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      })
+    )));
+    const chunk = canonicalChunk(5, 0, []);
+    chunk.vegetationCandidates = trees;
+    chunk.presentationLayers.natural.vegetation = trees;
+    const scene = new DistantTestGroup();
+    const assets = createDistantTestVisualAssets();
+    const heapBefore = process.memoryUsage().heapUsed;
+    const presentation = await createW8DistantPresentation({
+      THREE: DISTANT_TEST_THREE,
+      scene,
+      worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+      visualAssets: assets,
+      findSettlementsNear: async () => [],
+      resolveTemplate: async () => null,
+      getCanonicalChunkData: async () => chunk,
+    });
+    const startedAt = performance.now();
+    assert.equal(await presentation.sync(canonicalSyncInput({
+      centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
+    })), true);
+    const syncMs = performance.now() - startedAt;
+    const updateStartedAt = performance.now();
+    for (let frame = 0; frame < 120; frame += 1) {
+      presentation.update(8 + frame % 2, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+    }
+    const updateMeanMs = (performance.now() - updateStartedAt) / 120;
+    const snapshot = presentation.snapshot();
+    const naturalMeshes = scene.children[0].children[0].children.filter(mesh => (
+      mesh.material?.userData?.naturalLod === true
+    ));
+    const geometries = new Set(naturalMeshes.map(mesh => mesh.geometry));
+    const materials = new Set(naturalMeshes.map(mesh => mesh.material));
+    rows.push({
+      multiplier,
+      treeCount: trees.length,
+      fpsEquivalent: Math.round(1000 / updateMeanMs),
+      draw: snapshot.naturalLodDrawCallEquivalent,
+      mesh: snapshot.naturalLodMeshCount,
+      material: snapshot.naturalLodMaterialCount,
+      geometry: snapshot.naturalLodGeometryCount,
+      instance: snapshot.naturalLodVisibleInstanceCount,
+      heapDeltaBytes: process.memoryUsage().heapUsed - heapBefore,
+      syncMs: Math.round(syncMs * 1000) / 1000,
+      sliceMs: Math.round(snapshot.farLastMaximumSliceMs * 1000) / 1000,
+      updateMeanMs: Math.round(updateMeanMs * 1e6) / 1e6,
+    });
+    presentation.dispose();
+    assert.equal(scene.children.length, 0);
+    assert.equal([...geometries].every(geometry => geometry.disposed === true), true);
+    assert.equal([...materials].every(material => material.disposed === true), true);
+  }
+  const fixed = key => new Set(rows.map(row => row[key])).size === 1;
+  for (const key of ['draw', 'mesh', 'material', 'geometry']) assert.equal(fixed(key), true, key);
+  assert.deepEqual(rows.map(row => row.instance), [24, 48, 120, 240]);
+  t.diagnostic(JSON.stringify(rows));
 });
 
 test('canonical settlement identity hands off exclusively and destruction survives distance and save/load', async () => {
@@ -4531,8 +6288,16 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
   assert.equal(
     snapshot.farOwnerChunkCacheSize,
     Math.min(
-      snapshot.queryOwnerChunkCount - snapshot.queryUltraOwnerChunkCount,
+      snapshot.queryOwnerChunkCount - snapshot.queryUltraOnlyOwnerChunkCount
+        - snapshot.queryForestHorizonOnlyOwnerChunkCount,
       snapshot.farOwnerChunkCacheCapacity,
+    ),
+  );
+  assert.equal(
+    snapshot.forestHorizonOwnerChunkCacheSize,
+    Math.min(
+      snapshot.queryForestHorizonOnlyOwnerChunkCount,
+      snapshot.forestHorizonOwnerChunkCacheCapacity,
     ),
   );
   assert.equal(snapshot.queryConcurrencyLimit, 4);

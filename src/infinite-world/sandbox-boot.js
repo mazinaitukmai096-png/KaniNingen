@@ -131,6 +131,14 @@ function parseMeasurementMode(value) {
   return value;
 }
 
+function parseMeasurementQuality(value) {
+  if (!value) return null;
+  if (!['high', 'medium', 'low'].includes(value)) {
+    throw new RangeError('measurementQuality must be high, medium, or low');
+  }
+  return value;
+}
+
 export function isW8GameplaySimulationEnabled(measurementMode, runPhase, paused = false) {
   return measurementMode !== null || (runPhase === 'playing' && paused !== true);
 }
@@ -711,6 +719,9 @@ export async function bootInfiniteWorldSandbox({
   measurementMode = parseMeasurementMode(
     new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('measurementMode'),
   ),
+  measurementQuality = parseMeasurementQuality(
+    new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('measurementQuality'),
+  ),
   diagnosticProfile = parseW8DiagnosticProfile(
     new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnosticProfile'),
   ),
@@ -723,6 +734,9 @@ export async function bootInfiniteWorldSandbox({
   streamingTelemetryEnabled = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('streamingTelemetry') === '1',
+  disablePersistentTreePublication = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('disablePersistentTreePublication') === '1',
   streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
@@ -778,6 +792,46 @@ export async function bootInfiniteWorldSandbox({
   let running = false;
   let animationFrameId = null;
   let currentStageStartedAt = null;
+  const staticTreeActivationTimeline = {
+    schemaVersion: 'static-tree-activation-timeline-1',
+    bootStartedAtMs: clock(),
+    coordinatorCreatedAtMs: null,
+    staticStreamCreatedAtMs: null,
+    distantPresentationCreatedAtMs: null,
+    firstShadowPlanGeneratedAtMs: null,
+    firstDistantTreeVisibleAtMs: null,
+    firstDistantTreeVisiblePathIds: null,
+    firstDistantTreeVisibleInstanceCount: null,
+    firstDistantTreeQueryCandidateCount: null,
+    innerWarmStartedAtMs: null,
+    innerWarmCompletedAtMs: null,
+    outerWarmStartedAtMs: null,
+    outerWarmCompletedAtMs: null,
+    staticStreamActivatedAtMs: null,
+    firstStaticPlanAppliedAtMs: null,
+    firstRequiredOwnerRequestAtMs: null,
+    firstReadyOwnerAtMs: null,
+    firstPersistentTreePublishAtMs: null,
+    firstPersistentTreeDrawAtMs: null,
+    activationSource: null,
+    activationRunPhase: null,
+    activationPaused: null,
+  };
+  const recordStaticTreeActivationTime = (field, atMs = clock()) => {
+    if (staticTreeActivationTimeline[field] === null) {
+      staticTreeActivationTimeline[field] = atMs;
+    }
+    return staticTreeActivationTimeline[field];
+  };
+  const activateTreeStaticStream = source => {
+    treeStaticStreamActivated = true;
+    if (staticTreeActivationTimeline.staticStreamActivatedAtMs === null) {
+      recordStaticTreeActivationTime('staticStreamActivatedAtMs');
+      staticTreeActivationTimeline.activationSource = source;
+      staticTreeActivationTimeline.activationRunPhase = experienceShell?.getRunPhase?.() ?? null;
+      staticTreeActivationTimeline.activationPaused = experienceShell?.isPaused?.() ?? null;
+    }
+  };
 
   const startStage = stage => {
     state.stage = stage;
@@ -845,6 +899,7 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingCoordinator = createWorldStreamingCoordinator({
       registry: worldStreamingPolicyRegistry,
     });
+    recordStaticTreeActivationTime('coordinatorCreatedAtMs');
     const schedulerTerminalCorrelations = new Set();
     const recordGenerationSchedulerEvent = event => {
       const envelope = event?.envelope;
@@ -1064,7 +1119,7 @@ export async function bootInfiniteWorldSandbox({
       }
       if (measurementMode) {
         worldState.updateExperience({
-          settings: { quality: 'medium', showFps: false, fpsCap: 0 },
+          settings: { quality: measurementQuality ?? 'medium', showFps: false, fpsCap: 0 },
         });
       }
     });
@@ -1195,12 +1250,23 @@ export async function bootInfiniteWorldSandbox({
         epoch,
         planId,
       }) => {
+        if (required) recordStaticTreeActivationTime('firstRequiredOwnerRequestAtMs');
+        const observeReady = handle => {
+          void Promise.resolve(handle?.promise ?? handle).then(value => {
+            if (value !== null && value !== undefined) {
+              recordStaticTreeActivationTime('firstReadyOwnerAtMs');
+            }
+          }, () => {});
+          return handle;
+        };
         const { chunkX, chunkZ } = parseChunkKey(ownerKey);
         const consumerId = `static-object-stream:${treeStaticPolicyRuntime.policy.kind}:${ownerKey}`;
         if (resourceKind === 'canonical') {
           const existing = runtime.getChunkData(chunkX, chunkZ);
-          if (existing) return Object.freeze({ promise: Promise.resolve(existing), cancel: () => false });
-          return chunkDataService.requestChunk({
+          if (existing) return observeReady(Object.freeze({
+            promise: Promise.resolve(existing), cancel: () => false,
+          }));
+          return observeReady(chunkDataService.requestChunk({
             chunkX,
             chunkZ,
             priority,
@@ -1210,7 +1276,7 @@ export async function bootInfiniteWorldSandbox({
             epoch,
             telemetryTarget: WORLD_STREAMING_TARGET.TREE,
             telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
-          });
+          }));
         }
         const promise = traceGenerationBoundary({
           target: WORLD_STREAMING_TARGET.TREE,
@@ -1232,16 +1298,17 @@ export async function bootInfiniteWorldSandbox({
           deadlineAtMs,
           ...schedulerOptions,
         }));
-        return Object.freeze({
+        return observeReady(Object.freeze({
           promise,
           cancel: reason => chunkGeneratorTransport.cancelForestHorizonRequests({
             consumerId,
             epoch,
             reason: reason ?? 'static-plan-superseded',
           }) > 0,
-        });
+        }));
       },
     });
+    recordStaticTreeActivationTime('staticStreamCreatedAtMs');
     distantPresentation = await createW8DistantPresentation({
       THREE,
       scene,
@@ -1332,16 +1399,39 @@ export async function bootInfiniteWorldSandbox({
         return cancelled;
       },
       publishStaticOwnerTickets: ({ ownerKeys }) => {
-        if (ownerKeys.length > 0) treeStaticStreamActivated = true;
-        return treeStaticStream.publishOwners({ ownerKeys });
+        const published = treeStaticStream.publishOwners({ ownerKeys });
+        if (published.length > 0) {
+          recordStaticTreeActivationTime('firstPersistentTreePublishAtMs');
+          activateTreeStaticStream('publication-ticket');
+        }
+        return published;
       },
+      incrementalStaticTreePages: true,
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
       getNearVisibleStableIds: () =>
-        renderAdapter.visibleSettlementStableIdsSnapshot?.() ?? [],
+        renderAdapter.visibleStableIdsSnapshot?.() ?? [],
       getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
       measure: (stage, operation) => diagnostics.measure(stage, operation),
       telemetry: streamingTelemetry,
     });
+    recordStaticTreeActivationTime('distantPresentationCreatedAtMs');
+    const recordDistantTreeVisibility = () => {
+      if (staticTreeActivationTimeline.firstDistantTreeVisibleAtMs !== null) return true;
+      const treePaths = distantPresentation.treePathAuditSnapshot?.() ?? [];
+      const visiblePaths = treePaths.filter(path => path.active && path.instanceCount > 0);
+      if (visiblePaths.length === 0) return false;
+      const presentationSnapshot = distantPresentation.snapshot();
+      recordStaticTreeActivationTime('firstDistantTreeVisibleAtMs');
+      staticTreeActivationTimeline.firstDistantTreeVisiblePathIds = Object.freeze(
+        visiblePaths.map(path => path.pathId),
+      );
+      staticTreeActivationTimeline.firstDistantTreeVisibleInstanceCount = visiblePaths.reduce(
+        (sum, path) => sum + path.instanceCount, 0,
+      );
+      staticTreeActivationTimeline.firstDistantTreeQueryCandidateCount =
+        presentationSnapshot.queryNaturalCandidateCount;
+      return true;
+    };
     {
       const runtimeSnapshot = runtime.getCommittedChunkState();
       distantPresentation.syncLocalTerrain({
@@ -1371,10 +1461,9 @@ export async function bootInfiniteWorldSandbox({
            playerLogicalX: logicalPlayer.x,
            playerLogicalZ: logicalPlayer.z,
            includeFarNatural: false,
-           // Boot must present the already-canonical inner scene before the optional
-           // 84–140m tier warms.  The latter is queued from the first frame below.
            includeUltraNatural: false,
-         }));
+          }));
+      recordDistantTreeVisibility();
     }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
@@ -1496,7 +1585,6 @@ export async function bootInfiniteWorldSandbox({
         z: logicalPlayer.z,
       };
     };
-
     const initialSaveStorageMode = saveStore.snapshot().storage?.mode;
     let saveStatus = initialSaveStorageMode === 'unavailable'
       || state.saveError?.code === 'SAVE_STORAGE_UNAVAILABLE'
@@ -1525,6 +1613,9 @@ export async function bootInfiniteWorldSandbox({
     let postCommitLastError = null;
     let postCommitPumpActive = false;
     let postCommitTimer = null;
+    let farNaturalWarmStarted = false;
+    let ultraNaturalWarmStarted = false;
+    let naturalWarmRetryAt = 0;
     const gameplaySyncWorkByEpoch = new Map();
     let saveDeferredForStreaming = false;
     let lastCameraCollision = Object.freeze({
@@ -1539,6 +1630,39 @@ export async function bootInfiniteWorldSandbox({
       completedAt: null,
       status: measurementMode ? 'warmup' : 'disabled',
     };
+    let streamingAcceptanceMetrics = null;
+    const percentileOf = (values, ratio) => {
+      if (!values.length) return 0;
+      const ordered = [...values].sort((left, right) => left - right);
+      return ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * ratio) - 1)];
+    };
+    const collectStreamingAcceptanceMetrics = () => {
+      const telemetrySnapshot = streamingTelemetry.snapshot();
+      const tree = telemetrySnapshot.lifecycles.filter(lifecycle => (
+        lifecycle.target === WORLD_STREAMING_TARGET.TREE
+      ));
+      const workerToPublish = tree
+        .map(lifecycle => lifecycle.workerCompleteToPublishMs)
+        .filter(Number.isFinite);
+      const requestToFirstDraw = tree
+        .map(lifecycle => lifecycle.requestToFirstDrawMs)
+        .filter(Number.isFinite);
+      return Object.freeze({
+        workerToPublishCount: workerToPublish.length,
+        workerToPublishP50Ms: percentileOf(workerToPublish, 0.5),
+        workerToPublishP95Ms: percentileOf(workerToPublish, 0.95),
+        workerToPublishMaximumMs: Math.max(0, ...workerToPublish),
+        requestToFirstDrawCount: requestToFirstDraw.length,
+        requestToFirstDrawP50Ms: percentileOf(requestToFirstDraw, 0.5),
+        requestToFirstDrawP95Ms: percentileOf(requestToFirstDraw, 0.95),
+        requestToFirstDrawMaximumMs: Math.max(0, ...requestToFirstDraw),
+        playerArrivalMissingCount: tree.filter(lifecycle => (
+          lifecycle.playerArrivalAtMs !== null
+          && (lifecycle.firstDrawAtMs === null
+            || lifecycle.firstDrawAtMs > lifecycle.playerArrivalAtMs)
+        )).length,
+      });
+    };
     let distantQuality = worldState.experience.settings.quality;
     let distantRenderDistance = normalizeW8RenderDistancePreset(
       worldState.experience.settings.renderDistance
@@ -1548,6 +1672,8 @@ export async function bootInfiniteWorldSandbox({
 
     const synchronizeDistantPresentation = (runtimeSnapshot, {
       includeUltraNatural = true,
+      revealNatural = false,
+      naturalRevealInnerMeters = 0,
     } = {}) => distantPresentation.sync({
       transitionContract: runtimeSnapshot.transitionContract,
       activeDataKeys: runtimeSnapshot.activeDataKeys,
@@ -1561,6 +1687,8 @@ export async function bootInfiniteWorldSandbox({
       playerLogicalX: logicalPlayer.x,
       playerLogicalZ: logicalPlayer.z,
       includeUltraNatural,
+      revealNatural,
+      naturalRevealInnerMeters,
     });
 
     const synchronizeLocalTerrain = runtimeSnapshot => distantPresentation.syncLocalTerrain({
@@ -2359,12 +2487,43 @@ export async function bootInfiniteWorldSandbox({
           },
         },
       });
+      recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
       const treePolicyPlan = worldStreamingPlan.policyPlans.find(
         policy => policy.kind === treeStaticPolicyRuntime.policy.kind,
       );
-      if (treeStaticStreamActivated && !treeStaticStreamSuspended
-        && !playerRelocationInProgress) {
+      const treeStaticStreamCanApply = !treeStaticStreamSuspended
+        && !playerRelocationInProgress;
+      if (!treeStaticStreamActivated && treeStaticStreamCanApply) {
+        activateTreeStaticStream('first-shadow-plan');
+      }
+      if (treeStaticStreamActivated && treeStaticStreamCanApply) {
         treeStaticStream.applyPlan({ plan: worldStreamingPlan, policyPlan: treePolicyPlan });
+        recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
+        const streamControl = treeStaticStream.diagnostics();
+        if (!disablePersistentTreePublication) {
+          distantPresentation.applyStaticTreePlan?.({
+            coverageGeneration: streamControl.coverageGeneration,
+            planRevision: streamControl.planRevision,
+            planId: worldStreamingPlan.planId,
+            destructionRevision: [...(worldState.featureDamage?.entries?.() ?? [])]
+              .filter(([, value]) => value?.destroyed === true)
+              .map(([stableId]) => stableId)
+              .sort((left, right) => left.localeCompare(right))
+              .join('\n'),
+            quality: distantQuality,
+            renderDistancePreset: distantRenderDistance,
+            renderOrigin: committedChunkState.renderOrigin,
+            playerLogicalX: logicalPlayer.x,
+            playerLogicalZ: logicalPlayer.z,
+            activeDataKeys: committedChunkState.activeDataKeys,
+            renderedKeys: committedChunkState.renderedKeys,
+            retainedOwnerKeys: treePolicyPlan.allOwnerKeys,
+            // Admission is deliberately one owner per animation frame. The
+            // presentation coordinator shares one budget across dispose,
+            // visibility, compose, upload marking, build, and publication.
+            readyPages: treeStaticStream.drainReadyOwnerPages({ limit: 1 }),
+          });
+        }
       }
       return owner;
     }
@@ -2435,6 +2594,9 @@ export async function bootInfiniteWorldSandbox({
       const longTaskMaximum = measurementReport.longTasks.reduce(
         (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
       );
+      if (measurement.status === 'complete' && streamingAcceptanceMetrics === null) {
+        streamingAcceptanceMetrics = collectStreamingAcceptanceMetrics();
+      }
       const measurementText = measurement.mode
         ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 60s`
         : '';
@@ -2454,7 +2616,7 @@ export async function bootInfiniteWorldSandbox({
       const shadowDiagnosticText = diagnostics.enabled
         ? `\nWorld Streaming Shadow: ${escapeHtml(worldStreamingSnapshot.latestPlan?.planId ?? 'none')}  preset ${escapeHtml(worldStreamingSnapshot.latestPlan?.renderDistancePreset ?? 'none')}  match ${shadowComparison?.matches === true ? 'yes' : shadowComparison?.matches === false ? 'no' : 'unobserved'}  required ${shadowPolicy?.requiredOwnerKeys.length ?? 0}/${shadowComparison?.required?.observedCount ?? 0}  request ${shadowPolicy?.requestOwnerKeys.length ?? 0}/${shadowComparison?.requested?.observedCount ?? 0}  retained ${shadowPolicy?.retainedOwnerKeys.length ?? 0}/${shadowComparison?.retained?.observedCount ?? 0}  corridor ${shadowPolicy?.velocityCorridor.ownerKeys.length ?? 0} owner  plan ${number(worldStreamingSnapshot.performance.lastPlanDurationMs)}/${number(worldStreamingSnapshot.performance.p95PlanDurationMs)}/${number(worldStreamingSnapshot.performance.maximumPlanDurationMs)}ms last/p95/max`
         : '';
-      const staticStreamingDiagnosticText = `\nStatic Tree Stream: ${escapeHtml(staticTreeStreaming.latestPlanId ?? 'inactive')}  required ${staticTreeStreaming.readyRequiredOwnerCount}/${staticTreeStreaming.requiredOwnerCount}  prefetch ${staticTreeStreaming.readyPrefetchedOwnerCount}/${staticTreeStreaming.prefetchedOwnerCount}  backlog ${staticTreeStreaming.backlog}  requested/hit/reuse ${staticTreeStreaming.requestedCount}/${staticTreeStreaming.readyHitCount}/${staticTreeStreaming.pendingReuseCount}  tickets ${staticTreeStreaming.publishedTicketCount}/${staticTreeStreaming.ticketCount}  cancel/fail/invalidate ${staticTreeStreaming.cancelledCount}/${staticTreeStreaming.failedCount}/${staticTreeStreaming.invalidationCount}  Worker ${staticTreeStreaming.workerCount}`;
+      const staticStreamingDiagnosticText = `\nStatic Tree Stream: ${escapeHtml(staticTreeStreaming.latestPlanId ?? 'inactive')}  coverage/revision ${staticTreeStreaming.coverageGeneration}/${staticTreeStreaming.planRevision}  required ${staticTreeStreaming.readyRequiredOwnerCount}/${staticTreeStreaming.requiredOwnerCount}  prefetch ${staticTreeStreaming.readyPrefetchedOwnerCount}/${staticTreeStreaming.prefetchedOwnerCount}  backlog ${staticTreeStreaming.backlog}  requested/hit/reuse ${staticTreeStreaming.requestedCount}/${staticTreeStreaming.readyHitCount}/${staticTreeStreaming.pendingReuseCount}  tickets ${staticTreeStreaming.publishedTicketCount}/${staticTreeStreaming.ticketCount}  cancel/fail/invalidate ${staticTreeStreaming.cancelledCount}/${staticTreeStreaming.failedCount}/${staticTreeStreaming.invalidationCount}  Worker ${staticTreeStreaming.workerCount}\nStatic Tree Presentation: published/resident/pending/dispose ${presentationSnapshot.staticTreeCurrentPublishedOwnerCount}/${presentationSnapshot.staticTreeResidentOwnerCount}/${presentationSnapshot.staticTreePendingOwnerCount}/${presentationSnapshot.staticTreeDisposeOwnerCount}  publish wait last/max ${number(presentationSnapshot.staticTreeLastPublicationWaitMs)}/${number(presentationSnapshot.staticTreeMaximumPublicationWaitMs)}ms  matrix/attribute ${presentationSnapshot.staticTreeMatrixUpdateCount}/${presentationSnapshot.staticTreeAttributeUpdateCount}  compose max ${number(presentationSnapshot.staticTreeMaximumSliceMs)}ms  deferred dispose ${presentationSnapshot.deferredGenerationDisposeCount}${streamingAcceptanceMetrics ? `\nStatic Tree Acceptance: worker-publish count/p50/p95/max ${streamingAcceptanceMetrics.workerToPublishCount}/${number(streamingAcceptanceMetrics.workerToPublishP50Ms)}/${number(streamingAcceptanceMetrics.workerToPublishP95Ms)}/${number(streamingAcceptanceMetrics.workerToPublishMaximumMs)}ms  request-first-draw count/p50/p95/max ${streamingAcceptanceMetrics.requestToFirstDrawCount}/${number(streamingAcceptanceMetrics.requestToFirstDrawP50Ms)}/${number(streamingAcceptanceMetrics.requestToFirstDrawP95Ms)}/${number(streamingAcceptanceMetrics.requestToFirstDrawMaximumMs)}ms  arrival missing ${streamingAcceptanceMetrics.playerArrivalMissingCount}` : ''}`;
       const settlementReference = currentChunk?.settlementReferences?.[0];
       const fogFarMeters = scene.fog.far / UNITS_PER_METER;
       const cloudWithinFogCount = scenePresentationSnapshot.clouds.filter(cloud => Math.hypot(
@@ -2481,7 +2643,7 @@ Destroyed Stable IDs: ${gameplaySnapshot.state.destroyedFeatureCount + gameplayS
 Controls: WASD / Shift / Space / Left + Right Mouse / Wheel / H / Escape (developer keys isolated)
 Render Origin Chunk: (${runtimeSnapshot.renderOrigin.renderOriginChunkX}, ${runtimeSnapshot.renderOrigin.renderOriginChunkZ})
 W1B Render Profile: ${selectedRenderChunkSize} (${renderProfile.selectedUnitsPerMeter} units/m; startup benchmark: isolated)
-Render Distance: ${escapeHtml(presentationSnapshot.renderDistancePreset)}  Natural ${number(presentationSnapshot.naturalVisibilityMeters)}m  Terrain/River ${number(presentationSnapshot.clipmapExtentMeters)}m  General ${number(presentationSnapshot.visibilityMeters)}m  Settlement ${number(presentationSnapshot.remoteHorizonHiddenDistanceMeters)}m
+Render Distance: ${escapeHtml(presentationSnapshot.renderDistancePreset)}  Quality ${escapeHtml(distantQuality)}  Natural ${number(presentationSnapshot.naturalVisibilityMeters)}m  Terrain/River ${number(presentationSnapshot.clipmapExtentMeters)}m  General ${number(presentationSnapshot.visibilityMeters)}m  Settlement ${number(presentationSnapshot.remoteHorizonHiddenDistanceMeters)}m
 Rendered: ${runtimeSnapshot.renderedCount}/9  Prefetched Data: ${runtimeSnapshot.activeDataCount}/25  Cache: ${runtimeSnapshot.cacheSize}/${runtimeSnapshot.cacheCapacity}
 Chunk Generator: ${escapeHtml(chunkTransportSnapshot?.mode ?? chunkTransportSnapshot?.kind ?? 'unknown')}  fallback ${chunkTransportSnapshot?.fallbackOccurred ? escapeHtml(chunkTransportSnapshot.fallbackReason?.message ?? 'yes') : 'none'}  worker generation p50/max ${number(chunkTransportSnapshot?.generationMsP50)}/${number(chunkTransportSnapshot?.generationMsMaximum)}ms  receive p50/max ${number(chunkTransportSnapshot?.mainThreadReceiveMsP50)}/${number(chunkTransportSnapshot?.mainThreadReceiveMsMaximum)}ms
 Distant Local Terrain: epoch ${presentationSnapshot.committedLocalTerrainEpoch}/${presentationSnapshot.localTerrainSyncEpoch}  center (${presentationSnapshot.localTerrainCoverageCenter?.chunkX ?? 'n/a'}, ${presentationSnapshot.localTerrainCoverageCenter?.chunkZ ?? 'n/a'})  active/resolved/rendered/mid ${presentationSnapshot.localTerrainActiveKeyCount}/${presentationSnapshot.localTerrainResolvedChunkCount}/${presentationSnapshot.localTerrainRenderedKeyCount}/${presentationSnapshot.localTerrainMidgroundOwnerCount}  commits/rejects ${presentationSnapshot.localTerrainCommitCount}/${presentationSnapshot.localTerrainRejectionCount}  missing ${escapeHtml(presentationSnapshot.localTerrainMissingOwnerKeys.join(',') || 'none')}  far pending ${presentationSnapshot.farSyncPending ? presentationSnapshot.farSyncPendingCount : 0}
@@ -2579,6 +2741,9 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           );
         }
         renderer.render(scene, camera);
+        if (staticTreeActivationTimeline.firstPersistentTreePublishAtMs !== null) {
+          recordStaticTreeActivationTime('firstPersistentTreeDrawAtMs');
+        }
         if (streamingTelemetry.enabled) {
           renderAdapter.markFirstDraw?.();
           distantPresentation.markFirstDraw?.();
@@ -2591,19 +2756,60 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       if (!running) return;
       try {
         const frameNow = Number.isFinite(now) ? now : clock();
-        if (!farNaturalWarmStarted && diagnosticProfile.distant) {
+        if (!farNaturalWarmStarted && diagnosticProfile.distant
+          && frameNow >= naturalWarmRetryAt) {
           farNaturalWarmStarted = true;
+          recordStaticTreeActivationTime('innerWarmStartedAtMs');
           void diagnostics.measureAsync(
-            'distant-sync',
-            () => synchronizeDistantPresentation(runtime.getCommittedChunkState(), { includeUltraNatural: false }),
-          ).then(() => {
-            if (!running || ultraNaturalWarmStarted) return;
+            'distant-sync-natural',
+            () => synchronizeDistantPresentation(runtime.getCommittedChunkState(), {
+              includeUltraNatural: false,
+              revealNatural: true,
+              naturalRevealInnerMeters: 0,
+            }),
+          ).then(committed => {
+            if (committed !== true) {
+              farNaturalWarmStarted = false;
+              ultraNaturalWarmStarted = false;
+              naturalWarmRetryAt = clock() + 1_000;
+              return;
+            }
+            recordStaticTreeActivationTime('innerWarmCompletedAtMs');
+            recordDistantTreeVisibility();
+            const policy = resolveW8RenderDistancePolicy(distantRenderDistance);
+            if (!running || ultraNaturalWarmStarted
+              || policy.naturalInnerWarmMeters >= policy.fogFarMeters) {
+              return;
+            }
             ultraNaturalWarmStarted = true;
+            recordStaticTreeActivationTime('outerWarmStartedAtMs');
             void diagnostics.measureAsync(
-              'distant-sync-ultra',
-              () => synchronizeDistantPresentation(runtime.getCommittedChunkState()),
-            ).catch(error => { transitionError = error; });
-          }).catch(error => { transitionError = error; });
+              'distant-sync-natural-outer',
+              () => synchronizeDistantPresentation(runtime.getCommittedChunkState(), {
+                revealNatural: true,
+                naturalRevealInnerMeters: policy.naturalInnerWarmMeters,
+              }),
+            ).then(outerCommitted => {
+              if (outerCommitted === true) {
+                recordStaticTreeActivationTime('outerWarmCompletedAtMs');
+                recordDistantTreeVisibility();
+                return;
+              }
+              farNaturalWarmStarted = false;
+              ultraNaturalWarmStarted = false;
+              naturalWarmRetryAt = clock() + 1_000;
+            }).catch(error => {
+              farNaturalWarmStarted = false;
+              ultraNaturalWarmStarted = false;
+              naturalWarmRetryAt = clock() + 1_000;
+              transitionError = error;
+            });
+          }).catch(error => {
+            farNaturalWarmStarted = false;
+            ultraNaturalWarmStarted = false;
+            naturalWarmRetryAt = clock() + 1_000;
+            transitionError = error;
+          });
         }
         const rawFrameMs = Math.max(0, frameNow - lastFrameAt);
         latestFrameDurationMs = rawFrameMs;
@@ -2618,6 +2824,8 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           && measurementElapsed >= measurement.warmupMs) {
           runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
           diagnostics.reset();
+          streamingTelemetry.clear();
+          streamingAcceptanceMetrics = null;
           diagnostics.startFrame(frameNow);
           diagnosticFrameStarted = diagnostics.enabled;
           measurement.samplingStartedAt = frameNow;
@@ -2659,11 +2867,6 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           'player-update',
           () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin, deltaSeconds),
         );
-        diagnostics.measure('distant-update', () => distantPresentation.update(
-          logicalPlayer.x,
-          logicalPlayer.z,
-          frameRenderOrigin,
-        ));
         diagnostics.measure('gameplay-update', () => gameplay.update({
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,
@@ -2675,6 +2878,14 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
               experienceShell.isPaused(),
             ),
           }));
+        // Gameplay owns feature damage. Refresh every canonical distant tier
+        // after simulation so a Tree destroyed this frame cannot survive for
+        // one extra rendered frame as a Forest/Horizon silhouette.
+        diagnostics.measure('distant-update', () => distantPresentation.update(
+          logicalPlayer.x,
+          logicalPlayer.z,
+          frameRenderOrigin,
+        ));
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
         const presentation = diagnostics.measure(
           'presentation-effects', () => gameplay.consumePresentationEffects(),
@@ -2788,14 +2999,24 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           presentation: distantPresentation.snapshot(),
           scenePresentation: scenePresentation.snapshot(),
           measurement: Object.freeze({ ...measurement }),
-          streamingTelemetry: streamingTelemetry.snapshot(),
-          worldStreaming: worldStreamingCoordinator.snapshot(),
-          staticObjectStreaming: treeStaticStream.snapshot(),
           diagnostics: diagnostics.snapshot({
             drawCalls: renderer.info?.render?.calls ?? null,
             geometries: renderer.info?.memory?.geometries ?? null,
             materials: renderAdapter.resourceSnapshot().sharedMaterialCount,
             sceneObjects: countSceneObjects(scene),
+          }),
+          streamingTelemetry: streamingTelemetry.snapshot(),
+          worldStreaming: worldStreamingCoordinator.snapshot(),
+          staticObjectStreaming: treeStaticStream.snapshot(),
+          treePathAudit: Object.freeze({
+            treeStaticStreamActivated,
+            treeStaticStreamSuspended,
+            farNaturalWarmStarted,
+            ultraNaturalWarmStarted,
+            naturalWarmRetryAt,
+            activationTimeline: Object.freeze({ ...staticTreeActivationTimeline }),
+            near: renderAdapter.treePathAuditSnapshot?.() ?? null,
+            distant: distantPresentation.treePathAuditSnapshot?.() ?? Object.freeze([]),
           }),
           sceneObjectCount: countSceneObjects(scene),
           renderInfo: Object.freeze({
@@ -2834,5 +3055,3 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     throw error;
   }
 }
-    let farNaturalWarmStarted = false;
-    let ultraNaturalWarmStarted = false;

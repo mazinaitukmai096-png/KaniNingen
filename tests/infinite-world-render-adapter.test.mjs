@@ -134,14 +134,22 @@ test('render adapter applies Stable-ID destruction without allocating or leaking
   await adapter.loadProjected(projected);
   const entry = adapter.featureInstances.get(stableId);
   assert.ok(entry);
+  const firstVisibleSnapshot = adapter.visibleStableIdsSnapshot();
+  assert.equal(firstVisibleSnapshot.includes(stableId), true);
+  assert.equal(adapter.visibleStableIdsSnapshot(), firstVisibleSnapshot,
+    'unchanged Near ownership reuses the immutable Stable ID snapshot');
   assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
   assert.equal(adapter.setFeatureDestroyed(stableId, true), true);
+  const destroyedSnapshot = adapter.visibleStableIdsSnapshot();
+  assert.notEqual(destroyedSnapshot, firstVisibleSnapshot);
+  assert.equal(destroyedSnapshot.includes(stableId), false);
   assert.deepEqual(entry.mesh.matrices[entry.index].scale, { x: 0, y: 0, z: 0 });
   destroyed.add(stableId);
   adapter.refreshFeatureStates();
   assert.deepEqual(entry.mesh.matrices[entry.index].scale, { x: 0, y: 0, z: 0 });
   destroyed.delete(stableId);
   adapter.refreshFeatureStates();
+  assert.equal(adapter.visibleStableIdsSnapshot().includes(stableId), true);
   assert.notEqual(entry.mesh.matrices[entry.index].scale.x, 0);
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.resourceSnapshot().trackedFeatureInstanceCount, 0);
@@ -392,6 +400,19 @@ test('Settlement projection preserves finite layer order and renders junction, e
   const lotMesh = projected.group.children[lotIndex];
   assert.deepEqual(lotMesh.userData.surfaceKinds.sort(), ['entrance-path', 'forecourt']);
   assert.equal(lotMesh.count, 2);
+  await adapter.loadProjected(projected);
+  adapter.markFirstDraw();
+  const pathAudit = adapter.treePathAuditSnapshot();
+  assert.equal(pathAudit.pathId, 'near-tree');
+  assert.deepEqual(pathAudit.rootNames, ['w1a-render-root']);
+  assert.equal(pathAudit.rootCount, 1);
+  assert.equal(pathAudit.ownerCount, 1);
+  assert.equal(pathAudit.stableIdCount, 1);
+  assert.equal(pathAudit.instanceCount > 0, true);
+  assert.equal(pathAudit.firstDrawAtMs !== null, true);
+  assert.deepEqual(pathAudit.publicationSources, ['runtime-chunk-load']);
+  await adapter.unloadChunk('0,0');
+  assert.equal(adapter.treePathAuditSnapshot().disposeCount, 1);
   await adapter.shutdown();
 });
 

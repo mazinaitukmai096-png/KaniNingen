@@ -61,6 +61,10 @@ test('World Streaming Telemetry records ordered request-to-arrival lifecycle eve
   assert.deepEqual(snapshot.events.map(event => event.sequence), [1, 2, 3, 4, 5, 6, 7]);
   assert.equal(snapshot.orderViolationCount, 0);
   assert.equal(snapshot.lifecycles.length, 1);
+  assert.equal(snapshot.lifecycles[0].workerCompleteAtMs, 15);
+  assert.equal(snapshot.lifecycles[0].publishAtMs, 20);
+  assert.equal(snapshot.lifecycles[0].workerCompleteToPublishMs, 5);
+  assert.equal(snapshot.lifecycles[0].requestToPublishMs, 20);
   assert.equal(snapshot.lifecycles[0].requestToFirstDrawMs, 25);
   assert.equal(snapshot.lifecycles[0].firstDrawToPlayerArrivalMs, 5);
 });

@@ -64,6 +64,8 @@ export class ChunkRenderAdapter {
     this.pendingFirstDrawByChunk = new Map();
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
+    this.visibleStableIdsRevision = 0;
+    this.visibleStableIdsCache = null;
     this.occlusionMeshes = [];
     this.cameraCollisionBounds = [];
     this.occludedFeatureIds = new Set();
@@ -84,6 +86,15 @@ export class ChunkRenderAdapter {
       chunkOwnedGeometriesCreated: 0,
       chunkOwnedGeometriesDisposed: 0,
     };
+    this.treePathAudit = {
+      pathId: 'near-tree',
+      firstDrawAtMs: null,
+      lastUpdateAtMs: null,
+      matrixUpdateCount: 0,
+      bufferUpdateCount: 0,
+      visibilityChangeCount: 0,
+      disposeCount: 0,
+    };
 
     const Group = requireConstructor(THREE, 'Group');
     const PlaneGeometry = requireConstructor(THREE, 'PlaneGeometry');
@@ -93,6 +104,7 @@ export class ChunkRenderAdapter {
     const Object3D = requireConstructor(THREE, 'Object3D');
     this.worldRoot = new Group();
     this.worldRoot.name = 'w1a-render-root';
+    this.worldRoot.userData = { treePathId: 'near-tree', runtimeOwned: true };
     this.scene.add(this.worldRoot);
     this.geometries = Object.freeze({
       terrain: new PlaneGeometry(renderChunkSize, renderChunkSize),
@@ -109,6 +121,11 @@ export class ChunkRenderAdapter {
 
   #cloneMatrix(matrix) {
     return matrix.clone?.() ?? structuredClone(matrix);
+  }
+
+  #invalidateVisibleStableIds() {
+    this.visibleStableIdsRevision += 1;
+    this.visibleStableIdsCache = null;
   }
 
   #registry() {
@@ -151,6 +168,7 @@ export class ChunkRenderAdapter {
 
   #registerFeatureInstance({
     stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group, canonicalObject = null,
+    treePathId = null,
   }) {
     if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
     const registry = this.#registry();
@@ -162,7 +180,7 @@ export class ChunkRenderAdapter {
     if (!existing) {
       existing = {
         stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix,
-        parts: [], group, rubbleMesh: null, canonicalObject,
+        parts: [], group, rubbleMesh: null, canonicalObject, treePathId,
       };
       registry.featureInstances.set(stableId, existing);
     }
@@ -170,6 +188,7 @@ export class ChunkRenderAdapter {
     if (!registry.chunkFeatureIds.has(chunkKey)) registry.chunkFeatureIds.set(chunkKey, new Set());
     registry.chunkFeatureIds.get(chunkKey).add(stableId);
     const destroyed = this.isFeatureDestroyed(stableId);
+    existing.destroyed = destroyed;
     mesh.setMatrixAt(index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
     fadeMesh?.setMatrixAt(index, this.hiddenFeatureMatrix);
   }
@@ -177,19 +196,33 @@ export class ChunkRenderAdapter {
   setFeatureDestroyed(stableId, destroyed = true) {
     const entry = this.featureInstances.get(stableId);
     if (!entry) return false;
+    const nextDestroyed = destroyed === true;
+    const visibilityChanged = entry.destroyed !== nextDestroyed;
+    if (entry.destroyed !== nextDestroyed) {
+      entry.destroyed = nextDestroyed;
+      this.#invalidateVisibleStableIds();
+    }
     const occluded = this.occludedFeatureIds.has(stableId);
     for (const part of entry.parts) {
-      part.mesh.setMatrixAt(part.index, destroyed || occluded
+      part.mesh.setMatrixAt(part.index, nextDestroyed || occluded
         ? this.hiddenFeatureMatrix : part.originalMatrix);
       part.mesh.instanceMatrix.needsUpdate = true;
       if (part.fadeMesh) {
-        part.fadeMesh.setMatrixAt(part.index, !destroyed && occluded
+        part.fadeMesh.setMatrixAt(part.index, !nextDestroyed && occluded
           ? part.originalMatrix : this.hiddenFeatureMatrix);
         part.fadeMesh.instanceMatrix.needsUpdate = true;
       }
     }
+    if (entry.treePathId === 'near-tree') {
+      this.treePathAudit.matrixUpdateCount += entry.parts.length;
+      this.treePathAudit.bufferUpdateCount += entry.parts.reduce(
+        (sum, part) => sum + 1 + Number(Boolean(part.fadeMesh)), 0,
+      );
+      this.treePathAudit.visibilityChangeCount += Number(visibilityChanged);
+      this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
+    }
     const destructionPresentation = entry.canonicalObject?.destruction?.presentation ?? 'rubble';
-    if (destroyed && destructionPresentation === 'rubble' && !entry.rubbleMesh) {
+    if (nextDestroyed && destructionPresentation === 'rubble' && !entry.rubbleMesh) {
       const Mesh = requireConstructor(this.THREE, 'Mesh');
       const rubble = new Mesh(
         this.visualAssets.geometries.dodeca,
@@ -202,7 +235,7 @@ export class ChunkRenderAdapter {
       rubble.castShadow = true; rubble.receiveShadow = true;
       entry.group?.add?.(rubble);
       entry.rubbleMesh = rubble;
-    } else if ((!destroyed || destructionPresentation !== 'rubble') && entry.rubbleMesh) {
+    } else if ((!nextDestroyed || destructionPresentation !== 'rubble') && entry.rubbleMesh) {
       entry.group?.remove?.(entry.rubbleMesh);
       entry.rubbleMesh = null;
     }
@@ -449,6 +482,9 @@ export class ChunkRenderAdapter {
       mesh.receiveShadow = true;
       mesh.count = resourceItems.length;
       mesh.userData.featureStableIds = [];
+      mesh.userData.treePathId = resourceItems.some(item => item.treePathId === 'near-tree')
+        ? 'near-tree' : null;
+      mesh.userData.treeStableIds = [];
       let fadeMesh = null;
       if (cameraOccludable) {
         fadeMesh = new InstancedMesh(
@@ -465,6 +501,7 @@ export class ChunkRenderAdapter {
       resourceItems.forEach((item, index) => {
         mesh.setMatrixAt(index, item.matrix);
         mesh.userData.featureStableIds[index] = item.stableId;
+        if (item.treePathId === 'near-tree') mesh.userData.treeStableIds.push(item.stableId);
         if (fadeMesh) fadeMesh.userData.featureStableIds[index] = item.stableId;
         this.#registerFeatureInstance({
           stableId: item.stableId,
@@ -475,9 +512,15 @@ export class ChunkRenderAdapter {
           matrix: item.matrix,
           group,
           canonicalObject: item.canonicalObject ?? null,
+          treePathId: item.treePathId ?? null,
         });
       });
       mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.userData.treePathId === 'near-tree') {
+        this.treePathAudit.matrixUpdateCount += mesh.userData.treeStableIds.length;
+        this.treePathAudit.bufferUpdateCount += 1;
+        this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
+      }
       if (attach) group.add(mesh);
       meshes.push(mesh);
       if (fadeMesh) {
@@ -590,10 +633,12 @@ export class ChunkRenderAdapter {
       const descriptors = canonical?.presentation.parts
         ?? this.visualAssets.featureParts[visual.visualKind]
         ?? this.visualAssets.featureParts.broadleafTree;
+      const treePathId = candidate.subtype === 'shrub' ? null : 'near-tree';
       for (const descriptor of descriptors) {
         vegetationParts.push({
           stableId: canonical?.stableId ?? candidate.candidateId ?? candidate.stableId,
           canonicalObject: canonical,
+          treePathId,
           part: descriptor,
           matrix: createPartMatrix({
             localX,
@@ -947,7 +992,7 @@ export class ChunkRenderAdapter {
     const addDetail = (target, source, fallbackDimensions) => {
       const canonicalEligible = usesW8CanonicalObjects
         && source.worldPosition && source.owningChunkCoordinate && (
-        ['shrub', 'streetLamp', 'roadSign'].includes(source.detailType)
+        ['grass', 'shrub', 'streetLamp', 'roadSign'].includes(source.detailType)
         || typeof source.landmarkType === 'string'
       );
       const canonical = canonicalEligible ? resolveW8CanonicalWorldObject(source) : null;
@@ -1054,7 +1099,11 @@ export class ChunkRenderAdapter {
       this.loaded.set(projected.key, projected);
       projected.lifecycle = 'loaded';
       this.counts.loaded += 1;
+      if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
+        this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
+      }
       this.#recordPublishedChunk(projected.key);
+      this.#invalidateVisibleStableIds();
     } catch (error) {
       this.worldRoot.remove(projected.group);
       this.loaded.delete(projected.key);
@@ -1104,6 +1153,14 @@ export class ChunkRenderAdapter {
   }
 
   markFirstDraw() {
+    if (this.treePathAudit.firstDrawAtMs === null && [...this.loaded.values()].some(projected => (
+      projected.group.children?.some(child => (
+        child.userData?.treePathId === 'near-tree'
+          && child.visible !== false && child.userData.treeStableIds?.length > 0
+      ))
+    ))) {
+      this.treePathAudit.firstDrawAtMs = globalThis.performance?.now?.() ?? Date.now();
+    }
     if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
     let recorded = 0;
     for (const pending of this.pendingFirstDrawByChunk.values()) {
@@ -1129,6 +1186,10 @@ export class ChunkRenderAdapter {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
     this.worldRoot.remove(projected.group);
+    if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
+      this.treePathAudit.disposeCount += 1;
+      this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
+    }
     this.pendingFirstDrawByChunk.delete(key);
     for (const geometry of projected.ownedGeometries) {
       geometry.dispose();
@@ -1148,6 +1209,7 @@ export class ChunkRenderAdapter {
     }
     this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
+    this.#invalidateVisibleStableIds();
     projected.lifecycle = 'unloaded';
     this.counts.unloaded += 1;
   }
@@ -1197,11 +1259,63 @@ export class ChunkRenderAdapter {
     });
   }
 
+  treePathAuditSnapshot() {
+    const meshes = [];
+    const ownerKeys = new Set();
+    const stableIds = new Set();
+    let instanceCount = 0;
+    for (const [ownerKey, projected] of this.loaded) {
+      for (const mesh of projected.group.children ?? []) {
+        if (mesh.userData?.treePathId !== 'near-tree') continue;
+        const treeStableIds = mesh.userData.treeStableIds ?? [];
+        if (treeStableIds.length) ownerKeys.add(ownerKey);
+        for (const stableId of treeStableIds) stableIds.add(stableId);
+        instanceCount += treeStableIds.length;
+        meshes.push(Object.freeze({
+          ownerKey,
+          name: mesh.name ?? null,
+          materialName: mesh.material?.name
+            || mesh.material?.type
+            || mesh.material?.constructor?.name
+            || null,
+          count: treeStableIds.length,
+          visible: this.worldRoot.visible !== false && mesh.visible !== false,
+        }));
+      }
+    }
+    const active = meshes.some(mesh => mesh.visible && mesh.count > 0);
+    return Object.freeze({
+      pathId: 'near-tree',
+      rootNames: Object.freeze([this.worldRoot.name]),
+      rootCount: active ? 1 : 0,
+      meshes: Object.freeze(meshes),
+      meshCount: meshes.length,
+      materialNames: Object.freeze([...new Set(meshes
+        .map(mesh => mesh.materialName).filter(Boolean))]),
+      instanceCount,
+      ownerCount: ownerKeys.size,
+      stableIdCount: stableIds.size,
+      firstDrawAtMs: this.treePathAudit.firstDrawAtMs,
+      lastUpdateAtMs: this.treePathAudit.lastUpdateAtMs,
+      matrixUpdateCount: this.treePathAudit.matrixUpdateCount,
+      bufferUpdateCount: this.treePathAudit.bufferUpdateCount,
+      visibilityChangeCount: this.treePathAudit.visibilityChangeCount,
+      disposeCount: this.treePathAudit.disposeCount,
+      active,
+      hidden: !active,
+      publicationSources: Object.freeze(['runtime-chunk-load']),
+      planIds: Object.freeze([]),
+      coverageGenerations: Object.freeze([]),
+    });
+  }
+
   visibleStableIdsSnapshot() {
-    return Object.freeze([...this.featureInstances]
-      .filter(([stableId]) => !this.isFeatureDestroyed(stableId))
+    if (this.visibleStableIdsCache) return this.visibleStableIdsCache;
+    this.visibleStableIdsCache = Object.freeze([...this.featureInstances]
+      .filter(([, entry]) => entry.destroyed !== true)
       .map(([stableId]) => stableId)
       .sort((left, right) => left.localeCompare(right)));
+    return this.visibleStableIdsCache;
   }
 
   visibleSettlementStableIdsSnapshot() {
@@ -1251,6 +1365,7 @@ export class ChunkRenderAdapter {
       chunkOwnedGeometriesCreated: this.counts.chunkOwnedGeometriesCreated,
       chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
       trackedFeatureInstanceCount: this.featureInstances.size,
+      visibleStableIdsRevision: this.visibleStableIdsRevision,
       cameraOccludableMeshCount: this.occlusionMeshes.length,
       cameraCollisionBoundCount: this.cameraCollisionBounds.length,
       cameraOccludedFeatureCount: this.occludedFeatureIds.size,
@@ -1274,6 +1389,7 @@ export class ChunkRenderAdapter {
     if (this.ownsVisualAssets) this.visualAssets.dispose();
     this.featureInstances.clear();
     this.pendingFirstDrawByChunk.clear();
+    this.visibleStableIdsCache = null;
     this.chunkFeatureIds.clear();
     this.occlusionMeshes.length = 0;
     this.cameraCollisionBounds.length = 0;

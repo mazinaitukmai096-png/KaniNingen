@@ -295,10 +295,13 @@ export function createStaticObjectStream({
   const tickets = new Map();
   let activeCount = 0;
   let epoch = 0;
+  let coverageGeneration = 0;
+  let planRevision = 0;
   let latestPlan = null;
   let latestPolicyPlan = null;
   let latestCoverageSignature = null;
   let disposed = false;
+  const readyPageQueue = new Map();
   const counts = {
     plans: 0,
     unchangedPlans: 0,
@@ -310,6 +313,8 @@ export function createStaticObjectStream({
     pendingReuse: 0,
     queuedPromotions: 0,
     stalePlanCancels: 0,
+    stableCoverageCancels: 0,
+    staleResultDiscards: 0,
     ticketsCreated: 0,
     ticketsPublished: 0,
     ticketRejects: 0,
@@ -320,6 +325,15 @@ export function createStaticObjectStream({
   };
 
   const taskKey = (ownerKey, resourceKind) => `${resourceKind}\n${ownerKey}`;
+  const promoteQueuedTask = task => {
+    if (task?.state !== 'queued') return false;
+    const index = queue.indexOf(task);
+    if (index <= 0) return false;
+    queue.splice(index, 1);
+    queue.unshift(task);
+    counts.queuedPromotions += 1;
+    return true;
+  };
   const touchReady = key => {
     const value = ready.get(key);
     if (!value) return null;
@@ -336,16 +350,35 @@ export function createStaticObjectStream({
   const trimTickets = () => {
     while (tickets.size > ticketCapacity) tickets.delete(tickets.keys().next().value);
   };
+  const queueReadyPage = resource => {
+    if (!resource || !latestPolicyPlan?.allOwnerKeys.includes(resource.ownerKey)) return;
+    const required = latestPolicyPlan.requiredOwnerKeys.includes(resource.ownerKey);
+    readyPageQueue.set(taskKey(resource.ownerKey, resource.resourceKind), Object.freeze({
+      ...resource,
+      required,
+      deadlineAtMs: required
+        ? latestPolicyPlan.deadline.requiredAtMs
+        : latestPolicyPlan.deadline.prefetchedAtMs,
+    }));
+  };
   const createTicket = (ownerKey, resourceKind) => {
     if (!latestPlan || !latestPolicyPlan) return null;
-    const key = `${latestPlan.planId}\n${resourceKind}\n${ownerKey}`;
+    const key = taskKey(ownerKey, resourceKind);
     let ticket = tickets.get(key);
-    if (ticket) return ticket;
+    if (ticket) {
+      ticket.planId = latestPlan.planId;
+      ticket.planRevision = planRevision;
+      ticket.stateRevision = latestPlan.stateRevision;
+      ticket.originGeneration = latestPlan.originGeneration;
+      return ticket;
+    }
     const resource = ready.get(taskKey(ownerKey, resourceKind));
     ticket = {
       schemaVersion: WORLD_PUBLICATION_TICKET_SCHEMA,
-      ticketId: `${latestPlan.planId}:${policyKind}:${resourceKind}:${ownerKey}`,
+      ticketId: `${coverageGeneration}:${policyKind}:${resourceKind}:${ownerKey}`,
       planId: latestPlan.planId,
+      planRevision,
+      coverageGeneration,
       policyKind,
       publicationGroup: latestPolicyPlan.publicationGroup,
       stateRevision: latestPlan.stateRevision,
@@ -376,6 +409,8 @@ export function createStaticObjectStream({
     tasks.delete(task.key);
     if (state === 'ready') {
       const readyAtMs = clock();
+      const retainedByLatestCoverage = latestPolicyPlan?.allOwnerKeys.includes(task.ownerKey)
+        === true;
       ready.set(task.key, Object.freeze({
         ownerKey: task.ownerKey,
         resourceKind: task.resourceKind,
@@ -383,8 +418,12 @@ export function createStaticObjectStream({
         readyAtMs,
         sourcePlanId: task.planId,
       }));
+      if (retainedByLatestCoverage) queueReadyPage(ready.get(task.key));
+      else counts.staleResultDiscards += 1;
       trimReady();
-      markTicketsReady(task.ownerKey, task.resourceKind, readyAtMs);
+      if (retainedByLatestCoverage) {
+        markTicketsReady(task.ownerKey, task.resourceKind, readyAtMs);
+      }
       counts.completed += 1;
       task.resolve(value);
     } else if (state === 'cancelled') {
@@ -444,6 +483,7 @@ export function createStaticObjectStream({
     if (existingReady) {
       counts.readyHits += 1;
       createTicket(ownerKey, resourceKind);
+      queueReadyPage(existingReady);
       return Object.freeze({ promise: Promise.resolve(existingReady.value), cancel: () => false });
     }
     const existing = tasks.get(key);
@@ -452,12 +492,7 @@ export function createStaticObjectStream({
       if (required && !existing.required) {
         existing.required = true;
         existing.deadlineAtMs = deadlineAtMs;
-        const index = queue.indexOf(existing);
-        if (index > 0) {
-          queue.splice(index, 1);
-          queue.unshift(existing);
-        }
-        counts.queuedPromotions += 1;
+        promoteQueuedTask(existing);
         pump();
       }
       createTicket(ownerKey, resourceKind);
@@ -487,6 +522,7 @@ export function createStaticObjectStream({
       reject,
       cancel: null,
       stalePlanCount: 0,
+      cancellationRequested: false,
     };
     if (tasks.size >= queueCapacity) {
       counts.queueOverflows += 1;
@@ -516,44 +552,84 @@ export function createStaticObjectStream({
       throw new TypeError(`Static Object Stream requires ${policyKind} plan coverage`);
     }
     const nextSignature = coverageSignature(plan, policyPlan);
+    planRevision += 1;
+    const cancelOutsideCoverage = ({ retained, stableCoverage }) => {
+      for (const task of [...tasks.values()]) {
+        if (retained.has(task.ownerKey)) {
+          task.stalePlanCount = 0;
+          continue;
+        }
+        task.stalePlanCount += 1;
+        // One plan-revision grace retains useful work across a one-frame
+        // stop/start sample. If the same coverage survives the next revision,
+        // queued work outside it is no longer speculative and is cancelled.
+        if (task.stalePlanCount < 2) continue;
+        if (task.cancellationRequested) continue;
+        task.cancellationRequested = true;
+        if (task.state === 'queued') {
+          const index = queue.indexOf(task);
+          if (index >= 0) queue.splice(index, 1);
+          settleTask(task, 'cancelled');
+        } else {
+          task.cancel?.('superseded-static-plan');
+        }
+        counts.stalePlanCancels += 1;
+        if (stableCoverage) counts.stableCoverageCancels += 1;
+      }
+    };
     if (nextSignature === latestCoverageSignature) {
       latestPlan = plan;
       latestPolicyPlan = policyPlan;
-      // Readiness belongs to canonical owners, while tickets belong to the
-      // latest publication revision. Re-ticket lazily at publication without
-      // cancelling or regenerating unchanged owner coverage.
-      tickets.clear();
+      cancelOutsideCoverage({
+        retained: new Set(policyPlan.allOwnerKeys),
+        stableCoverage: true,
+      });
+      for (const ticket of tickets.values()) {
+        ticket.planId = plan.planId;
+        ticket.planRevision = planRevision;
+        ticket.stateRevision = plan.stateRevision;
+        ticket.originGeneration = plan.originGeneration;
+      }
       counts.unchangedPlans += 1;
+      pump();
       return false;
     }
     epoch += 1;
+    coverageGeneration += 1;
     latestPlan = plan;
     latestPolicyPlan = policyPlan;
     latestCoverageSignature = nextSignature;
     counts.plans += 1;
     const retained = new Set(policyPlan.allOwnerKeys);
-    for (const task of [...tasks.values()]) {
-      if (retained.has(task.ownerKey)) {
-        task.stalePlanCount = 0;
-        continue;
+    cancelOutsideCoverage({ retained, stableCoverage: false });
+    for (const [key, ticket] of tickets) {
+      if (!retained.has(ticket.ownerKey)) tickets.delete(key);
+      else {
+        ticket.planId = plan.planId;
+        ticket.planRevision = planRevision;
+        ticket.stateRevision = plan.stateRevision;
+        ticket.originGeneration = plan.originGeneration;
       }
-      task.stalePlanCount += 1;
-      // One changed-plan grace avoids cancelling useful corridor work during
-      // an instantaneous stop/start sample or a one-frame direction jitter.
-      if (task.stalePlanCount < 2) continue;
-      if (task.state === 'queued') {
-        const index = queue.indexOf(task);
-        if (index >= 0) queue.splice(index, 1);
-        settleTask(task, 'cancelled');
-      } else task.cancel?.('superseded-static-plan');
-      counts.stalePlanCancels += 1;
     }
-    tickets.clear();
+    for (const [key, resource] of readyPageQueue) {
+      if (!retained.has(resource.ownerKey)) readyPageQueue.delete(key);
+    }
     const required = new Set(policyPlan.requiredOwnerKeys);
     const requestedOwnerKeys = [
       ...policyPlan.requiredOwnerKeys,
       ...policyPlan.prefetchedOwnerKeys,
-    ];
+    ].sort((left, right) => {
+      const leftOwner = parseChunkKey(left);
+      const rightOwner = parseChunkKey(right);
+      const leftX = (leftOwner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.x;
+      const leftZ = (leftOwner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.z;
+      const rightX = (rightOwner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.x;
+      const rightZ = (rightOwner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.z;
+      return Number(required.has(right)) - Number(required.has(left))
+        || leftX * leftX + leftZ * leftZ - (rightX * rightX + rightZ * rightZ)
+        || leftOwner.chunkZ - rightOwner.chunkZ
+        || leftOwner.chunkX - rightOwner.chunkX;
+    });
     const requested = requestedOwnerKeys.map(ownerKey => ({
       ownerKey,
       resourceKind: classifyOwner({ ownerKey, plan, policyPlan }),
@@ -575,23 +651,30 @@ export function createStaticObjectStream({
     if (existingReady) {
       counts.readyHits += 1;
       createTicket(ownerKey, resourceKind);
+      queueReadyPage(existingReady);
       return Promise.resolve(existingReady.value);
     }
     const existing = tasks.get(key);
     if (existing) {
       counts.pendingReuse += 1;
+      promoteQueuedTask(existing);
       createTicket(ownerKey, resourceKind);
+      pump();
       return existing.promise.then(value => value ?? fallback());
     }
     if (!latestPlan || !latestPolicyPlan) return fallback();
-    return enqueue({
+    const handle = enqueue({
       ownerKey,
       resourceKind,
       required: true,
       deadlineAtMs: latestPolicyPlan.deadline.requiredAtMs,
       planId: latestPlan.planId,
       publicationGroup: latestPolicyPlan.publicationGroup,
-    }).promise;
+      pumpNow: false,
+    });
+    promoteQueuedTask(tasks.get(key));
+    pump();
+    return handle.promise;
   };
 
   const publishOwners = ({
@@ -624,6 +707,36 @@ export function createStaticObjectStream({
     }
     return Object.freeze(published);
   };
+  const drainReadyOwnerPages = ({ limit = 32 } = {}) => {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new RangeError('ready owner page drain limit must be a positive safe integer');
+    }
+    const pages = [];
+    const prioritized = [...readyPageQueue.entries()].sort((left, right) => (
+      Number(right[1].required) - Number(left[1].required)
+        || (left[1].deadlineAtMs ?? Number.POSITIVE_INFINITY)
+          - (right[1].deadlineAtMs ?? Number.POSITIVE_INFINITY)
+        || left[1].readyAtMs - right[1].readyAtMs
+        || left[1].ownerKey.localeCompare(right[1].ownerKey)
+    ));
+    for (const [key, resource] of prioritized) {
+      if (pages.length >= limit) break;
+      readyPageQueue.delete(key);
+      pages.push(Object.freeze({
+        ownerKey: resource.ownerKey,
+        resourceKind: resource.resourceKind,
+        value: resource.value,
+        readyAtMs: resource.readyAtMs,
+        sourcePlanId: resource.sourcePlanId,
+        required: resource.required,
+        deadlineAtMs: resource.deadlineAtMs,
+        coverageGeneration,
+        planRevision,
+        planId: latestPlan?.planId ?? null,
+      }));
+    }
+    return Object.freeze(pages);
+  };
 
   const snapshot = () => {
     const required = new Set(latestPolicyPlan?.requiredOwnerKeys ?? []);
@@ -641,6 +754,8 @@ export function createStaticObjectStream({
       policyKind,
       workerCount: 1,
       epoch,
+      coverageGeneration,
+      planRevision,
       latestPlanId: latestPlan?.planId ?? null,
       publicationGroup: latestPolicyPlan?.publicationGroup ?? null,
       requiredOwnerCount: required.size,
@@ -655,11 +770,19 @@ export function createStaticObjectStream({
       ),
       queuedCount: queue.length,
       inFlightCount: activeCount,
+      queuedOwnerKeys: Object.freeze(queue
+        .filter(task => task.state === 'queued')
+        .map(task => task.ownerKey)),
+      inFlightOwnerKeys: Object.freeze([...tasks.values()]
+        .filter(task => task.state === 'in-flight')
+        .map(task => task.ownerKey)
+        .sort()),
       backlog: queue.length + activeCount,
       queueCapacity,
       readyCacheSize: ready.size,
       readyCacheCapacity: readyCapacity,
       ticketCount: tickets.size,
+      readyPageQueueCount: readyPageQueue.size,
       ticketCapacity,
       tickets: Object.freeze([...tickets.values()].map(ticket => Object.freeze({ ...ticket }))),
       counts: Object.freeze({ ...counts }),
@@ -684,6 +807,8 @@ export function createStaticObjectStream({
     return Object.freeze({
       policyKind,
       workerCount: 1,
+      coverageGeneration,
+      planRevision,
       latestPlanId: latestPlan?.planId ?? null,
       requiredOwnerCount: requiredOwnerKeys.length,
       readyRequiredOwnerCount,
@@ -736,11 +861,13 @@ export function createStaticObjectStream({
     tasks.clear();
     ready.clear();
     tickets.clear();
+    readyPageQueue.clear();
   };
   return Object.freeze({
     applyPlan,
     requestOrReuse,
     publishOwners,
+    drainReadyOwnerPages,
     invalidate,
     diagnostics,
     snapshot,

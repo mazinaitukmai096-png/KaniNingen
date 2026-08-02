@@ -185,6 +185,54 @@ test('superseded owner work is cooperatively cancelled and cannot publish stale 
   await stream.dispose();
 });
 
+test('late in-flight completion outside stable coverage is cached but not published', async () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const pending = new Map();
+  let noncancellableOwner = null;
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 1,
+    requestOwner: request => {
+      noncancellableOwner ??= request.ownerKey;
+      let resolve;
+      const promise = new Promise(nextResolve => { resolve = nextResolve; });
+      pending.set(request.ownerKey, { request, resolve });
+      return {
+        promise,
+        cancel: () => {
+          if (request.ownerKey === noncancellableOwner) return false;
+          resolve(null);
+          return true;
+        },
+      };
+    },
+  });
+  const first = planner({ player: { x: 0, z: 0 } });
+  stream.applyPlan({ plan: first, policyPlan: policyPlan(first) });
+  const staleOwner = stream.snapshot().inFlightOwnerKeys[0];
+  const relocated = planner({ player: { x: 512, z: 512 } });
+  const relocatedAgain = planner({ player: { x: 512, z: 512 }, stateRevision: 1 });
+  stream.applyPlan({ plan: relocated, policyPlan: policyPlan(relocated) });
+  stream.applyPlan({ plan: relocatedAgain, policyPlan: policyPlan(relocatedAgain) });
+
+  pending.get(staleOwner).resolve(Object.freeze({ ownerKey: staleOwner }));
+  await waitFor(
+    () => stream.snapshot().counts.staleResultDiscards === 1,
+    'late stale completion did not settle into reusable cache',
+  );
+  assert.equal(stream.drainReadyOwnerPages({ limit: 32 })
+    .some(page => page.ownerKey === staleOwner), false);
+
+  const returned = planner({ player: { x: 0, z: 0 }, stateRevision: 2 });
+  stream.applyPlan({ plan: returned, policyPlan: policyPlan(returned) });
+  assert.equal(stream.snapshot().counts.readyHits > 0, true);
+  assert.equal(stream.drainReadyOwnerPages({ limit: 32 })
+    .some(page => page.ownerKey === staleOwner), true);
+  await stream.dispose();
+});
+
 test('one-sample stop and restart does not cancel reusable corridor work', async () => {
   const runtime = createPolicyRuntime({ horizon: false });
   const plan = createPlanner(runtime.policy);
@@ -203,6 +251,114 @@ test('one-sample stop and restart does not cancel reusable corridor work', async
 
   assert.equal(stream.snapshot().counts.cancelled, 0);
   assert.equal(stream.snapshot().counts.stalePlanCancels, 0);
+});
+
+test('stable stopped coverage cancels stale corridor backlog without duplicate requeue', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const pending = [];
+  const requestedOwnerKeys = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 1,
+    requestOwner: request => {
+      requestedOwnerKeys.push(request.ownerKey);
+      let resolve;
+      const handle = { request, resolve: null, cancelled: false };
+      const promise = new Promise(nextResolve => {
+        resolve = nextResolve;
+        handle.resolve = resolve;
+        pending.push(handle);
+      });
+      return {
+        promise,
+        cancel: () => {
+          handle.cancelled = true;
+          resolve(null);
+          return true;
+        },
+      };
+    },
+  });
+  const moving = planner({ velocity: { x: 32, z: 0 } });
+  const stopped = planner({ velocity: { x: 0, z: 0 } });
+  const stoppedAgain = planner({ velocity: { x: 0, z: 0 }, stateRevision: 1 });
+  stream.applyPlan({ plan: moving, policyPlan: policyPlan(moving) });
+  const movingSnapshot = stream.snapshot();
+  stream.applyPlan({ plan: stopped, policyPlan: policyPlan(stopped) });
+  const stoppedSnapshot = stream.snapshot();
+  stream.applyPlan({ plan: stoppedAgain, policyPlan: policyPlan(stoppedAgain) });
+  const stoppedAgainSnapshot = stream.snapshot();
+  const stoppedRetained = new Set(policyPlan(stopped).allOwnerKeys);
+  const staleQueuedOwnerKeys = stoppedAgainSnapshot.queuedOwnerKeys.filter(ownerKey => (
+    !stoppedRetained.has(ownerKey)
+  ));
+
+  assert.equal(new Set(stoppedAgainSnapshot.queuedOwnerKeys).size,
+    stoppedAgainSnapshot.queuedOwnerKeys.length);
+  assert.equal(stoppedAgainSnapshot.counts.cancelled > 0, true);
+  assert.equal(stoppedAgainSnapshot.counts.stalePlanCancels > 0, true);
+  assert.equal(stoppedAgainSnapshot.counts.stableCoverageCancels > 0, true);
+  assert.equal(staleQueuedOwnerKeys.length, 0);
+  assert.equal(stoppedAgainSnapshot.planRevision, 3);
+  assert.equal(stoppedAgainSnapshot.coverageGeneration, 2);
+
+  let completedOutsideStoppedCoverage = 0;
+  while (stream.snapshot().backlog > 0) {
+    const next = pending.shift();
+    if (next) {
+      if (!next.cancelled && !stoppedRetained.has(next.request.ownerKey)) {
+        completedOutsideStoppedCoverage += 1;
+      }
+      if (!next.cancelled) next.resolve(Object.freeze({ ownerKey: next.request.ownerKey }));
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const drained = stream.snapshot();
+  const movingAgain = planner({ velocity: { x: 32, z: 0 }, stateRevision: 2 });
+  stream.applyPlan({ plan: movingAgain, policyPlan: policyPlan(movingAgain) });
+  const reaccelerated = stream.snapshot();
+
+  assert.equal(completedOutsideStoppedCoverage, 0);
+  assert.equal(drained.counts.staleResultDiscards, 0);
+  assert.equal(reaccelerated.readyPageQueueCount <= stoppedRetained.size, true);
+
+  t.diagnostic(JSON.stringify({
+    moving: {
+      coverageGeneration: movingSnapshot.coverageGeneration,
+      planRevision: movingSnapshot.planRevision,
+      backlog: movingSnapshot.backlog,
+      queued: movingSnapshot.queuedCount,
+      inFlight: movingSnapshot.inFlightCount,
+    },
+    stopped: {
+      coverageGeneration: stoppedSnapshot.coverageGeneration,
+      planRevision: stoppedSnapshot.planRevision,
+      backlog: stoppedSnapshot.backlog,
+      staleQueuedOwnerCount: staleQueuedOwnerKeys.length,
+      duplicateQueuedOwnerCount: stoppedAgainSnapshot.queuedOwnerKeys.length
+        - new Set(stoppedAgainSnapshot.queuedOwnerKeys).size,
+      unchangedPlanCount: stoppedAgainSnapshot.counts.unchangedPlans,
+    },
+    drained: {
+      backlog: drained.backlog,
+      requestedCount: drained.counts.requested,
+      completedCount: drained.counts.completed,
+      completedOutsideStoppedCoverage,
+      readyOwnerCount: drained.readyOwnerCount,
+    },
+    reaccelerated: {
+      coverageGeneration: reaccelerated.coverageGeneration,
+      planRevision: reaccelerated.planRevision,
+      backlog: reaccelerated.backlog,
+      readyPageQueueCount: reaccelerated.readyPageQueueCount,
+      readyHits: reaccelerated.counts.readyHits,
+      pendingReuse: reaccelerated.counts.pendingReuse,
+    },
+    requestedOwnerCount: requestedOwnerKeys.length,
+  }));
+  await stream.dispose();
 });
 
 test('lifecycle invalidation releases queued presentation work for Gameplay relocation', async () => {
@@ -250,6 +406,70 @@ test('state and Floating Origin revisions re-ticket without regenerating logical
   assert.equal(ticket.ownerKey, ownerKey);
   assert.equal(stream.snapshot().counts.unchangedPlans, 1);
   assert.equal(stream.snapshot().counts.cancelled, 0);
+  await stream.dispose();
+});
+
+test('coverage generation is stable across plan revisions and does not regenerate tickets', async () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const plan = createPlanner(runtime.policy);
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  const first = plan({ stateRevision: 10, originGeneration: 3 });
+  const revised = plan({ stateRevision: 11, originGeneration: 4 });
+  stream.applyPlan({ plan: first, policyPlan: policyPlan(first) });
+  await waitFor(() => stream.snapshot().backlog === 0, 'initial coverage did not settle');
+  const ownerKey = policyPlan(first).requiredOwnerKeys[0];
+  const before = stream.snapshot();
+  const beforeTicket = before.tickets.find(ticket => ticket.ownerKey === ownerKey);
+
+  assert.equal(stream.applyPlan({ plan: revised, policyPlan: policyPlan(revised) }), false);
+  const after = stream.snapshot();
+  const afterTicket = after.tickets.find(ticket => ticket.ownerKey === ownerKey);
+  assert.equal(after.coverageGeneration, before.coverageGeneration);
+  assert.equal(after.planRevision, before.planRevision + 1);
+  assert.equal(afterTicket.ticketId, beforeTicket.ticketId);
+  assert.equal(afterTicket.planId, revised.planId);
+  assert.equal(afterTicket.stateRevision, 11);
+  assert.equal(afterTicket.originGeneration, 4);
+  await stream.dispose();
+});
+
+test('ready owner pages drain incrementally without waiting for the full coverage set', async () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const plan = createPlanner(runtime.policy)({});
+  const deferred = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 2,
+    requestOwner: request => {
+      let resolve;
+      const promise = new Promise(nextResolve => {
+        resolve = nextResolve;
+        deferred.push({ request, resolve });
+      });
+      return { promise, cancel: () => { resolve(null); return true; } };
+    },
+  });
+  stream.applyPlan({ plan, policyPlan: policyPlan(plan) });
+  await waitFor(() => deferred.length >= 2, 'owner requests did not start');
+  const completed = deferred.shift();
+  completed.resolve(Object.freeze({ ownerKey: completed.request.ownerKey }));
+  await waitFor(
+    () => stream.snapshot().readyPageQueueCount === 1,
+    'completed owner was not exposed as a ready page',
+  );
+
+  const [page] = stream.drainReadyOwnerPages({ limit: 1 });
+  assert.equal(page.ownerKey, completed.request.ownerKey);
+  assert.equal(page.coverageGeneration, stream.snapshot().coverageGeneration);
+  assert.equal(page.planRevision, stream.snapshot().planRevision);
+  assert.ok(stream.snapshot().backlog > 0);
+  assert.equal(stream.drainReadyOwnerPages({ limit: 1 }).length, 0);
+  for (const pending of deferred) pending.resolve(Object.freeze({ ownerKey: pending.request.ownerKey }));
   await stream.dispose();
 });
 

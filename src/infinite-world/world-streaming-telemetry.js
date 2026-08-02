@@ -210,6 +210,10 @@ export function createWorldStreamingTelemetry({
           stream,
           requestSequence: null,
           requestAtMs: null,
+          workerCompleteSequence: null,
+          workerCompleteAtMs: null,
+          publishSequence: null,
+          publishAtMs: null,
           firstDrawSequence: null,
           firstDrawAtMs: null,
           playerArrivalSequence: null,
@@ -229,6 +233,15 @@ export function createWorldStreamingTelemetry({
       if (type === WORLD_STREAMING_EVENT.REQUEST && lifecycle.requestSequence === null) {
         lifecycle.requestSequence = event.sequence;
         lifecycle.requestAtMs = timestampMs;
+      }
+      if (type === WORLD_STREAMING_EVENT.WORKER_COMPLETE
+        && lifecycle.workerCompleteSequence === null) {
+        lifecycle.workerCompleteSequence = event.sequence;
+        lifecycle.workerCompleteAtMs = timestampMs;
+      }
+      if (type === WORLD_STREAMING_EVENT.PUBLISH && lifecycle.publishSequence === null) {
+        lifecycle.publishSequence = event.sequence;
+        lifecycle.publishAtMs = timestampMs;
       }
       if (type === WORLD_STREAMING_EVENT.FIRST_DRAW && lifecycle.firstDrawSequence === null) {
         lifecycle.firstDrawSequence = event.sequence;
@@ -274,6 +287,15 @@ export function createWorldStreamingTelemetry({
       stream: value.stream,
       requestSequence: value.requestSequence,
       requestAtMs: value.requestAtMs,
+      workerCompleteSequence: value.workerCompleteSequence,
+      workerCompleteAtMs: value.workerCompleteAtMs,
+      publishSequence: value.publishSequence,
+      publishAtMs: value.publishAtMs,
+      workerCompleteToPublishMs:
+        value.workerCompleteAtMs !== null && value.publishAtMs !== null
+          ? Math.max(0, value.publishAtMs - value.workerCompleteAtMs) : null,
+      requestToPublishMs: value.requestAtMs !== null && value.publishAtMs !== null
+        ? Math.max(0, value.publishAtMs - value.requestAtMs) : null,
       firstDrawSequence: value.firstDrawSequence,
       firstDrawAtMs: value.firstDrawAtMs,
       requestToFirstDrawMs: value.requestAtMs !== null && value.firstDrawAtMs !== null
