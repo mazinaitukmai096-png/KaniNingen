@@ -8074,6 +8074,11 @@ export async function createW8DistantPresentation({
         renderDistancePreset: activeGeneration?.renderDistancePreset
           ?? activeLocalTerrainGeneration?.renderDistancePreset
           ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
+        distantRenderDistancePreset: activeGeneration?.renderDistancePreset ?? null,
+        localTerrainRenderDistancePreset:
+          activeLocalTerrainGeneration?.renderDistancePreset ?? null,
+        staticNaturalRenderDistancePreset:
+          persistentTreeGeneration?.renderDistancePreset ?? null,
         quality: activeGeneration?.quality ?? null,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,

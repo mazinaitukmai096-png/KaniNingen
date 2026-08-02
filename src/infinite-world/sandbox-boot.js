@@ -3100,6 +3100,23 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const runtimeSnapshot = runtime.snapshot();
         const renderOrigin = runtimeSnapshot.renderOrigin;
         const experienceSnapshot = experienceShell.snapshot();
+        const presentationSnapshot = distantPresentation.snapshot();
+        const fogRenderDistancePreset = Object.keys(W8_RENDER_DISTANCE_PRESETS).find(preset => (
+          Math.abs(
+            resolveW8RenderDistancePolicy(preset).fogFarMeters * UNITS_PER_METER
+              - scene.fog.far,
+          ) < 1e-6
+        )) ?? null;
+        const renderDistancePresets = Object.freeze({
+          fog: fogRenderDistancePreset,
+          terrain: presentationSnapshot.localTerrainRenderDistancePreset,
+          river: presentationSnapshot.distantRenderDistancePreset,
+          natural: presentationSnapshot.staticNaturalRenderDistancePreset,
+          distant: presentationSnapshot.distantRenderDistancePreset,
+        });
+        const observedRenderDistancePresets = Object.values(renderDistancePresets)
+          .filter(value => value !== null);
+        const renderDistanceMixed = new Set(observedRenderDistancePresets).size > 1;
         return {
           boot: snapshotSandboxBootState(state),
           runtime: runtimeSnapshot,
@@ -3136,7 +3153,17 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           }),
           save: saveStore.snapshot(),
           audio: audioDirector.snapshot(),
-          presentation: distantPresentation.snapshot(),
+          presentation: presentationSnapshot,
+          renderDistanceConsistency: Object.freeze({
+            schemaVersion: 'render-distance-consistency-observation-1',
+            requestedPreset: distantRenderDistance,
+            presets: renderDistancePresets,
+            mixed: renderDistanceMixed,
+            requestedMismatch: Object.values(renderDistancePresets).some(value => (
+              value !== null && value !== distantRenderDistance
+            )),
+            atomicPublicationRequired: renderDistanceMixed,
+          }),
           scenePresentation: scenePresentation.snapshot(),
           measurement: Object.freeze({ ...measurement }),
           diagnostics: diagnostics.snapshot({

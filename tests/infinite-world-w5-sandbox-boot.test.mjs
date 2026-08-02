@@ -1642,6 +1642,12 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
     const switchStartedAt = performance.now();
     environment.renderDistanceControl.value = 'short';
     environment.renderDistanceControl.dispatch('change');
+    const switching = sandbox.snapshot();
+    assert.equal(switching.renderDistanceConsistency.requestedPreset, 'short');
+    assert.equal(switching.renderDistanceConsistency.presets.fog, 'short');
+    assert.equal(switching.renderDistanceConsistency.mixed, true);
+    assert.equal(switching.renderDistanceConsistency.requestedMismatch, true);
+    assert.equal(switching.renderDistanceConsistency.atomicPublicationRequired, true);
     let switched = sandbox.snapshot();
     for (let attempt = 0; attempt < 500
       && (switched.presentation.renderDistancePreset !== 'short'
@@ -1653,6 +1659,8 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
     }
     const switchMs = performance.now() - switchStartedAt;
     assert.equal(switched.presentation.renderDistancePreset, 'short');
+    assert.equal(switched.renderDistanceConsistency.mixed, false);
+    assert.equal(switched.renderDistanceConsistency.requestedMismatch, false);
     assert.equal(switched.runtime.activeDataCount, 25);
     assert.equal(switched.runtime.renderedCount, 9);
     assert.deepEqual(switched.runtime.activeDataKeys.map(key => {
