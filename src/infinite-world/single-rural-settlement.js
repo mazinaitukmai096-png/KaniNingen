@@ -14,6 +14,9 @@ import { SETTLEMENT_TYPES } from '../settlement-type.js';
 import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { sha256Hex } from './legacy-core/g0/sha256.js';
+import {
+  ROAD_GENERATION_COUNTER,
+} from './road-generation-timing.js';
 
 export const FINITE_WORLD_UNITS_PER_METER = 40;
 export const W4_SINGLE_RURAL = Object.freeze({
@@ -91,8 +94,10 @@ function visitPreparedFrontageCandidatePlacements({
   maximumSlotOffset,
   placementIdentity,
   visitor,
+  roadTimingStats = null,
 }) {
   const profile = BUILDING_FRONTAGE_PROFILES[type];
+  if (roadTimingStats) roadTimingStats.spatialQueries += 1;
   const selectedSegment = preparedRoute.routeSegments.find(candidate => (
     candidate.segment.roadId === road.roadId
   ));
@@ -104,6 +109,7 @@ function visitPreparedFrontageCandidatePlacements({
     const slotOffset = attempt === 0 ? 0 : (attempt % 2 === 1 ? magnitude : -magnitude);
     const routeDistance = baseDistance + slotOffset * profile.slotSpacing;
     if (routeDistance < 0 || routeDistance > preparedRoute.routeLength) continue;
+    if (roadTimingStats) roadTimingStats.spatialQueries += 1;
     const located = preparedRoute.routeSegments.find(candidate => (
       routeDistance <= candidate.startDistance + candidate.length + 1e-9
     )) ?? preparedRoute.routeSegments[preparedRoute.routeSegments.length - 1];
@@ -199,12 +205,41 @@ function convertLot(lot) {
   });
 }
 
-function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
+function roadFunctionStarted(roadTimingRun) {
+  return roadTimingRun ? (globalThis.performance?.now?.() ?? Date.now()) : null;
+}
+
+function recordRoadFunction(roadTimingRun, name, startedAt) {
+  if (startedAt === null) return;
+  const completedAt = globalThis.performance?.now?.() ?? Date.now();
+  roadTimingRun?.recordFunction?.(name, Math.max(0, completedAt - startedAt));
+}
+
+function hasFrontageSpotConflict(placed, spot, roadTimingStats) {
+  for (const existing of placed) {
+    roadTimingStats.intersectionCandidates += 1;
+    if (migratedFrontageSpotsConflict(spot, existing)) return true;
+  }
+  return false;
+}
+
+function hasFrontageLotConflict(lots, lot, roadTimingStats) {
+  for (const existing of lots) {
+    roadTimingStats.intersectionCandidates += 1;
+    if (orientedRectanglesOverlap(lot, existing)) return true;
+  }
+  return false;
+}
+
+function buildDeterministicBuildings({ town, hierarchy, settlementId, roadTimingRun = null }) {
+  const startedAt = roadFunctionStarted(roadTimingRun);
+  const planStartedAt = roadFunctionStarted(roadTimingRun);
   const plan = buildFrontageAnchorPlan({
     samples: hierarchy.pathSamples,
     roads: hierarchy.roads,
     town,
   });
+  recordRoadFunction(roadTimingRun, 'settlement-frontage-plan', planStartedAt);
   const anchors = [...plan.CORE, ...plan.MIDDLE, ...plan.OUTER];
   const roadsById = new Map(hierarchy.roads.map(road => [road.roadId, road]));
   const roadsByRoute = new Map();
@@ -232,6 +267,11 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
     settlementType: town.settlementType,
     townId: town.id,
   });
+  const roadTimingStats = roadTimingRun ? {
+    intersectionCandidates: 0,
+    spatialQueries: 0,
+  } : null;
+  const placementStartedAt = roadFunctionStarted(roadTimingRun);
   for (let buildingIndex = 1; buildingIndex <= attemptedBuildingCount; buildingIndex += 1) {
     let type = selectBuildingType(buildingIndex);
     let accepted = null;
@@ -242,6 +282,7 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
       const anchorKey = `${anchor.x},${anchor.z}`;
       let selectedRoad = frontageRoadByAnchor.get(anchorKey);
       if (selectedRoad === undefined) {
+        if (roadTimingStats) roadTimingStats.spatialQueries += 1;
         selectedRoad = selectFrontageRoad({
           x: anchor.x,
           z: anchor.z,
@@ -282,6 +323,7 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
         townId: town.id,
         maximumSlotOffset: 8,
         placementIdentity,
+        roadTimingStats,
         visitor: candidate => {
           const spot = {
             ...candidate,
@@ -291,7 +333,10 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
           };
           if (Math.hypot(candidate.x - town.x, candidate.z - town.z)
             > town.radius - APPROXIMATE_BUILDING_RADIUS[type]) return null;
-          if (placed.some(existing => migratedFrontageSpotsConflict(spot, existing))) return null;
+          const spotConflict = roadTimingStats
+            ? hasFrontageSpotConflict(placed, spot, roadTimingStats)
+            : placed.some(existing => migratedFrontageSpotsConflict(spot, existing));
+          if (spotConflict) return null;
           const road = roadsById.get(candidate.frontageRoadId);
           let lot;
           try {
@@ -307,7 +352,10 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
           } catch {
             return null;
           }
-          if (lots.some(existing => orientedRectanglesOverlap(lot, existing))) return null;
+          const lotConflict = roadTimingStats
+            ? hasFrontageLotConflict(lots, lot, roadTimingStats)
+            : lots.some(existing => orientedRectanglesOverlap(lot, existing));
+          if (lotConflict) return null;
           return { spot, lot };
         },
       });
@@ -346,7 +394,19 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
     visualRecords.push(visualRecord);
   }
 
-  return Promise.all(placed.map(async building => Object.freeze({
+  if (roadTimingRun) {
+    roadTimingRun.addCounter(
+      ROAD_GENERATION_COUNTER.INTERSECTION_CANDIDATES,
+      roadTimingStats.intersectionCandidates,
+    );
+    roadTimingRun.addCounter(
+      ROAD_GENERATION_COUNTER.SPATIAL_QUERIES,
+      roadTimingStats.spatialQueries,
+    );
+    recordRoadFunction(roadTimingRun, 'settlement-frontage-placement', placementStartedAt);
+  }
+  const stableIdStartedAt = roadFunctionStarted(roadTimingRun);
+  const result = Promise.all(placed.map(async building => Object.freeze({
     stableId: await stableId('settlement-building-v1', {
       settlementId,
       buildingIndex: building.buildingIndex,
@@ -372,6 +432,13 @@ function buildDeterministicBuildings({ town, hierarchy, settlementId }) {
     requestedBuildingCount,
     buildings: buildings.sort((a, b) => a.stableId.localeCompare(b.stableId)),
   }));
+  if (!roadTimingRun) return result;
+  return result.then(value => {
+    roadTimingRun.addCounter(ROAD_GENERATION_COUNTER.SORT_DEDUPE_ITEMS, value.buildings.length);
+    recordRoadFunction(roadTimingRun, 'settlement-building-stable-id', stableIdStartedAt);
+    recordRoadFunction(roadTimingRun, 'settlement-building-placement', startedAt);
+    return value;
+  });
 }
 
 export async function createSingleRuralSettlementTemplate({ worldSeedHash }) {
@@ -478,7 +545,7 @@ function summarizeMigratedRoads(hierarchy, town) {
   });
 }
 
-export async function createMigratedSettlementTemplate({ candidate }) {
+export async function createMigratedSettlementTemplate({ candidate, roadTimingRun = null }) {
   const profile = MIGRATED_SETTLEMENT_PROFILES[candidate?.townType];
   if (!profile || profile.settlementType !== candidate?.settlementType) {
     throw new RangeError('candidate does not match a migrated Settlement profile');
@@ -496,13 +563,18 @@ export async function createMigratedSettlementTemplate({ candidate }) {
     type: candidate.townType,
     settlementType: candidate.settlementType,
   });
+  const hierarchyStartedAt = roadFunctionStarted(roadTimingRun);
   const hierarchy = createMigratedHierarchy(town);
-  const roadIds = await Promise.all(hierarchy.roads.map(road => stableId('settlement-road-v1', {
+  recordRoadFunction(roadTimingRun, 'settlement-road-hierarchy', hierarchyStartedAt);
+  const resolveRoadIds = () => Promise.all(hierarchy.roads.map(road => stableId('settlement-road-v1', {
     settlementId: candidate.settlementId,
     sourceRoadId: road.roadId,
     routeId: road.routeId,
   })));
-  const roads = hierarchy.roads.map((road, index) => Object.freeze({
+  const roadIdStartedAt = roadFunctionStarted(roadTimingRun);
+  const roadIds = await resolveRoadIds();
+  recordRoadFunction(roadTimingRun, 'settlement-road-stable-id', roadIdStartedAt);
+  const createRoadRecords = () => hierarchy.roads.map((road, index) => Object.freeze({
     stableId: roadIds[index],
     featureType: 'settlement-road',
     settlementId: candidate.settlementId,
@@ -514,10 +586,18 @@ export async function createMigratedSettlementTemplate({ candidate }) {
     start: Object.freeze({ x: q6(meters(road.start.x) + candidate.center.x), z: q6(meters(road.start.z) + candidate.center.z) }),
     end: Object.freeze({ x: q6(meters(road.end.x) + candidate.center.x), z: q6(meters(road.end.z) + candidate.center.z) }),
   })).sort((a, b) => a.stableId.localeCompare(b.stableId));
+  const roadRecordsStartedAt = roadFunctionStarted(roadTimingRun);
+  const roads = createRoadRecords();
+  recordRoadFunction(roadTimingRun, 'settlement-road-canonicalization', roadRecordsStartedAt);
+  if (roadTimingRun) {
+    roadTimingRun.addCounter(ROAD_GENERATION_COUNTER.SEGMENTS, roads.length);
+    roadTimingRun.addCounter(ROAD_GENERATION_COUNTER.SORT_DEDUPE_ITEMS, roads.length);
+  }
   const buildingResult = await buildDeterministicBuildings({
     town,
     hierarchy,
     settlementId: candidate.settlementId,
+    roadTimingRun,
   });
   const translateRectangle = rectangle => Object.freeze({
     ...rectangle,

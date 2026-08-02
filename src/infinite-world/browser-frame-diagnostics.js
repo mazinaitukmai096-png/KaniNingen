@@ -1,3 +1,5 @@
+import { CHUNK_GENERATION_STAGE_ORDER } from './chunk-generation-stage-timing.js';
+
 const DEFAULT_FRAME_LIMIT = 300;
 const DEFAULT_HITCH_LIMIT = 64;
 const DEFAULT_EVENT_LIMIT = 2_048;
@@ -18,6 +20,23 @@ const EMPTY_SNAPSHOT = Object.freeze({
   heaviestFrames: Object.freeze([]),
   hitchWindows: Object.freeze([]),
   timeline: Object.freeze([]),
+  chunkSupply: Object.freeze({
+    requests: Object.freeze([]),
+    completedRequestCount: 0,
+    stageTotalsMs: Object.freeze({}),
+    stagePercentages: Object.freeze({}),
+    dominantStage: null,
+    dominantStageMs: 0,
+    generationStages: Object.freeze({}),
+    top20SlowestGeneration: Object.freeze([]),
+    dominantGenerationStage: null,
+    dominantGenerationStageMs: 0,
+    dominantGenerationStagePercent: 0,
+    dominantGenerationStageAtLeast70Percent: false,
+    roadGeneration: null,
+  }),
+  coverageMisses: Object.freeze([]),
+  publicationTransitions: Object.freeze([]),
   terrainReadyGate: Object.freeze({
     blockedFrameCount: 0,
     blockedDurationMs: 0,
@@ -261,6 +280,427 @@ function workerRequestTimeline(events) {
     requestToResponseMs: Number.isFinite(record.queueTimeMs)
       && Number.isFinite(record.executionWallClockMs)
       ? record.queueTimeMs + record.executionWallClockMs : null,
+  })));
+}
+
+function chunkSupplyTimeline(events) {
+  const byRequest = new Map();
+  const relevant = new Set([
+    'chunk-request-queued',
+    'chunk-worker-dispatch',
+    'worker-message-sent',
+    'worker-message-received',
+    'worker-chunk-stages',
+    'worker-late-response',
+    'worker-response-resolved',
+    'chunk-main-response-received',
+    'chunk-owner-ready',
+    'chunk-owner-delivered',
+  ]);
+  for (const event of events) {
+    if (!relevant.has(event.type) || !Number.isSafeInteger(event.requestId)) continue;
+    const record = byRequest.get(event.requestId) ?? {
+      requestId: event.requestId,
+      ownerKey: event.ownerKey ?? null,
+      consumerId: event.consumerId ?? null,
+      operationKind: event.operationKind ?? 'chunk',
+      priority: event.priority ?? null,
+      required: event.required ?? null,
+      requestAtMs: null,
+      serviceDispatchAtMs: null,
+      workerMessageSentAtMs: null,
+      workerMessageReceivedAtMs: null,
+      mainResponseAtMs: null,
+      readyAtMs: null,
+      deliveredAtMs: null,
+      runtimeRequestCompleteAtMs: null,
+      runtimeOwnerReadyAtMs: null,
+      terrainPreparedAtMs: null,
+      terrainAttachedAtMs: null,
+      terrainOldOwnerReleasedAtMs: null,
+      serviceQueueTimeMs: null,
+      workerQueueTimeMs: null,
+      workerExecutionMs: null,
+      messageDeliveryMs: null,
+      transportResidualMs: null,
+      mainHandlerMs: null,
+      backlogAtDispatch: null,
+      generationTotalMs: null,
+      generationStageTotalsMs: null,
+      generationStageCallCounts: null,
+      generationStageEvents: null,
+      generationStartedAtMs: null,
+      generationCompletedAtMs: null,
+      responsePostStartedAtMs: null,
+      responsePostCompletedAtMs: null,
+      postMessageCallMs: null,
+      transferMs: null,
+      workerQueueResidentMs: null,
+      schedulerQueueTimeMs: null,
+      deadlineAtMs: null,
+      deadlineMissAtStart: false,
+      deadlineMissAtMainReceive: false,
+      lateResponse: false,
+      roadTiming: null,
+      roadTimingSummary: null,
+    };
+    record.ownerKey ??= event.ownerKey ?? null;
+    record.consumerId ??= event.consumerId ?? null;
+    record.operationKind ??= event.operationKind ?? null;
+    record.priority ??= event.priority ?? null;
+    record.required ??= event.required ?? null;
+    if (event.type === 'chunk-request-queued') record.requestAtMs = event.timestampMs;
+    else if (event.type === 'chunk-worker-dispatch') {
+      record.serviceDispatchAtMs = event.timestampMs;
+      record.serviceQueueTimeMs = event.serviceQueueTimeMs ?? null;
+      record.backlogAtDispatch = event.backlog ?? null;
+    } else if (event.type === 'worker-message-sent') {
+      record.workerMessageSentAtMs = event.sentAtMs ?? event.timestampMs;
+    } else if (event.type === 'worker-message-received') {
+      record.workerMessageReceivedAtMs = event.receivedAtMs ?? event.timestampMs;
+      record.workerQueueTimeMs = event.workerQueueTimeMs ?? null;
+      record.workerExecutionMs = event.workerExecutionMs ?? null;
+      record.messageDeliveryMs = event.messageDeliveryMs ?? null;
+      record.transportResidualMs = event.residualWaitMs ?? null;
+      record.schedulerQueueTimeMs = event.schedulerQueueTimeMs ?? null;
+    } else if (event.type === 'worker-chunk-stages') {
+      record.generationTotalMs = event.generationTotalMs ?? null;
+      record.generationStageTotalsMs = event.stageTotalsMs ?? null;
+      record.generationStageCallCounts = event.stageCallCounts ?? null;
+      record.generationStageEvents = event.stageEvents ?? null;
+      record.generationStartedAtMs = event.generationStartedAtMs ?? null;
+      record.generationCompletedAtMs = event.generationCompletedAtMs ?? null;
+      record.responsePostStartedAtMs = event.responsePostStartedAtMs ?? null;
+      record.responsePostCompletedAtMs = event.responsePostCompletedAtMs ?? null;
+      record.postMessageCallMs = event.postMessageCallMs ?? null;
+      record.transferMs = event.transferMs ?? null;
+      record.workerQueueResidentMs = event.workerQueueResidentMs ?? null;
+      record.schedulerQueueTimeMs = event.schedulerQueueTimeMs ?? record.schedulerQueueTimeMs;
+      record.deadlineAtMs = event.deadlineAtMs ?? null;
+      record.deadlineMissAtStart = event.deadlineMissAtStart === true;
+      record.deadlineMissAtMainReceive = event.deadlineMissAtMainReceive === true;
+      record.roadTiming = event.roadTiming ?? null;
+      record.roadTimingSummary = event.roadTimingSummary ?? null;
+    } else if (event.type === 'worker-late-response') {
+      record.lateResponse = true;
+    } else if (event.type === 'worker-response-resolved') {
+      record.mainHandlerMs = event.mainHandlerMs ?? null;
+    } else if (event.type === 'chunk-main-response-received') {
+      record.mainResponseAtMs = event.timestampMs;
+    } else if (event.type === 'chunk-owner-ready') {
+      record.readyAtMs = event.timestampMs;
+    } else if (event.type === 'chunk-owner-delivered') {
+      record.deliveredAtMs = event.timestampMs;
+    }
+    byRequest.set(event.requestId, record);
+  }
+  const byOwner = new Map();
+  for (const record of byRequest.values()) {
+    if (!record.ownerKey) continue;
+    const ownerRecords = byOwner.get(record.ownerKey) ?? [];
+    ownerRecords.push(record);
+    byOwner.set(record.ownerKey, ownerRecords);
+  }
+  const ownerEventFields = Object.freeze({
+    'runtime-owner-request-complete': 'runtimeRequestCompleteAtMs',
+    'runtime-prefetch-owner-ready': 'runtimeOwnerReadyAtMs',
+    'runtime-terrain-prepared': 'terrainPreparedAtMs',
+    'runtime-terrain-attached': 'terrainAttachedAtMs',
+    'runtime-terrain-old-owner-released': 'terrainOldOwnerReleasedAtMs',
+  });
+  for (const event of events) {
+    const field = ownerEventFields[event.type];
+    if (!field || !event.ownerKey) continue;
+    const candidate = (byOwner.get(event.ownerKey) ?? []).findLast(record => (
+      !Number.isFinite(record.requestAtMs)
+      || record.requestAtMs <= event.timestampMs
+    ));
+    if (candidate) candidate[field] = event.timestampMs;
+  }
+  const resolved = [...byRequest.values()].map(record => {
+    const requestToReadyMs = Number.isFinite(record.requestAtMs)
+      && Number.isFinite(record.readyAtMs)
+      ? Math.max(0, record.readyAtMs - record.requestAtMs) : null;
+    const serviceQueueMs = Number.isFinite(record.serviceQueueTimeMs)
+      ? record.serviceQueueTimeMs
+      : Number.isFinite(record.requestAtMs) && Number.isFinite(record.serviceDispatchAtMs)
+        ? Math.max(0, record.serviceDispatchAtMs - record.requestAtMs) : null;
+    const mainReceiveToReadyMs = Number.isFinite(record.workerMessageReceivedAtMs)
+      && Number.isFinite(record.readyAtMs)
+      ? Math.max(0, record.readyAtMs - record.workerMessageReceivedAtMs) : null;
+    const knownDurationMs = [
+      serviceQueueMs,
+      record.workerQueueTimeMs,
+      record.workerExecutionMs,
+      record.messageDeliveryMs,
+      mainReceiveToReadyMs,
+    ].filter(Number.isFinite).reduce((sum, value) => sum + value, 0);
+    const generationAccountedMs = CHUNK_GENERATION_STAGE_ORDER.reduce(
+      (sum, stage) => sum + (Number.isFinite(record.generationStageTotalsMs?.[stage])
+        ? record.generationStageTotalsMs[stage] : 0),
+      0,
+    );
+    const generationTotalMs = Number.isFinite(record.generationTotalMs)
+      ? record.generationTotalMs : record.workerExecutionMs;
+    const generationPercentages = Object.fromEntries(
+      CHUNK_GENERATION_STAGE_ORDER.map(stage => [
+        stage,
+        Number.isFinite(generationTotalMs) && generationTotalMs > 0
+          ? ((record.generationStageTotalsMs?.[stage] ?? 0) / generationTotalMs) * 100
+          : 0,
+      ]),
+    );
+    const pipeline = [
+      Number.isFinite(record.requestAtMs)
+        ? Object.freeze({ stage: 'queue', timestampMs: record.requestAtMs }) : null,
+      Number.isFinite(record.generationStartedAtMs)
+        ? Object.freeze({ stage: 'start', timestampMs: record.generationStartedAtMs }) : null,
+      ...(record.generationStageEvents ?? []).filter(stage => (
+        Number.isFinite(stage.startedAtMs) && Number.isFinite(stage.completedAtMs)
+      )).flatMap(stage => [
+        Object.freeze({
+          stage: stage.stage,
+          status: 'start',
+          timestampMs: stage.startedAtMs,
+          durationMs: stage.durationMs,
+        }),
+        Object.freeze({
+          stage: stage.stage,
+          status: stage.status ?? 'completed',
+          timestampMs: stage.completedAtMs,
+          durationMs: stage.durationMs,
+        }),
+      ]),
+      Number.isFinite(record.responsePostStartedAtMs)
+        ? Object.freeze({ stage: 'postMessage', timestampMs: record.responsePostStartedAtMs }) : null,
+      Number.isFinite(record.workerMessageReceivedAtMs)
+        ? Object.freeze({ stage: 'main-receive', timestampMs: record.workerMessageReceivedAtMs }) : null,
+      Number.isFinite(record.readyAtMs)
+        ? Object.freeze({ stage: 'ready', timestampMs: record.readyAtMs }) : null,
+    ].filter(Boolean).sort((left, right) => left.timestampMs - right.timestampMs
+      || left.stage.localeCompare(right.stage));
+    return Object.freeze({
+      ...record,
+      requestClass: record.required === true ? 'required' : 'prefetch',
+      serviceQueueMs,
+      mainReceiveToReadyMs,
+      requestToReadyMs,
+      requestToTerrainPreparedMs: Number.isFinite(record.requestAtMs)
+        && Number.isFinite(record.terrainPreparedAtMs)
+        ? Math.max(0, record.terrainPreparedAtMs - record.requestAtMs) : null,
+      readyToTerrainPreparedMs: Number.isFinite(record.readyAtMs)
+        && Number.isFinite(record.terrainPreparedAtMs)
+        ? Math.max(0, record.terrainPreparedAtMs - record.readyAtMs) : null,
+      unattributedMs: Number.isFinite(requestToReadyMs)
+        ? Math.max(0, requestToReadyMs - knownDurationMs) : null,
+      generationTotalMs,
+      generationAccountedMs,
+      generationUnattributedMs: Number.isFinite(generationTotalMs)
+        ? Math.max(0, generationTotalMs - generationAccountedMs) : null,
+      generationOverlapMs: Number.isFinite(generationTotalMs)
+        ? Math.max(0, generationAccountedMs - generationTotalMs) : null,
+      generationPercentages: Object.freeze(generationPercentages),
+      deadlineMiss: record.deadlineMissAtStart === true
+        || record.deadlineMissAtMainReceive === true,
+      timeline: Object.freeze(pipeline),
+    });
+  }).slice(-256);
+  const completed = resolved.filter(record => Number.isFinite(record.requestToReadyMs));
+  const stageKeys = Object.freeze([
+    'serviceQueueMs',
+    'workerQueueTimeMs',
+    'workerExecutionMs',
+    'messageDeliveryMs',
+    'mainReceiveToReadyMs',
+    'unattributedMs',
+  ]);
+  const stageTotalsMs = Object.fromEntries(stageKeys.map(key => [key, completed.reduce(
+    (sum, record) => sum + (Number.isFinite(record[key]) ? record[key] : 0),
+    0,
+  )]));
+  const totalKnownMs = Object.values(stageTotalsMs).reduce((sum, value) => sum + value, 0);
+  const stagePercentages = Object.fromEntries(stageKeys.map(key => [
+    key,
+    totalKnownMs > 0 ? stageTotalsMs[key] / totalKnownMs : 0,
+  ]));
+  const dominant = Object.entries(stageTotalsMs).sort((left, right) => (
+    right[1] - left[1] || left[0].localeCompare(right[0])
+  ))[0] ?? [null, 0];
+  const profiled = resolved.filter(record => Number.isFinite(record.generationTotalMs));
+  const generationStages = Object.fromEntries(CHUNK_GENERATION_STAGE_ORDER.map(stage => {
+    const durations = profiled.flatMap(record => (
+      Array.isArray(record.generationStageEvents)
+        ? record.generationStageEvents
+          .filter(event => event.stage === stage && Number.isFinite(event.durationMs))
+          .map(event => event.durationMs)
+        : Number.isFinite(record.generationStageTotalsMs?.[stage])
+          && (record.generationStageCallCounts?.[stage] ?? 0) > 0
+          ? [record.generationStageTotalsMs[stage]] : []
+    ));
+    const totalMs = profiled.reduce(
+      (sum, record) => sum + (Number.isFinite(record.generationStageTotalsMs?.[stage])
+        ? record.generationStageTotalsMs[stage] : 0),
+      0,
+    );
+    const invocationCount = profiled.reduce(
+      (sum, record) => sum + (Number.isFinite(record.generationStageCallCounts?.[stage])
+        ? record.generationStageCallCounts[stage] : 0),
+      0,
+    );
+    return [stage, Object.freeze({
+      invocationCount,
+      chunkCount: profiled.filter(record => (
+        (record.generationStageCallCounts?.[stage] ?? 0) > 0
+      )).length,
+      p50: percentile(durations, 0.5),
+      p95: percentile(durations, 0.95),
+      max: durations.length ? Math.max(...durations) : 0,
+      totalMs,
+    })];
+  }));
+  const transferValues = profiled.map(record => record.transferMs).filter(Number.isFinite);
+  const postMessageValues = profiled.map(record => record.postMessageCallMs).filter(Number.isFinite);
+  generationStages.transfer = Object.freeze({
+    invocationCount: transferValues.length,
+    chunkCount: transferValues.length,
+    ...summarize(transferValues),
+    totalMs: transferValues.reduce((sum, value) => sum + value, 0),
+    includes: 'structured clone, thread dispatch, main deserialization, and event-loop wait',
+  });
+  generationStages.postMessage = Object.freeze({
+    invocationCount: postMessageValues.length,
+    chunkCount: postMessageValues.length,
+    ...summarize(postMessageValues),
+    totalMs: postMessageValues.reduce((sum, value) => sum + value, 0),
+  });
+  const totalGenerationMs = profiled.reduce(
+    (sum, record) => sum + record.generationTotalMs,
+    0,
+  );
+  const dominantGeneration = totalGenerationMs > 0
+    ? CHUNK_GENERATION_STAGE_ORDER.map(stage => [
+      stage,
+      generationStages[stage].totalMs,
+    ]).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]
+      ?? [null, 0]
+    : [null, 0];
+  const dominantGenerationStagePercent = totalGenerationMs > 0
+    ? (dominantGeneration[1] / totalGenerationMs) * 100 : 0;
+  const top20SlowestGeneration = [...profiled]
+    .sort((left, right) => right.generationTotalMs - left.generationTotalMs
+      || left.requestId - right.requestId)
+    .slice(0, 20)
+    .map(record => Object.freeze({
+      requestId: record.requestId,
+      owner: record.ownerKey,
+      priority: record.priority,
+      requestClass: record.requestClass,
+      generationTotalMs: record.generationTotalMs,
+      stagesMs: Object.freeze(Object.fromEntries(CHUNK_GENERATION_STAGE_ORDER.map(stage => [
+        stage,
+        record.generationStageTotalsMs?.[stage] ?? 0,
+      ]))),
+      percentages: record.generationPercentages,
+      deadlineMiss: record.deadlineMiss,
+      lateResponse: record.lateResponse,
+      transferMs: record.transferMs,
+      postMessageCallMs: record.postMessageCallMs,
+      generationUnattributedMs: record.generationUnattributedMs,
+      generationOverlapMs: record.generationOverlapMs,
+    }));
+  const roadGeneration = [...resolved]
+    .reverse()
+    .find(record => record.roadTimingSummary?.schemaVersion === 'road-generation-timing-1')
+    ?.roadTimingSummary ?? null;
+  return Object.freeze({
+    requests: Object.freeze(resolved),
+    completedRequestCount: completed.length,
+    requestToReady: summarize(completed.map(record => record.requestToReadyMs)),
+    serviceQueue: summarize(completed.map(record => record.serviceQueueMs).filter(Number.isFinite)),
+    workerQueue: summarize(completed.map(record => record.workerQueueTimeMs).filter(Number.isFinite)),
+    workerExecution: summarize(completed.map(record => record.workerExecutionMs).filter(Number.isFinite)),
+    messageDelivery: summarize(completed.map(record => record.messageDeliveryMs).filter(Number.isFinite)),
+    mainReceiveToReady: summarize(completed.map(record => record.mainReceiveToReadyMs).filter(Number.isFinite)),
+    stageTotalsMs: Object.freeze(stageTotalsMs),
+    stagePercentages: Object.freeze(stagePercentages),
+    dominantStage: dominant[0],
+    dominantStageMs: dominant[1],
+    generationStages: Object.freeze(generationStages),
+    profiledChunkCount: profiled.length,
+    deadlineMissCount: profiled.filter(record => record.deadlineMiss).length,
+    lateResponseCount: resolved.filter(record => record.lateResponse).length,
+    top20SlowestGeneration: Object.freeze(top20SlowestGeneration),
+    dominantGenerationStage: dominantGeneration[0],
+    dominantGenerationStageMs: dominantGeneration[1],
+    dominantGenerationStagePercent,
+    dominantGenerationStageAtLeast70Percent: dominantGenerationStagePercent >= 70,
+    generationTotalMs: totalGenerationMs,
+    roadGeneration,
+  });
+}
+
+function coverageMissTimeline(events) {
+  const result = [];
+  let active = null;
+  for (const event of events) {
+    if (event.type === 'player-prepared-coverage-miss') {
+      if (active) result.push(Object.freeze({ ...active, restoredAtMs: null, durationMs: null }));
+      active = { ...event };
+    } else if (event.type === 'player-prepared-coverage-restored' && active) {
+      result.push(Object.freeze({
+        ...active,
+        restoredAtMs: event.timestampMs,
+        restoredFrameSequence: event.frameSequence,
+        durationMs: Math.max(0, event.timestampMs - active.timestampMs),
+      }));
+      active = null;
+    }
+  }
+  if (active) result.push(Object.freeze({ ...active, restoredAtMs: null, durationMs: null }));
+  return Object.freeze(result.slice(-32));
+}
+
+function publicationTransitionTimeline(events) {
+  const byGeneration = new Map();
+  const relevant = new Set([
+    'chunk-transition-runtime-ready',
+    'terrain-post-commit-started',
+    'terrain-post-commit-ready',
+    'terrain-replacement-ready',
+    'terrain-replacement-attached',
+    'terrain-coverage-verified',
+    'distant-post-commit-started',
+    'distant-post-commit-ready',
+    'distant-publication-queued',
+    'distant-publication-complete',
+    'chunk-transition-publication-complete',
+  ]);
+  for (const event of events) {
+    if (!relevant.has(event.type) || !Number.isSafeInteger(event.transitionGeneration)) continue;
+    const record = byGeneration.get(event.transitionGeneration) ?? {
+      transitionGeneration: event.transitionGeneration,
+      events: [],
+    };
+    record.events.push(Object.freeze({
+      type: event.type,
+      timestampMs: event.timestampMs,
+      frameSequence: event.frameSequence,
+      coverageEpoch: event.coverageEpoch ?? null,
+      coverageSignature: event.coverageSignature ?? null,
+      rootId: event.rootId ?? event.activeRootId ?? null,
+      rootAttached: event.rootAttached ?? null,
+      buildingPublicationSource: event.buildingPublicationSource ?? null,
+      settlementRoadPublicationSource: event.settlementRoadPublicationSource ?? null,
+      settlementPublicationPlanId: event.settlementPublicationPlanId ?? null,
+      settlementPublicationRevision: event.settlementPublicationRevision ?? null,
+    }));
+    byGeneration.set(event.transitionGeneration, record);
+  }
+  return Object.freeze([...byGeneration.values()].slice(-32).map(record => Object.freeze({
+    transitionGeneration: record.transitionGeneration,
+    events: Object.freeze(record.events),
+    durationMs: record.events.length > 1
+      ? Math.max(0, record.events.at(-1).timestampMs - record.events[0].timestampMs) : 0,
   })));
 }
 
@@ -553,6 +993,9 @@ export function createBrowserFrameDiagnostics({
         heaviestFrames: Object.freeze(heaviestFrames),
         hitchWindows: Object.freeze(allHitchWindows),
         timeline: Object.freeze([...timeline]),
+        chunkSupply: chunkSupplyTimeline(timeline),
+        coverageMisses: coverageMissTimeline(timeline),
+        publicationTransitions: publicationTransitionTimeline(timeline),
         terrainTransitions: terrainTransitionTimeline(timeline),
         workerRequests: workerRequestTimeline(timeline),
         terrainReadyGate: Object.freeze({

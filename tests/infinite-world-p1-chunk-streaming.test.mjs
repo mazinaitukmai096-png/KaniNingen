@@ -65,7 +65,7 @@ function straightPlan({ sprint = false, localX = 1 } = {}) {
   });
 }
 
-async function createRuntime(seed) {
+async function createRuntime(seed, { onPipelineEvent = null } = {}) {
   const source = await createSandboxChunkGenerator({ worldSeed: seed });
   const calls = [];
   const generator = {
@@ -78,12 +78,14 @@ async function createRuntime(seed) {
   const chunkDataService = new ChunkDataService({
     transport: createInlineChunkGeneratorTransport({ generator }),
     cacheCapacity: 81,
+    onPipelineEvent,
   });
   const runtime = new ChunkRuntimeManager({
     chunkDataService,
     renderAdapter: adapter,
     cacheCapacity: 81,
     yieldToHost: () => Promise.resolve(),
+    onPipelineEvent,
   });
   await runtime.initialize(0, 0);
   return { runtime, adapter, calls, chunkDataService };
@@ -140,6 +142,36 @@ test('MAX Sprint starts preparation before the boundary, deduplicates it, and co
   assert.equal(transition.prepared, true);
   assert.equal(runtime.getStreamingState().preparationPending, false);
   assert.ok(runtime.snapshot().chunkDataService.counts.transportCalls >= calls.length);
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('new-territory diagnostics preserve request, ready, Terrain prepare, attach, verification, and release order', async () => {
+  const events = [];
+  const onPipelineEvent = (type, details) => events.push({ type, ...details });
+  const { runtime, chunkDataService } = await createRuntime('p1-pipeline-timeline', {
+    onPipelineEvent,
+  });
+  events.length = 0;
+  const prepared = await runtime.prepareTransition(1, 0);
+  assert.ok(prepared);
+  assert.equal(events.filter(event => event.type === 'chunk-request-queued').length, 5);
+  assert.equal(events.filter(event => event.type === 'chunk-worker-dispatch').length, 5);
+  assert.equal(events.filter(event => event.type === 'chunk-request-deduped').length, 0);
+  assert.equal(events.filter(event => event.type === 'chunk-owner-ready').length, 5);
+  assert.equal(events.filter(event => event.type === 'runtime-terrain-prepared').length, 3);
+  const firstRequest = events.findIndex(event => event.type === 'chunk-request-queued');
+  const firstReady = events.findIndex(event => event.type === 'chunk-owner-ready');
+  const preparationReady = events.findIndex(event => event.type === 'runtime-prefetch-ready');
+  assert.ok(firstRequest >= 0 && firstRequest < firstReady && firstReady < preparationReady);
+
+  events.length = 0;
+  await runtime.transitionToChunk(1, 0);
+  const attached = events.map(event => event.type).lastIndexOf('runtime-terrain-attached');
+  const verified = events.findIndex(event => event.type === 'runtime-terrain-coverage-verified');
+  const released = events.findIndex(event => event.type === 'runtime-terrain-old-owner-released');
+  assert.ok(attached >= 0 && attached < verified && verified < released);
+  assert.equal(new Set(runtime.snapshot().renderedKeys).size, 9);
   await runtime.shutdown();
   await chunkDataService.shutdown();
 });

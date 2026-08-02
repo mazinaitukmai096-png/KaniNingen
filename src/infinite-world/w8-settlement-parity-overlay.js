@@ -9,6 +9,7 @@ import {
   createMigratedSettlementTemplate,
 } from './single-rural-settlement.js';
 import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
+import { ROAD_GENERATION_COUNTER } from './road-generation-timing.js';
 
 export const W8_SETTLEMENT_PARITY_DENSITY = Object.freeze({
   schemaVersion: 'w8-settlement-parity-density-1',
@@ -41,6 +42,37 @@ const q6 = value => {
   return Object.is(rounded, -0) ? 0 : rounded;
 };
 const meters = value => q6(value / FINITE_WORLD_UNITS_PER_METER);
+
+function roadTimingStarted(roadTimingRun) {
+  return roadTimingRun ? (globalThis.performance?.now?.() ?? Date.now()) : null;
+}
+
+function recordRoadFunction(roadTimingRun, name, startedAt) {
+  if (startedAt === null) return;
+  const completedAt = globalThis.performance?.now?.() ?? Date.now();
+  roadTimingRun?.recordFunction?.(name, Math.max(0, completedAt - startedAt));
+}
+
+function overlapsAnotherRoad(roads, road, footprint, roadTimingStats) {
+  for (const other of roads) {
+    if (other.stableId === road.stableId) continue;
+    roadTimingStats.intersectionCandidates += 1;
+    if (orientedRectanglesOverlap(footprint, roadRectangle(other))) return true;
+  }
+  return false;
+}
+
+function overlapsExistingLot(lots, rectangle, roadTimingStats) {
+  for (const existing of lots) {
+    roadTimingStats.intersectionCandidates += 1;
+    if (orientedRectanglesOverlap(
+      rectangle,
+      existing,
+      W8_SETTLEMENT_PARITY_DENSITY.lotSeparationMeters,
+    )) return true;
+  }
+  return false;
+}
 
 function finiteLotFromRoad({ type, buildingIndex, buildingX, buildingZ, rotationY,
   road, centerline, frontX, frontZ }) {
@@ -151,9 +183,13 @@ export async function createW8SettlementParityOverlay({
   candidate,
   worldSeedHash,
   sourceTemplate = null,
+  roadTimingRun = null,
 } = {}) {
   if (typeof worldSeedHash !== 'string') throw new TypeError('worldSeedHash is required');
-  const template = sourceTemplate ?? await createMigratedSettlementTemplate({ candidate });
+  const template = sourceTemplate ?? await createMigratedSettlementTemplate({
+    candidate,
+    roadTimingRun,
+  });
   const targetCount = targetBuildingCount(template);
   const additionsRequired = Math.max(0, targetCount - template.buildings.length);
   const lots = template.buildings.map(building => lotRectangle({
@@ -171,9 +207,17 @@ export async function createW8SettlementParityOverlay({
     x: building.x,
     z: building.z,
   }));
+  const planStartedAt = roadTimingStarted(roadTimingRun);
   const roads = template.roads
     .filter(road => road.roadKind !== 'START_APPROACH')
     .toSorted((left, right) => left.stableId.localeCompare(right.stableId));
+  recordRoadFunction(roadTimingRun, 'overlay-settlement-road-plan', planStartedAt);
+  const roadTimingStats = roadTimingRun ? {
+    intersectionCandidates: 0,
+    spatialQueries: 0,
+    stableIdCalls: 0,
+    stableIdMs: 0,
+  } : null;
   const spacing = W8_SETTLEMENT_PARITY_DENSITY.roadSlotSpacingMeters[template.settlementType];
   let buildingIndex = template.requestedBuildingCount + 1;
   const selectBuildingType = createW8SettlementBuildingTypeSelector({
@@ -181,6 +225,7 @@ export async function createW8SettlementParityOverlay({
     townId: template.settlementId,
   });
 
+  const roadSlotStartedAt = roadTimingStarted(roadTimingRun);
   for (const road of roads) {
     if (buildings.length >= additionsRequired) break;
     const dx = road.end.x - road.start.x;
@@ -232,13 +277,17 @@ export async function createW8SettlementParityOverlay({
           width: meters(profile.footprintWidth),
           depth: meters(profile.footprintDepth),
         };
-        if (roads.some(other => other.stableId !== road.stableId
-          && orientedRectanglesOverlap(footprint, roadRectangle(other)))) continue;
-        if (lots.some(existing => orientedRectanglesOverlap(
-          rectangle,
-          existing,
-          W8_SETTLEMENT_PARITY_DENSITY.lotSeparationMeters,
-        ))) continue;
+        if (roadTimingStats
+          ? overlapsAnotherRoad(roads, road, footprint, roadTimingStats)
+          : roads.some(other => other.stableId !== road.stableId
+            && orientedRectanglesOverlap(footprint, roadRectangle(other)))) continue;
+        if (roadTimingStats
+          ? overlapsExistingLot(lots, rectangle, roadTimingStats)
+          : lots.some(existing => orientedRectanglesOverlap(
+            rectangle,
+            existing,
+            W8_SETTLEMENT_PARITY_DENSITY.lotSeparationMeters,
+          ))) continue;
         const buildingRadius = Math.hypot(
           meters(profile.footprintWidth),
           meters(profile.footprintDepth),
@@ -252,6 +301,7 @@ export async function createW8SettlementParityOverlay({
           routeId: road.routeId,
           records: visualRecords,
         });
+        const stableIdStartedAt = roadTimingStarted(roadTimingRun);
         const stableId = await overlayStableId({
           worldSeedHash,
           settlementId: template.settlementId,
@@ -260,6 +310,11 @@ export async function createW8SettlementParityOverlay({
           slot,
           side,
         });
+        if (stableIdStartedAt !== null) {
+          roadTimingStats.stableIdCalls += 1;
+          roadTimingStats.stableIdMs += Math.max(0,
+            (globalThis.performance?.now?.() ?? Date.now()) - stableIdStartedAt);
+        }
         const owner = logicalWorldToOwnedChunk(x, z);
         buildings.push(Object.freeze({
           schemaVersion: 'w8-settlement-building-overlay-1',
@@ -299,6 +354,7 @@ export async function createW8SettlementParityOverlay({
       }
     }
   }
+  recordRoadFunction(roadTimingRun, 'overlay-road-slot-placement', roadSlotStartedAt);
 
   const gridSpacing = spacing;
   const gridRadius = template.radiusMeters * 0.88;
@@ -310,6 +366,7 @@ export async function createW8SettlementParityOverlay({
     x: Math.ceil((template.center.x + gridRadius) / gridSpacing),
     z: Math.ceil((template.center.z + gridRadius) / gridSpacing),
   };
+  const gridStartedAt = roadTimingStarted(roadTimingRun);
   for (let gridZ = gridMinimum.z; gridZ <= gridMaximum.z && buildings.length < additionsRequired; gridZ += 1) {
     for (let gridX = gridMinimum.x; gridX <= gridMaximum.x && buildings.length < additionsRequired; gridX += 1) {
       const parityOffset = ((gridX * 31 + gridZ * 17) & 3) / 4 - 0.375;
@@ -319,6 +376,7 @@ export async function createW8SettlementParityOverlay({
       };
       if (Math.hypot(point.x - template.center.x, point.z - template.center.z) > gridRadius) continue;
       let nearest = null;
+      if (roadTimingStats) roadTimingStats.spatialQueries += roads.length;
       for (const road of roads) {
         const projection = nearestPointOnSegment(point, road.start, road.end);
         if (!nearest || projection.distance < nearest.distance
@@ -360,13 +418,17 @@ export async function createW8SettlementParityOverlay({
         width: meters(profile.footprintWidth),
         depth: meters(profile.footprintDepth),
       };
-      if (roads.some(road => road.stableId !== nearest.road.stableId
-        && orientedRectanglesOverlap(footprint, roadRectangle(road)))) continue;
-      if (lots.some(existing => orientedRectanglesOverlap(
-        rectangle,
-        existing,
-        W8_SETTLEMENT_PARITY_DENSITY.lotSeparationMeters,
-      ))) continue;
+      if (roadTimingStats
+        ? overlapsAnotherRoad(roads, nearest.road, footprint, roadTimingStats)
+        : roads.some(road => road.stableId !== nearest.road.stableId
+          && orientedRectanglesOverlap(footprint, roadRectangle(road)))) continue;
+      if (roadTimingStats
+        ? overlapsExistingLot(lots, rectangle, roadTimingStats)
+        : lots.some(existing => orientedRectanglesOverlap(
+          rectangle,
+          existing,
+          W8_SETTLEMENT_PARITY_DENSITY.lotSeparationMeters,
+        ))) continue;
       const visual = createSettlementBuildingVisual({
         settlementType: template.settlementType,
         townId: template.settlementId,
@@ -376,6 +438,7 @@ export async function createW8SettlementParityOverlay({
         routeId: nearest.road.routeId,
         records: visualRecords,
       });
+      const stableIdStartedAt = roadTimingStarted(roadTimingRun);
       const stableId = await overlayStableId({
         worldSeedHash,
         settlementId: template.settlementId,
@@ -384,6 +447,11 @@ export async function createW8SettlementParityOverlay({
         slot: `grid-${gridX}-${gridZ}`,
         side: 0,
       });
+      if (stableIdStartedAt !== null) {
+        roadTimingStats.stableIdCalls += 1;
+        roadTimingStats.stableIdMs += Math.max(0,
+          (globalThis.performance?.now?.() ?? Date.now()) - stableIdStartedAt);
+      }
       const owner = logicalWorldToOwnedChunk(x, z);
       const buildingRadius = Math.hypot(
         meters(profile.footprintWidth),
@@ -426,8 +494,10 @@ export async function createW8SettlementParityOverlay({
       buildingIndex += 1;
     }
   }
+  recordRoadFunction(roadTimingRun, 'overlay-grid-fallback-placement', gridStartedAt);
 
-  return Object.freeze({
+  const canonicalizationStartedAt = roadTimingStarted(roadTimingRun);
+  const result = Object.freeze({
     schemaVersion: 'w8-settlement-parity-overlay-template-1',
     settlementId: template.settlementId,
     settlementType: template.settlementType,
@@ -441,6 +511,23 @@ export async function createW8SettlementParityOverlay({
     shortageCount: Math.max(0, additionsRequired - buildings.length),
     buildings: Object.freeze(buildings.sort((left, right) => left.stableId.localeCompare(right.stableId))),
   });
+  if (roadTimingRun) {
+    roadTimingRun.addCounter(
+      ROAD_GENERATION_COUNTER.INTERSECTION_CANDIDATES,
+      roadTimingStats.intersectionCandidates,
+    );
+    roadTimingRun.addCounter(ROAD_GENERATION_COUNTER.SPATIAL_QUERIES, roadTimingStats.spatialQueries);
+    if (roadTimingStats.stableIdCalls > 0) {
+      roadTimingRun.recordFunction(
+        'overlay-stable-id',
+        roadTimingStats.stableIdMs,
+        roadTimingStats.stableIdCalls,
+      );
+    }
+    roadTimingRun.addCounter(ROAD_GENERATION_COUNTER.SORT_DEDUPE_ITEMS, result.buildings.length);
+  }
+  recordRoadFunction(roadTimingRun, 'overlay-canonicalization', canonicalizationStartedAt);
+  return result;
 }
 
 export function composeW8SettlementPresentationTemplate(overlay) {

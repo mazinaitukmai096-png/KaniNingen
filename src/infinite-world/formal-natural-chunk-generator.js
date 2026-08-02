@@ -17,6 +17,11 @@ import {
 } from './legacy-core/g6/rock-redistribution.js';
 import { LOGICAL_CHUNK_SIZE_METERS, RENDER_CHUNK_SIZE } from './chunk-coordinates.js';
 import { createNaturalChunkGenerator } from './natural-chunk-generator.js';
+import {
+  CHUNK_GENERATION_STAGE,
+  measureChunkGenerationStage,
+  measureChunkGenerationStageSync,
+} from './chunk-generation-stage-timing.js';
 
 export const W3_GENERATOR_VERSION = parseGeneratorVersion('300.0.0');
 export const W3_CHUNK_DATA_SCHEMA = 'w3-formal-natural-detail-chunk-data-1';
@@ -254,8 +259,22 @@ async function createRockCandidates(chunk, macroEvaluator, baseProfile, placemen
   return output.sort(compareFormalDetailCandidates).slice(0, W3_FORMAL_DETAILS.maximumRocksPerChunk);
 }
 
-export async function hashW3ChunkContent(content) {
-  return `sha256:${await sha256Hex(canonicalizeJson(content))}`;
+export async function hashW3ChunkContent(content, { stageRecorder = null } = {}) {
+  const serialized = stageRecorder
+    ? measureChunkGenerationStageSync(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.SERIALIZE,
+      () => canonicalizeJson(content),
+    )
+    : canonicalizeJson(content);
+  const digest = stageRecorder
+    ? await measureChunkGenerationStage(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.HASH,
+      () => sha256Hex(serialized),
+    )
+    : await sha256Hex(serialized);
+  return `sha256:${digest}`;
 }
 
 export function validateW3FormalChunkData(chunkData) {
@@ -313,9 +332,12 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
     worldSeedHash: naturalGenerator.worldSeedHash,
     seed64: naturalGenerator.seed64,
     generatorVersion: W3_GENERATOR_VERSION,
-    async generateChunk(chunkX, chunkZ) {
-      const natural = await naturalGenerator.generateChunk(chunkX, chunkZ);
+    async generateChunk(chunkX, chunkZ, { stageRecorder = null } = {}) {
+      const natural = stageRecorder
+        ? await naturalGenerator.generateChunk(chunkX, chunkZ, { stageRecorder })
+        : await naturalGenerator.generateChunk(chunkX, chunkZ);
       const candidateInput = { ...natural, worldSeedHash: naturalGenerator.worldSeedHash };
+      const naturalToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.NATURAL);
       const vegetationCandidates = await createVegetationCandidates(candidateInput, placementSeed);
       const rockCandidates = await createRockCandidates(
         candidateInput,
@@ -324,6 +346,7 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
         placementSeed,
         vegetationCandidates,
       );
+      if (stageRecorder) stageRecorder.end(naturalToken);
       const chunkId = createChunkId({
         worldSeedHash: naturalGenerator.worldSeedHash,
         generatorMajor: W3_GENERATOR_VERSION.major,
@@ -354,7 +377,10 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
           formalRockConnected: true,
         },
       };
-      const chunkData = { ...content, contentHash: await hashW3ChunkContent(content) };
+      const contentHash = stageRecorder
+        ? await hashW3ChunkContent(content, { stageRecorder })
+        : await hashW3ChunkContent(content);
+      const chunkData = { ...content, contentHash };
       const validation = validateW3FormalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W3 ChunkData: ${validation.errors.join('; ')}`);
       return chunkData;

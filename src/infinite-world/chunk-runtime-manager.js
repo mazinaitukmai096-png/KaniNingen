@@ -35,6 +35,7 @@ export class ChunkRuntimeManager {
     chunkIndex = null,
     clock = defaultClock,
     yieldToHost = defaultYieldToHost,
+    onPipelineEvent = null,
   } = {}) {
     if (chunkDataService === null && generator === null) {
       throw new TypeError('chunkDataService is required');
@@ -57,6 +58,9 @@ export class ChunkRuntimeManager {
     }
     if (typeof clock !== 'function') throw new TypeError('clock must be a function');
     if (typeof yieldToHost !== 'function') throw new TypeError('yieldToHost must be a function');
+    if (onPipelineEvent !== null && typeof onPipelineEvent !== 'function') {
+      throw new TypeError('onPipelineEvent must be a function when provided');
+    }
     this.chunkDataService = chunkDataService ?? new ChunkDataService({
       transport: createInlineChunkGeneratorTransport({ generator }),
       cacheCapacity,
@@ -68,6 +72,7 @@ export class ChunkRuntimeManager {
     this.chunkIndex = chunkIndex;
     this.clock = clock;
     this.yieldToHost = yieldToHost;
+    this.onPipelineEvent = onPipelineEvent;
     this.floatingOrigin = new FloatingOrigin();
     this.performance = new PerformanceLedger();
     this.cache = new Map();
@@ -128,6 +133,15 @@ export class ChunkRuntimeManager {
     const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'centerChunkX');
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'centerChunkZ');
     this.counts.transitionsRequested += 1;
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-requested', {
+      ownerKey: createChunkKey(chunkX, chunkZ),
+      chunkX,
+      chunkZ,
+      fromChunkX: this.centerChunkX,
+      fromChunkZ: this.centerChunkZ,
+      transitionPendingCount: this.transitionPendingCount,
+      preparationPendingCount: this.preparationPendingCount,
+    });
     this.transitionPendingCount += 1;
     const operation = this.transitionChain.then(() => this.#performTransition(chunkX, chunkZ))
       .finally(() => { this.transitionPendingCount -= 1; });
@@ -165,6 +179,14 @@ export class ChunkRuntimeManager {
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'preparedCenterChunkZ');
     if (this.isShutdown) return Promise.reject(new Error('chunk runtime manager is shut down'));
     const key = createChunkKey(chunkX, chunkZ);
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-prefetch-requested', {
+      ownerKey: key,
+      chunkX,
+      chunkZ,
+      fromChunkX: this.centerChunkX,
+      fromChunkZ: this.centerChunkZ,
+      preparationPendingCount: this.preparationPendingCount,
+    });
     this.preferredPreparationKey = key;
     const stalePlans = this.#markUnpreferredPlans(key);
     const currentKey = this.centerChunkX === null ? null : createChunkKey(this.centerChunkX, this.centerChunkZ);
@@ -208,7 +230,17 @@ export class ChunkRuntimeManager {
       released: false,
       committing: false,
       promise: null,
+      startedAtMs: this.clock(),
     };
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-prefetch-plan-created', {
+      ownerKey: key,
+      chunkX,
+      chunkZ,
+      fromCenterKey,
+      epoch,
+      dataOwnerCount: plan.dataCoordinates.length,
+      renderOwnerCount: plan.renderCoordinates.length,
+    });
     this.preparedPlanRegistry.add(plan);
     return plan;
   }
@@ -226,6 +258,14 @@ export class ChunkRuntimeManager {
 
   async #requestChunkData(coordinate, { priority, consumerId, epoch }) {
     const generationStartedAt = this.clock();
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-request-started', {
+      ownerKey: coordinate.key,
+      chunkX: coordinate.chunkX,
+      chunkZ: coordinate.chunkZ,
+      priority,
+      consumerId,
+      epoch,
+    });
     const request = this.chunkDataService.requestChunk({
       chunkX: coordinate.chunkX,
       chunkZ: coordinate.chunkZ,
@@ -234,7 +274,18 @@ export class ChunkRuntimeManager {
       epoch,
     });
     const chunkData = await request.promise;
-    this.performance.record('generation', this.clock() - generationStartedAt);
+    const requestDurationMs = this.clock() - generationStartedAt;
+    this.performance.record('generation', requestDurationMs);
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-request-complete', {
+      ownerKey: coordinate.key,
+      chunkX: coordinate.chunkX,
+      chunkZ: coordinate.chunkZ,
+      priority,
+      consumerId,
+      epoch,
+      requestDurationMs,
+      result: chunkData === null ? 'cancelled' : 'ready',
+    });
     return chunkData;
   }
 
@@ -246,6 +297,14 @@ export class ChunkRuntimeManager {
     const existing = this.cache.get(coordinate.key);
     if (existing?.data) {
       existing.lastUsed = ++this.accessTick;
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-cache-hit', {
+        ownerKey: coordinate.key,
+        chunkX: coordinate.chunkX,
+        chunkZ: coordinate.chunkZ,
+        priority,
+        consumerId,
+        epoch,
+      });
       return Object.freeze({ data: existing.data, generated: false });
     }
     const chunkData = await this.#requestChunkData(coordinate, { priority, consumerId, epoch });
@@ -297,6 +356,14 @@ export class ChunkRuntimeManager {
 
   async #prepareTransitionPlan(plan, { yieldBetweenUnits }) {
     try {
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-prefetch-started', {
+        ownerKey: plan.key,
+        chunkX: plan.chunkX,
+        chunkZ: plan.chunkZ,
+        epoch: plan.epoch,
+        dataOwnerCount: plan.dataCoordinates.length,
+        renderOwnerCount: plan.renderCoordinates.length,
+      });
       if (plan.discarded) return null;
       for (const coordinate of plan.dataCoordinates) {
         if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
@@ -310,6 +377,16 @@ export class ChunkRuntimeManager {
           consumerId: plan.consumerId,
           epoch: plan.epoch,
         });
+        if (this.onPipelineEvent && result.generated) {
+          this.#recordPipelineEvent('runtime-prefetch-owner-ready', {
+            ownerKey: coordinate.key,
+            targetOwnerKey: plan.key,
+            chunkX: coordinate.chunkX,
+            chunkZ: coordinate.chunkZ,
+            epoch: plan.epoch,
+            renderRequired: isRenderCoordinate,
+          });
+        }
         if (result.cancelled || plan.discarded) {
           await this.#discardPreparedTransition(plan);
           return null;
@@ -331,6 +408,13 @@ export class ChunkRuntimeManager {
         });
         this.performance.record('projection', this.clock() - projectionStartedAt);
         plan.projectedByKey.set(coordinate.key, projected);
+        if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-prepared', {
+          ownerKey: coordinate.key,
+          targetOwnerKey: plan.key,
+          chunkX: coordinate.chunkX,
+          chunkZ: coordinate.chunkZ,
+          epoch: plan.epoch,
+        });
         this.counts.preparedProjections += 1;
         if (yieldBetweenUnits) await this.yieldToHost();
       }
@@ -340,6 +424,17 @@ export class ChunkRuntimeManager {
       }
       plan.ready = true;
       this.counts.preparedTransitions += 1;
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-prefetch-ready', {
+        ownerKey: plan.key,
+        chunkX: plan.chunkX,
+        chunkZ: plan.chunkZ,
+        epoch: plan.epoch,
+        readyDataOwnerCount: plan.dataCoordinates.filter(coordinate => (
+          this.cache.has(coordinate.key)
+        )).length,
+        preparedTerrainOwnerCount: plan.projectedByKey.size,
+        durationMs: Math.max(0, this.clock() - plan.startedAtMs),
+      });
       return plan;
     } catch (error) {
       await this.#discardPreparedTransition(plan, { force: true });
@@ -421,6 +516,13 @@ export class ChunkRuntimeManager {
     const prepared = usePreparedTransition
       ? await this.#ensurePreparedTransition(chunkX, chunkZ, { initial }) : null;
     const startedAt = this.clock();
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-commit-started', {
+      ownerKey: createChunkKey(chunkX, chunkZ),
+      chunkX,
+      chunkZ,
+      prepared: prepared !== null,
+      preparedEpoch: prepared?.epoch ?? null,
+    });
     const desiredDataCoordinates = prepared?.dataCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 2);
     const desiredDataKeys = new Set(desiredDataCoordinates.map(coordinate => coordinate.key));
     const desiredRenderCoordinates = prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1);
@@ -461,11 +563,26 @@ export class ChunkRuntimeManager {
         this.performance.record('load', this.clock() - loadStartedAt);
         prepared?.projectedByKey.delete(entry.key);
         attached.push(entry);
+        if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-attached', {
+          ownerKey: entry.key,
+          targetOwnerKey: createChunkKey(chunkX, chunkZ),
+          chunkX,
+          chunkZ,
+          preparedEpoch: prepared?.epoch ?? null,
+        });
         publicationSequence.push(Object.freeze({ type: 'replacement-attached', ownerKey: entry.key }));
         this.counts.renderLoaded += 1;
       }
 
       this.#validateReplacementRenderCoverage(desiredRenderKeys, attached);
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-coverage-verified', {
+        ownerKey: createChunkKey(chunkX, chunkZ),
+        chunkX,
+        chunkZ,
+        attachedReplacementCount: attached.length,
+        desiredRenderOwnerCount: desiredRenderKeys.size,
+        preparedEpoch: prepared?.epoch ?? null,
+      });
       publicationSequence.push(Object.freeze({
         type: 'new-coverage-verified',
         ownerKeys: Object.freeze(sortedKeys(desiredRenderKeys)),
@@ -553,8 +670,28 @@ export class ChunkRuntimeManager {
         durationMs,
         transitionContract: this.committedTransitionContract,
       });
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-committed', {
+        ownerKey: createChunkKey(chunkX, chunkZ),
+        chunkX,
+        chunkZ,
+        transitionGeneration,
+        prepared: prepared !== null,
+        durationMs,
+        attachedReplacementCount: attached.length,
+        releasedOwnerCount: publicationSequence.filter(event => (
+          event.type === 'old-owner-released'
+        )).length,
+      });
       return this.latestTransition;
     } catch (error) {
+      if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-rejected', {
+        ownerKey: createChunkKey(chunkX, chunkZ),
+        chunkX,
+        chunkZ,
+        prepared: prepared !== null,
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+      });
       this.transitionProtectedDataKeys = new Set();
       if (replacementCommitted) throw error;
       const rollbackErrors = [];
@@ -632,6 +769,10 @@ export class ChunkRuntimeManager {
         this.deferredRenderReleaseKeys.delete(key);
         this.counts.renderUnloaded += 1;
         publicationSequence.push(Object.freeze({ type: 'old-owner-released', ownerKey: key }));
+        if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-old-owner-released', {
+          ownerKey: key,
+          desiredRenderOwnerCount: desiredRenderKeys.size,
+        });
       } catch (error) {
         this.deferredRenderReleaseKeys.add(key);
         this.counts.deferredRenderReleases += 1;
@@ -656,6 +797,15 @@ export class ChunkRuntimeManager {
     while (this.identityAudit.size > this.identityAuditCapacity) {
       this.identityAudit.delete(this.identityAudit.keys().next().value);
       this.counts.identityAuditEvicted += 1;
+    }
+  }
+
+  #recordPipelineEvent(type, details) {
+    if (!this.onPipelineEvent) return null;
+    try {
+      return this.onPipelineEvent(type, details);
+    } catch {
+      return null;
     }
   }
 

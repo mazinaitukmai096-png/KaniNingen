@@ -1315,6 +1315,18 @@ export async function createW8DistantPresentation({
     pendingDistantPublication = null;
     generation.root = persistentDistantRoot;
     generation.stagingRoot = publication.stagingRoot;
+    recordDiagnosticEvent('distant-publication-complete', {
+      syncEpoch: generation.epoch,
+      transitionGeneration: generation.transitionContract?.generation ?? null,
+      coverageSignature: generation.transitionContract?.coverageSignature ?? null,
+      renderDistancePreset: generation.renderDistancePreset,
+      rootId: generation.root?.name ?? null,
+      rootAttached: generation.root?.parent === root,
+      buildingPublicationSource,
+      settlementRoadPublicationSource,
+      settlementPublicationPlanId,
+      settlementPublicationRevision,
+    });
     persistentDistantPublishedGeneration = generation;
     positionGenerationForOrigin(generation, committedRenderOrigin);
     if (generation.naturalReveal < 1) generation.naturalRevealStartedAt = monotonicNow();
@@ -6550,6 +6562,15 @@ export async function createW8DistantPresentation({
       localTerrainLastRejectionReason = reason;
       localTerrainLastMissingOwnerKeys = Object.freeze(sortedKeyList(missingOwnerKeys));
       localTerrainLastSyncDurationMs = monotonicNow() - startedAt;
+      recordDiagnosticEvent('terrain-replacement-rejected', {
+        coverageEpoch: requestedEpoch,
+        transitionGeneration: acceptedTransition?.generation ?? null,
+        reason,
+        missingOwnerKeys: localTerrainLastMissingOwnerKeys,
+        activeRootId: activeLocalTerrainGeneration?.root?.name ?? null,
+        activeRootAttached: activeLocalTerrainGeneration?.root?.parent === root,
+        stagingRootId: stagingLocalTerrainRootId,
+      });
       return Object.freeze({
         committed: false,
         reused: false,
@@ -6655,6 +6676,15 @@ export async function createW8DistantPresentation({
         renderedKeys,
       );
       assignTransitionContract(activeLocalTerrainGeneration, acceptedTransition);
+      recordDiagnosticEvent('terrain-coverage-verified', {
+        coverageEpoch: requestedEpoch,
+        transitionGeneration: acceptedTransition?.generation ?? null,
+        rootId: activeLocalTerrainGeneration.root.name,
+        rootAttached: activeLocalTerrainGeneration.root.parent === root,
+        reused: true,
+        activeOwnerCount: activeKeys.size,
+        renderedOwnerCount: rendered.size,
+      });
       committedLocalTerrainEpoch = requestedEpoch;
       currentCanonicalSurfacePolicy = surfacePolicy;
       recordDiagnosticEvent('terrain-replacement-reused', {
@@ -6803,6 +6833,15 @@ export async function createW8DistantPresentation({
       rootAttached: generation.root.parent === root,
       oldRootId: previous?.root?.name ?? null,
       oldRootAttached: previous?.root?.parent === root,
+    });
+    recordDiagnosticEvent('terrain-coverage-verified', {
+      coverageEpoch: requestedEpoch,
+      transitionGeneration: acceptedTransition?.generation ?? null,
+      rootId: generation.root.name,
+      rootAttached: generation.root.parent === root,
+      reused: false,
+      activeOwnerCount: activeKeys.size,
+      renderedOwnerCount: rendered.size,
     });
     committedLocalTerrainEpoch = requestedEpoch;
     localTerrainCommitCount += 1;
@@ -8133,6 +8172,12 @@ export async function createW8DistantPresentation({
           ? true : false,
         rootAttached: generation.root.parent === root,
         naturalExcluded: generation.excludeNatural === true,
+        coverageSignature: acceptedTransition?.coverageSignature ?? null,
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
+        settlementPublicationPlanId,
+        settlementPublicationRevision,
       });
       generation.syncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - syncStartedAt;
       pendingFarSyncEpochs.delete(epoch);

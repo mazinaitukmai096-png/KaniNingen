@@ -17,6 +17,11 @@ import {
   naturalMaterialWeights,
   summarizeNaturalBiomeSamples,
 } from './natural-biome-field.js';
+import {
+  CHUNK_GENERATION_STAGE,
+  measureChunkGenerationStage,
+  measureChunkGenerationStageSync,
+} from './chunk-generation-stage-timing.js';
 
 export const W2_GENERATOR_VERSION = parseGeneratorVersion('200.0.0');
 export const W2_CHUNK_DATA_SCHEMA = 'w2-natural-chunk-data-1';
@@ -141,8 +146,22 @@ function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator
   };
 }
 
-export async function hashW2ChunkContent(content) {
-  return `sha256:${await sha256Hex(canonicalizeJson(content))}`;
+export async function hashW2ChunkContent(content, { stageRecorder = null } = {}) {
+  const serialized = stageRecorder
+    ? measureChunkGenerationStageSync(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.SERIALIZE,
+      () => canonicalizeJson(content),
+    )
+    : canonicalizeJson(content);
+  const digest = stageRecorder
+    ? await measureChunkGenerationStage(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.HASH,
+      () => sha256Hex(serialized),
+    )
+    : await sha256Hex(serialized);
+  return `sha256:${digest}`;
 }
 
 export function validateW2NaturalChunkData(chunkData) {
@@ -197,7 +216,7 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
     worldSeedHash,
     seed64,
     generatorVersion: W2_GENERATOR_VERSION,
-    async generateChunk(chunkXInput, chunkZInput) {
+    async generateChunk(chunkXInput, chunkZInput, { stageRecorder = null } = {}) {
       const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'chunkX');
       const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'chunkZ');
       const chunkId = createChunkId({
@@ -205,8 +224,20 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
         generatorMajor: W2_GENERATOR_VERSION.major,
         chunkCoordinate: { x: chunkX, z: chunkZ },
       });
-      const natural = generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator });
-      const edgeData = await createEdgeData(natural.terrain);
+      const natural = stageRecorder
+        ? measureChunkGenerationStageSync(
+          stageRecorder,
+          CHUNK_GENERATION_STAGE.TERRAIN,
+          () => generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator }),
+        )
+        : generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator });
+      const edgeData = stageRecorder
+        ? await measureChunkGenerationStage(
+          stageRecorder,
+          CHUNK_GENERATION_STAGE.HASH,
+          () => createEdgeData(natural.terrain),
+        )
+        : await createEdgeData(natural.terrain);
       const content = {
         schemaVersion: W2_CHUNK_DATA_SCHEMA,
         chunkId,
@@ -230,7 +261,10 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
           formalRockConnected: false,
         },
       };
-      const chunkData = { ...content, contentHash: await hashW2ChunkContent(content) };
+      const contentHash = stageRecorder
+        ? await hashW2ChunkContent(content, { stageRecorder })
+        : await hashW2ChunkContent(content);
+      const chunkData = { ...content, contentHash };
       const validation = validateW2NaturalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W2 ChunkData: ${validation.errors.join('; ')}`);
       return chunkData;

@@ -10,6 +10,11 @@ import {
   W5_SETTLEMENT_DISTRIBUTION,
 } from './settlement-distributor.js';
 import { createMigratedSettlementTemplate } from './single-rural-settlement.js';
+import {
+  CHUNK_GENERATION_STAGE,
+  measureChunkGenerationStage,
+  measureChunkGenerationStageSync,
+} from './chunk-generation-stage-timing.js';
 
 export const W5_GENERATOR_VERSION = parseGeneratorVersion('500.0.0');
 export const W5_CHUNK_DATA_SCHEMA = 'w5-distributed-settlement-chunk-data-1';
@@ -156,7 +161,7 @@ function lruSet(map, key, value, capacity) {
   return value;
 }
 
-export async function hashW5ChunkContent(content) {
+export async function hashW5ChunkContent(content, { stageRecorder = null } = {}) {
   const envelope = {
     schemaVersion: 'w5-transitive-content-envelope-1',
     chunkId: content.chunkId,
@@ -169,7 +174,21 @@ export async function hashW5ChunkContent(content) {
     settlementFeatures: content.settlementFeatures,
     generationProof: content.generationProof,
   };
-  return `sha256:${await sha256Hex(canonicalizeJson(envelope))}`;
+  const serialized = stageRecorder
+    ? measureChunkGenerationStageSync(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.SERIALIZE,
+      () => canonicalizeJson(envelope),
+    )
+    : canonicalizeJson(envelope);
+  const digest = stageRecorder
+    ? await measureChunkGenerationStage(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.HASH,
+      () => sha256Hex(serialized),
+    )
+    : await sha256Hex(serialized);
+  return `sha256:${digest}`;
 }
 
 export function validateW5DistributedChunkData(chunkData) {
@@ -204,18 +223,27 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
   let templateCacheHits = 0;
   let templateCacheMisses = 0;
 
-  async function getTemplate(candidate) {
+  async function getTemplate(candidate, roadTimingRun = null) {
     if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
-    if (templateCache.has(candidate.settlementId)) {
+    const cacheLookupStartedAt = roadTimingRun
+      ? (globalThis.performance?.now?.() ?? Date.now()) : null;
+    const hasCachedTemplate = templateCache.has(candidate.settlementId);
+    if (cacheLookupStartedAt !== null) {
+      roadTimingRun.recordFunction('source-template-cache-lookup', Math.max(0,
+        (globalThis.performance?.now?.() ?? Date.now()) - cacheLookupStartedAt));
+    }
+    if (hasCachedTemplate) {
       templateCacheHits += 1;
+      roadTimingRun?.recordCacheHit();
       const cached = templateCache.get(candidate.settlementId);
       templateCache.delete(candidate.settlementId);
       templateCache.set(candidate.settlementId, cached);
       return cached;
     }
     templateCacheMisses += 1;
+    roadTimingRun?.recordCacheMiss();
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
-    const template = await createMigratedSettlementTemplate({ candidate });
+    const template = await createMigratedSettlementTemplate({ candidate, roadTimingRun });
     if (isShutdown) return template;
     templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
     templatesMaterialized += 1;
@@ -229,13 +257,16 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     generatorVersion: W5_GENERATOR_VERSION,
     distributor,
     reviewSpawn: Object.freeze({ ...reviewSettlement.center, settlementId: reviewSettlement.settlementId }),
-    async resolveSettlementTemplate({ candidate } = {}) {
+    async resolveSettlementTemplate({ candidate, roadTimingRun = null } = {}) {
       if (!candidate?.settlementId) throw new TypeError('Settlement candidate is required');
-      return getTemplate(candidate);
+      return getTemplate(candidate, roadTimingRun);
     },
-    async generateChunk(chunkX, chunkZ) {
+    async generateChunk(chunkX, chunkZ, { stageRecorder = null } = {}) {
       if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
-      const formal = await formalGenerator.generateChunk(chunkX, chunkZ);
+      const formal = stageRecorder
+        ? await formalGenerator.generateChunk(chunkX, chunkZ, { stageRecorder })
+        : await formalGenerator.generateChunk(chunkX, chunkZ);
+      const settlementToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.SETTLEMENT);
       const bounds = chunkBounds(formal.chunkX, formal.chunkZ);
       const chunkCenter = {
         x: (bounds.minX + bounds.maxX) / 2,
@@ -250,7 +281,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       const intersectingCandidates = candidates.filter(candidate => (
         rectangleDistance(candidate.center, bounds) <= candidateInfluence[candidate.settlementType]
       ));
-      const templates = await Promise.all(intersectingCandidates.map(getTemplate));
+      const templates = await Promise.all(intersectingCandidates.map(candidate => getTemplate(candidate)));
       const projections = templates.map(template => projectTemplate(template, formal));
       const settlementReferences = projections.flatMap(projection => projection.references)
         .sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -262,6 +293,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
       const rockCandidates = formal.rockCandidates.filter(candidate => (
         !templates.some(template => conflictsWithTemplate(candidate, template))
       ));
+      if (stageRecorder) stageRecorder.end(settlementToken);
       const chunkId = createChunkId({
         worldSeedHash: formalGenerator.worldSeedHash,
         generatorMajor: W5_GENERATOR_VERSION.major,
@@ -295,7 +327,10 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
           formalRockConnected: true,
         },
       };
-      const chunkData = { ...content, contentHash: await hashW5ChunkContent(content) };
+      const contentHash = stageRecorder
+        ? await hashW5ChunkContent(content, { stageRecorder })
+        : await hashW5ChunkContent(content);
+      const chunkData = { ...content, contentHash };
       const validation = validateW5DistributedChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W5 ChunkData: ${validation.errors.join('; ')}`);
       return chunkData;

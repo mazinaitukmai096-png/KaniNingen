@@ -52,6 +52,7 @@ export function createWorkerChunkGeneratorTransport({
   fallbackTransportFactory = null,
   clock = defaultClock,
   onSchedulerEvent = null,
+  onPipelineEvent = null,
 } = {}) {
   if (typeof worldSeed !== 'string' || !worldSeed) throw new TypeError('worldSeed is required');
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
@@ -64,6 +65,9 @@ export function createWorkerChunkGeneratorTransport({
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
   if (onSchedulerEvent !== null && typeof onSchedulerEvent !== 'function') {
     throw new TypeError('onSchedulerEvent must be a function when provided');
+  }
+  if (onPipelineEvent !== null && typeof onPipelineEvent !== 'function') {
+    throw new TypeError('onPipelineEvent must be a function when provided');
   }
 
   let worker = null;
@@ -80,6 +84,7 @@ export function createWorkerChunkGeneratorTransport({
   let runtimeFailure = null;
   let controlRequestId = 1_000_000_000;
   const pending = new Map();
+  const pipelineReceipts = onPipelineEvent ? new Map() : null;
   const forestHorizonCancelledBeforeEpoch = new Map();
   const removers = [];
   const generationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
@@ -100,16 +105,24 @@ export function createWorkerChunkGeneratorTransport({
     diagnosticQueries: 0,
     staleGenerationResponses: 0,
     lateResponses: 0,
+    pipelineTimingMessages: 0,
+    pipelineTimingOrphans: 0,
     workerErrors: 0,
     fallbackCount: 0,
   };
   let fallbackReason = null;
   let lastGeneratorSnapshot = null;
   let lastWorkerSchedulerSnapshot = null;
+  const mainTimeOriginMs = Number.isFinite(globalThis.performance?.timeOrigin)
+    ? globalThis.performance.timeOrigin : Date.now() - clock();
 
   const emitSchedulerEvent = event => {
     if (!onSchedulerEvent) return;
     try { onSchedulerEvent(Object.freeze(event)); } catch { /* diagnostics are isolated */ }
+  };
+  const emitPipelineEvent = (type, details) => {
+    if (!onPipelineEvent) return;
+    try { onPipelineEvent(type, details); } catch { /* diagnostics are isolated */ }
   };
 
   const terminateWorker = async () => {
@@ -133,11 +146,13 @@ export function createWorkerChunkGeneratorTransport({
       operation.reject(error);
     }
     pending.clear();
+    pipelineReceipts?.clear();
   };
 
   const shutdownError = () => new Error('Worker ChunkData transport is shut down');
 
   const onMessage = event => {
+    const receivedAtMs = clock();
     const message = event.data;
     if (!message || message.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) return;
     if (message.serviceGeneration !== serviceGeneration) {
@@ -159,12 +174,146 @@ export function createWorkerChunkGeneratorTransport({
       initializeReject?.(transportError(message));
       return;
     }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.PIPELINE_TIMING) {
+      const receipt = pipelineReceipts?.get(message.requestId) ?? null;
+      if (!receipt) {
+        counts.pipelineTimingOrphans += 1;
+        return;
+      }
+      pipelineReceipts.delete(message.requestId);
+      counts.pipelineTimingMessages += 1;
+      const workerToMainTime = value => Number.isFinite(message.workerTimeOriginMs)
+        && Number.isFinite(value)
+        ? message.workerTimeOriginMs + value - mainTimeOriginMs : null;
+      const responsePostStartedAtMs = workerToMainTime(message.responsePostStartedAtMs);
+      const responsePostCompletedAtMs = workerToMainTime(message.responsePostCompletedAtMs);
+      const generationStartedAtMs = workerToMainTime(message.generationStartedAtMs);
+      const generationCompletedAtMs = workerToMainTime(message.generationCompletedAtMs);
+      const transferMs = Number.isFinite(responsePostCompletedAtMs)
+        ? Math.max(0, receipt.receivedAtMs - responsePostCompletedAtMs) : null;
+      const stageEvents = Array.isArray(message.stageTiming?.events)
+        ? message.stageTiming.events.map(stage => Object.freeze({
+          ...stage,
+          startedAtMs: workerToMainTime(stage.startedAtMs),
+          completedAtMs: workerToMainTime(stage.completedAtMs),
+        })) : [];
+      emitPipelineEvent('worker-chunk-stages', {
+        ownerKey: receipt.ownerKey,
+        requestId: message.requestId,
+        correlationId: receipt.correlationId,
+        operationKind: receipt.operationKind,
+        target: receipt.target,
+        stream: receipt.stream,
+        priority: receipt.priority,
+        required: receipt.required,
+        requestClass: receipt.required === true ? 'required' : 'prefetch',
+        deadlineAtMs: receipt.deadlineAtMs,
+        deadlineMissAtStart: message.scheduler?.deadlineMiss === true,
+        deadlineMissAtMainReceive: Number.isFinite(receipt.deadlineAtMs)
+          ? receipt.receivedAtMs > receipt.deadlineAtMs : false,
+        workerReceivedAtMs: workerToMainTime(message.requestReceivedAtMs),
+        generationStartedAtMs,
+        generationCompletedAtMs,
+        generationTotalMs: message.generationTotalMs,
+        responsePostStartedAtMs,
+        responsePostCompletedAtMs,
+        postMessageCallMs: message.postMessageCallMs,
+        transferMs,
+        mainReceivedAtMs: receipt.receivedAtMs,
+        workerQueueResidentMs: message.scheduler?.workerQueueResidentMs ?? null,
+        schedulerQueueTimeMs: message.scheduler?.queueTimeMs ?? null,
+        stageTotalsMs: message.stageTiming?.totalsMs ?? null,
+        stageCallCounts: message.stageTiming?.callCounts ?? null,
+        stageEvents,
+        roadTiming: message.roadTiming ?? null,
+        roadTimingSummary: message.roadTimingSummary ?? null,
+      });
+      return;
+    }
     const operation = pending.get(message.requestId);
     if (!operation) {
       counts.lateResponses += 1;
+      emitPipelineEvent('worker-late-response', {
+        requestId: message.requestId,
+        ownerKey: message.chunkKey ?? null,
+        responseType: message.type,
+        receivedAtMs,
+      });
       return;
     }
+    const operationKind = operation.request.scheduler?.operationKind ?? null;
+    const ownerKey = message.chunkKey
+      ?? (Number.isSafeInteger(operation.request.chunkX)
+        && Number.isSafeInteger(operation.request.chunkZ)
+        ? `${operation.request.chunkX},${operation.request.chunkZ}` : null);
+    const executionMs = Math.max(0, Number(
+      message.generationMs ?? message.operationMs ?? 0,
+    ) || 0);
+    const workerQueueTimeMs = Number.isFinite(message.scheduler?.workerQueueResidentMs)
+      ? Math.max(0, message.scheduler.workerQueueResidentMs)
+      : Number.isFinite(message.scheduler?.queueTimeMs)
+        ? Math.max(0, message.scheduler.queueTimeMs) : null;
+    const schedulerQueueTimeMs = Number.isFinite(message.scheduler?.queueTimeMs)
+      ? Math.max(0, message.scheduler.queueTimeMs) : null;
+    const workerResponseSentAtMs = Number.isFinite(message.pipelineTiming?.workerTimeOriginMs)
+      && Number.isFinite(message.pipelineTiming?.responseSentAtMs)
+      ? message.pipelineTiming.workerTimeOriginMs
+        + message.pipelineTiming.responseSentAtMs - mainTimeOriginMs : null;
+    const messageDeliveryMs = Number.isFinite(workerResponseSentAtMs)
+      ? Math.max(0, receivedAtMs - workerResponseSentAtMs) : null;
+    emitPipelineEvent('worker-message-received', {
+      ownerKey,
+      requestId: message.requestId,
+      correlationId: operation.request.scheduler?.correlationId ?? null,
+      operationKind,
+      target: operation.request.scheduler?.target ?? null,
+      stream: operation.request.scheduler?.stream ?? null,
+      priority: operation.request.scheduler?.priority ?? null,
+      required: operation.request.scheduler?.required ?? null,
+      responseType: message.type,
+      sentAtMs: operation.sentAt,
+      receivedAtMs,
+      requestToMessageMs: Math.max(0, receivedAtMs - operation.sentAt),
+      workerQueueTimeMs,
+      schedulerQueueTimeMs,
+      workerExecutionMs: executionMs,
+      workerResponseSentAtMs,
+      messageDeliveryMs,
+      residualWaitMs: workerQueueTimeMs === null
+        ? null : Math.max(0, receivedAtMs - operation.sentAt
+          - workerQueueTimeMs - executionMs
+          - (messageDeliveryMs ?? 0)),
+      pendingCount: pending.size,
+    });
+    if (pipelineReceipts && message.pipelineTiming) {
+      pipelineReceipts.set(message.requestId, Object.freeze({
+        ownerKey,
+        correlationId: operation.request.scheduler?.correlationId ?? null,
+        operationKind,
+        target: operation.request.scheduler?.target ?? null,
+        stream: operation.request.scheduler?.stream ?? null,
+        priority: operation.request.scheduler?.priority ?? null,
+        required: operation.request.scheduler?.required ?? null,
+        deadlineAtMs: operation.request.scheduler?.deadlineAtMs ?? null,
+        receivedAtMs,
+      }));
+      while (pipelineReceipts.size > TRANSPORT_TIMING_SAMPLE_CAPACITY) {
+        pipelineReceipts.delete(pipelineReceipts.keys().next().value);
+      }
+    }
     pending.delete(message.requestId);
+    const resolveOperation = value => {
+      emitPipelineEvent('worker-response-resolved', {
+        ownerKey,
+        requestId: message.requestId,
+        correlationId: operation.request.scheduler?.correlationId ?? null,
+        operationKind,
+        responseType: message.type,
+        mainHandlerMs: Math.max(0, clock() - receivedAtMs),
+        pendingCount: pending.size,
+      });
+      operation.resolve(value);
+    };
     if (message.type === CHUNK_GENERATOR_MESSAGE.ERROR) {
       emitSchedulerEvent({
         type: 'terminal',
@@ -202,7 +351,7 @@ export function createWorkerChunkGeneratorTransport({
       generationTimes.record(generationMs);
       receiveTimes.record(Math.max(0, receivedMs - generationMs));
       counts.generated += 1;
-      operation.resolve(message.chunkData);
+      resolveOperation(message.chunkData);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON) {
@@ -211,7 +360,7 @@ export function createWorkerChunkGeneratorTransport({
       forestHorizonGenerationTimes.record(generationMs);
       forestHorizonReceiveTimes.record(Math.max(0, receivedMs - generationMs));
       counts.forestHorizonGenerated += 1;
-      operation.resolve(message.manifest);
+      resolveOperation(message.manifest);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
@@ -220,7 +369,7 @@ export function createWorkerChunkGeneratorTransport({
       settlementQueryTimes.record(operationMs);
       settlementQueryReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.settlementQueries += 1;
-      operation.resolve(message.settlements);
+      resolveOperation(message.settlements);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE) {
@@ -229,7 +378,7 @@ export function createWorkerChunkGeneratorTransport({
       settlementTemplateTimes.record(operationMs);
       settlementTemplateReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.settlementTemplateQueries += 1;
-      operation.resolve(message.template);
+      resolveOperation(message.template);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS) {
@@ -240,7 +389,7 @@ export function createWorkerChunkGeneratorTransport({
       counts.diagnosticQueries += 1;
       lastGeneratorSnapshot = message.generatorSnapshot ?? null;
       lastWorkerSchedulerSnapshot = message.workerSchedulerSnapshot ?? null;
-      operation.resolve(lastGeneratorSnapshot);
+      resolveOperation(lastGeneratorSnapshot);
     }
   };
 
@@ -285,6 +434,7 @@ export function createWorkerChunkGeneratorTransport({
       metadata = candidateMetadata;
       lastGeneratorSnapshot = null;
       lastWorkerSchedulerSnapshot = null;
+      pipelineReceipts?.clear();
       runtimeFailure = null;
       mode = 'inline-fallback';
       initialized = true;
@@ -327,7 +477,8 @@ export function createWorkerChunkGeneratorTransport({
         : runtimeFailure ?? new Error('Chunk generator Worker is unavailable'));
       return;
     }
-    pending.set(request.requestId, { resolve, reject, sentAt: clock(), request });
+    const sentAt = clock();
+    pending.set(request.requestId, { resolve, reject, sentAt, request });
     emitSchedulerEvent({
       type: 'queued',
       envelope: request.scheduler ?? null,
@@ -336,7 +487,23 @@ export function createWorkerChunkGeneratorTransport({
       backlog: pending.size,
     });
     try {
+      const postStartedAtMs = clock();
       target.postMessage(request);
+      emitPipelineEvent('worker-message-sent', {
+        ownerKey: Number.isSafeInteger(request.chunkX) && Number.isSafeInteger(request.chunkZ)
+          ? `${request.chunkX},${request.chunkZ}` : null,
+        requestId: request.requestId,
+        correlationId: request.scheduler?.correlationId ?? null,
+        operationKind: request.scheduler?.operationKind ?? null,
+        target: request.scheduler?.target ?? null,
+        stream: request.scheduler?.stream ?? null,
+        priority: request.scheduler?.priority ?? null,
+        required: request.scheduler?.required ?? null,
+        deadlineAtMs: request.scheduler?.deadlineAtMs ?? null,
+        sentAtMs: sentAt,
+        postMessageCallMs: Math.max(0, clock() - postStartedAtMs),
+        pendingCount: pending.size,
+      });
     } catch (error) {
       pending.delete(request.requestId);
       reject(error);
@@ -373,6 +540,7 @@ export function createWorkerChunkGeneratorTransport({
         requestId, serviceGeneration, chunkX, chunkZ, priority, required, createdAtMs,
         deadlineAtMs, consumerId, epoch, correlationId: telemetryCorrelationId,
         target: telemetryTarget, stream: telemetryStream, scheduler,
+        pipelineDiagnostics: onPipelineEvent !== null,
       }));
     },
     async generateForestHorizonManifest({
@@ -433,6 +601,7 @@ export function createWorkerChunkGeneratorTransport({
         target: telemetryTarget,
         stream: telemetryStream,
         scheduler,
+        pipelineDiagnostics: onPipelineEvent !== null,
       }));
     },
     cancelForestHorizonRequests({
@@ -538,6 +707,7 @@ export function createWorkerChunkGeneratorTransport({
         centerWorldZ,
         radiusMeters,
         scheduler,
+        ...(onPipelineEvent ? { pipelineDiagnostics: true } : {}),
       });
     },
     async resolveSettlementPresentationTemplate({ candidate, ...options } = {}) {
@@ -568,6 +738,7 @@ export function createWorkerChunkGeneratorTransport({
         serviceGeneration,
         candidate,
         scheduler,
+        ...(onPipelineEvent ? { pipelineDiagnostics: true } : {}),
       });
     },
     async requestDiagnostics(options = {}) {
@@ -599,6 +770,7 @@ export function createWorkerChunkGeneratorTransport({
         requestId,
         serviceGeneration,
         scheduler,
+        ...(onPipelineEvent ? { pipelineDiagnostics: true } : {}),
       });
     },
     snapshot() {

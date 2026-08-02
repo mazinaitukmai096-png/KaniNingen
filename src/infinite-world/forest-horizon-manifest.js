@@ -1,5 +1,10 @@
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { sha256Hex } from './legacy-core/g0/sha256.js';
+import {
+  CHUNK_GENERATION_STAGE,
+  measureChunkGenerationStage,
+  measureChunkGenerationStageSync,
+} from './chunk-generation-stage-timing.js';
 import { resolveCanonicalGroundSurface } from './w8-surface-policy.js';
 import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js';
 
@@ -86,11 +91,12 @@ function assembleForestHorizonManifest(chunk, vegetation, contentHash) {
 export async function hashW8ForestHorizonManifestContent({
   chunk,
   vegetation,
+  stageRecorder = null,
 } = {}) {
   if (!chunk || !Array.isArray(vegetation)) {
     throw new TypeError('Forest horizon manifest content is required');
   }
-  return `sha256:${await sha256Hex(canonicalizeJson({
+  const serialize = () => canonicalizeJson({
     schemaVersion: W8_FOREST_HORIZON_MANIFEST_SCHEMA,
     chunkId: chunk.chunkId,
     chunkX: chunk.chunkX,
@@ -101,7 +107,22 @@ export async function hashW8ForestHorizonManifestContent({
     generatorVersion: chunk.generatorVersion,
     canonicalSurfacePolicy: chunk.canonicalSurfacePolicy ?? null,
     vegetation,
-  }))}`;
+  });
+  const serialized = stageRecorder
+    ? measureChunkGenerationStageSync(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.SERIALIZE,
+      serialize,
+    )
+    : serialize();
+  const digest = stageRecorder
+    ? await measureChunkGenerationStage(
+      stageRecorder,
+      CHUNK_GENERATION_STAGE.HASH,
+      () => sha256Hex(serialized),
+    )
+    : await sha256Hex(serialized);
+  return `sha256:${digest}`;
 }
 
 /**
@@ -124,10 +145,17 @@ export function createW8ForestHorizonManifest(chunk) {
  * intentionally has its own content hash so no full W8 Chunk has to be
  * materialized merely to obtain the full Chunk hash.
  */
-export async function createHashedW8ForestHorizonManifest(chunk) {
+export async function createHashedW8ForestHorizonManifest(
+  chunk,
+  { stageRecorder = null } = {},
+) {
   if (!chunk) return null;
   if (chunk.schemaVersion === W8_FOREST_HORIZON_MANIFEST_SCHEMA) return chunk;
   const vegetation = resolveForestHorizonVegetation(chunk);
-  const contentHash = await hashW8ForestHorizonManifestContent({ chunk, vegetation });
+  const contentHash = await hashW8ForestHorizonManifestContent({
+    chunk,
+    vegetation,
+    stageRecorder,
+  });
   return assembleForestHorizonManifest(chunk, vegetation, contentHash);
 }

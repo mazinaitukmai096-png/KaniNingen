@@ -18,6 +18,7 @@ export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   INITIALIZED: 'chunk-generator:initialized',
   GENERATE: 'chunk-generator:generate',
   GENERATED: 'chunk-generator:generated',
+  PIPELINE_TIMING: 'chunk-generator:pipeline-timing',
   GENERATE_FOREST_HORIZON: 'chunk-generator:generate-forest-horizon',
   GENERATED_FOREST_HORIZON: 'chunk-generator:generated-forest-horizon',
   CANCEL_FOREST_HORIZON: 'chunk-generator:cancel-forest-horizon',
@@ -120,6 +121,7 @@ export function createChunkGeneratorRequest({
   target = null,
   stream = null,
   scheduler = null,
+  pipelineDiagnostics = false,
 }) {
   if (!Number.isSafeInteger(requestId) || requestId < 1) throw new RangeError('requestId must be positive');
   createChunkDataRequestKey(chunkX, chunkZ);
@@ -134,6 +136,7 @@ export function createChunkGeneratorRequest({
     serviceGeneration,
     chunkX,
     chunkZ,
+    ...(pipelineDiagnostics === true ? { pipelineDiagnostics: true } : {}),
     scheduler: createChunkGeneratorSchedulerEnvelope({
       requestId,
       operationKind: 'chunk',
@@ -166,6 +169,7 @@ export function createForestHorizonGeneratorRequest({
   target = 'tree',
   stream = 'distant',
   scheduler = null,
+  pipelineDiagnostics = false,
 }) {
   if (!Number.isSafeInteger(requestId) || requestId < 1) {
     throw new RangeError('requestId must be positive');
@@ -188,6 +192,7 @@ export function createForestHorizonGeneratorRequest({
     chunkZ,
     consumerId,
     epoch,
+    ...(pipelineDiagnostics === true ? { pipelineDiagnostics: true } : {}),
     scheduler: createChunkGeneratorSchedulerEnvelope({
       requestId,
       operationKind: 'forest-horizon',

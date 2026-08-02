@@ -11,6 +11,7 @@ import {
   createChunkGeneratorSchedulerEnvelope,
 } from '../src/infinite-world/chunk-data-service-protocol.js';
 import { createInlineChunkGeneratorTransport } from '../src/infinite-world/inline-chunk-generator-transport.js';
+import { CHUNK_GENERATION_STAGE } from '../src/infinite-world/chunk-generation-stage-timing.js';
 import { createChunkGeneratorWorkerCore } from '../src/infinite-world/chunk-generator-worker-core.js';
 import { createNodeChunkGeneratorWorker } from '../src/infinite-world/node-worker-chunk-generator-adapter.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
@@ -165,6 +166,65 @@ test('Worker core includes the full generator snapshot only in an explicit diagn
   assert.ok(diagnosticsResponse.operationMs >= 0);
   await core.shutdown();
   assert.equal(shutdownCalls, 1);
+});
+
+test('Worker core emits one diagnostics-only generation profile trailer after the Chunk payload', async () => {
+  const responses = [];
+  const generator = {
+    worldSeed: seed,
+    worldSeedHash: `sha256:${'8'.repeat(64)}`,
+    generatorVersion: { major: 800, minor: 0, patch: 0 },
+    experienceSpawn: { x: 0, z: 0 },
+    reviewSpawn: { x: 0, z: 0 },
+    distributor: { findSettlementsNear: async () => [] },
+    async generateChunk(chunkX, chunkZ, options = {}) {
+      options.stageRecorder?.measureSync(CHUNK_GENERATION_STAGE.TERRAIN, () => chunkX + chunkZ);
+      return fixtureChunk(chunkX, chunkZ);
+    },
+  };
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    generatorFactory: async () => generator,
+  });
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 13,
+    worldSeed: seed,
+  });
+  responses.length = 0;
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 91,
+    serviceGeneration: 13,
+    chunkX: 5,
+    chunkZ: -2,
+    pipelineDiagnostics: true,
+  });
+  assert.deepEqual(responses.map(response => response.type), [
+    CHUNK_GENERATOR_MESSAGE.GENERATED,
+    CHUNK_GENERATOR_MESSAGE.PIPELINE_TIMING,
+  ]);
+  assert.equal(responses[0].chunkData.contentHash, fixtureChunk(5, -2).contentHash);
+  assert.equal(responses[1].stageTiming.callCounts.terrain, 1);
+  assert.ok(responses[1].generationTotalMs >= responses[1].stageTiming.totalsMs.terrain);
+  assert.ok(responses[1].postMessageCallMs >= 0);
+
+  responses.length = 0;
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 92,
+    serviceGeneration: 13,
+    chunkX: 6,
+    chunkZ: -2,
+  });
+  assert.deepEqual(responses.map(response => response.type), [
+    CHUNK_GENERATOR_MESSAGE.GENERATED,
+  ]);
+  assert.equal(Object.hasOwn(responses[0], 'pipelineTiming'), false);
+  await core.shutdown();
 });
 
 test('Inline diagnostics are explicit and shutdown waits for active generation before releasing the generator', async () => {
@@ -419,6 +479,7 @@ test('Worker transport sends the unified deadline envelope and settles a generic
   await drainAsyncWork(2);
   const request = fake.messages.at(-1);
   assert.equal(request.type, CHUNK_GENERATOR_MESSAGE.GENERATE);
+  assert.equal(Object.hasOwn(request, 'pipelineDiagnostics'), false);
   assert.deepEqual(request.scheduler, {
     schemaVersion: 'world-generation-request-1',
     requestId: 77,
@@ -455,6 +516,99 @@ test('Worker transport sends the unified deadline envelope and settles a generic
   });
   assert.equal(transport.snapshot().counts.generated, 0);
   assert.equal(transport.snapshot().counts.lateResponses, 1);
+  await transport.shutdown();
+});
+
+test('Worker transport attributes queue, execution, delivery, and main resolution only when diagnostics are enabled', async () => {
+  const fake = new FakeWorker();
+  const events = [];
+  let now = 100;
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    serviceGeneration: 12,
+    workerFactory: () => fake,
+    clock: () => now,
+    onPipelineEvent: (type, details) => events.push({ type, ...details }),
+  });
+  await transport.initialize();
+  const generated = transport.generateChunk({
+    requestId: 78,
+    chunkX: -4,
+    chunkZ: 7,
+    priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    required: true,
+  });
+  await drainAsyncWork(2);
+  const request = fake.messages.at(-1);
+  assert.equal(request.pipelineDiagnostics, true);
+  assert.equal(events.at(-1).type, 'worker-message-sent');
+  assert.equal(events.at(-1).ownerKey, '-4,7');
+
+  now = 125;
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATED,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 78,
+    serviceGeneration: 12,
+    chunkKey: '-4,7',
+    chunkData: fixtureChunk(-4, 7),
+    generationMs: 12,
+    scheduler: { queueTimeMs: 5, backlogAtStart: 2 },
+    pipelineTiming: {
+      workerTimeOriginMs: globalThis.performance.timeOrigin,
+      responseSentAtMs: 124,
+    },
+  });
+  assert.equal((await generated).chunkId, fixtureChunk(-4, 7).chunkId);
+  const received = events.find(event => event.type === 'worker-message-received');
+  assert.equal(received.requestToMessageMs, 25);
+  assert.equal(received.workerQueueTimeMs, 5);
+  assert.equal(received.workerExecutionMs, 12);
+  assert.equal(received.residualWaitMs, 7);
+  assert.equal(received.messageDeliveryMs, 1);
+  assert.equal(events.at(-1).type, 'worker-response-resolved');
+  assert.equal(events.at(-1).mainHandlerMs, 0);
+  fake.emit({
+    type: CHUNK_GENERATOR_MESSAGE.PIPELINE_TIMING,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 78,
+    serviceGeneration: 12,
+    chunkKey: '-4,7',
+    workerTimeOriginMs: globalThis.performance.timeOrigin,
+    requestReceivedAtMs: 104,
+    generationStartedAtMs: 110,
+    generationCompletedAtMs: 122,
+    generationTotalMs: 12,
+    responsePostStartedAtMs: 123,
+    responsePostCompletedAtMs: 124,
+    postMessageCallMs: 1,
+    scheduler: {
+      queueTimeMs: 5,
+      workerQueueResidentMs: 6,
+      deadlineMiss: false,
+    },
+    stageTiming: {
+      totalsMs: { terrain: 9, canonical: 3 },
+      callCounts: { terrain: 1, canonical: 1 },
+      events: [{
+        sequence: 1,
+        stage: 'terrain',
+        startedAtMs: 110,
+        completedAtMs: 119,
+        durationMs: 9,
+        status: 'completed',
+      }],
+    },
+  });
+  const stages = events.find(event => event.type === 'worker-chunk-stages');
+  assert.equal(stages.ownerKey, '-4,7');
+  assert.equal(stages.workerQueueResidentMs, 6);
+  assert.equal(stages.generationTotalMs, 12);
+  assert.equal(stages.stageTotalsMs.terrain, 9);
+  assert.equal(stages.postMessageCallMs, 1);
+  assert.equal(stages.transferMs, 1);
+  assert.equal(stages.deadlineMissAtMainReceive, false);
+  assert.equal(transport.snapshot().counts.lateResponses, 0);
   await transport.shutdown();
 });
 
