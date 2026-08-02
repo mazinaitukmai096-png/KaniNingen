@@ -617,6 +617,7 @@ export async function createW8DistantPresentation({
   let activeGeneration = null;
   let buildingPublicationSource = 'legacy-distant-root';
   let settlementRoadPublicationSource = 'legacy-distant-root';
+  let settlementMetadataPublicationSource = 'legacy-distant-root';
   let settlementPublicationPlanId = null;
   let settlementPublicationRevision = 0;
   let persistentDistantRoot = null;
@@ -7412,6 +7413,7 @@ export async function createW8DistantPresentation({
         staticNaturalExcluded: incrementalStaticTreePages,
         buildingPublicationSource,
         settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
       };
       const naturalRevealInitialByStableId = new Map();
       const presentationBuildOrigin = activeGeneration && persistentDistantRoot
@@ -8017,10 +8019,14 @@ export async function createW8DistantPresentation({
       ])].sort());
       return Object.freeze({
         schemaVersion: 'legacy-building-settlement-observation-1',
-        publicationSource: buildingPublicationSource === settlementRoadPublicationSource
-          ? buildingPublicationSource : 'mixed-exclusive-handoff',
+        publicationSource: new Set([
+          buildingPublicationSource,
+          settlementRoadPublicationSource,
+          settlementMetadataPublicationSource,
+        ]).size === 1 ? buildingPublicationSource : 'mixed-exclusive-handoff',
         buildingPublicationSource,
         settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
         publicationPlanId: settlementPublicationPlanId,
         publicationRevision: settlementPublicationRevision,
         renderDistancePreset: generation.renderDistancePreset,
@@ -8063,22 +8069,30 @@ export async function createW8DistantPresentation({
       if (publicationKinds.includes('settlement-road')) {
         settlementRoadPublicationSource = 'shared-streaming-plan';
       }
+      if (publicationKinds.includes('metadata-remote')) {
+        settlementMetadataPublicationSource = 'shared-streaming-plan';
+      }
       settlementPublicationPlanId = stage.planId;
       settlementPublicationRevision = stage.renderDistanceRevision;
       activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
       activeGeneration.root.userData.settlementRoadPublicationSource =
         settlementRoadPublicationSource;
+      activeGeneration.root.userData.settlementMetadataPublicationSource =
+        settlementMetadataPublicationSource;
       return true;
     },
     useLegacyBuildingSettlementPublication() {
       buildingPublicationSource = 'legacy-distant-root';
       settlementRoadPublicationSource = 'legacy-distant-root';
+      settlementMetadataPublicationSource = 'legacy-distant-root';
       settlementPublicationPlanId = null;
       settlementPublicationRevision = 0;
       if (activeGeneration?.root?.userData) {
         activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
         activeGeneration.root.userData.settlementRoadPublicationSource =
           settlementRoadPublicationSource;
+        activeGeneration.root.userData.settlementMetadataPublicationSource =
+          settlementMetadataPublicationSource;
       }
       return true;
     },
@@ -8331,6 +8345,7 @@ export async function createW8DistantPresentation({
           stagedPersistentNaturalRenderDistancePreset,
         buildingPublicationSource,
         settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
         settlementPublicationPlanId,
         settlementPublicationRevision,
         quality: activeGeneration?.quality ?? null,

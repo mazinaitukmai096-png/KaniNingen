@@ -1618,7 +1618,11 @@ export async function bootInfiniteWorldSandbox({
       },
       publishStage: stage => distantPresentation.claimBuildingSettlementPublication?.(
         stage,
-        { publicationKinds: Object.freeze(['building']) },
+        { publicationKinds: Object.freeze([
+          'building',
+          'settlement-road',
+          'metadata-remote',
+        ]) },
       ) === true,
     });
     if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY) {
