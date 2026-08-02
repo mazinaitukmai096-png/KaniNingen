@@ -1032,6 +1032,23 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.rafCallbacks.at(-1)(performance.now() + 116);
     const browserAcceptanceDiagnosticFrameCount = 1;
     warmed = outcome.sandbox.snapshot();
+    assert.equal(warmed.diagnostics.browserFrameAttribution.enabled, true);
+    assert.equal(
+      warmed.diagnostics.browserFrameAttribution.measurementSource,
+      'node-fakethree',
+    );
+    assert.equal(
+      warmed.diagnostics.browserFrameAttribution.frames.length,
+      browserAcceptanceDiagnosticFrameCount,
+    );
+    assert.ok(
+      warmed.diagnostics.browserFrameAttribution.frames[0].stages['player-update'] >= 0,
+    );
+    assert.equal(
+      warmed.diagnostics.browserFrameAttribution.frames[0].frameTotalMs,
+      warmed.diagnostics.frames[0].durationMs,
+      'Browser attribution and legacy MeasurementReport must observe the same rAF interval',
+    );
     assert.equal(warmed.presentationDiagnostics.browserAcceptance, 'FAIL');
     assert.equal(warmed.presentationDiagnostics.presenterAudit.duplicatePresenterCount, 0);
     assert.equal(
@@ -1101,6 +1118,10 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       null,
     );
     assert.notEqual(firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs, null);
+    assert.ok(
+      firstDraw.diagnostics.browserFrameAttribution.workerRequests.length > 0,
+      'Browser attribution must correlate real scheduler request and response waits',
+    );
     assert.equal(
       firstDraw.treePathAudit.activationTimeline.staticStreamActivatedAtMs
         < firstDraw.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs,
@@ -2193,7 +2214,7 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
   assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);[\s\S]*?const gameplaySync[\s\S]*?synchronizeLocalTerrain/g) ?? []).length, 1,
     'explicit runtime relocation starts atomic Gameplay staging before Local/Far compose');
-  assert.match(boot, /const gameplayRebase = gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(nextState\);\s*\n\s*await gameplayRebase;/,
+  assert.match(boot, /const gameplayRebase = gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(nextState\);[\s\S]{0,600}?\n\s*await gameplayRebase;/,
     'moving Chunk transitions start Gameplay staging before the deferred Local/Far pump');
   assert.match(boot, /const gameplayWork = gameplaySyncWorkByEpoch[\s\S]*distant-local-terrain-sync[\s\S]*distant-sync[\s\S]*await gameplayWork/,
     'the pump joins the already-started Gameplay staging after Local/Far compose');

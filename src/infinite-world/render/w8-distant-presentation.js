@@ -8361,8 +8361,11 @@ export async function createW8DistantPresentation({
         : processPersistentDistantPublication(remainingFrameBudgetMs());
       if (diagnosticsEnabled) recordDiagnosticWork('runtime-presentation-handoff', {
         calls: 1,
+        durationMs: handoffFrame.durationMs,
         meshUpdates: handoffFrame.meshUpdates,
+        matrixUpdates: handoffFrame.matrixUpdates,
         bufferUpdates: handoffFrame.bufferUpdates,
+        uploadBytes: handoffFrame.uploadBytes,
         localTerrainHandoffs: handoffFrame.localTerrainHandoffs,
         distantAdmissions: publicationFrame.admissions,
         distantUploadBytes: publicationFrame.bytes,

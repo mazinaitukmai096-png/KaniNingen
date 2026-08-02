@@ -1,3 +1,5 @@
+import { createBrowserFrameDiagnostics } from './browser-frame-diagnostics.js';
+
 const DEFAULT_SAMPLE_LIMIT = 7_200;
 const DEFAULT_HITCH_LIMIT = 256;
 const DEFAULT_FRAME_DETAIL_LIMIT = 512;
@@ -217,6 +219,12 @@ export function createW8RuntimeDiagnostics({
     throw new TypeError('hitchThresholdMs must be positive');
   }
   const performanceObject = globalObject.performance ?? null;
+  const browserFrames = createBrowserFrameDiagnostics({
+    enabled,
+    globalObject,
+    clock,
+    environment,
+  });
   const stageSamples = new Map();
   const frameSamples = [];
   const frameRecords = [];
@@ -232,24 +240,27 @@ export function createW8RuntimeDiagnostics({
     target.push(value);
     if (target.length > limit) target.splice(0, target.length - limit);
   };
-  const recordStage = (stage, durationMs) => {
+  const recordStage = (stage, durationMs, { async = false } = {}) => {
     if (!enabled) return durationMs;
     if (!stageSamples.has(stage)) stageSamples.set(stage, []);
     pushBounded(stageSamples.get(stage), durationMs, sampleLimit);
     if (currentFrame) {
       currentFrame.stages[stage] = (currentFrame.stages[stage] ?? 0) + durationMs;
     }
+    browserFrames.recordStage(stage, durationMs, { async });
     return durationMs;
   };
-  const begin = stage => {
+  const begin = (stage, { async = false } = {}) => {
+    if (!enabled) return Object.freeze({ stage, disabled: true, async });
     const startedAt = clock();
     const sequence = ++markSequence;
     const startMark = `w8:${stage}:${sequence}:start`;
     const endMark = `w8:${stage}:${sequence}:end`;
     if (enabled) performanceObject?.mark?.(startMark);
-    return Object.freeze({ stage, startedAt, sequence, startMark, endMark });
+    return Object.freeze({ stage, startedAt, sequence, startMark, endMark, async });
   };
   const end = token => {
+    if (token?.disabled) return 0;
     const durationMs = Math.max(0, clock() - token.startedAt);
     if (enabled) {
       performanceObject?.mark?.(token.endMark);
@@ -259,7 +270,7 @@ export function createW8RuntimeDiagnostics({
       performanceObject?.clearMarks?.(token.startMark);
       performanceObject?.clearMarks?.(token.endMark);
     }
-    return recordStage(token.stage, durationMs);
+    return recordStage(token.stage, durationMs, { async: token.async });
   };
 
   if (enabled && typeof globalObject.PerformanceObserver === 'function') {
@@ -283,12 +294,14 @@ export function createW8RuntimeDiagnostics({
     begin,
     end,
     measure(stage, operation) {
+      if (!enabled) return operation();
       const token = begin(stage);
       try { return operation(); }
       finally { end(token); }
     },
     async measureAsync(stage, operation) {
-      const token = begin(stage);
+      if (!enabled) return operation();
+      const token = begin(stage, { async: true });
       try { return await operation(); }
       finally { end(token); }
     },
@@ -300,6 +313,7 @@ export function createW8RuntimeDiagnostics({
         stages: {},
         work: {},
       };
+      browserFrames.startFrame(frameNow);
       return currentFrame.sequence;
     },
     currentFrameSequence() {
@@ -316,6 +330,7 @@ export function createW8RuntimeDiagnostics({
         if (!Number.isFinite(value)) continue;
         target[metric] = (target[metric] ?? 0) + value;
       }
+      browserFrames.recordWork(route, values);
       return Object.freeze({ frameSequence: currentFrame.sequence, route });
     },
     recordEvent(type, details = {}) {
@@ -332,7 +347,16 @@ export function createW8RuntimeDiagnostics({
         ...details,
       });
       pushBounded(events, event, DEFAULT_EVENT_LIMIT);
+      browserFrames.recordEvent(type, details);
       return event;
+    },
+    recordTerrainGate(details) {
+      if (!enabled) return null;
+      return browserFrames.recordTerrainGate(details);
+    },
+    sealFrame({ rendererInfo = null } = {}) {
+      if (!enabled) return null;
+      return browserFrames.sealFrame({ rendererInfo });
     },
     finishFrame(durationMs, frameNow = clock()) {
       if (!enabled) return null;
@@ -348,6 +372,7 @@ export function createW8RuntimeDiagnostics({
       pushBounded(frameSamples, durationMs, sampleLimit);
       pushBounded(frameRecords, record, DEFAULT_FRAME_DETAIL_LIMIT);
       if (durationMs > hitchThresholdMs) pushBounded(hitches, record, hitchLimit);
+      browserFrames.finishFrame(durationMs, frameNow);
       currentFrame = null;
       return record;
     },
@@ -359,6 +384,7 @@ export function createW8RuntimeDiagnostics({
       longTasks.length = 0;
       events.length = 0;
       currentFrame = null;
+      browserFrames.reset();
     },
     snapshot(resources = {}) {
       const stages = {};
@@ -390,6 +416,7 @@ export function createW8RuntimeDiagnostics({
         stages: Object.freeze(stages),
         longTasks: Object.freeze([...longTasks]),
         resources: Object.freeze({ ...resources }),
+        browserFrameAttribution: browserFrames.snapshot(),
       });
     },
     dispose() {

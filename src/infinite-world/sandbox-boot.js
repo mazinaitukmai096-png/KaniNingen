@@ -951,6 +951,8 @@ export async function bootInfiniteWorldSandbox({
         devicePixelRatio: measurementMode ? 1 : (globalObject.devicePixelRatio ?? 1),
         userAgent: globalObject.navigator?.userAgent ?? 'unknown',
         worldSeed: requestedSeed,
+        settlementStreamingMode,
+        diagnosticsMode: diagnosticsEnabled ? 'on' : 'off',
       },
     });
     const diagnosticMeasure = diagnostics.enabled
@@ -1034,9 +1036,13 @@ export async function bootInfiniteWorldSandbox({
     recordStaticTreeActivationTime('coordinatorCreatedAtMs');
     const schedulerTerminalCorrelations = new Set();
     const recordGenerationSchedulerEvent = event => {
+      if (event?.type !== 'started' && event?.type !== 'terminal') return;
       const envelope = event?.envelope;
       const correlationId = envelope?.correlationId ?? null;
-      if (!streamingTelemetry.enabled || correlationId === null) return;
+      if (!streamingTelemetry.enabled && !diagnostics.enabled) return;
+      const diagnosticCorrelationId = correlationId
+        ?? (envelope?.requestId === undefined ? null : `scheduler:${envelope.requestId}`);
+      if (!envelope || (correlationId === null && diagnosticCorrelationId === null)) return;
       const details = {
         correlationId,
         target: envelope.target,
@@ -1063,8 +1069,32 @@ export async function bootInfiniteWorldSandbox({
             backlog: event.backlog,
             name: event.error?.name ?? null,
             message: event.error?.message ?? null,
+            terminalAtMs: event.terminalAtMs ?? null,
+            executionWallClockMs: Number.isFinite(event.terminalAtMs)
+              && Number.isFinite(event.startedAtMs)
+              ? event.terminalAtMs - event.startedAtMs : null,
           },
       };
+      if (diagnostics.enabled) diagnostics.recordEvent(
+        event.type === 'started' ? 'worker-request-started' : 'worker-request-terminal',
+        {
+          correlationId: diagnosticCorrelationId,
+          target: envelope.target,
+          stream: envelope.stream,
+          requestId: envelope.requestId,
+          operationKind: envelope.operationKind,
+          queueTimeMs: details.metadata.queueTimeMs,
+          startedAtMs: details.metadata.startTimeMs,
+          terminalState: details.metadata.terminalState,
+          cancellationReason: details.metadata.cancellationReason,
+          deadlineMiss: details.metadata.deadlineMiss,
+          priorityAging: details.metadata.priorityAging,
+          backlog: details.metadata.backlog,
+          terminalAtMs: details.metadata.terminalAtMs ?? null,
+          executionWallClockMs: details.metadata.executionWallClockMs ?? null,
+        },
+      );
+      if (!streamingTelemetry.enabled || correlationId === null) return;
       if (event.type === 'started') {
         streamingTelemetry.record(WORLD_STREAMING_EVENT.WORKER_START, details);
       } else if (event.type === 'terminal') {
@@ -2047,6 +2077,15 @@ export async function bootInfiniteWorldSandbox({
             if (!gameplayResult.ok) throw gameplayResult.error;
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             postCommitCompletedEpoch = committedEpoch;
+            if (diagnostics.enabled) diagnostics.recordEvent(
+              'chunk-transition-publication-complete',
+              {
+                workEpoch: committedEpoch,
+                transitionGeneration: runtimeState.transitionContract?.generation ?? null,
+                centerChunkX: runtimeState.centerChunkX,
+                centerChunkZ: runtimeState.centerChunkZ,
+              },
+            );
             postCommitFailureCount = 0;
             if (transitionError === postCommitLastError) transitionError = null;
             postCommitLastError = null;
@@ -2671,16 +2710,35 @@ export async function bootInfiniteWorldSandbox({
       if (transitionTargetKey
         || runtime.isCenteredAt(owner.chunkX, owner.chunkZ)) return;
       transitionTargetKey = owner.key;
+      if (diagnostics.enabled) diagnostics.recordEvent('chunk-transition-started', {
+        ownerKey: owner.key,
+        chunkX: owner.chunkX,
+        chunkZ: owner.chunkZ,
+      });
       diagnostics.measureAsync(
         'chunk-transition',
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
       )
         .then(async () => {
           const nextState = runtime.getCommittedChunkState();
+          if (diagnostics.enabled) diagnostics.recordEvent('chunk-transition-runtime-ready', {
+            ownerKey: owner.key,
+            transitionGeneration: nextState.transitionContract?.generation ?? null,
+            centerChunkX: nextState.centerChunkX,
+            centerChunkZ: nextState.centerChunkZ,
+          });
           scenePresentation.rebase(nextState.renderOrigin);
           commitDistantRuntimeState(nextState);
           const gameplayRebase = gameplayRenderAdapter.rebase(nextState.renderOrigin);
           schedulePostCommitWork(nextState);
+          if (diagnostics.enabled) diagnostics.recordEvent(
+            'chunk-transition-publication-scheduled',
+            {
+              ownerKey: owner.key,
+              transitionGeneration: nextState.transitionContract?.generation ?? null,
+              workEpoch: postCommitRequestedEpoch,
+            },
+          );
           await gameplayRebase;
         })
         .catch(error => { transitionError = error; })
@@ -2736,6 +2794,7 @@ export async function bootInfiniteWorldSandbox({
         sprint: false,
         scaleStageId: scaleProfile.stage.id,
       });
+      let terrainCoverageGateResult = null;
       if (measurement.mode === 'crossing' && measurement.status === 'sampling') {
         const startX = logicalPlayer.x;
         const startZ = logicalPlayer.z;
@@ -2750,6 +2809,7 @@ export async function bootInfiniteWorldSandbox({
           startZ,
           sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
         });
+        terrainCoverageGateResult = gatedMovement;
         logicalPlayer.x = gatedMovement.x;
         logicalPlayer.z = gatedMovement.z;
         if (gatedMovement.terrainCoverageBlocked) {
@@ -2774,7 +2834,12 @@ export async function bootInfiniteWorldSandbox({
           movementMultiplier: gameplay.getPlayerMovementMultiplier(),
         });
         movement = update.movement;
+        terrainCoverageGateResult = update.horizontalCollision;
       }
+      if (diagnostics.enabled) diagnostics.recordTerrainGate({
+        blocked: terrainCoverageGateResult?.terrainCoverageBlocked === true,
+        ownerKey: terrainCoverageGateResult?.terrainCoverageOwner?.key ?? null,
+      });
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       requestDirectionalPrefetch(movement);
       requestTransition(owner);
@@ -3332,6 +3397,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       });
     }
 
+    function sealDiagnosticFrame() {
+      if (!diagnostics.enabled) return;
+      diagnostics.sealFrame({ rendererInfo: renderer.info });
+    }
+
     function frame(now) {
       if (!running) return;
       try {
@@ -3442,6 +3512,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         ));
         if (playerRelocationInProgress) {
           renderActiveScene();
+          sealDiagnosticFrame();
           animationFrameId = requestAnimationFrameFn(frame);
           return;
         }
@@ -3487,8 +3558,16 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           diagnostics.measure('hud', () => updateHud(owner));
           lastHudAt = frameNow;
         }
+        sealDiagnosticFrame();
         animationFrameId = requestAnimationFrameFn(frame);
       } catch (error) {
+        if (diagnostics.enabled) {
+          diagnostics.recordEvent('runtime-frame-failed', {
+            name: error?.name ?? 'Error',
+            message: error?.message ?? String(error),
+          });
+          sealDiagnosticFrame();
+        }
         failRuntimeLoop(error);
       }
     }
