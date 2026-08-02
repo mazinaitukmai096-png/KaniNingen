@@ -1600,9 +1600,11 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       assert.equal(snapshot.worldStreaming.latestComparison.policies.filter(policy => (
         ['building-presentation', 'settlement-presentation'].includes(policy.kind)
       )).every(policy => policy.matches === true), true);
-      assert.equal(snapshot.buildingSettlementStreaming.mode, 'shadow');
-      assert.equal(snapshot.buildingSettlementStreaming.counts.published, 0);
+      assert.equal(snapshot.buildingSettlementStreaming.mode, 'shared');
+      assert.equal(snapshot.buildingSettlementStreaming.counts.published, 1);
       assert.notEqual(snapshot.buildingSettlementStreaming.readyStage, null);
+      assert.equal(snapshot.presentation.buildingPublicationSource, 'shared-streaming-plan');
+      assert.equal(snapshot.presentation.settlementRoadPublicationSource, 'legacy-distant-root');
       results.push({
         preset,
         bootMs,

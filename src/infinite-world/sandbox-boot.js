@@ -794,6 +794,11 @@ export async function bootInfiniteWorldSandbox({
   disablePersistentTreePublication = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('disablePersistentTreePublication') === '1',
+  settlementStreamingMode = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('settlementStreaming') === 'legacy'
+    ? BUILDING_SETTLEMENT_STREAM_MODE.LEGACY
+    : BUILDING_SETTLEMENT_STREAM_MODE.SHARED,
   streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
@@ -1596,7 +1601,7 @@ export async function bootInfiniteWorldSandbox({
       recordDistantTreeVisibility();
     }
     buildingSettlementStream = createBuildingSettlementStream({
-      initialMode: BUILDING_SETTLEMENT_STREAM_MODE.SHADOW,
+      initialMode: settlementStreamingMode,
       async buildStage({ observation, isCurrent }) {
         await Promise.resolve();
         if (!isCurrent()) throw new Error('Building/Settlement staging cancelled');
@@ -1611,7 +1616,14 @@ export async function bootInfiniteWorldSandbox({
           dispose() {},
         };
       },
+      publishStage: stage => distantPresentation.claimBuildingSettlementPublication?.(
+        stage,
+        { publicationKinds: Object.freeze(['building']) },
+      ) === true,
     });
+    if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY) {
+      distantPresentation.useLegacyBuildingSettlementPublication?.();
+    }
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
 
@@ -2762,6 +2774,13 @@ export async function bootInfiniteWorldSandbox({
             plan: worldStreamingPlan,
             observation: settlementStreamingObservation,
             renderDistanceRevision: renderDistanceRequestRevision,
+          }).then(stage => {
+            if (stage && settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED) {
+              buildingSettlementStream.commit({
+                planId: stage.planId,
+                renderDistanceRevision: stage.renderDistanceRevision,
+              });
+            }
           }).catch(error => {
             if (error?.message !== 'Building/Settlement staging cancelled') {
               transitionError = error;

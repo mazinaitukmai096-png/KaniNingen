@@ -615,6 +615,10 @@ export async function createW8DistantPresentation({
   });
   const emptyStats = createStats();
   let activeGeneration = null;
+  let buildingPublicationSource = 'legacy-distant-root';
+  let settlementRoadPublicationSource = 'legacy-distant-root';
+  let settlementPublicationPlanId = null;
+  let settlementPublicationRevision = 0;
   let persistentDistantRoot = null;
   let persistentDistantPublishedGeneration = null;
   const liveDistantEntries = new Map();
@@ -7406,6 +7410,8 @@ export async function createW8DistantPresentation({
         treePathId: incrementalStaticTreePages ? null : TREE_RENDER_PATH.LEGACY,
         treeNaturalExcluded: incrementalStaticTreePages,
         staticNaturalExcluded: incrementalStaticTreePages,
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
       };
       const naturalRevealInitialByStableId = new Map();
       const presentationBuildOrigin = activeGeneration && persistentDistantRoot
@@ -8011,7 +8017,12 @@ export async function createW8DistantPresentation({
       ])].sort());
       return Object.freeze({
         schemaVersion: 'legacy-building-settlement-observation-1',
-        publicationSource: 'legacy-distant-root',
+        publicationSource: buildingPublicationSource === settlementRoadPublicationSource
+          ? buildingPublicationSource : 'mixed-exclusive-handoff',
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
+        publicationPlanId: settlementPublicationPlanId,
+        publicationRevision: settlementPublicationRevision,
         renderDistancePreset: generation.renderDistancePreset,
         quality: generation.quality,
         generalVisibilityMeters: generation.visibilityMeters,
@@ -8028,6 +8039,48 @@ export async function createW8DistantPresentation({
           linkage => !settlementIdSet.has(linkage.settlementId),
         ).length,
       });
+    },
+    claimBuildingSettlementPublication(stage, {
+      publicationKinds = Object.freeze(['building']),
+    } = {}) {
+      if (!activeGeneration || !stage || !Array.isArray(publicationKinds)) return false;
+      const observation = this.settlementStreamingShadowSnapshot();
+      const sameOwners = stage.ownerKeys.length === observation.settlementOwnerKeys.length
+        && stage.ownerKeys.every(ownerKey => observation.settlementOwnerKeys.includes(ownerKey));
+      const sameStableIds = stage.stableIds.length === observation.stableIds.length
+        && stage.stableIds.every(stableId => observation.stableIds.includes(stableId));
+      const sameDamage = JSON.stringify(stage.damageStates) === JSON.stringify(
+        observation.damageStates,
+      );
+      const sameRoads = JSON.stringify(stage.roadLinkages) === JSON.stringify(
+        observation.roadLinkages,
+      );
+      if (!sameOwners || !sameStableIds || !sameDamage || !sameRoads
+        || stage.renderDistancePreset !== activeGeneration.renderDistancePreset) return false;
+      if (publicationKinds.includes('building')) {
+        buildingPublicationSource = 'shared-streaming-plan';
+      }
+      if (publicationKinds.includes('settlement-road')) {
+        settlementRoadPublicationSource = 'shared-streaming-plan';
+      }
+      settlementPublicationPlanId = stage.planId;
+      settlementPublicationRevision = stage.renderDistanceRevision;
+      activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
+      activeGeneration.root.userData.settlementRoadPublicationSource =
+        settlementRoadPublicationSource;
+      return true;
+    },
+    useLegacyBuildingSettlementPublication() {
+      buildingPublicationSource = 'legacy-distant-root';
+      settlementRoadPublicationSource = 'legacy-distant-root';
+      settlementPublicationPlanId = null;
+      settlementPublicationRevision = 0;
+      if (activeGeneration?.root?.userData) {
+        activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
+        activeGeneration.root.userData.settlementRoadPublicationSource =
+          settlementRoadPublicationSource;
+      }
+      return true;
     },
     snapshot({
       includeRemoteHorizonAtmospheres = false,
@@ -8276,6 +8329,10 @@ export async function createW8DistantPresentation({
           preparedRenderDistanceLocalTerrain?.generation?.renderDistancePreset ?? null,
         stagedStaticNaturalRenderDistancePreset:
           stagedPersistentNaturalRenderDistancePreset,
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
+        settlementPublicationPlanId,
+        settlementPublicationRevision,
         quality: activeGeneration?.quality ?? null,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
