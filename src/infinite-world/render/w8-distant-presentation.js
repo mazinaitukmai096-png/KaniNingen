@@ -66,6 +66,10 @@ import {
 } from '../vegetation-lod-policy.js';
 import { createW8ForestHorizonManifest } from '../forest-horizon-manifest.js';
 import {
+  createSettlementStreamingSnapshotCache,
+  isSettlementStreamingSnapshotCurrent,
+} from '../settlement-streaming-snapshot-cache.js';
+import {
   WORLD_STREAMING_EVENT,
   WORLD_STREAMING_STREAM,
   WORLD_STREAMING_TARGET,
@@ -134,6 +138,17 @@ const TREE_RENDER_PATH = Object.freeze({
   HORIZON: 'forest-horizon-tree',
   ULTRA: 'ultra-tree',
 });
+
+function appendSettlementSnapshotHash(hash, value) {
+  const text = String(value ?? '');
+  let next = hash >>> 0;
+  for (let index = 0; index < text.length; index += 1) {
+    next ^= text.charCodeAt(index);
+    next = Math.imul(next, 0x01000193) >>> 0;
+  }
+  next ^= 0xff;
+  return Math.imul(next, 0x01000193) >>> 0;
+}
 
 export function resolveW8PersistentNaturalBucketCapacity({
   kind,
@@ -632,6 +647,9 @@ export async function createW8DistantPresentation({
   let settlementMetadataPublicationSource = 'legacy-distant-root';
   let settlementPublicationPlanId = null;
   let settlementPublicationRevision = 0;
+  const settlementStreamingSnapshotCache = createSettlementStreamingSnapshotCache();
+  let settlementShadowSnapshotRequestCount = 0;
+  let settlementShadowSnapshotReuseCount = 0;
   let settlementShadowSnapshotCount = 0;
   let settlementShadowCanonicalObjectScanCount = 0;
   let settlementShadowStableIdMaterializationCount = 0;
@@ -8335,6 +8353,9 @@ export async function createW8DistantPresentation({
     settlementStreamingShadowSnapshot({
       renderDistancePreset = null,
       includePrepared = false,
+      frameSequence = null,
+      renderDistanceRevision = 0,
+      stateRevision = 0,
     } = {}) {
       const requestedPreset = renderDistancePreset === null
         ? null : normalizeW8RenderDistancePreset(renderDistancePreset);
@@ -8344,94 +8365,170 @@ export async function createW8DistantPresentation({
           || preparedGeneration.renderDistancePreset === requestedPreset)
         ? preparedGeneration : activeGeneration;
       if (!generation) return null;
-      const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
-      settlementShadowSnapshotCount += 1;
-      settlementShadowCanonicalObjectScanCount += generation.canonicalObjects.size;
-      const records = [...generation.canonicalObjects.values()].filter(object => (
-        object.settlementId !== null && object.settlementId !== undefined
-      ));
-      const stableIds = records.map(object => object.stableId).sort();
-      settlementShadowStableIdMaterializationCount += stableIds.length;
-      const settlementIds = [...new Set(records.map(object => object.settlementId))].sort();
-      const settlementIdSet = new Set(settlementIds);
-      const roadLinkages = records.filter(object => (
-        object.record?.featureType === 'settlement-road'
-      )).map(object => Object.freeze({
-        stableId: object.stableId,
-        settlementId: object.settlementId,
-        ownerKey: object.ownerKey,
-      })).sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const damageStates = records.filter(object => object.destructible).map(object => (
-        Object.freeze({
-          stableId: object.stableId,
-          destroyed: isFeatureDestroyed(object.stableId) === true,
-        })
-      )).sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const buildingOwnerKeys = Object.freeze([
-        ...new Set(generation.queryBuildingOwnerChunkKeys ?? []),
-      ].sort());
-      const settlementOwnerKeys = Object.freeze([...new Set([
-        ...buildingOwnerKeys,
-        ...records.map(object => object.ownerKey),
-      ])].sort());
-      if (diagnosticsEnabled) recordDiagnosticWork('settlement-shadow-observation', {
-        calls: 1,
-        canonicalObjectsScanned: generation.canonicalObjects.size,
-        settlementRecordsMaterialized: records.length,
-        stableIdsMaterialized: stableIds.length,
-        ownerKeysMaterialized: buildingOwnerKeys.length + settlementOwnerKeys.length,
-        roadLinkagesMaterialized: roadLinkages.length,
-        damageStatesMaterialized: damageStates.length,
-        maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
-      });
-      return Object.freeze({
-        schemaVersion: 'legacy-building-settlement-observation-1',
-        publicationSource: new Set([
+      settlementShadowSnapshotRequestCount += 1;
+      const materialize = () => {
+        const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
+        settlementShadowSnapshotCount += 1;
+        settlementShadowCanonicalObjectScanCount += generation.canonicalObjects.size;
+        const stableIds = [];
+        const stableIdSet = new Set();
+        const settlementIdSet = new Set();
+        const settlementOwnerSet = new Set(generation.queryBuildingOwnerChunkKeys ?? []);
+        const roadLinkages = [];
+        const damageStates = [];
+        let duplicateStableIdCount = 0;
+        let settlementRecordCount = 0;
+        for (const object of generation.canonicalObjects.values()) {
+          if (object.settlementId === null || object.settlementId === undefined) continue;
+          settlementRecordCount += 1;
+          stableIds.push(object.stableId);
+          if (stableIdSet.has(object.stableId)) duplicateStableIdCount += 1;
+          else stableIdSet.add(object.stableId);
+          settlementIdSet.add(object.settlementId);
+          settlementOwnerSet.add(object.ownerKey);
+          if (object.record?.featureType === 'settlement-road') {
+            roadLinkages.push(Object.freeze({
+              stableId: object.stableId,
+              settlementId: object.settlementId,
+              ownerKey: object.ownerKey,
+            }));
+          }
+          if (object.destructible) {
+            damageStates.push(Object.freeze({
+              stableId: object.stableId,
+              destroyed: isFeatureDestroyed(object.stableId) === true,
+            }));
+          }
+        }
+        stableIds.sort();
+        roadLinkages.sort((left, right) => left.stableId.localeCompare(right.stableId));
+        damageStates.sort((left, right) => left.stableId.localeCompare(right.stableId));
+        const settlementIds = [...settlementIdSet].sort();
+        const buildingOwnerKeys = Object.freeze([
+          ...new Set(generation.queryBuildingOwnerChunkKeys ?? []),
+        ].sort());
+        const settlementOwnerKeys = Object.freeze([...settlementOwnerSet].sort());
+        const invalidRoadLinkageCount = roadLinkages.reduce(
+          (count, linkage) => count + Number(!settlementIdSet.has(linkage.settlementId)),
+          0,
+        );
+        let snapshotHash = appendSettlementSnapshotHash(0x811c9dc5, generation.epoch);
+        snapshotHash = appendSettlementSnapshotHash(snapshotHash, generation.renderDistancePreset);
+        for (const ownerKey of buildingOwnerKeys) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, ownerKey);
+        }
+        for (const ownerKey of settlementOwnerKeys) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, ownerKey);
+        }
+        for (const stableId of stableIds) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, stableId);
+        }
+        for (const settlementId of settlementIds) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, settlementId);
+        }
+        for (const linkage of roadLinkages) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.stableId);
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.settlementId);
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, linkage.ownerKey);
+        }
+        for (const damageState of damageStates) {
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.stableId);
+          snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.destroyed ? 1 : 0);
+        }
+        settlementShadowStableIdMaterializationCount += stableIds.length;
+        if (diagnosticsEnabled) recordDiagnosticWork('settlement-shadow-observation', {
+          calls: 1,
+          requests: 1,
+          cacheMisses: 1,
+          canonicalObjectsScanned: generation.canonicalObjects.size,
+          settlementRecordsMaterialized: settlementRecordCount,
+          stableIdsMaterialized: stableIds.length,
+          ownerKeysMaterialized: buildingOwnerKeys.length + settlementOwnerKeys.length,
+          roadLinkagesMaterialized: roadLinkages.length,
+          damageStatesMaterialized: damageStates.length,
+          maximumSynchronousSliceMs: monotonicNow() - diagnosticStartedAt,
+        });
+        return Object.freeze({
+          schemaVersion: 'legacy-building-settlement-observation-1',
+          contentHash: `settlement-stream:${snapshotHash.toString(16).padStart(8, '0')}`,
+          frameSequence,
+          presentationRevision: generation.epoch,
+          renderDistanceRevision,
+          stateRevision,
+          publicationSource: buildingPublicationSource === settlementRoadPublicationSource
+            && buildingPublicationSource === settlementMetadataPublicationSource
+            ? buildingPublicationSource : 'mixed-exclusive-handoff',
           buildingPublicationSource,
           settlementRoadPublicationSource,
           settlementMetadataPublicationSource,
-        ]).size === 1 ? buildingPublicationSource : 'mixed-exclusive-handoff',
-        buildingPublicationSource,
-        settlementRoadPublicationSource,
-        settlementMetadataPublicationSource,
-        publicationPlanId: settlementPublicationPlanId,
-        publicationRevision: settlementPublicationRevision,
-        renderDistancePreset: generation.renderDistancePreset,
-        quality: generation.quality,
-        generalVisibilityMeters: generation.visibilityMeters,
-        metadataQueryDistanceMeters: generation.settlementMetadataQueryDistanceMeters,
-        buildingOwnerKeys,
-        settlementOwnerKeys,
-        stableIds: Object.freeze(stableIds),
-        settlementIds: Object.freeze(settlementIds),
-        roadLinkages: Object.freeze(roadLinkages),
-        damageStates: Object.freeze(damageStates),
-        duplicateStableIdCount: stableIds.length - new Set(stableIds).size,
-        duplicateSettlementIdCount: 0,
-        invalidRoadLinkageCount: roadLinkages.filter(
-          linkage => !settlementIdSet.has(linkage.settlementId),
-        ).length,
-        canonicalObjectScanCount: generation.canonicalObjects.size,
-        settlementRecordCount: records.length,
+          publicationPlanId: settlementPublicationPlanId,
+          publicationRevision: settlementPublicationRevision,
+          renderDistancePreset: generation.renderDistancePreset,
+          quality: generation.quality,
+          generalVisibilityMeters: generation.visibilityMeters,
+          metadataQueryDistanceMeters: generation.settlementMetadataQueryDistanceMeters,
+          buildingOwnerKeys,
+          settlementOwnerKeys,
+          stableIds: Object.freeze(stableIds),
+          settlementIds: Object.freeze(settlementIds),
+          roadLinkages: Object.freeze(roadLinkages),
+          damageStates: Object.freeze(damageStates),
+          duplicateStableIdCount,
+          duplicateSettlementIdCount: 0,
+          invalidRoadLinkageCount,
+          canonicalObjectScanCount: generation.canonicalObjects.size,
+          settlementRecordCount,
+        });
+      };
+      if (!Number.isSafeInteger(frameSequence) || frameSequence < 0) return materialize();
+      const snapshot = settlementStreamingSnapshotCache.read({
+        frameSequence,
+        presentationRevision: generation.epoch,
+        renderDistanceRevision,
+        stateRevision,
+        materialize,
       });
+      if (settlementStreamingSnapshotCache.lastReadReused) {
+        settlementShadowSnapshotReuseCount += 1;
+        if (diagnosticsEnabled) recordDiagnosticWork('settlement-shadow-observation', {
+          requests: 1,
+          cacheHits: 1,
+        });
+      }
+      return snapshot;
     },
-    claimBuildingSettlementPublication(stage, {
+    canClaimBuildingSettlementPublication(stage, {
       publicationKinds = Object.freeze(['building']),
+      observation = stage?.observation ?? null,
+      currentObservation = observation,
+      stateRevision = null,
+      renderDistanceRevision = null,
     } = {}) {
-      if (!activeGeneration || !stage || !Array.isArray(publicationKinds)) return false;
-      const observation = this.settlementStreamingShadowSnapshot();
-      const sameOwners = stage.ownerKeys.length === observation.settlementOwnerKeys.length
-        && stage.ownerKeys.every(ownerKey => observation.settlementOwnerKeys.includes(ownerKey));
-      const sameStableIds = stage.stableIds.length === observation.stableIds.length
-        && stage.stableIds.every(stableId => observation.stableIds.includes(stableId));
-      const sameDamage = JSON.stringify(stage.damageStates) === JSON.stringify(
-        observation.damageStates,
-      );
-      const sameRoads = JSON.stringify(stage.roadLinkages) === JSON.stringify(
-        observation.roadLinkages,
-      );
-      if (!sameOwners || !sameStableIds || !sameDamage || !sameRoads
-        || stage.renderDistancePreset !== activeGeneration.renderDistancePreset) return false;
+      const preparedGeneration = preparedRenderDistanceDistant?.generation ?? null;
+      const generation = preparedGeneration?.renderDistancePreset === stage?.renderDistancePreset
+        ? preparedGeneration : activeGeneration;
+      if (!generation || !stage || !observation || !currentObservation
+        || !Array.isArray(publicationKinds)) {
+        return false;
+      }
+      if (stage.observation !== observation
+        || stage.contentHash !== observation.contentHash
+        || stage.contentHash !== currentObservation.contentHash
+        || stage.renderDistancePreset !== generation.renderDistancePreset
+        || observation.presentationRevision !== generation.epoch
+        || observation.renderDistanceRevision !== (
+          renderDistanceRevision ?? observation.renderDistanceRevision
+        )
+        || !isSettlementStreamingSnapshotCurrent(currentObservation, {
+          presentationRevision: generation.epoch,
+          renderDistanceRevision: renderDistanceRevision ?? currentObservation.renderDistanceRevision,
+          stateRevision: stateRevision ?? currentObservation.stateRevision,
+        })) return false;
+      return true;
+    },
+    claimBuildingSettlementPublication(stage, options = {}) {
+      if (!this.canClaimBuildingSettlementPublication(stage, options)) return false;
+      const { publicationKinds = Object.freeze(['building']) } = options;
       if (publicationKinds.includes('building')) {
         buildingPublicationSource = 'shared-streaming-plan';
       }
@@ -8717,9 +8814,12 @@ export async function createW8DistantPresentation({
         settlementMetadataPublicationSource,
         settlementPublicationPlanId,
         settlementPublicationRevision,
+        settlementShadowSnapshotRequestCount,
+        settlementShadowSnapshotReuseCount,
         settlementShadowSnapshotCount,
         settlementShadowCanonicalObjectScanCount,
         settlementShadowStableIdMaterializationCount,
+        settlementStreamingSnapshotCache: settlementStreamingSnapshotCache.snapshot(),
         quality: activeGeneration?.quality ?? null,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,

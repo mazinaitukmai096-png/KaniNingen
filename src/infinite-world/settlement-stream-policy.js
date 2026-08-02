@@ -44,7 +44,14 @@ function createShadowPolicy({ kind, generatorKind, observedKey, distanceResolver
       const observation = readObservation?.(renderDistancePreset) ?? null;
       const ownerKeys = observation?.renderDistancePreset === renderDistancePreset
         ? sortedKeys(observation[observedKey]) : Object.freeze([]);
-      return { required: ownerKeys, prefetched: [], retained: ownerKeys };
+      return {
+        required: ownerKeys,
+        prefetched: [],
+        retained: ownerKeys,
+        sourceSnapshot: observation,
+        sourceHash: typeof observation?.contentHash === 'string'
+          ? `${observation.contentHash}:${observedKey}` : null,
+      };
     },
     generatorKind,
     cachePolicy: Object.freeze({ kind: 'canonical-owner-ready-lru', maximumEntries: 2048 }),
@@ -89,12 +96,14 @@ export function createW8BuildingSettlementShadowPolicies({ readObservation } = {
 }
 
 function compareKeys(planned = [], observed = []) {
-  const plannedSet = new Set(planned);
-  const observedSet = new Set(observed);
-  const missing = observed.filter(key => !plannedSet.has(key));
-  const extra = planned.filter(key => !observedSet.has(key));
+  const matches = planned.length === observed.length
+    && planned.every((key, index) => key === observed[index]);
+  const plannedSet = matches ? null : new Set(planned);
+  const observedSet = matches ? null : new Set(observed);
+  const missing = matches ? [] : observed.filter(key => !plannedSet.has(key));
+  const extra = matches ? [] : planned.filter(key => !observedSet.has(key));
   return Object.freeze({
-    matches: missing.length === 0 && extra.length === 0,
+    matches: matches || (missing.length === 0 && extra.length === 0),
     plannedCount: planned.length,
     observedCount: observed.length,
     missing: Object.freeze(missing),
@@ -135,16 +144,19 @@ export function compareW8BuildingSettlementShadow({ plan, observation } = {}) {
   const identityMatches = observation.duplicateStableIdCount === 0
     && observation.duplicateSettlementIdCount === 0
     && observation.invalidRoadLinkageCount === 0;
+  const sharedSnapshotIdentity = buildingPlan.sourceSnapshot === observation
+    && settlementPlan.sourceSnapshot === observation;
   return Object.freeze({
     schemaVersion: 'building-settlement-shadow-comparison-1',
     matches: buildingOwners.matches && settlementOwners.matches
-      && presetBoundaryMatches && identityMatches,
+      && presetBoundaryMatches && identityMatches && sharedSnapshotIdentity,
     reason: null,
     renderDistancePreset: plan.renderDistancePreset,
     buildingOwners,
     settlementOwners,
     presetBoundaryMatches,
     identityMatches,
+    sharedSnapshotIdentity,
     stableIdCount: observation.stableIds.length,
     settlementIdCount: observation.settlementIds.length,
     roadLinkageCount: observation.roadLinkages.length,

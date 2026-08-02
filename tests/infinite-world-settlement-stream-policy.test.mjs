@@ -11,6 +11,11 @@ import { createWorldStreamingPlan } from '../src/infinite-world/world-streaming-
 import { validateWorldStreamingPolicy } from '../src/infinite-world/world-streaming-policy-registry.js';
 
 const observation = Object.freeze({
+  contentHash: 'settlement-stream:1:0:4',
+  frameSequence: 1,
+  presentationRevision: 1,
+  renderDistanceRevision: 0,
+  stateRevision: 4,
   renderDistancePreset: 'current',
   quality: 'high',
   generalVisibilityMeters: 187.5,
@@ -59,6 +64,8 @@ test('Building and Settlement enter WorldStreamingPlan as read-only shadow polic
   assert.equal(settlement.velocityCorridor.distanceMeters, 0);
   assert.equal(building.publicationGroup, 'settlement-static');
   assert.equal(settlement.publicationGroup, 'settlement-static');
+  assert.equal(building.sourceSnapshot, observation);
+  assert.equal(settlement.sourceSnapshot, observation);
 });
 
 test('Settlement shadow parity covers owner, identity, Road, damage, and Current 875m metadata', () => {

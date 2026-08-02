@@ -1044,11 +1044,20 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.ok(warmed.presentationDiagnostics.visibleRootRevisions.some(root => (
       root.role === 'persistent-natural' && root.attached
     )));
-    assert.ok(
-      warmed.diagnostics.work['settlement-shadow-observation'].calls.max >= 3,
-      'one frame materializes the direct observation plus Building and Settlement owner reads',
+    assert.equal(
+      warmed.diagnostics.work['settlement-shadow-observation'].calls.max,
+      1,
+      'one frame materializes one canonical Settlement snapshot',
     );
-    assert.ok(warmed.presentation.settlementShadowSnapshotCount >= 3);
+    assert.ok(warmed.diagnostics.work['settlement-shadow-observation'].cacheHits.max >= 2);
+    assert.ok(warmed.presentation.settlementShadowSnapshotRequestCount >= 3);
+    assert.ok(warmed.presentation.settlementShadowSnapshotReuseCount > 0);
+    assert.ok(warmed.presentation.settlementShadowSnapshotCount
+      < warmed.presentation.settlementShadowSnapshotRequestCount);
+    assert.equal(
+      warmed.presentation.settlementStreamingSnapshotCache.counts.materialized,
+      warmed.presentation.settlementShadowSnapshotCount,
+    );
     assert.ok(warmed.presentation.settlementShadowCanonicalObjectScanCount
       >= warmed.presentation.settlementShadowSnapshotCount);
     assert.ok(warmed.presentation.canonicalVegetationRecordCount >= warmed.presentation.visibleCanonicalVegetationCount);
@@ -1830,11 +1839,21 @@ test('normal play skips detailed runtime snapshots and debug HUD writes while di
         return runtime;
       },
     });
+    const settlementCacheBeforeFrame = sandbox.snapshot().presentation
+      .settlementStreamingSnapshotCache.counts;
     const snapshotsBeforeFrame = snapshotCalls;
     const hudBeforeFrame = environment.hud.innerHTML;
     environment.rafCallbacks[0](performance.now() + 100);
     assert.equal(snapshotCalls, snapshotsBeforeFrame);
     assert.equal(environment.hud.innerHTML, hudBeforeFrame);
+    const afterFrame = sandbox.snapshot();
+    const settlementCacheAfterFrame = afterFrame.presentation
+      .settlementStreamingSnapshotCache.counts;
+    assert.equal(settlementCacheAfterFrame.materialized
+      - settlementCacheBeforeFrame.materialized, 1);
+    assert.ok(settlementCacheAfterFrame.reused - settlementCacheBeforeFrame.reused >= 2);
+    assert.equal(afterFrame.diagnostics.work['settlement-shadow-observation'], undefined,
+      'diagnostics-off play must not allocate Settlement diagnostic aggregates');
     await sandbox.shutdown();
   } finally {
     environment.restore();

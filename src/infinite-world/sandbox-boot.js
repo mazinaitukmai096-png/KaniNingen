@@ -846,6 +846,9 @@ export async function bootInfiniteWorldSandbox({
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
   let buildingSettlementStream = null;
+  let settlementStreamingFrameSequence = 0;
+  let latestSettlementStreamingObservation = null;
+  let renderDistanceRequestRevision = 0;
   let naturalStaticStreamActivated = false;
   let naturalStaticStreamSuspended = false;
   let canonicalWorldSeedHash = null;
@@ -886,6 +889,15 @@ export async function bootInfiniteWorldSandbox({
     }
     return staticTreeActivationTimeline[field];
   };
+  const readSettlementStreamingObservation = renderDistancePreset => (
+    distantPresentation?.settlementStreamingShadowSnapshot?.({
+      renderDistancePreset,
+      includePrepared: true,
+      frameSequence: settlementStreamingFrameSequence,
+      renderDistanceRevision: renderDistanceRequestRevision,
+      stateRevision: worldState?.revision ?? 0,
+    }) ?? null
+  );
   const activateNaturalStaticStream = source => {
     naturalStaticStreamActivated = true;
     if (staticTreeActivationTimeline.staticStreamActivatedAtMs === null) {
@@ -970,12 +982,7 @@ export async function bootInfiniteWorldSandbox({
       return [runtime.policy.kind, Object.freeze({ ...runtime, naturalKind: kind })];
     }));
     for (const policy of createW8BuildingSettlementShadowPolicies({
-      readObservation: renderDistancePreset => (
-        distantPresentation?.settlementStreamingShadowSnapshot?.({
-          renderDistancePreset,
-          includePrepared: true,
-        }) ?? null
-      ),
+      readObservation: readSettlementStreamingObservation,
     })) worldStreamingPolicyRegistry.register(policy);
     let naturalPresentationCoverageGeneration = -1;
     let naturalPresentationCoveragePreset = null;
@@ -1671,11 +1678,16 @@ export async function bootInfiniteWorldSandbox({
       },
       publishStage: stage => distantPresentation.claimBuildingSettlementPublication?.(
         stage,
-        { publicationKinds: Object.freeze([
-          'building',
-          'settlement-road',
-          'metadata-remote',
-        ]) },
+        {
+          publicationKinds: Object.freeze([
+            'building',
+            'settlement-road',
+            'metadata-remote',
+          ]),
+          observation: stage.observation,
+          currentObservation: latestSettlementStreamingObservation ?? stage.observation,
+          renderDistanceRevision: renderDistanceRequestRevision,
+        },
       ) === true,
     });
     if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY) {
@@ -1856,7 +1868,6 @@ export async function bootInfiniteWorldSandbox({
         ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
     );
     let requestedDistantRenderDistance = distantRenderDistance;
-    let renderDistanceRequestRevision = 0;
     let pendingRenderDistancePublication = null;
     let appliedStaticNaturalRetainedOwnerKeys = Object.freeze([]);
     let buildingSettlementShadowComparison = null;
@@ -2378,6 +2389,22 @@ export async function bootInfiniteWorldSandbox({
         && (!settlementTicket
           || settlementTicket.renderDistancePreset !== pending.preset
           || settlementTicket.renderDistanceRevision !== pending.revision)) return false;
+      if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
+        && typeof distantPresentation.canClaimBuildingSettlementPublication === 'function'
+        && !distantPresentation.canClaimBuildingSettlementPublication(
+          settlementTicket.stage,
+          {
+            publicationKinds: Object.freeze([
+              'building',
+              'settlement-road',
+              'metadata-remote',
+            ]),
+            observation: settlementTicket.observation,
+            currentObservation: latestSettlementStreamingObservation
+              ?? settlementTicket.observation,
+            renderDistanceRevision: pending.revision,
+          },
+        )) return false;
       if (!distantPresentation.commitPreparedRenderDistancePreset?.(pending.preset)) return false;
       if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
         && !buildingSettlementStream.commit({
@@ -2800,11 +2827,9 @@ export async function bootInfiniteWorldSandbox({
       const committedChunkState = runtime.getCommittedChunkState();
       const settlementStreamingObservation = diagnosticMeasure(
         'settlement-shadow-observation',
-        () => distantPresentation.settlementStreamingShadowSnapshot?.({
-          renderDistancePreset: requestedDistantRenderDistance,
-          includePrepared: true,
-        }) ?? null,
+        () => readSettlementStreamingObservation(requestedDistantRenderDistance),
       );
+      latestSettlementStreamingObservation = settlementStreamingObservation;
       const worldStreamingPlan = diagnosticMeasure(
         'world-streaming-plan',
         () => worldStreamingCoordinator.createShadowPlan({
@@ -2821,11 +2846,13 @@ export async function bootInfiniteWorldSandbox({
           },
           ...(settlementStreamingObservation ? {
             [W8_BUILDING_STREAM_POLICY_KIND]: {
+              sourceSnapshot: settlementStreamingObservation,
               requiredOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
               requestOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
               retainedOwnerKeys: settlementStreamingObservation.buildingOwnerKeys,
             },
             [W8_SETTLEMENT_STREAM_POLICY_KIND]: {
+              sourceSnapshot: settlementStreamingObservation,
               requiredOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
               requestOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
               retainedOwnerKeys: settlementStreamingObservation.settlementOwnerKeys,
@@ -2866,12 +2893,8 @@ export async function bootInfiniteWorldSandbox({
       if (buildingSettlementShadowComparison.matches && settlementStreamingObservation) {
         const stagingSignature = diagnosticMeasure(
           'settlement-staging-signature',
-          () => JSON.stringify({
-            preset: worldStreamingPlan.renderDistancePreset,
-            owners: settlementStreamingObservation.settlementOwnerKeys,
-            stableIds: settlementStreamingObservation.stableIds,
-            damage: settlementStreamingObservation.damageStates,
-          }),
+          () => `${worldStreamingPlan.renderDistancePreset}:`
+            + settlementStreamingObservation.contentHash,
         );
         if (stagingSignature !== buildingSettlementStagingSignature) {
           buildingSettlementStagingSignature = stagingSignature;
@@ -3230,6 +3253,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     function frame(now) {
       if (!running) return;
       try {
+        settlementStreamingFrameSequence += 1;
         const frameNow = Number.isFinite(now) ? now : clock();
         if (!farNaturalWarmStarted && diagnosticProfile.distant
           && pendingRenderDistancePublication === null

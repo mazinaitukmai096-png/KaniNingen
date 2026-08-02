@@ -238,7 +238,7 @@ export function createWorldStreamingPlan({
     );
     const retainedOwnerKeys = normalizeOwnerKeys(resolved?.retained ?? [], `${policy.kind}.retained`);
     const requestOwnerKeys = unionOwnerKeys(requiredOwnerKeys, prefetchedOwnerKeys);
-    return Object.freeze({
+    const policyPlan = {
       kind: policy.kind,
       stream: policy.stream,
       generatorKind: policy.generatorKind,
@@ -249,6 +249,7 @@ export function createWorldStreamingPlan({
       retainedOwnerKeys,
       requestOwnerKeys,
       allOwnerKeys: unionOwnerKeys(requestOwnerKeys, retainedOwnerKeys),
+      sourceHash: typeof resolved?.sourceHash === 'string' ? resolved.sourceHash : null,
       deadline: Object.freeze({
         requiredAtMs: deadlineAt(
           createdAt,
@@ -260,7 +261,12 @@ export function createWorldStreamingPlan({
         ),
       }),
       velocityCorridor,
+    };
+    Object.defineProperty(policyPlan, 'sourceSnapshot', {
+      value: resolved?.sourceSnapshot ?? null,
+      enumerable: false,
     });
+    return Object.freeze(policyPlan);
   }).sort((left, right) => left.kind.localeCompare(right.kind));
   const signature = JSON.stringify({
     player: logicalPlayer,
@@ -270,9 +276,11 @@ export function createWorldStreamingPlan({
     originGeneration,
     policies: policyPlans.map(policy => ({
       kind: policy.kind,
-      required: policy.requiredOwnerKeys,
-      prefetched: policy.prefetchedOwnerKeys,
-      retained: policy.retainedOwnerKeys,
+      ...(policy.sourceHash ? { sourceHash: policy.sourceHash } : {
+        required: policy.requiredOwnerKeys,
+        prefetched: policy.prefetchedOwnerKeys,
+        retained: policy.retainedOwnerKeys,
+      }),
     })),
   });
   const planId = `world-plan-${sequence}-${hashText(signature)}`;

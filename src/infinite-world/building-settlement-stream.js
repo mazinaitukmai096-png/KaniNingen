@@ -13,14 +13,16 @@ export const BUILDING_SETTLEMENT_STREAM_MODE = Object.freeze({
 const MODES = new Set(Object.values(BUILDING_SETTLEMENT_STREAM_MODE));
 
 function stableSignature(plan, observation) {
-  return JSON.stringify({
-    preset: plan.renderDistancePreset,
-    buildingOwners: observation.buildingOwnerKeys,
-    settlementOwners: observation.settlementOwnerKeys,
-    stableIds: observation.stableIds,
-    roadLinkages: observation.roadLinkages,
-    damageStates: observation.damageStates,
-  });
+  if (typeof observation.contentHash !== 'string' || !observation.contentHash) {
+    throw new TypeError('Building/Settlement observation contentHash is required');
+  }
+  return `${plan.renderDistancePreset}:${observation.contentHash}`;
+}
+
+function sameRecords(left = [], right = [], fields = []) {
+  return left.length === right.length && left.every((value, index) => (
+    fields.every(field => value?.[field] === right[index]?.[field])
+  ));
 }
 
 function validateStagingPayload(payload, observation) {
@@ -45,11 +47,12 @@ function validateStagingPayload(payload, observation) {
     throw new Error('Building/Settlement staging identity mismatch');
   }
   if (payload.invalidRoadLinkageCount !== 0
-    || JSON.stringify(payload.roadLinkages ?? [])
-      !== JSON.stringify(observation.roadLinkages)) {
+    || !sameRecords(payload.roadLinkages, observation.roadLinkages, [
+      'stableId', 'settlementId', 'ownerKey',
+    ])) {
     throw new Error('Building/Settlement staging Road linkage mismatch');
   }
-  if (JSON.stringify(payload.damageStates ?? []) !== JSON.stringify(observation.damageStates)) {
+  if (!sameRecords(payload.damageStates, observation.damageStates, ['stableId', 'destroyed'])) {
     throw new Error('Building/Settlement staging damage state mismatch');
   }
   return true;
@@ -131,6 +134,8 @@ export function createBuildingSettlementStream({
         planId: plan.planId,
         renderDistancePreset: plan.renderDistancePreset,
         renderDistanceRevision,
+        contentHash: observation.contentHash,
+        observation,
         publicationGroup: buildingPlan.publicationGroup,
         ownerKeys: Object.freeze([...staged.ownerKeys]),
         stableIds: Object.freeze([...staged.stableIds]),
@@ -177,6 +182,8 @@ export function createBuildingSettlementStream({
         planId: readyStage.planId,
         renderDistancePreset: readyStage.renderDistancePreset,
         renderDistanceRevision: readyStage.renderDistanceRevision,
+        observation: readyStage.observation,
+        stage: readyStage,
       }) : null;
     },
     snapshot() {

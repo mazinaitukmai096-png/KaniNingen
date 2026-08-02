@@ -17,12 +17,14 @@ function normalizeObservedKeys(values, label) {
 }
 
 function compareKeys(planned, observed) {
-  const plannedSet = new Set(planned);
-  const observedSet = new Set(observed);
-  const missingFromPlan = observed.filter(key => !plannedSet.has(key));
-  const shadowOnly = planned.filter(key => !observedSet.has(key));
+  const matches = planned.length === observed.length
+    && planned.every((key, index) => key === observed[index]);
+  const plannedSet = matches ? null : new Set(planned);
+  const observedSet = matches ? null : new Set(observed);
+  const missingFromPlan = matches ? [] : observed.filter(key => !plannedSet.has(key));
+  const shadowOnly = matches ? [] : planned.filter(key => !observedSet.has(key));
   return Object.freeze({
-    matches: missingFromPlan.length === 0 && shadowOnly.length === 0,
+    matches: matches || (missingFromPlan.length === 0 && shadowOnly.length === 0),
     plannedCount: planned.length,
     observedCount: observed.length,
     missingFromPlan: Object.freeze(missingFromPlan),
@@ -43,21 +45,26 @@ function compareCurrentRequests(plan, currentRequests = {}) {
         retained: null,
       });
     }
+    const sharedSnapshotIdentity = policyPlan.sourceSnapshot !== null
+      && observed.sourceSnapshot === policyPlan.sourceSnapshot;
+    const observedKeys = (values, label) => sharedSnapshotIdentity
+      ? values : normalizeObservedKeys(values, label);
     const required = compareKeys(
       policyPlan.requiredOwnerKeys,
-      normalizeObservedKeys(observed.requiredOwnerKeys ?? [], `${policyPlan.kind}.required`),
+      observedKeys(observed.requiredOwnerKeys ?? [], `${policyPlan.kind}.required`),
     );
     const requested = compareKeys(
       policyPlan.requestOwnerKeys,
-      normalizeObservedKeys(observed.requestOwnerKeys ?? [], `${policyPlan.kind}.requested`),
+      observedKeys(observed.requestOwnerKeys ?? [], `${policyPlan.kind}.requested`),
     );
     const retained = compareKeys(
       policyPlan.retainedOwnerKeys,
-      normalizeObservedKeys(observed.retainedOwnerKeys ?? [], `${policyPlan.kind}.retained`),
+      observedKeys(observed.retainedOwnerKeys ?? [], `${policyPlan.kind}.retained`),
     );
     return Object.freeze({
       kind: policyPlan.kind,
       observed: true,
+      sharedSnapshotIdentity,
       matches: required.matches && requested.matches && retained.matches,
       required,
       requested,
