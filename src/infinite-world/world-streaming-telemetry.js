@@ -31,6 +31,13 @@ export const WORLD_STREAMING_STREAM = Object.freeze({
   GAMEPLAY: 'gameplay',
 });
 
+export const WORLD_STREAMING_NATURAL_TARGETS = Object.freeze([
+  WORLD_STREAMING_TARGET.TREE,
+  WORLD_STREAMING_TARGET.BUSH,
+  WORLD_STREAMING_TARGET.GRASS,
+  WORLD_STREAMING_TARGET.ROCK,
+]);
+
 const EVENT_TYPES = new Set(Object.values(WORLD_STREAMING_EVENT));
 const TARGETS = new Set(Object.values(WORLD_STREAMING_TARGET));
 const STREAMS = new Set(Object.values(WORLD_STREAMING_STREAM));
@@ -73,6 +80,122 @@ const DISABLED_TELEMETRY = Object.freeze({
 });
 
 const defaultClock = () => globalThis.performance?.now?.() ?? Date.now();
+
+const percentileOf = (values, ratio) => {
+  if (!values.length) return 0;
+  const ordered = [...values].sort((left, right) => left - right);
+  return ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * ratio) - 1)];
+};
+
+function summarizeAcceptanceSamples(samples) {
+  const workerToPublish = samples.map(sample => sample.workerToPublishMs).filter(Number.isFinite);
+  const requestToFirstDraw = samples.map(sample => sample.requestToFirstDrawMs).filter(Number.isFinite);
+  return Object.freeze({
+    workerToPublishCount: workerToPublish.length,
+    workerToPublishP50Ms: percentileOf(workerToPublish, 0.5),
+    workerToPublishP95Ms: percentileOf(workerToPublish, 0.95),
+    workerToPublishMaximumMs: Math.max(0, ...workerToPublish),
+    requestToFirstDrawCount: requestToFirstDraw.length,
+    requestToFirstDrawP50Ms: percentileOf(requestToFirstDraw, 0.5),
+    requestToFirstDrawP95Ms: percentileOf(requestToFirstDraw, 0.95),
+    requestToFirstDrawMaximumMs: Math.max(0, ...requestToFirstDraw),
+    playerArrivalMissingCount: samples.filter(sample => sample.playerArrivalMissing).length,
+  });
+}
+
+export function collectWorldStreamingAcceptanceMetrics(snapshot, {
+  targets = WORLD_STREAMING_NATURAL_TARGETS,
+  stream = WORLD_STREAMING_STREAM.DISTANT,
+} = {}) {
+  const events = Array.isArray(snapshot?.events) ? snapshot.events : [];
+  const targetSet = new Set(targets);
+  const sharedByResource = new Map();
+  const samplesByTarget = new Map(targets.map(target => [target, []]));
+  const activeSampleByTargetResource = new Map();
+  for (const event of events) {
+    if (event.stream !== stream || typeof event.resourceKey !== 'string') continue;
+    let shared = sharedByResource.get(event.resourceKey);
+    if (!shared) {
+      shared = { requestAtMs: null, workerCompleteAtMs: null };
+      sharedByResource.set(event.resourceKey, shared);
+    }
+    if (event.type === WORLD_STREAMING_EVENT.REQUEST) shared.requestAtMs = event.timestampMs;
+    if (event.type === WORLD_STREAMING_EVENT.WORKER_COMPLETE) {
+      shared.workerCompleteAtMs = event.timestampMs;
+    }
+    if (!targetSet.has(event.target)) continue;
+    const sampleKey = `${event.target}\n${event.resourceKey}`;
+    let sample = activeSampleByTargetResource.get(sampleKey);
+    if (event.type === WORLD_STREAMING_EVENT.PUBLISH) {
+      sample = {
+        resourceKey: event.resourceKey,
+        requestAtMs: shared.requestAtMs,
+        workerCompleteAtMs: shared.workerCompleteAtMs,
+        publishAtMs: event.timestampMs,
+        firstDrawAtMs: null,
+        playerArrivalAtMs: null,
+      };
+      samplesByTarget.get(event.target).push(sample);
+      activeSampleByTargetResource.set(sampleKey, sample);
+    }
+    if (event.type === WORLD_STREAMING_EVENT.FIRST_DRAW && sample) {
+      sample.firstDrawAtMs = event.timestampMs;
+    }
+    if (event.type === WORLD_STREAMING_EVENT.PLAYER_ARRIVAL) {
+      if (!sample) {
+        sample = {
+          resourceKey: event.resourceKey,
+          requestAtMs: shared.requestAtMs,
+          workerCompleteAtMs: shared.workerCompleteAtMs,
+          publishAtMs: null,
+          firstDrawAtMs: null,
+          playerArrivalAtMs: null,
+        };
+        samplesByTarget.get(event.target).push(sample);
+        activeSampleByTargetResource.set(sampleKey, sample);
+      }
+      sample.playerArrivalAtMs = event.timestampMs;
+    }
+  }
+  const resolvedByTarget = Object.freeze(Object.fromEntries(targets.map(target => {
+    const resolved = samplesByTarget.get(target).map(sample => Object.freeze({
+        workerToPublishMs: Number.isFinite(sample.workerCompleteAtMs)
+          && Number.isFinite(sample.publishAtMs)
+          ? Math.max(0, sample.publishAtMs - sample.workerCompleteAtMs) : null,
+        requestToFirstDrawMs: Number.isFinite(sample.requestAtMs)
+          && Number.isFinite(sample.firstDrawAtMs)
+          ? Math.max(0, sample.firstDrawAtMs - sample.requestAtMs) : null,
+        playerArrivalMissing: Number.isFinite(sample.playerArrivalAtMs)
+          && (!Number.isFinite(sample.firstDrawAtMs)
+            || sample.firstDrawAtMs > sample.playerArrivalAtMs),
+      }));
+    return [target, summarizeAcceptanceSamples(resolved)];
+  })));
+  const aggregateSamples = [];
+  for (const target of targets) {
+    for (const sample of samplesByTarget.get(target)) {
+      aggregateSamples.push({
+        workerToPublishMs: Number.isFinite(sample.workerCompleteAtMs)
+          && Number.isFinite(sample.publishAtMs)
+          ? Math.max(0, sample.publishAtMs - sample.workerCompleteAtMs) : null,
+        requestToFirstDrawMs: Number.isFinite(sample.requestAtMs)
+          && Number.isFinite(sample.firstDrawAtMs)
+          ? Math.max(0, sample.firstDrawAtMs - sample.requestAtMs) : null,
+        playerArrivalMissing: Number.isFinite(sample.playerArrivalAtMs)
+          && (!Number.isFinite(sample.firstDrawAtMs)
+            || sample.firstDrawAtMs > sample.playerArrivalAtMs),
+      });
+    }
+  }
+  const natural = summarizeAcceptanceSamples(aggregateSamples);
+  return Object.freeze({
+    schemaVersion: 'world-streaming-acceptance-1',
+    targets: Object.freeze([...targets]),
+    byTarget: resolvedByTarget,
+    natural,
+    ...resolvedByTarget[WORLD_STREAMING_TARGET.TREE],
+  });
+}
 
 function optionalString(value, label) {
   if (value === null || value === undefined) return null;

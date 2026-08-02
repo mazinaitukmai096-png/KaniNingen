@@ -52,6 +52,7 @@ import {
   WORLD_STREAMING_EVENT,
   WORLD_STREAMING_STREAM,
   WORLD_STREAMING_TARGET,
+  collectWorldStreamingAcceptanceMetrics,
   createWorldStreamingTelemetry,
 } from './world-streaming-telemetry.js';
 import {
@@ -69,7 +70,7 @@ import {
 } from './forest-horizon-owner-policy.js';
 import {
   W8_VEGETATION_LOD_KINDS,
-  resolveW8VegetationLodPolicy,
+  resolveW8VegetationVisibilityContract,
 } from './vegetation-lod-policy.js';
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
@@ -922,25 +923,21 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy());
     const staticNaturalKinds = Object.freeze(Object.values(W8_VEGETATION_LOD_KINDS));
     const staticNaturalPolicyRuntimes = new Map(staticNaturalKinds.map(kind => {
+      const distanceProfileResolver = renderDistancePreset => (
+        resolveW8VegetationVisibilityContract(renderDistancePreset).byKind[kind]
+      );
       const runtime = createCircularStaticStreamingPolicy({
         kind: `natural-${kind}`,
         publicationGroup: 'natural-static',
         maximumRequiredDistanceMeters: Math.max(
           ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(renderDistancePreset => (
-            kind === W8_VEGETATION_LOD_KINDS.TREE
-              ? resolveW8RenderDistancePolicy(renderDistancePreset).fogFarMeters
-              : resolveW8VegetationLodPolicy(kind, renderDistancePreset).visibilityMeters
+            Math.max(
+              distanceProfileResolver(renderDistancePreset).exactDistanceMeters,
+              distanceProfileResolver(renderDistancePreset).horizonDistanceMeters ?? 0,
+            )
           )),
         ),
-        distanceProfileResolver: renderDistancePreset => {
-          const renderPolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
-          const lodPolicy = resolveW8VegetationLodPolicy(kind, renderDistancePreset);
-          return Object.freeze({
-            exactDistanceMeters: lodPolicy.visibilityMeters,
-            horizonDistanceMeters: kind === W8_VEGETATION_LOD_KINDS.TREE
-              ? renderPolicy.fogFarMeters : null,
-          });
-        },
+        distanceProfileResolver,
         horizonOwnerPredicate: coordinates => {
           if (kind !== W8_VEGETATION_LOD_KINDS.TREE) return false;
           forestHorizonOwnerPredicate ??= createW8ForestHorizonOwnerPredicate(
@@ -1738,38 +1735,9 @@ export async function bootInfiniteWorldSandbox({
       status: measurementMode ? 'warmup' : 'disabled',
     };
     let streamingAcceptanceMetrics = null;
-    const percentileOf = (values, ratio) => {
-      if (!values.length) return 0;
-      const ordered = [...values].sort((left, right) => left - right);
-      return ordered[Math.min(ordered.length - 1, Math.ceil(ordered.length * ratio) - 1)];
-    };
-    const collectStreamingAcceptanceMetrics = () => {
-      const telemetrySnapshot = streamingTelemetry.snapshot();
-      const tree = telemetrySnapshot.lifecycles.filter(lifecycle => (
-        lifecycle.target === WORLD_STREAMING_TARGET.TREE
-      ));
-      const workerToPublish = tree
-        .map(lifecycle => lifecycle.workerCompleteToPublishMs)
-        .filter(Number.isFinite);
-      const requestToFirstDraw = tree
-        .map(lifecycle => lifecycle.requestToFirstDrawMs)
-        .filter(Number.isFinite);
-      return Object.freeze({
-        workerToPublishCount: workerToPublish.length,
-        workerToPublishP50Ms: percentileOf(workerToPublish, 0.5),
-        workerToPublishP95Ms: percentileOf(workerToPublish, 0.95),
-        workerToPublishMaximumMs: Math.max(0, ...workerToPublish),
-        requestToFirstDrawCount: requestToFirstDraw.length,
-        requestToFirstDrawP50Ms: percentileOf(requestToFirstDraw, 0.5),
-        requestToFirstDrawP95Ms: percentileOf(requestToFirstDraw, 0.95),
-        requestToFirstDrawMaximumMs: Math.max(0, ...requestToFirstDraw),
-        playerArrivalMissingCount: tree.filter(lifecycle => (
-          lifecycle.playerArrivalAtMs !== null
-          && (lifecycle.firstDrawAtMs === null
-            || lifecycle.firstDrawAtMs > lifecycle.playerArrivalAtMs)
-        )).length,
-      });
-    };
+    const collectStreamingAcceptanceMetrics = () => (
+      collectWorldStreamingAcceptanceMetrics(streamingTelemetry.snapshot())
+    );
     let distantQuality = worldState.experience.settings.quality;
     let distantRenderDistance = normalizeW8RenderDistancePreset(
       worldState.experience.settings.renderDistance
@@ -2769,7 +2737,7 @@ export async function bootInfiniteWorldSandbox({
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const worldStreamingSnapshot = worldStreamingCoordinator.snapshot();
-      const staticTreeStreaming = naturalStaticStream.diagnostics();
+      const staticNaturalStreaming = naturalStaticStream.diagnostics();
       const shadowPolicy = worldStreamingSnapshot.latestPlan?.policyPlans?.find(
         policy => policy.kind === LEGACY_RUNTIME_CHUNK_POLICY_KIND,
       ) ?? null;
@@ -2779,7 +2747,15 @@ export async function bootInfiniteWorldSandbox({
       const shadowDiagnosticText = diagnostics.enabled
         ? `\nWorld Streaming Shadow: ${escapeHtml(worldStreamingSnapshot.latestPlan?.planId ?? 'none')}  preset ${escapeHtml(worldStreamingSnapshot.latestPlan?.renderDistancePreset ?? 'none')}  match ${shadowComparison?.matches === true ? 'yes' : shadowComparison?.matches === false ? 'no' : 'unobserved'}  required ${shadowPolicy?.requiredOwnerKeys.length ?? 0}/${shadowComparison?.required?.observedCount ?? 0}  request ${shadowPolicy?.requestOwnerKeys.length ?? 0}/${shadowComparison?.requested?.observedCount ?? 0}  retained ${shadowPolicy?.retainedOwnerKeys.length ?? 0}/${shadowComparison?.retained?.observedCount ?? 0}  corridor ${shadowPolicy?.velocityCorridor.ownerKeys.length ?? 0} owner  plan ${number(worldStreamingSnapshot.performance.lastPlanDurationMs)}/${number(worldStreamingSnapshot.performance.p95PlanDurationMs)}/${number(worldStreamingSnapshot.performance.maximumPlanDurationMs)}ms last/p95/max`
         : '';
-      const staticStreamingDiagnosticText = `\nStatic Tree Stream: ${escapeHtml(staticTreeStreaming.latestPlanId ?? 'inactive')}  coverage/revision ${staticTreeStreaming.coverageGeneration}/${staticTreeStreaming.planRevision}  required ${staticTreeStreaming.readyRequiredOwnerCount}/${staticTreeStreaming.requiredOwnerCount}  prefetch ${staticTreeStreaming.readyPrefetchedOwnerCount}/${staticTreeStreaming.prefetchedOwnerCount}  backlog ${staticTreeStreaming.backlog}  requested/hit/reuse ${staticTreeStreaming.requestedCount}/${staticTreeStreaming.readyHitCount}/${staticTreeStreaming.pendingReuseCount}  tickets ${staticTreeStreaming.publishedTicketCount}/${staticTreeStreaming.ticketCount}  cancel/fail/invalidate ${staticTreeStreaming.cancelledCount}/${staticTreeStreaming.failedCount}/${staticTreeStreaming.invalidationCount}  Worker ${staticTreeStreaming.workerCount}\nStatic Tree Presentation: published/resident/pending/dispose ${presentationSnapshot.staticTreeCurrentPublishedOwnerCount}/${presentationSnapshot.staticTreeResidentOwnerCount}/${presentationSnapshot.staticTreePendingOwnerCount}/${presentationSnapshot.staticTreeDisposeOwnerCount}  publish wait last/max ${number(presentationSnapshot.staticTreeLastPublicationWaitMs)}/${number(presentationSnapshot.staticTreeMaximumPublicationWaitMs)}ms  matrix/attribute ${presentationSnapshot.staticTreeMatrixUpdateCount}/${presentationSnapshot.staticTreeAttributeUpdateCount}  compose max ${number(presentationSnapshot.staticTreeMaximumSliceMs)}ms  deferred dispose ${presentationSnapshot.deferredGenerationDisposeCount}${streamingAcceptanceMetrics ? `\nStatic Tree Acceptance: worker-publish count/p50/p95/max ${streamingAcceptanceMetrics.workerToPublishCount}/${number(streamingAcceptanceMetrics.workerToPublishP50Ms)}/${number(streamingAcceptanceMetrics.workerToPublishP95Ms)}/${number(streamingAcceptanceMetrics.workerToPublishMaximumMs)}ms  request-first-draw count/p50/p95/max ${streamingAcceptanceMetrics.requestToFirstDrawCount}/${number(streamingAcceptanceMetrics.requestToFirstDrawP50Ms)}/${number(streamingAcceptanceMetrics.requestToFirstDrawP95Ms)}/${number(streamingAcceptanceMetrics.requestToFirstDrawMaximumMs)}ms  arrival missing ${streamingAcceptanceMetrics.playerArrivalMissingCount}` : ''}`;
+      const naturalCoverageText = staticNaturalStreaming.policyCoverage.map(coverage => (
+        `${coverage.kind.replace('natural-', '')} ${coverage.readyRequiredOwnerCount}/${coverage.requiredOwnerCount}`
+      )).join('  ');
+      const naturalMissingText = streamingAcceptanceMetrics
+        ? Object.entries(streamingAcceptanceMetrics.byTarget).map(([target, metrics]) => (
+          `${target}:${metrics.playerArrivalMissingCount}`
+        )).join(' ') : '';
+      const naturalAcceptance = streamingAcceptanceMetrics?.natural;
+      const staticStreamingDiagnosticText = `\nStatic Natural Stream: ${escapeHtml(staticNaturalStreaming.latestPlanId ?? 'inactive')}  coverage/revision ${staticNaturalStreaming.coverageGeneration}/${staticNaturalStreaming.planRevision}  required ${staticNaturalStreaming.readyRequiredOwnerCount}/${staticNaturalStreaming.requiredOwnerCount}  prefetch ${staticNaturalStreaming.readyPrefetchedOwnerCount}/${staticNaturalStreaming.prefetchedOwnerCount}  by-kind ${escapeHtml(naturalCoverageText)}  backlog ${staticNaturalStreaming.backlog}  requested/hit/reuse ${staticNaturalStreaming.requestedCount}/${staticNaturalStreaming.readyHitCount}/${staticNaturalStreaming.pendingReuseCount}  tickets ${staticNaturalStreaming.publishedTicketCount}/${staticNaturalStreaming.ticketCount}  cancel/fail/invalidate ${staticNaturalStreaming.cancelledCount}/${staticNaturalStreaming.failedCount}/${staticNaturalStreaming.invalidationCount}  Worker ${staticNaturalStreaming.workerCount}\nStatic Natural Presentation: published/resident/pending/dispose ${presentationSnapshot.staticNaturalCurrentPublishedOwnerCount}/${presentationSnapshot.staticNaturalResidentOwnerCount}/${presentationSnapshot.staticNaturalPendingOwnerCount}/${presentationSnapshot.staticNaturalDisposeOwnerCount}  publish wait last/max ${number(presentationSnapshot.staticTreeLastPublicationWaitMs)}/${number(presentationSnapshot.staticTreeMaximumPublicationWaitMs)}ms  matrix/attribute ${presentationSnapshot.staticTreeMatrixUpdateCount}/${presentationSnapshot.staticTreeAttributeUpdateCount}  compose max ${number(presentationSnapshot.staticTreeMaximumSliceMs)}ms  deferred dispose ${presentationSnapshot.deferredGenerationDisposeCount}${naturalAcceptance ? `\nStatic Natural Acceptance: worker-publish count/p50/p95/max ${naturalAcceptance.workerToPublishCount}/${number(naturalAcceptance.workerToPublishP50Ms)}/${number(naturalAcceptance.workerToPublishP95Ms)}/${number(naturalAcceptance.workerToPublishMaximumMs)}ms  request-first-draw count/p50/p95/max ${naturalAcceptance.requestToFirstDrawCount}/${number(naturalAcceptance.requestToFirstDrawP50Ms)}/${number(naturalAcceptance.requestToFirstDrawP95Ms)}/${number(naturalAcceptance.requestToFirstDrawMaximumMs)}ms  arrival missing ${naturalAcceptance.playerArrivalMissingCount} (${escapeHtml(naturalMissingText)})` : ''}`;
       const settlementReference = currentChunk?.settlementReferences?.[0];
       const fogFarMeters = scene.fog.far / UNITS_PER_METER;
       const cloudWithinFogCount = scenePresentationSnapshot.clouds.filter(cloud => Math.hypot(

@@ -8,6 +8,7 @@ import {
   WORLD_STREAMING_STREAM,
   WORLD_STREAMING_TARGET,
   WORLD_STREAMING_TELEMETRY_SCHEMA,
+  collectWorldStreamingAcceptanceMetrics,
   createWorldStreamingTelemetry,
   worldStreamingTargetForCanonicalObject,
 } from '../src/infinite-world/world-streaming-telemetry.js';
@@ -133,6 +134,44 @@ test('request and first draw correlate by stream, target, and owner resource', (
   assert.equal(publish.correlationId, correlationId);
   assert.equal(firstDraw.correlationId, correlationId);
   assert.equal(telemetry.snapshot().lifecycles[0].requestToFirstDrawMs, 60);
+});
+
+test('Natural acceptance correlates one shared owner request with every Object publication', () => {
+  let now = 0;
+  const telemetry = createWorldStreamingTelemetry({
+    enabled: true,
+    clock: () => now,
+    sessionId: 'natural-acceptance',
+  });
+  const owner = {
+    target: WORLD_STREAMING_TARGET.TREE,
+    stream: WORLD_STREAMING_STREAM.DISTANT,
+    resourceKey: '7,8',
+    ownerKey: '7,8',
+  };
+  const correlationId = telemetry.beginRequest(owner);
+  now = 10;
+  telemetry.record(WORLD_STREAMING_EVENT.WORKER_COMPLETE, { ...owner, correlationId });
+  for (const target of [
+    WORLD_STREAMING_TARGET.TREE,
+    WORLD_STREAMING_TARGET.BUSH,
+    WORLD_STREAMING_TARGET.GRASS,
+    WORLD_STREAMING_TARGET.ROCK,
+  ]) {
+    now += 5;
+    telemetry.record(WORLD_STREAMING_EVENT.PUBLISH, { ...owner, target });
+    now += 5;
+    telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, { ...owner, target });
+    now += 5;
+    telemetry.record(WORLD_STREAMING_EVENT.PLAYER_ARRIVAL, { ...owner, target });
+  }
+  const metrics = collectWorldStreamingAcceptanceMetrics(telemetry.snapshot());
+  assert.deepEqual(Object.keys(metrics.byTarget), ['tree', 'bush', 'grass', 'rock']);
+  assert.equal(metrics.natural.workerToPublishCount, 4);
+  assert.equal(metrics.natural.requestToFirstDrawCount, 4);
+  assert.equal(metrics.natural.playerArrivalMissingCount, 0);
+  assert.equal(metrics.byTarget.grass.playerArrivalMissingCount, 0);
+  assert.equal(metrics.workerToPublishCount, 1, 'legacy top-level aliases remain Tree-only');
 });
 
 test('failed lifecycle is retained as an explicit terminal event', () => {

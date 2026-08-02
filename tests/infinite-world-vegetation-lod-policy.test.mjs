@@ -3,12 +3,39 @@ import assert from 'node:assert/strict';
 
 import {
   W8_VEGETATION_LOD_KINDS,
+  W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA,
   evaluateW8VegetationLodBlend,
   resolveW8VegetationLodBlend,
   resolveW8VegetationLodPolicy,
+  resolveW8VegetationVisibilityContract,
 } from '../src/infinite-world/vegetation-lod-policy.js';
 
 const q6 = value => Math.round(value * 1e6) / 1e6;
+
+test('Natural visibility contract preserves the formal Object-specific preset distances', () => {
+  const expected = {
+    short: { tree: 84, bush: 84, grass: 64, rock: 84 },
+    standard: { tree: 112, bush: 112, grass: 67.2, rock: 112 },
+    current: { tree: 140, bush: 140, grass: 84, rock: 140 },
+  };
+  for (const [preset, visibilityByKind] of Object.entries(expected)) {
+    const contract = resolveW8VegetationVisibilityContract(preset);
+    assert.equal(contract.schemaVersion, W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA);
+    assert.equal(contract.renderDistancePreset, preset);
+    assert.equal(resolveW8VegetationVisibilityContract(preset), contract);
+    for (const [kind, exactDistanceMeters] of Object.entries(visibilityByKind)) {
+      assert.equal(contract.byKind[kind].exactDistanceMeters, exactDistanceMeters);
+      assert.equal(
+        contract.byKind[kind].exactDistanceMeters,
+        resolveW8VegetationLodPolicy(kind, preset).visibilityMeters,
+      );
+      assert.equal(
+        contract.byKind[kind].horizonDistanceMeters === null,
+        kind !== W8_VEGETATION_LOD_KINDS.TREE,
+      );
+    }
+  }
+});
 
 test('Vegetation LOD policy is shared, ordered, and safe across Near-owner handoff', () => {
   for (const preset of ['short', 'standard', 'current']) {

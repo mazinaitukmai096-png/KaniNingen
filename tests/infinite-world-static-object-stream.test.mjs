@@ -233,6 +233,11 @@ test('one Static Object Stream merges registered object policies and requests ea
     [first.policy.kind, second.policy.kind]);
   assert.deepEqual(stream.snapshot().policyCoverage.map(value => value.kind),
     [first.policy.kind, second.policy.kind]);
+  assert.deepEqual(stream.diagnostics().policyCoverage.map(value => value.kind),
+    [first.policy.kind, second.policy.kind]);
+  assert.equal(stream.diagnostics().policyCoverage.every(value => (
+    value.readyRequiredOwnerCount === value.requiredOwnerCount
+  )), true);
   assert.equal(stream.snapshot().requiredOwnerCount,
     new Set(plans.flatMap(value => value.requiredOwnerKeys)).size);
   assert.equal(stream.snapshot().prefetchedOwnerCount > 0, true);

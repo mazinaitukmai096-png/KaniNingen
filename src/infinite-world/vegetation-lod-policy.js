@@ -21,6 +21,9 @@ export const W8_VEGETATION_LOD_TIERS = Object.freeze({
   HORIZON: 'horizon',
 });
 
+export const W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA =
+  'w8-vegetation-visibility-contract-1';
+
 export const W8_FOREST_SILHOUETTE_COLOR_HEX = 0x28512f;
 export const W8_ATMOSPHERIC_VEGETATION_COLOR_HEX = 0x49674f;
 
@@ -152,6 +155,7 @@ const profileFor = (kind, renderDistance) => {
 };
 
 const policyCache = new Map();
+const visibilityContractCache = new Map();
 
 export function resolveW8VegetationLodPolicy(
   kind,
@@ -167,6 +171,32 @@ export function resolveW8VegetationLodPolicy(
   });
   policyCache.set(key, policy);
   return policy;
+}
+
+export function resolveW8VegetationVisibilityContract(
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+) {
+  const renderDistance = resolveW8RenderDistancePolicy(renderDistancePreset);
+  if (visibilityContractCache.has(renderDistance.id)) {
+    return visibilityContractCache.get(renderDistance.id);
+  }
+  const byKind = Object.freeze(Object.fromEntries(
+    Object.values(W8_VEGETATION_LOD_KINDS).map(kind => {
+      const policy = resolveW8VegetationLodPolicy(kind, renderDistance.id);
+      return [kind, Object.freeze({
+        kind,
+        exactDistanceMeters: policy.visibilityMeters,
+        horizonDistanceMeters: policy.horizonVisibilityMeters,
+      })];
+    }),
+  ));
+  const contract = Object.freeze({
+    schemaVersion: W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA,
+    renderDistancePreset: renderDistance.id,
+    byKind,
+  });
+  visibilityContractCache.set(renderDistance.id, contract);
+  return contract;
 }
 
 const transitionProgress = (distanceMeters, band) => {

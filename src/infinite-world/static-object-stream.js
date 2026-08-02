@@ -953,6 +953,15 @@ export function createStaticObjectStream({
         readyPrefetchedOwnerCount += Number(isReady(ownerKey));
       }
     }
+    const policyCoverage = Object.freeze((latestPolicyPlan?.memberPolicyPlans ?? [])
+      .map(member => Object.freeze({
+        kind: member.kind,
+        requiredOwnerCount: member.requiredOwnerKeys.length,
+        readyRequiredOwnerCount: member.requiredOwnerKeys.filter(isReady).length,
+        prefetchedOwnerCount: member.prefetchedOwnerKeys.length,
+        readyPrefetchedOwnerCount: member.prefetchedOwnerKeys.filter(isReady).length,
+        retainedOwnerCount: member.retainedOwnerKeys.length,
+      })));
     return Object.freeze({
       policyKind,
       policyKinds: memberPolicyKinds,
@@ -960,6 +969,7 @@ export function createStaticObjectStream({
       coverageGeneration,
       planRevision,
       latestPlanId: latestPlan?.planId ?? null,
+      policyCoverage,
       requiredOwnerCount: requiredOwnerKeys.length,
       readyRequiredOwnerCount,
       missingRequiredOwnerCount: requiredOwnerKeys.length - readyRequiredOwnerCount,
