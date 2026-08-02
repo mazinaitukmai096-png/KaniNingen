@@ -85,6 +85,10 @@ import {
   compareW8BuildingSettlementShadow,
   createW8BuildingSettlementShadowPolicies,
 } from './settlement-stream-policy.js';
+import {
+  BUILDING_SETTLEMENT_STREAM_MODE,
+  createBuildingSettlementStream,
+} from './building-settlement-stream.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 
@@ -836,6 +840,7 @@ export async function bootInfiniteWorldSandbox({
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
+  let buildingSettlementStream = null;
   let naturalStaticStreamActivated = false;
   let naturalStaticStreamSuspended = false;
   let canonicalWorldSeedHash = null;
@@ -1590,6 +1595,23 @@ export async function bootInfiniteWorldSandbox({
           }));
       recordDistantTreeVisibility();
     }
+    buildingSettlementStream = createBuildingSettlementStream({
+      initialMode: BUILDING_SETTLEMENT_STREAM_MODE.SHADOW,
+      async buildStage({ observation, isCurrent }) {
+        await Promise.resolve();
+        if (!isCurrent()) throw new Error('Building/Settlement staging cancelled');
+        return {
+          sceneAttached: false,
+          capacity: observation.settlementOwnerKeys.length,
+          ownerKeys: [...observation.settlementOwnerKeys],
+          stableIds: [...observation.stableIds],
+          roadLinkages: [...observation.roadLinkages],
+          damageStates: [...observation.damageStates],
+          invalidRoadLinkageCount: observation.invalidRoadLinkageCount,
+          dispose() {},
+        };
+      },
+    });
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
 
@@ -1769,6 +1791,7 @@ export async function bootInfiniteWorldSandbox({
     let pendingRenderDistancePublication = null;
     let appliedStaticNaturalRetainedOwnerKeys = Object.freeze([]);
     let buildingSettlementShadowComparison = null;
+    let buildingSettlementStagingSignature = null;
     running = true;
 
     const synchronizeDistantPresentation = (runtimeSnapshot, {
@@ -2726,6 +2749,26 @@ export async function bootInfiniteWorldSandbox({
         plan: worldStreamingPlan,
         observation: settlementStreamingObservation,
       });
+      if (buildingSettlementShadowComparison.matches && settlementStreamingObservation) {
+        const stagingSignature = JSON.stringify({
+          preset: worldStreamingPlan.renderDistancePreset,
+          owners: settlementStreamingObservation.settlementOwnerKeys,
+          stableIds: settlementStreamingObservation.stableIds,
+          damage: settlementStreamingObservation.damageStates,
+        });
+        if (stagingSignature !== buildingSettlementStagingSignature) {
+          buildingSettlementStagingSignature = stagingSignature;
+          void buildingSettlementStream.applyShadowPlan({
+            plan: worldStreamingPlan,
+            observation: settlementStreamingObservation,
+            renderDistanceRevision: renderDistanceRequestRevision,
+          }).catch(error => {
+            if (error?.message !== 'Building/Settlement staging cancelled') {
+              transitionError = error;
+            }
+          });
+        }
+      }
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
       const staticNaturalPolicyPlans = worldStreamingPlan.policyPlans.filter(
         policy => staticNaturalPolicyRuntimes.has(policy.kind),
@@ -3223,6 +3266,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       await runtime.shutdown();
       distantPresentation.dispose();
       await naturalStaticStream.dispose();
+      await buildingSettlementStream.dispose();
       await chunkDataService.shutdown();
       scenePresentation.dispose();
       visualAssets.dispose();
@@ -3322,6 +3366,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           streamingTelemetry: streamingTelemetry.snapshot(),
           worldStreaming: worldStreamingCoordinator.snapshot(),
           buildingSettlementShadow: buildingSettlementShadowComparison,
+          buildingSettlementStreaming: buildingSettlementStream.snapshot(),
           staticObjectStreaming: naturalStaticStream.snapshot(),
           treePathAudit: Object.freeze({
             treeStaticStreamActivated: naturalStaticStreamActivated,
@@ -3357,6 +3402,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       distantPresentation?.dispose?.();
       await naturalStaticStream?.dispose?.();
+      await buildingSettlementStream?.dispose?.();
       await chunkDataService?.shutdown?.();
       scenePresentation?.dispose?.();
       visualAssets?.dispose?.();

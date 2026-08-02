@@ -1600,6 +1600,9 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       assert.equal(snapshot.worldStreaming.latestComparison.policies.filter(policy => (
         ['building-presentation', 'settlement-presentation'].includes(policy.kind)
       )).every(policy => policy.matches === true), true);
+      assert.equal(snapshot.buildingSettlementStreaming.mode, 'shadow');
+      assert.equal(snapshot.buildingSettlementStreaming.counts.published, 0);
+      assert.notEqual(snapshot.buildingSettlementStreaming.readyStage, null);
       results.push({
         preset,
         bootMs,
