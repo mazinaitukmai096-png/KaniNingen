@@ -202,13 +202,13 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 ## 9. 現在の状態
 
 **Branch:** `feature/infinite-chunk-sandbox-w1a`
-**最新実装commit:** `dbdfb2c feat: stream tree presentation through shared plans`
+**最新実装commit:** `fac3f5a fix: gate player movement on terrain coverage`
 **Origin差:** pushなし / behind 0
-**現在Phase:** Phase 5A正式完了、Phase 5B開始前
+**現在Phase:** Phase 5A-2正式完了、Phase 5B開始前
 **Phase 4:** 完了・commit済み
-**Phase 5A:** Tree Static Stream移行完了・commit済み
-**Vegetation LOD:** 実装済み差分を未commitで保持
-**現在の目的:** Bush / Rock / GrassをTreeと同じStatic Stream基盤へ移行する。
+**Phase 5A:** Phase 5A-2のincremental publication、persistent bucket、terrain coverage gateまで完了
+**Vegetation LOD:** `1a0a32a`でcommit済み
+**現在の目的:** Phase 5B開始前で停止し、次回承認後にBush / Rock / Grassを共通Static Streamへ移行する。
 
 ---
 
@@ -220,7 +220,7 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 - [x] Phase 2: World Streaming Plan / Policy Registry
 - [x] Phase 3: Canonical Owner Cache
 - [x] Phase 4: Worker Scheduler
-- [ ] Phase 5: Static Object Stream（Phase 5A Tree完了、Phase 5B未着手）
+- [ ] Phase 5: Static Object Stream（Phase 5A-2完了、Phase 5B未着手）
 - [ ] Phase 6: Building / Settlement
 - [ ] Phase 7: Publication Coordination
 - [ ] Phase 8: Dynamic Entity Stream
@@ -245,8 +245,29 @@ Codexは各Phase完了時または重要commit後に、このファイルを更�
 
 ## 12. 現在進行中
 
-Phase 5Aは正式完了。Treeを共通Streaming Planの最初のconsumerとして接続し、
-高速移動時にTreeが遅れて出現する問題を解消した。
+Phase 5Aの以前の受入れ判定は取り消した。ready-setがReadyでも、Distant rootの
+全owner compose完了までpublishされず、高速移動時のTree遅延とmain-thread freezeが残っていた。
+Phase 5A-2ではowner/page単位publication、persistent bucket、dirty range更新、
+frame-budget upload/disposeへの移行を完了した。Phase 5Bには進んでいない。
+
+Phase 5A-2の停止→密度回復→再加速Harnessで、次の集中要因を確定した。
+
+- 停止coverage外のstale corridor workがqueue/in-flightに残る
+- ready page admission、build、visibility、compose、Buffer更新、dispose、publicationのbudgetが分断される
+- 旧owner disposeが再加速時の1 frameへ集中する
+- bucket末尾compactionによりresident instanceのmatrix再composeが発生する
+
+停止coverageが安定した時点のstale cancellation、最新coverage外の完了結果の
+publication抑止、required/deadline優先の統合frame budget、1 owner/frame admission・dispose・
+publication、compaction移動のframe分散を実装・自動検証した。Browser自動操作は行わず、
+ユーザー実機で全力走行、停止、再加速時のfreeze非再現を確認した。
+
+Path Auditで、Coordinator、Static Stream、shadow planはboot時点で準備済みにもかかわらず、
+`applyPlan`がDistant outer warm全体の完了までactivation fenceで禁止されていたことを確定した。
+最初のDistant Tree可視からStatic Stream activationまで約9.9秒あり、このfenceが起動遅延の
+確定原因だった。Phase 5A-2ではactivationを最初の有効なshadow planへ接続し、Distant warmは
+初期表示を準備する独立処理として維持する。同じownerはStatic Streamのpending/ready taskへ
+合流させ、on-demand consumerをbackground queueより優先して重複生成を防ぐ。
 
 確認済み:
 
@@ -257,10 +278,11 @@ Phase 5Aは正式完了。Treeを共通Streaming Planの最初のconsumerとし�
 - backlog 0
 - failed 0
 - Worker 1
-- 高速移動時の森林密度低下なし
-- 停止後の一括出現なし
-- 急旋回後のTree欠落なし
+- ready済みとfirst draw済みを別指標として追跡
 - Continue優先度競合を修正
+- outer warm activation fenceを切り離し、最初のshadow planからStatic Streamを開始
+- Distant warmとStatic Streamのowner要求をpending/ready reuseでdedupe
+- activation fence修正後の全repository serial suite 712/712 PASS
 - 全repository serial suite 705/705 PASS
 - Phase 5A staged tree単独検証 87/87 PASS
 - commit後関連integration 108/108 PASS
@@ -273,18 +295,20 @@ Browser Current / High:
 - frame p95 12.2ms / max 90.9ms
 - 高速直進、停止、急旋回で進行方向の密度低下・停止後の一括出現なし
 
-次工程はBush / Rock / GrassのStatic Stream移行。Phase 5B開始前で停止中。
+上記Browser値は初回Phase 5A時点の参考値であり、正式5-runはPhase 11で再判定する。
 
 ---
 
 ## 13. 現在の決定事項
 
 - Treeの描画距離不足ではなく、先読み・再利用・publication starvationが原因だった。
-- Tree高速移動問題はvelocity-aware ready-set、owner reuse、scheduler、publication ticketで解消した。
+- velocity-aware ready-setだけではfirst drawを保証しない。owner/page publicationまでをGateとする。
 - 生成coverageとpublication freshnessは分離する。
 - 同じowner集合ならstate revision更新だけで生成をcancelしない。
+- Distant outer warmはStatic Streamのactivation条件にせず、独立した初期表示warmとして継続する。
+- Static Stream activationは最初の有効なshadow planで一度だけ行い、suspend / relocation中は適用しない。
 - Gameplay requestをStatic presentationより優先する。
-- Tree成功後にBush / Rock / Grassを同じStatic Streamへ移行する。
+- Phase 5A-2はユーザー実機確認まで合格。次回承認後にのみBush / Rock / Grassへ進む。
 - Tree専用prefetchやObject名分岐は作らない。
 - Worker Poolは現時点で採用しない。
 
@@ -294,6 +318,7 @@ Browser Current / High:
 
 ### Priority A
 
+- Current / High / MAXの正式5-runをPhase 11で判定する
 - generation p95 329.9msをPhase 11 Production Acceptanceで正式再評価する
 - foreground Browser 5-run、長時間soak、50ms超frame率をPhase 11で正式判定する
 
@@ -313,11 +338,11 @@ Browser Current / High:
 
 ## 15. 次にやること
 
-1. Phase 5BとしてBushをTreeと同じStatic Stream policyへ接続する。
-2. Bush合格後、Rockを同じ基盤へ移行する。
-3. Rock合格後、Grassを同じ基盤へ移行する。
+1. Phase 5A-2完了状態を維持する。
+2. Phase 5B開始の明示承認を待つ。
+3. 承認後、Bush / Rock / Grassを同じStatic Stream基盤へ順次移行する。
 4. Object別のready-set、owner reuse、publication、Stable ID、destructionを比較する。
-5. Phase 5B完了後に全repository serial suiteとBrowser高速移動を再実行する。
+5. Phase 11で正式5-run、長時間soak、generation p95を再評価する。
 
 ---
 
@@ -385,3 +410,75 @@ PROJECT_MASTER.mdを読んで、現在の状態から続けてください。
 ```
 
 ChatGPTは移行時に、最新版PROJECT_MASTER.mdの更新または作成を自動で案内する。
+
+## 20. Phase 5A-2完了記録
+
+Phase 5A-2は正式完了。Phase 5Bには未着手。
+
+保存commit:
+
+- `1a0a32a feat: define canonical vegetation lod policies`
+- `bc4e723 feat: publish distant world through persistent frame budgets`
+- `fac3f5a fix: gate player movement on terrain coverage`
+
+完了内容:
+
+- owner/page単位incremental publication
+- Static Streamのstale corridor cancellation
+- persistent Tree / Distant Natural / Settlement bucket
+- admission、build、visibility、compose、Buffer更新、dispose、publicationのframe budget化
+- Distant outer warmからStatic Stream activation fenceを分離
+- Player位置commit前のcanonical Terrain readiness / finite height gate
+- 未Ready時の直前位置・正式height維持とprefetch / transition要求
+- Save v5、Stable ID、PLAY-SYNC、Floating Origin、destruction、Continue / Retryを維持
+
+検証:
+
+- Vegetation LOD基盤: 17/17 PASS
+- Phase 5A-2 staged関連suite: 110/110 PASS
+- Player terrain coverage専用: 2/2 PASS
+- movement / prefetch / Continue / Retry関連: 49/49 PASS
+- 全repository serial suite: 717/717 PASS
+- `node --check`: PASS
+- `git diff --check`: PASS
+- ユーザー実機の全力走行、停止、再加速で以前のfreezeは再現しなかった
+
+Phase 11でforeground 5-run、長時間soak、generation p95を正式再評価する。
+
+## 21. Browser運用ルール
+
+Browserは利用枠を大きく消費するため、原則として使用しない。
+
+優先順位は必ず以下とする。
+
+1. Unit Test
+2. Integration Test
+3. Harness
+4. Telemetry
+5. Browser（最後の受入れ確認のみ）
+
+Browserを使う前に、
+
+- Browserでしか確認できない項目
+- Browserが本当に必要な理由
+
+を明示すること。
+
+Browser確認は原則1 runのみ。
+
+以下は禁止。
+
+- 同一シナリオの繰り返し実行
+- 長時間走行
+- 不要な再読込
+- 不要なスクリーンショット取得
+- Browser待機だけの長時間実行
+
+Browserでは確認できない事項は推測しない。
+
+Browser連携が利用できない場合は、
+
+- 未確認と明記
+- Harness／Telemetryで代替可能な範囲だけ確認
+
+とする。
