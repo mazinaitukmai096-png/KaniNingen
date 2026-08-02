@@ -1412,10 +1412,22 @@ export async function bootInfiniteWorldSandbox({
       scene,
       worldSeedHash: generator.worldSeedHash,
       visualAssets,
-      resolveStaticNaturalCapacity: renderDistancePreset => Object.freeze(
+      // Persistent buckets survive render-distance publication. Size them for
+      // every registered preset so an atomic Short -> Current switch can keep
+      // the old presentation alive while the replacement coverage is staged.
+      resolveStaticNaturalCapacity: () => Object.freeze(
         [...staticNaturalPolicyRuntimes.values()].map(runtime => Object.freeze({
           naturalKind: runtime.naturalKind,
-          ...runtime.maximumCoverage(renderDistancePreset),
+          maximumCanonicalOwnerCount: Math.max(
+            ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(preset => (
+              runtime.maximumCoverage(preset).maximumCanonicalOwnerCount
+            )),
+          ),
+          maximumManifestOwnerCount: Math.max(
+            ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(preset => (
+              runtime.maximumCoverage(preset).maximumManifestOwnerCount
+            )),
+          ),
         })),
       ),
       findSettlementsNear: generator.distributor.findSettlementsNear,
@@ -1743,12 +1755,19 @@ export async function bootInfiniteWorldSandbox({
       worldState.experience.settings.renderDistance
         ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
     );
+    let requestedDistantRenderDistance = distantRenderDistance;
+    let renderDistanceRequestRevision = 0;
+    let pendingRenderDistancePublication = null;
+    let appliedStaticNaturalRetainedOwnerKeys = Object.freeze([]);
     running = true;
 
     const synchronizeDistantPresentation = (runtimeSnapshot, {
       includeUltraNatural = true,
       revealNatural = false,
       naturalRevealInnerMeters = 0,
+      renderDistancePreset = distantRenderDistance,
+      deferPublication = false,
+      preserveStaticNatural = false,
     } = {}) => distantPresentation.sync({
       transitionContract: runtimeSnapshot.transitionContract,
       activeDataKeys: runtimeSnapshot.activeDataKeys,
@@ -1758,12 +1777,14 @@ export async function bootInfiniteWorldSandbox({
       centerChunkX: runtimeSnapshot.centerChunkX,
       centerChunkZ: runtimeSnapshot.centerChunkZ,
       quality: distantQuality,
-      renderDistancePreset: distantRenderDistance,
+      renderDistancePreset,
       playerLogicalX: logicalPlayer.x,
       playerLogicalZ: logicalPlayer.z,
       includeUltraNatural,
       revealNatural,
       naturalRevealInnerMeters,
+      deferPublication,
+      preserveStaticNatural,
     });
 
     const synchronizeLocalTerrain = runtimeSnapshot => distantPresentation.syncLocalTerrain({
@@ -1792,7 +1813,10 @@ export async function bootInfiniteWorldSandbox({
       })
     );
 
-    const synchronizeLocalTerrainPreset = runtimeSnapshot => (
+    const synchronizeLocalTerrainPreset = (runtimeSnapshot, {
+      renderDistancePreset = distantRenderDistance,
+      deferPublication = false,
+    } = {}) => (
       distantPresentation.syncLocalTerrainPreset({
         coverageEpoch: ++localTerrainCoverageEpoch,
         transitionContract: runtimeSnapshot.transitionContract,
@@ -1802,7 +1826,8 @@ export async function bootInfiniteWorldSandbox({
         renderOrigin: runtimeSnapshot.renderOrigin,
         centerChunkX: runtimeSnapshot.centerChunkX,
         centerChunkZ: runtimeSnapshot.centerChunkZ,
-        renderDistancePreset: distantRenderDistance,
+        renderDistancePreset,
+        deferPublication,
       })
     );
 
@@ -1889,6 +1914,9 @@ export async function bootInfiniteWorldSandbox({
                 'distant-sync',
                 () => synchronizeDistantPresentation(runtimeState),
               );
+              if (pendingRenderDistancePublication) {
+                beginRenderDistancePublication(requestedDistantRenderDistance);
+              }
             }
             if (!isSameCommittedRuntimeState(committedEpoch, runtimeState)) return;
             const gameplayResult = await gameplayWork;
@@ -2165,16 +2193,91 @@ export async function bootInfiniteWorldSandbox({
     audioDirector = createW8AudioDirector({
       globalObject, volume: worldState.experience.settings.volume,
     });
-    const applyRuntimeSettings = settings => {
+    const applyRenderDistanceFog = renderDistancePreset => {
+      scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
+      scene.fog.far = resolveW8RenderDistancePolicy(
+        renderDistancePreset,
+      ).fogFarMeters * UNITS_PER_METER;
+    };
+    const applyRuntimeSettings = (settings, { applyRenderDistance = true } = {}) => {
       const qualityRatio = { low: 1, medium: 1.2, high: 1.5 }[settings.quality] ?? 1.5;
       renderer.setPixelRatio(measurementMode
         ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, qualityRatio));
       renderer.shadowMap.enabled = diagnosticProfile.shadows && settings.quality !== 'low';
-      scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
-      scene.fog.far = resolveW8RenderDistancePolicy(
-        settings.renderDistance,
-      ).fogFarMeters * UNITS_PER_METER;
+      if (applyRenderDistance) applyRenderDistanceFog(settings.renderDistance);
       audioDirector.setVolume(settings.volume);
+    };
+
+    const beginRenderDistancePublication = nextRenderDistance => {
+      const revision = ++renderDistanceRequestRevision;
+      distantPresentation.discardPreparedRenderDistancePreset?.();
+      distantPresentation.stageStaticNaturalRenderDistancePreset?.(nextRenderDistance);
+      localTerrainCoverageEpoch = Math.max(
+        localTerrainCoverageEpoch,
+        distantPresentation.invalidatePendingLocalTerrainSync?.()
+          ?? localTerrainCoverageEpoch,
+      );
+      distantPresentation.invalidatePendingFarSync?.();
+      const runtimeSnapshot = runtime.snapshot();
+      scenePresentation.rebase(runtimeSnapshot.renderOrigin);
+      commitDistantRuntimeState(runtimeSnapshot);
+      pendingRenderDistancePublication = {
+        revision,
+        preset: nextRenderDistance,
+        distantPrepared: false,
+        localTerrainPrepared: false,
+        requiredNaturalOwnerKeys: Object.freeze([]),
+        requestedAtMs: clock(),
+        preparedAtMs: null,
+      };
+      void diagnostics.measureAsync('distant-sync', async () => {
+        const distantPrepared = await synchronizeDistantPresentation(runtimeSnapshot, {
+          renderDistancePreset: nextRenderDistance,
+          deferPublication: true,
+          preserveStaticNatural: true,
+        });
+        if (!distantPrepared || pendingRenderDistancePublication?.revision !== revision) {
+          return false;
+        }
+        const localTerrain = await diagnostics.measureAsync(
+          'distant-local-preset-sync',
+          () => synchronizeLocalTerrainPreset(runtimeSnapshot, {
+            renderDistancePreset: nextRenderDistance,
+            deferPublication: true,
+          }),
+        );
+        if (pendingRenderDistancePublication?.revision !== revision) return false;
+        pendingRenderDistancePublication.distantPrepared = true;
+        pendingRenderDistancePublication.localTerrainPrepared =
+          localTerrain?.prepared === true || localTerrain?.committed === true;
+        pendingRenderDistancePublication.preparedAtMs = clock();
+        return true;
+      }).catch(error => {
+        if (pendingRenderDistancePublication?.revision === revision) {
+          pendingRenderDistancePublication = null;
+          distantPresentation.discardPreparedRenderDistancePreset?.();
+        }
+        transitionError = error;
+      });
+    };
+
+    const tryCommitRenderDistancePublication = () => {
+      const pending = pendingRenderDistancePublication;
+      if (!pending || pending.revision !== renderDistanceRequestRevision
+        || pending.preset !== requestedDistantRenderDistance
+        || !pending.distantPrepared || !pending.localTerrainPrepared) return false;
+      const streamControl = naturalStaticStream.diagnostics();
+      if (streamControl.missingRequiredOwnerCount > 0
+        || !distantPresentation.isStaticNaturalCoverageReady?.(
+          pending.requiredNaturalOwnerKeys,
+        )) return false;
+      if (!distantPresentation.commitPreparedRenderDistancePreset?.(pending.preset)) return false;
+      distantRenderDistance = pending.preset;
+      appliedStaticNaturalRetainedOwnerKeys = pending.retainedNaturalOwnerKeys
+        ?? appliedStaticNaturalRetainedOwnerKeys;
+      applyRenderDistanceFog(distantRenderDistance);
+      pendingRenderDistancePublication = null;
+      return true;
     };
     scenePresentation.cloudRoot.visible = diagnosticProfile.transparency;
     renderAdapter.setDiagnosticTransparencyEnabled?.(diagnosticProfile.transparency);
@@ -2359,34 +2462,22 @@ export async function bootInfiniteWorldSandbox({
       onSettingsChanged: settings => {
         const qualityChanged = settings.quality !== distantQuality;
         const nextRenderDistance = normalizeW8RenderDistancePreset(settings.renderDistance);
-        const renderDistanceChanged = nextRenderDistance !== distantRenderDistance;
+        const renderDistanceChanged = nextRenderDistance !== requestedDistantRenderDistance;
         distantQuality = settings.quality;
-        distantRenderDistance = nextRenderDistance;
-        applyRuntimeSettings(settings);
-        if ((qualityChanged || renderDistanceChanged) && diagnosticProfile.distant) {
-          if (renderDistanceChanged) {
-            localTerrainCoverageEpoch = Math.max(
-              localTerrainCoverageEpoch,
-              distantPresentation.invalidatePendingLocalTerrainSync?.()
-                ?? localTerrainCoverageEpoch,
-            );
-          }
+        requestedDistantRenderDistance = nextRenderDistance;
+        applyRuntimeSettings(settings, { applyRenderDistance: !renderDistanceChanged });
+        if (renderDistanceChanged && diagnosticProfile.distant) {
+          beginRenderDistancePublication(nextRenderDistance);
+        } else if (renderDistanceChanged) {
+          distantRenderDistance = nextRenderDistance;
+          applyRenderDistanceFog(nextRenderDistance);
+        } else if (qualityChanged && diagnosticProfile.distant) {
           const runtimeSnapshot = runtime.snapshot();
           scenePresentation.rebase(runtimeSnapshot.renderOrigin);
           commitDistantRuntimeState(runtimeSnapshot);
           void diagnostics.measureAsync(
             'distant-sync',
-            async () => {
-              const committed = await synchronizeDistantPresentation(runtimeSnapshot);
-              if (committed && renderDistanceChanged
-                && distantRenderDistance === nextRenderDistance) {
-                await diagnostics.measureAsync(
-                  'distant-local-preset-sync',
-                  () => synchronizeLocalTerrainPreset(runtimeSnapshot),
-                );
-              }
-              return committed;
-            },
+            () => synchronizeDistantPresentation(runtimeSnapshot),
           ).catch(error => { transitionError = error; });
         }
         scheduleSave();
@@ -2596,7 +2687,7 @@ export async function bootInfiniteWorldSandbox({
       const worldStreamingPlan = worldStreamingCoordinator.createShadowPlan({
         player: { x: logicalPlayer.x, z: logicalPlayer.z },
         velocity: { x: movement.velocityX, z: movement.velocityZ },
-        renderDistancePreset: distantRenderDistance,
+        renderDistancePreset: requestedDistantRenderDistance,
         stateRevision: worldState.revision,
         originGeneration: committedChunkState.transitionContract?.generation ?? 0,
         currentRequests: {
@@ -2611,6 +2702,26 @@ export async function bootInfiniteWorldSandbox({
       const staticNaturalPolicyPlans = worldStreamingPlan.policyPlans.filter(
         policy => staticNaturalPolicyRuntimes.has(policy.kind),
       );
+      const requestedNaturalRequiredOwnerKeys = Object.freeze([
+        ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.requiredOwnerKeys)),
+      ]);
+      const requestedNaturalRetainedOwnerKeys = Object.freeze([
+        ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.allOwnerKeys)),
+      ]);
+      if (pendingRenderDistancePublication) {
+        pendingRenderDistancePublication.requiredNaturalOwnerKeys =
+          requestedNaturalRequiredOwnerKeys;
+        pendingRenderDistancePublication.retainedNaturalOwnerKeys =
+          requestedNaturalRetainedOwnerKeys;
+      } else {
+        appliedStaticNaturalRetainedOwnerKeys = requestedNaturalRetainedOwnerKeys;
+      }
+      const presentedNaturalRetainedOwnerKeys = pendingRenderDistancePublication
+        ? Object.freeze([...new Set([
+          ...appliedStaticNaturalRetainedOwnerKeys,
+          ...requestedNaturalRetainedOwnerKeys,
+        ])])
+        : requestedNaturalRetainedOwnerKeys;
       const naturalStaticStreamCanApply = !naturalStaticStreamSuspended
         && !playerRelocationInProgress;
       if (!naturalStaticStreamActivated && naturalStaticStreamCanApply) {
@@ -2640,9 +2751,7 @@ export async function bootInfiniteWorldSandbox({
             playerLogicalZ: logicalPlayer.z,
             activeDataKeys: committedChunkState.activeDataKeys,
             renderedKeys: committedChunkState.renderedKeys,
-            retainedOwnerKeys: Object.freeze([
-              ...new Set(staticNaturalPolicyPlans.flatMap(policy => policy.allOwnerKeys)),
-            ]),
+            retainedOwnerKeys: presentedNaturalRetainedOwnerKeys,
             resourceKindEntries: naturalStaticStream.resourceKindEntries(),
             policyResourceCoverage: resolveNaturalPresentationPolicyCoverage({
               plan: worldStreamingPlan,
@@ -2896,6 +3005,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       try {
         const frameNow = Number.isFinite(now) ? now : clock();
         if (!farNaturalWarmStarted && diagnosticProfile.distant
+          && pendingRenderDistancePublication === null
           && frameNow >= naturalWarmRetryAt) {
           farNaturalWarmStarted = true;
           recordStaticTreeActivationTime('innerWarmStartedAtMs');
@@ -3024,6 +3134,9 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           logicalPlayer.x,
           logicalPlayer.z,
           frameRenderOrigin,
+        ));
+        diagnostics.measure('render-distance-publication', () => (
+          tryCommitRenderDistancePublication()
         ));
         recordDistantTreeVisibility();
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
@@ -3156,11 +3269,17 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           presentation: presentationSnapshot,
           renderDistanceConsistency: Object.freeze({
             schemaVersion: 'render-distance-consistency-observation-1',
-            requestedPreset: distantRenderDistance,
+            requestedPreset: requestedDistantRenderDistance,
+            appliedPreset: distantRenderDistance,
+            requestedRevision: renderDistanceRequestRevision,
+            publicationPending: pendingRenderDistancePublication !== null,
+            pendingPreset: pendingRenderDistancePublication?.preset ?? null,
+            pendingRequiredNaturalOwnerCount:
+              pendingRenderDistancePublication?.requiredNaturalOwnerKeys?.length ?? 0,
             presets: renderDistancePresets,
             mixed: renderDistanceMixed,
             requestedMismatch: Object.values(renderDistancePresets).some(value => (
-              value !== null && value !== distantRenderDistance
+              value !== null && value !== requestedDistantRenderDistance
             )),
             atomicPublicationRequired: renderDistanceMixed,
           }),

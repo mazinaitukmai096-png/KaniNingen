@@ -1644,23 +1644,46 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
     environment.renderDistanceControl.dispatch('change');
     const switching = sandbox.snapshot();
     assert.equal(switching.renderDistanceConsistency.requestedPreset, 'short');
-    assert.equal(switching.renderDistanceConsistency.presets.fog, 'short');
-    assert.equal(switching.renderDistanceConsistency.mixed, true);
+    assert.equal(switching.renderDistanceConsistency.appliedPreset, 'current');
+    assert.equal(switching.renderDistanceConsistency.presets.fog, 'current');
+    assert.equal(switching.renderDistanceConsistency.mixed, false);
     assert.equal(switching.renderDistanceConsistency.requestedMismatch, true);
-    assert.equal(switching.renderDistanceConsistency.atomicPublicationRequired, true);
+    assert.equal(switching.renderDistanceConsistency.publicationPending, true);
+    assert.equal(switching.renderDistanceConsistency.atomicPublicationRequired, false);
     let switched = sandbox.snapshot();
-    for (let attempt = 0; attempt < 500
+    for (let attempt = 0; attempt < 1_000
       && (switched.presentation.renderDistancePreset !== 'short'
         || switched.presentation.clipmapExtentMeters !== 192
-        || switched.presentation.farSyncPending);
+        || switched.presentation.farSyncPending
+        || switched.renderDistanceConsistency.publicationPending);
       attempt += 1) {
+      environment.rafCallbacks.at(-1)(performance.now() + 100 + attempt * 16);
       await new Promise(resolve => setTimeout(resolve, 10));
       switched = sandbox.snapshot();
     }
     const switchMs = performance.now() - switchStartedAt;
-    assert.equal(switched.presentation.renderDistancePreset, 'short');
+    assert.equal(switched.presentation.renderDistancePreset, 'short', JSON.stringify({
+      consistency: switched.renderDistanceConsistency,
+      presentation: {
+        distant: switched.presentation.distantRenderDistancePreset,
+        local: switched.presentation.localTerrainRenderDistancePreset,
+        natural: switched.presentation.staticNaturalRenderDistancePreset,
+        preparedDistant: switched.presentation.preparedDistantRenderDistancePreset,
+        preparedLocal: switched.presentation.preparedLocalTerrainRenderDistancePreset,
+        stagedNatural: switched.presentation.stagedStaticNaturalRenderDistancePreset,
+      },
+      staticObjectStreaming: switched.staticObjectStreaming,
+    }));
+    assert.equal(switched.renderDistanceConsistency.appliedPreset, 'short', JSON.stringify({
+      boot: switched.boot,
+      consistency: switched.renderDistanceConsistency,
+    }));
+    assert.equal(switched.renderDistanceConsistency.publicationPending, false);
     assert.equal(switched.renderDistanceConsistency.mixed, false);
     assert.equal(switched.renderDistanceConsistency.requestedMismatch, false);
+    assert.equal(switched.staticObjectStreaming.policyCoverage.every(coverage => (
+      coverage.readyRequiredOwnerCount === coverage.requiredOwnerCount
+    )), true, 'atomic publication must wait for every required Natural owner');
     assert.equal(switched.runtime.activeDataCount, 25);
     assert.equal(switched.runtime.renderedCount, 9);
     assert.deepEqual(switched.runtime.activeDataKeys.map(key => {

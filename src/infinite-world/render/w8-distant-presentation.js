@@ -619,6 +619,7 @@ export async function createW8DistantPresentation({
   let persistentDistantPublishedGeneration = null;
   const liveDistantEntries = new Map();
   let pendingDistantPublication = null;
+  let preparedRenderDistanceDistant = null;
   const retiredDistantGenerations = new Set();
   let distantPersistentPublicationCount = 0;
   let distantPersistentReusedMeshCount = 0;
@@ -640,6 +641,7 @@ export async function createW8DistantPresentation({
   let pendingDistantFirstDraw = null;
   const pendingStaticTreeFirstDraw = [];
   let activeLocalTerrainGeneration = null;
+  let preparedRenderDistanceLocalTerrain = null;
   const localTerrainOwnerIndexData = new WeakMap();
   let committedRuntimeTransitionContract = null;
   const acceptRuntimeTransitionContract = transitionContract => {
@@ -4329,6 +4331,7 @@ export async function createW8DistantPresentation({
   };
 
   let persistentTreeGeneration = null;
+  let stagedPersistentNaturalRenderDistancePreset = null;
   const persistentTreePages = new Map();
   const pendingPersistentTreePages = new Map();
   const pendingPersistentTreePublications = new Map();
@@ -4457,6 +4460,48 @@ export async function createW8DistantPresentation({
       naturalPolicyCoverageProvided: false,
       surfacePolicy: currentCanonicalSurfacePolicy,
     };
+  };
+
+  const applyPersistentNaturalRenderDistancePreset = renderDistancePreset => {
+    if (!persistentTreeGeneration) return false;
+    const preset = normalizeW8RenderDistancePreset(renderDistancePreset);
+    persistentTreeGeneration.renderDistancePreset = preset;
+    persistentTreeGeneration.renderDistancePolicy = resolveW8RenderDistancePolicy(preset);
+    persistentTreeGeneration.settlementPresentationPolicy =
+      resolveW8SettlementPresentationPolicy(persistentTreeGeneration.quality, preset);
+    persistentTreeGeneration.naturalLodPolicies.clear();
+    for (const material of new Set(persistentTreeGeneration.naturalLodMaterials.values())) {
+      const mode = material.userData?.naturalLodMode;
+      const kind = material.userData?.naturalLodKind;
+      const uniforms = material.userData?.naturalLodUniforms;
+      if (!mode || !kind || !uniforms) continue;
+      const policy = resolveW8VegetationLodPolicy(kind, preset);
+      const enter = mode === 'horizon'
+        ? policy.horizonEntry
+        : mode === 'forest'
+          ? policy.fullToForest
+          : mode === 'atmospheric'
+            ? (policy.forestToAtmospheric ?? policy.fullToForest)
+            : null;
+      const exit = mode === 'horizon'
+        ? policy.horizonFade
+        : mode === 'full'
+          ? policy.fullToForest
+          : mode === 'forest' ? policy.forestToAtmospheric : policy.atmosphericFade;
+      if (!exit) continue;
+      uniforms.w8NaturalEnterStart.value = enter?.minimum ?? -1;
+      uniforms.w8NaturalEnterEnd.value = enter?.maximum ?? 0;
+      uniforms.w8NaturalExitStart.value = exit.minimum;
+      uniforms.w8NaturalExitEnd.value = exit.maximum;
+      uniforms.w8NaturalFogBlendStart.value = mode === 'horizon'
+        ? policy.horizonEntry.minimum
+        : policy.forestToAtmospheric?.minimum ?? policy.fullToForest.minimum;
+      uniforms.w8NaturalVisibility.value = mode === 'horizon'
+        ? policy.horizonVisibilityMeters : policy.visibilityMeters;
+    }
+    persistentTreeVisibilityDirty = true;
+    stagedPersistentNaturalRenderDistancePreset = null;
+    return true;
   };
 
   const applyPersistentNaturalPolicyCoverage = (generation, coverageEntries) => {
@@ -6960,6 +7005,7 @@ export async function createW8DistantPresentation({
       centerChunkX,
       centerChunkZ,
       renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+      deferPublication = false,
     } = {}) {
       const startedAt = globalThis.performance?.now?.() ?? Date.now();
       localTerrainLastRootSwapDurationMs = 0;
@@ -7147,6 +7193,27 @@ export async function createW8DistantPresentation({
         throw error;
       }
       if (stagingLocalTerrainRootId === localRoot.name) stagingLocalTerrainRootId = null;
+      if (deferPublication) {
+        if (preparedRenderDistanceLocalTerrain) {
+          disposeGeneration(preparedRenderDistanceLocalTerrain.generation);
+        }
+        preparedRenderDistanceLocalTerrain = {
+          generation,
+          previous,
+          reusableMidgroundMesh,
+          requestedEpoch,
+        };
+        localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+        return Object.freeze({
+          committed: false,
+          prepared: true,
+          reused: false,
+          coverageEpoch: requestedEpoch,
+          reason: null,
+          missingOwnerKeys: Object.freeze([]),
+          activeRootId: previous.root.name,
+        });
+      }
       previous.ownedGeometries.delete(reusableMidgroundMesh.geometry);
       generation.ownedGeometries.add(reusableMidgroundMesh.geometry);
       const swapStartedAt = globalThis.performance?.now?.() ?? Date.now();
@@ -7183,6 +7250,8 @@ export async function createW8DistantPresentation({
       includeUltraNatural = true,
       revealNatural = false,
       naturalRevealInnerMeters = 0,
+      deferPublication = false,
+      preserveStaticNatural = false,
     }) {
       if (disposed) throw new Error('distant presentation is disposed');
       const syncStartedAt = globalThis.performance?.now?.() ?? Date.now();
@@ -7276,7 +7345,7 @@ export async function createW8DistantPresentation({
       });
       clipmapSampleCache.clear();
 
-      if (incrementalStaticTreePages) {
+      if (incrementalStaticTreePages && !preserveStaticNatural) {
         if (!persistentTreeGeneration
           || persistentTreeGeneration.quality !== quality
           || persistentTreeGeneration.renderDistancePreset !== requestedRenderDistancePreset) {
@@ -7596,6 +7665,15 @@ export async function createW8DistantPresentation({
       }) : null) ?? Object.freeze([]);
       const rootSwapStartedAt = globalThis.performance?.now?.() ?? Date.now();
       committedEpoch = epoch;
+      if (deferPublication) {
+        if (preparedRenderDistanceDistant) disposeGeneration(
+          preparedRenderDistanceDistant.generation,
+        );
+        preparedRenderDistanceDistant = { generation, previous };
+        generation.syncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - syncStartedAt;
+        pendingFarSyncEpochs.delete(epoch);
+        return true;
+      }
       if (incrementalStaticTreePages && previous && persistentDistantRoot) {
         beginPersistentDistantPublication(generation, previous);
       } else {
@@ -7644,6 +7722,70 @@ export async function createW8DistantPresentation({
         beforeEpoch: syncEpoch + 1,
       });
       return syncEpoch;
+    },
+    stageStaticNaturalRenderDistancePreset(renderDistancePreset) {
+      stagedPersistentNaturalRenderDistancePreset = normalizeW8RenderDistancePreset(
+        renderDistancePreset,
+      );
+      return stagedPersistentNaturalRenderDistancePreset;
+    },
+    isStaticNaturalCoverageReady(ownerKeys = []) {
+      return Array.isArray(ownerKeys) && ownerKeys.every(ownerKey => (
+        persistentTreePublishedOwners.has(ownerKey)
+          && !pendingPersistentTreePages.has(ownerKey)
+          && !pendingPersistentTreePublications.has(ownerKey)
+      ));
+    },
+    commitPreparedRenderDistancePreset(renderDistancePreset) {
+      const preset = normalizeW8RenderDistancePreset(renderDistancePreset);
+      const distant = preparedRenderDistanceDistant;
+      const localTerrain = preparedRenderDistanceLocalTerrain;
+      if (!distant || !localTerrain
+        || distant.generation.renderDistancePreset !== preset
+        || localTerrain.generation.renderDistancePreset !== preset
+        || stagedPersistentNaturalRenderDistancePreset !== preset
+        || distant.previous !== activeGeneration
+        || localTerrain.previous !== activeLocalTerrainGeneration) return false;
+      const distantGeneration = distant.generation;
+      root.add(distantGeneration.root);
+      activeGeneration = distantGeneration;
+      recordDistantPublication(distantGeneration);
+      retireGeneration(distant.previous);
+      persistentDistantRoot = distantGeneration.root;
+      persistentDistantPublishedGeneration = distantGeneration;
+      liveDistantEntries.clear();
+      for (const [key, entry] of directCanonicalMeshEntries(distantGeneration)) {
+        liveDistantEntries.set(key, entry);
+      }
+      for (const [key, entry] of directAuxiliaryMeshEntries(distantGeneration)) {
+        liveDistantEntries.set(key, entry);
+      }
+      const localGeneration = localTerrain.generation;
+      localTerrain.previous.ownedGeometries.delete(
+        localTerrain.reusableMidgroundMesh.geometry,
+      );
+      localGeneration.ownedGeometries.add(localTerrain.reusableMidgroundMesh.geometry);
+      root.add(localGeneration.root);
+      activeLocalTerrainGeneration = localGeneration;
+      committedLocalTerrainEpoch = localTerrain.requestedEpoch;
+      localTerrainCommitCount += 1;
+      retireGeneration(localTerrain.previous);
+      applyPersistentNaturalRenderDistancePreset(preset);
+      localTerrainLastRootSwapDurationMs = 0;
+      preparedRenderDistanceDistant = null;
+      preparedRenderDistanceLocalTerrain = null;
+      return true;
+    },
+    discardPreparedRenderDistancePreset() {
+      if (preparedRenderDistanceDistant) disposeGeneration(
+        preparedRenderDistanceDistant.generation,
+      );
+      if (preparedRenderDistanceLocalTerrain) disposeGeneration(
+        preparedRenderDistanceLocalTerrain.generation,
+      );
+      preparedRenderDistanceDistant = null;
+      preparedRenderDistanceLocalTerrain = null;
+      stagedPersistentNaturalRenderDistancePreset = null;
     },
     applyStaticTreePlan({
       coverageGeneration,
@@ -8079,6 +8221,12 @@ export async function createW8DistantPresentation({
           activeLocalTerrainGeneration?.renderDistancePreset ?? null,
         staticNaturalRenderDistancePreset:
           persistentTreeGeneration?.renderDistancePreset ?? null,
+        preparedDistantRenderDistancePreset:
+          preparedRenderDistanceDistant?.generation?.renderDistancePreset ?? null,
+        preparedLocalTerrainRenderDistancePreset:
+          preparedRenderDistanceLocalTerrain?.generation?.renderDistancePreset ?? null,
+        stagedStaticNaturalRenderDistancePreset:
+          stagedPersistentNaturalRenderDistancePreset,
         quality: activeGeneration?.quality ?? null,
         distantTownProxyCount: 0,
         distantNaturalProxyLimit: DISTANT_ROCK_PROXY_LIMIT,
@@ -8523,6 +8671,15 @@ export async function createW8DistantPresentation({
       syncEpoch += 1;
       localTerrainSyncEpoch += 1;
       cancelCanonicalChunkRequests?.({ consumerId: 'distant-owner-query' });
+      if (preparedRenderDistanceDistant) {
+        disposeGeneration(preparedRenderDistanceDistant.generation);
+        preparedRenderDistanceDistant = null;
+      }
+      if (preparedRenderDistanceLocalTerrain) {
+        disposeGeneration(preparedRenderDistanceLocalTerrain.generation);
+        preparedRenderDistanceLocalTerrain = null;
+      }
+      stagedPersistentNaturalRenderDistancePreset = null;
       disposeGeneration(activeGeneration);
       activeGeneration = null;
       pendingDistantPublication = null;
