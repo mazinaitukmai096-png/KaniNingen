@@ -4791,6 +4791,70 @@ export async function createW8DistantPresentation({
     });
   };
 
+  const suppressPublishedNearDistantBuildings = () => {
+    const generation = persistentDistantPublishedGeneration ?? activeGeneration;
+    if (!generation?.persistentDistant) return 0;
+    const nearStableIds = readNearVisibleSnapshotState().stableIds;
+    if (!nearStableIds.size) return 0;
+    const slotsByBucket = new Map();
+    const hidden = hiddenCanonicalMatrix();
+    for (const stableId of nearStableIds) {
+      const object = generation.canonicalObjects.get(stableId);
+      if (object?.record?.featureType !== 'settlement-building') continue;
+      for (const instance of object.instances) {
+        const { bucket, item } = instance;
+        const slot = item.slot;
+        if (!bucket?.persistent || !bucket.mesh || !Number.isSafeInteger(slot)
+          || bucket.mesh.userData?.canonicalStableIds?.[slot] !== stableId) continue;
+        bucket.mesh.setMatrixAt(slot, hidden);
+        bucket.mesh.userData.canonicalStableIds[slot] = null;
+        if (bucket.mesh.userData.canonicalObjects) {
+          bucket.mesh.userData.canonicalObjects[slot] = null;
+        }
+        if (bucket.mesh.userData.canonicalOpacities) {
+          bucket.mesh.userData.canonicalOpacities[slot] = 0;
+        }
+        writeLocalHandoffOpacity(bucket, slot, 0);
+        if (!slotsByBucket.has(bucket)) slotsByBucket.set(bucket, []);
+        slotsByBucket.get(bucket).push(slot);
+      }
+      generation.distantVisibleStableIds?.delete?.(stableId);
+    }
+    let suppressed = 0;
+    for (const [bucket, slots] of slotsByBucket) {
+      const matrixUpload = markAttributeRanges(bucket.mesh.instanceMatrix, slots, 16);
+      const opacityUpload = markAttributeRanges(bucket.localHandoffOpacityAttribute, slots, 1);
+      const uploadBytes = (matrixUpload?.byteCount ?? 0) + (opacityUpload?.byteCount ?? 0);
+      suppressed += slots.length;
+      bucket.mesh.userData.visibleInstanceCount = (
+        bucket.mesh.userData.canonicalStableIds?.filter(Boolean).length ?? 0
+      );
+      bucket.mesh.boundingBox = null;
+      bucket.mesh.boundingSphere = null;
+      if (typeof bucket.mesh.computeBoundingSphere === 'function') {
+        bucket.mesh.computeBoundingSphere();
+      }
+      distantPersistentMatrixUpdateCount += slots.length;
+      distantPersistentBufferUpdateCount += Number(Boolean(matrixUpload))
+        + Number(Boolean(opacityUpload));
+      distantPersistentUploadByteCount += uploadBytes;
+      distantPersistentMaximumMatrixUpdatesPerFrame = Math.max(
+        distantPersistentMaximumMatrixUpdatesPerFrame,
+        slots.length,
+      );
+      distantPersistentMaximumBufferUpdatesPerFrame = Math.max(
+        distantPersistentMaximumBufferUpdatesPerFrame,
+        Number(Boolean(matrixUpload)) + Number(Boolean(opacityUpload)),
+      );
+      distantPersistentMaximumUploadBytesPerFrame = Math.max(
+        distantPersistentMaximumUploadBytesPerFrame,
+        uploadBytes,
+      );
+      distantPersistentBoundsRecalculationCount += 1;
+    }
+    return suppressed;
+  };
+
   const composePersistentTreeDirtyRanges = (
     generation,
     budgetMs = STATIC_TREE_PAGE_FRAME_BUDGET_MS,
@@ -5642,6 +5706,10 @@ export async function createW8DistantPresentation({
         activeDataKeys,
         renderedKeys,
       )) runtimePresentationHandoffLocalTerrainCount += 1;
+      // The Near registry contains only attached, draw-ready projections.
+      // Suppress matching Building slots before this commit can be rendered;
+      // the remaining ownership/visibility compose stays frame-budgeted.
+      suppressPublishedNearDistantBuildings();
       queueRuntimePresentationHandoff({
         transitionContract: acceptedTransition,
         activeDataKeys,

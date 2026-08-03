@@ -2077,6 +2077,125 @@ test('persistent Distant reuses Settlement slots while Natural remains on Static
   presentation.dispose();
 });
 
+test('revisited Near Building publication suppresses every persistent Distant part before render', async () => {
+  const building = Object.freeze({
+    ...CANONICAL_BUILDING,
+    worldPosition: Object.freeze({ ...CANONICAL_BUILDING.worldPosition, y: 0 }),
+  });
+  const source = canonicalChunk(5, 0, [building]);
+  const visualAssets = createDistantTestVisualAssets();
+  const buildingParts = Object.freeze([
+    CANONICAL_HOUSE_PART,
+    Object.freeze({
+      ...CANONICAL_HOUSE_PART,
+      material: 'lotResidential',
+      position: Object.freeze([0, 0.4, 0]),
+      scale: Object.freeze([0.9, 0.8, 0.9]),
+      materialRole: 'roof',
+    }),
+  ]);
+  visualAssets.resolveBuildingParts = record => (
+    record.buildingType === 'house' ? buildingParts : null
+  );
+  let nearVisibleStableIds = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    incrementalStaticTreePages: true,
+    visualAssets,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has('5,0')) result.chunks.set('5,0', source);
+    return result;
+  };
+  const syncAndDrain = async (state, coverageEpoch) => {
+    assert.equal(presentation.syncLocalTerrain({
+      coverageEpoch,
+      ...state,
+    }).committed, true);
+    assert.equal(await presentation.sync({
+      ...state,
+      quality: 'high',
+      renderDistancePreset: 'current',
+      playerLogicalX: state.centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+      playerLogicalZ: 8,
+    }), true);
+    for (let frame = 0; frame < 128 && (
+      presentation.snapshot().distantPersistentPublicationPending
+        || presentation.snapshot().runtimePresentationHandoffPending
+    ); frame += 1) {
+      presentation.update(
+        state.centerChunkX * LEGACY_CHUNK_SIZE_METERS + 8,
+        8,
+        state.renderOrigin,
+      );
+    }
+    assert.equal(presentation.snapshot().distantPersistentPublicationPending, false);
+    assert.equal(presentation.snapshot().runtimePresentationHandoffPending, false);
+  };
+  const visibleDistantParts = () => {
+    const parts = [];
+    const visit = node => {
+      if (node?.matrices && node.userData?.canonicalStableIds) {
+        node.userData.canonicalStableIds.forEach((stableId, slot) => {
+          if (stableId === building.stableId) parts.push({ mesh: node, slot });
+        });
+      }
+      for (const child of node?.children ?? []) visit(child);
+    };
+    visit(scene);
+    return parts;
+  };
+
+  const initial = coverage(3);
+  await syncAndDrain(initial, 1);
+  assert.ok(visibleDistantParts().length >= 2, 'the outer Building uses multiple live buckets');
+
+  const far = coverage(20);
+  await syncAndDrain(far, 2);
+  assert.equal(visibleDistantParts().length, 0, 'the far departure retires the city Building');
+
+  const revisitedOuter = coverage(3);
+  await syncAndDrain(revisitedOuter, 3);
+  const revisitedParts = visibleDistantParts();
+  assert.ok(revisitedParts.length >= 2, 'the Distant Building republishes on revisit');
+  const wall = revisitedParts.find(({ mesh }) => mesh.name.includes('houseWall'));
+  assert.ok(wall);
+  const wallMatrix = wall.mesh.matrices[wall.slot].value;
+  assert.equal(building.worldPosition.y, 0);
+  assert.equal(
+    wallMatrix.position.y - wallMatrix.scale.y / 2,
+    0,
+    'canonical Y, matrix base Y, and the flat current Terrain height agree',
+  );
+
+  const revisitedNear = coverage(4);
+  assert.equal(presentation.syncLocalTerrain({
+    coverageEpoch: 4,
+    ...revisitedNear,
+  }).committed, true);
+  nearVisibleStableIds = [building.stableId];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: revisitedNear.activeDataKeys,
+    renderedKeys: revisitedNear.renderedKeys,
+    renderOrigin: revisitedNear.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(
+    visibleDistantParts().length,
+    0,
+    'draw-ready Near publication must suppress every old Distant part synchronously',
+  );
+  presentation.dispose();
+});
+
 test('continuous Local Terrain boundaries discard stale builds and shutdown blocks late publication', async () => {
   const pendingYields = [];
   const scene = new DistantTestGroup();
