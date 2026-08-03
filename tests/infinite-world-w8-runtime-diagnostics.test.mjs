@@ -1778,6 +1778,14 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
     playerLogicalZ: 8,
   }), true);
   assert.equal(presentation.snapshot().runtimePresentationHandoffPending, true);
+  const expectedImmediateVisibleOwners = initial.activeDataKeys
+    .filter(key => !reaccelerated.renderedKeys.includes(key))
+    .sort();
+  assert.deepEqual(
+    [...presentation.snapshot().localTerrainHandoffOwnerKeys].sort(),
+    expectedImmediateVisibleOwners,
+    'Near publication must update old Local Terrain coverage before the next render frame',
+  );
   let accelerationFrames = 0;
   while (presentation.snapshot().runtimePresentationHandoffPending
     && accelerationFrames < 128) {

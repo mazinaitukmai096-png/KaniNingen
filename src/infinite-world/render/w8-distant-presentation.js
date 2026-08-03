@@ -5463,13 +5463,14 @@ export async function createW8DistantPresentation({
     quality,
     playerLogicalX,
     playerLogicalZ,
+    initialStage = 'local-terrain',
   }) => {
     if (pendingRuntimePresentationHandoff) {
       runtimePresentationHandoffSupersededCount += 1;
     }
     pendingRuntimePresentationHandoff = {
       sequence: ++runtimePresentationHandoffSequence,
-      stage: 'local-terrain',
+      stage: initialStage,
       transitionContract,
       activeDataKeys: Object.freeze([...activeDataKeys]),
       renderedKeys: Object.freeze([...renderedKeys]),
@@ -5634,6 +5635,13 @@ export async function createW8DistantPresentation({
     positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
     positionGenerationForOrigin(activeGeneration, renderOrigin);
     if (incrementalStaticTreePages) {
+      // Near has already published this contract. Update the retained Local
+      // Terrain indices before a renderer can observe the next frame.
+      if (applyLocalTerrainOwnerHandoff(
+        activeLocalTerrainGeneration,
+        activeDataKeys,
+        renderedKeys,
+      )) runtimePresentationHandoffLocalTerrainCount += 1;
       queueRuntimePresentationHandoff({
         transitionContract: acceptedTransition,
         activeDataKeys,
@@ -5642,6 +5650,7 @@ export async function createW8DistantPresentation({
         quality,
         playerLogicalX,
         playerLogicalZ,
+        initialStage: 'ownership',
       });
       return true;
     }
