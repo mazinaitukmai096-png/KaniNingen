@@ -48,6 +48,7 @@ export function createStreamingOwnerMetadataCache({
   const diagnosticsAreEnabled = asEnabled(diagnosticsEnabled);
   const coordinates = new Map();
   const classifications = new Map();
+  const classificationsByRevision = new Map();
   let frameId = null;
   let frameParsedInputs = null;
   let frameClassifiedInputs = null;
@@ -121,6 +122,36 @@ export function createStreamingOwnerMetadataCache({
     return descriptor;
   };
 
+  const deleteClassification = descriptor => {
+    classifications.delete(descriptor);
+    const revisionEntries = classificationsByRevision.get(descriptor.classificationRevision);
+    const policyEntries = revisionEntries?.get(descriptor.policyKind);
+    if (policyEntries?.get(descriptor.ownerKey) !== descriptor) return;
+    policyEntries.delete(descriptor.ownerKey);
+    if (policyEntries.size === 0) revisionEntries.delete(descriptor.policyKind);
+    if (revisionEntries.size === 0) {
+      classificationsByRevision.delete(descriptor.classificationRevision);
+    }
+  };
+
+  const cacheClassification = descriptor => {
+    let revisionEntries = classificationsByRevision.get(descriptor.classificationRevision);
+    if (!revisionEntries) {
+      revisionEntries = new Map();
+      classificationsByRevision.set(descriptor.classificationRevision, revisionEntries);
+    }
+    let policyEntries = revisionEntries.get(descriptor.policyKind);
+    if (!policyEntries) {
+      policyEntries = new Map();
+      revisionEntries.set(descriptor.policyKind, policyEntries);
+    }
+    policyEntries.set(descriptor.ownerKey, descriptor);
+    classifications.set(descriptor, descriptor);
+    while (classifications.size > maximumClassificationCount) {
+      deleteClassification(classifications.keys().next().value);
+    }
+  };
+
   const classify = ({
     ownerKey,
     policyKind,
@@ -132,9 +163,9 @@ export function createStreamingOwnerMetadataCache({
     const kind = nonEmptyString(policyKind, 'policyKind');
     const classificationRevision = nonEmptyString(revision, 'revision');
     if (typeof classifier !== 'function') throw new TypeError('classifier is required');
-    const cacheKey = `${classificationRevision}\n${kind}\n${key}`;
     const diagnostic = ensureMetrics();
     if (diagnostic) {
+      const cacheKey = `${classificationRevision}\n${kind}\n${key}`;
       diagnostic.classifyCalls += 1;
       diagnostic.classifyInputs.add(cacheKey);
       increment(diagnostic.classifyCallsByPath, path);
@@ -142,10 +173,13 @@ export function createStreamingOwnerMetadataCache({
       if (frameClassifiedInputs?.has(cacheKey)) diagnostic.classifySameFrameDuplicates += 1;
       else frameClassifiedInputs?.add(cacheKey);
     }
-    const cached = reuseClassifications ? classifications.get(cacheKey) : null;
+    const cached = reuseClassifications
+      ? classificationsByRevision.get(classificationRevision)?.get(kind)?.get(key)
+      : null;
     if (cached) {
       if (diagnostic) diagnostic.classifyHits += 1;
-      return touch(classifications, cacheKey, cached);
+      touch(classifications, cached, cached);
+      return cached;
     }
     const coordinate = parse(key, { path: `${path}:coordinate` });
     const resourceKind = classifier(coordinate);
@@ -163,8 +197,7 @@ export function createStreamingOwnerMetadataCache({
       diagnostic.descriptorAllocations += 1;
     }
     if (reuseClassifications) {
-      classifications.set(cacheKey, descriptor);
-      trim(classifications, maximumClassificationCount);
+      cacheClassification(descriptor);
     }
     return descriptor;
   };
@@ -202,11 +235,20 @@ export function createStreamingOwnerMetadataCache({
   const retainClassificationRevision = ({ revision, descriptors = [] } = {}) => {
     const classificationRevision = nonEmptyString(revision, 'revision');
     if (!Array.isArray(descriptors)) throw new TypeError('descriptors must be an array');
-    const retained = new Set(descriptors.map(descriptor => (
-      `${classificationRevision}\n${descriptor.policyKind}\n${descriptor.ownerKey}`
-    )));
-    for (const key of classifications.keys()) {
-      if (!retained.has(key)) classifications.delete(key);
+    const retainedByPolicy = new Map();
+    for (const descriptor of descriptors) {
+      let retainedOwners = retainedByPolicy.get(descriptor.policyKind);
+      if (!retainedOwners) {
+        retainedOwners = new Set();
+        retainedByPolicy.set(descriptor.policyKind, retainedOwners);
+      }
+      retainedOwners.add(descriptor.ownerKey);
+    }
+    for (const descriptor of classifications.keys()) {
+      if (descriptor.classificationRevision !== classificationRevision
+        || !retainedByPolicy.get(descriptor.policyKind)?.has(descriptor.ownerKey)) {
+        deleteClassification(descriptor);
+      }
     }
     return classifications.size;
   };
@@ -214,6 +256,7 @@ export function createStreamingOwnerMetadataCache({
   const invalidateClassifications = () => {
     const size = classifications.size;
     classifications.clear();
+    classificationsByRevision.clear();
     return size;
   };
 
