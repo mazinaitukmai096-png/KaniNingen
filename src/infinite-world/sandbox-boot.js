@@ -98,6 +98,20 @@ import {
 import { createWebGLRenderDiagnostics } from './webgl-render-diagnostics.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
+const HUD_DIAGNOSTIC_STAGE_NAMES = Object.freeze([
+  'chunk-transition',
+  'chunk-prefetch',
+  'distant-sync',
+  'gameplay-sync',
+  'gameplay-update',
+  'save-total',
+  'render',
+  'distant-clear',
+  'distant-midground-terrain',
+  'distant-midground-features',
+  'distant-clipmap',
+  'distant-feature-proxies',
+]);
 export const SANDBOX_RUNTIME_BUILD_IDENTITY = Object.freeze({
   schemaVersion: 'infinite-world-runtime-build-identity-1',
   sourceRevision: 'w8-real-webgl-draw-audit-1',
@@ -3532,19 +3546,17 @@ export async function bootInfiniteWorldSandbox({
         ...(renderResources.renderCoverage?.loadedKeys ?? []).filter(key => !renderedKeySet.has(key)),
       ].sort();
       const measurementReport = diagnosticMeasure(
-        'diagnostics-snapshot',
-        () => diagnostics.snapshot({
+        'diagnostics-hud-summary',
+        () => diagnostics.hudSnapshot({
           drawCalls: renderInfo?.render?.calls ?? null,
           triangles: renderInfo?.render?.triangles ?? null,
           geometries: renderInfo?.memory?.geometries ?? null,
           materials: renderResources.sharedMaterialCount,
           sceneObjects: countSceneObjects(scene),
-        }),
+        }, HUD_DIAGNOSTIC_STAGE_NAMES),
       );
       const stageP95 = stage => number(measurementReport.stages[stage]?.p95);
-      const longTaskMaximum = measurementReport.longTasks.reduce(
-        (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
-      );
+      const longTaskMaximum = measurementReport.longTaskMaximumMs;
       if (measurement.status === 'complete' && streamingAcceptanceMetrics === null) {
         streamingAcceptanceMetrics = collectStreamingAcceptanceMetrics();
       }
@@ -3552,7 +3564,7 @@ export async function bootInfiniteWorldSandbox({
         ? `\nMeasurement: ${measurement.mode} ${measurement.status}  1920x1080  warm-up 10s + sample 60s`
         : '';
       const diagnosticText = diagnostics.enabled
-        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nMeasurement frame count/p50/p95/p99/max: ${measurementReport.frame.count} / ${number(measurementReport.frame.p50)} / ${number(measurementReport.frame.p95)} / ${number(measurementReport.frame.p99)} / ${number(measurementReport.frame.max)} ms\nLong Tasks count/max: ${measurementReport.longTasks.length} / ${number(longTaskMaximum)} ms  Resources draw/triangles/geometry/material/scene: ${measurementReport.resources.drawCalls ?? 'n/a'} / ${measurementReport.resources.triangles ?? 'n/a'} / ${measurementReport.resources.geometries ?? 'n/a'} / ${measurementReport.resources.materials ?? 'n/a'} / ${measurementReport.resources.sceneObjects ?? 'n/a'}\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
+        ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nMeasurement frame count/p50/p95/p99/max: ${measurementReport.frame.count} / ${number(measurementReport.frame.p50)} / ${number(measurementReport.frame.p95)} / ${number(measurementReport.frame.p99)} / ${number(measurementReport.frame.max)} ms\nLong Tasks count/max: ${measurementReport.longTaskCount} / ${number(longTaskMaximum)} ms  Resources draw/triangles/geometry/material/scene: ${measurementReport.resources.drawCalls ?? 'n/a'} / ${measurementReport.resources.triangles ?? 'n/a'} / ${measurementReport.resources.geometries ?? 'n/a'} / ${measurementReport.resources.materials ?? 'n/a'} / ${measurementReport.resources.sceneObjects ?? 'n/a'}\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
         : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';

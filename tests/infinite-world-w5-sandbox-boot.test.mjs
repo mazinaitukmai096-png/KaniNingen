@@ -2299,6 +2299,10 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
+  assert.match(boot, /diagnosticMeasure\(\s*'diagnostics-hud-summary',[\s\S]*diagnostics\.hudSnapshot\(/,
+    'HUD reads only the bounded diagnostics summary');
+  assert.equal((boot.match(/diagnostics\.snapshot\(/g) ?? []).length, 1,
+    'the full diagnostics snapshot is reserved for the explicit sandbox snapshot API');
   assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);[\s\S]*?const gameplaySync[\s\S]*?synchronizeLocalTerrain/g) ?? []).length, 1,
     'explicit runtime relocation starts atomic Gameplay staging before Local/Far compose');
   assert.match(boot, /const gameplayRebase = gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(nextState\);[\s\S]{0,600}?\n\s*await gameplayRebase;/,

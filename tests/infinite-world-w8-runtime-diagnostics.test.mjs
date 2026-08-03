@@ -734,6 +734,24 @@ test('MeasurementReport correlates stage samples with hitch frames and reports p
   });
   assert.equal(report.stages.render.count, 2);
   assert.equal(report.resources.geometries, 7);
+  const hudReport = diagnostics.hudSnapshot(
+    { geometries: 7 },
+    ['render', 'save-serialization', 'missing', 'render'],
+  );
+  assert.equal(hudReport.schemaVersion, 'w8-hud-measurement-summary-1');
+  assert.equal(hudReport.frame.p95, 56);
+  assert.equal(hudReport.hitchRatio, 0.5);
+  assert.equal(hudReport.stages.render.count, 2);
+  assert.equal(hudReport.stages['save-serialization'].p95, 44);
+  assert.equal(hudReport.stages.missing.count, 0);
+  assert.deepEqual(Object.keys(hudReport.stages), ['render', 'save-serialization', 'missing']);
+  assert.equal(hudReport.longTaskCount, 0);
+  assert.equal(hudReport.longTaskMaximumMs, 0);
+  assert.equal(hudReport.resources.geometries, 7);
+  assert.equal('frames' in hudReport, false);
+  assert.equal('work' in hudReport, false);
+  assert.equal('events' in hudReport, false);
+  assert.equal('browserFrameAttribution' in hudReport, false);
   diagnostics.dispose();
 });
 

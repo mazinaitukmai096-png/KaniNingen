@@ -419,6 +419,25 @@ export function createW8RuntimeDiagnostics({
         browserFrameAttribution: browserFrames.snapshot(),
       });
     },
+    hudSnapshot(resources = {}, stageNames = []) {
+      const stages = {};
+      for (const stage of stageNames) {
+        if (typeof stage !== 'string' || !stage || stages[stage]) continue;
+        stages[stage] = distribution(stageSamples.get(stage) ?? []);
+      }
+      const frame = distribution(frameSamples);
+      return Object.freeze({
+        schemaVersion: 'w8-hud-measurement-summary-1',
+        frame,
+        hitchRatio: frame.count ? hitches.length / frame.count : 0,
+        stages: Object.freeze(stages),
+        longTaskCount: longTasks.length,
+        longTaskMaximumMs: longTasks.reduce(
+          (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
+        ),
+        resources: Object.freeze({ ...resources }),
+      });
+    },
     dispose() {
       observer?.disconnect?.();
       observer = null;
