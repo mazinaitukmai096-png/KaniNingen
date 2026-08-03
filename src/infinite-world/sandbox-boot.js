@@ -2947,7 +2947,7 @@ export async function bootInfiniteWorldSandbox({
     addWindowListener('resize', resize);
     addWindowListener('pagehide', handlePageHide);
 
-    function requestTransition(owner, movement = null) {
+    function requestTransition(owner, movement = null, { required = false } = {}) {
       if (transitionTargetKey
         || runtime.isCenteredAt(owner.chunkX, owner.chunkZ)) return;
       transitionTargetKey = owner.key;
@@ -2964,7 +2964,7 @@ export async function bootInfiniteWorldSandbox({
       });
       diagnostics.measureAsync(
         'chunk-transition',
-        () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ),
+        () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ, { required }),
       )
         .then(async () => {
           const nextState = runtime.getCommittedChunkState();
@@ -3012,7 +3012,7 @@ export async function bootInfiniteWorldSandbox({
         ).catch(error => { transitionError = error; })
           .finally(() => directionalPrefetchPending.delete(owner.key));
       }
-      requestTransition(owner, movement);
+      requestTransition(owner, movement, { required: true });
     }
 
     function requestDirectionalPrefetch(movement) {

@@ -129,9 +129,15 @@ export class ChunkRuntimeManager {
     return this.transitionToChunk(centerChunkX, centerChunkZ);
   }
 
-  transitionToChunk(chunkXInput, chunkZInput) {
+  transitionToChunk(chunkXInput, chunkZInput, { required = false } = {}) {
     const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'centerChunkX');
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'centerChunkZ');
+    if (typeof required !== 'boolean') throw new TypeError('required must be a boolean');
+    const key = createChunkKey(chunkX, chunkZ);
+    if (required) {
+      const prepared = this.preparedTransitions.get(key);
+      if (prepared && !prepared.discarded) prepared.required = true;
+    }
     this.counts.transitionsRequested += 1;
     if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-requested', {
       ownerKey: createChunkKey(chunkX, chunkZ),
@@ -143,7 +149,11 @@ export class ChunkRuntimeManager {
       preparationPendingCount: this.preparationPendingCount,
     });
     this.transitionPendingCount += 1;
-    const operation = this.transitionChain.then(() => this.#performTransition(chunkX, chunkZ))
+    const operation = this.transitionChain.then(() => this.#performTransition(
+      chunkX,
+      chunkZ,
+      { required },
+    ))
       .finally(() => { this.transitionPendingCount -= 1; });
     this.transitionChain = operation.catch(() => {});
     return operation;
@@ -225,6 +235,7 @@ export class ChunkRuntimeManager {
       dataCoordinates: squareChunkCoordinates(chunkX, chunkZ, 2),
       renderCoordinates: squareChunkCoordinates(chunkX, chunkZ, 1),
       projectedByKey: new Map(),
+      required: false,
       ready: false,
       discarded: false,
       released: false,
@@ -417,7 +428,7 @@ export class ChunkRuntimeManager {
           epoch: plan.epoch,
         });
         this.counts.preparedProjections += 1;
-        if (yieldBetweenUnits) await this.yieldToHost();
+        if (yieldBetweenUnits && !plan.required) await this.yieldToHost();
       }
       if (plan.discarded) {
         await this.#discardPreparedTransition(plan);
@@ -477,7 +488,7 @@ export class ChunkRuntimeManager {
     return missing;
   }
 
-  async #ensurePreparedTransition(chunkX, chunkZ, { initial }) {
+  async #ensurePreparedTransition(chunkX, chunkZ, { initial, required = false }) {
     const key = createChunkKey(chunkX, chunkZ);
     this.preferredPreparationKey = key;
     const stalePlans = this.#markUnpreferredPlans(key);
@@ -486,6 +497,7 @@ export class ChunkRuntimeManager {
     if (!plan || plan.fromCenterKey !== currentKey || plan.discarded) {
       if (plan) await this.#discardPreparedTransition(plan);
       plan = this.#createPreparedTransitionPlan(chunkX, chunkZ, currentKey);
+      plan.required = required;
       this.preparedTransitions.set(key, plan);
       this.preparationPendingCount += 1;
       const operation = this.preparationChain.then(async () => {
@@ -495,6 +507,7 @@ export class ChunkRuntimeManager {
       plan.promise = operation;
       this.preparationChain = operation.catch(() => {});
     }
+    if (required) plan.required = true;
     const prepared = await plan.promise;
     for (const stale of stalePlans) await this.#discardPreparedTransition(stale);
     if (!prepared || prepared.discarded || !prepared.ready) {
@@ -503,7 +516,7 @@ export class ChunkRuntimeManager {
     return prepared;
   }
 
-  async #performTransition(chunkX, chunkZ) {
+  async #performTransition(chunkX, chunkZ, { required = false } = {}) {
     if (this.isShutdown) throw new Error('chunk runtime manager is shut down');
     if (this.centerChunkX === chunkX && this.centerChunkZ === chunkZ) {
       await this.#releaseObsoleteRenderOwners(this.renderedKeys, []);
@@ -515,7 +528,7 @@ export class ChunkRuntimeManager {
     const before = { ...this.counts };
     const usePreparedTransition = this.#canPrepareTransition(chunkX, chunkZ);
     const prepared = usePreparedTransition
-      ? await this.#ensurePreparedTransition(chunkX, chunkZ, { initial }) : null;
+      ? await this.#ensurePreparedTransition(chunkX, chunkZ, { initial, required }) : null;
     const startedAt = this.clock();
     if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-transition-commit-started', {
       ownerKey: createChunkKey(chunkX, chunkZ),

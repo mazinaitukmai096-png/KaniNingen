@@ -91,6 +91,27 @@ async function createRuntime(seed, { onPipelineEvent = null } = {}) {
   return { runtime, adapter, calls, chunkDataService };
 }
 
+async function countPreparationYields(seed, transitionOptions = null) {
+  const source = await createSandboxChunkGenerator({ worldSeed: seed });
+  const adapter = new PreparedAdapter();
+  let yieldCount = 0;
+  const runtime = new ChunkRuntimeManager({
+    generator: source,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    yieldToHost: () => {
+      yieldCount += 1;
+      return Promise.resolve();
+    },
+  });
+  await runtime.initialize(0, 0);
+  yieldCount = 0;
+  if (transitionOptions === null) await runtime.prepareTransition(1, 0);
+  else await runtime.transitionToChunk(1, 0, transitionOptions);
+  await runtime.shutdown();
+  return yieldCount;
+}
+
 test('P0 reproduction contract fixes the reported seed, movement variants, crossings, and save variants', () => {
   assert.equal(P1_CHUNK_STREAMING_REPRODUCTION.worldSeed, 'KaniNingen Infinite Natural World');
   assert.deepEqual(P1_CHUNK_STREAMING_REPRODUCTION.scaleStages, ['TINY', 'MID', 'MAX']);
@@ -144,6 +165,12 @@ test('MAX Sprint starts preparation before the boundary, deduplicates it, and co
   assert.ok(runtime.snapshot().chunkDataService.counts.transportCalls >= calls.length);
   await runtime.shutdown();
   await chunkDataService.shutdown();
+});
+
+test('required transition skips only projection yields while normal transition and prefetch keep them', async () => {
+  assert.equal(await countPreparationYields('p1-prefetch-yields'), 8);
+  assert.equal(await countPreparationYields('p1-normal-transition-yields', {}), 8);
+  assert.equal(await countPreparationYields('p1-required-transition-yields', { required: true }), 5);
 });
 
 test('new-territory diagnostics preserve request, ready, Terrain prepare, attach, verification, and release order', async () => {
