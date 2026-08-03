@@ -66,7 +66,7 @@ test('origin transform diagnostics retain only bounded anomaly pre/post frames',
   assert.deepEqual(snapshot.incidents[0].frames.map(frame => frame.frameSequence), [1, 2, 3, 4, 5]);
   assert.deepEqual(snapshot.incidents[0].anomalyCodes, ['distant-origin-revision']);
   assert.equal(snapshot.latest.frameSequence, 5);
-  assert.equal(snapshot.buildIdentity.sourceRevision, 'w8-origin-transform-audit-1');
+  assert.equal(snapshot.buildIdentity.sourceRevision, 'w8-real-webgl-draw-audit-1');
 });
 
 test('Player terrain coverage gate retains the last formal position and height until ready', () => {
@@ -763,7 +763,12 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.boot.stage, 'Ready');
     assert.equal(snapshot.boot.initializationComplete, true);
     assert.equal(snapshot.boot.loopStarted, true);
-    assert.equal(snapshot.runtimeBuildIdentity.sourceRevision, 'w8-origin-transform-audit-1');
+    assert.equal(snapshot.runtimeBuildIdentity.sourceRevision, 'w8-real-webgl-draw-audit-1');
+    assert.equal(snapshot.webglRenderDiagnostics.enabled, false,
+      'FakeThree must never activate real WebGL draw diagnostics');
+    assert.equal(snapshot.webglRenderDiagnostics.supported, false);
+    assert.equal(snapshot.webglRenderDiagnostics.captureCount, 0,
+      'diagnostics must not traverse a FakeThree scene as a WebGL frame');
     assert.equal(snapshot.originTransformDiagnostics.latest.frameSequence, 0);
     assert.deepEqual(snapshot.originTransformDiagnostics.latest.anomalyCodes, []);
     assert.equal(snapshot.originTransformDiagnostics.latest.activeFeatureFlags.settlementStreamingMode,

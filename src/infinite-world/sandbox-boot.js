@@ -95,12 +95,13 @@ import {
   BUILDING_SETTLEMENT_STREAM_MODE,
   createBuildingSettlementStream,
 } from './building-settlement-stream.js';
+import { createWebGLRenderDiagnostics } from './webgl-render-diagnostics.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 export const SANDBOX_RUNTIME_BUILD_IDENTITY = Object.freeze({
   schemaVersion: 'infinite-world-runtime-build-identity-1',
-  sourceRevision: 'w8-origin-transform-audit-1',
-  requiredAncestorCommits: Object.freeze(['28e0a22', '638703d']),
+  sourceRevision: 'w8-real-webgl-draw-audit-1',
+  requiredAncestorCommits: Object.freeze(['28e0a22', '638703d', 'a06e278']),
   htmlEntry: 'infinite-world-sandbox.html',
   moduleEntry: 'src/infinite-world/sandbox-entry.js?v=w8-finite-parity',
 });
@@ -887,6 +888,9 @@ export async function bootInfiniteWorldSandbox({
   diagnosticsEnabled = measurementMode !== null
     || new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnostics') === '1'
     || diagnosticProfile.profileId !== 'baseline',
+  forceFirstWebGLDiagnosticIncident = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('webglDiagnosticForceIncident') === '1',
   streamingTelemetryEnabled = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('streamingTelemetry') === '1',
@@ -951,6 +955,7 @@ export async function bootInfiniteWorldSandbox({
   let localTerrainCoverageEpoch = 0;
   let audioDirector = null;
   let diagnostics = null;
+  let webglRenderDiagnostics = null;
   const originTransformDiagnostics = createOriginTransformDiagnosticRing();
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
@@ -1863,6 +1868,54 @@ export async function bootInfiniteWorldSandbox({
     if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY) {
       distantPresentation.useLegacyBuildingSettlementPublication?.();
     }
+    webglRenderDiagnostics = createWebGLRenderDiagnostics({
+      enabled: diagnostics.enabled,
+      THREE,
+      renderer,
+      scene,
+      camera,
+      canvas: renderer.domElement,
+      buildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
+      clock,
+      forceFirstIncident: forceFirstWebGLDiagnosticIncident,
+      publishProof(frame, ringSnapshot) {
+        const dataset = globalObject.document?.documentElement?.dataset;
+        if (!dataset) return;
+        const firstInstanced = frame.meshDrawState.find(mesh => (
+          mesh.count > 0 && mesh.instanceMatrixGpuVersion !== null
+        )) ?? frame.meshDrawState.find(mesh => (
+          mesh.count > 0 && mesh.instanceMatrixVersion !== null
+        ));
+        dataset.infiniteWorldWebglProof = JSON.stringify({
+          realWebGLRenderer: true,
+          frameSequence: frame.frameSequence,
+          rendererInfo: frame.rendererInfo,
+          rootCount: frame.sceneDrawState.roots.length,
+          meshCount: frame.meshDrawState.length,
+          allRenderableMainDrawCount: frame.sceneDrawState.allRenderableMainDrawCount,
+          roleDrawCounts: frame.sceneDrawState.roleDrawCounts,
+          firstInstanced: firstInstanced ? {
+            name: firstInstanced.name,
+            role: firstInstanced.role,
+            count: firstInstanced.count,
+            instanceMatrixVersion: firstInstanced.instanceMatrixVersion,
+            instanceMatrixGpuVersion: firstInstanced.instanceMatrixGpuVersion,
+            actualDrawCount: firstInstanced.actualDrawCount,
+            gpuBufferUploadCount: firstInstanced.gpuBufferUploadCount,
+            gpuBufferUploadBytes: firstInstanced.gpuBufferUploadBytes,
+          } : null,
+          anomalyCodes: frame.anomalyCodes,
+          screenshot: ringSnapshot.canvasScreenshot ? {
+            mimeType: ringSnapshot.canvasScreenshot.mimeType,
+            width: ringSnapshot.canvasScreenshot.width,
+            height: ringSnapshot.canvasScreenshot.height,
+            dataUrlPrefix: ringSnapshot.canvasScreenshot.dataUrl?.slice(0, 32) ?? null,
+            dataUrlLength: ringSnapshot.canvasScreenshot.dataUrl?.length ?? 0,
+            error: ringSnapshot.canvasScreenshot.error,
+          } : null,
+        });
+      },
+    });
     state.chunkGenerationMs = runtimeContext.getChunkGenerationMs();
     state.renderProjectionMs = runtimeContext.getRenderProjectionMs();
 
@@ -3792,7 +3845,32 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             playerMarker.position.z,
           );
         }
-        renderer.render(scene, camera);
+        let webglCapture = null;
+        if (webglRenderDiagnostics?.enabled) {
+          const runtimeState = runtime.getCommittedChunkState();
+          webglCapture = webglRenderDiagnostics.beginFrame({
+            frameSequence: settlementStreamingFrameSequence,
+            transitionGeneration: runtimeState.transitionContract?.generation ?? null,
+            renderOriginRevision: runtimeState.renderOrigin?.rebaseCount ?? null,
+            playerLogicalPosition: Object.freeze({ x: logicalPlayer.x, z: logicalPlayer.z }),
+            currentOwnerKey: `${runtimeState.centerChunkX},${runtimeState.centerChunkZ}`,
+            worldExpected: !titleActive && runtimeState.renderedKeys.length > 0,
+          });
+        }
+        try {
+          renderer.render(scene, camera);
+        } finally {
+          if (webglCapture) {
+            try {
+              webglRenderDiagnostics.finishFrame(webglCapture);
+            } catch (error) {
+              diagnostics.recordEvent('webgl-render-diagnostic-failed', {
+                name: error?.name ?? 'Error',
+                message: error?.message ?? String(error),
+              });
+            }
+          }
+        }
         if (staticTreeActivationTimeline.firstPersistentTreePublishAtMs !== null) {
           recordStaticTreeActivationTime('firstPersistentTreeDrawAtMs');
         }
@@ -3886,6 +3964,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
           diagnostics.reset();
           originTransformDiagnostics.reset();
+          webglRenderDiagnostics?.reset();
           streamingTelemetry.clear();
           streamingAcceptanceMetrics = null;
           diagnostics.startFrame(frameNow);
@@ -4103,6 +4182,21 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           presentation: presentationSnapshot,
           runtimeBuildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
           originTransformDiagnostics: originTransformDiagnostics.snapshot(),
+          webglRenderDiagnostics: webglRenderDiagnostics?.snapshot() ?? Object.freeze({
+            schemaVersion: 'webgl-render-diagnostics-1',
+            buildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
+            enabled: false,
+            supported: false,
+            realWebGLRenderer: false,
+            captureCount: 0,
+            latest: null,
+            incidents: Object.freeze([]),
+            pendingIncident: null,
+            rendererInfo: null,
+            sceneDrawState: null,
+            meshDrawState: null,
+            canvasScreenshot: null,
+          }),
           presentationDiagnostics: Object.freeze({
             schemaVersion: 'w8-browser-acceptance-diagnostics-1',
             browserAcceptance: 'FAIL',
