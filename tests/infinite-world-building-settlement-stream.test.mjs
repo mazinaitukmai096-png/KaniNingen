@@ -36,7 +36,7 @@ const observation = Object.freeze({
   invalidRoadLinkageCount: 0,
 });
 
-function plan(sequence = 1, source = observation) {
+function plan(sequence = 1, source = observation, originGeneration = 1) {
   return createWorldStreamingPlan({
     sequence,
     generatedAtMs: sequence,
@@ -44,7 +44,7 @@ function plan(sequence = 1, source = observation) {
     velocity: { x: 0, z: 0 },
     renderDistancePreset: 'current',
     stateRevision: sequence,
-    originGeneration: 1,
+    originGeneration,
     policies: createW8BuildingSettlementShadowPolicies({
       readObservation: () => source,
     }).map(validateWorldStreamingPolicy),
@@ -73,7 +73,9 @@ test('transactional staging remains detached and legacy is the only publisher', 
   });
   assert.equal(staged.ownerKeys.length, 2);
   assert.equal(stream.snapshot().mode, BUILDING_SETTLEMENT_STREAM_MODE.SHADOW);
-  assert.equal(stream.commit({ planId: staged.planId, renderDistanceRevision: 3 }), false);
+  assert.equal(stream.commit({
+    planId: staged.planId, originGeneration: 1, renderDistanceRevision: 3,
+  }), false);
   assert.equal(publishCount, 0);
   assert.equal(stream.snapshot().counts.ready, 1);
   await stream.dispose();
@@ -143,7 +145,9 @@ test('legacy and shared modes preserve identical owner, Stable ID, Road, and dam
       observation,
       renderDistanceRevision: 0,
     });
-    stream.commit({ planId: stage.planId, renderDistanceRevision: 0 });
+    stream.commit({
+      planId: stage.planId, originGeneration: 1, renderDistanceRevision: 0,
+    });
     const result = {
       ownerKeys: stage.ownerKeys,
       stableIds: stage.stableIds,
@@ -237,9 +241,46 @@ test('superseded async staging is discarded and shared publication is exclusive'
   assert.equal(await firstPromise, null);
   resolvers[1]();
   const second = await secondPromise;
-  assert.equal(stream.commit({ planId: second.planId, renderDistanceRevision: 1 }), false);
-  assert.equal(stream.commit({ planId: second.planId, renderDistanceRevision: 2 }), true);
+  assert.equal(stream.commit({
+    planId: second.planId, originGeneration: 1, renderDistanceRevision: 1,
+  }), false);
+  assert.equal(stream.commit({
+    planId: second.planId, originGeneration: 1, renderDistanceRevision: 2,
+  }), true);
   assert.equal(published.planId, second.planId);
+  assert.equal(stream.snapshot().counts.cancelled, 1);
+  assert.equal(stream.snapshot().counts.stale, 2);
+  await stream.dispose();
+});
+
+test('Terrain transition generation supersedes same-content Building staging', async () => {
+  const resolvers = [];
+  let published = null;
+  const stream = createBuildingSettlementStream({
+    initialMode: BUILDING_SETTLEMENT_STREAM_MODE.SHARED,
+    buildStage: context => new Promise(resolve => resolvers.push(
+      () => resolve(validPayload(context.observation)),
+    )),
+    publishStage: stage => { published = stage; return true; },
+  });
+  const oldPromise = stream.applyShadowPlan({
+    plan: plan(1, observation, 7), observation, renderDistanceRevision: 0,
+  });
+  const currentPromise = stream.applyShadowPlan({
+    plan: plan(2, observation, 8), observation, renderDistanceRevision: 0,
+  });
+  resolvers[0]();
+  assert.equal(await oldPromise, null, 'old Terrain generation must stay detached');
+  resolvers[1]();
+  const current = await currentPromise;
+  assert.equal(stream.commit({
+    planId: current.planId, originGeneration: 7, renderDistanceRevision: 0,
+  }), false, 'old Terrain generation cannot publish the current Building stage');
+  assert.equal(published, null);
+  assert.equal(stream.commit({
+    planId: current.planId, originGeneration: 8, renderDistanceRevision: 0,
+  }), true);
+  assert.equal(published.originGeneration, 8);
   assert.equal(stream.snapshot().counts.cancelled, 1);
   assert.equal(stream.snapshot().counts.stale, 2);
   await stream.dispose();

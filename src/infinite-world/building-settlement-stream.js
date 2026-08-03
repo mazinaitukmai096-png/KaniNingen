@@ -16,7 +16,7 @@ function stableSignature(plan, observation) {
   if (typeof observation.contentHash !== 'string' || !observation.contentHash) {
     throw new TypeError('Building/Settlement observation contentHash is required');
   }
-  return `${plan.renderDistancePreset}:${observation.contentHash}`;
+  return `${plan.originGeneration}:${plan.renderDistancePreset}:${observation.contentHash}`;
 }
 
 function sameRecords(left = [], right = [], fields = []) {
@@ -132,6 +132,7 @@ export function createBuildingSettlementStream({
         schemaVersion: 'building-settlement-stage-1',
         sequence: requestSequence,
         planId: plan.planId,
+        originGeneration: plan.originGeneration,
         renderDistancePreset: plan.renderDistancePreset,
         renderDistanceRevision,
         contentHash: observation.contentHash,
@@ -166,9 +167,10 @@ export function createBuildingSettlementStream({
       mode = nextMode;
       return mode;
     },
-    commit({ planId, renderDistanceRevision } = {}) {
+    commit({ planId, originGeneration, renderDistanceRevision } = {}) {
       if (mode !== BUILDING_SETTLEMENT_STREAM_MODE.SHARED || !readyStage) return false;
       if (readyStage.planId !== planId
+        || readyStage.originGeneration !== originGeneration
         || readyStage.renderDistanceRevision !== renderDistanceRevision) {
         counts.stale += 1;
         return false;
@@ -180,6 +182,7 @@ export function createBuildingSettlementStream({
     readyTicket() {
       return readyStage ? Object.freeze({
         planId: readyStage.planId,
+        originGeneration: readyStage.originGeneration,
         renderDistancePreset: readyStage.renderDistancePreset,
         renderDistanceRevision: readyStage.renderDistanceRevision,
         observation: readyStage.observation,
@@ -194,6 +197,7 @@ export function createBuildingSettlementStream({
         readyStage: readyStage ? Object.freeze({
           sequence: readyStage.sequence,
           planId: readyStage.planId,
+          originGeneration: readyStage.originGeneration,
           renderDistancePreset: readyStage.renderDistancePreset,
           renderDistanceRevision: readyStage.renderDistanceRevision,
           publicationGroup: readyStage.publicationGroup,

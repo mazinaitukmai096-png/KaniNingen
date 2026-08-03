@@ -8665,6 +8665,7 @@ export async function createW8DistantPresentation({
       if (stage.observation !== observation
         || stage.contentHash !== observation.contentHash
         || stage.contentHash !== currentObservation.contentHash
+        || stage.originGeneration !== generation.transitionContract?.generation
         || stage.renderDistancePreset !== generation.renderDistancePreset
         || observation.presentationRevision !== generation.epoch
         || observation.renderDistanceRevision !== (

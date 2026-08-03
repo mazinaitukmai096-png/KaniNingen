@@ -2498,9 +2498,12 @@ export async function bootInfiniteWorldSandbox({
           pending.requiredNaturalOwnerKeys,
         )) return false;
       const settlementTicket = buildingSettlementStream.readyTicket();
+      const currentOriginGeneration = runtime.getCommittedChunkState()
+        .transitionContract?.generation ?? 0;
       if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
         && (!settlementTicket
           || settlementTicket.renderDistancePreset !== pending.preset
+          || settlementTicket.originGeneration !== currentOriginGeneration
           || settlementTicket.renderDistanceRevision !== pending.revision)) return false;
       if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
         && typeof distantPresentation.canClaimBuildingSettlementPublication === 'function'
@@ -2522,6 +2525,7 @@ export async function bootInfiniteWorldSandbox({
       if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.SHARED
         && !buildingSettlementStream.commit({
           planId: settlementTicket.planId,
+          originGeneration: currentOriginGeneration,
           renderDistanceRevision: settlementTicket.renderDistanceRevision,
         })) {
         throw new Error('Building/Settlement revision publication failed after staging');
@@ -3155,7 +3159,8 @@ export async function bootInfiniteWorldSandbox({
       if (buildingSettlementShadowComparison.matches && settlementStreamingObservation) {
         const stagingSignature = diagnosticMeasure(
           'settlement-staging-signature',
-          () => `${worldStreamingPlan.renderDistancePreset}:`
+          () => `${worldStreamingPlan.originGeneration}:`
+            + `${worldStreamingPlan.renderDistancePreset}:`
             + settlementStreamingObservation.contentHash,
         );
         if (stagingSignature !== buildingSettlementStagingSignature) {
@@ -3169,6 +3174,8 @@ export async function bootInfiniteWorldSandbox({
               && pendingRenderDistancePublication === null) {
               buildingSettlementStream.commit({
                 planId: stage.planId,
+                originGeneration: runtime.getCommittedChunkState()
+                  .transitionContract?.generation ?? 0,
                 renderDistanceRevision: stage.renderDistanceRevision,
               });
             }
