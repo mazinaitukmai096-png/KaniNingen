@@ -55,6 +55,10 @@ import {
 import {
   evaluateNodeStreamingBenchmark,
 } from './infinite-world-streaming-performance-benchmark-helper.mjs';
+import {
+  NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
+  resolveNaturalOwnerBuildQueueTarget,
+} from '../src/infinite-world/streaming-capacity-budget.js';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
@@ -5346,8 +5350,15 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   let activeRetainedOwnerKeys = initialOwnerKeys;
   let sourceReadyPages = prioritizeReadyPages(initialPages);
   let planRevision = 0;
+  let capacityPhase = 'moving';
+  let capacityPlayerSpeed = 33;
+  let previousPublishedEventCount = 0;
+  let previousStaleCount = 0;
+  const capacityFrames = [];
   const updateOnce = async () => {
-    const readyPages = sourceReadyPages.splice(0, 1);
+    const readyPages = sourceReadyPages.splice(0, resolveNaturalOwnerBuildQueueTarget({
+      backlog: sourceReadyPages.length,
+    }));
     presentation.applyStaticTreePlan(plan({
       coverageGeneration: activeCoverageGeneration,
       planRevision: ++planRevision,
@@ -5365,6 +5376,26 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
         + state.staticTreeDisposeOwnerCount,
     );
     await new Promise(resolve => setImmediate(resolve));
+    const sampled = presentation.snapshot();
+    capacityFrames.push(Object.freeze({
+      phase: capacityPhase,
+      playerSpeed: capacityPlayerSpeed,
+      requested: readyPages.length,
+      required: readyPages.filter(page => page.required).length,
+      published: publishedOwners.length - previousPublishedEventCount,
+      usefulPublished: publishedOwners.length - previousPublishedEventCount,
+      staleCompleted: sampled.staticTreeStalePageDiscardCount - previousStaleCount,
+      cancelled: 0,
+      queueDepth: sourceReadyPages.length,
+      inFlight: sampled.staticTreeBuildInFlightCount,
+      preparePending: sampled.staticTreePreparePendingOwnerCount
+        + sampled.staticTreeBuildQueuedOwnerCount,
+      publicationPending: sampled.staticTreePublicationPendingOwnerCount,
+      gateActive: false,
+      gateDuration: 0,
+    }));
+    previousPublishedEventCount = publishedOwners.length;
+    previousStaleCount = sampled.staticTreeStalePageDiscardCount;
   };
   const driveUntil = async (predicate, maximumFrames = 1_000) => {
     let frames = 0;
@@ -5436,6 +5467,8 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
     published: snapshot.staticTreeCurrentPublishedOwnerCount,
   };
 
+  capacityPhase = 'stopped';
+  capacityPlayerSpeed = 0;
   const stopFrames = await driveUntil(() => {
     const state = presentation.snapshot();
     return sourceReadyPages.length === 0
@@ -5461,6 +5494,8 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   activeCoverageGeneration = 2;
   activeRetainedOwnerKeys = retainedAfterAcceleration;
   sourceReadyPages = prioritizeReadyPages(accelerationPages);
+  capacityPhase = 'reaccelerated';
+  capacityPlayerSpeed = 47.85;
   const accelerationUpdateStart = updateDurations.length;
   const accelerationBacklogStart = admissionBacklogs.length;
   const accelerationFrames = await driveUntil(() => {
@@ -5487,6 +5522,36 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   ));
   const heapAfter = process.memoryUsage().heapUsed;
   const lifecycleSnapshot = telemetry.snapshot();
+  const capacityWindows = Object.freeze(['moving', 'stopped', 'reaccelerated']
+    .flatMap(phase => {
+      const frames = capacityFrames.filter(frame => frame.phase === phase);
+      const windows = [];
+      for (let offset = 0; offset < frames.length; offset += 60) {
+        const samples = frames.slice(offset, offset + 60);
+        const rate = 60 / samples.length;
+        const sum = key => samples.reduce((total, sample) => total + sample[key], 0);
+        windows.push(Object.freeze({
+          time: `${phase}:${Math.floor(offset / 60)}`,
+          playerSpeed: samples[0]?.playerSpeed ?? 0,
+          requestedPerSec: sum('requested') * rate,
+          requiredPerSec: sum('required') * rate,
+          publishedPerSec: sum('published') * rate,
+          usefulPublishedPerSec: sum('usefulPublished') * rate,
+          staleCompletedPerSec: sum('staleCompleted') * rate,
+          cancelledPerSec: sum('cancelled') * rate,
+          queueDepth: Math.max(0, ...samples.map(sample => sample.queueDepth)),
+          inFlight: Math.max(0, ...samples.map(sample => sample.inFlight)),
+          preparePending: Math.max(0, ...samples.map(sample => sample.preparePending)),
+          publicationPending: Math.max(
+            0,
+            ...samples.map(sample => sample.publicationPending),
+          ),
+          gateActive: samples.some(sample => sample.gateActive),
+          gateDuration: sum('gateDuration'),
+        }));
+      }
+      return windows;
+    }));
   const maximumBacklogDrop = Math.max(0, ...accelerationBacklogs.slice(1).map((value, index) => (
     accelerationBacklogs[index] - value
   )));
@@ -5503,18 +5568,21 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   assert.equal(snapshot.staticTreeOwnerRebuildCount, 0);
   assert.equal(snapshot.staticTreeStalePageDiscardCount, 0);
   assert.equal(snapshot.staticTreeRootResetCount, 1);
-  assert.equal(snapshot.staticTreeMaximumAdmissionsPerFrame <= 1, true);
+  assert.equal(
+    snapshot.staticTreeMaximumAdmissionsPerFrame <= NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
+    true,
+  );
   assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
   assert.equal(snapshot.staticNaturalActiveLegacyRecordCount, 0);
   assert.equal(snapshot.staticNaturalOverlappingStableIdCount, 0);
-  assert.equal(moving.admissionMaximumPerFrame <= 1, true);
-  assert.equal(stopped.admissionMaximumPerFrame <= 1, true);
-  assert.equal(accelerated.admissionMaximumPerFrame <= 1, true);
+  assert.equal(moving.admissionMaximumPerFrame > 1, true);
+  assert.equal(stopped.admissionMaximumPerFrame <= NATURAL_OWNER_BUILD_QUEUE_MAXIMUM, true);
+  assert.equal(accelerated.admissionMaximumPerFrame <= NATURAL_OWNER_BUILD_QUEUE_MAXIMUM, true);
   assert.equal(accelerated.publishOwnerMaximumPerFrame <= 1, true);
   assert.equal(accelerated.disposeOwnerMaximumPerFrame <= 1, true);
   assert.equal(accelerated.disposedOwnerCount, ownerCount / 2);
   assert.equal(accelerated.frameCount > accelerated.disposedOwnerCount, true);
-  assert.equal(maximumBacklogDrop <= 2, true);
+  assert.equal(maximumBacklogDrop <= NATURAL_OWNER_BUILD_QUEUE_MAXIMUM + 1, true);
   assert.equal(accelerated.visibilityMatrixInvalidationCount, 0);
   assert.equal(snapshot.staticTreeVisibilityMatrixInvalidationCount, 0);
   assert.equal(accelerated.visibilityMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
@@ -5539,7 +5607,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
     orphanResourceCount: snapshot.staticNaturalOrphanObjectCount
       + snapshot.staticNaturalOrphanSlotCount,
     admissionMaximumPerFrame: snapshot.staticTreeMaximumAdmissionsPerFrame,
-    configuredAdmissionLimit: snapshot.staticTreeOwnerAdmissionLimit,
+    configuredAdmissionLimit: snapshot.staticTreeOwnerAdmissionMaximum,
     observedWork: {
       matrixUpdates: accelerated.matrixUpdateCount,
       bufferUpdates: accelerated.bufferUpdateCount,
@@ -5552,7 +5620,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   assert.equal(nodeBenchmark.deterministicPass, true);
   assert.equal(nodeBenchmark.admissionLimitChangeRequired, false);
   assert.equal(nodeBenchmark.productionBudgetChangeRequired, false);
-  assert.equal(nodeBenchmark.configuredAdmissionLimit, 1);
+  assert.equal(nodeBenchmark.configuredAdmissionLimit, NATURAL_OWNER_BUILD_QUEUE_MAXIMUM);
   assert.equal(nodeBenchmark.browserFrameGate, 'pending');
   t.diagnostic(JSON.stringify({
     acceptance: nodeBenchmark,
@@ -5600,6 +5668,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
       allocatedBuckets: snapshot.staticTreeAllocatedBucketCount,
       heapDeltaBytes: heapAfter - heapBefore,
     },
+    capacityWindows,
   }));
   presentation.dispose();
 });

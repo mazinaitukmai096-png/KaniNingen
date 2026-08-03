@@ -75,6 +75,10 @@ import {
   WORLD_STREAMING_TARGET,
   worldStreamingTargetForCanonicalObject,
 } from '../world-streaming-telemetry.js';
+import {
+  NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
+  resolveNaturalOwnerBuildQueueTarget,
+} from '../streaming-capacity-budget.js';
 
 export {
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
@@ -126,7 +130,6 @@ const PERSISTENT_NATURAL_MAXIMUM_BUCKET_SLOTS_PER_OWNER = Object.freeze({
   rock: Object.freeze({ full: 64, derived: 64 }),
 });
 const STATIC_TREE_DISPOSE_BUDGET_MS = 2;
-const STATIC_TREE_OWNER_ADMISSION_LIMIT = 1;
 const STATIC_TREE_OWNER_DISPOSE_LIMIT = 1;
 const STATIC_TREE_OWNER_PUBLICATION_LIMIT = 1;
 const RUNTIME_PRESENTATION_FRAME_BUDGET_MS = PRESENTATION_SLICE_BUDGET_MS;
@@ -4493,6 +4496,8 @@ export async function createW8DistantPresentation({
   let persistentTreeBufferRangeUpdateCount = 0;
   let persistentTreeBufferUploadByteCount = 0;
   let persistentTreeAdmissionsSinceFrame = 0;
+  let persistentTreeLastBuildQueueTarget = 0;
+  let persistentTreeMaximumBuildQueueTarget = 0;
   let persistentTreeMaximumAdmissionsPerFrame = 0;
   let persistentTreeAdmissionLimitViolationCount = 0;
   let persistentTreeCompactionMoveCount = 0;
@@ -5246,7 +5251,7 @@ export async function createW8DistantPresentation({
       persistentTreeMaximumAdmissionsPerFrame,
       admittedOwners,
     );
-    if (admittedOwners > STATIC_TREE_OWNER_ADMISSION_LIMIT) {
+    if (admittedOwners > NATURAL_OWNER_BUILD_QUEUE_MAXIMUM) {
       persistentTreeAdmissionLimitViolationCount += 1;
     }
     const frameSample = streamingTelemetry || diagnosticsEnabled ? {
@@ -5398,8 +5403,7 @@ export async function createW8DistantPresentation({
       frameSample.publishedOwners = publishedOwners;
     }
 
-    if (persistentTreeBuildActive || persistentTreeBuildQueuedCount > 0
-      || pendingPersistentTreePages.size === 0
+    if (pendingPersistentTreePages.size === 0
       || remainingBudgetMs() < 0.25) {
       finishFrameSample();
       return Object.freeze({ remainingMs: remainingBudgetMs(), buildStarted: false });
@@ -5411,18 +5415,39 @@ export async function createW8DistantPresentation({
         || left.readyAtMs - right.readyAtMs
         || left.ownerKey.localeCompare(right.ownerKey)
     ));
-    const page = prioritizedPages[0];
-    pendingPersistentTreePages.delete(page.ownerKey);
+    const queueTarget = resolveNaturalOwnerBuildQueueTarget({
+      backlog: pendingPersistentTreePages.size + persistentTreeBuildQueuedCount,
+    });
+    persistentTreeLastBuildQueueTarget = queueTarget;
+    persistentTreeMaximumBuildQueueTarget = Math.max(
+      persistentTreeMaximumBuildQueueTarget,
+      queueTarget,
+    );
+    const availableQueueSlots = Math.max(0, queueTarget - persistentTreeBuildQueuedCount);
+    if (availableQueueSlots === 0) {
+      finishFrameSample();
+      return Object.freeze({ remainingMs: remainingBudgetMs(), buildStarted: false });
+    }
+    const pages = prioritizedPages.slice(0, availableQueueSlots);
+    for (const page of pages) pendingPersistentTreePages.delete(page.ownerKey);
     const pageBudgetMs = Math.max(0.25, remainingBudgetMs());
-    void enqueuePersistentNaturalOwnerBuild(page, pageBudgetMs, { deferStart: true })
-      .then(allocation => {
-        if (frameSample && allocation) {
-          frameSample.builtOwners = 1;
-          frameSample.buildMs = allocation.durationMs;
-          frameSample.buildMaximumSliceMs = allocation.maximumSliceMs;
-          frameSample.allocatedObjects = allocation.objectCount;
-          frameSample.allocatedInstances = allocation.instanceCount;
-          frameSample.allocatedBuckets = allocation.bucketCount;
+    const scheduled = pages.map(page => (
+      enqueuePersistentNaturalOwnerBuild(page, pageBudgetMs, { deferStart: true })
+    ));
+    void Promise.all(scheduled)
+      .then(allocations => {
+        if (frameSample) {
+          for (const allocation of allocations.filter(Boolean)) {
+            frameSample.builtOwners += 1;
+            frameSample.buildMs += allocation.durationMs;
+            frameSample.buildMaximumSliceMs = Math.max(
+              frameSample.buildMaximumSliceMs,
+              allocation.maximumSliceMs,
+            );
+            frameSample.allocatedObjects += allocation.objectCount;
+            frameSample.allocatedInstances += allocation.instanceCount;
+            frameSample.allocatedBuckets += allocation.bucketCount;
+          }
         }
       }).catch(error => {
         if (error !== SYNC_CANCELLED) throw error;
@@ -8852,6 +8877,10 @@ export async function createW8DistantPresentation({
         staticTreePublishedOwnerCount: persistentTreePublishedOwnerCount,
         staticTreeCurrentPublishedOwnerCount: persistentTreePublishedOwners.size,
         staticTreeResidentOwnerCount: persistentTreePages.size,
+        staticTreePreparePendingOwnerCount: pendingPersistentTreePages.size,
+        staticTreeBuildInFlightCount: Number(persistentTreeBuildActive),
+        staticTreeBuildQueuedOwnerCount: persistentTreeBuildQueuedCount,
+        staticTreePublicationPendingOwnerCount: pendingPersistentTreePublications.size,
         staticTreePendingOwnerCount: pendingPersistentTreePages.size
           + pendingPersistentTreePublications.size
           + persistentTreeBuildQueuedCount,
@@ -8876,7 +8905,9 @@ export async function createW8DistantPresentation({
         staticTreeAllocatedBucketCount: persistentTreeAllocatedBucketCount,
         staticTreeBufferRangeUpdateCount: persistentTreeBufferRangeUpdateCount,
         staticTreeBufferUploadByteCount: persistentTreeBufferUploadByteCount,
-        staticTreeOwnerAdmissionLimit: STATIC_TREE_OWNER_ADMISSION_LIMIT,
+        staticTreeOwnerAdmissionLimit: persistentTreeLastBuildQueueTarget,
+        staticTreeOwnerAdmissionMaximum: NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
+        staticTreeMaximumBuildQueueTarget: persistentTreeMaximumBuildQueueTarget,
         staticTreeOwnerDisposeLimit: STATIC_TREE_OWNER_DISPOSE_LIMIT,
         staticTreeOwnerPublicationLimit: STATIC_TREE_OWNER_PUBLICATION_LIMIT,
         staticTreeFrameBudgetMs: STATIC_TREE_PAGE_FRAME_BUDGET_MS,

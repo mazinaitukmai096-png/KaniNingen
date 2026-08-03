@@ -70,6 +70,7 @@ import {
   createNaturalCoverageKey,
 } from './natural-streaming-coverage.js';
 import { createStreamingOwnerMetadataCache } from './streaming-owner-metadata.js';
+import { resolveNaturalOwnerBuildQueueTarget } from './streaming-capacity-budget.js';
 import {
   createW8ForestHorizonOwnerPredicate,
 } from './forest-horizon-owner-policy.js';
@@ -3263,13 +3264,20 @@ export async function bootInfiniteWorldSandbox({
           });
         }
         if (!disablePersistentTreePublication) {
+          const readyPageAdmissionLimit = resolveNaturalOwnerBuildQueueTarget({
+            backlog: streamControl.readyPageCount,
+          });
           const readyPages = diagnosticMeasure(
             'static-natural-ready-admission',
-            () => naturalStaticStream.drainReadyOwnerPages({ limit: 1 }),
+            () => readyPageAdmissionLimit > 0
+              ? naturalStaticStream.drainReadyOwnerPages({ limit: readyPageAdmissionLimit })
+              : Object.freeze([]),
           );
           if (diagnostics.enabled) diagnostics.recordWork('static-natural-ready-admission', {
             calls: 1,
             admittedOwners: readyPages.length,
+            admissionLimit: readyPageAdmissionLimit,
+            readyPageBacklog: streamControl.readyPageCount,
             readyRequiredOwners: streamControl.readyRequiredOwnerCount,
             missingRequiredOwners: streamControl.missingRequiredOwnerCount,
             requestBacklog: streamControl.backlog,
@@ -3283,9 +3291,9 @@ export async function bootInfiniteWorldSandbox({
             playerLogicalZ: logicalPlayer.z,
             activeDataKeys: committedChunkState.activeDataKeys,
             renderedKeys: committedChunkState.renderedKeys,
-            // Admission is deliberately one owner per animation frame. The
-            // presentation coordinator shares one budget across dispose,
-            // visibility, compose, upload marking, build, and publication.
+            // A small backlog-aware admission window removes the idle frame
+            // between serialized builds. Each build still yields to the host,
+            // and the presentation coordinator retains its shared time budget.
             readyPages,
           };
           if (coverageNeedsApply) {
