@@ -164,6 +164,7 @@ export function gatePlayerMovementByTerrainCoverage({
   startX,
   startZ,
   sampleCanonicalTerrainHeight,
+  isTerrainCoveragePublished,
 }) {
   if (!Number.isFinite(horizontalMovement?.x) || !Number.isFinite(horizontalMovement?.z)) {
     throw new Error('Player horizontal movement resolver returned a non-finite position');
@@ -171,11 +172,13 @@ export function gatePlayerMovementByTerrainCoverage({
   if (typeof sampleCanonicalTerrainHeight !== 'function') {
     throw new TypeError('Player terrain coverage gate requires a canonical Terrain sampler');
   }
+  if (typeof isTerrainCoveragePublished !== 'function') {
+    throw new TypeError('Player terrain coverage gate requires a publication predicate');
+  }
   const owner = decomposeLogicalWorldPosition(horizontalMovement.x, horizontalMovement.z);
-  const candidateTerrainHeightMeters = sampleCanonicalTerrainHeight(
-    horizontalMovement.x,
-    horizontalMovement.z,
-  );
+  const candidateTerrainHeightMeters = isTerrainCoveragePublished(owner)
+    ? sampleCanonicalTerrainHeight(horizontalMovement.x, horizontalMovement.z)
+    : null;
   if (Number.isFinite(candidateTerrainHeightMeters)) {
     return Object.freeze({
       ...horizontalMovement,
@@ -184,9 +187,11 @@ export function gatePlayerMovementByTerrainCoverage({
       terrainCoverageOwner: owner,
     });
   }
-  const retainedTerrainHeightMeters = sampleCanonicalTerrainHeight(startX, startZ);
+  const retainedOwner = decomposeLogicalWorldPosition(startX, startZ);
+  const retainedTerrainHeightMeters = isTerrainCoveragePublished(retainedOwner)
+    ? sampleCanonicalTerrainHeight(startX, startZ)
+    : null;
   if (!Number.isFinite(retainedTerrainHeightMeters)) {
-    const retainedOwner = decomposeLogicalWorldPosition(startX, startZ);
     throw new Error(`formal Terrain is not active for Player Chunk ${retainedOwner.key}`);
   }
   return Object.freeze({
@@ -2202,6 +2207,12 @@ export async function bootInfiniteWorldSandbox({
       return height;
     }
 
+    function isPlayerTerrainCoveragePublished(owner) {
+      const committed = runtime.getCommittedChunkState();
+      return committed.transitionContract !== null
+        && committed.renderedKeys.includes(owner.key);
+    }
+
     function assertRuntimePreparedForPlayer(owner) {
       const runtimeSnapshot = runtime.snapshot();
       const activeDataKeys = new Set(runtimeSnapshot.activeDataKeys);
@@ -2549,6 +2560,7 @@ export async function bootInfiniteWorldSandbox({
           startX: input.startX,
           startZ: input.startZ,
           sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+          isTerrainCoveragePublished: isPlayerTerrainCoveragePublished,
         });
         if (gatedMovement.terrainCoverageBlocked) {
           requestPlayerTerrainCoverage(gatedMovement.terrainCoverageOwner, {
@@ -2901,6 +2913,7 @@ export async function bootInfiniteWorldSandbox({
           startX,
           startZ,
           sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+          isTerrainCoveragePublished: isPlayerTerrainCoveragePublished,
         });
         terrainCoverageGateResult = gatedMovement;
         logicalPlayer.x = gatedMovement.x;

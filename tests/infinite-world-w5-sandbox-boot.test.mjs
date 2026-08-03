@@ -51,6 +51,7 @@ test('Player terrain coverage gate retains the last formal position and height u
       samples.push([x, z]);
       return x === 47.75 ? 12.5 : null;
     },
+    isTerrainCoveragePublished: () => true,
   });
   assert.deepEqual(samples, [[48.25, -3], [47.75, -3]]);
   assert.equal(blocked.terrainCoverageBlocked, true);
@@ -63,10 +64,42 @@ test('Player terrain coverage gate retains the last formal position and height u
     startX: 47.75,
     startZ: -3,
     sampleCanonicalTerrainHeight: () => 14.25,
+    isTerrainCoveragePublished: () => true,
   });
   assert.equal(ready.terrainCoverageBlocked, false);
   assert.deepEqual({ x: ready.x, z: ready.z }, { x: 48.25, z: -3 });
   assert.equal(ready.terrainHeightMeters, 14.25);
+});
+
+test('Player terrain coverage gate rejects cached Terrain until its owner is published', () => {
+  const sampledOwners = [];
+  const publishedOwners = new Set(['2,-1']);
+  const blocked = gatePlayerMovementByTerrainCoverage({
+    horizontalMovement: Object.freeze({ x: 48.25, z: -3, collided: false }),
+    startX: 47.75,
+    startZ: -3,
+    sampleCanonicalTerrainHeight(x, z) {
+      sampledOwners.push(`${Math.floor(x / LOGICAL_CHUNK_SIZE_METERS)},${
+        Math.floor(z / LOGICAL_CHUNK_SIZE_METERS)}`);
+      return 12.5;
+    },
+    isTerrainCoveragePublished: owner => publishedOwners.has(owner.key),
+  });
+
+  assert.equal(blocked.terrainCoverageBlocked, true);
+  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 47.75, z: -3 });
+  assert.deepEqual(sampledOwners, ['2,-1'], 'an unpublished cache entry is never sampled as visible Terrain');
+
+  publishedOwners.add('3,-1');
+  const ready = gatePlayerMovementByTerrainCoverage({
+    horizontalMovement: Object.freeze({ x: 48.25, z: -3, collided: false }),
+    startX: 47.75,
+    startZ: -3,
+    sampleCanonicalTerrainHeight: () => 14.25,
+    isTerrainCoveragePublished: owner => publishedOwners.has(owner.key),
+  });
+  assert.equal(ready.terrainCoverageBlocked, false);
+  assert.deepEqual({ x: ready.x, z: ready.z }, { x: 48.25, z: -3 });
 });
 
 class Triple {
