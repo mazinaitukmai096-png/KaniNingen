@@ -3231,7 +3231,7 @@ export async function bootInfiniteWorldSandbox({
             plan: worldStreamingPlan,
             policyPlans: staticNaturalPolicyPlans,
             publicationContext,
-            ownerMetadataRevision: latestNaturalCoverageState.key.signature,
+            ownerMetadataRevision: worldStreamingPlan.planId,
           }));
           recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
         } else naturalStaticStream.updatePublicationContext(publicationContext);
