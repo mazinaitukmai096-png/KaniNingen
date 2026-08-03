@@ -5166,6 +5166,7 @@ export async function createW8DistantPresentation({
   const enqueuePersistentNaturalOwnerBuild = (
     page,
     budgetMs = STATIC_TREE_PAGE_FRAME_BUDGET_MS,
+    { deferStart = false } = {},
   ) => {
     const requestedGeneration = persistentTreeGeneration;
     persistentTreeBuildQueuedCount += 1;
@@ -5189,7 +5190,10 @@ export async function createW8DistantPresentation({
         persistentTreeBuildActive = false;
       }
     };
-    const scheduled = persistentTreeBuildTail.then(execute);
+    const start = deferStart
+      ? () => Promise.resolve(yieldToMainThread()).then(execute)
+      : execute;
+    const scheduled = persistentTreeBuildTail.then(start);
     // Keep the serialization tail usable after an observed build failure. The
     // returned promise retains the original rejection for the owning caller.
     persistentTreeBuildTail = scheduled.then(() => undefined, () => undefined);
@@ -5410,18 +5414,19 @@ export async function createW8DistantPresentation({
     const page = prioritizedPages[0];
     pendingPersistentTreePages.delete(page.ownerKey);
     const pageBudgetMs = Math.max(0.25, remainingBudgetMs());
-    void enqueuePersistentNaturalOwnerBuild(page, pageBudgetMs).then(allocation => {
-      if (frameSample && allocation) {
-        frameSample.builtOwners = 1;
-        frameSample.buildMs = allocation.durationMs;
-        frameSample.buildMaximumSliceMs = allocation.maximumSliceMs;
-        frameSample.allocatedObjects = allocation.objectCount;
-        frameSample.allocatedInstances = allocation.instanceCount;
-        frameSample.allocatedBuckets = allocation.bucketCount;
-      }
-    }).catch(error => {
-      if (error !== SYNC_CANCELLED) throw error;
-    }).finally(finishFrameSample);
+    void enqueuePersistentNaturalOwnerBuild(page, pageBudgetMs, { deferStart: true })
+      .then(allocation => {
+        if (frameSample && allocation) {
+          frameSample.builtOwners = 1;
+          frameSample.buildMs = allocation.durationMs;
+          frameSample.buildMaximumSliceMs = allocation.maximumSliceMs;
+          frameSample.allocatedObjects = allocation.objectCount;
+          frameSample.allocatedInstances = allocation.instanceCount;
+          frameSample.allocatedBuckets = allocation.bucketCount;
+        }
+      }).catch(error => {
+        if (error !== SYNC_CANCELLED) throw error;
+      }).finally(finishFrameSample);
     return Object.freeze({ remainingMs: 0, buildStarted: true });
   };
 

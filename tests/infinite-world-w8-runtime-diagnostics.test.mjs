@@ -5139,6 +5139,7 @@ test('incremental Tree pages publish per owner within dirty-range frame budgets'
   const firstTree = tree('detail-v1:vegetation:incremental-tree-a', 5, 88);
   const secondTree = tree('detail-v1:vegetation:incremental-tree-b', 6, 104);
   const publications = [];
+  let ownerBuildYieldCount = 0;
   const telemetry = createWorldStreamingTelemetry({
     enabled: true,
     capacity: 64,
@@ -5165,6 +5166,10 @@ test('incremental Tree pages publish per owner within dirty-range frame budgets'
     getCanonicalChunkData: async () => null,
     incrementalStaticTreePages: true,
     telemetry,
+    yieldToMainThread: () => {
+      ownerBuildYieldCount += 1;
+      return new Promise(resolve => setImmediate(resolve));
+    },
     publishStaticOwnerTickets: input => {
       publications.push(Object.freeze({ ...input, atMs: performance.now() }));
       return Object.freeze(input.ownerKeys.map(ownerKey => Object.freeze({ ownerKey })));
@@ -5197,6 +5202,12 @@ test('incremental Tree pages publish per owner within dirty-range frame budgets'
   };
 
   presentation.applyStaticTreePlan({ ...basePlan, readyPages: [page(5, firstTree)] });
+  presentation.update(8, 8, basePlan.renderOrigin);
+  await Promise.resolve();
+  assert.equal(ownerBuildYieldCount, 1,
+    'an admitted owner build must cross a task boundary before it starts');
+  assert.equal(presentation.snapshot().staticTreeResidentOwnerCount, 0,
+    'an admitted owner must not build in the animation-frame microtask checkpoint');
   const firstFrames = await driveUntil(() => publications.length === 1);
   let snapshot = presentation.snapshot();
   assert.equal(publications[0].ownerKeys[0], '5,0');
