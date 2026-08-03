@@ -348,6 +348,7 @@ export class ChunkRuntimeManager {
       if (key === preferredKey) continue;
       if (plan.committing) continue;
       plan.discarded = true;
+      this.chunkDataService.cancelConsumer({ consumerId: plan.consumerId, epoch: plan.epoch });
       this.preparedTransitions.delete(key);
       stale.push(plan);
     }

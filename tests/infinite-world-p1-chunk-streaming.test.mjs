@@ -194,6 +194,66 @@ test('a superseded movement direction cannot commit stale prepared render result
   await runtime.shutdown();
 });
 
+test('a superseded directional prefetch cancels its in-flight owner before required preparation waits', async () => {
+  const source = await createSandboxChunkGenerator({ worldSeed: 'p1-required-supersedes-prefetch' });
+  let delayStaleOwner = false;
+  let delayedRequest = null;
+  let notifyStaleOwnerStarted;
+  const staleOwnerStarted = new Promise(resolve => { notifyStaleOwnerStarted = resolve; });
+  const cancelledRequestIds = [];
+  const transport = {
+    async initialize() {
+      return {
+        worldSeed: source.worldSeed,
+        worldSeedHash: source.worldSeedHash,
+        generatorVersion: source.generatorVersion,
+        experienceSpawn: source.experienceSpawn,
+        reviewSpawn: source.reviewSpawn,
+      };
+    },
+    generateChunk(request) {
+      if (delayStaleOwner && `${request.chunkX},${request.chunkZ}` === '3,-2') {
+        return new Promise(resolve => {
+          delayedRequest = { requestId: request.requestId, resolve };
+          notifyStaleOwnerStarted();
+        });
+      }
+      return source.generateChunk(request.chunkX, request.chunkZ);
+    },
+    cancelGenerationRequest({ requestId }) {
+      if (requestId !== delayedRequest?.requestId) return false;
+      cancelledRequestIds.push(requestId);
+      delayedRequest.resolve(null);
+      return true;
+    },
+    snapshot: () => Object.freeze({ kind: 'supersession-test' }),
+    shutdown: () => source.shutdown?.(),
+  };
+  const chunkDataService = new ChunkDataService({ transport, cacheCapacity: 81 });
+  const runtime = new ChunkRuntimeManager({
+    chunkDataService,
+    renderAdapter: new PreparedAdapter(),
+    cacheCapacity: 81,
+    yieldToHost: () => Promise.resolve(),
+  });
+  await runtime.initialize(0, 0);
+
+  delayStaleOwner = true;
+  const stale = runtime.prepareTransition(1, 0);
+  await staleOwnerStarted;
+  const required = runtime.prepareTransition(0, -1);
+  await Promise.resolve();
+
+  assert.deepEqual(cancelledRequestIds, [delayedRequest.requestId]);
+  assert.equal(await stale, null);
+  assert.ok(await required);
+  await runtime.transitionToChunk(0, -1);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().centerChunkZ, -1);
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
 test('prepared transition order and Chunk identity remain deterministic', async () => {
   const left = await createRuntime('p1-determinism');
   const right = await createRuntime('p1-determinism');
