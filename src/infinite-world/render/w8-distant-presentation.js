@@ -3327,6 +3327,91 @@ export async function createW8DistantPresentation({
       (generation.buildOriginChunkZ - renderOrigin.renderOriginChunkZ)
         * LOGICAL_CHUNK_SIZE_METERS * UNITS_PER_METER,
     );
+    if (diagnosticsEnabled) {
+      generation.lastRenderOriginRevision = Number.isSafeInteger(renderOrigin.rebaseCount)
+        ? renderOrigin.rebaseCount : null;
+      generation.lastRenderOriginAppliedAtMs = monotonicNow();
+      generation.root.userData ??= {};
+      generation.root.userData.lastRenderOriginRevision = generation.lastRenderOriginRevision;
+      generation.root.userData.lastRenderOriginChunkX = renderOrigin.renderOriginChunkX;
+      generation.root.userData.lastRenderOriginChunkZ = renderOrigin.renderOriginChunkZ;
+      generation.root.userData.lastRenderOriginAppliedAtMs =
+        generation.lastRenderOriginAppliedAtMs;
+    }
+  };
+
+  const transformVectorSnapshot = value => Object.freeze({
+    x: Number(value?.x ?? 0),
+    y: Number(value?.y ?? 0),
+    z: Number(value?.z ?? 0),
+  });
+
+  const matrixWorldTranslationSnapshot = object => {
+    const elements = object?.matrixWorld?.elements;
+    if (elements?.length >= 16 && [elements[12], elements[13], elements[14]].every(Number.isFinite)) {
+      return Object.freeze({ x: elements[12], y: elements[13], z: elements[14] });
+    }
+    let x = 0;
+    let y = 0;
+    let z = 0;
+    for (let current = object; current; current = current.parent) {
+      x += Number(current.position?.x ?? 0);
+      y += Number(current.position?.y ?? 0);
+      z += Number(current.position?.z ?? 0);
+    }
+    return Object.freeze({ x, y, z });
+  };
+
+  const generationTransformSnapshot = (role, generation, { attachedTo = root } = {}) => {
+    if (!generation?.root) return Object.freeze({ role, attached: false, rootIdentity: null });
+    const currentOriginChunkX = committedRenderOrigin?.renderOriginChunkX
+      ?? generation.currentOriginChunkX;
+    const currentOriginChunkZ = committedRenderOrigin?.renderOriginChunkZ
+      ?? generation.currentOriginChunkZ;
+    const expectedX = (generation.buildOriginChunkX - currentOriginChunkX)
+      * LOGICAL_CHUNK_SIZE_METERS * UNITS_PER_METER;
+    const expectedZ = (generation.buildOriginChunkZ - currentOriginChunkZ)
+      * LOGICAL_CHUNK_SIZE_METERS * UNITS_PER_METER;
+    return Object.freeze({
+      role,
+      rootIdentity: generation.root.name ?? null,
+      logicalOwner: Number.isSafeInteger(generation.centerChunkX)
+        ? `${generation.centerChunkX},${generation.centerChunkZ}` : null,
+      transitionGeneration: generation.transitionContract?.generation ?? null,
+      renderOriginRevision: generation.root.userData?.lastRenderOriginRevision
+        ?? generation.lastRenderOriginRevision
+        ?? committedRenderOrigin?.rebaseCount ?? null,
+      rootPosition: transformVectorSnapshot(generation.root.position),
+      matrixWorldTranslation: matrixWorldTranslationSnapshot(generation.root),
+      buildOrigin: Object.freeze({
+        chunkX: generation.buildOriginChunkX,
+        chunkZ: generation.buildOriginChunkZ,
+      }),
+      currentOrigin: Object.freeze({
+        chunkX: generation.root.userData?.lastRenderOriginChunkX
+          ?? generation.currentOriginChunkX,
+        chunkZ: generation.root.userData?.lastRenderOriginChunkZ
+          ?? generation.currentOriginChunkZ,
+      }),
+      generationCurrentOrigin: Object.freeze({
+        chunkX: generation.currentOriginChunkX,
+        chunkZ: generation.currentOriginChunkZ,
+      }),
+      rebaseAppliedBy: 'positionGenerationForOrigin',
+      rebaseAppliedAtMs: generation.root.userData?.lastRenderOriginAppliedAtMs
+        ?? generation.lastRenderOriginAppliedAtMs ?? null,
+      staleRevisionGuard: 'acceptCommittedRenderOrigin',
+      attached: generation.root.parent === attachedTo,
+      visible: generation.root.visible !== false,
+      drawnOwnerCount: generation.currentVisibleMidgroundOwnerKeys?.size
+        ?? generation.renderedKeys?.size ?? generation.activeKeys?.size ?? 0,
+      originAligned: (generation.root.userData?.lastRenderOriginChunkX
+          ?? generation.currentOriginChunkX) === currentOriginChunkX
+        && (generation.root.userData?.lastRenderOriginChunkZ
+          ?? generation.currentOriginChunkZ) === currentOriginChunkZ
+        && Math.abs(Number(generation.root.position?.x ?? 0) - expectedX) < 1e-6
+        && Math.abs(Number(generation.root.position?.z ?? 0) - expectedZ) < 1e-6,
+    });
   };
 
   const remoteAnchorValues = bucket => (
@@ -7275,6 +7360,82 @@ export async function createW8DistantPresentation({
     });
   };
 
+  const snapshotOriginTransforms = ({ slotLimit = 48 } = {}) => {
+    const visibleDistantGeneration = persistentDistantPublishedGeneration ?? activeGeneration;
+    const clipmap = activeLocalTerrainGeneration?.root?.children?.find(child => (
+      child.name === 'w8-seeded-macro-terrain-clipmap'
+    )) ?? null;
+    const buildingSlots = [];
+    for (const bucket of visibleDistantGeneration?.canonicalBuckets?.values?.() ?? []) {
+      if (!bucket.persistent || !bucket.name?.includes('building') || !bucket.mesh) continue;
+      for (let slot = 0; slot < bucket.items.length && buildingSlots.length < slotLimit; slot += 1) {
+        const item = bucket.items[slot];
+        if (!item) continue;
+        buildingSlots.push(Object.freeze({
+          ownerKey: item.object.ownerKey,
+          stableId: item.object.stableId,
+          slotIndex: slot,
+          materialBucket: bucket.key,
+          visibleStableId: bucket.mesh.userData?.canonicalStableIds?.[slot] ?? null,
+          matrixUploadRevision: bucket.mesh.instanceMatrix?.version ?? null,
+          handoffOpacity: localHandoffOpacityValues(bucket)?.[slot] ?? null,
+          handoffOpacityUploadRevision: bucket.localHandoffOpacityAttribute?.version ?? null,
+          matrixDirty: bucket.dirtySlots?.has(slot) ?? false,
+        }));
+      }
+      if (buildingSlots.length >= slotLimit) break;
+    }
+    const localTerrain = generationTransformSnapshot('distant-local-terrain', activeLocalTerrainGeneration);
+    return Object.freeze({
+      schemaVersion: 'w8-origin-transform-audit-1',
+      committedRenderOrigin,
+      roots: Object.freeze([
+        Object.freeze({
+          role: 'distant-container',
+          rootIdentity: root.name,
+          renderOriginRevision: committedRenderOrigin?.rebaseCount ?? null,
+          rootPosition: transformVectorSnapshot(root.position),
+          matrixWorldTranslation: matrixWorldTranslationSnapshot(root),
+          rebaseAppliedBy: 'scene-owned-fixed-container',
+          staleRevisionGuard: 'acceptCommittedRenderOrigin',
+          attached: root.parent === scene,
+          visible: root.visible !== false,
+          originAligned: Number(root.position?.x ?? 0) === 0
+            && Number(root.position?.y ?? 0) === 0
+            && Number(root.position?.z ?? 0) === 0,
+        }),
+        localTerrain,
+        Object.freeze({
+          role: 'clipmap',
+          rootIdentity: clipmap?.name ?? null,
+          logicalOwner: localTerrain.logicalOwner ?? null,
+          transitionGeneration: localTerrain.transitionGeneration ?? null,
+          renderOriginRevision: localTerrain.renderOriginRevision ?? null,
+          rootPosition: transformVectorSnapshot(clipmap?.position),
+          matrixWorldTranslation: clipmap ? matrixWorldTranslationSnapshot(clipmap) : null,
+          rebaseAppliedBy: 'distant-local-terrain-parent',
+          rebaseAppliedAtMs: localTerrain.rebaseAppliedAtMs ?? null,
+          staleRevisionGuard: 'acceptCommittedRenderOrigin + transitionIsCurrent',
+          attached: Boolean(clipmap?.parent === activeLocalTerrainGeneration?.root),
+          visible: clipmap?.visible !== false,
+          drawnOwnerCount: localTerrain.drawnOwnerCount ?? 0,
+          originAligned: localTerrain.originAligned === true,
+        }),
+        generationTransformSnapshot('distant-building-and-legacy', visibleDistantGeneration),
+        generationTransformSnapshot(
+          'persistent-natural',
+          persistentTreeGeneration,
+          { attachedTo: scene },
+        ),
+      ]),
+      buildingSlots: Object.freeze(buildingSlots),
+      buildingSlotCount: [...(visibleDistantGeneration?.canonicalBuckets?.values?.() ?? [])]
+        .filter(bucket => bucket.persistent && bucket.name?.includes('building'))
+        .reduce((sum, bucket) => sum + bucket.items.filter(Boolean).length, 0),
+      buildingSlotSnapshotTruncated: buildingSlots.length >= slotLimit,
+    });
+  };
+
   return Object.freeze({
     syncLocalTerrainIncrementally,
     syncLocalTerrain({
@@ -9379,6 +9540,7 @@ export async function createW8DistantPresentation({
     treeMaterialAuditSnapshot: snapshotTreeMaterials,
     visibleRootRevisionSnapshot: snapshotVisibleRootRevisions,
     presenterAuditSnapshot: snapshotPresenterAudit,
+    originTransformAuditSnapshot: snapshotOriginTransforms,
     canonicalAuditSnapshot() {
       const objects = [
         ...(activeGeneration ? [...activeGeneration.canonicalObjects.values()] : []),

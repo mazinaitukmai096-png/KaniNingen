@@ -97,6 +97,94 @@ import {
 } from './building-settlement-stream.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
+export const SANDBOX_RUNTIME_BUILD_IDENTITY = Object.freeze({
+  schemaVersion: 'infinite-world-runtime-build-identity-1',
+  sourceRevision: 'w8-origin-transform-audit-1',
+  requiredAncestorCommits: Object.freeze(['28e0a22', '638703d']),
+  htmlEntry: 'infinite-world-sandbox.html',
+  moduleEntry: 'src/infinite-world/sandbox-entry.js?v=w8-finite-parity',
+});
+
+export function createOriginTransformDiagnosticRing({
+  preFrameCapacity = 30,
+  postFrameCapacity = 30,
+  incidentCapacity = 4,
+} = {}) {
+  for (const [name, value] of Object.entries({
+    preFrameCapacity, postFrameCapacity, incidentCapacity,
+  })) {
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new RangeError(`${name} must be a positive safe integer`);
+    }
+  }
+  const preFrames = [];
+  const incidents = [];
+  let activeIncident = null;
+  let latest = null;
+  const freezeSample = sample => Object.freeze({
+    ...sample,
+    anomalyCodes: Object.freeze([...(sample.anomalyCodes ?? [])]),
+    roots: Object.freeze([...(sample.roots ?? [])]),
+    buildingSlots: Object.freeze([...(sample.buildingSlots ?? [])]),
+  });
+  const finishIncident = () => {
+    if (!activeIncident) return;
+    incidents.push(Object.freeze({
+      triggerFrameSequence: activeIncident.triggerFrameSequence,
+      anomalyCodes: Object.freeze([...activeIncident.anomalyCodes]),
+      frames: Object.freeze([...activeIncident.frames]),
+    }));
+    while (incidents.length > incidentCapacity) incidents.shift();
+    activeIncident = null;
+  };
+  return Object.freeze({
+    record(sample) {
+      const frozen = freezeSample(sample);
+      latest = frozen;
+      if (activeIncident) {
+        activeIncident.frames.push(frozen);
+        for (const code of frozen.anomalyCodes) activeIncident.anomalyCodes.add(code);
+        if (frozen.anomalyCodes.length) activeIncident.remainingPostFrames = postFrameCapacity;
+        else activeIncident.remainingPostFrames -= 1;
+        if (activeIncident.remainingPostFrames <= 0) finishIncident();
+      } else if (frozen.anomalyCodes.length) {
+        activeIncident = {
+          triggerFrameSequence: frozen.frameSequence,
+          anomalyCodes: new Set(frozen.anomalyCodes),
+          frames: [...preFrames, frozen],
+          remainingPostFrames: postFrameCapacity,
+        };
+      }
+      preFrames.push(frozen);
+      while (preFrames.length > preFrameCapacity) preFrames.shift();
+      return frozen;
+    },
+    reset() {
+      preFrames.length = 0;
+      incidents.length = 0;
+      activeIncident = null;
+      latest = null;
+    },
+    snapshot() {
+      const pending = activeIncident ? Object.freeze({
+        triggerFrameSequence: activeIncident.triggerFrameSequence,
+        anomalyCodes: Object.freeze([...activeIncident.anomalyCodes]),
+        frames: Object.freeze([...activeIncident.frames]),
+        remainingPostFrames: activeIncident.remainingPostFrames,
+      }) : null;
+      return Object.freeze({
+        schemaVersion: 'origin-transform-diagnostic-ring-1',
+        buildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
+        latest,
+        incidents: Object.freeze([...incidents]),
+        pendingIncident: pending,
+        preFrameCapacity,
+        postFrameCapacity,
+        incidentCapacity,
+      });
+    },
+  });
+}
 
 export function shouldDeferAutosaveForStreaming(streamingState, { force = false } = {}) {
   if (force) return false;
@@ -833,6 +921,16 @@ export async function bootInfiniteWorldSandbox({
   if (typeof requestAnimationFrameFn !== 'function') {
     throw recordSandboxBootFailure({ state, hud, error: new Error('requestAnimationFrame is unavailable'), clock });
   }
+  if (globalObject.document?.documentElement?.dataset) {
+    globalObject.document.documentElement.dataset.infiniteWorldBuild =
+      SANDBOX_RUNTIME_BUILD_IDENTITY.sourceRevision;
+    globalObject.document.documentElement.dataset.infiniteWorldFlags = [
+      `settlement:${settlementStreamingMode}`,
+      'incrementalStaticTreePages:true',
+      `persistentStaticNatural:${!disablePersistentTreePublication}`,
+      `diagnostics:${diagnosticsEnabled}`,
+    ].join(',');
+  }
 
   let generator = null;
   let chunkDataService = null;
@@ -853,6 +951,7 @@ export async function bootInfiniteWorldSandbox({
   let localTerrainCoverageEpoch = 0;
   let audioDirector = null;
   let diagnostics = null;
+  const originTransformDiagnostics = createOriginTransformDiagnosticRing();
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
@@ -3526,6 +3625,152 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       gameplayRenderAdapter.updatePresentation?.(deltaSeconds);
     }
 
+    const rootPositionSnapshot = object => Object.freeze({
+      x: Number(object?.position?.x ?? 0),
+      y: Number(object?.position?.y ?? 0),
+      z: Number(object?.position?.z ?? 0),
+    });
+    const matrixWorldTranslationSnapshot = object => {
+      const elements = object?.matrixWorld?.elements;
+      if (elements?.length >= 16
+        && [elements[12], elements[13], elements[14]].every(Number.isFinite)) {
+        return Object.freeze({ x: elements[12], y: elements[13], z: elements[14] });
+      }
+      let x = 0;
+      let y = 0;
+      let z = 0;
+      for (let current = object; current; current = current.parent) {
+        x += Number(current.position?.x ?? 0);
+        y += Number(current.position?.y ?? 0);
+        z += Number(current.position?.z ?? 0);
+      }
+      return Object.freeze({ x, y, z });
+    };
+    const recordOriginTransformDiagnosticFrame = () => {
+      if (!diagnostics.enabled) return null;
+      const runtimeSnapshot = runtime.getCommittedChunkState();
+      const renderOrigin = runtimeSnapshot.renderOrigin;
+      const transitionGeneration = runtimeSnapshot.transitionContract?.generation ?? null;
+      const renderResources = renderAdapter.resourceSnapshot();
+      const gameplayRender = gameplayRenderAdapter.snapshot();
+      const distant = distantPresentation.originTransformAuditSnapshot?.() ?? {
+        roots: Object.freeze([]), buildingSlots: Object.freeze([]), committedRenderOrigin: null,
+      };
+      const roots = [];
+      const nearRoot = renderAdapter.worldRoot;
+      roots.push(Object.freeze({
+        role: 'near-terrain-building-root',
+        rootIdentity: nearRoot?.name ?? null,
+        logicalOwner: `${runtimeSnapshot.centerChunkX},${runtimeSnapshot.centerChunkZ}`,
+        transitionGeneration,
+        renderOriginRevision: renderResources.rebaseCount,
+        rootPosition: rootPositionSnapshot(nearRoot),
+        matrixWorldTranslation: matrixWorldTranslationSnapshot(nearRoot),
+        rebaseAppliedBy: 'ChunkRenderAdapter.rebase',
+        staleRevisionGuard: 'RuntimeTransitionContract publication',
+        attached: nearRoot?.parent === scene,
+        visible: nearRoot?.visible !== false,
+        drawnOwnerCount: renderResources.renderCoverage?.terrainKeys?.length ?? 0,
+        originAligned: renderAdapter.renderOriginChunkX === renderOrigin.renderOriginChunkX
+          && renderAdapter.renderOriginChunkZ === renderOrigin.renderOriginChunkZ,
+      }));
+      for (const [ownerKey, projected] of renderAdapter.loaded) {
+        const expected = logicalWorldToRenderLocal(
+          projected.chunkX * LOGICAL_CHUNK_SIZE_METERS,
+          projected.chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+          renderOrigin.renderOriginChunkX,
+          renderOrigin.renderOriginChunkZ,
+          selectedRenderChunkSize,
+        );
+        roots.push(Object.freeze({
+          role: 'near-owner',
+          rootIdentity: projected.group?.name ?? null,
+          logicalOwner: ownerKey,
+          transitionGeneration,
+          renderOriginRevision: renderResources.rebaseCount,
+          rootPosition: rootPositionSnapshot(projected.group),
+          matrixWorldTranslation: matrixWorldTranslationSnapshot(projected.group),
+          rebaseAppliedBy: 'ChunkRenderAdapter.#positionGroup',
+          staleRevisionGuard: 'RuntimeTransitionContract publication',
+          attached: projected.group?.parent === nearRoot,
+          visible: projected.group?.visible !== false,
+          drawnOwnerCount: 1,
+          originAligned: Math.abs(Number(projected.group?.position?.x ?? 0) - expected.x) < 1e-6
+            && Math.abs(Number(projected.group?.position?.z ?? 0) - expected.z) < 1e-6,
+        }));
+      }
+      roots.push(...distant.roots);
+      for (const gameplayRoot of [gameplayRenderAdapter.root, gameplayRenderAdapter.combatRoot]) {
+        roots.push(Object.freeze({
+          role: gameplayRoot === gameplayRenderAdapter.root ? 'collision-gameplay' : 'combat',
+          rootIdentity: gameplayRoot?.name ?? null,
+          logicalOwner: null,
+          transitionGeneration,
+          renderOriginRevision: gameplayRender.renderOrigin.rebaseCount,
+          rootPosition: rootPositionSnapshot(gameplayRoot),
+          matrixWorldTranslation: matrixWorldTranslationSnapshot(gameplayRoot),
+          rebaseAppliedBy: 'GameplayRenderAdapter.rebase',
+          staleRevisionGuard: 'GameplayRenderAdapter.rebase epoch guard',
+          attached: gameplayRoot?.parent === scene,
+          visible: gameplayRoot?.visible !== false,
+          drawnOwnerCount: gameplayRender.liveChunkGroups,
+          originAligned: gameplayRender.renderOrigin.renderOriginChunkX
+              === renderOrigin.renderOriginChunkX
+            && gameplayRender.renderOrigin.renderOriginChunkZ
+              === renderOrigin.renderOriginChunkZ,
+        }));
+      }
+      roots.push(Object.freeze({
+        role: 'camera',
+        rootIdentity: camera.name || 'gameplay-camera',
+        logicalOwner: decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z).key,
+        transitionGeneration,
+        renderOriginRevision: renderOrigin.rebaseCount,
+        rootPosition: rootPositionSnapshot(camera),
+        matrixWorldTranslation: matrixWorldTranslationSnapshot(camera),
+        rebaseAppliedBy: 'experienceShell.updateCamera',
+        staleRevisionGuard: 'current frame renderOrigin',
+        attached: camera.parent === scene,
+        visible: camera.visible !== false,
+        drawnOwnerCount: 1,
+        originAligned: true,
+      }));
+      const anomalyCodes = [];
+      const expectedRevision = renderOrigin.rebaseCount;
+      if (renderResources.rebaseCount !== expectedRevision) anomalyCodes.push('near-origin-revision');
+      if (distant.committedRenderOrigin?.rebaseCount !== expectedRevision) {
+        anomalyCodes.push('distant-origin-revision');
+      }
+      if (gameplayRender.renderOrigin.rebaseCount !== expectedRevision) {
+        anomalyCodes.push('gameplay-origin-revision');
+      }
+      for (const rootEntry of roots) {
+        if (rootEntry.rootIdentity && rootEntry.attached !== false && rootEntry.originAligned === false) {
+          anomalyCodes.push(`root-transform:${rootEntry.role}:${rootEntry.rootIdentity}`);
+        }
+      }
+      return originTransformDiagnostics.record(Object.freeze({
+        buildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
+        activeFeatureFlags: Object.freeze({
+          settlementStreamingMode,
+          incrementalStaticTreePages: true,
+          persistentStaticNatural: !disablePersistentTreePublication,
+          diagnosticsEnabled: diagnostics.enabled,
+          streamingTelemetryEnabled: streamingTelemetry.enabled,
+        }),
+        frameSequence: settlementStreamingFrameSequence,
+        transitionGeneration,
+        renderOriginRevision: expectedRevision,
+        rebaseCount: expectedRevision,
+        playerLogicalPosition: Object.freeze({ x: logicalPlayer.x, z: logicalPlayer.z }),
+        roots: Object.freeze(roots),
+        drawnOwnerCount: roots.reduce((sum, entry) => sum + Number(entry.drawnOwnerCount ?? 0), 0),
+        ownerKeys: Object.freeze([...renderAdapter.loaded.keys()].sort()),
+        buildingSlots: distant.buildingSlots,
+        anomalyCodes: Object.freeze([...new Set(anomalyCodes)].sort()),
+      }));
+    };
+
     function renderActiveScene() {
       diagnostics.measure('render', () => {
         const titleActive = !measurement.mode && experienceShell.getMode?.() === 'menu';
@@ -3556,6 +3801,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           distantPresentation.markFirstDraw?.();
           gameplayRenderAdapter.markFirstDraw?.();
         }
+        recordOriginTransformDiagnosticFrame();
       });
     }
 
@@ -3639,6 +3885,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           && measurementElapsed >= measurement.warmupMs) {
           runtime.resetPerformance(['frame', 'generation', 'projection', 'load', 'unload', 'rebase', 'crossing']);
           diagnostics.reset();
+          originTransformDiagnostics.reset();
           streamingTelemetry.clear();
           streamingAcceptanceMetrics = null;
           diagnostics.startFrame(frameNow);
@@ -3854,6 +4101,8 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           save: saveStore.snapshot(),
           audio: audioDirector.snapshot(),
           presentation: presentationSnapshot,
+          runtimeBuildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
+          originTransformDiagnostics: originTransformDiagnostics.snapshot(),
           presentationDiagnostics: Object.freeze({
             schemaVersion: 'w8-browser-acceptance-diagnostics-1',
             browserAcceptance: 'FAIL',

@@ -1129,6 +1129,18 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
   assert.equal(generationRoot.position.x, buildLocalX - RENDER_CHUNK_SIZE,
     'the generation root applies exactly one Chunk of origin delta');
   const currentOrigin = presentation.snapshot().currentOrigin;
+  const originAudit = presentation.originTransformAuditSnapshot();
+  const distantRoot = originAudit.roots.find(root => root.role === 'distant-building-and-legacy');
+  assert.equal(originAudit.schemaVersion, 'w8-origin-transform-audit-1');
+  assert.equal(originAudit.committedRenderOrigin.rebaseCount, 4);
+  assert.equal(distantRoot.renderOriginRevision, 4);
+  assert.equal(distantRoot.originAligned, true);
+  assert.deepEqual(distantRoot.rootPosition, {
+    x: buildLocalX - RENDER_CHUNK_SIZE,
+    y: 0,
+    z: 0,
+  });
+  assert.deepEqual(distantRoot.matrixWorldTranslation, distantRoot.rootPosition);
 
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: ['5,0'], renderedKeys: [],
@@ -2173,6 +2185,15 @@ test('revisited Near Building publication suppresses every persistent Distant pa
     0,
     'canonical Y, matrix base Y, and the flat current Terrain height agree',
   );
+  const slotAudit = presentation.originTransformAuditSnapshot();
+  assert.equal(slotAudit.buildingSlotCount >= 2, true);
+  assert.equal(slotAudit.buildingSlots.every(slot => (
+    slot.stableId === building.stableId
+      && Number.isSafeInteger(slot.slotIndex)
+      && slot.materialBucket.includes('building')
+      && Object.hasOwn(slot, 'matrixUploadRevision')
+      && Object.hasOwn(slot, 'handoffOpacityUploadRevision')
+  )), true, 'reused Building slots expose identity, material bucket, and upload revisions');
 
   const revisitedNear = coverage(4);
   assert.equal(presentation.syncLocalTerrain({

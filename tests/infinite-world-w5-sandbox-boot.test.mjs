@@ -6,6 +6,7 @@ import vm from 'node:vm';
 
 import {
   bootInfiniteWorldSandbox,
+  createOriginTransformDiagnosticRing,
   createSandboxBootState,
   createSandboxEntryController,
   createW8ScenePresentation,
@@ -40,6 +41,33 @@ import {
 const repoRoot = resolve(import.meta.dirname, '..');
 const runIsolatedW5BootPerformanceGate = process.env.KANININGEN_RUN_W5_BOOT_PERFORMANCE === '1';
 let nodeObjectConstructionCount = 0;
+
+test('origin transform diagnostics retain only bounded anomaly pre/post frames', () => {
+  const ring = createOriginTransformDiagnosticRing({
+    preFrameCapacity: 2,
+    postFrameCapacity: 2,
+    incidentCapacity: 1,
+  });
+  const sample = (frameSequence, anomalyCodes = []) => ({
+    frameSequence,
+    anomalyCodes,
+    roots: [{ role: 'terrain', rootIdentity: `root-${frameSequence}` }],
+    buildingSlots: [{ slotIndex: frameSequence }],
+  });
+  ring.record(sample(1));
+  ring.record(sample(2));
+  ring.record(sample(3, ['distant-origin-revision']));
+  ring.record(sample(4));
+  ring.record(sample(5));
+
+  const snapshot = ring.snapshot();
+  assert.equal(snapshot.pendingIncident, null);
+  assert.equal(snapshot.incidents.length, 1);
+  assert.deepEqual(snapshot.incidents[0].frames.map(frame => frame.frameSequence), [1, 2, 3, 4, 5]);
+  assert.deepEqual(snapshot.incidents[0].anomalyCodes, ['distant-origin-revision']);
+  assert.equal(snapshot.latest.frameSequence, 5);
+  assert.equal(snapshot.buildIdentity.sourceRevision, 'w8-origin-transform-audit-1');
+});
 
 test('Player terrain coverage gate retains the last formal position and height until ready', () => {
   const samples = [];
@@ -735,6 +763,16 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.boot.stage, 'Ready');
     assert.equal(snapshot.boot.initializationComplete, true);
     assert.equal(snapshot.boot.loopStarted, true);
+    assert.equal(snapshot.runtimeBuildIdentity.sourceRevision, 'w8-origin-transform-audit-1');
+    assert.equal(snapshot.originTransformDiagnostics.latest.frameSequence, 0);
+    assert.deepEqual(snapshot.originTransformDiagnostics.latest.anomalyCodes, []);
+    assert.equal(snapshot.originTransformDiagnostics.latest.activeFeatureFlags.settlementStreamingMode,
+      'shared');
+    assert.equal(snapshot.originTransformDiagnostics.latest.activeFeatureFlags.incrementalStaticTreePages,
+      true);
+    assert.equal(snapshot.originTransformDiagnostics.latest.roots.filter(root => (
+      root.rootIdentity && root.attached !== false && root.originAligned === false
+    )).length, 0);
     assert.equal(snapshot.treePathAudit.treeStaticStreamActivated, true);
     assert.equal(snapshot.staticObjectStreaming.counts.plans > 0, true);
     assert.deepEqual(new Set(snapshot.staticObjectStreaming.policyKinds), new Set([
@@ -1989,6 +2027,17 @@ test('a newly visible full Chunk object is damage-queryable before deferred pres
     }));
 
     const moved = sandbox.snapshot();
+    assert.deepEqual(moved.originTransformDiagnostics.latest.anomalyCodes, [],
+      `Near, Distant Terrain/Building/Natural, and Gameplay roots share the current origin: ${JSON.stringify({
+        runtimeOrigin: moved.runtime.renderOrigin,
+        latest: moved.originTransformDiagnostics.latest,
+        pendingIncident: moved.originTransformDiagnostics.pendingIncident,
+      })}`);
+    assert.equal(moved.originTransformDiagnostics.latest.renderOriginRevision,
+      moved.runtime.renderOrigin.rebaseCount);
+    assert.equal(moved.originTransformDiagnostics.latest.roots.filter(root => (
+      root.rootIdentity && root.attached !== false && root.originAligned === false
+    )).length, 0);
     const visibleStableIds = new Set(sandbox.renderAdapter.visibleStableIdsSnapshot());
     const visibleTargets = [];
     const visibleSettlementBuildingIds = [];
