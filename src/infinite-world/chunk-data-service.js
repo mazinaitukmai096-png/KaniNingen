@@ -69,6 +69,8 @@ export class ChunkDataService {
     this.subscriberSequence = 0;
     this.dispatchScheduled = false;
     this.inFlight = null;
+    this.requiredLookahead = null;
+    this.drainActive = false;
     this.initializePromise = null;
     this.metadata = null;
     this.isShutdown = false;
@@ -132,7 +134,7 @@ export class ChunkDataService {
         requestId: `${consumerId}:${epoch}`,
         metadata: {
           consumerId, epoch, priority, required, deadlineAtMs,
-          backlog: this.queue.length + (this.inFlight ? 1 : 0),
+          backlog: this.queue.length + this.#inFlightCount(),
         },
       })
       ?? null;
@@ -146,7 +148,7 @@ export class ChunkDataService {
       required,
       deadlineAtMs,
       correlationId: telemetryCorrelationId,
-      backlog: this.queue.length + (this.inFlight ? 1 : 0),
+      backlog: this.queue.length + this.#inFlightCount(),
     });
     this.counts.requests += 1;
     if (this.isShutdown) {
@@ -229,11 +231,11 @@ export class ChunkDataService {
         required,
         deadlineAtMs,
         correlationId: telemetryCorrelationId,
-        backlog: this.queue.length + (this.inFlight ? 1 : 0),
+        backlog: this.queue.length + this.#inFlightCount(),
       });
       this.counts.maximumBacklog = Math.max(
         this.counts.maximumBacklog,
-        this.queue.length + (this.inFlight ? 1 : 0),
+        this.queue.length + this.#inFlightCount(),
       );
       this.#recordTelemetry(WORLD_STREAMING_EVENT.CACHE_MISS, {
         correlationId: telemetryCorrelationId,
@@ -264,7 +266,7 @@ export class ChunkDataService {
         required,
         correlationId: telemetryCorrelationId,
         entryState: entry.state,
-        backlog: this.queue.length + (this.inFlight ? 1 : 0),
+        backlog: this.queue.length + this.#inFlightCount(),
       });
       if (entry.state === 'queued' && priority < entry.priority) {
         entry.priority = priority;
@@ -321,7 +323,8 @@ export class ChunkDataService {
       pendingCount: this.pending.size,
       queuedCount: queued.length,
       inFlightKey: this.inFlight?.key ?? null,
-      inFlightCount: this.inFlight ? 1 : 0,
+      requiredLookaheadKey: this.requiredLookahead?.key ?? null,
+      inFlightCount: this.#inFlightCount(),
       queued: Object.freeze(queued.map(entry => Object.freeze({
         key: entry.key,
         priority: entry.priority,
@@ -337,7 +340,7 @@ export class ChunkDataService {
       scheduler: Object.freeze({
         workerCount: 1,
         agingIntervalMs: this.agingIntervalMs,
-        backlog: queued.length + (this.inFlight ? 1 : 0),
+        backlog: queued.length + this.#inFlightCount(),
       }),
       isShutdown: this.isShutdown,
       counts: Object.freeze({ ...this.counts }),
@@ -405,7 +408,7 @@ export class ChunkDataService {
         terminalState: 'cancelled',
         cancellationReason: 'consumer-cancelled',
         deadlineMiss: entry.deadlineAtMs !== null && this.clock() > entry.deadlineAtMs,
-        backlog: this.queue.length + (this.inFlight ? 1 : 0),
+        backlog: this.queue.length + this.#inFlightCount(),
       },
     });
     if (entry.state === 'queued' && entry.subscribers.size === 0) {
@@ -428,7 +431,14 @@ export class ChunkDataService {
   }
 
   #scheduleDispatch() {
-    if (this.dispatchScheduled || this.inFlight || this.isShutdown) return;
+    if (this.dispatchScheduled || this.isShutdown) return;
+    const canDispatchPrimary = this.inFlight === null;
+    const canDispatchRequiredLookahead = this.inFlight !== null
+      && this.requiredLookahead === null
+      && this.queue.some(entry => (
+        entry.state === 'queued' && entry.subscribers.size > 0 && entry.required
+      ));
+    if (!canDispatchPrimary && !canDispatchRequiredLookahead) return;
     this.dispatchScheduled = true;
     scheduleMicrotask(() => {
       this.dispatchScheduled = false;
@@ -436,9 +446,11 @@ export class ChunkDataService {
     });
   }
 
-  async #dispatchNext() {
-    if (this.isShutdown || this.inFlight) return;
+  #dispatchNext() {
+    if (this.isShutdown) return;
     this.queue = this.queue.filter(entry => entry.state === 'queued' && entry.subscribers.size > 0);
+    const dispatchingRequiredLookahead = this.inFlight !== null;
+    if (dispatchingRequiredLookahead && this.requiredLookahead !== null) return;
     const dispatchAtMs = this.clock();
     this.queue.sort((left, right) => compareWorldGenerationRequests(
       left,
@@ -446,14 +458,27 @@ export class ChunkDataService {
       dispatchAtMs,
       { agingIntervalMs: this.agingIntervalMs },
     ));
-    const entry = this.queue.shift();
+    const entryIndex = dispatchingRequiredLookahead
+      ? this.queue.findIndex(entry => entry.required)
+      : 0;
+    if (entryIndex < 0 || entryIndex >= this.queue.length) return;
+    const [entry] = this.queue.splice(entryIndex, 1);
     if (!entry) return;
     entry.state = 'in-flight';
-    this.inFlight = entry;
+    if (dispatchingRequiredLookahead) this.requiredLookahead = entry;
+    else this.inFlight = entry;
+    this.#startTransport(entry, dispatchAtMs);
+    if (!dispatchingRequiredLookahead) void this.#drainDispatchedEntries();
+    this.#scheduleDispatch();
+  }
+
+  #startTransport(entry, dispatchAtMs) {
     this.counts.dispatched += 1;
     const ranking = describeWorldGenerationPriority(entry.scheduler, dispatchAtMs, {
       agingIntervalMs: this.agingIntervalMs,
     });
+    entry.dispatchAtMs = dispatchAtMs;
+    entry.ranking = ranking;
     if (this.onPipelineEvent) this.#recordPipelineEvent('chunk-worker-dispatch', {
       ownerKey: entry.key,
       chunkX: entry.chunkX,
@@ -468,7 +493,7 @@ export class ChunkDataService {
       deadlineMiss: ranking.deadlineMiss,
       serviceQueueTimeMs: ranking.queueTimeMs,
       correlationId: entry.telemetryCorrelationId,
-      backlog: this.queue.length + 1,
+      backlog: this.queue.length + this.#inFlightCount(),
     });
     this.counts.priorityAgingSteps += ranking.agingSteps;
     if (ranking.agingSteps > 0) this.counts.agedDispatches += 1;
@@ -490,14 +515,13 @@ export class ChunkDataService {
         cancellationReason: null,
         deadlineMiss: ranking.deadlineMiss,
         priorityAging: ranking.agingSteps,
-        backlog: this.queue.length + 1,
+        backlog: this.queue.length + this.#inFlightCount(),
       },
     });
-    let chunkData = null;
-    let error = null;
+    this.counts.transportCalls += 1;
+    let transportPromise;
     try {
-      this.counts.transportCalls += 1;
-      chunkData = await this.transport.generateChunk({
+      transportPromise = Promise.resolve(this.transport.generateChunk({
         requestId: entry.sequence,
         chunkX: entry.chunkX,
         chunkZ: entry.chunkZ,
@@ -511,8 +535,54 @@ export class ChunkDataService {
         telemetryTarget: entry.telemetryTarget,
         telemetryStream: entry.telemetryStream,
         scheduler: entry.scheduler,
-      });
-      const responseReceivedAtMs = this.clock();
+      }));
+    } catch (error) {
+      transportPromise = Promise.reject(error);
+    }
+    entry.transportResult = transportPromise.then(
+      chunkData => Object.freeze({
+        chunkData,
+        error: null,
+        responseReceivedAtMs: this.clock(),
+      }),
+      error => Object.freeze({
+        chunkData: null,
+        error,
+        responseReceivedAtMs: this.clock(),
+      }),
+    );
+  }
+
+  async #drainDispatchedEntries() {
+    if (this.drainActive) return;
+    this.drainActive = true;
+    try {
+      while (this.inFlight) {
+        const entry = this.inFlight;
+        await this.#completeEntry(entry);
+        if (this.inFlight !== entry) {
+          throw new Error('ChunkData dispatch ownership changed before completion');
+        }
+        this.inFlight = this.requiredLookahead;
+        this.requiredLookahead = null;
+        this.#scheduleDispatch();
+      }
+    } finally {
+      this.drainActive = false;
+      if (this.inFlight) void this.#drainDispatchedEntries();
+      else this.#scheduleDispatch();
+    }
+  }
+
+  async #completeEntry(entry) {
+    const { ranking, dispatchAtMs } = entry;
+    let chunkData = null;
+    let error = null;
+    try {
+      const transportResult = await entry.transportResult;
+      if (transportResult.error) throw transportResult.error;
+      chunkData = transportResult.chunkData;
+      const { responseReceivedAtMs } = transportResult;
       if (this.onPipelineEvent) this.#recordPipelineEvent('chunk-main-response-received', {
         ownerKey: entry.key,
         chunkX: entry.chunkX,
@@ -601,7 +671,6 @@ export class ChunkDataService {
       }
     } finally {
       this.pending.delete(entry.key);
-      this.inFlight = null;
     }
     for (const subscriber of entry.subscribers.values()) {
       const currentEpoch = this.consumerEpochs.get(subscriber.consumerId) ?? subscriber.epoch;
@@ -635,7 +704,10 @@ export class ChunkDataService {
       }
     }
     entry.subscribers.clear();
-    this.#scheduleDispatch();
+  }
+
+  #inFlightCount() {
+    return Number(this.inFlight !== null) + Number(this.requiredLookahead !== null);
   }
 
   #recordTelemetry(type, details) {

@@ -39,6 +39,15 @@ async function nextDispatch() {
   await new Promise(resolve => setImmediate(resolve));
 }
 
+function resolvePending(transport, chunkX, chunkZ = 0, revision = 'a') {
+  const index = transport.pending.findIndex(value => (
+    value.request.chunkX === chunkX && value.request.chunkZ === chunkZ
+  ));
+  assert.notEqual(index, -1, `missing pending transport request for ${chunkX},${chunkZ}`);
+  const [pending] = transport.pending.splice(index, 1);
+  pending.resolve(chunk(chunkX, chunkZ, revision));
+}
+
 test('ChunkDataService dispatches priority 1 through 5 and preserves FIFO within a priority', async () => {
   const transport = deferredTransport();
   const service = new ChunkDataService({ transport });
@@ -50,13 +59,116 @@ test('ChunkDataService dispatches priority 1 through 5 and preserves FIFO within
     service.requestChunk({ chunkX: 2, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'p2' }),
     service.requestChunk({ chunkX: 0, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER, consumerId: 'r' }),
   ];
-  for (const expectedX of [1, 2, 0, 3, 4, 5]) {
+  const dispatchOrder = [1, 2, 0, 3, 4, 5];
+  for (let index = 0; index < dispatchOrder.length; index += 1) {
+    const expectedX = dispatchOrder[index];
     await nextDispatch();
-    assert.equal(transport.calls.at(-1).chunkX, expectedX);
-    transport.pending.shift().resolve(chunk(expectedX, 0));
+    assert.equal(transport.calls[index].chunkX, expectedX);
+    resolvePending(transport, expectedX);
   }
   const values = await Promise.all(requests.map(request => request.promise));
   assert.deepEqual(values.map(value => value.chunkX), [5, 4, 3, 1, 2, 0]);
+});
+
+test('ChunkDataService keeps exactly one required lookahead queued without publishing out of order', async () => {
+  const transport = deferredTransport();
+  const readyOrder = [];
+  const service = new ChunkDataService({
+    transport,
+    onPipelineEvent(type, details) {
+      if (type === 'chunk-owner-ready') readyOrder.push(details.chunkX);
+    },
+  });
+  const first = service.requestChunk({
+    chunkX: 0, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'first',
+  });
+  const second = service.requestChunk({
+    chunkX: 1, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'second',
+  });
+  const third = service.requestChunk({
+    chunkX: 2, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED, consumerId: 'third',
+  });
+  const warm = service.requestChunk({
+    chunkX: 3, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER, consumerId: 'warm',
+  });
+
+  await nextDispatch();
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1]);
+  assert.equal(service.snapshot().inFlightCount, 2);
+  assert.equal(service.snapshot().inFlightKey, '0,0');
+  assert.equal(service.snapshot().requiredLookaheadKey, '1,0');
+
+  let secondDelivered = false;
+  void second.promise.then(() => { secondDelivered = true; });
+  resolvePending(transport, 1);
+  await nextDispatch();
+  assert.equal(secondDelivered, false, 'lookahead completion must not publish before the active owner');
+  assert.equal(service.snapshot().completedCacheSize, 0);
+
+  resolvePending(transport, 0);
+  assert.equal((await first.promise).chunkX, 0);
+  assert.equal((await second.promise).chunkX, 1);
+  await nextDispatch();
+  assert.deepEqual(readyOrder, [0, 1]);
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1, 2]);
+  assert.equal(service.snapshot().inFlightCount, 1,
+    'non-required work must not occupy the required lookahead slot');
+
+  resolvePending(transport, 2);
+  assert.equal((await third.promise).chunkX, 2);
+  await nextDispatch();
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1, 2, 3]);
+  resolvePending(transport, 3);
+  assert.equal((await warm.promise).chunkX, 3);
+  await nextDispatch();
+
+  const snapshot = service.snapshot();
+  assert.deepEqual(readyOrder, [0, 1, 2, 3]);
+  assert.equal(new Set(transport.calls.map(value => value.requestId)).size, 4);
+  assert.equal(snapshot.pendingCount, 0);
+  assert.equal(snapshot.inFlightCount, 0);
+  assert.equal(snapshot.counts.pendingDedupeHits, 0);
+  assert.equal(snapshot.counts.staleSubscriberResults, 0);
+});
+
+test('ChunkDataService cancels a required lookahead without duplicate, stale, or orphan state', async () => {
+  const transport = deferredTransport();
+  const service = new ChunkDataService({ transport });
+  const first = service.requestChunk({
+    chunkX: 10, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'first',
+  });
+  const cancelled = service.requestChunk({
+    chunkX: 11, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'cancelled',
+  });
+  const third = service.requestChunk({
+    chunkX: 12, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED, consumerId: 'third',
+  });
+
+  await nextDispatch();
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [10, 11]);
+  assert.equal(cancelled.cancel(), true);
+  assert.deepEqual(transport.cancelCalls, [{
+    requestId: 2,
+    reason: 'no-active-subscribers',
+  }]);
+  resolvePending(transport, 11);
+  resolvePending(transport, 10);
+  assert.equal((await first.promise).chunkX, 10);
+  assert.equal(await cancelled.promise, null);
+
+  await nextDispatch();
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [10, 11, 12]);
+  resolvePending(transport, 12);
+  assert.equal((await third.promise).chunkX, 12);
+  await nextDispatch();
+
+  const snapshot = service.snapshot();
+  assert.equal(new Set(transport.calls.map(value => value.requestId)).size, 3);
+  assert.equal(snapshot.pendingCount, 0);
+  assert.equal(snapshot.queuedCount, 0);
+  assert.equal(snapshot.inFlightCount, 0);
+  assert.equal(snapshot.counts.cancelledOperations, 1);
+  assert.equal(snapshot.counts.staleSubscriberResults, 0);
 });
 
 test('ChunkDataService dedupes Runtime, Gameplay, and Distant consumers, promotes queued work, and returns one canonical object reference', async () => {
