@@ -19,6 +19,12 @@ export const PLAYER_SCALE_STAGE_IDS = Object.freeze({
 
 export const NEW_GAME_PLAYER_SCALE_STAGE_ID = PLAYER_SCALE_STAGE_IDS.TINY;
 
+const TINY_REFERENCE_VISUAL_SCALE = 0.08;
+const TINY_VISUAL_SCALE = 0.06;
+const TINY_LINEAR_SCALE = TINY_VISUAL_SCALE / TINY_REFERENCE_VISUAL_SCALE;
+const scaleTinyLinearValue = value => value * TINY_LINEAR_SCALE;
+const finiteMetersPerSecondToFrameSpeed = value => value * 40 / 60;
+
 const PLAYER_LEG_HALF_WIDTH_UNITS = 7.5;
 const PLAYER_LEG_HALF_HEIGHT_UNITS = 22.5;
 const PLAYER_LEG_ROTATION_RADIANS = 0.35;
@@ -119,32 +125,32 @@ export const PLAYER_SCALE_PROFILES = Object.freeze({
   [PLAYER_SCALE_STAGE_IDS.TINY]: createProfile({
     id: PLAYER_SCALE_STAGE_IDS.TINY,
     label: 'Tiny',
-    visualScale: 0.08,
-    movementSpeed: PLAYER_SPEED * 0.16,
+    visualScale: TINY_VISUAL_SCALE,
+    movementSpeed: finiteMetersPerSecondToFrameSpeed(4.5),
     sprintMultiplier: 1.35,
     jumpVelocity: PLAYER_JUMP_VELOCITY * 0.09,
     gravity: PLAYER_GRAVITY / 7,
-    attackOffsetX: 8,
-    attackOffsetZ: 10,
-    singleAttackRadius: 18,
-    doubleAttackRadius: 22,
-    landingRadius: 28,
-    landingPushRadius: 48,
-    landingShake: 6,
-    playerShakeMultiplier: 0.08,
-    cameraShakeCap: 20,
-    windArcRadius: 20,
-    windArcParticleScale: 0.22,
-    cameraDistance: 85,
-    cameraMinDistance: 50,
-    cameraMaxDistance: 220,
-    cameraHeight: 32,
-    cameraNear: 0.5,
+    attackOffsetX: scaleTinyLinearValue(8),
+    attackOffsetZ: scaleTinyLinearValue(10),
+    singleAttackRadius: scaleTinyLinearValue(18),
+    doubleAttackRadius: scaleTinyLinearValue(22),
+    landingRadius: scaleTinyLinearValue(28),
+    landingPushRadius: scaleTinyLinearValue(48),
+    landingShake: scaleTinyLinearValue(6),
+    playerShakeMultiplier: TINY_VISUAL_SCALE,
+    cameraShakeCap: scaleTinyLinearValue(20),
+    windArcRadius: scaleTinyLinearValue(20),
+    windArcParticleScale: scaleTinyLinearValue(0.22),
+    cameraDistance: scaleTinyLinearValue(85),
+    cameraMinDistance: scaleTinyLinearValue(50),
+    cameraMaxDistance: scaleTinyLinearValue(220),
+    cameraHeight: scaleTinyLinearValue(32),
+    cameraNear: scaleTinyLinearValue(0.5),
     cameraPitch: 0.55,
     cameraMinPitch: 0.05,
     cameraMaxPitch: 1.5,
-    cameraTargetHeight: 8,
-    cameraGroundClearance: 3,
+    cameraTargetHeight: scaleTinyLinearValue(8),
+    cameraGroundClearance: scaleTinyLinearValue(3),
     allowedTargetClass: 'TINY_SANDBOX',
   }),
   [PLAYER_SCALE_STAGE_IDS.MID]: createProfile({
