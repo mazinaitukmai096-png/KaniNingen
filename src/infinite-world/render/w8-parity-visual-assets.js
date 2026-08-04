@@ -12,6 +12,14 @@ const descriptor = (
   geometry, material, position, scale, rotation, materialRole,
 });
 
+export const W8_PRODUCTION_TREE_VISUAL_SCALE = 4 / 3;
+
+const productionTree = (...parts) => Object.freeze(parts.map(part => Object.freeze({
+  ...part,
+  position: Object.freeze(part.position.map(value => value * W8_PRODUCTION_TREE_VISUAL_SCALE)),
+  scale: Object.freeze(part.scale.map(value => value * W8_PRODUCTION_TREE_VISUAL_SCALE)),
+})));
+
 const house = (...parts) => Object.freeze(parts);
 export const W8_FINITE_HOUSE_VARIANTS = Object.freeze([
   house(
@@ -123,20 +131,20 @@ export const W8_PARITY_FEATURE_PARTS = Object.freeze({
       descriptor('box', 'window', [x, 0.368, 0.382], [0.105, 0.184, 0.026])
     )),
   ]),
-  tree: Object.freeze([
+  tree: productionTree(
     descriptor('box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]),
     descriptor('cone', 'treeLeaves', [0, 0.621, 0], [0.5, 0.759, 0.5]),
-  ]),
-  broadleafTree: Object.freeze([
+  ),
+  broadleafTree: productionTree(
     descriptor('box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]),
     descriptor('sphere', 'treeLeavesMeadow', [0, 0.552, 0], [0.6875, 0.448, 0.6875]),
     descriptor('sphere', 'treeLeavesMeadow', [0.265, 0.655, -0.265], [0.4375, 0.241, 0.4375]),
-  ]),
-  wetlandTree: Object.freeze([
+  ),
+  wetlandTree: productionTree(
     descriptor('box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]),
     descriptor('sphere', 'treeLeavesForest', [0, 0.552, 0], [0.6875, 0.448, 0.6875]),
     descriptor('sphere', 'treeLeavesForest', [-0.265, 0.655, 0.265], [0.4375, 0.241, 0.4375]),
-  ]),
+  ),
   // finite rock/pebble used a unit dodecahedron with its centre at half its
   // scale.  The projection supplies that finite scale in metres.
   rock: Object.freeze([

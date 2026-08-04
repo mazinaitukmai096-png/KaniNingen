@@ -14,6 +14,7 @@ import {
 import {
   W8_FINITE_HOUSE_VARIANTS,
   W8_PARITY_FEATURE_PARTS,
+  W8_PRODUCTION_TREE_VISUAL_SCALE,
   createW8ParityVisualAssetLibrary,
 } from '../src/infinite-world/render/w8-parity-visual-assets.js';
 import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
@@ -163,6 +164,50 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
   assert.equal('horizonTerrain' in assets.materials, false);
   assets.dispose();
   assert.equal(assets.snapshot().disposed, true);
+});
+
+test('W8 production Trees enlarge every part uniformly while preserving ground contact', () => {
+  assert.equal(W8_PRODUCTION_TREE_VISUAL_SCALE, 4 / 3);
+  const originalTreeParts = {
+    tree: [
+      ['box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]],
+      ['cone', 'treeLeaves', [0, 0.621, 0], [0.5, 0.759, 0.5]],
+    ],
+    broadleafTree: [
+      ['box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]],
+      ['sphere', 'treeLeavesMeadow', [0, 0.552, 0], [0.6875, 0.448, 0.6875]],
+      ['sphere', 'treeLeavesMeadow', [0.265, 0.655, -0.265], [0.4375, 0.241, 0.4375]],
+    ],
+    wetlandTree: [
+      ['box', 'treeTrunk', [0, 0.207, 0], [0.15, 0.414, 0.15]],
+      ['sphere', 'treeLeavesForest', [0, 0.552, 0], [0.6875, 0.448, 0.6875]],
+      ['sphere', 'treeLeavesForest', [-0.265, 0.655, 0.265], [0.4375, 0.241, 0.4375]],
+    ],
+  };
+
+  for (const [kind, originalParts] of Object.entries(originalTreeParts)) {
+    const enlargedParts = W8_PARITY_FEATURE_PARTS[kind];
+    assert.equal(enlargedParts.length, originalParts.length, kind);
+    for (let index = 0; index < originalParts.length; index += 1) {
+      const [geometry, material, position, scale] = originalParts[index];
+      const enlarged = enlargedParts[index];
+      assert.equal(enlarged.geometry, geometry, `${kind} geometry ${index}`);
+      assert.equal(enlarged.material, material, `${kind} material ${index}`);
+      assert.deepEqual(enlarged.rotation, [0, 0, 0], `${kind} rotation ${index}`);
+      assert.deepEqual(
+        enlarged.position,
+        position.map(value => value * W8_PRODUCTION_TREE_VISUAL_SCALE),
+        `${kind} position ${index}`,
+      );
+      assert.deepEqual(
+        enlarged.scale,
+        scale.map(value => value * W8_PRODUCTION_TREE_VISUAL_SCALE),
+        `${kind} scale ${index}`,
+      );
+    }
+    const trunk = enlargedParts[0];
+    assert.equal(trunk.position[1] - trunk.scale[1] / 2, 0, `${kind} trunk ground contact`);
+  }
 });
 
 test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentation only', async () => {
