@@ -14,6 +14,8 @@ import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { createRoadGraphV1SettlementTemplate } from './road-graph-v1-settlement-adapter.js';
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { createRoadGraphV2SettlementTemplate } from './road-graph-v2-settlement-adapter.js';
+import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
+import { createRoadGraphV3SettlementTemplate } from './road-graph-v3-settlement-adapter.js';
 import {
   CHUNK_GENERATION_STAGE,
   measureChunkGenerationStage,
@@ -221,11 +223,13 @@ export async function createDistributedSettlementChunkGenerator({
 } = {}) {
   if (settlementRoadGraphGeneratorId !== null
     && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID
-    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V2_GENERATOR_ID) {
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V2_GENERATOR_ID
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V3_GENERATOR_ID) {
     throw new RangeError(`unsupported experimental Settlement Road Graph: ${settlementRoadGraphGeneratorId}`);
   }
   const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
+  const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
   const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed });
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
   const reviewSettlement = await distributor.findHomeSettlement(0, 0);
@@ -267,8 +271,10 @@ export async function createDistributedSettlementChunkGenerator({
       ),
       roadTimingRun,
     };
-    const template = useRoadGraphV2
-      ? await createRoadGraphV2SettlementTemplate(roadGraphTemplateOptions)
+    const template = useRoadGraphV3
+      ? await createRoadGraphV3SettlementTemplate(roadGraphTemplateOptions)
+      : useRoadGraphV2
+        ? await createRoadGraphV2SettlementTemplate(roadGraphTemplateOptions)
       : useRoadGraphV1
         ? await createRoadGraphV1SettlementTemplate(roadGraphTemplateOptions)
         : await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });

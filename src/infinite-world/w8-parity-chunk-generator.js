@@ -19,6 +19,8 @@ import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v1-settlement-adapter.js';
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v2-settlement-adapter.js';
+import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
+import { ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v3-settlement-adapter.js';
 import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
@@ -1073,12 +1075,14 @@ export async function createW8ParityChunkGenerator({
 } = {}) {
   if (settlementRoadGraphGeneratorId !== null
     && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID
-    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V2_GENERATOR_ID) {
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V2_GENERATOR_ID
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V3_GENERATOR_ID) {
     throw new RangeError(`unsupported experimental Settlement Road Graph: ${settlementRoadGraphGeneratorId}`);
   }
   const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
-  const useExperimentalRoadGraph = useRoadGraphV1 || useRoadGraphV2;
+  const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
+  const useExperimentalRoadGraph = useRoadGraphV1 || useRoadGraphV2 || useRoadGraphV3;
   const cacheCapacities = resolveW8CacheCapacities(cacheCapacityOverrides);
   const base = await baseGeneratorFactory({
     worldSeed,
@@ -1318,8 +1322,10 @@ export async function createW8ParityChunkGenerator({
     terrainSuitability: null,
   });
   const majorRoadSurfacePolicyVersion = 'w8-settlement-surface-policy-1';
-  const majorRoadSourceContractVersion = useRoadGraphV2
-    ? ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA
+  const majorRoadSourceContractVersion = useRoadGraphV3
+    ? ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA
+    : useRoadGraphV2
+      ? ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA
     : useRoadGraphV1
       ? ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA
       : 'w5-migrated-settlement-template-1';
