@@ -22,6 +22,7 @@ import {
   sampleW8SurfaceHeightMeters,
 } from './w8-parity-chunk-generator.js';
 import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
+import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
@@ -268,6 +269,7 @@ function parseMeasurementQuality(value) {
 export function parseSettlementRoadGraphGeneratorId(value) {
   if (value === null || value === '' || value === 'legacy-migrated-v1') return null;
   if (value === ROAD_GRAPH_V1_GENERATOR_ID) return ROAD_GRAPH_V1_GENERATOR_ID;
+  if (value === ROAD_GRAPH_V2_GENERATOR_ID) return ROAD_GRAPH_V2_GENERATOR_ID;
   throw new RangeError(`unsupported experimental Settlement Road Graph: ${value}`);
 }
 
