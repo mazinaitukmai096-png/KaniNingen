@@ -8,6 +8,7 @@ import {
   SETTLEMENT_SEMANTIC_STABLE_ID_SCHEMA,
 } from './settlement-semantic-identity.js';
 import { createSettlementStageGeneratorRegistry } from './settlement-stage-generator-registry.js';
+import { BLOCK_V1_STAGE_GENERATOR } from './block-generator-v1.js';
 
 export const ROAD_GRAPH_V1_GENERATOR_ID = 'road-graph-v1';
 export const ROAD_GRAPH_V1_SCHEMA = 'settlement-road-graph-v1';
@@ -464,6 +465,7 @@ export const ROAD_GRAPH_V1_STAGE_GENERATOR = Object.freeze({
 
 const experimentalRegistry = createSettlementStageGeneratorRegistry();
 experimentalRegistry.register(ROAD_GRAPH_V1_STAGE_GENERATOR);
+experimentalRegistry.register(BLOCK_V1_STAGE_GENERATOR);
 experimentalRegistry.freeze();
 
 export const EXPERIMENTAL_SETTLEMENT_STAGE_GENERATOR_REGISTRY = experimentalRegistry;

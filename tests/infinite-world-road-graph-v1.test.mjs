@@ -8,6 +8,10 @@ import { SETTLEMENT_TYPES } from '../src/settlement-type.js';
 import { canonicalizeJson } from '../src/infinite-world/legacy-core/g0/canonical-json.js';
 import { hashWorldSeed } from '../src/infinite-world/legacy-core/g0/seed.js';
 import {
+  BLOCK_GENERATOR_V1_ID,
+  createRoadGraphV1Blocks,
+} from '../src/infinite-world/block-generator-v1.js';
+import {
   SETTLEMENT_SEMANTIC_STABLE_ID_SCHEMA,
   createSettlementSemanticStableId,
 } from '../src/infinite-world/settlement-semantic-identity.js';
@@ -91,7 +95,7 @@ function fakeFormalChunk(chunkX, chunkZ) {
   };
 }
 
-test('road-graph-v1 is registered only as the experimental roadGraph stage', () => {
+test('road-graph-v1 and block-v1 are registered only as their experimental stages', () => {
   const descriptor = EXPERIMENTAL_SETTLEMENT_STAGE_GENERATOR_REGISTRY.get(
     'roadGraph',
     ROAD_GRAPH_V1_GENERATOR_ID,
@@ -99,6 +103,13 @@ test('road-graph-v1 is registered only as the experimental roadGraph stage', () 
   assert.equal(descriptor.generatorId, 'road-graph-v1');
   assert.equal(descriptor.stage, 'roadGraph');
   assert.equal(descriptor.generate, createRoadGraphV1);
+  const blockDescriptor = EXPERIMENTAL_SETTLEMENT_STAGE_GENERATOR_REGISTRY.get(
+    'block',
+    BLOCK_GENERATOR_V1_ID,
+  );
+  assert.equal(blockDescriptor.generatorId, BLOCK_GENERATOR_V1_ID);
+  assert.equal(blockDescriptor.stage, 'block');
+  assert.equal(blockDescriptor.generate, createRoadGraphV1Blocks);
   assert.equal(EXPERIMENTAL_SETTLEMENT_STAGE_GENERATOR_REGISTRY.get('block', 'road-graph-v1'), null);
 });
 
