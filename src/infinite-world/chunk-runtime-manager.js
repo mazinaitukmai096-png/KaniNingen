@@ -79,6 +79,8 @@ export class ChunkRuntimeManager {
     this.identityAudit = new Map();
     this.activeDataKeys = new Set();
     this.renderedKeys = new Set();
+    this.provisionalTerrainKeys = new Set();
+    this.provisionalTerrainPromises = new Map();
     this.deferredRenderReleaseKeys = new Set();
     this.transitionProtectedDataKeys = new Set();
     this.centerChunkX = null;
@@ -220,6 +222,61 @@ export class ChunkRuntimeManager {
     plan.promise = operation;
     this.preparationChain = operation.catch(() => {});
     return operation;
+  }
+
+  publishTraversalTerrain(chunkXInput, chunkZInput) {
+    const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'traversalTerrainChunkX');
+    const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'traversalTerrainChunkZ');
+    const key = createChunkKey(chunkX, chunkZ);
+    if (this.isShutdown) return Promise.resolve(false);
+    if (this.renderedKeys.has(key) || this.provisionalTerrainKeys.has(key)) {
+      return Promise.resolve(true);
+    }
+    if (!this.activeDataKeys.has(key)) return Promise.resolve(false);
+    if (typeof this.renderAdapter.projectTerrainChunk !== 'function'
+      || typeof this.renderAdapter.loadProjectedTerrain !== 'function'
+      || typeof this.renderAdapter.retainTerrainChunk !== 'function'
+      || typeof this.renderAdapter.unloadProvisionalTerrain !== 'function') {
+      return Promise.resolve(false);
+    }
+    const pending = this.provisionalTerrainPromises.get(key);
+    if (pending) return pending;
+    const operation = (async () => {
+      let projected = null;
+      try {
+        const entry = this.cache.get(key);
+        if (!entry?.data || !this.activeDataKeys.has(key)) return false;
+        projected = await this.renderAdapter.projectTerrainChunk(entry.data, this.renderOrigin);
+        if (this.renderedKeys.has(key) || !this.activeDataKeys.has(key)) {
+          await this.renderAdapter.discardProjected?.(projected);
+          return this.renderedKeys.has(key);
+        }
+        this.provisionalTerrainKeys.add(key);
+        await this.renderAdapter.loadProjectedTerrain(projected);
+        return true;
+      } catch {
+        this.provisionalTerrainKeys.delete(key);
+        if (projected && projected.lifecycle === 'staged-terrain') {
+          try { await this.renderAdapter.discardProjected?.(projected); } catch { /* fallback below */ }
+        }
+        return false;
+      }
+    })().finally(() => this.provisionalTerrainPromises.delete(key));
+    this.provisionalTerrainPromises.set(key, operation);
+    return operation;
+  }
+
+  isTerrainCoveragePublished(chunkXInput, chunkZInput) {
+    const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'terrainCoverageChunkX');
+    const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'terrainCoverageChunkZ');
+    const key = createChunkKey(chunkX, chunkZ);
+    return this.renderedKeys.has(key) || this.provisionalTerrainKeys.has(key);
+  }
+
+  isTerrainCoverageProvisional(chunkXInput, chunkZInput) {
+    const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'provisionalTerrainChunkX');
+    const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'provisionalTerrainChunkZ');
+    return this.provisionalTerrainKeys.has(createChunkKey(chunkX, chunkZ));
   }
 
   #createPreparedTransitionPlan(chunkX, chunkZ, fromCenterKey) {
@@ -573,9 +630,12 @@ export class ChunkRuntimeManager {
       }
       for (const entry of staged) {
         const loadStartedAt = this.clock();
+        const promotedTerrain = this.provisionalTerrainKeys.has(entry.key);
         await this.renderAdapter.loadProjected(entry.projected);
         this.performance.record('load', this.clock() - loadStartedAt);
         prepared?.projectedByKey.delete(entry.key);
+        if (promotedTerrain) this.provisionalTerrainKeys.delete(entry.key);
+        entry.promotedTerrain = promotedTerrain;
         attached.push(entry);
         if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-attached', {
           ownerKey: entry.key,
@@ -660,6 +720,7 @@ export class ChunkRuntimeManager {
       replacementCommitted = true;
 
       await this.#releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence);
+      await this.#releaseObsoleteProvisionalTerrains(desiredRenderKeys);
       this.#evictInactiveCacheEntries();
       this.#validateRuntimeInvariants();
       this.counts.transitionsPerformed += 1;
@@ -711,7 +772,12 @@ export class ChunkRuntimeManager {
       const rollbackErrors = [];
       for (const entry of [...attached].reverse()) {
         try {
-          await this.renderAdapter.unloadChunk(entry.key);
+          if (entry.promotedTerrain) {
+            await this.renderAdapter.retainTerrainChunk(entry.key);
+            this.provisionalTerrainKeys.add(entry.key);
+          } else {
+            await this.renderAdapter.unloadChunk(entry.key);
+          }
           this.counts.renderUnloaded += 1;
         } catch (rollbackError) {
           this.deferredRenderReleaseKeys.add(entry.key);
@@ -800,6 +866,16 @@ export class ChunkRuntimeManager {
     }
   }
 
+  async #releaseObsoleteProvisionalTerrains(desiredRenderKeys) {
+    if (typeof this.renderAdapter.unloadProvisionalTerrain !== 'function') return;
+    const obsolete = sortedKeys(this.provisionalTerrainKeys)
+      .filter(key => !desiredRenderKeys.has(key));
+    for (const key of obsolete) {
+      await this.renderAdapter.unloadProvisionalTerrain(key);
+      this.provisionalTerrainKeys.delete(key);
+    }
+  }
+
   #registerIdentity(key, chunkData) {
     const identity = Object.freeze({ chunkId: chunkData.chunkId, contentHash: chunkData.contentHash });
     const existing = this.identityAudit.get(key);
@@ -830,6 +906,10 @@ export class ChunkRuntimeManager {
     for (const key of this.renderedKeys) {
       if (!this.activeDataKeys.has(key)) throw new Error(`rendered chunk is outside active data set: ${key}`);
     }
+    for (const key of this.provisionalTerrainKeys) {
+      if (this.renderedKeys.has(key)) throw new Error(`Terrain owner is both committed and provisional: ${key}`);
+      if (!this.activeDataKeys.has(key)) throw new Error(`provisional Terrain is outside active data set: ${key}`);
+    }
     const renderCoverage = this.renderAdapter.renderCoverageSnapshot?.();
     if (renderCoverage) {
       const expected = sortedKeys(this.#physicalRenderKeys());
@@ -849,6 +929,12 @@ export class ChunkRuntimeManager {
       }
       if (renderCoverage.lifecycleMismatchKeys?.length) {
         throw new Error(`loaded chunk lifecycle mismatch: ${renderCoverage.lifecycleMismatchKeys.join(', ')}`);
+      }
+      const provisional = sortedKeys(renderCoverage.provisionalTerrainKeys ?? []);
+      const expectedProvisional = sortedKeys(this.provisionalTerrainKeys);
+      if (provisional.length !== expectedProvisional.length
+        || provisional.some((key, index) => key !== expectedProvisional[index])) {
+        throw new Error('provisional Terrain coverage does not match Runtime owners');
       }
     }
     const chunkIds = new Map();
@@ -893,6 +979,7 @@ export class ChunkRuntimeManager {
     const candidates = [...this.cache.entries()]
       .filter(([key]) => !this.activeDataKeys.has(key)
         && !this.renderedKeys.has(key)
+        && !this.provisionalTerrainKeys.has(key)
         && !this.transitionProtectedDataKeys.has(key))
       .sort((a, b) => a[1].lastUsed - b[1].lastUsed
         || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -946,6 +1033,7 @@ export class ChunkRuntimeManager {
       pendingPrefetchCount: this.pendingPrefetchKeys.size,
       preparedTransitionCount: this.preparedTransitions.size,
       deferredRenderReleaseCount: this.deferredRenderReleaseKeys.size,
+      provisionalTerrainCount: this.provisionalTerrainKeys.size,
     });
   }
 
@@ -974,6 +1062,7 @@ export class ChunkRuntimeManager {
       pendingPrefetchKeys: Object.freeze(sortedKeys(this.pendingPrefetchKeys)),
       renderedKeys: this.renderedKeyList,
       deferredRenderReleaseKeys: Object.freeze(sortedKeys(this.deferredRenderReleaseKeys)),
+      provisionalTerrainKeys: Object.freeze(sortedKeys(this.provisionalTerrainKeys)),
       transitionContract: this.committedTransitionContract,
       streaming: this.getStreamingState(),
       counts: Object.freeze({ ...this.counts }),
@@ -995,7 +1084,14 @@ export class ChunkRuntimeManager {
       this.performance.record('unload', this.clock() - startedAt);
       this.counts.renderUnloaded += 1;
     }
+    if (typeof this.renderAdapter.unloadProvisionalTerrain === 'function') {
+      for (const key of sortedKeys(this.provisionalTerrainKeys)) {
+        await this.renderAdapter.unloadProvisionalTerrain(key);
+      }
+    }
     this.renderedKeys.clear();
+    this.provisionalTerrainKeys.clear();
+    this.provisionalTerrainPromises.clear();
     this.deferredRenderReleaseKeys.clear();
     this.transitionProtectedDataKeys.clear();
     this.activeDataKeys.clear();

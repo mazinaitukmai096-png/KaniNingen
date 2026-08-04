@@ -57,6 +57,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkX = 0;
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
+    this.provisionalTerrain = new Map();
     this.disposedChunkGeometries = new WeakSet();
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
@@ -164,6 +165,20 @@ export class ChunkRenderAdapter {
     this.occlusionMeshes.push(...registry.occlusionMeshes);
     this.cameraCollisionBounds.push(...registry.cameraCollisionBounds);
     for (const mesh of registry.transparentMeshes) this.transparentMeshes.add(mesh);
+  }
+
+  #removeProjectedRegistry(projected) {
+    const key = projected.key;
+    const groupMeshes = new Set(projected.group.children ?? []);
+    this.occlusionMeshes = this.occlusionMeshes.filter(mesh => !groupMeshes.has(mesh));
+    this.cameraCollisionBounds = this.cameraCollisionBounds.filter(bound => bound.chunkKey !== key);
+    for (const mesh of groupMeshes) this.transparentMeshes.delete(mesh);
+    for (const stableId of this.chunkFeatureIds.get(key) ?? []) {
+      this.featureInstances.delete(stableId);
+      this.occludedFeatureIds.delete(stableId);
+      this.occlusionLastHitAt.delete(stableId);
+    }
+    this.chunkFeatureIds.delete(key);
   }
 
   #registerFeatureInstance({
@@ -367,6 +382,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkX = origin.renderOriginChunkX;
     this.renderOriginChunkZ = origin.renderOriginChunkZ;
     for (const projected of this.loaded.values()) this.#positionGroup(projected);
+    for (const projected of this.provisionalTerrain.values()) this.#positionGroup(projected);
     if (origin.rebaseCount > this.counts.rebased) this.counts.rebased = origin.rebaseCount;
   }
 
@@ -426,6 +442,68 @@ export class ChunkRenderAdapter {
     geometry.computeVertexNormals();
     this.counts.chunkOwnedGeometriesCreated += 1;
     return geometry;
+  }
+
+  async projectTerrainChunk(chunkData, origin = null) {
+    if (this.disposed) throw new Error('render adapter is shut down');
+    if (!chunkData) throw new TypeError('ChunkData is required for rendering');
+    const { Group, Mesh } = this.THREE;
+    requireConstructor(this.THREE, 'Group');
+    requireConstructor(this.THREE, 'Mesh');
+    const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
+    if (this.loaded.has(key) || this.provisionalTerrain.has(key)) {
+      throw new Error(`Terrain owner is already published: ${key}`);
+    }
+    const group = new Group();
+    group.name = `w1a-provisional-terrain-${key}`;
+    group.userData = {
+      chunkKey: key,
+      chunkId: chunkData.chunkId,
+      contentHash: chunkData.contentHash,
+      provisionalTerrain: true,
+    };
+    const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
+    const terrainGeometry = naturalTerrain
+      ? this.#createNaturalTerrainGeometry(chunkData)
+      : this.geometries.terrain;
+    const terrain = new Mesh(
+      terrainGeometry,
+      naturalTerrain ? this.materials.naturalTerrain : this.materials.terrain,
+    );
+    terrain.name = naturalTerrain ? 'w2-natural-terrain' : 'w1a-terrain';
+    terrain.receiveShadow = true;
+    if (!naturalTerrain) {
+      terrain.rotation.x = -Math.PI / 2;
+      terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
+    }
+    group.add(terrain);
+    const projected = {
+      key,
+      chunkX: chunkData.chunkX,
+      chunkZ: chunkData.chunkZ,
+      group,
+      terrain,
+      ownedGeometries: naturalTerrain ? [terrainGeometry] : [],
+      lifecycle: 'staged-terrain',
+    };
+    this.#positionGroup(projected, origin);
+    return projected;
+  }
+
+  async loadProjectedTerrain(projected) {
+    if (!projected?.key || !projected.group || !projected.terrain) {
+      throw new TypeError('invalid projected Terrain');
+    }
+    if (projected.lifecycle !== 'staged-terrain') {
+      throw new Error(`Terrain owner is not staged for load: ${projected.key}:${projected.lifecycle}`);
+    }
+    if (this.loaded.has(projected.key) || this.provisionalTerrain.has(projected.key)) {
+      throw new Error(`Terrain owner is already published: ${projected.key}`);
+    }
+    this.#positionGroup(projected);
+    this.worldRoot.add(projected.group);
+    this.provisionalTerrain.set(projected.key, projected);
+    projected.lifecycle = 'provisional';
   }
 
   #ensureSettlementResources() {
@@ -1091,12 +1169,38 @@ export class ChunkRenderAdapter {
       throw new Error(`render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`);
     }
     if (this.loaded.has(projected.key)) throw new Error(`render chunk already loaded: ${projected.key}`);
+    const provisional = this.provisionalTerrain.get(projected.key) ?? null;
+    const projectedTerrain = (projected.group.children ?? []).find(child => (
+      child.name === 'w2-natural-terrain' || child.name === 'w1a-terrain'
+    ));
     projected.lifecycle = 'loading';
     try {
       this.#positionGroup(projected);
       this.#commitProjectedRegistry(projected);
+      if (provisional) {
+        this.worldRoot.remove(provisional.group);
+        provisional.group.remove(provisional.terrain);
+        if (projectedTerrain) projected.group.remove(projectedTerrain);
+        projected.group.add(provisional.terrain);
+      }
       this.worldRoot.add(projected.group);
       this.loaded.set(projected.key, projected);
+      if (provisional) {
+        this.provisionalTerrain.delete(projected.key);
+        projected.promotedTerrain = provisional;
+        projected.ownedGeometries = [
+          ...(projected.ownedGeometries ?? []).filter(geometry => geometry !== projectedTerrain?.geometry),
+          ...(provisional.ownedGeometries ?? []),
+        ];
+        if (projectedTerrain && projectedTerrain.geometry !== provisional.terrain.geometry
+          && projectedTerrain.geometry !== this.geometries.terrain) {
+          projectedTerrain.geometry.dispose?.();
+          this.disposedChunkGeometries.add(projectedTerrain.geometry);
+          this.counts.chunkOwnedGeometriesDisposed += 1;
+        }
+        projectedTerrain?.dispose?.();
+        provisional.lifecycle = 'promoted';
+      }
       projected.lifecycle = 'loaded';
       this.counts.loaded += 1;
       if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
@@ -1107,6 +1211,15 @@ export class ChunkRenderAdapter {
     } catch (error) {
       this.worldRoot.remove(projected.group);
       this.loaded.delete(projected.key);
+      if (provisional) {
+        projected.group.remove(provisional.terrain);
+        if (projectedTerrain) projected.group.add(projectedTerrain);
+        provisional.group.add(provisional.terrain);
+        this.#positionGroup(provisional);
+        this.worldRoot.add(provisional.group);
+        this.provisionalTerrain.set(projected.key, provisional);
+        provisional.lifecycle = 'provisional';
+      }
       projected.lifecycle = 'staged';
       throw error;
     }
@@ -1196,22 +1309,58 @@ export class ChunkRenderAdapter {
       this.disposedChunkGeometries.add(geometry);
       this.counts.chunkOwnedGeometriesDisposed += 1;
     }
-    const occlusionMeshes = new Set(projected.group.children ?? []);
-    this.occlusionMeshes = this.occlusionMeshes.filter(mesh => !occlusionMeshes.has(mesh));
-    this.cameraCollisionBounds = this.cameraCollisionBounds.filter(bound => bound.chunkKey !== key);
-    for (const mesh of occlusionMeshes) this.transparentMeshes.delete(mesh);
+    this.#removeProjectedRegistry(projected);
     for (const child of projected.group.children ?? []) child.dispose?.();
     projected.group.clear();
-    for (const stableId of this.chunkFeatureIds.get(key) ?? []) this.featureInstances.delete(stableId);
-    for (const stableId of this.chunkFeatureIds.get(key) ?? []) {
-      this.occludedFeatureIds.delete(stableId);
-      this.occlusionLastHitAt.delete(stableId);
-    }
-    this.chunkFeatureIds.delete(key);
     this.loaded.delete(key);
     this.#invalidateVisibleStableIds();
     projected.lifecycle = 'unloaded';
     this.counts.unloaded += 1;
+  }
+
+  async retainTerrainChunk(key) {
+    const projected = this.loaded.get(key);
+    const provisional = projected?.promotedTerrain;
+    if (!projected || !provisional) {
+      throw new Error(`render chunk has no promoted Terrain to retain: ${key}`);
+    }
+    const terrain = provisional.terrain;
+    this.worldRoot.remove(projected.group);
+    projected.group.remove(terrain);
+    this.#removeProjectedRegistry(projected);
+    for (const geometry of projected.ownedGeometries ?? []) {
+      if (geometry === terrain.geometry) continue;
+      geometry.dispose?.();
+      this.disposedChunkGeometries.add(geometry);
+      this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
+    for (const child of projected.group.children ?? []) child.dispose?.();
+    projected.group.clear();
+    provisional.group.add(terrain);
+    this.#positionGroup(provisional);
+    this.worldRoot.add(provisional.group);
+    this.loaded.delete(key);
+    this.provisionalTerrain.set(key, provisional);
+    projected.lifecycle = 'unloaded';
+    provisional.lifecycle = 'provisional';
+    this.pendingFirstDrawByChunk.delete(key);
+    this.#invalidateVisibleStableIds();
+    this.counts.unloaded += 1;
+  }
+
+  async unloadProvisionalTerrain(key) {
+    const projected = this.provisionalTerrain.get(key);
+    if (!projected) throw new Error(`provisional Terrain is not loaded: ${key}`);
+    this.worldRoot.remove(projected.group);
+    for (const geometry of projected.ownedGeometries ?? []) {
+      geometry.dispose?.();
+      this.disposedChunkGeometries.add(geometry);
+      this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
+    for (const child of projected.group.children ?? []) child.dispose?.();
+    projected.group.clear();
+    this.provisionalTerrain.delete(key);
+    projected.lifecycle = 'unloaded';
   }
 
   async discardProjected(projected) {
@@ -1256,6 +1405,7 @@ export class ChunkRenderAdapter {
       missingTerrainKeys: Object.freeze(sort(missingTerrainKeys)),
       disposedTerrainKeys: Object.freeze(sort(disposedTerrainKeys)),
       lifecycleMismatchKeys: Object.freeze(sort(lifecycleMismatchKeys)),
+      provisionalTerrainKeys: Object.freeze(sort([...this.provisionalTerrain.keys()])),
     });
   }
 
@@ -1349,6 +1499,7 @@ export class ChunkRenderAdapter {
     const visualResources = this.visualAssets.snapshot();
     return Object.freeze({
       liveChunkGroups: this.loaded.size,
+      provisionalTerrainGroupCount: this.provisionalTerrain.size,
       sharedGeometryCount: Object.keys(this.geometries).length
         + (this.settlementResources ? Object.keys(this.settlementResources.geometries).length : 0)
         + visualResources.sharedGeometryCount,
@@ -1379,6 +1530,7 @@ export class ChunkRenderAdapter {
   async shutdown() {
     if (this.disposed) return;
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
+    for (const key of [...this.provisionalTerrain.keys()]) await this.unloadProvisionalTerrain(key);
     this.scene.remove(this.worldRoot);
     for (const geometry of Object.values(this.geometries)) geometry.dispose();
     for (const material of Object.values(this.materials)) material.dispose();

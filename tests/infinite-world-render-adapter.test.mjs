@@ -120,6 +120,39 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
   await adapter.shutdown();
 });
 
+test('Terrain-only publication defers auxiliary layers and promotes the same mesh into the formal owner', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'renderer-terrain-promotion' });
+  const data = await generator.generateChunk(0, 0);
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const provisional = await adapter.projectTerrainChunk(data, {
+    renderOriginChunkX: 0, renderOriginChunkZ: 0,
+  });
+  const terrain = provisional.terrain;
+  await adapter.loadProjectedTerrain(provisional);
+  assert.deepEqual(adapter.renderCoverageSnapshot().provisionalTerrainKeys, ['0,0']);
+  assert.equal(provisional.group.children.length, 1);
+  assert.equal(adapter.featureInstances.size, 0, 'Stable IDs are not registered by Phase 1');
+
+  const full = await adapter.projectChunk(data, null, { deferredRegistration: true });
+  assert.equal(adapter.featureInstances.size, 0, 'supplemental projection remains staged');
+  await adapter.loadProjected(full);
+  assert.equal(full.group.children.includes(terrain), true);
+  assert.equal(full.group.children.filter(child => (
+    child.name === 'w2-natural-terrain' || child.name === 'w1a-terrain'
+  )).length, 1);
+  assert.deepEqual(adapter.renderCoverageSnapshot().provisionalTerrainKeys, []);
+  assert.deepEqual(adapter.renderCoverageSnapshot().loadedKeys, ['0,0']);
+  assert.ok(adapter.featureInstances.size > 0, 'Stable IDs publish only with the full owner');
+
+  await adapter.retainTerrainChunk('0,0');
+  assert.equal(provisional.group.children[0], terrain);
+  assert.deepEqual(adapter.renderCoverageSnapshot().loadedKeys, []);
+  assert.deepEqual(adapter.renderCoverageSnapshot().provisionalTerrainKeys, ['0,0']);
+  assert.equal(adapter.featureInstances.size, 0);
+  await adapter.unloadProvisionalTerrain('0,0');
+  await adapter.shutdown();
+});
+
 test('render adapter applies Stable-ID destruction without allocating or leaking Chunk resources', async () => {
   const generator = await createSandboxChunkGenerator({ worldSeed: 'renderer-destruction-state' });
   const data = await generator.generateChunk(0, 0);

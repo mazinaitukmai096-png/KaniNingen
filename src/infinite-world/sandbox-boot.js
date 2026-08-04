@@ -1527,6 +1527,10 @@ export async function bootInfiniteWorldSandbox({
           }
           finally { renderProjectionMs += Math.max(0, clock() - startedAt); }
         },
+        projectTerrainChunk: (chunkData, origin) => (
+          renderAdapter.projectTerrainChunk?.(chunkData, origin)
+        ),
+        loadProjectedTerrain: projected => renderAdapter.loadProjectedTerrain?.(projected),
         loadProjected: projected => {
           const result = diagnostics.measure(
             'chunk-load', () => renderAdapter.loadProjected(projected),
@@ -1556,6 +1560,8 @@ export async function bootInfiniteWorldSandbox({
         discardProjected: projected => diagnostics.measure(
           'chunk-discard', () => renderAdapter.discardProjected?.(projected),
         ),
+        retainTerrainChunk: key => renderAdapter.retainTerrainChunk?.(key),
+        unloadProvisionalTerrain: key => renderAdapter.unloadProvisionalTerrain?.(key),
         renderCoverageSnapshot: () => renderAdapter.renderCoverageSnapshot?.() ?? null,
         shutdown: () => renderAdapter.shutdown(),
       };
@@ -2000,6 +2006,7 @@ export async function bootInfiniteWorldSandbox({
     });
 
     let transitionTargetKey = null;
+    let transitionRetryTimer = null;
     const directionalPrefetchPending = new Set();
     let transitionError = null;
     let lastTerrainCoverageMissOwnerKey = null;
@@ -2377,7 +2384,8 @@ export async function bootInfiniteWorldSandbox({
     function isPlayerTerrainCoveragePublished(owner) {
       const committed = runtime.getCommittedChunkState();
       return committed.transitionContract !== null
-        && committed.renderedKeys.includes(owner.key);
+        && (runtime.isTerrainCoveragePublished?.(owner.chunkX, owner.chunkZ)
+          ?? committed.renderedKeys.includes(owner.key));
     }
 
     function assertRuntimePreparedForPlayer(owner) {
@@ -2988,12 +2996,26 @@ export async function bootInfiniteWorldSandbox({
           );
           await gameplayRebase;
         })
-        .catch(error => { transitionError = error; })
+        .catch(error => {
+          transitionError = error;
+          if (runtime.isTerrainCoverageProvisional?.(owner.chunkX, owner.chunkZ)) {
+            if (transitionRetryTimer !== null) clearTimeoutFn(transitionRetryTimer);
+            transitionRetryTimer = setTimeoutFn(() => {
+              transitionRetryTimer = null;
+              const playerOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+              if (playerOwner.key === owner.key
+                && runtime.isTerrainCoverageProvisional?.(owner.chunkX, owner.chunkZ)) {
+                requestTransition(owner, movement, { required: true });
+              }
+            }, 250);
+          }
+        })
         .finally(() => { transitionTargetKey = null; });
     }
 
     function requestPlayerTerrainCoverage(owner, movement = null) {
       if (!owner || (transitionTargetKey && transitionTargetKey !== owner.key)) return;
+      void runtime.publishTraversalTerrain?.(owner.chunkX, owner.chunkZ);
       if (transitionTargetKey !== owner.key && !directionalPrefetchPending.has(owner.key)) {
         if (diagnostics.enabled) diagnostics.recordEvent('terrain-gate-prefetch-requested', {
           ownerKey: owner.key,
@@ -4096,6 +4118,10 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       distantPresentation.invalidatePendingFarSync?.();
       if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
       if (postCommitTimer !== null) { clearTimeoutFn(postCommitTimer); postCommitTimer = null; }
+      if (transitionRetryTimer !== null) {
+        clearTimeoutFn(transitionRetryTimer);
+        transitionRetryTimer = null;
+      }
       cancelScheduledSave();
       removeWindowListener('resize', resize);
       removeWindowListener('pagehide', handlePageHide);

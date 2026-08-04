@@ -11,6 +11,7 @@ import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk
 class RecordingAdapter {
   constructor() {
     this.loaded = new Map();
+    this.provisionalTerrain = new Map();
     this.staged = new Set();
     this.unloadHistory = [];
     this.publicationHistory = [];
@@ -20,6 +21,8 @@ class RecordingAdapter {
     this.failProjectAt = null;
     this.failLoadAt = null;
     this.failUnloadKeys = new Set();
+    this.failTerrainProject = false;
+    this.terrainProjectAttempts = 0;
     this.projectGate = null;
     this.origin = null;
     this.shutdownCalled = false;
@@ -50,11 +53,34 @@ class RecordingAdapter {
     this.#recordCoverage('prepare');
     return projected;
   }
+  async projectTerrainChunk(data) {
+    this.terrainProjectAttempts += 1;
+    if (this.failTerrainProject) throw new Error('injected provisional Terrain prepare failure');
+    return {
+      key: `${data.chunkX},${data.chunkZ}`,
+      chunkId: data.chunkId,
+      contentHash: data.contentHash,
+      lifecycle: 'staged-terrain',
+    };
+  }
+  async loadProjectedTerrain(projected) {
+    if (this.loaded.has(projected.key) || this.provisionalTerrain.has(projected.key)) {
+      throw new Error(`duplicate provisional Terrain load ${projected.key}`);
+    }
+    projected.lifecycle = 'provisional';
+    this.provisionalTerrain.set(projected.key, projected);
+  }
   async loadProjected(projected) {
     this.loadAttempts += 1;
     if (this.failLoadAt === this.loadAttempts) throw new Error('injected Terrain attach failure');
     if (this.loaded.has(projected.key)) throw new Error(`duplicate render load ${projected.key}`);
     projected.lifecycle = 'loaded';
+    const provisional = this.provisionalTerrain.get(projected.key) ?? null;
+    if (provisional) {
+      this.provisionalTerrain.delete(projected.key);
+      projected.promotedTerrain = provisional;
+      provisional.lifecycle = 'promoted';
+    }
     this.staged.delete(projected);
     this.loaded.set(projected.key, projected);
     this.publicationHistory.push({ type: 'replacement-attached', ownerKey: projected.key });
@@ -66,6 +92,20 @@ class RecordingAdapter {
     this.unloadHistory.push(key);
     this.publicationHistory.push({ type: 'old-owner-released', ownerKey: key });
     this.#recordCoverage('release');
+  }
+  async retainTerrainChunk(key) {
+    const projected = this.loaded.get(key);
+    if (!projected?.promotedTerrain) throw new Error(`missing promoted Terrain ${key}`);
+    this.loaded.delete(key);
+    projected.lifecycle = 'unloaded';
+    projected.promotedTerrain.lifecycle = 'provisional';
+    this.provisionalTerrain.set(key, projected.promotedTerrain);
+  }
+  async unloadProvisionalTerrain(key) {
+    const projected = this.provisionalTerrain.get(key);
+    if (!projected) throw new Error(`missing provisional Terrain ${key}`);
+    this.provisionalTerrain.delete(key);
+    projected.lifecycle = 'unloaded';
   }
   async discardProjected(projected) {
     if (projected.lifecycle !== 'staged') throw new Error(`cannot discard ${projected.key}:${projected.lifecycle}`);
@@ -81,6 +121,7 @@ class RecordingAdapter {
       missingTerrainKeys: [],
       disposedTerrainKeys: [],
       lifecycleMismatchKeys: [],
+      provisionalTerrainKeys: [...this.provisionalTerrain.keys()].sort(),
     };
   }
   gateNextProject() {
@@ -98,6 +139,7 @@ class RecordingAdapter {
   async shutdown() {
     this.shutdownCalled = true;
     this.loaded.clear();
+    this.provisionalTerrain.clear();
     this.staged.clear();
   }
 }
@@ -164,6 +206,89 @@ test('runtime maintains 3x3 render and 5x5 data sets and generates only an enter
   await runtime.shutdown();
   assert.equal(adapter.loaded.size, 0);
   assert.equal(adapter.shutdownCalled, true);
+});
+
+test('Player traversal publishes Terrain alone and promotes it without duplicate ownership', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-two-phase-promotion' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+
+  assert.equal(await runtime.publishTraversalTerrain(2, 0), true);
+  assert.equal(runtime.isTerrainCoveragePublished(2, 0), true);
+  assert.deepEqual(runtime.snapshot().provisionalTerrainKeys, ['2,0']);
+  assert.equal(runtime.snapshot().renderedCount, 9, 'Phase 1 does not mutate committed Render coverage');
+  assert.equal(adapter.loaded.has('2,0'), false, 'supplemental layers remain unpublished in Phase 1');
+  assert.equal(adapter.provisionalTerrain.has('2,0'), true);
+  assert.equal(adapter.terrainProjectAttempts, 1);
+
+  await runtime.transitionToChunk(1, 0, { required: true });
+  assert.equal(adapter.loaded.has('2,0'), true);
+  assert.equal(adapter.provisionalTerrain.has('2,0'), false);
+  assert.equal(adapter.loaded.get('2,0').promotedTerrain?.key, '2,0');
+  assert.equal(adapter.terrainProjectAttempts, 1, 'formal commit reuses the Phase 1 Terrain owner');
+  assert.deepEqual(runtime.snapshot().provisionalTerrainKeys, []);
+  assert.equal(new Set(adapter.loaded.keys()).size, 9);
+  await runtime.shutdown();
+});
+
+test('Phase 1 failure preserves old coverage and falls back to the atomic transition', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-phase-one-fallback' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  const oldKeys = [...adapter.loaded.keys()].sort();
+  adapter.failTerrainProject = true;
+
+  assert.equal(await runtime.publishTraversalTerrain(2, 0), false);
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldKeys);
+  assert.deepEqual(runtime.snapshot().provisionalTerrainKeys, []);
+  await runtime.transitionToChunk(1, 0, { required: true });
+  assert.equal(runtime.snapshot().centerChunkX, 1);
+  assert.equal(adapter.loaded.size, 9);
+  await runtime.shutdown();
+});
+
+test('Phase 2 failure demotes a promoted Player Terrain and retains old coverage for retry', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-phase-two-retain' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  const oldKeys = [...adapter.loaded.keys()].sort();
+  assert.equal(await runtime.publishTraversalTerrain(2, -1), true);
+  adapter.failLoadAt = adapter.loadAttempts + 2;
+
+  await assert.rejects(runtime.transitionToChunk(1, 0, { required: true }), /injected Terrain attach failure/);
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldKeys);
+  assert.equal(adapter.provisionalTerrain.has('2,-1'), true,
+    'the Terrain available below the Player survives supplemental publication failure');
+  assert.equal(runtime.isTerrainCoverageProvisional(2, -1), true);
+  assert.deepEqual(runtime.snapshot().provisionalTerrainKeys, ['2,-1']);
+  adapter.failLoadAt = null;
+  await runtime.transitionToChunk(1, 0, { required: true });
+  assert.equal(adapter.loaded.size, 9);
+  assert.equal(adapter.provisionalTerrain.size, 0);
+  await runtime.shutdown();
+});
+
+test('provisional Terrain rebases, superseded directions are released, and revisit stays unique', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'terrain-provisional-rebase' });
+  const adapter = new RecordingAdapter();
+  const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 81 });
+  await runtime.initialize(0, 0);
+  await runtime.publishTraversalTerrain(2, 0);
+  await runtime.publishTraversalTerrain(0, 2);
+  assert.deepEqual(runtime.snapshot().provisionalTerrainKeys, ['0,2', '2,0']);
+
+  await runtime.transitionToChunk(1, 0, { required: true });
+  assert.equal(adapter.origin.renderOriginChunkX, 1);
+  assert.equal(adapter.origin.renderOriginChunkZ, 0);
+  assert.equal(adapter.provisionalTerrain.size, 0, 'superseded direction leaves no orphan Terrain');
+  await runtime.transitionToChunk(0, 0, { required: true });
+  assert.equal(adapter.loaded.size, 9);
+  assert.equal(new Set(adapter.loaded.keys()).size, 9);
+  assert.equal(adapter.staged.size, 0);
+  await runtime.shutdown();
 });
 
 test('Terrain prepare failure discards staging and preserves the complete old coverage', async () => {
