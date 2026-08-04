@@ -358,10 +358,30 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
 
   function createHumanModel() {
     const group = base.createEntityModel('human');
+    group.clear?.();
+    const torso = appendPart(
+      group, 'box', 'humanBody', [0, 92.5, 0], [36, 55, 26], 'torso',
+    );
+    const leftLeg = appendPart(
+      group, 'box', 'humanBody', [-11, 34, 0], [14, 68, 22], 'left-leg',
+    );
+    const rightLeg = appendPart(
+      group, 'box', 'humanBody', [11, 34, 0], [14, 68, 22], 'right-leg',
+    );
+    const head = appendPart(
+      group, 'sphere', 'skin', [0, 130, 0], [10, 10, 10], 'head',
+    );
     group.userData = {
       ...(group.userData ?? {}),
-      presentationParts: { body: group.children[0] ?? null, head: group.children[1] ?? null },
-      finiteMeshCount: 2,
+      presentationParts: {
+        body: torso,
+        torso,
+        leftLeg,
+        rightLeg,
+        legs: [leftLeg, rightLeg],
+        head,
+      },
+      finiteMeshCount: 4,
     };
     return group;
   }

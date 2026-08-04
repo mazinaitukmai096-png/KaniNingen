@@ -186,9 +186,54 @@ test('W8 Player is the finite 21 Mesh hierarchy and its pivots drive presentatio
   assert.equal(parts.legs.length, 8);
 
   const finiteHuman = assets.createEntityModel('human');
-  assert.equal(countMeshes(finiteHuman), 2);
-  assert.equal(finiteHuman.userData.finiteMeshCount, 2);
-  assert.deepEqual(Object.keys(finiteHuman.userData.presentationParts).sort(), ['body', 'head']);
+  assert.equal(countMeshes(finiteHuman), 4);
+  assert.equal(finiteHuman.userData.finiteMeshCount, 4);
+  assert.deepEqual(Object.keys(finiteHuman.userData.presentationParts).sort(), [
+    'body', 'head', 'leftLeg', 'legs', 'rightLeg', 'torso',
+  ]);
+  const humanParts = finiteHuman.userData.presentationParts;
+  assert.equal(humanParts.body, humanParts.torso);
+  assert.deepEqual(humanParts.legs, [humanParts.leftLeg, humanParts.rightLeg]);
+  assert.deepEqual(
+    { x: humanParts.torso.scale.x, y: humanParts.torso.scale.y, z: humanParts.torso.scale.z },
+    { x: 36, y: 55, z: 26 },
+  );
+  assert.deepEqual(
+    { x: humanParts.leftLeg.position.x, y: humanParts.leftLeg.position.y,
+      z: humanParts.leftLeg.position.z },
+    { x: -11, y: 34, z: 0 },
+  );
+  assert.deepEqual(
+    { x: humanParts.rightLeg.position.x, y: humanParts.rightLeg.position.y,
+      z: humanParts.rightLeg.position.z },
+    { x: 11, y: 34, z: 0 },
+  );
+  assert.deepEqual(
+    { x: humanParts.head.position.x, y: humanParts.head.position.y,
+      z: humanParts.head.position.z },
+    { x: 0, y: 130, z: 0 },
+  );
+  assert.deepEqual(
+    { x: humanParts.head.scale.x, y: humanParts.head.scale.y, z: humanParts.head.scale.z },
+    { x: 10, y: 10, z: 10 },
+  );
+  const humanMinimumY = Math.min(
+    humanParts.leftLeg.position.y - humanParts.leftLeg.scale.y / 2,
+    humanParts.rightLeg.position.y - humanParts.rightLeg.scale.y / 2,
+  );
+  const humanMaximumY = humanParts.head.position.y + humanParts.head.scale.y;
+  assert.equal(humanMinimumY, 0);
+  assert.equal(humanMaximumY, 140);
+  const humanVisualScale = finiteHuman.userData.productionVisualScale;
+  assert.equal(humanVisualScale, 0.5);
+  assert.equal((humanMaximumY - humanMinimumY) * humanVisualScale
+    / PRODUCTION_VISUAL_UNITS_PER_METER, 1.75);
+  assert.equal(humanParts.head.scale.y * 2 * humanVisualScale
+    / PRODUCTION_VISUAL_UNITS_PER_METER, 0.25);
+  assert.equal(humanParts.torso.scale.x * humanVisualScale
+    / PRODUCTION_VISUAL_UNITS_PER_METER, 0.45);
+  assert.equal(humanParts.leftLeg.scale.y * humanVisualScale
+    / PRODUCTION_VISUAL_UNITS_PER_METER, 0.85);
   const finiteTank = assets.createEntityModel('tank');
   assert.equal(countMeshes(finiteTank), 8);
   assert.equal(finiteTank.userData.finiteMeshCount, 8);
