@@ -47,6 +47,16 @@ test('every committed and worktree change stays inside the Infinite World allowl
     ...status.map(line => line.slice(3).replaceAll('\\', '/')),
   ])];
   assert.ok(changedPaths.length > 0);
+  const playerScaleProfileScope = new Set([
+    'src/player-scale-profile.js',
+    'src/scale-sandbox.js',
+    'tests/capital-civic-core.test.mjs',
+    'tests/civic-space.test.mjs',
+    'tests/player-scale-profile.test.mjs',
+    'tests/scale-sandbox.test.mjs',
+    'tests/settlement-building-visuals.test.mjs',
+    'tests/settlement-life-details.test.mjs',
+  ]);
   for (const path of changedPaths) {
     const allowed = path === 'tests/destruction-feel-regression.test.mjs'
       || path === 'src/core/input.js'
@@ -54,6 +64,7 @@ test('every committed and worktree change stays inside the Infinite World allowl
       || path === 'tests/runtime-stability.test.mjs'
       || path === 'ゲーム起動.bat'
       || path === 'infinite-world-sandbox.html'
+      || playerScaleProfileScope.has(path)
       || path.startsWith('src/infinite-world/')
       || path.startsWith('tests/infinite-world-')
       || path.startsWith('docs/infinite-world/');

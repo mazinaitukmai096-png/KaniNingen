@@ -24,6 +24,7 @@ import {
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
+  W6_INITIAL_SCALE_STAGE_ID,
   W7_NUCLEAR_CONTRACT,
   W8_COMBAT_COMMAND_TYPES,
   createCombatCommand,
@@ -2792,6 +2793,7 @@ export async function bootInfiniteWorldSandbox({
             await gameplay.restart({
               playerSpawn: experienceSpawn,
               renderOrigin: runtime.snapshot().renderOrigin,
+              scaleStageId: W6_INITIAL_SCALE_STAGE_ID,
             });
             worldState.updatePlayer({ facingY: experienceSpawn.facingY });
             synchronized = await synchronizeRuntimeToLogicalPlayer();
@@ -2870,6 +2872,7 @@ export async function bootInfiniteWorldSandbox({
           await gameplay.restart({
             playerSpawn: experienceSpawn,
             renderOrigin: runtime.snapshot().renderOrigin,
+            scaleStageId: W6_INITIAL_SCALE_STAGE_ID,
           });
           worldState.updatePlayer({ facingY: experienceSpawn.facingY });
           await synchronizeRuntimeToLogicalPlayer();

@@ -150,9 +150,9 @@ function syntheticMilitaryBase({
   };
 }
 
-test('W6 imports the protected Tiny/Mid/Max and Max Gameplay contracts without changing their values', () => {
+test('W6 imports the protected Tiny/Mid/Max contracts with Tiny as the New Game stage', () => {
   assert.equal(W6_INITIAL_SCALE_STAGE_ID, INITIAL_SCALE_STAGE_ID);
-  assert.equal(W6_INITIAL_SCALE_STAGE_ID, 'MAX');
+  assert.equal(W6_INITIAL_SCALE_STAGE_ID, 'TINY');
   assert.equal(W6_ATTACK_CONTRACT.cooldownMs, ATTACK_COOLDOWN);
   assert.equal(W6_ATTACK_CONTRACT.singleDamage, 550);
   assert.equal(W6_ATTACK_CONTRACT.doubleDamage, 650);

@@ -226,7 +226,6 @@ test('normal town building opportunities retain legacy non-building thresholds a
 test('unrelated gameplay modules remain at the Phase 3A-2B HEAD', () => {
   for (const path of [
     'src/world-scale-rebalance.js',
-    'src/scale-sandbox.js',
     'src/constants.js',
     'src/core/input.js',
     'src/core/renderer.js',

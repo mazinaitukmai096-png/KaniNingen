@@ -42,10 +42,10 @@ function extractFunction(source, name) {
   assert.fail(`unterminated function: ${name}`);
 }
 
-test('the sandbox exposes exactly TINY, MID, and MAX with an explicit MAX initial stage', () => {
+test('the sandbox exposes exactly TINY, MID, and MAX with an explicit Tiny initial stage', () => {
   assert.deepEqual(Object.keys(SCALE_STAGES), ['TINY', 'MID', 'MAX']);
   assert.equal(Object.keys(SCALE_STAGES).length, 3);
-  assert.equal(INITIAL_SCALE_STAGE_ID, SCALE_STAGE_IDS.MAX);
+  assert.equal(INITIAL_SCALE_STAGE_ID, SCALE_STAGE_IDS.TINY);
   assert.match(game, /let activeScaleStageId = INITIAL_SCALE_STAGE_ID;/);
 
   const buttons = [...html.matchAll(/data-scale-stage="([A-Z]+)"/g)].map(match => match[1]);
@@ -110,18 +110,20 @@ test('MAX preserves every locked baseline scale, movement, attack, landing, and 
 test('TINY and MID use independently tuned visual, collision, movement, attack, and camera values', () => {
   const tiny = SCALE_STAGES.TINY;
   const mid = SCALE_STAGES.MID;
-  assert.equal(tiny.visualScale, 0.15);
-  assert.equal(tiny.collisionRadius, PLAYER_RADIUS * 0.15);
-  assert.equal(tiny.movementSpeed, PLAYER_SPEED * 0.5);
-  assert.equal(tiny.jumpVelocity, PLAYER_JUMP_VELOCITY * 0.6);
-  assert.equal(tiny.singleAttackRadius, 70);
-  assert.equal(tiny.cameraDistance, 140);
-  assert.equal(tiny.cameraNear, 1);
-  assert.equal(tiny.cameraMinDistance, 90);
-  assert.equal(tiny.cameraMaxDistance, 360);
+  assert.equal(tiny.visualScale, 0.08);
+  assert.equal(tiny.collisionRadius, PLAYER_RADIUS * 0.08);
+  assert.equal(tiny.movementSpeed, PLAYER_SPEED * 0.16);
+  assert.equal(tiny.sprintMultiplier, 1.35);
+  assert.equal(tiny.jumpVelocity, PLAYER_JUMP_VELOCITY * 0.09);
+  assert.equal(tiny.gravity, PLAYER_GRAVITY / 7);
+  assert.equal(tiny.singleAttackRadius, 18);
+  assert.equal(tiny.cameraDistance, 85);
+  assert.equal(tiny.cameraNear, 0.5);
+  assert.equal(tiny.cameraMinDistance, 50);
+  assert.equal(tiny.cameraMaxDistance, 220);
   assert.equal(tiny.cameraMinPitch, 0.05);
   assert.equal(tiny.cameraMaxPitch, 1.5);
-  assert.equal(tiny.playerShakeMultiplier, 0.15);
+  assert.equal(tiny.playerShakeMultiplier, 0.08);
 
   assert.equal(mid.visualScale, 0.45);
   assert.equal(mid.collisionRadius, PLAYER_RADIUS * 0.45);
@@ -155,9 +157,9 @@ test('all stages retain full yaw, tuned pitch/distance bounds, and safe near-cam
   }
   assert.deepEqual(
     [tiny.cameraGroundClearance, mid.cameraGroundClearance, max.cameraGroundClearance],
-    [6, 10, 12],
+    [3, 10, 12],
   );
-  assert.deepEqual([tiny.cameraNear, mid.cameraNear, max.cameraNear], [1, 4, 10]);
+  assert.deepEqual([tiny.cameraNear, mid.cameraNear, max.cameraNear], [0.5, 4, 10]);
 
   assert.match(game, /yaw -= e\.movementX \* CAM_MOUSE_ROTATION_SPEED \* settings\.mouseSensitivity \* activeScaleStage\.cameraRotationSensitivity;/);
   assert.doesNotMatch(game, /yaw\s*=\s*Math\.(?:max|min)|Math\.(?:max|min)\([^\n]*yaw/);
@@ -167,9 +169,9 @@ test('stage-scaled Player shake, stage reset, and camera ground protection are e
   const [tiny, mid, max] = [SCALE_STAGES.TINY, SCALE_STAGES.MID, SCALE_STAGES.MAX];
   assert.deepEqual(
     [tiny.playerShakeMultiplier, mid.playerShakeMultiplier, max.playerShakeMultiplier],
-    [0.15, 0.45, 1],
+    [0.08, 0.45, 1],
   );
-  assert.deepEqual([tiny.cameraShakeCap, mid.cameraShakeCap, max.cameraShakeCap], [36, 96, Infinity]);
+  assert.deepEqual([tiny.cameraShakeCap, mid.cameraShakeCap, max.cameraShakeCap], [20, 96, Infinity]);
 
   const applyStage = extractFunction(game, 'applyScaleStage');
   assert.match(applyStage, /shake = 0;/);

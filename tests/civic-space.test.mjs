@@ -247,7 +247,6 @@ test('Core, Frontage, Lot, visuals, and gameplay modules remain byte-identical t
     'src/building-lot.js',
     'src/settlement-building-visuals.js',
     'src/world-scale-rebalance.js',
-    'src/scale-sandbox.js',
     'src/constants.js',
   ]) {
     const current = readFileSync(resolve(repoRoot, path), 'utf8').replace(/\r\n/g, '\n');

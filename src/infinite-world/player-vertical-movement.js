@@ -1,20 +1,5 @@
 import { LOGICAL_CHUNK_SIZE_METERS, decomposeLogicalWorldPosition } from './chunk-coordinates.js';
-import { finiteWorldUnitsToMeters } from './gameplay-contract.js';
-
-const PLAYER_LEG_HALF_WIDTH_UNITS = 7.5;
-const PLAYER_LEG_HALF_HEIGHT_UNITS = 22.5;
-const PLAYER_LEG_ROTATION_RADIANS = 0.35;
-const PLAYER_MODEL_MAXIMUM_Y_UNITS = 73;
-
-const playerLegVerticalExtent = Math.abs(Math.sin(PLAYER_LEG_ROTATION_RADIANS))
-  * PLAYER_LEG_HALF_WIDTH_UNITS
-  + Math.abs(Math.cos(PLAYER_LEG_ROTATION_RADIANS)) * PLAYER_LEG_HALF_HEIGHT_UNITS;
-
-export const PLAYER_MODEL_VERTICAL_BOUNDS_UNITS = Object.freeze({
-  minimum: -playerLegVerticalExtent,
-  maximum: PLAYER_MODEL_MAXIMUM_Y_UNITS,
-  height: PLAYER_MODEL_MAXIMUM_Y_UNITS + playerLegVerticalExtent,
-});
+export { PLAYER_MODEL_VERTICAL_BOUNDS_UNITS } from '../player-scale-profile.js';
 
 function finite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
@@ -74,23 +59,24 @@ export function sampleFormalTerrainHeightMeters(chunkData, logicalWorldX, logica
 
 export function getScalePlayerVerticalMetrics(scaleProfile) {
   const stage = scaleProfile?.stage;
-  if (!stage || !Number.isFinite(stage.visualScale) || stage.visualScale <= 0
-    || !Number.isFinite(stage.collisionRadius) || stage.collisionRadius <= 0
-    || !Number.isFinite(stage.jumpVelocity) || stage.jumpVelocity <= 0
-    || !Number.isFinite(stage.gravity) || stage.gravity <= 0) {
+  const collision = scaleProfile?.collision;
+  if (!stage || !Number.isFinite(scaleProfile?.visualScale) || scaleProfile.visualScale <= 0
+    || !Number.isFinite(collision?.radiusMeters) || collision.radiusMeters <= 0
+    || !Number.isFinite(collision?.heightMeters) || collision.heightMeters <= 0
+    || !Number.isFinite(collision?.footOffsetMeters) || collision.footOffsetMeters <= 0
+    || !Number.isFinite(scaleProfile?.jumpVelocityMetersPerSecond)
+    || scaleProfile.jumpVelocityMetersPerSecond <= 0
+    || !Number.isFinite(scaleProfile?.gravityMetersPerSecondSquared)
+    || scaleProfile.gravityMetersPerSecondSquared <= 0) {
     throw new TypeError('valid Scale Player vertical profile is required');
   }
   return Object.freeze({
     stageId: stage.id,
-    footOffsetMeters: finiteWorldUnitsToMeters(
-      -PLAYER_MODEL_VERTICAL_BOUNDS_UNITS.minimum * stage.visualScale,
-    ),
-    heightMeters: finiteWorldUnitsToMeters(
-      PLAYER_MODEL_VERTICAL_BOUNDS_UNITS.height * stage.visualScale,
-    ),
-    radiusMeters: finiteWorldUnitsToMeters(stage.collisionRadius),
-    jumpVelocityMetersPerSecond: finiteWorldUnitsToMeters(stage.jumpVelocity) * 60,
-    gravityMetersPerSecondSquared: finiteWorldUnitsToMeters(stage.gravity) * 3600,
+    footOffsetMeters: collision.footOffsetMeters,
+    heightMeters: collision.heightMeters,
+    radiusMeters: collision.radiusMeters,
+    jumpVelocityMetersPerSecond: scaleProfile.jumpVelocityMetersPerSecond,
+    gravityMetersPerSecondSquared: scaleProfile.gravityMetersPerSecondSquared,
   });
 }
 

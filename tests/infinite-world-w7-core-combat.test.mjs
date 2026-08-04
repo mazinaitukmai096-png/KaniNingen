@@ -1967,6 +1967,27 @@ test('GP-TANK-01 Tank shell uses swept collision at maximum frame delta and spee
     await split.runtime.shutdown();
   });
 
+  await t.test('a shell inside the legacy 3m sphere but outside Max collision bounds misses Player', async () => {
+    const { runtime, state } = await createRuntime({
+      playerSpawn: { x: 7, z: 2 },
+      chunk: tankOnlyChunk(),
+      configureState(candidate) { candidate.player.score = 100_000; },
+    });
+    const tank = armTank(runtime, state, findBaseTank(state), { x: 14, z: 14 });
+    addShell(runtime, tank, {
+      id: `${tank.stableId}:scale-aware-player-miss`,
+      x: 3.5,
+    });
+    runtime.update({
+      deltaSeconds: 0.05,
+      player: { ...state.player, y: 1 },
+    });
+    assert.equal(state.player.hp, state.player.maxHp);
+    assert.equal(runtime.snapshot().counts.playerHits, 0);
+    assert.equal(runtime.projectiles.length, 1);
+    await runtime.shutdown();
+  });
+
   await t.test('a high-speed shell hits a Human crossed between endpoints', async () => {
     const { runtime, state } = await createRuntime({
       playerSpawn: { x: 15, z: 15 },

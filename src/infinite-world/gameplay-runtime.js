@@ -350,6 +350,33 @@ function segmentSphereFirstHitT(
   return hitT >= 0 && hitT <= 1 ? hitT : Number.POSITIVE_INFINITY;
 }
 
+export function segmentEllipsoidFirstHitT({
+  start,
+  end,
+  center,
+  radiusX,
+  radiusY,
+  radiusZ,
+} = {}) {
+  if (![start?.x, start?.y, start?.z, end?.x, end?.y, end?.z,
+    center?.x, center?.y, center?.z, radiusX, radiusY, radiusZ].every(Number.isFinite)
+    || radiusX <= 0 || radiusY <= 0 || radiusZ <= 0) {
+    throw new TypeError('finite positive ellipsoid sweep bounds are required');
+  }
+  return segmentSphereFirstHitT(
+    start.x / radiusX,
+    start.y / radiusY,
+    start.z / radiusZ,
+    end.x / radiusX,
+    end.y / radiusY,
+    end.z / radiusZ,
+    center.x / radiusX,
+    center.y / radiusY,
+    center.z / radiusZ,
+    1,
+  );
+}
+
 function tankDistanceSquared3D(entity, tankY, player, playerY) {
   return (entity.x - player.x) ** 2
     + (tankY - playerY) ** 2
@@ -3163,7 +3190,8 @@ export class InfiniteGameplayRuntime {
     }
     this.#maintainFiniteTankSpawns(combatPlayer, boundedDelta);
     const bulletSpeed = finiteWorldFrameSpeedToMetersPerSecond(W7_CORE_COMBAT_CONTRACT.tank.bulletSpeed);
-    const bulletHitRadius = finiteWorldUnitsToMeters(W7_CORE_COMBAT_CONTRACT.tank.bulletHitRadius);
+    const playerScaleProfile = getW6ScaleProfile(this.state.activeScaleStageId);
+    const playerHitBounds = playerScaleProfile.playerHitBounds;
     for (let index = this.projectiles.length - 1; index >= 0; index -= 1) {
       const projectile = this.projectiles[index];
       if (projectile.type === 'tank-shell') {
@@ -3191,22 +3219,20 @@ export class InfiniteGameplayRuntime {
         let nearestHitKind = null;
         let nearestCandidate = null;
         let nearestEntity = null;
-        const playerCenterY = Number.isFinite(combatPlayer.y)
+        const playerRootY = Number.isFinite(combatPlayer.y)
           ? combatPlayer.y
-          : this.#terrainHeightAt(this.state.player.x, this.state.player.z);
+          : this.#terrainHeightAt(this.state.player.x, this.state.player.z)
+            + playerScaleProfile.collision.footOffsetMeters;
+        const playerCenterY = playerRootY + playerHitBounds.centerOffsetYMeters;
         if (this.state.player.hp > 0) {
-          const playerHitT = segmentSphereFirstHitT(
-            startX,
-            startY,
-            startZ,
-            nextX,
-            nextY,
-            nextZ,
-            this.state.player.x,
-            playerCenterY,
-            this.state.player.z,
-            bulletHitRadius,
-          );
+          const playerHitT = segmentEllipsoidFirstHitT({
+            start: { x: startX, y: startY, z: startZ },
+            end: { x: nextX, y: nextY, z: nextZ },
+            center: { x: this.state.player.x, y: playerCenterY, z: this.state.player.z },
+            radiusX: playerHitBounds.radiusMeters,
+            radiusY: playerHitBounds.halfHeightMeters,
+            radiusZ: playerHitBounds.radiusMeters,
+          });
           if (playerHitT < nearestHitT) {
             nearestHitT = playerHitT;
             nearestHitKind = 'player';
@@ -3995,7 +4021,7 @@ export class InfiniteGameplayRuntime {
     }
   }
 
-  async restart({ playerSpawn, renderOrigin } = {}) {
+  async restart({ playerSpawn, renderOrigin, scaleStageId } = {}) {
     this.tankSpawnEpoch += 1;
     this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
@@ -4004,7 +4030,7 @@ export class InfiniteGameplayRuntime {
     this.pendingTankTerrainChunks.clear();
     this.tankTerrainQueryErrors.clear();
     this.entityKnockbacks.clear();
-    this.state.restartRun({ playerSpawn });
+    this.state.restartRun({ playerSpawn, scaleStageId });
     this.projectiles.length = 0;
     this.combatEffects.length = 0;
     this.presentationEvents.length = 0;

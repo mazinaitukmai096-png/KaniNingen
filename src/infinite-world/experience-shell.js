@@ -645,7 +645,7 @@ export function createInfiniteExperienceShell({
         dx /= length; dz /= length;
         const sprint = keys.isPressed('ShiftLeft') || keys.isPressed('ShiftRight');
         const speed = scaleProfile.movementMetersPerSecond
-          * (intro ? 0.35 : sprint ? 1.45 : 1) * movementMultiplier;
+          * (intro ? 0.35 : sprint ? scaleProfile.sprintMultiplier : 1) * movementMultiplier;
         const startX = player.x;
         const startZ = player.z;
         horizontalCollision = resolvePlayerHorizontalMovement({
@@ -759,7 +759,7 @@ export function createInfiniteExperienceShell({
       )) * unitsPerMeter;
       lookAtY = trackLookAtY + (targetY - trackLookAtY) * eased;
     } else camera.position.set(targetCamera.x, targetCamera.y, targetCamera.z);
-    camera.near = finiteWorldUnitsToMeters(scaleProfile.stage.cameraNear) * unitsPerMeter;
+    camera.near = scaleProfile.cameraNearMeters * unitsPerMeter;
     camera.updateProjectionMatrix?.();
     camera.lookAt(renderLocal.x, lookAtY, renderLocal.z);
     playerMarker.position.y = playerRootY * unitsPerMeter;

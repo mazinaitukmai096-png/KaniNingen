@@ -3,11 +3,11 @@ import { sha256Hex } from './legacy-core/g0/sha256.js';
 import {
   W6_ENTITY_CONTRACTS,
   W6_GAMEPLAY_SCHEMA,
-  W6_INITIAL_SCALE_STAGE_ID,
   W6_PLAYER_MAX_HP,
   W6_SAVE_ENVELOPE_SCHEMA,
   W6_SAVE_SCHEMA,
   W6_SAVE_VERSION,
+  W6_STATE_BOOTSTRAP_SCALE_STAGE_ID,
   W6_STATIC_TARGET_CONTRACTS,
   W7_GAMEPLAY_SCHEMA,
   W7_LEGACY_GAMEPLAY_SCHEMA,
@@ -495,7 +495,9 @@ export class InfiniteWorldState {
   constructor({ worldSeedHash, worldSeed = worldSeedHash, playerSpawn } = {}) {
     this.worldSeedHash = requiredString(worldSeedHash, 'worldSeedHash');
     this.worldSeed = requiredString(worldSeed, 'worldSeed');
-    this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
+    // The menu/bootstrap state is not a started run. New Game applies the Tiny
+    // initial profile in restartRun(), while Continue restores the saved stage.
+    this.activeScaleStageId = W6_STATE_BOOTSTRAP_SCALE_STAGE_ID;
     this.player = { ...cloneRecord(createW6PlayerState(playerSpawn)), acidDebuffSeconds: 0 };
     this.featureDamage = new Map();
     this.entityStates = new Map();
@@ -583,12 +585,13 @@ export class InfiniteWorldState {
     return Object.freeze({ ...this.player });
   }
 
-  restartRun({ playerSpawn } = {}) {
+  restartRun({ playerSpawn, scaleStageId = this.activeScaleStageId } = {}) {
     const spawn = {
       x: finite(playerSpawn?.x, 'restart playerSpawn.x'),
       z: finite(playerSpawn?.z, 'restart playerSpawn.z'),
     };
-    this.activeScaleStageId = W6_INITIAL_SCALE_STAGE_ID;
+    if (!isW6ScaleStageId(scaleStageId)) throw new RangeError(`unknown scale stage: ${scaleStageId}`);
+    this.activeScaleStageId = scaleStageId;
     Object.assign(this.player, createW6PlayerState(spawn), { acidDebuffSeconds: 0 });
     this.featureDamage.clear();
     this.entityStates.clear();

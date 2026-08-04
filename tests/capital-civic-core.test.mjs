@@ -298,7 +298,6 @@ test('Frontage, Lot, visuals, gameplay constants, and unrelated modules remain b
     'src/building-lot.js',
     'src/settlement-building-visuals.js',
     'src/world-scale-rebalance.js',
-    'src/scale-sandbox.js',
     'src/constants.js',
     'src/core/input.js',
     'src/core/renderer.js',

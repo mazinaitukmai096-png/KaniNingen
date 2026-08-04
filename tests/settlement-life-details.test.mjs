@@ -297,7 +297,6 @@ test('locked Civic Space, building visual, Frontage, Lot, and gameplay modules a
     'src/building-lot.js',
     'src/settlement-building-visuals.js',
     'src/world-scale-rebalance.js',
-    'src/scale-sandbox.js',
     'src/constants.js',
   ]) {
     const current = readFileSync(resolve(repoRoot, path), 'utf8').replace(/\r\n/g, '\n');

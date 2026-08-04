@@ -1479,8 +1479,10 @@ test('MAX Player movement waits for formal destination Terrain and resumes after
         return streaming.transitionPending === false && streaming.preparationPending === false;
       }, 'intro coverage work must settle before the blocked MAX step');
       await new Promise(resolveValue => setImmediate(resolveValue));
+      environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
       environment.listeners.get('keydown')({ code: 'Digit3', preventDefault() {} });
       assert.equal(sandbox.snapshot().gameplay.state.activeScaleStageId, 'MAX');
+      environment.listeners.get('keydown')({ code: 'Tab', preventDefault() {} });
 
       const before = sandbox.snapshot();
       const yaw = before.experience.camera.yaw;
@@ -1590,6 +1592,13 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
       && sandbox.snapshot().experience.runPhase === 'intro'
     ),
       'New Game preparation must enter the run before lifecycle assertions');
+    assert.equal(
+      worldState.activeScaleStageId,
+      'TINY',
+      'New Game must start from the Tiny profile',
+    );
+
+    worldState.setScaleStage('MID');
 
     worldState.updatePlayer({ score: 7700, hp: 61 });
     let autosaveTimer = null;
@@ -1656,6 +1665,11 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
       })}`,
     );
     assert.deepEqual(worldState.createSaveSnapshot(), interrupted);
+    assert.equal(
+      worldState.activeScaleStageId,
+      'MID',
+      'Continue must restore the Stage stored in the v5 Save',
+    );
     assert.deepEqual(sandbox.snapshot().spatial.playerLogical, {
       x: interrupted.player.x, z: interrupted.player.z, facingY: interrupted.player.facingY,
     });

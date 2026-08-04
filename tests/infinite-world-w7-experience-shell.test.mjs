@@ -418,19 +418,19 @@ test('window blur clears movement, sprint, and held jump before input resumes', 
   fixture.shell.dispose();
 });
 
-test('finite Scale movement ratios remain 0.5, 0.75, and 1 while Shift sprint remains 1.45', () => {
-  for (const [stageId, ratio] of [['TINY', 0.5], ['MID', 0.75], ['MAX', 1]]) {
+test('Scale movement and Sprint use the resolved Stage profile', () => {
+  for (const stageId of ['TINY', 'MID', 'MAX']) {
     const fixture = createFixture();
     fixture.elements.get('start-button').dispatch('click');
     const profile = getW6ScaleProfile(stageId);
     const player = finishIntro(fixture, { x: 0, z: 0, facingY: 0 }, profile);
     fixture.globalObject.dispatch('keydown', { code: 'KeyD' });
     fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
-    assert.equal(player.x, getW6ScaleProfile('MAX').movementMetersPerSecond * ratio);
+    assert.equal(player.x, profile.movementMetersPerSecond);
     player.x = 0;
     fixture.globalObject.dispatch('keydown', { code: 'ShiftLeft' });
     fixture.shell.updatePlayer({ deltaSeconds: 1, player, scaleProfile: profile });
-    assert.equal(player.x, profile.movementMetersPerSecond * 1.45);
+    assert.equal(player.x, profile.sprintMetersPerSecond);
     fixture.shell.dispose();
   }
 });

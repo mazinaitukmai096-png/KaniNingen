@@ -134,6 +134,7 @@ export const W7_SAVE_SCHEMA = W8_SAVE_SCHEMA;
 export const W7_SAVE_ENVELOPE_SCHEMA = W8_SAVE_ENVELOPE_SCHEMA;
 export const W7_SAVE_SCHEMA_VERSION = W8_SAVE_SCHEMA_VERSION;
 export const W6_INITIAL_SCALE_STAGE_ID = INITIAL_SCALE_STAGE_ID;
+export const W6_STATE_BOOTSTRAP_SCALE_STAGE_ID = SCALE_STAGE_IDS.MAX;
 export const W6_PLAYER_MAX_HP = PLAYER_MAX_HP;
 
 export const W6_ATTACK_CONTRACT = Object.freeze({
@@ -512,9 +513,28 @@ export function finiteFrameChanceProbability(probabilityPerFrame, deltaSeconds) 
 
 export function getW6ScaleProfile(stageId) {
   const stage = getScaleStage(stageId);
+  const collision = Object.freeze({
+    radiusMeters: finiteWorldUnitsToMeters(stage.collisionRadius),
+    heightMeters: finiteWorldUnitsToMeters(stage.collisionHeight),
+    footOffsetMeters: finiteWorldUnitsToMeters(stage.footOffset),
+  });
+  const playerHitBounds = Object.freeze({
+    shape: stage.playerHitBounds.shape,
+    radiusMeters: finiteWorldUnitsToMeters(stage.playerHitBounds.radius),
+    halfHeightMeters: finiteWorldUnitsToMeters(stage.playerHitBounds.halfHeight),
+    centerOffsetYMeters: finiteWorldUnitsToMeters(stage.playerHitBounds.centerOffsetY),
+  });
   return Object.freeze({
     stage,
+    visualScale: stage.visualScale,
+    collision,
+    playerHitBounds,
     movementMetersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(stage.movementSpeed),
+    sprintMultiplier: stage.sprintMultiplier,
+    sprintMetersPerSecond: finiteWorldFrameSpeedToMetersPerSecond(stage.movementSpeed)
+      * stage.sprintMultiplier,
+    jumpVelocityMetersPerSecond: finiteWorldUnitsToMeters(stage.jumpVelocity) * 60,
+    gravityMetersPerSecondSquared: finiteWorldUnitsToMeters(stage.gravity) * 3600,
     singleAttackRadiusMeters: finiteWorldUnitsToMeters(stage.singleAttackRadius),
     doubleAttackRadiusMeters: finiteWorldUnitsToMeters(stage.doubleAttackRadius),
     attackOffsetXMeters: finiteWorldUnitsToMeters(stage.attackOffsetX),
@@ -527,6 +547,7 @@ export function getW6ScaleProfile(stageId) {
     cameraDistanceMeters: finiteWorldUnitsToMeters(stage.cameraDistance),
     cameraHeightMeters: finiteWorldUnitsToMeters(stage.cameraHeight),
     cameraTargetHeightMeters: finiteWorldUnitsToMeters(stage.cameraTargetHeight),
+    cameraNearMeters: finiteWorldUnitsToMeters(stage.cameraNear),
   });
 }
 

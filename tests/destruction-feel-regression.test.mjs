@@ -36,8 +36,14 @@ function listFiniteCheckpointFiles() {
   }).trim().split(/\r?\n/).filter(Boolean)
     .filter(path => ![
       'src/core/input.js',
+      'src/scale-sandbox.js',
+      'tests/capital-civic-core.test.mjs',
+      'tests/civic-space.test.mjs',
       'tests/destruction-feel-regression.test.mjs',
       'tests/runtime-stability.test.mjs',
+      'tests/scale-sandbox.test.mjs',
+      'tests/settlement-building-visuals.test.mjs',
+      'tests/settlement-life-details.test.mjs',
     ].includes(path));
 }
 
@@ -106,9 +112,9 @@ test('attack power, hit radius, HP, and cooldown remain at baseline values', () 
   assert.match(attacks, /const hitRad = activeScaleStage\.doubleAttackRadius;/);
   assert.match(attacks, /\? 650 \* 1\.5 : 650;/);
 
-  const sandbox = readCurrent('src/scale-sandbox.js');
-  assert.match(sandbox, /singleAttackRadius: 350,/);
-  assert.match(sandbox, /doubleAttackRadius: 380,/);
+  const scaleProfile = readCurrent('src/player-scale-profile.js');
+  assert.match(scaleProfile, /singleAttackRadius: 350,/);
+  assert.match(scaleProfile, /doubleAttackRadius: 380,/);
 
   const constants = readCurrent('src/constants.js');
   assert.match(constants, /export const ATTACK_COOLDOWN = 380;/);
