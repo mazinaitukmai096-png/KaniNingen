@@ -20,7 +20,11 @@ import { ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v1-settle
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v2-settlement-adapter.js';
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
-import { ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v3-settlement-adapter.js';
+import {
+  ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA,
+  ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA,
+} from './road-graph-v3-settlement-adapter.js';
+import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
 import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
@@ -1072,6 +1076,7 @@ export async function createW8ParityChunkGenerator({
   baseGeneratorFactory = createDistributedSettlementChunkGenerator,
   cacheCapacities: cacheCapacityOverrides,
   settlementRoadGraphGeneratorId = null,
+  settlementLotMode = null,
 } = {}) {
   if (settlementRoadGraphGeneratorId !== null
     && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID
@@ -1083,10 +1088,17 @@ export async function createW8ParityChunkGenerator({
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
   const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
   const useExperimentalRoadGraph = useRoadGraphV1 || useRoadGraphV2 || useRoadGraphV3;
+  if (settlementLotMode !== null && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID) {
+    throw new RangeError(`unsupported experimental Settlement Lot mode: ${settlementLotMode}`);
+  }
+  if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID && !useRoadGraphV3) {
+    throw new RangeError('lot-v1 requires settlementRoadGraphGeneratorId=road-graph-v3');
+  }
   const cacheCapacities = resolveW8CacheCapacities(cacheCapacityOverrides);
   const base = await baseGeneratorFactory({
     worldSeed,
     ...(useExperimentalRoadGraph ? { settlementRoadGraphGeneratorId } : {}),
+    ...(settlementLotMode ? { settlementLotMode } : {}),
   });
   const naturalPresentationPolicy = await createW8NaturalPresentationPhase1Policy({
     worldSeedHash: base.worldSeedHash,
@@ -1323,7 +1335,9 @@ export async function createW8ParityChunkGenerator({
   });
   const majorRoadSurfacePolicyVersion = 'w8-settlement-surface-policy-1';
   const majorRoadSourceContractVersion = useRoadGraphV3
-    ? ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA
+    ? (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
+      ? ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA
+      : ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA)
     : useRoadGraphV2
       ? ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA
     : useRoadGraphV1
@@ -2321,6 +2335,7 @@ export async function createW8ParityChunkGenerator({
     reviewSpawn: base.reviewSpawn,
     experienceSpawn,
     ...(useExperimentalRoadGraph ? { settlementRoadGraphGeneratorId } : {}),
+    ...(settlementLotMode ? { settlementLotMode } : {}),
     async auditSettlementsNear(x, z, radiusMeters) {
       assertGeneratorActive();
       const candidates = await base.distributor.findSettlementsNear(x, z, radiusMeters);

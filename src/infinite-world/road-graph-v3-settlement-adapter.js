@@ -12,8 +12,18 @@ import {
   ROAD_GRAPH_V3_EXPERIMENTAL_STAGE_GENERATOR_REGISTRY,
   ROAD_GRAPH_V3_GENERATOR_ID,
 } from './road-graph-v3.js';
+import {
+  SETTLEMENT_LOT_V1_GENERATOR_ID,
+  createRoadGraphV3Blocks,
+  createSettlementLotsV1,
+} from './settlement-lot-v1.js';
+import {
+  buildDeterministicBuildingsFromLots,
+  filterScatterBuildingsForLotCoverage,
+} from './lot-building-adapter-v1.js';
 
 export const ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v3-road-only-template-1';
+export const ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v3-lot-v1-template-1';
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
@@ -128,7 +138,11 @@ export async function createRoadGraphV3SettlementTemplate({
   candidate,
   connectivityGraph,
   roadTimingRun = null,
+  settlementLotMode = null,
 } = {}) {
+  if (settlementLotMode !== null && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID) {
+    throw new RangeError(`unsupported experimental Settlement Lot mode: ${settlementLotMode}`);
+  }
   const profile = MIGRATED_SETTLEMENT_PROFILES[candidate?.townType];
   if (!profile || profile.settlementType !== candidate?.settlementType) {
     throw new RangeError('candidate does not match a migrated Settlement profile');
@@ -158,12 +172,94 @@ export async function createRoadGraphV3SettlementTemplate({
     settlementType: candidate.settlementType,
   });
   const hierarchy = adaptRoadGraphToLegacyHierarchy({ graph, candidate, town });
-  const buildingResult = await buildDeterministicBuildings({
+  const scatterBuildingResult = await buildDeterministicBuildings({
     town,
     hierarchy,
     settlementId: candidate.settlementId,
     roadTimingRun,
   });
+  let blocks = Object.freeze([]);
+  let lots = Object.freeze([]);
+  let blockResults = Object.freeze([]);
+  let buildingResult = scatterBuildingResult;
+  let lotSummary = null;
+  if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID) {
+    blocks = await createRoadGraphV3Blocks({ worldSeedHash, roadGraph: graph });
+    const generatedLots = await createSettlementLotsV1({ worldSeedHash, roadGraph: graph, blocks });
+    lots = generatedLots.lots;
+    blockResults = generatedLots.blockResults;
+    const lotBuildings = await buildDeterministicBuildingsFromLots({
+      town,
+      settlementId: candidate.settlementId,
+      roadGraph: graph,
+      candidate,
+      lots,
+    });
+    if (!generatedLots.validation.valid || !lotBuildings.validation.valid) {
+      lots = Object.freeze([]);
+      blockResults = Object.freeze(blockResults.map(result => Object.freeze({
+        ...result,
+        mode: 'SCATTER_FALLBACK',
+        fallbackReason: 'VALIDATION_FAILED',
+        lotIds: Object.freeze([]),
+      })));
+      lotSummary = Object.freeze({
+        blockResults,
+        blockCount: blocks.length,
+        lotCount: 0,
+        usedLotCount: 0,
+        lotUtilization: 0,
+        scatterFallbackBlockCount: Math.max(1, blocks.length),
+        scatterFallbackBuildingCount: scatterBuildingResult.buildings.length,
+        emptyLotCount: 0,
+        frontageFailureCount: generatedLots.frontageFailureCount,
+        lotValidation: generatedLots.validation,
+        buildingValidation: lotBuildings.validation,
+      });
+    } else {
+      const fallback = filterScatterBuildingsForLotCoverage({
+        scatterBuildings: scatterBuildingResult.buildings,
+        lots,
+        blocks,
+        blockResults,
+        roadGraph: graph,
+        candidate,
+      });
+      const lotBuildingIndexes = new Set(lotBuildings.buildings.map(building => building.buildingIndex));
+      const fallbackBuildings = fallback.buildings.filter(
+        building => !lotBuildingIndexes.has(building.buildingIndex),
+      );
+      const combined = [...lotBuildings.buildings, ...fallbackBuildings]
+        .sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const unique = [];
+      const buildingIds = new Set();
+      for (const building of combined) {
+        if (buildingIds.has(building.stableId)) continue;
+        buildingIds.add(building.stableId);
+        unique.push(building);
+      }
+      buildingResult = Object.freeze({
+        requestedBuildingCount: scatterBuildingResult.requestedBuildingCount,
+        buildings: Object.freeze(unique),
+      });
+      lotSummary = Object.freeze({
+        blockResults,
+        blockCount: blocks.length,
+        lotCount: lots.length,
+        usedLotCount: lotBuildings.usedLotIds.length,
+        lotUtilization: lots.length === 0 ? 0 : q6(lotBuildings.usedLotIds.length / lots.length),
+        scatterFallbackBlockCount: blockResults.filter(result => (
+          result.mode === 'SCATTER_FALLBACK'
+        )).length + (blocks.length === 0 ? 1 : 0),
+        scatterFallbackBuildingCount: fallbackBuildings.length,
+        excludedScatterBuildingCount: fallback.excludedCount,
+        emptyLotCount: lotBuildings.emptyLotCount,
+        frontageFailureCount: generatedLots.frontageFailureCount,
+        lotValidation: generatedLots.validation,
+        buildingValidation: lotBuildings.validation,
+      });
+    }
+  }
   const buildings = buildingResult.buildings.map(building => Object.freeze({
     ...building,
     x: q6(building.x + candidate.center.x),
@@ -210,7 +306,9 @@ export async function createRoadGraphV3SettlementTemplate({
     ]),
   ));
   return Object.freeze({
-    schemaVersion: ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA,
+    schemaVersion: settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
+      ? ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA
+      : ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA,
     settlementId: candidate.settlementId,
     settlementType: candidate.settlementType,
     townType: candidate.townType,
@@ -229,7 +327,12 @@ export async function createRoadGraphV3SettlementTemplate({
     buildingShortageCount: buildingResult.requestedBuildingCount - buildings.length,
     roads: Object.freeze(roads),
     buildings: Object.freeze(buildings),
-    blocks: Object.freeze([]),
+    blocks,
+    ...(settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID ? {
+      settlementLotMode,
+      lots,
+      lotSummary,
+    } : {}),
     gatewayHandoffs,
     roadSummary: Object.freeze({
       generatorId: ROAD_GRAPH_V3_GENERATOR_ID,
@@ -238,8 +341,15 @@ export async function createRoadGraphV3SettlementTemplate({
       gatewayHandoffCount: gatewayHandoffs.length,
       fallbackType: graph.metadata.fallbackType,
       fictitiousGatewayCount: 0,
-      blockCount: 0,
-      roadOnly: true,
+      blockCount: blocks.length,
+      roadOnly: settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID,
+      ...(settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID ? {
+        lotGeneratorId: SETTLEMENT_LOT_V1_GENERATOR_ID,
+        lotCount: lots.length,
+        lotBuildingCount: lotSummary.usedLotCount,
+        scatterFallbackBlockCount: lotSummary.scatterFallbackBlockCount,
+        scatterFallbackBuildingCount: lotSummary.scatterFallbackBuildingCount,
+      } : {}),
     }),
     roadGraph: graph,
   });

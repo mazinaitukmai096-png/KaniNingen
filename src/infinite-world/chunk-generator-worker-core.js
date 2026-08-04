@@ -228,6 +228,9 @@ export function createChunkGeneratorWorkerCore({
           ...(request.settlementRoadGraphGeneratorId
             ? { settlementRoadGraphGeneratorId: request.settlementRoadGraphGeneratorId }
             : {}),
+          ...(request.settlementLotMode
+            ? { settlementLotMode: request.settlementLotMode }
+            : {}),
         });
         serviceGeneration = request.serviceGeneration;
         postMessage({

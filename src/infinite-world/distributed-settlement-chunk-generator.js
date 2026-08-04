@@ -16,6 +16,7 @@ import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { createRoadGraphV2SettlementTemplate } from './road-graph-v2-settlement-adapter.js';
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
 import { createRoadGraphV3SettlementTemplate } from './road-graph-v3-settlement-adapter.js';
+import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
 import {
   CHUNK_GENERATION_STAGE,
   measureChunkGenerationStage,
@@ -220,6 +221,7 @@ export function validateW5DistributedChunkData(chunkData) {
 export async function createDistributedSettlementChunkGenerator({
   worldSeed = 'KaniNingen Infinite Natural World',
   settlementRoadGraphGeneratorId = null,
+  settlementLotMode = null,
 } = {}) {
   if (settlementRoadGraphGeneratorId !== null
     && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID
@@ -230,6 +232,12 @@ export async function createDistributedSettlementChunkGenerator({
   const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
   const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
+  if (settlementLotMode !== null && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID) {
+    throw new RangeError(`unsupported experimental Settlement Lot mode: ${settlementLotMode}`);
+  }
+  if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID && !useRoadGraphV3) {
+    throw new RangeError('lot-v1 requires settlementRoadGraphGeneratorId=road-graph-v3');
+  }
   const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed });
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
   const reviewSettlement = await distributor.findHomeSettlement(0, 0);
@@ -270,6 +278,7 @@ export async function createDistributedSettlementChunkGenerator({
         Math.max(candidate.radiusMeters ?? 0, 1),
       ),
       roadTimingRun,
+      ...(settlementLotMode ? { settlementLotMode } : {}),
     };
     const template = useRoadGraphV3
       ? await createRoadGraphV3SettlementTemplate(roadGraphTemplateOptions)
@@ -292,6 +301,7 @@ export async function createDistributedSettlementChunkGenerator({
     distributor,
     reviewSpawn: Object.freeze({ ...reviewSettlement.center, settlementId: reviewSettlement.settlementId }),
     ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+    ...(settlementLotMode ? { settlementLotMode } : {}),
     async resolveSettlementTemplate({ candidate, roadTimingRun = null } = {}) {
       if (!candidate?.settlementId) throw new TypeError('Settlement candidate is required');
       return getTemplate(candidate, roadTimingRun);

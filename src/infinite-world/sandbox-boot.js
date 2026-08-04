@@ -24,6 +24,7 @@ import {
 import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
+import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
@@ -273,6 +274,12 @@ export function parseSettlementRoadGraphGeneratorId(value) {
   if (value === ROAD_GRAPH_V2_GENERATOR_ID) return ROAD_GRAPH_V2_GENERATOR_ID;
   if (value === ROAD_GRAPH_V3_GENERATOR_ID) return ROAD_GRAPH_V3_GENERATOR_ID;
   throw new RangeError(`unsupported experimental Settlement Road Graph: ${value}`);
+}
+
+export function parseSettlementLotMode(value) {
+  if (value === null || value === '') return null;
+  if (value === SETTLEMENT_LOT_V1_GENERATOR_ID) return SETTLEMENT_LOT_V1_GENERATOR_ID;
+  throw new RangeError(`unsupported experimental Settlement Lot mode: ${value}`);
 }
 
 export function gatePlayerMovementByTerrainCoverage({
@@ -933,6 +940,11 @@ export async function bootInfiniteWorldSandbox({
       globalObject.location?.search ?? '',
     ).get('settlementRoadGraph'),
   ),
+  settlementLotMode = parseSettlementLotMode(
+    new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('settlementLotMode'),
+  ),
   streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
@@ -1321,11 +1333,13 @@ export async function bootInfiniteWorldSandbox({
       const workerTransport = createWorkerChunkGeneratorTransport({
         worldSeed: requestedSeed,
         ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+        ...(settlementLotMode ? { settlementLotMode } : {}),
         workerFactory: chunkGeneratorWorkerFactory ?? undefined,
         fallbackTransportFactory: async () => createInlineChunkGeneratorTransport({
           generator: await generatorFactory({
             worldSeed: requestedSeed,
             ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+            ...(settlementLotMode ? { settlementLotMode } : {}),
           }),
           clock,
           onSchedulerEvent: recordGenerationSchedulerEvent,

@@ -10,6 +10,7 @@ import {
 import { createLegacyMigratedSettlementTemplate } from './legacy-migrated-settlement-adapter.js';
 import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 import { ROAD_GENERATION_COUNTER } from './road-generation-timing.js';
+import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
 
 export const W8_SETTLEMENT_PARITY_DENSITY = Object.freeze({
   schemaVersion: 'w8-settlement-parity-density-1',
@@ -173,6 +174,9 @@ async function overlayStableId({ worldSeedHash, settlementId, type, road, slot, 
 }
 
 function targetBuildingCount(template) {
+  if (template.settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID) {
+    return template.buildings.length;
+  }
   const ratio = W8_SETTLEMENT_PARITY_DENSITY
     .buildingOpportunityRatioByTownType[template.townType];
   if (!Number.isFinite(ratio)) throw new RangeError(`unsupported W8 town type: ${template.townType}`);

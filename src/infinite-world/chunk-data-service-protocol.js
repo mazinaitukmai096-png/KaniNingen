@@ -54,6 +54,7 @@ export function createChunkGeneratorInitializeRequest({
   serviceGeneration,
   worldSeed,
   settlementRoadGraphGeneratorId = null,
+  settlementLotMode = null,
 }) {
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
     throw new RangeError('serviceGeneration must be a positive safe integer');
@@ -63,12 +64,17 @@ export function createChunkGeneratorInitializeRequest({
     && (typeof settlementRoadGraphGeneratorId !== 'string' || !settlementRoadGraphGeneratorId)) {
     throw new TypeError('settlementRoadGraphGeneratorId must be a non-empty string when provided');
   }
+  if (settlementLotMode !== null
+    && (typeof settlementLotMode !== 'string' || !settlementLotMode)) {
+    throw new TypeError('settlementLotMode must be a non-empty string when provided');
+  }
   return Object.freeze({
     type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
     protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
     serviceGeneration,
     worldSeed,
     ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+    ...(settlementLotMode ? { settlementLotMode } : {}),
   });
 }
 

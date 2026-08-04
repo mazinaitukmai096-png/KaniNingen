@@ -48,6 +48,7 @@ function transportError(message) {
 export function createWorkerChunkGeneratorTransport({
   worldSeed,
   settlementRoadGraphGeneratorId = null,
+  settlementLotMode = null,
   serviceGeneration = 1,
   workerFactory = () => browserWorkerFactory(globalThis),
   fallbackTransportFactory = null,
@@ -59,6 +60,10 @@ export function createWorkerChunkGeneratorTransport({
   if (settlementRoadGraphGeneratorId !== null
     && (typeof settlementRoadGraphGeneratorId !== 'string' || !settlementRoadGraphGeneratorId)) {
     throw new TypeError('settlementRoadGraphGeneratorId must be a non-empty string when provided');
+  }
+  if (settlementLotMode !== null
+    && (typeof settlementLotMode !== 'string' || !settlementLotMode)) {
+    throw new TypeError('settlementLotMode must be a non-empty string when provided');
   }
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
     throw new RangeError('serviceGeneration must be a positive safe integer');
@@ -466,6 +471,7 @@ export function createWorkerChunkGeneratorTransport({
           serviceGeneration,
           worldSeed,
           ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+          ...(settlementLotMode ? { settlementLotMode } : {}),
         }));
         return await initializePromise;
       } catch (error) {
