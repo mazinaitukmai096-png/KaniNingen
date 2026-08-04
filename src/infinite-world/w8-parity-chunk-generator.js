@@ -15,6 +15,7 @@ import {
   W5_CHUNK_DATA_SCHEMA,
   createDistributedSettlementChunkGenerator,
 } from './distributed-settlement-chunk-generator.js';
+import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
@@ -1065,9 +1066,18 @@ export async function createW8ParityChunkGenerator({
   worldSeed = 'KaniNingen Infinite Natural World',
   baseGeneratorFactory = createDistributedSettlementChunkGenerator,
   cacheCapacities: cacheCapacityOverrides,
+  settlementRoadGraphGeneratorId = null,
 } = {}) {
+  if (settlementRoadGraphGeneratorId !== null
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID) {
+    throw new RangeError(`unsupported experimental Settlement Road Graph: ${settlementRoadGraphGeneratorId}`);
+  }
+  const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const cacheCapacities = resolveW8CacheCapacities(cacheCapacityOverrides);
-  const base = await baseGeneratorFactory({ worldSeed });
+  const base = await baseGeneratorFactory({
+    worldSeed,
+    ...(useRoadGraphV1 ? { settlementRoadGraphGeneratorId } : {}),
+  });
   const naturalPresentationPolicy = await createW8NaturalPresentationPhase1Policy({
     worldSeedHash: base.worldSeedHash,
   });
@@ -1704,6 +1714,7 @@ export async function createW8ParityChunkGenerator({
     surfaceBackedChunk,
     roadTimingContext = null,
   ) => {
+    if (useRoadGraphV1) return Object.freeze([]);
     const roadTimingRun = roadTimingContext?.recorder?.beginRun({
       owner: { x: chunkX, z: chunkZ },
       deadlineMiss: roadTimingContext?.deadlineMissAtStart === true,
@@ -1779,7 +1790,7 @@ export async function createW8ParityChunkGenerator({
   let experienceSpawn = getLruValue(EXPERIENCE_SPAWN_CACHE, base.worldSeedHash) ?? null;
   if (!experienceSpawn) {
     let preparedSpawnSources = null;
-    if (base.worldSeedHash === PROTECTED_SAFE_SPAWN_BOOTSTRAP.worldSeedHash) {
+    if (base.worldSeedHash === PROTECTED_SAFE_SPAWN_BOOTSTRAP.worldSeedHash && !useRoadGraphV1) {
       const pinnedOwner = decomposeLogicalWorldPosition(
         PROTECTED_SAFE_SPAWN_BOOTSTRAP.x,
         PROTECTED_SAFE_SPAWN_BOOTSTRAP.z,
@@ -2286,6 +2297,7 @@ export async function createW8ParityChunkGenerator({
     distributor: base.distributor,
     reviewSpawn: base.reviewSpawn,
     experienceSpawn,
+    ...(useRoadGraphV1 ? { settlementRoadGraphGeneratorId: ROAD_GRAPH_V1_GENERATOR_ID } : {}),
     async auditSettlementsNear(x, z, radiusMeters) {
       assertGeneratorActive();
       const candidates = await base.distributor.findSettlementsNear(x, z, radiusMeters);

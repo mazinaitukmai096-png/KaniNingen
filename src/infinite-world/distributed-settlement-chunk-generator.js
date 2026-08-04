@@ -10,6 +10,8 @@ import {
   W5_SETTLEMENT_DISTRIBUTION,
 } from './settlement-distributor.js';
 import { createLegacyMigratedSettlementTemplate } from './legacy-migrated-settlement-adapter.js';
+import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
+import { createRoadGraphV1SettlementTemplate } from './road-graph-v1-settlement-adapter.js';
 import {
   CHUNK_GENERATION_STAGE,
   measureChunkGenerationStage,
@@ -211,7 +213,15 @@ export function validateW5DistributedChunkData(chunkData) {
   return Object.freeze({ valid: errors.length === 0, errors: Object.freeze(errors) });
 }
 
-export async function createDistributedSettlementChunkGenerator({ worldSeed = 'KaniNingen Infinite Natural World' } = {}) {
+export async function createDistributedSettlementChunkGenerator({
+  worldSeed = 'KaniNingen Infinite Natural World',
+  settlementRoadGraphGeneratorId = null,
+} = {}) {
+  if (settlementRoadGraphGeneratorId !== null
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V1_GENERATOR_ID) {
+    throw new RangeError(`unsupported experimental Settlement Road Graph: ${settlementRoadGraphGeneratorId}`);
+  }
+  const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed });
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
   const reviewSettlement = await distributor.findHomeSettlement(0, 0);
@@ -243,7 +253,18 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     templateCacheMisses += 1;
     roadTimingRun?.recordCacheMiss();
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
-    const template = await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
+    const template = useRoadGraphV1
+      ? await createRoadGraphV1SettlementTemplate({
+        worldSeedHash: formalGenerator.worldSeedHash,
+        candidate,
+        connectivityGraph: await distributor.buildConnectivityGraphNear(
+          candidate.center.x,
+          candidate.center.z,
+          Math.max(candidate.radiusMeters ?? 0, 1),
+        ),
+        roadTimingRun,
+      })
+      : await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
     if (isShutdown) return template;
     templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
     templatesMaterialized += 1;
@@ -257,6 +278,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     generatorVersion: W5_GENERATOR_VERSION,
     distributor,
     reviewSpawn: Object.freeze({ ...reviewSettlement.center, settlementId: reviewSettlement.settlementId }),
+    ...(useRoadGraphV1 ? { settlementRoadGraphGeneratorId: ROAD_GRAPH_V1_GENERATOR_ID } : {}),
     async resolveSettlementTemplate({ candidate, roadTimingRun = null } = {}) {
       if (!candidate?.settlementId) throw new TypeError('Settlement candidate is required');
       return getTemplate(candidate, roadTimingRun);

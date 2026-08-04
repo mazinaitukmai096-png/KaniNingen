@@ -223,7 +223,12 @@ export function createChunkGeneratorWorkerCore({
         throw new Error(`unsupported Chunk generator protocol: ${request?.protocolVersion}`);
       }
       if (request.type === CHUNK_GENERATOR_MESSAGE.INITIALIZE) {
-        generator = await generatorFactory({ worldSeed: request.worldSeed });
+        generator = await generatorFactory({
+          worldSeed: request.worldSeed,
+          ...(request.settlementRoadGraphGeneratorId
+            ? { settlementRoadGraphGeneratorId: request.settlementRoadGraphGeneratorId }
+            : {}),
+        });
         serviceGeneration = request.serviceGeneration;
         postMessage({
           type: CHUNK_GENERATOR_MESSAGE.INITIALIZED,

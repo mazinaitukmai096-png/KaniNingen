@@ -231,7 +231,7 @@ function hasFrontageLotConflict(lots, lot, roadTimingStats) {
   return false;
 }
 
-function buildDeterministicBuildings({ town, hierarchy, settlementId, roadTimingRun = null }) {
+export function buildDeterministicBuildings({ town, hierarchy, settlementId, roadTimingRun = null }) {
   const startedAt = roadFunctionStarted(roadTimingRun);
   const planStartedAt = roadFunctionStarted(roadTimingRun);
   const plan = buildFrontageAnchorPlan({

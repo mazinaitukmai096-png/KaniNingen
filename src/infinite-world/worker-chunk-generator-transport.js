@@ -47,6 +47,7 @@ function transportError(message) {
 
 export function createWorkerChunkGeneratorTransport({
   worldSeed,
+  settlementRoadGraphGeneratorId = null,
   serviceGeneration = 1,
   workerFactory = () => browserWorkerFactory(globalThis),
   fallbackTransportFactory = null,
@@ -55,6 +56,10 @@ export function createWorkerChunkGeneratorTransport({
   onPipelineEvent = null,
 } = {}) {
   if (typeof worldSeed !== 'string' || !worldSeed) throw new TypeError('worldSeed is required');
+  if (settlementRoadGraphGeneratorId !== null
+    && (typeof settlementRoadGraphGeneratorId !== 'string' || !settlementRoadGraphGeneratorId)) {
+    throw new TypeError('settlementRoadGraphGeneratorId must be a non-empty string when provided');
+  }
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
     throw new RangeError('serviceGeneration must be a positive safe integer');
   }
@@ -457,7 +462,11 @@ export function createWorkerChunkGeneratorTransport({
           initializeResolve = resolve;
           initializeReject = reject;
         });
-        worker.postMessage(createChunkGeneratorInitializeRequest({ serviceGeneration, worldSeed }));
+        worker.postMessage(createChunkGeneratorInitializeRequest({
+          serviceGeneration,
+          worldSeed,
+          ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+        }));
         return await initializePromise;
       } catch (error) {
         return activateFallback(error);

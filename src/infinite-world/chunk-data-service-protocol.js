@@ -50,16 +50,25 @@ export function createChunkDataRequestKey(chunkX, chunkZ) {
   return `${chunkX},${chunkZ}`;
 }
 
-export function createChunkGeneratorInitializeRequest({ serviceGeneration, worldSeed }) {
+export function createChunkGeneratorInitializeRequest({
+  serviceGeneration,
+  worldSeed,
+  settlementRoadGraphGeneratorId = null,
+}) {
   if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
     throw new RangeError('serviceGeneration must be a positive safe integer');
   }
   if (typeof worldSeed !== 'string' || !worldSeed) throw new TypeError('worldSeed is required');
+  if (settlementRoadGraphGeneratorId !== null
+    && (typeof settlementRoadGraphGeneratorId !== 'string' || !settlementRoadGraphGeneratorId)) {
+    throw new TypeError('settlementRoadGraphGeneratorId must be a non-empty string when provided');
+  }
   return Object.freeze({
     type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
     protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
     serviceGeneration,
     worldSeed,
+    ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
   });
 }
 

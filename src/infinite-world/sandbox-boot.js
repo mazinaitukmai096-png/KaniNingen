@@ -21,6 +21,7 @@ import {
   createW8ParityChunkGenerator,
   sampleW8SurfaceHeightMeters,
 } from './w8-parity-chunk-generator.js';
+import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
@@ -262,6 +263,12 @@ function parseMeasurementQuality(value) {
     throw new RangeError('measurementQuality must be high, medium, or low');
   }
   return value;
+}
+
+export function parseSettlementRoadGraphGeneratorId(value) {
+  if (value === null || value === '' || value === 'legacy-migrated-v1') return null;
+  if (value === ROAD_GRAPH_V1_GENERATOR_ID) return ROAD_GRAPH_V1_GENERATOR_ID;
+  throw new RangeError(`unsupported experimental Settlement Road Graph: ${value}`);
 }
 
 export function gatePlayerMovementByTerrainCoverage({
@@ -917,6 +924,11 @@ export async function bootInfiniteWorldSandbox({
   ).get('settlementStreaming') === 'legacy'
     ? BUILDING_SETTLEMENT_STREAM_MODE.LEGACY
     : BUILDING_SETTLEMENT_STREAM_MODE.SHARED,
+  settlementRoadGraphGeneratorId = parseSettlementRoadGraphGeneratorId(
+    new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('settlementRoadGraph'),
+  ),
   streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
@@ -1304,9 +1316,13 @@ export async function bootInfiniteWorldSandbox({
     const generatorMetadata = await runStage('Legacy Core', async () => {
       const workerTransport = createWorkerChunkGeneratorTransport({
         worldSeed: requestedSeed,
+        ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
         workerFactory: chunkGeneratorWorkerFactory ?? undefined,
         fallbackTransportFactory: async () => createInlineChunkGeneratorTransport({
-          generator: await generatorFactory({ worldSeed: requestedSeed }),
+          generator: await generatorFactory({
+            worldSeed: requestedSeed,
+            ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
+          }),
           clock,
           onSchedulerEvent: recordGenerationSchedulerEvent,
         }),
