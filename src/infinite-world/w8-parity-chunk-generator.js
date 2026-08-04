@@ -16,6 +16,7 @@ import {
   createDistributedSettlementChunkGenerator,
 } from './distributed-settlement-chunk-generator.js';
 import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
+import { ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v1-settlement-adapter.js';
 import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
@@ -1312,7 +1313,9 @@ export async function createW8ParityChunkGenerator({
     terrainSuitability: null,
   });
   const majorRoadSurfacePolicyVersion = 'w8-settlement-surface-policy-1';
-  const majorRoadSourceContractVersion = 'w5-migrated-settlement-template-1';
+  const majorRoadSourceContractVersion = useRoadGraphV1
+    ? ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA
+    : 'w5-migrated-settlement-template-1';
   const getMajorRoadSourceContentHash = (node, roadTimingContext = null) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     const cacheLookupStartedAt = roadTimingRun ? nowMs() : null;
@@ -1418,6 +1421,7 @@ export async function createW8ParityChunkGenerator({
       const obstacles = createCanonicalMajorRoadObstacles({
         buildings: presentation.buildings,
         landmarks: createMajorRoadLandmarkObstacles(reference),
+        preserveFrontageRoadId: useRoadGraphV1,
       });
       majorRoadDiagnostics.obstacleBuildingCount += obstacles
         .filter(value => value.kind === 'BUILDING').length;
@@ -1433,6 +1437,7 @@ export async function createW8ParityChunkGenerator({
       return Object.freeze({
         obstacles,
         localRoads: Object.freeze([...presentation.roads]),
+        gatewayHandoffs: Object.freeze([...(presentation.gatewayHandoffs ?? [])]),
       });
     }, node.stableId);
   };
@@ -1514,6 +1519,11 @@ export async function createW8ParityChunkGenerator({
           .sort((left, right) => left.stableId.localeCompare(right.stableId))),
         localRoads: Object.freeze(resolved.flatMap(value => value.localRoads)
           .sort((left, right) => left.stableId.localeCompare(right.stableId))),
+        gatewayHandoffs: Object.freeze(resolved.flatMap(value => value.gatewayHandoffs)
+          .sort((left, right) => (
+            left.connectivityEdgeId.localeCompare(right.connectivityEdgeId)
+              || left.gatewayStableId.localeCompare(right.gatewayStableId)
+          ))),
       });
       if (roadTimingRun) {
         roadTimingRun.addCounter(
@@ -1714,7 +1724,6 @@ export async function createW8ParityChunkGenerator({
     surfaceBackedChunk,
     roadTimingContext = null,
   ) => {
-    if (useRoadGraphV1) return Object.freeze([]);
     const roadTimingRun = roadTimingContext?.recorder?.beginRun({
       owner: { x: chunkX, z: chunkZ },
       deadlineMiss: roadTimingContext?.deadlineMissAtStart === true,

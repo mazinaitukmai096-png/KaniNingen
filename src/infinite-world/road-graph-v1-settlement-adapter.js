@@ -10,6 +10,7 @@ import {
   ROAD_GRAPH_CLASSES,
   ROAD_GRAPH_V1_GENERATOR_ID,
 } from './road-graph-v1.js';
+import { createSettlementRoadGatewayHandoff } from './settlement-road-gateway-handoff.js';
 
 export const ROAD_GRAPH_V1_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v1-settlement-template-1';
 
@@ -119,6 +120,40 @@ function translateRectangle(rectangle, center) {
   });
 }
 
+function createGatewayHandoffs(graph, candidate) {
+  const nodesById = new Map(graph.nodes.map(node => [node.nodeId, node]));
+  return Object.freeze(graph.edges
+    .filter(edge => edge.flags.connectivityGateway === true)
+    .map(edge => {
+      const endpointNodes = [
+        nodesById.get(edge.startNodeId),
+        nodesById.get(edge.endNodeId),
+      ];
+      const gatewayNodes = endpointNodes.filter(node => (
+        node?.role === 'connectivity-gateway'
+          && node.gatewayId === edge.flags.routeId.slice(
+            `${candidate.settlementId}:arterial:`.length,
+          )
+      ));
+      if (gatewayNodes.length !== 1) {
+        throw new Error(`Road Graph arterial requires one gateway node: ${edge.stableId}`);
+      }
+      const gatewayNode = gatewayNodes[0];
+      return createSettlementRoadGatewayHandoff({
+        gatewayStableId: gatewayNode.stableId,
+        connectivityEdgeId: gatewayNode.gatewayId,
+        settlementId: candidate.settlementId,
+        targetSettlementId: gatewayNode.targetSettlementId,
+        arterialRoadStableId: edge.stableId,
+        logicalPosition: gatewayNode.position,
+      });
+    })
+    .sort((left, right) => (
+      left.connectivityEdgeId.localeCompare(right.connectivityEdgeId)
+        || left.gatewayStableId.localeCompare(right.gatewayStableId)
+    )));
+}
+
 export async function createRoadGraphV1SettlementTemplate({
   worldSeedHash,
   candidate,
@@ -154,6 +189,7 @@ export async function createRoadGraphV1SettlementTemplate({
     settlementType: candidate.settlementType,
   });
   const hierarchy = adaptRoadGraphToLegacyHierarchy({ graph, candidate, town });
+  const gatewayHandoffs = createGatewayHandoffs(graph, candidate);
   const buildingResult = await buildDeterministicBuildings({
     town,
     hierarchy,
@@ -224,10 +260,12 @@ export async function createRoadGraphV1SettlementTemplate({
     buildingShortageCount: buildingResult.requestedBuildingCount - buildings.length,
     roads: Object.freeze(roads),
     buildings: Object.freeze(buildings),
+    gatewayHandoffs,
     roadSummary: Object.freeze({
       generatorId: ROAD_GRAPH_V1_GENERATOR_ID,
       roadClassCounts,
       gatewayMode: graph.metadata.gatewayMode,
+      gatewayHandoffCount: gatewayHandoffs.length,
       fallbackType: graph.metadata.fallbackType,
       fictitiousGatewayCount: 0,
     }),

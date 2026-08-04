@@ -7,6 +7,10 @@ import {
   decomposeLogicalWorldPosition,
 } from './chunk-coordinates.js';
 import { FINITE_WORLD_UNITS_PER_METER } from './single-rural-settlement.js';
+import {
+  resolveDirectionalSettlementRoadGatewayHandoff,
+  resolveSettlementRoadGatewayHandoff,
+} from './settlement-road-gateway-handoff.js';
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
@@ -76,11 +80,19 @@ function rectangle(record, kind, stableId) {
   });
 }
 
-export function createCanonicalMajorRoadObstacles({ buildings = [], landmarks = [] } = {}) {
+export function createCanonicalMajorRoadObstacles({
+  buildings = [],
+  landmarks = [],
+  preserveFrontageRoadId = false,
+} = {}) {
   const obstacles = [];
   for (const building of buildings) {
     const footprint = rectangle(building, 'BUILDING', `${building.stableId}:footprint`);
-    if (footprint) obstacles.push(footprint);
+    if (footprint) obstacles.push(Object.freeze({
+      ...footprint,
+      ...(preserveFrontageRoadId && building.frontageRoadId
+        ? { frontageRoadStableId: building.frontageRoadId } : {}),
+    }));
     const lot = building.lot;
     if (lot?.lotStatus === 'ACTIVE') {
       const lotRecord = rectangle({
@@ -90,7 +102,11 @@ export function createCanonicalMajorRoadObstacles({ buildings = [], landmarks = 
         width: lot.widthMeters ?? lot.width,
         depth: lot.depthMeters ?? lot.depth,
       }, 'LOT', `${building.stableId}:lot`);
-      if (lotRecord) obstacles.push(lotRecord);
+      if (lotRecord) obstacles.push(Object.freeze({
+        ...lotRecord,
+        ...(preserveFrontageRoadId && building.frontageRoadId
+          ? { frontageRoadStableId: building.frontageRoadId } : {}),
+      }));
     }
   }
   for (const landmark of landmarks) {
@@ -151,6 +167,13 @@ function pointSegmentDistance(point, start, end) {
 
 function segmentIsClear(start, end, obstacles) {
   return obstacles.every(obstacle => !majorRoadSegmentIntersectsObstacle(start, end, obstacle));
+}
+
+function gatewayApproachIsClear(start, end, obstacles, handoff) {
+  return obstacles.every(obstacle => (
+    obstacle.frontageRoadStableId === handoff.arterialRoadStableId
+      || !majorRoadSegmentIntersectsObstacle(start, end, obstacle)
+  ));
 }
 
 function createObstacleSpatialIndex(obstacles, cellSizeMeters) {
@@ -480,28 +503,72 @@ async function createRoad({
   nodesById,
   obstacles,
   localRoads,
+  gatewayHandoffs,
   timingObserver,
 }) {
   const roadStartedAt = nowMs();
   const endpoints = edge.settlementIds.map(id => nodesById.get(id));
   if (endpoints.some(value => !value)) throw new Error('MAJOR Road edge has an unknown endpoint');
   const settlementCenters = Object.freeze(endpoints.map(endpoint => endpoint.center));
-  const startAccess = selectSettlementTerminal(
-    endpoints[0].stableId,
-    endpoints[0].center,
-    endpoints[1].center,
-    endpoints[0].radiusMeters,
-    obstacles,
-    localRoads,
-  );
-  const endAccess = selectSettlementTerminal(
-    endpoints[1].stableId,
-    endpoints[1].center,
-    endpoints[0].center,
-    endpoints[1].radiusMeters,
-    obstacles,
-    localRoads,
-  );
+  const contractedHandoffs = endpoints.map((endpoint, index) => (
+    resolveSettlementRoadGatewayHandoff({
+      handoffs: gatewayHandoffs,
+      connectivityEdgeId: edge.stableId,
+      settlementId: endpoint.stableId,
+    }) ?? (gatewayHandoffs.length > 0
+      ? resolveDirectionalSettlementRoadGatewayHandoff({
+        handoffs: gatewayHandoffs,
+        connectivityEdgeId: edge.stableId,
+        settlementId: endpoint.stableId,
+        targetSettlementId: endpoints[1 - index].stableId,
+        settlementCenter: endpoint.center,
+        targetCenter: endpoints[1 - index].center,
+      }) : null)
+  ));
+  if (gatewayHandoffs.length > 0 && contractedHandoffs.some(handoff => handoff === null)) {
+    throw new Error(`orphan Settlement road gateway handoff: ${edge.stableId}`);
+  }
+  const createContractedAccess = (handoff, endpoint) => {
+    if (!handoff) return null;
+    const dx = handoff.logicalPosition.x - endpoint.center.x;
+    const dz = handoff.logicalPosition.z - endpoint.center.z;
+    const length = Math.hypot(dx, dz);
+    if (length <= 1e-9) {
+      throw new Error(`Settlement road gateway handoff equals its center: ${handoff.gatewayStableId}`);
+    }
+    const portalRadius = endpoint.radiusMeters + W8_CANONICAL_MAJOR_ROAD.widthMeters * 2
+      + W8_CANONICAL_MAJOR_ROAD.obstacleClearanceMeters;
+    const portal = Object.freeze({
+      x: q6(endpoint.center.x + dx / length * portalRadius),
+      z: q6(endpoint.center.z + dz / length * portalRadius),
+    });
+    const sharedGateway = handoff.bindingMode === 'directional-shared-gateway';
+    return Object.freeze({
+      connection: sharedGateway ? portal : handoff.logicalPosition,
+      portal,
+      localRoadStableId: sharedGateway ? null : handoff.arterialRoadStableId,
+      gatewayHandoff: handoff,
+      trimMode: sharedGateway ? 'SHARED_GATEWAY_TRUNK' : 'DIRECT_GATEWAY',
+    });
+  };
+  const startAccess = createContractedAccess(contractedHandoffs[0], endpoints[0])
+    ?? selectSettlementTerminal(
+      endpoints[0].stableId,
+      endpoints[0].center,
+      endpoints[1].center,
+      endpoints[0].radiusMeters,
+      obstacles,
+      localRoads,
+    );
+  const endAccess = createContractedAccess(contractedHandoffs[1], endpoints[1])
+    ?? selectSettlementTerminal(
+      endpoints[1].stableId,
+      endpoints[1].center,
+      endpoints[0].center,
+      endpoints[1].radiusMeters,
+      obstacles,
+      localRoads,
+    );
   const start = startAccess.portal;
   const end = endAccess.portal;
   const maximumRadius = Math.max(...endpoints.map(value => value.radiusMeters));
@@ -534,9 +601,33 @@ async function createRoad({
   waypoints = [startAccess.connection, ...waypoints, endAccess.connection]
     .filter((point, index, values) => index === 0
       || point.x !== values[index - 1].x || point.z !== values[index - 1].z);
-  if (!waypoints.slice(1).every((point, index) => (
-    segmentIsClear(waypoints[index], point, relevantObstacles)
-  ))) throw new Error(`canonical MAJOR Road intersects an obstacle: ${edge.stableId}`);
+  const lastSegmentIndex = waypoints.length - 2;
+  if (!waypoints.slice(1).every((point, index) => {
+    const first = waypoints[index];
+    if (index === 0 && first.x === startAccess.connection.x
+      && first.z === startAccess.connection.z
+      && (first.x !== startAccess.portal.x || first.z !== startAccess.portal.z)
+      && startAccess.gatewayHandoff) {
+      return gatewayApproachIsClear(
+        first,
+        point,
+        relevantObstacles,
+        startAccess.gatewayHandoff,
+      );
+    }
+    if (index === lastSegmentIndex && point.x === endAccess.connection.x
+      && point.z === endAccess.connection.z
+      && (point.x !== endAccess.portal.x || point.z !== endAccess.portal.z)
+      && endAccess.gatewayHandoff) {
+      return gatewayApproachIsClear(
+        first,
+        point,
+        relevantObstacles,
+        endAccess.gatewayHandoff,
+      );
+    }
+    return segmentIsClear(first, point, relevantObstacles);
+  })) throw new Error(`canonical MAJOR Road intersects an obstacle: ${edge.stableId}`);
   stageStartedAt = nowMs();
   const stableId = `major-road-v1:${(await sha256Hex(canonicalizeJson({
     schemaVersion: W8_CANONICAL_MAJOR_ROAD.schemaVersion,
@@ -582,6 +673,18 @@ async function createRoad({
       startAccess.localRoadStableId,
       endAccess.localRoadStableId,
     ]),
+    ...(contractedHandoffs.every(Boolean) ? {
+      gatewayHandoffs: Object.freeze(contractedHandoffs),
+      gatewayConnections: Object.freeze([startAccess, endAccess].map(access => Object.freeze({
+        gatewayStableId: access.gatewayHandoff.gatewayStableId,
+        handoffPosition: access.gatewayHandoff.logicalPosition,
+        majorConnectionPosition: access.connection,
+        externalPortalPosition: access.portal,
+        trimMode: access.trimMode,
+        sharedTrunkConnectivityEdgeId: access.trimMode === 'SHARED_GATEWAY_TRUNK'
+          ? access.gatewayHandoff.gatewaySourceConnectivityEdgeId : null,
+      }))),
+    } : {}),
     waypoints: Object.freeze(waypoints.map(point => Object.freeze({
       x: q6(point.x), z: q6(point.z),
     }))),
@@ -621,7 +724,9 @@ export async function createCanonicalMajorRoadNetwork({
     });
     const obstacles = Array.isArray(resolved) ? resolved : resolved?.obstacles;
     const localRoads = Array.isArray(resolved) ? [] : resolved?.localRoads ?? [];
-    if (!Array.isArray(obstacles) || !Array.isArray(localRoads)) {
+    const gatewayHandoffs = Array.isArray(resolved) ? [] : resolved?.gatewayHandoffs ?? [];
+    if (!Array.isArray(obstacles) || !Array.isArray(localRoads)
+      || !Array.isArray(gatewayHandoffs)) {
       throw new TypeError('MAJOR Road obstacle resolver returned an invalid result');
     }
     roads.push(await createRoad({
@@ -630,6 +735,10 @@ export async function createCanonicalMajorRoadNetwork({
       nodesById,
       obstacles: [...obstacles].sort((left, right) => left.stableId.localeCompare(right.stableId)),
       localRoads: [...localRoads].sort((left, right) => left.stableId.localeCompare(right.stableId)),
+      gatewayHandoffs: [...gatewayHandoffs].sort((left, right) => (
+        left.connectivityEdgeId.localeCompare(right.connectivityEdgeId)
+          || left.gatewayStableId.localeCompare(right.gatewayStableId)
+      )),
       timingObserver,
     }));
   }
@@ -730,6 +839,8 @@ export function projectCanonicalMajorRoadsToChunk({
         routeTerminals: road.terminals,
         settlementPortals: road.settlementPortals,
         localRoadHandoffIds: road.localRoadHandoffIds,
+        ...(road.gatewayHandoffs ? { gatewayHandoffs: road.gatewayHandoffs } : {}),
+        ...(road.gatewayConnections ? { gatewayConnections: road.gatewayConnections } : {}),
         connectivityEdgeId: road.connectivityEdgeId,
         canonicalOwnerRegion: road.ownerRegion,
         roadKind: ROAD_KINDS.MAJOR,

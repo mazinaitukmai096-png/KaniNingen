@@ -32,6 +32,11 @@ import {
 } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { createMigratedSettlementTemplate } from '../src/infinite-world/single-rural-settlement.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
+import { createCanonicalMajorRoadNetwork } from '../src/infinite-world/canonical-major-road-network.js';
+import {
+  SETTLEMENT_ROAD_GATEWAY_HANDOFF_SCHEMA,
+  validateSettlementRoadGatewayHandoff,
+} from '../src/infinite-world/settlement-road-gateway-handoff.js';
 import { parseSettlementRoadGraphGeneratorId } from '../src/infinite-world/sandbox-boot.js';
 import { createChunkGeneratorInitializeRequest } from '../src/infinite-world/chunk-data-service-protocol.js';
 
@@ -377,22 +382,157 @@ test('explicit flag selects road-graph-v1 through W5/W8 while default legacy out
   await experimental.shutdown();
 });
 
-test('experimental W8 path has one Road Graph authority and publishes no canonical MAJOR duplicate', async () => {
+test('experimental W8 joins Road Graph arterials to canonical MAJOR Roads at gateway contracts', async () => {
   const generator = await createW8ParityChunkGenerator({
     worldSeed: 'KaniNingen Infinite Natural World',
     settlementRoadGraphGeneratorId: ROAD_GRAPH_V1_GENERATOR_ID,
   });
-  const ownerX = Math.floor(generator.reviewSpawn.x / 16);
-  const ownerZ = Math.floor(generator.reviewSpawn.z / 16);
-  const chunks = await Promise.all([
-    generator.generateChunk(ownerX, ownerZ),
-    generator.generateChunk(ownerX + 1, ownerZ),
-    generator.generateChunk(ownerX, ownerZ + 1),
-  ]);
-  const roads = chunks.flatMap(chunk => chunk.settlementFeatures)
-    .filter(feature => feature.featureType === 'settlement-road');
-  assert.ok(roads.some(road => road.roadClass));
-  assert.equal(roads.some(road => road.canonicalMajorRoad === true), false);
-  assert.equal(new Set(roads.map(road => road.stableId)).size, roads.length);
-  await generator.shutdown();
+  try {
+    const query = {
+      centerWorldX: 384,
+      centerWorldZ: 384,
+      radiusMeters: 1823.058008,
+    };
+    const [network, repeated, parallel] = await Promise.all([
+      generator.resolveCanonicalMajorRoadNetwork(query),
+      generator.resolveCanonicalMajorRoadNetwork(query),
+      generator.resolveCanonicalMajorRoadNetwork(query),
+    ]);
+    assert.deepEqual(repeated, network);
+    assert.deepEqual(parallel, network);
+    assert.equal(network.graphEdgeCount, 16);
+    assert.equal(network.roadCount, 16);
+    assert.equal(network.roads.reduce((sum, road) => sum + road.segments.length, 0), 3084);
+    assert.deepEqual(
+      new Set(network.roads.map(road => road.connectivityEdgeId)),
+      new Set(network.graph.edges.map(edge => edge.stableId)),
+    );
+
+    const undirectedSegmentKeys = new Set();
+    const nodesById = new Map(network.graph.nodes.map(node => [node.stableId, node]));
+    const gatewayConnections = network.roads.flatMap(road => road.gatewayConnections);
+    assert.equal(gatewayConnections.filter(value => value.trimMode === 'DIRECT_GATEWAY').length, 22);
+    assert.equal(gatewayConnections
+      .filter(value => value.trimMode === 'SHARED_GATEWAY_TRUNK').length, 10);
+    for (const road of network.roads) {
+      assert.notEqual(road.settlementIds[0], road.settlementIds[1], 'self-loop');
+      assert.equal(road.gatewayHandoffs.length, 2);
+      assert.equal(road.gatewayConnections.length, 2);
+      for (const handoff of road.gatewayHandoffs) {
+        assert.equal(handoff.schemaVersion, SETTLEMENT_ROAD_GATEWAY_HANDOFF_SCHEMA);
+        assert.equal(validateSettlementRoadGatewayHandoff(handoff).valid, true);
+      }
+      road.gatewayConnections.forEach((connection, endpointIndex) => {
+        const handoff = road.gatewayHandoffs[endpointIndex];
+        assert.equal(connection.gatewayStableId, handoff.gatewayStableId);
+        if (connection.trimMode === 'DIRECT_GATEWAY') {
+          assert.deepEqual(connection.majorConnectionPosition, handoff.logicalPosition);
+          assert.deepEqual(road.terminals[endpointIndex], handoff.logicalPosition);
+        } else {
+          assert.equal(connection.trimMode, 'SHARED_GATEWAY_TRUNK');
+          assert.notEqual(connection.sharedTrunkConnectivityEdgeId, road.connectivityEdgeId);
+          assert.ok(connection.sharedTrunkConnectivityEdgeId);
+        }
+      });
+      for (let index = 0; index < road.segments.length; index += 1) {
+        const segment = road.segments[index];
+        assert.notDeepEqual(segment.start, segment.end, 'zero-length segment');
+        if (index > 0) assert.deepEqual(road.segments[index - 1].end, segment.start);
+        const first = `${segment.start.x},${segment.start.z}`;
+        const second = `${segment.end.x},${segment.end.z}`;
+        const key = first < second ? `${first}|${second}` : `${second}|${first}`;
+        assert.equal(undirectedSegmentKeys.has(key), false, `duplicate segment: ${key}`);
+        undirectedSegmentKeys.add(key);
+      }
+    }
+
+    const presentations = new Map();
+    for (const node of network.graph.nodes) {
+      presentations.set(node.stableId, await generator.resolveSettlementPresentationTemplate({
+        candidate: {
+          settlementId: node.stableId,
+          settlementType: node.settlementType,
+          townType: node.role,
+          macroRegion: node.ownerRegion,
+          center: node.center,
+          radiusMeters: node.radiusMeters,
+          urbanization: null,
+          terrainSuitability: null,
+        },
+      }));
+    }
+    for (const road of network.roads) {
+      road.gatewayHandoffs.forEach((handoff, endpointIndex) => {
+        const arterial = presentations.get(handoff.settlementId).roads
+          .find(candidate => candidate.stableId === handoff.arterialRoadStableId);
+        assert.ok(arterial, 'gateway arterial exists');
+        assert.equal(arterial.roadClass, 'arterial');
+        assert.equal(arterial.flags.connectivityGateway, true);
+        assert.ok([arterial.start, arterial.end].some(point => (
+          point.x === handoff.logicalPosition.x && point.z === handoff.logicalPosition.z
+        )), 'arterial reaches the gateway with gap 0');
+        const first = `${arterial.start.x},${arterial.start.z}`;
+        const second = `${arterial.end.x},${arterial.end.z}`;
+        const arterialKey = first < second ? `${first}|${second}` : `${second}|${first}`;
+        assert.equal(undirectedSegmentKeys.has(arterialKey), false, 'overlapping approach');
+        assert.equal(nodesById.has(road.settlementIds[endpointIndex]), true);
+      });
+    }
+
+    const sharedSources = new Map();
+    for (const road of network.roads) {
+      road.gatewayConnections.forEach((connection, endpointIndex) => {
+        if (connection.trimMode !== 'SHARED_GATEWAY_TRUNK') return;
+        sharedSources.set(
+          `${road.settlementIds[endpointIndex]}:${connection.sharedTrunkConnectivityEdgeId}`,
+          {
+            node: nodesById.get(road.settlementIds[endpointIndex]),
+            sourceEdgeId: connection.sharedTrunkConnectivityEdgeId,
+          },
+        );
+      });
+    }
+    for (const { node, sourceEdgeId } of sharedSources.values()) {
+      const localGraph = await generator.distributor.buildConnectivityGraphNear(
+        node.center.x,
+        node.center.z,
+        node.radiusMeters,
+      );
+      assert.ok(localGraph.edges.some(edge => edge.stableId === sourceEdgeId), 'orphan road');
+    }
+
+    const allHandoffs = [...presentations.values()].flatMap(value => value.gatewayHandoffs);
+    const resolveContractOnly = async () => ({
+      obstacles: [],
+      localRoads: [],
+      gatewayHandoffs: allHandoffs,
+    });
+    const reversedGraph = Object.freeze({
+      ...network.graph,
+      nodes: Object.freeze([...network.graph.nodes].reverse()),
+      edges: Object.freeze([...network.graph.edges].reverse()),
+    });
+    const [forwardContractNetwork, reverseContractNetwork, parallelContractNetwork] =
+      await Promise.all([
+        createCanonicalMajorRoadNetwork({
+          worldSeedHash: generator.worldSeedHash,
+          graph: network.graph,
+          resolveObstacles: resolveContractOnly,
+        }),
+        createCanonicalMajorRoadNetwork({
+          worldSeedHash: generator.worldSeedHash,
+          graph: reversedGraph,
+          resolveObstacles: resolveContractOnly,
+        }),
+        createCanonicalMajorRoadNetwork({
+          worldSeedHash: generator.worldSeedHash,
+          graph: network.graph,
+          resolveObstacles: resolveContractOnly,
+        }),
+      ]);
+    assert.deepEqual(reverseContractNetwork, forwardContractNetwork);
+    assert.deepEqual(parallelContractNetwork, forwardContractNetwork);
+  } finally {
+    await generator.shutdown();
+  }
 });
