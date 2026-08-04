@@ -9,7 +9,7 @@ import {
   createSettlementDistributor,
   W5_SETTLEMENT_DISTRIBUTION,
 } from './settlement-distributor.js';
-import { createMigratedSettlementTemplate } from './single-rural-settlement.js';
+import { createLegacyMigratedSettlementTemplate } from './legacy-migrated-settlement-adapter.js';
 import {
   CHUNK_GENERATION_STAGE,
   measureChunkGenerationStage,
@@ -94,7 +94,7 @@ function conflictsWithTemplate(candidate, template) {
   ) <= building.radiusMeters + radius + 0.35);
 }
 
-function projectTemplate(template, chunk) {
+export function projectMigratedSettlementTemplate(template, chunk) {
   const bounds = chunkBounds(chunk.chunkX, chunk.chunkZ);
   if (rectangleDistance(template.center, bounds) > template.influenceRadiusMeters) {
     return { features: [], references: [] };
@@ -243,7 +243,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
     templateCacheMisses += 1;
     roadTimingRun?.recordCacheMiss();
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
-    const template = await createMigratedSettlementTemplate({ candidate, roadTimingRun });
+    const template = await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
     if (isShutdown) return template;
     templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
     templatesMaterialized += 1;
@@ -282,7 +282,7 @@ export async function createDistributedSettlementChunkGenerator({ worldSeed = 'K
         rectangleDistance(candidate.center, bounds) <= candidateInfluence[candidate.settlementType]
       ));
       const templates = await Promise.all(intersectingCandidates.map(candidate => getTemplate(candidate)));
-      const projections = templates.map(template => projectTemplate(template, formal));
+      const projections = templates.map(template => projectMigratedSettlementTemplate(template, formal));
       const settlementReferences = projections.flatMap(projection => projection.references)
         .sort((a, b) => a.stableId.localeCompare(b.stableId));
       const settlementFeatures = projections.flatMap(projection => projection.features)

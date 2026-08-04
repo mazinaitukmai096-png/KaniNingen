@@ -6,8 +6,8 @@ import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { logicalWorldToOwnedChunk } from './chunk-coordinates.js';
 import {
   FINITE_WORLD_UNITS_PER_METER,
-  createMigratedSettlementTemplate,
 } from './single-rural-settlement.js';
+import { createLegacyMigratedSettlementTemplate } from './legacy-migrated-settlement-adapter.js';
 import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 import { ROAD_GENERATION_COUNTER } from './road-generation-timing.js';
 
@@ -186,7 +186,7 @@ export async function createW8SettlementParityOverlay({
   roadTimingRun = null,
 } = {}) {
   if (typeof worldSeedHash !== 'string') throw new TypeError('worldSeedHash is required');
-  const template = sourceTemplate ?? await createMigratedSettlementTemplate({
+  const template = sourceTemplate ?? await createLegacyMigratedSettlementTemplate({
     candidate,
     roadTimingRun,
   });
@@ -568,7 +568,7 @@ export async function createW8SettlementPresentationTemplate({
   candidate,
   worldSeedHash,
 } = {}) {
-  const sourceTemplate = await createMigratedSettlementTemplate({ candidate });
+  const sourceTemplate = await createLegacyMigratedSettlementTemplate({ candidate });
   const overlay = await createW8SettlementParityOverlay({
     candidate,
     worldSeedHash,
