@@ -20,7 +20,7 @@ export const PLAYER_SCALE_STAGE_IDS = Object.freeze({
 export const NEW_GAME_PLAYER_SCALE_STAGE_ID = PLAYER_SCALE_STAGE_IDS.TINY;
 
 const TINY_REFERENCE_VISUAL_SCALE = 0.08;
-const TINY_VISUAL_SCALE = 0.06;
+const TINY_VISUAL_SCALE = 0.05;
 const TINY_LINEAR_SCALE = TINY_VISUAL_SCALE / TINY_REFERENCE_VISUAL_SCALE;
 const scaleTinyLinearValue = value => value * TINY_LINEAR_SCALE;
 const finiteMetersPerSecondToFrameSpeed = value => value * 40 / 60;
@@ -126,7 +126,7 @@ export const PLAYER_SCALE_PROFILES = Object.freeze({
     id: PLAYER_SCALE_STAGE_IDS.TINY,
     label: 'Tiny',
     visualScale: TINY_VISUAL_SCALE,
-    movementSpeed: finiteMetersPerSecondToFrameSpeed(4.5),
+    movementSpeed: finiteMetersPerSecondToFrameSpeed(4),
     sprintMultiplier: 1.35,
     jumpVelocity: PLAYER_JUMP_VELOCITY * 0.09,
     gravity: PLAYER_GRAVITY / 7,

@@ -14,7 +14,7 @@ test('Player Scale resolver owns the complete Tiny, Mid, and Max physical profil
   assert.equal(NEW_GAME_PLAYER_SCALE_STAGE_ID, 'TINY');
   assert.deepEqual(
     Object.values(PLAYER_SCALE_PROFILES).map(profile => profile.visualScale),
-    [0.06, 0.45, 1],
+    [0.05, 0.45, 1],
   );
   for (const stageId of ['TINY', 'MID', 'MAX']) {
     const profile = resolvePlayerScaleProfile(stageId);
@@ -52,32 +52,32 @@ test('meter profile derives camera, movement, attack, vertical collision, and hi
     assert.ok(Math.abs(actual - expected) < 1e-12, `${actual} != ${expected}`);
   };
   const tiny = getW6ScaleProfile('TINY');
-  assert.equal(tiny.visualScale, 0.06);
-  assert.equal(tiny.collision.radiusMeters, 0.0975);
+  assert.equal(tiny.visualScale, 0.05);
+  assert.equal(tiny.collision.radiusMeters, 0.08125);
   assert.equal(tiny.collision.heightMeters, tiny.stage.collisionHeight / 40);
   assert.equal(tiny.collision.footOffsetMeters, tiny.stage.footOffset / 40);
-  assertNear(tiny.movementMetersPerSecond, 4.5);
+  assertNear(tiny.movementMetersPerSecond, 4);
   assert.equal(tiny.sprintMultiplier, 1.35);
-  assertNear(tiny.sprintMetersPerSecond, 6.075);
+  assertNear(tiny.sprintMetersPerSecond, 5.4);
   assertNear(tiny.jumpVelocityMetersPerSecond, 4.32);
   assertNear(tiny.gravityMetersPerSecondSquared, 18);
-  assert.equal(tiny.cameraDistanceMeters, 1.59375);
-  assert.equal(tiny.cameraHeightMeters, 0.6);
-  assert.equal(tiny.cameraTargetHeightMeters, 0.15);
-  assert.equal(tiny.cameraNearMeters, 0.009375);
-  assert.equal(tiny.singleAttackRadiusMeters, 0.3375);
-  assert.equal(tiny.doubleAttackRadiusMeters, 0.4125);
-  assert.equal(tiny.landingRadiusMeters, 0.525);
-  assert.equal(tiny.landingPushRadiusMeters, 0.9);
-  assert.equal(tiny.windArcRadiusMeters, 0.375);
+  assert.equal(tiny.cameraDistanceMeters, 1.328125);
+  assert.equal(tiny.cameraHeightMeters, 0.5);
+  assert.equal(tiny.cameraTargetHeightMeters, 0.125);
+  assert.equal(tiny.cameraNearMeters, 0.0078125);
+  assert.equal(tiny.singleAttackRadiusMeters, 0.28125);
+  assert.equal(tiny.doubleAttackRadiusMeters, 0.34375);
+  assert.equal(tiny.landingRadiusMeters, 0.4375);
+  assert.equal(tiny.landingPushRadiusMeters, 0.75);
+  assert.equal(tiny.windArcRadiusMeters, 0.3125);
   assert.equal(tiny.playerHitBounds.shape, 'vertical-ellipsoid');
   assert.equal(tiny.playerHitBounds.radiusMeters, tiny.collision.radiusMeters);
   assert.equal(tiny.playerHitBounds.halfHeightMeters, tiny.collision.heightMeters / 2);
 });
 
-test('Tiny linear bounds derive from the 0.06 to 0.08 visual ratio', () => {
+test('Tiny linear bounds derive from the 0.05 to 0.08 visual ratio', () => {
   const tiny = resolvePlayerScaleProfile('TINY');
-  const ratio = 0.06 / 0.08;
+  const ratio = 0.05 / 0.08;
   const reference = {
     attackOffsetX: 8,
     attackOffsetZ: 10,
