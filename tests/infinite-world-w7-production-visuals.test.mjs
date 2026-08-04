@@ -16,7 +16,9 @@ import {
   W8_PARITY_FEATURE_PARTS,
   W8_PRODUCTION_TREE_VISUAL_SCALE,
   createW8ParityVisualAssetLibrary,
+  resolveW8BuildingParts,
 } from '../src/infinite-world/render/w8-parity-visual-assets.js';
+import { W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE } from '../src/infinite-world/render/house-human-scale-visual-profile.js';
 import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
 import { W7_NUCLEAR_CONTRACT } from '../src/infinite-world/gameplay-contract.js';
 
@@ -164,6 +166,68 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
   assert.equal('horizonTerrain' in assets.materials, false);
   assets.dispose();
   assert.equal(assets.snapshot().disposed, true);
+});
+
+test('W8 House facade details resolve from one Human-scale profile without changing the body', () => {
+  const profile = W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE;
+  assert.equal(profile.referenceHumanHeightMeters, 1.75);
+  assert.deepEqual(profile.entrance, { widthMeters: 0.85, heightMeters: 1.95 });
+  assert.deepEqual(profile.window, {
+    widthMeters: 0.95,
+    heightMeters: 1,
+    sillHeightMeters: 0.85,
+    floorHeightMeters: 2.4,
+  });
+  assert.equal(profile.entrancePathWidthMeters, 0.9);
+
+  const bodySignatures = [
+    [[0, 0.278, 0], [0.615, 0.556, 0.762], [0, 0.722, 0], [0.692, 0.333, 0.857]],
+    [[0, 0.25, 0], [0.923, 0.5, 0.619], [0, 0.542, 0], [1, 0.083, 0.714]],
+    [[0, 0.528, 0], [0.5, 1.056, 0.619], [0, 1.097, 0], [0.538, 0.083, 0.667]],
+    [[0, 0.222, 0], [0.577, 0.444, 0.571], [0, 0.5, 0], [0.654, 0.111, 0.667]],
+    [[0, 0.236, 0], [0.462, 0.472, 0.571], [0, 0.625, 0], [0.538, 0.306, 0.667]],
+  ];
+  W8_FINITE_HOUSE_VARIANTS.forEach((parts, index) => {
+    assert.deepEqual(parts[0].position, bodySignatures[index][0]);
+    assert.deepEqual(parts[0].scale, bodySignatures[index][1]);
+    assert.deepEqual(parts[1].position, bodySignatures[index][2]);
+    assert.deepEqual(parts[1].scale, bodySignatures[index][3]);
+    assert.ok(parts.some(part => part.houseDetail?.role === 'entrance'), `entrance ${index}`);
+    assert.ok(parts.filter(part => part.houseDetail?.role === 'window').length >= 2, `windows ${index}`);
+  });
+
+  for (const heightMeters of [3.96, 4.5, 5.04]) {
+    const resolvedVariants = new Map();
+    for (let candidate = 0; candidate < 100 && resolvedVariants.size < 5; candidate += 1) {
+      const parts = resolveW8BuildingParts({
+        buildingType: 'house', stableId: `human-scale-house-${candidate}`,
+        widthMeters: 6.5, heightMeters, depthMeters: 5.25,
+      });
+      resolvedVariants.set(parts[0].scale.join(','), parts);
+    }
+    assert.equal(resolvedVariants.size, 5);
+    for (const parts of resolvedVariants.values()) {
+      for (const part of parts.filter(value => value.houseDetail?.role === 'entrance')) {
+        assert.ok(Math.abs(part.scale[0] * 6.5 - profile.entrance.widthMeters) < 1e-12);
+        assert.ok(Math.abs(part.scale[1] * heightMeters - profile.entrance.heightMeters) < 1e-12);
+        assert.ok(Math.abs((part.position[1] - part.scale[1] / 2) * heightMeters) < 1e-12);
+      }
+      for (const part of parts.filter(value => value.houseDetail?.role === 'window')) {
+        assert.ok(Math.abs(part.scale[0] * 6.5 - profile.window.widthMeters) < 1e-12);
+        assert.ok(Math.abs(part.scale[1] * heightMeters - profile.window.heightMeters) < 1e-12);
+        assert.ok(Math.abs(
+          (part.position[1] - part.scale[1] / 2) * heightMeters
+          - (profile.window.sillHeightMeters
+            + part.houseDetail.floorIndex * profile.window.floorHeightMeters),
+        ) < 1e-12);
+      }
+    }
+  }
+
+  const apartmentFloors = W8_FINITE_HOUSE_VARIANTS[2]
+    .filter(part => part.houseDetail?.role === 'window')
+    .map(part => part.houseDetail.floorIndex);
+  assert.deepEqual(apartmentFloors, [0, 0, 1, 1]);
 });
 
 test('W8 production Trees enlarge every part uniformly while preserving ground contact', () => {

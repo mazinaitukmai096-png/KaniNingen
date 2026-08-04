@@ -433,6 +433,8 @@ test('Settlement projection preserves finite layer order and renders junction, e
   const lotMesh = projected.group.children[lotIndex];
   assert.deepEqual(lotMesh.userData.surfaceKinds.sort(), ['entrance-path', 'forecourt']);
   assert.equal(lotMesh.count, 2);
+  assert.equal(lotMesh.matrices[0].scale.x, 0.9 * adapter.unitsPerMeter);
+  assert.equal(lotMesh.matrices[1].scale.x, 2.25 * adapter.unitsPerMeter);
   await adapter.loadProjected(projected);
   adapter.markFirstDraw();
   const pathAudit = adapter.treePathAuditSnapshot();

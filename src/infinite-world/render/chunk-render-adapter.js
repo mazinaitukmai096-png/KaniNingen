@@ -9,6 +9,7 @@ import {
   PRODUCTION_VISUAL_UNITS_PER_METER,
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
+import { W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE } from './house-human-scale-visual-profile.js';
 import {
   resolveW8CanonicalCandidateSet,
   resolveW8NaturalCandidateVisual,
@@ -896,6 +897,10 @@ export class ChunkRenderAdapter {
         lotMesh.count = surfaces.length;
         lotMesh.userData.surfaceKinds = [];
         surfaces.forEach(({ building, surface, surfaceKind }, index) => {
+          const visualWidthMeters = surfaceKind === 'entrance-path'
+            && building.buildingType === 'house'
+            ? Math.max(surface.width, W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE.entrancePathWidthMeters)
+            : surface.width;
           transform.position.set(
             (surface.centerX - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
             (building.worldPosition.y + FINITE_ROAD_SURFACE_HEIGHT_METERS + 0.00075)
@@ -904,7 +909,7 @@ export class ChunkRenderAdapter {
           );
           transform.rotation.set(-Math.PI / 2, 0, surface.rotationY);
           transform.scale.set(
-            surface.width * this.unitsPerMeter,
+            visualWidthMeters * this.unitsPerMeter,
             surface.depth * this.unitsPerMeter,
             1,
           );

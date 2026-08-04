@@ -5,11 +5,14 @@ import {
   createProductionVisualAssetLibrary,
 } from './production-visual-assets.js';
 import { SETTLEMENT_BUILDING_PALETTES } from '../../settlement-building-visuals.js';
+import { W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE } from './house-human-scale-visual-profile.js';
 
 const descriptor = (
   geometry, material, position, scale, rotation = [0, 0, 0], materialRole = null,
+  houseDetail = null,
 ) => Object.freeze({
   geometry, material, position, scale, rotation, materialRole,
+  ...(houseDetail ? { houseDetail } : {}),
 });
 
 export const W8_PRODUCTION_TREE_VISUAL_SCALE = 4 / 3;
@@ -21,44 +24,77 @@ const productionTree = (...parts) => Object.freeze(parts.map(part => Object.free
 })));
 
 const house = (...parts) => Object.freeze(parts);
+const houseDetail = (role, floorIndex = null) => Object.freeze({
+  role,
+  ...(floorIndex === null ? {} : { floorIndex }),
+});
+const houseEntrance = (x, z, depth = 0.025) => {
+  const { entrance, referenceHouseWidthMeters, referenceHouseHeightMeters } =
+    W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE;
+  return descriptor(
+    'box', 'charred', [x, entrance.heightMeters / referenceHouseHeightMeters / 2, z],
+    [entrance.widthMeters / referenceHouseWidthMeters,
+      entrance.heightMeters / referenceHouseHeightMeters, depth],
+    [0, 0, 0], null, houseDetail('entrance'),
+  );
+};
+const houseWindow = (x, z, floorIndex = 0, depth = 0.025) => {
+  const { window, referenceHouseWidthMeters, referenceHouseHeightMeters } =
+    W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE;
+  const centerHeightMeters = window.sillHeightMeters + window.heightMeters / 2
+    + floorIndex * window.floorHeightMeters;
+  return descriptor(
+    'box', 'window', [x, centerHeightMeters / referenceHouseHeightMeters, z],
+    [window.widthMeters / referenceHouseWidthMeters,
+      window.heightMeters / referenceHouseHeightMeters, depth],
+    [0, 0, 0], null, houseDetail('window', floorIndex),
+  );
+};
 export const W8_FINITE_HOUSE_VARIANTS = Object.freeze([
   house(
     descriptor('box', 'houseWall', [0, 0.278, 0], [0.615, 0.556, 0.762], [0, 0, 0], 'wall'),
     descriptor('pyramid', 'houseRoof', [0, 0.722, 0], [0.692, 0.333, 0.857], [0, 0, 0], 'roof'),
-    descriptor('box', 'charred', [0, 0.18, 0.386], [0.115, 0.28, 0.03]),
-    descriptor('box', 'window', [-0.23, 0.34, 0.386], [0.12, 0.16, 0.025]),
-    descriptor('box', 'window', [0.23, 0.34, 0.386], [0.12, 0.16, 0.025]),
+    houseEntrance(0, 0.386, 0.03),
+    houseWindow(-0.23, 0.386),
+    houseWindow(0.23, 0.386),
     descriptor('box', 'factoryTrim', [-0.22, 0.81, -0.18], [0.07, 0.30, 0.08]),
   ),
   house(
     descriptor('box', 'houseWall', [0, 0.25, 0], [0.923, 0.5, 0.619], [0, 0, 0], 'wall'),
     descriptor('box', 'houseRoof', [0, 0.542, 0], [1, 0.083, 0.714], [0, 0, 0], 'roof'),
-    descriptor('box', 'charred', [-0.23, 0.139, 0.324], [0.115, 0.278, 0.03]),
-    descriptor('box', 'charred', [0.23, 0.139, 0.324], [0.115, 0.278, 0.03]),
-    descriptor('box', 'window', [-0.12, 0.34, 0.324], [0.12, 0.15, 0.025]),
-    descriptor('box', 'window', [0.12, 0.34, 0.324], [0.12, 0.15, 0.025]),
+    houseEntrance(-0.23, 0.324, 0.03),
+    houseEntrance(0.23, 0.324, 0.03),
+    houseWindow(-0.12, 0.324),
+    houseWindow(0.12, 0.324),
   ),
   house(
     descriptor('box', 'houseWall', [0, 0.528, 0], [0.5, 1.056, 0.619], [0, 0, 0], 'wall'),
     descriptor('box', 'houseRoof', [0, 1.097, 0], [0.538, 0.083, 0.667], [0, 0, 0], 'roof'),
-    ...[0.194, 0.5, 0.806].flatMap(y => [
-      descriptor('box', 'window', [-0.12, y, 0.324], [0.115, 0.194, 0.025]),
-      descriptor('box', 'window', [0.12, y, 0.324], [0.115, 0.194, 0.025]),
+    houseEntrance(0, 0.324),
+    ...[0, 1].flatMap(floorIndex => [
+      houseWindow(-0.15, 0.324, floorIndex),
+      houseWindow(0.15, 0.324, floorIndex),
     ]),
   ),
   house(
     descriptor('box', 'houseWall', [0, 0.222, 0], [0.577, 0.444, 0.571], [0, 0, 0], 'wall'),
     descriptor('box', 'houseRoof', [0, 0.5, 0], [0.654, 0.111, 0.667], [0, 0, 0], 'roof'),
-    descriptor('box', 'houseRoof', [0, 0.333, 0.371], [0.346, 0.056, 0.19], [-0.15, 0, 0], 'roof'),
-    descriptor('box', 'charred', [-0.135, 0.15, 0.438], [0.031, 0.306, 0.038]),
-    descriptor('box', 'charred', [0.135, 0.15, 0.438], [0.031, 0.306, 0.038]),
-    descriptor('box', 'window', [-0.2, 0.28, 0.291], [0.11, 0.16, 0.025]),
-    descriptor('box', 'window', [0.2, 0.28, 0.291], [0.11, 0.16, 0.025]),
+    descriptor('box', 'houseRoof', [0, 0.456, 0.371], [0.346, 0.031, 0.19],
+      [-0.15, 0, 0], 'roof', houseDetail('porch-canopy')),
+    descriptor('box', 'charred', [-0.135, 0.22, 0.438], [0.031, 0.44, 0.038],
+      [0, 0, 0], null, houseDetail('porch-pillar')),
+    descriptor('box', 'charred', [0.135, 0.22, 0.438], [0.031, 0.44, 0.038],
+      [0, 0, 0], null, houseDetail('porch-pillar')),
+    houseEntrance(0, 0.438, 0.038),
+    houseWindow(-0.2, 0.291),
+    houseWindow(0.2, 0.291),
   ),
   house(
     descriptor('box', 'houseWall', [0, 0.236, 0], [0.462, 0.472, 0.571], [0, 0, 0], 'wall'),
     descriptor('pyramid', 'houseRoof', [0, 0.625, 0], [0.538, 0.306, 0.667], [0, 0, 0], 'roof'),
-    descriptor('box', 'charred', [0, 0.16, 0.291], [0.12, 0.31, 0.025]),
+    houseEntrance(0, 0.291),
+    houseWindow(-0.17, 0.291),
+    houseWindow(0.17, 0.291),
     descriptor('box', 'charred', [0.327, 0.125, 0], [0.212, 0.25, 0.286]),
     descriptor('box', 'houseRoof', [0.327, 0.272, 0], [0.25, 0.044, 0.333], [0, 0, 0.2], 'roof'),
   ),
@@ -81,9 +117,47 @@ export function resolveW8BuildingParts(building) {
   const source = building?.buildingType === 'house'
     ? W8_FINITE_HOUSE_VARIANTS[stableVariantIndex(building.stableId, W8_FINITE_HOUSE_VARIANTS.length)]
     : W8_PARITY_FEATURE_PARTS[building?.buildingType] ?? [];
+  const widthMeters = building?.widthMeters;
+  const heightMeters = building?.heightMeters;
+  const facadeSource = building?.buildingType === 'house'
+    && Number.isFinite(widthMeters) && widthMeters > 0
+    && Number.isFinite(heightMeters) && heightMeters > 0
+    ? source.map(part => {
+      const detail = part.houseDetail;
+      if (!detail) return part;
+      const { entrance, window, porch } = W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE;
+      if (detail.role === 'entrance') return Object.freeze({
+        ...part,
+        position: Object.freeze([part.position[0], entrance.heightMeters / heightMeters / 2, part.position[2]]),
+        scale: Object.freeze([entrance.widthMeters / widthMeters,
+          entrance.heightMeters / heightMeters, part.scale[2]]),
+      });
+      if (detail.role === 'window') {
+        const centerHeightMeters = window.sillHeightMeters + window.heightMeters / 2
+          + detail.floorIndex * window.floorHeightMeters;
+        return Object.freeze({
+          ...part,
+          position: Object.freeze([part.position[0], centerHeightMeters / heightMeters, part.position[2]]),
+          scale: Object.freeze([window.widthMeters / widthMeters,
+            window.heightMeters / heightMeters, part.scale[2]]),
+        });
+      }
+      if (detail.role === 'porch-pillar') return Object.freeze({
+        ...part,
+        position: Object.freeze([part.position[0], porch.pillarHeightMeters / heightMeters / 2, part.position[2]]),
+        scale: Object.freeze([part.scale[0], porch.pillarHeightMeters / heightMeters, part.scale[2]]),
+      });
+      if (detail.role === 'porch-canopy') return Object.freeze({
+        ...part,
+        position: Object.freeze([part.position[0], porch.canopyCenterHeightMeters / heightMeters, part.position[2]]),
+        scale: Object.freeze([part.scale[0], porch.canopyThicknessMeters / heightMeters, part.scale[2]]),
+      });
+      return part;
+    })
+    : source;
   const visual = building?.visual;
-  if (!visual) return source;
-  return source.map(part => {
+  if (!visual) return facadeSource;
+  return facadeSource.map(part => {
     const color = part.materialRole === 'wall' ? visual.wallColor
       : part.materialRole === 'roof' ? visual.roofColor : null;
     const roofScale = part.materialRole === 'roof' ? visual.roofScale ?? 1 : 1;
