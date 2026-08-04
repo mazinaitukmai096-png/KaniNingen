@@ -126,7 +126,7 @@ function normalizedShapeSignature(graph) {
   });
 }
 
-test('v3 registers only a Road Graph stage and its settlement adapter stays road-only', async () => {
+test('v3 registers only a Road Graph stage and its adapter uses the existing Building pipeline', async () => {
   assert.equal(
     ROAD_GRAPH_V3_EXPERIMENTAL_STAGE_GENERATOR_REGISTRY.get('roadGraph', ROAD_GRAPH_V3_GENERATOR_ID)?.generate,
     createRoadGraphV3,
@@ -145,9 +145,24 @@ test('v3 registers only a Road Graph stage and its settlement adapter stays road
     assert.equal(template.roadSummary.blockCount, 0);
     assert.ok(template.roads.length > 0);
     assert.deepEqual(template.blocks, []);
-    assert.deepEqual(template.buildings, []);
-    assert.equal(template.requestedBuildingCount, 0);
-    assert.equal(template.buildingShortageCount, 0);
+    assert.ok(template.requestedBuildingCount > 0);
+    assert.ok(template.buildings.length > 0);
+    assert.equal(
+      template.buildingShortageCount,
+      template.requestedBuildingCount - template.buildings.length,
+    );
+    const roadsById = new Map(template.roads.map(road => [road.stableId, road]));
+    assert.equal(new Set(template.buildings.map(building => building.stableId)).size,
+      template.buildings.length);
+    for (const building of template.buildings) {
+      const frontageRoad = roadsById.get(building.frontageRoadId);
+      assert.ok(frontageRoad, `orphan Building frontage: ${building.stableId}`);
+      assert.equal(building.frontageRouteId, frontageRoad.routeId);
+      assert.equal(building.settlementId, template.settlementId);
+      assert.equal(building.lot.lotStatus, 'ACTIVE');
+      assert.ok(building.lot.path);
+      assert.ok(building.lot.forecourt);
+    }
     assert.equal(template.gatewayHandoffs.length, input.gateways.length);
   }
 });
@@ -322,7 +337,8 @@ test('explicit v3 flag works while v1, v2, legacy, and production default remain
   assert.equal(v3Generator.settlementRoadGraphGeneratorId, ROAD_GRAPH_V3_GENERATOR_ID);
   assert.equal(template.roadSummary.generatorId, ROAD_GRAPH_V3_GENERATOR_ID);
   assert.deepEqual(template.blocks, []);
-  assert.deepEqual(template.buildings, []);
+  assert.ok(template.requestedBuildingCount > 0);
+  assert.ok(template.buildings.length > 0);
   await v3Generator.shutdown();
 
   const w8 = await createW8ParityChunkGenerator({
@@ -330,6 +346,9 @@ test('explicit v3 flag works while v1, v2, legacy, and production default remain
     settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
   });
   assert.equal(w8.settlementRoadGraphGeneratorId, ROAD_GRAPH_V3_GENERATOR_ID);
+  const presentation = await w8.resolveSettlementPresentationTemplate({ candidate });
+  assert.ok(presentation.sourceBuildingCount > 0);
+  assert.ok(presentation.buildings.length > 0);
   await w8.shutdown();
 });
 

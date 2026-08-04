@@ -3,6 +3,7 @@ import {
   FINITE_WORLD_UNITS_PER_METER,
   MIGRATED_SETTLEMENT_PROFILES,
   W4_SINGLE_RURAL,
+  buildDeterministicBuildings,
 } from './single-rural-settlement.js';
 import { createSettlementRoadGatewayHandoff } from './settlement-road-gateway-handoff.js';
 import { resolveRoadGraphV1ConnectivityGateways } from './road-graph-v1-settlement-adapter.js';
@@ -25,6 +26,76 @@ const LEGACY_KIND_BY_CLASS = Object.freeze({
   [ROAD_GRAPH_CLASSES.LOCAL]: ROAD_KINDS.LOCAL,
   [ROAD_GRAPH_CLASSES.ALLEY]: ROAD_KINDS.ALLEY,
 });
+
+function adaptRoadGraphToLegacyHierarchy({ graph, candidate, town }) {
+  const roads = graph.segments.map(segment => {
+    const start = {
+      x: (segment.start.x - candidate.center.x) * FINITE_WORLD_UNITS_PER_METER,
+      z: (segment.start.z - candidate.center.z) * FINITE_WORLD_UNITS_PER_METER,
+    };
+    const end = {
+      x: (segment.end.x - candidate.center.x) * FINITE_WORLD_UNITS_PER_METER,
+      z: (segment.end.z - candidate.center.z) * FINITE_WORLD_UNITS_PER_METER,
+    };
+    return Object.freeze({
+      roadId: segment.stableId,
+      routeId: segment.flags.routeId,
+      routeOrder: segment.flags.routeOrder,
+      kind: LEGACY_KIND_BY_CLASS[segment.class],
+      roadClass: segment.class,
+      width: segment.widthMeters * FINITE_WORLD_UNITS_PER_METER,
+      start: Object.freeze(start),
+      end: Object.freeze(end),
+      tangentX: segment.tangent.x,
+      tangentZ: segment.tangent.z,
+      normalX: segment.normal.x,
+      normalZ: segment.normal.z,
+      town,
+      townId: town.id,
+      isTownSpine: segment.class === ROAD_GRAPH_CLASSES.COLLECTOR,
+      sourceOwner: segment.sourceOwner,
+      purpose: segment.purpose,
+      flags: segment.flags,
+    });
+  });
+  const pathSamples = [];
+  let sequence = 0;
+  for (const road of roads) {
+    const length = Math.hypot(road.end.x - road.start.x, road.end.z - road.start.z);
+    const sampleCount = Math.max(1, Math.ceil(length / 52));
+    for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex += 1) {
+      const t = (sampleIndex + 0.5) / sampleCount;
+      pathSamples.push(Object.freeze({
+        x: road.start.x + (road.end.x - road.start.x) * t,
+        z: road.start.z + (road.end.z - road.start.z) * t,
+        tc: town,
+        roadId: road.roadId,
+        routeId: road.routeId,
+        kind: road.kind,
+        width: road.width,
+        tangentX: road.tangentX,
+        tangentZ: road.tangentZ,
+        normalX: road.normalX,
+        normalZ: road.normalZ,
+        length: length / sampleCount,
+        routeOrder: road.routeOrder,
+        sampleIndex,
+        sequence: sequence++,
+        isWater: false,
+        isBlocked: false,
+      }));
+    }
+  }
+  return Object.freeze({ roads: Object.freeze(roads), pathSamples: Object.freeze(pathSamples) });
+}
+
+function translateRectangle(rectangle, center) {
+  return Object.freeze({
+    ...rectangle,
+    centerX: q6(rectangle.centerX + center.x),
+    centerZ: q6(rectangle.centerZ + center.z),
+  });
+}
 
 function createGatewayHandoffs(graph, candidate) {
   const nodesById = new Map(graph.nodes.map(node => [node.nodeId, node]));
@@ -56,6 +127,7 @@ export async function createRoadGraphV3SettlementTemplate({
   worldSeedHash,
   candidate,
   connectivityGraph,
+  roadTimingRun = null,
 } = {}) {
   const profile = MIGRATED_SETTLEMENT_PROFILES[candidate?.townType];
   if (!profile || profile.settlementType !== candidate?.settlementType) {
@@ -76,6 +148,38 @@ export async function createRoadGraphV3SettlementTemplate({
     },
     gateways,
   });
+  const town = Object.freeze({
+    id: candidate.settlementId,
+    x: 0,
+    z: 0,
+    radius: profile.radius,
+    coreRadius: profile.coreRadius,
+    type: candidate.townType,
+    settlementType: candidate.settlementType,
+  });
+  const hierarchy = adaptRoadGraphToLegacyHierarchy({ graph, candidate, town });
+  const buildingResult = await buildDeterministicBuildings({
+    town,
+    hierarchy,
+    settlementId: candidate.settlementId,
+    roadTimingRun,
+  });
+  const buildings = buildingResult.buildings.map(building => Object.freeze({
+    ...building,
+    x: q6(building.x + candidate.center.x),
+    z: q6(building.z + candidate.center.z),
+    lot: Object.freeze({
+      ...building.lot,
+      centerX: q6(building.lot.centerX + candidate.center.x),
+      centerZ: q6(building.lot.centerZ + candidate.center.z),
+      entranceX: q6(building.lot.entranceX + candidate.center.x),
+      entranceZ: q6(building.lot.entranceZ + candidate.center.z),
+      roadAccessX: q6(building.lot.roadAccessX + candidate.center.x),
+      roadAccessZ: q6(building.lot.roadAccessZ + candidate.center.z),
+      path: translateRectangle(building.lot.path, candidate.center),
+      forecourt: translateRectangle(building.lot.forecourt, candidate.center),
+    }),
+  }));
   const roads = graph.segments.map(segment => Object.freeze({
     stableId: segment.stableId,
     featureType: 'settlement-road',
@@ -121,10 +225,10 @@ export async function createRoadGraphV3SettlementTemplate({
       finiteWorldUnitsPerMeter: FINITE_WORLD_UNITS_PER_METER,
       productionHumanHeightMeters: W4_SINGLE_RURAL.productionHumanHeightMeters,
     }),
-    requestedBuildingCount: 0,
-    buildingShortageCount: 0,
+    requestedBuildingCount: buildingResult.requestedBuildingCount,
+    buildingShortageCount: buildingResult.requestedBuildingCount - buildings.length,
     roads: Object.freeze(roads),
-    buildings: Object.freeze([]),
+    buildings: Object.freeze(buildings),
     blocks: Object.freeze([]),
     gatewayHandoffs,
     roadSummary: Object.freeze({
