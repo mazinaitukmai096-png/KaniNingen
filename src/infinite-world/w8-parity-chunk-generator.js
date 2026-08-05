@@ -22,9 +22,11 @@ import { ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA } from './road-graph-v2-settle
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
 import {
   ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA,
+  ROAD_GRAPH_V3_LOT_V2_SETTLEMENT_TEMPLATE_SCHEMA,
   ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA,
 } from './road-graph-v3-settlement-adapter.js';
 import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from './settlement-lot-v2.js';
 import { W5_SETTLEMENT_DISTRIBUTION } from './settlement-distributor.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
@@ -1088,11 +1090,14 @@ export async function createW8ParityChunkGenerator({
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
   const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
   const useExperimentalRoadGraph = useRoadGraphV1 || useRoadGraphV2 || useRoadGraphV3;
-  if (settlementLotMode !== null && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID) {
+  if (settlementLotMode !== null
+    && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID
+    && settlementLotMode !== SETTLEMENT_LOT_V2_GENERATOR_ID) {
     throw new RangeError(`unsupported experimental Settlement Lot mode: ${settlementLotMode}`);
   }
-  if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID && !useRoadGraphV3) {
-    throw new RangeError('lot-v1 requires settlementRoadGraphGeneratorId=road-graph-v3');
+  if ((settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
+    || settlementLotMode === SETTLEMENT_LOT_V2_GENERATOR_ID) && !useRoadGraphV3) {
+    throw new RangeError(`${settlementLotMode} requires settlementRoadGraphGeneratorId=road-graph-v3`);
   }
   const cacheCapacities = resolveW8CacheCapacities(cacheCapacityOverrides);
   const base = await baseGeneratorFactory({
@@ -1337,7 +1342,9 @@ export async function createW8ParityChunkGenerator({
   const majorRoadSourceContractVersion = useRoadGraphV3
     ? (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
       ? ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA
-      : ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA)
+      : settlementLotMode === SETTLEMENT_LOT_V2_GENERATOR_ID
+        ? ROAD_GRAPH_V3_LOT_V2_SETTLEMENT_TEMPLATE_SCHEMA
+        : ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA)
     : useRoadGraphV2
       ? ROAD_GRAPH_V2_SETTLEMENT_TEMPLATE_SCHEMA
     : useRoadGraphV1

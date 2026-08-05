@@ -25,6 +25,7 @@ import {
   pointInSettlementPolygon,
   validateSettlementLotsV1,
 } from '../src/infinite-world/settlement-lot-v1.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from '../src/infinite-world/settlement-lot-v2.js';
 import { parseSettlementLotMode } from '../src/infinite-world/sandbox-boot.js';
 import { MIGRATED_SETTLEMENT_PROFILES } from '../src/infinite-world/single-rural-settlement.js';
 import {
@@ -104,7 +105,8 @@ function buildingRectangle(building) {
 test('lot-v1 is accepted only with road-graph-v3 and is carried by Worker initialization', async () => {
   assert.equal(parseSettlementLotMode(null), null);
   assert.equal(parseSettlementLotMode('lot-v1'), SETTLEMENT_LOT_V1_GENERATOR_ID);
-  assert.throws(() => parseSettlementLotMode('lot-v2'), /unsupported experimental Settlement Lot/);
+  assert.equal(parseSettlementLotMode('lot-v2'), SETTLEMENT_LOT_V2_GENERATOR_ID);
+  assert.throws(() => parseSettlementLotMode('lot-v3'), /unsupported experimental Settlement Lot/);
   assert.deepEqual(createChunkGeneratorInitializeRequest({
     serviceGeneration: 1,
     worldSeed: 'lot protocol',

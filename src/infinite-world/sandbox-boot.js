@@ -25,6 +25,7 @@ import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
 import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from './settlement-lot-v2.js';
 import { PersistentChunkIndex } from './persistent-chunk-index.js';
 import { InfiniteGameplayRuntime } from './gameplay-runtime.js';
 import {
@@ -279,6 +280,7 @@ export function parseSettlementRoadGraphGeneratorId(value) {
 export function parseSettlementLotMode(value) {
   if (value === null || value === '') return null;
   if (value === SETTLEMENT_LOT_V1_GENERATOR_ID) return SETTLEMENT_LOT_V1_GENERATOR_ID;
+  if (value === SETTLEMENT_LOT_V2_GENERATOR_ID) return SETTLEMENT_LOT_V2_GENERATOR_ID;
   throw new RangeError(`unsupported experimental Settlement Lot mode: ${value}`);
 }
 

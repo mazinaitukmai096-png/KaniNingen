@@ -17,6 +17,7 @@ import { createRoadGraphV2SettlementTemplate } from './road-graph-v2-settlement-
 import { ROAD_GRAPH_V3_GENERATOR_ID } from './road-graph-v3.js';
 import { createRoadGraphV3SettlementTemplate } from './road-graph-v3-settlement-adapter.js';
 import { SETTLEMENT_LOT_V1_GENERATOR_ID } from './settlement-lot-v1.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from './settlement-lot-v2.js';
 import {
   CHUNK_GENERATION_STAGE,
   measureChunkGenerationStage,
@@ -232,11 +233,14 @@ export async function createDistributedSettlementChunkGenerator({
   const useRoadGraphV1 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V1_GENERATOR_ID;
   const useRoadGraphV2 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V2_GENERATOR_ID;
   const useRoadGraphV3 = settlementRoadGraphGeneratorId === ROAD_GRAPH_V3_GENERATOR_ID;
-  if (settlementLotMode !== null && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID) {
+  if (settlementLotMode !== null
+    && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID
+    && settlementLotMode !== SETTLEMENT_LOT_V2_GENERATOR_ID) {
     throw new RangeError(`unsupported experimental Settlement Lot mode: ${settlementLotMode}`);
   }
-  if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID && !useRoadGraphV3) {
-    throw new RangeError('lot-v1 requires settlementRoadGraphGeneratorId=road-graph-v3');
+  if ((settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
+    || settlementLotMode === SETTLEMENT_LOT_V2_GENERATOR_ID) && !useRoadGraphV3) {
+    throw new RangeError(`${settlementLotMode} requires settlementRoadGraphGeneratorId=road-graph-v3`);
   }
   const formalGenerator = await createFormalNaturalChunkGenerator({ worldSeed });
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
