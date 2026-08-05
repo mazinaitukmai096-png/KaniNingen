@@ -79,6 +79,10 @@ import {
   NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
   resolveNaturalOwnerBuildQueueTarget,
 } from '../streaming-capacity-budget.js';
+import {
+  buildSettlementRoadRibbonMeshData,
+  createRoadRibbonHeightSampler,
+} from './settlement-road-ribbon-geometry.js';
 
 export {
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
@@ -1156,6 +1160,14 @@ export async function createW8DistantPresentation({
   };
   const estimateMeshUploadBytes = mesh => {
     if (!mesh) return 0;
+    if (!mesh.instanceMatrix) {
+      const attributeBytesTotal = Object.values(mesh.geometry?.attributes ?? {})
+        .reduce((total, attribute) => total + attributeBytes(attribute), 0);
+      const indexBytes = attributeBytes(mesh.geometry?.index);
+      const directIndexBytes = ArrayBuffer.isView(mesh.geometry?.index)
+        ? mesh.geometry.index.byteLength : 0;
+      return attributeBytesTotal + Math.max(indexBytes, directIndexBytes);
+    }
     let bytes = attributeBytes(mesh.instanceMatrix) + attributeBytes(mesh.instanceColor);
     if (bytes === 0 && Number.isFinite(mesh.count)) bytes += mesh.count * 16 * 4;
     for (const attribute of Object.values(mesh.geometry?.attributes ?? {})) {
@@ -2043,10 +2055,26 @@ export async function createW8DistantPresentation({
       existing.naturalHorizonOnly &&= naturalHorizonOnly;
       return { object: existing, isNew: false };
     }
+    const roadEndpointHeight = point => {
+      if (Number.isFinite(point?.y)) return point.y;
+      try {
+        return resolveCanonicalGroundSurface({
+          chunkData: chunk, worldX: point.x, worldZ: point.z,
+        }).heightMeters;
+      } catch {
+        return record.worldPosition.y;
+      }
+    };
     const object = {
       stableId: record.stableId,
       settlementId: identity.settlementId,
       record,
+      ...(record.featureType === 'settlement-road' ? {
+        renderRoadElevation: Object.freeze({
+          startY: roadEndpointHeight(record.start),
+          endY: roadEndpointHeight(record.end),
+        }),
+      } : {}),
       identity,
       identityKey,
       ownerKey: `${record.owningChunkCoordinate.x},${record.owningChunkCoordinate.z}`,
@@ -3195,6 +3223,111 @@ export async function createW8DistantPresentation({
     return material;
   };
 
+  const isSettlementRoadBucket = bucket => bucket.geometry === '__road__'
+    && bucket.material === 'road' && bucket.name === 'road';
+
+  const createSettlementRoadBucketGeometry = (items, generation) => {
+    const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
+    const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
+    const itemsByOwner = new Map();
+    for (const item of items) {
+      const owner = item.object.record.owningChunkCoordinate;
+      const key = `${owner.x},${owner.z}`;
+      const ownerItems = itemsByOwner.get(key) ?? [];
+      ownerItems.push(item);
+      itemsByOwner.set(key, ownerItems);
+    }
+    const parts = [...itemsByOwner.entries()].sort(([left], [right]) => left.localeCompare(right))
+      .map(([ownerKey, ownerItems]) => {
+        const [chunkX, chunkZ] = ownerKey.split(',').map(Number);
+        const roads = ownerItems.map(item => item.object.record);
+        const elevationByStableId = new Map(ownerItems.map(item => [
+          item.object.stableId,
+          item.object.renderRoadElevation,
+        ]));
+        const heightAt = createRoadRibbonHeightSampler(roads, (road, _point, endpoint) => {
+          const elevation = elevationByStableId.get(road.stableId);
+          return endpoint === 'start' ? elevation?.startY : elevation?.endY;
+        });
+        return {
+          ownerKey,
+          meshData: buildSettlementRoadRibbonMeshData({
+            roads,
+            heightAt,
+            originX: generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS,
+            originZ: generation.buildOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS,
+            unitsPerMeter: UNITS_PER_METER,
+            surfaceOffsetMeters: 0.075,
+            clipBounds: {
+              minX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
+              minZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+              maxX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
+              maxZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
+            },
+          }),
+        };
+      });
+    const positions = [];
+    const normals = [];
+    const indices = [];
+    let vertexOffset = 0;
+    for (const { meshData } of parts) {
+      positions.push(...meshData.positions);
+      normals.push(...meshData.normals);
+      indices.push(...[...meshData.indices].map(index => index + vertexOffset));
+      vertexOffset += meshData.stats.vertexCount;
+    }
+    const meshData = {
+      positions: new Float32Array(positions),
+      normals: new Float32Array(normals),
+      indices: new Uint32Array(indices),
+      hash: parts.map(part => `${part.ownerKey}:${part.meshData.hash}`).join('|'),
+      stats: Object.freeze({
+        roadRecordCount: items.length,
+        routeCount: new Set(items.map(item => item.object.record.routeId
+          ?? item.object.record.sourceStableId ?? item.object.stableId)).size,
+        polylineCount: parts.reduce((total, part) => total + part.meshData.stats.polylineCount, 0),
+        nodeCount: parts.reduce((total, part) => total + part.meshData.stats.nodeCount, 0),
+        junctionCount: parts.reduce((total, part) => total + part.meshData.stats.junctionCount, 0),
+        miterJoinCount: parts.reduce((total, part) => total + part.meshData.stats.miterJoinCount, 0),
+        bevelJoinCount: parts.reduce((total, part) => total + part.meshData.stats.bevelJoinCount, 0),
+        vertexCount: positions.length / 3,
+        indexCount: indices.length,
+        triangleCount: indices.length / 3,
+        duplicateFaceCount: parts.reduce(
+          (total, part) => total + part.meshData.stats.duplicateFaceCount, 0,
+        ),
+        degenerateTriangleCount: parts.reduce(
+          (total, part) => total + part.meshData.stats.degenerateTriangleCount, 0,
+        ),
+        uploadBytes: positions.length * 4 + normals.length * 4 + indices.length * 4,
+      }),
+    };
+    const geometry = new BufferGeometry();
+    geometry.setAttribute('position', new Float32BufferAttribute(meshData.positions, 3));
+    geometry.setAttribute('normal', new Float32BufferAttribute(meshData.normals, 3));
+    if (typeof geometry.setIndex === 'function') geometry.setIndex([...meshData.indices]);
+    else geometry.index = meshData.indices;
+    geometry.userData = { roadRibbon: meshData.stats, roadRibbonHash: meshData.hash };
+    generation.ownedGeometries.add(geometry);
+    return geometry;
+  };
+
+  const replaceSettlementRoadBucketGeometry = (bucket, generation, items) => {
+    const signature = items.map(item => item.object.stableId).sort().join('\n');
+    if (bucket.roadRibbonSignature === signature && bucket.mesh?.geometry) return false;
+    const previous = bucket.roadRibbonGeometry ?? null;
+    const geometry = createSettlementRoadBucketGeometry(items, generation);
+    bucket.roadRibbonGeometry = geometry;
+    bucket.roadRibbonSignature = signature;
+    if (bucket.mesh) bucket.mesh.geometry = geometry;
+    if (previous && previous !== geometry) {
+      generation.ownedGeometries.delete(previous);
+      previous.dispose?.();
+    }
+    return true;
+  };
+
   const prepareCanonicalBucketMesh = (bucket, context) => {
     if (!bucket.items.length) return null;
     const persistentEntryKey = `bucket:${bucket.key
@@ -3213,8 +3346,9 @@ export async function createW8DistantPresentation({
       return { mesh: null, roadBucketStartedAt: null, persistentReuse: true };
     }
     const roadBucketStartedAt = bucket.geometry === '__road__' ? monotonicNow() : null;
-    let geometry = bucket.geometry === '__road__'
-      ? roadGeometry : visualAssets.geometries[bucket.geometry];
+    let geometry = isSettlementRoadBucket(bucket)
+      ? createSettlementRoadBucketGeometry(bucket.items, context.generation)
+      : bucket.geometry === '__road__' ? roadGeometry : visualAssets.geometries[bucket.geometry];
     const sourceMaterial = visualAssets.materials[bucket.material];
     const localHorizon = bucket.name === 'horizon-building'
       || bucket.name === 'horizon-landmark';
@@ -3269,7 +3403,9 @@ export async function createW8DistantPresentation({
       }
       geometry = createLocalHandoffGeometry(geometry, bucket, context);
     }
-    const mesh = new InstancedMesh(geometry, material, bucket.capacity ?? bucket.items.length);
+    const mesh = isSettlementRoadBucket(bucket)
+      ? new Mesh(geometry, material)
+      : new InstancedMesh(geometry, material, bucket.capacity ?? bucket.items.length);
     mesh.name = `w8-canonical-lod-${bucket.name}-${bucket.geometry}-${bucket.material}`;
     mesh.count = 0;
     mesh.visible = true;
@@ -3283,7 +3419,16 @@ export async function createW8DistantPresentation({
       canonicalObjects: [],
       canonicalOpacities: [],
       remoteSettlementIds: [],
+      ...(isSettlementRoadBucket(bucket) ? {
+        roadRibbon: geometry.userData?.roadRibbon ?? null,
+        roadRibbonHash: geometry.userData?.roadRibbonHash ?? null,
+      } : {}),
     };
+    if (isSettlementRoadBucket(bucket)) {
+      bucket.roadRibbonGeometry = geometry;
+      bucket.roadRibbonSignature = bucket.items.map(item => item.object.stableId).sort().join('\n');
+      mesh.count = bucket.items.length;
+    }
     return { mesh, roadBucketStartedAt };
   };
 
@@ -3550,6 +3695,27 @@ export async function createW8DistantPresentation({
     const nearStableIds = generation.nearVisibleStableIds ?? new Set();
     const mesh = bucket.mesh;
     if (!mesh) return Object.freeze({ composed: 0, matrices: 0, attributes: 0 });
+    if (isSettlementRoadBucket(bucket)) {
+      const startedAt = monotonicNow();
+      const activeItems = bucket.items.filter(item => {
+        const opacity = canonicalInstanceOpacity(item.object, item);
+        return ['mid', 'far'].includes(item.object.visibleLod)
+          && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
+          && opacity > 0;
+      });
+      replaceSettlementRoadBucketGeometry(bucket, generation, activeItems);
+      mesh.count = activeItems.length;
+      mesh.userData.visibleInstanceCount = activeItems.length;
+      mesh.userData.canonicalStableIds = activeItems.map(item => item.object.stableId);
+      mesh.userData.canonicalObjects = activeItems.map(item => item.object.record);
+      mesh.userData.canonicalOpacities = activeItems.map(item => (
+        canonicalInstanceOpacity(item.object, item)
+      ));
+      mesh.userData.roadRibbon = mesh.geometry.userData?.roadRibbon ?? null;
+      mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
+      generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - startedAt;
+      return Object.freeze({ composed: 1, matrices: 0, attributes: 2 });
+    }
     if (generation.persistentDistant === true && bucket.persistent === true) {
       const hidden = hiddenCanonicalMatrix();
       const stableIds = [];
@@ -3829,6 +3995,30 @@ export async function createW8DistantPresentation({
     for (const bucket of dirtyBuckets.values()) {
       const mesh = bucket.mesh;
       if (!mesh) continue;
+      if (isSettlementRoadBucket(bucket)) {
+        const startedAt = monotonicNow();
+        const activeItems = bucket.items.filter(item => {
+          const opacity = canonicalInstanceOpacity(item.object, item);
+          return ['mid', 'far'].includes(item.object.visibleLod)
+            && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
+            && opacity > 0;
+        });
+        replaceSettlementRoadBucketGeometry(bucket, generation, activeItems);
+        mesh.count = activeItems.length;
+        mesh.userData.visibleInstanceCount = activeItems.length;
+        mesh.userData.canonicalStableIds = activeItems.map(item => item.object.stableId);
+        mesh.userData.canonicalObjects = activeItems.map(item => item.object.record);
+        mesh.userData.canonicalOpacities = activeItems.map(item => (
+          canonicalInstanceOpacity(item.object, item)
+        ));
+        mesh.userData.roadRibbon = mesh.geometry.userData?.roadRibbon ?? null;
+        mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
+        generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - startedAt;
+        composed += 1;
+        const pendingYield = scheduler.checkpoint();
+        if (pendingYield) await pendingYield;
+        continue;
+      }
       if (generation.persistentDistant === true && bucket.persistent === true) {
         const hidden = hiddenCanonicalMatrix();
         const stableIds = [];

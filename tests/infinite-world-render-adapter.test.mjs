@@ -380,7 +380,7 @@ test('Camera collision ignores LOS obstruction and only pushes a camera penetrat
   await adapter.shutdown();
 });
 
-test('Settlement projection preserves finite layer order and renders junction, entrance, and forecourt surfaces', async () => {
+test('Settlement projection preserves finite layer order and renders ribbon, entrance, and forecourt surfaces', async () => {
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
   const roads = [
     {
@@ -426,10 +426,14 @@ test('Settlement projection preserves finite layer order and renders junction, e
   const buildingIndex = indexOf(/production-infinite-settlement-building/);
   const vegetationIndex = indexOf(/production-vegetation/);
   assert.ok(roadIndex > 0);
-  assert.ok(junctionIndex > roadIndex);
-  assert.ok(lotIndex > junctionIndex);
+  assert.equal(junctionIndex, -1);
+  assert.ok(lotIndex > roadIndex);
   assert.ok(buildingIndex > lotIndex);
   assert.ok(vegetationIndex > buildingIndex);
+  const roadMesh = projected.group.children[roadIndex];
+  assert.equal(roadMesh.userData.roadRibbon.roadRecordCount, 2);
+  assert.equal(roadMesh.userData.roadRibbon.degenerateTriangleCount, 0);
+  assert.equal(roadMesh.userData.roadRibbon.duplicateFaceCount, 0);
   const lotMesh = projected.group.children[lotIndex];
   assert.deepEqual(lotMesh.userData.surfaceKinds.sort(), ['entrance-path', 'forecourt']);
   assert.equal(lotMesh.count, 2);

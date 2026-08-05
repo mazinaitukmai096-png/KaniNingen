@@ -228,12 +228,15 @@ test('W4 renderer lazily shares Settlement resources and releases all streamed C
   const scene = new Scene();
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
   const runtime = new ChunkRuntimeManager({ generator, renderAdapter: adapter, cacheCapacity: 40 });
+  const loadedRoadChunkCount = () => [...adapter.loaded.values()].filter(projected => (
+    projected.group.children.some(child => child.name === 'w4-rural-roads')
+  )).length;
   await runtime.initialize(0, 0);
   let resources = adapter.resourceSnapshot();
   assert.equal(resources.sharedGeometryCount, 7);
   assert.equal(resources.sharedMaterialCount, 26);
   assert.equal(resources.liveChunkGroups, 9);
-  assert.equal(resources.liveChunkOwnedGeometryCount, 9);
+  assert.equal(resources.liveChunkOwnedGeometryCount, 9 + loadedRoadChunkCount());
   assert.ok([...adapter.loaded.values()].some(projected => (
     projected.group.children.some(child => child.name === 'w4-rural-roads')
   )));
@@ -241,7 +244,7 @@ test('W4 renderer lazily shares Settlement resources and releases all streamed C
     await runtime.transitionToChunk(x, 0);
     resources = adapter.resourceSnapshot();
     assert.equal(resources.liveChunkGroups, 9);
-    assert.equal(resources.liveChunkOwnedGeometryCount, 9);
+    assert.equal(resources.liveChunkOwnedGeometryCount, 9 + loadedRoadChunkCount());
   }
   await runtime.shutdown();
   resources = adapter.resourceSnapshot();

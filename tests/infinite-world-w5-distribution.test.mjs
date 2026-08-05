@@ -305,16 +305,21 @@ test('W5 renderer shows distributed Settlement resources and disposes them witho
   ));
   const roadMesh = roadProjection.group.children.find(child => child.name === 'infinite-settlement-roads');
   const roadChunk = runtime.getChunkData(roadProjection.chunkX, roadProjection.chunkZ);
-  const firstRoad = roadChunk.settlementFeatures.find(feature => feature.featureType === 'settlement-road');
-  assert.equal(
-    roadMesh.matrices[0].position.y,
-    (firstRoad.worldPosition.y + 0.075) * adapter.unitsPerMeter,
-  );
+  const roadCount = roadChunk.settlementFeatures.filter(feature => (
+    feature.featureType === 'settlement-road'
+  )).length;
+  assert.equal(roadMesh.userData.roadRibbon.roadRecordCount, roadCount);
+  assert.equal(roadMesh.userData.roadRibbon.degenerateTriangleCount, 0);
+  assert.equal(roadMesh.userData.roadRibbon.duplicateFaceCount, 0);
+  assert.equal([...roadMesh.geometry.attributes.position.values].every(Number.isFinite), true);
   for (let step = 1; step <= 6; step += 1) {
     await runtime.transitionToChunk(startX + step, startZ);
     resources = adapter.resourceSnapshot();
     assert.equal(resources.liveChunkGroups, 9);
-    assert.equal(resources.liveChunkOwnedGeometryCount, 9);
+    const loadedRoadChunkCount = [...adapter.loaded.values()].filter(projected => (
+      projected.group.children.some(child => child.name === 'infinite-settlement-roads')
+    )).length;
+    assert.equal(resources.liveChunkOwnedGeometryCount, 9 + loadedRoadChunkCount);
   }
   await runtime.shutdown();
   resources = adapter.resourceSnapshot();

@@ -28,6 +28,10 @@ import {
   resolveCanonicalSurfaceColorRgb,
   sampleW8SurfaceHeightMeters,
 } from '../w8-surface-policy.js';
+import {
+  buildSettlementRoadRibbonMeshData,
+  createRoadRibbonHeightSampler,
+} from './settlement-road-ribbon-geometry.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
@@ -445,6 +449,40 @@ export class ChunkRenderAdapter {
     return geometry;
   }
 
+  #createSettlementRoadGeometry(chunkData, roads) {
+    const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
+    const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
+    const chunkMinimumX = chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const chunkMinimumZ = chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const heightAt = createRoadRibbonHeightSampler(
+      roads,
+      (road, point) => Number.isFinite(point.y)
+        ? point.y : sampleW8SurfaceHeightMeters(chunkData, point.x, point.z),
+    );
+    const meshData = buildSettlementRoadRibbonMeshData({
+      roads,
+      heightAt,
+      originX: chunkMinimumX,
+      originZ: chunkMinimumZ,
+      unitsPerMeter: this.unitsPerMeter,
+      surfaceOffsetMeters: FINITE_ROAD_SURFACE_HEIGHT_METERS,
+      clipBounds: {
+        minX: chunkMinimumX,
+        minZ: chunkMinimumZ,
+        maxX: chunkMinimumX + LOGICAL_CHUNK_SIZE_METERS,
+        maxZ: chunkMinimumZ + LOGICAL_CHUNK_SIZE_METERS,
+      },
+    });
+    const geometry = new BufferGeometry();
+    geometry.setAttribute('position', new Float32BufferAttribute(meshData.positions, 3));
+    geometry.setAttribute('normal', new Float32BufferAttribute(meshData.normals, 3));
+    if (typeof geometry.setIndex === 'function') geometry.setIndex([...meshData.indices]);
+    else geometry.index = meshData.indices;
+    geometry.userData = { roadRibbon: meshData.stats, roadRibbonHash: meshData.hash };
+    this.counts.chunkOwnedGeometriesCreated += 1;
+    return geometry;
+  }
+
   async projectTerrainChunk(chunkData, origin = null) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
@@ -643,6 +681,7 @@ export class ChunkRenderAdapter {
       roads: [], lots: [], buildings: [], water: [], formalDetails: [],
       vegetation: [], rocks: [], ambientDetails: [],
     };
+    let roadRibbonGeometry = null;
 
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
     const terrainGeometry = naturalTerrain
@@ -794,84 +833,19 @@ export class ChunkRenderAdapter {
       const resources = this.#ensureSettlementResources();
       const roads = settlementFeatures.filter(feature => feature.featureType === 'settlement-road');
       const buildings = settlementFeatures.filter(feature => feature.featureType === 'settlement-building');
-      const roadMesh = new InstancedMesh(
-        resources.geometries.road,
-        resources.materials.road,
-        Math.max(1, roads.length),
-      );
-      roadMesh.name = chunkData.generatorVersion?.major >= 500
-        ? 'infinite-settlement-roads' : 'w4-rural-roads';
-      roadMesh.receiveShadow = true;
-      roadMesh.count = roads.length;
-      roads.forEach((road, index) => {
-        const dx = road.end.x - road.start.x;
-        const dz = road.end.z - road.start.z;
-        const localX = (road.start.x + road.end.x) / 2
-          - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
-        const localZ = (road.start.z + road.end.z) / 2
-          - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-        transform.position.set(
-          localX * this.unitsPerMeter,
-          (road.worldPosition.y + FINITE_ROAD_SURFACE_HEIGHT_METERS) * this.unitsPerMeter,
-          localZ * this.unitsPerMeter,
-        );
-        transform.rotation.set(-Math.PI / 2, 0, Math.atan2(dz, dx));
-        transform.scale.set(
-          Math.hypot(dx, dz) * this.unitsPerMeter,
-          road.widthMeters * this.unitsPerMeter,
-          1,
-        );
-        transform.updateMatrix();
-        roadMesh.setMatrixAt(index, transform.matrix);
-      });
-      roadMesh.instanceMatrix.needsUpdate = true;
-      if (roads.length) layerMeshes.roads.push(roadMesh);
-
-      const junctions = new Map();
-      for (const road of roads) {
-        // Canonical MAJOR routes are split into short, Chunk-owned projection
-        // segments. Their internal joins are continuity seams, not junctions.
-        if (road.canonicalMajorRoad === true) continue;
-        for (const point of [road.start, road.end]) {
-          const junctionKey = `${Math.round(point.x * 100)},${Math.round(point.z * 100)}`;
-          const entry = junctions.get(junctionKey) ?? {
-            x: point.x, z: point.z, y: 0, sampleCount: 0, roadCount: 0, widthMeters: 0,
-          };
-          entry.y += road.worldPosition.y;
-          entry.sampleCount += 1;
-          entry.roadCount += 1;
-          entry.widthMeters = Math.max(entry.widthMeters, road.widthMeters);
-          junctions.set(junctionKey, entry);
-        }
-      }
-      const visibleJunctions = [...junctions.values()].filter(junction => junction.roadCount >= 2);
-      if (visibleJunctions.length) {
-        const junctionMesh = new InstancedMesh(
-          resources.geometries.road,
-          resources.materials.road,
-          visibleJunctions.length,
-        );
-        junctionMesh.name = 'infinite-settlement-junctions';
-        junctionMesh.receiveShadow = true;
-        junctionMesh.count = visibleJunctions.length;
-        visibleJunctions.forEach((junction, index) => {
-          transform.position.set(
-            (junction.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
-            (junction.y / junction.sampleCount + FINITE_ROAD_SURFACE_HEIGHT_METERS + 0.0005)
-              * this.unitsPerMeter,
-            (junction.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter,
-          );
-          transform.rotation.set(-Math.PI / 2, 0, 0);
-          transform.scale.set(
-            junction.widthMeters * 1.08 * this.unitsPerMeter,
-            junction.widthMeters * 1.08 * this.unitsPerMeter,
-            1,
-          );
-          transform.updateMatrix();
-          junctionMesh.setMatrixAt(index, transform.matrix);
-        });
-        junctionMesh.instanceMatrix.needsUpdate = true;
-        layerMeshes.roads.push(junctionMesh);
+      if (roads.length) {
+        roadRibbonGeometry = this.#createSettlementRoadGeometry(chunkData, roads);
+        const roadMesh = new Mesh(roadRibbonGeometry, resources.materials.road);
+        roadMesh.name = chunkData.generatorVersion?.major >= 500
+          ? 'infinite-settlement-roads' : 'w4-rural-roads';
+        roadMesh.count = roads.length;
+        roadMesh.receiveShadow = true;
+        roadMesh.userData = {
+          roadRibbon: roadRibbonGeometry.userData.roadRibbon,
+          roadRibbonHash: roadRibbonGeometry.userData.roadRibbonHash,
+          sourceRoadStableIds: Object.freeze(roads.map(road => road.stableId).sort()),
+        };
+        layerMeshes.roads.push(roadMesh);
       }
 
       const residentialLotSurfaces = [];
@@ -1156,7 +1130,10 @@ export class ChunkRenderAdapter {
       chunkX: chunkData.chunkX,
       chunkZ: chunkData.chunkZ,
       group,
-      ownedGeometries: naturalTerrain ? [terrainGeometry] : [],
+      ownedGeometries: [
+        ...(naturalTerrain ? [terrainGeometry] : []),
+        ...(roadRibbonGeometry ? [roadRibbonGeometry] : []),
+      ],
       registry: this.projectionStaging,
       lifecycle: 'staged',
     };
