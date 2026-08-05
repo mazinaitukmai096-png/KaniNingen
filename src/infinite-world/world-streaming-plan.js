@@ -293,6 +293,10 @@ export function createWorldStreamingPlan({
       value: resolved?.sourceSnapshot ?? null,
       enumerable: false,
     });
+    Object.defineProperty(policyPlan, 'resourceKindEntries', {
+      value: resolved?.resourceKindEntries ?? null,
+      enumerable: false,
+    });
     return Object.freeze(policyPlan);
   }).sort((left, right) => left.kind.localeCompare(right.kind));
   ownerMetadataCache?.recordSignature('world-streaming-plan:signature');

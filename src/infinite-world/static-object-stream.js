@@ -118,6 +118,7 @@ function collectCorridorOwners({
   exactRadiusMeters,
   horizonRadiusMeters,
   horizonOwnerPredicate,
+  exactOwnerKeys = null,
 }) {
   const result = new Set();
   const radius = Math.max(exactRadiusMeters, horizonRadiusMeters ?? exactRadiusMeters);
@@ -135,7 +136,11 @@ function collectCorridorOwners({
         && segmentIntersectsExpandedChunkAabb(
           chunkX, chunkZ, start, end, horizonRadiusMeters,
         );
-      if (exact || horizon) result.add(createChunkKey(chunkX, chunkZ));
+      if (exact || horizon) {
+        const ownerKey = createChunkKey(chunkX, chunkZ);
+        result.add(ownerKey);
+        if (exact) exactOwnerKeys?.add(ownerKey);
+      }
     }
   }
   return result;
@@ -222,21 +227,28 @@ export function createCircularStaticStreamingPolicy({
     }
     const required = coverageFor(player, renderDistancePreset);
     const profile = distanceProfileResolver(renderDistancePreset);
+    const exactOwnerKeys = new Set();
     const prefetched = collectCorridorOwners({
       start: player,
       end: velocityCorridor.endpoint,
       exactRadiusMeters: profile.exactDistanceMeters,
       horizonRadiusMeters: profile.horizonDistanceMeters,
       horizonOwnerPredicate,
+      exactOwnerKeys,
     });
     for (const ownerKey of required) prefetched.delete(ownerKey);
     const retained = coverageFor(player, renderDistancePreset, retentionMarginMeters);
     for (const ownerKey of required) retained.add(ownerKey);
     for (const ownerKey of prefetched) retained.add(ownerKey);
+    const allOwnerKeys = new Set([...required, ...prefetched, ...retained]);
     const resolved = Object.freeze({
       required: sorted(required, ownerMetadataCache, `${kind}:required-sort`),
       prefetched: sorted(prefetched, ownerMetadataCache, `${kind}:prefetched-sort`),
       retained: sorted(retained, ownerMetadataCache, `${kind}:retained-sort`),
+      resourceKindEntries: Object.freeze([...allOwnerKeys].map(ownerKey => Object.freeze([
+        ownerKey,
+        exactOwnerKeys.has(ownerKey) ? exactResourceKind : horizonResourceKind,
+      ]))),
     });
     coverageCache.set(coverageKey, resolved);
     while (coverageCache.size > 64) coverageCache.delete(coverageCache.keys().next().value);
@@ -333,24 +345,53 @@ function mergePolicyPlanCoverage(
   if (publicationGroups.size !== 1) {
     throw new Error('Static Object Stream policy group must share one publicationGroup');
   }
-  const union = field => sorted(
-    ordered.flatMap(value => value[field]),
-    ownerMetadataCache,
-    `static-object-stream:merge:${field}`,
-  );
+  const compareOwnerKeys = (left, right) => {
+    const a = ownerMetadataCache?.parse(left, {
+      path: 'static-object-stream:merge-ordered',
+    }) ?? parseChunkKey(left);
+    const b = ownerMetadataCache?.parse(right, {
+      path: 'static-object-stream:merge-ordered',
+    }) ?? parseChunkKey(right);
+    return a.chunkZ - b.chunkZ || a.chunkX - b.chunkX;
+  };
+  const mergeOrdered = arrays => {
+    let merged = [];
+    for (const values of arrays) {
+      const next = [];
+      let leftIndex = 0;
+      let rightIndex = 0;
+      while (leftIndex < merged.length || rightIndex < values.length) {
+        const left = merged[leftIndex];
+        const right = values[rightIndex];
+        if (left === undefined) {
+          if (next.at(-1) !== right) next.push(right);
+          rightIndex += 1;
+        } else if (right === undefined) {
+          if (next.at(-1) !== left) next.push(left);
+          leftIndex += 1;
+        } else {
+          const comparison = compareOwnerKeys(left, right);
+          const value = comparison <= 0 ? left : right;
+          if (next.at(-1) !== value) next.push(value);
+          if (comparison <= 0) leftIndex += 1;
+          if (comparison >= 0) rightIndex += 1;
+        }
+      }
+      merged = next;
+    }
+    return Object.freeze(merged);
+  };
+  const union = field => mergeOrdered(ordered.map(value => value[field]));
   const finiteDeadline = field => {
     const values = ordered.map(value => value.deadline[field]).filter(Number.isFinite);
     return values.length ? Math.min(...values) : null;
   };
   const requiredOwnerKeys = union('requiredOwnerKeys');
+  const requiredOwnerSet = new Set(requiredOwnerKeys);
   const prefetchedOwnerKeys = union('prefetchedOwnerKeys')
-    .filter(ownerKey => !requiredOwnerKeys.includes(ownerKey));
+    .filter(ownerKey => !requiredOwnerSet.has(ownerKey));
   const retainedOwnerKeys = union('retainedOwnerKeys');
-  const requestOwnerKeys = sorted(
-    [...requiredOwnerKeys, ...prefetchedOwnerKeys],
-    ownerMetadataCache,
-    'static-object-stream:merge:requestOwnerKeys',
-  );
+  const requestOwnerKeys = mergeOrdered([requiredOwnerKeys, prefetchedOwnerKeys]);
   return Object.freeze({
     kind: policyKind,
     policyKinds,
@@ -365,11 +406,7 @@ function mergePolicyPlanCoverage(
     prefetchedOwnerKeys: Object.freeze(prefetchedOwnerKeys),
     retainedOwnerKeys,
     requestOwnerKeys,
-    allOwnerKeys: sorted(
-      [...requestOwnerKeys, ...retainedOwnerKeys],
-      ownerMetadataCache,
-      'static-object-stream:merge:allOwnerKeys',
-    ),
+    allOwnerKeys: mergeOrdered([requestOwnerKeys, retainedOwnerKeys]),
     deadline: Object.freeze({
       requiredAtMs: finiteDeadline('requiredAtMs'),
       prefetchedAtMs: finiteDeadline('prefetchedAtMs'),
@@ -438,6 +475,19 @@ export function createStaticObjectStream({
   let latestResourceKindByOwner = new Map();
   let latestOwnerDescriptorByKey = new Map();
   let latestPolicyResourceKindEntries = Object.freeze([]);
+  let latestPolicyDescriptorMaps = new Map();
+  let latestRequestedOwnerKeys = new Set();
+  let latestRequiredOwnerKeys = new Set();
+  let latestApplyDiff = Object.freeze({
+    enteringOwnerCount: 0,
+    leavingOwnerCount: 0,
+    unchangedOwnerCount: 0,
+    classifiedOwnerCount: 0,
+    sortTargetOwnerCount: 0,
+    queueCandidateCount: 0,
+    queueInsertionCount: 0,
+  });
+  let applyAttemptSequence = 0;
   let latestPublicationContext = null;
   let publicationContextPendingForPlan = false;
   let disposed = false;
@@ -470,6 +520,12 @@ export function createStaticObjectStream({
     resourceKindClassifications: 0,
     coverageSignatures: 0,
     coverageOwnerEntryAllocations: 0,
+    enteringOwners: 0,
+    leavingOwners: 0,
+    unchangedOwners: 0,
+    sortTargetOwners: 0,
+    queueInsertions: 0,
+    supersededApplies: 0,
   };
 
   const taskKey = (ownerKey, resourceKind) => `${resourceKind}\n${ownerKey}`;
@@ -805,23 +861,32 @@ export function createStaticObjectStream({
     if (plan?.schemaVersion !== 'world-streaming-plan-1') {
       throw new TypeError(`Static Object Stream requires ${policyKind} plan coverage`);
     }
-    if (publicationContext !== null) {
-      updatePublicationContext(publicationContext, { deferStaleCancellation: true });
-    } else if (!publicationContextPendingForPlan
+    const applyAttempt = ++applyAttemptSequence;
+    let stagedPublicationContext = publicationContext;
+    if (stagedPublicationContext === null && (!publicationContextPendingForPlan
       || !latestPublicationContext
       || latestPublicationContext.stateRevision !== plan.stateRevision
-      || latestPublicationContext.originGeneration !== plan.originGeneration) {
-      const nextSequence = (latestPublicationContext?.sequence ?? 0) + 1;
-      updatePublicationContext(Object.freeze({
+      || latestPublicationContext.originGeneration !== plan.originGeneration)) {
+      stagedPublicationContext = Object.freeze({
         schemaVersion: WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA,
-        sequence: nextSequence,
+        sequence: (latestPublicationContext?.sequence ?? 0) + 1,
         generatedAtMs: Number.isFinite(plan.generatedAtMs) ? plan.generatedAtMs : clock(),
         stateRevision: plan.stateRevision ?? 0,
         destructionRevision: latestPublicationContext?.destructionRevision ?? null,
         originGeneration: plan.originGeneration ?? 0,
-      }), { deferStaleCancellation: true });
+      });
+    } else if (stagedPublicationContext === null) {
+      stagedPublicationContext = latestPublicationContext;
     }
-    publicationContextPendingForPlan = false;
+    if (stagedPublicationContext?.schemaVersion !== WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA) {
+      throw new TypeError(
+        `Static Object Stream requires ${WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA}`,
+      );
+    }
+    if (latestPublicationContext
+      && stagedPublicationContext.sequence < latestPublicationContext.sequence) {
+      return false;
+    }
     const selectedPolicyPlans = policyPlans ?? (policyPlan ? [policyPlan] : []);
     const mergedPolicyPlan = mergePolicyPlanCoverage(
       policyKind,
@@ -829,8 +894,6 @@ export function createStaticObjectStream({
       selectedPolicyPlans,
       ownerMetadataCache,
     );
-    counts.coverageMerges += 1;
-    counts.ownerSorts += 6;
     policyPlan = mergedPolicyPlan;
     const classificationRevision = ownerMetadataRevision
       ?? `world-plan:${plan.signatureHash}`;
@@ -854,49 +917,106 @@ export function createStaticObjectStream({
       stagedCoordinates.set(ownerKey, coordinate);
       return coordinate;
     };
-    const descriptorsByPolicy = new Map();
-    const nextPolicyResourceKindEntries = Object.freeze(selectedPolicyPlans.map(member => {
-      const descriptors = Object.freeze(member.allOwnerKeys.map(ownerKey => {
-        const coordinate = coordinateFor(ownerKey);
-        return ownerMetadataCache?.classify({
-          ownerKey,
-          policyKind: member.kind,
-          revision: classificationRevision,
-          path: 'static-object-stream:policy-classification',
-          classifier: owner => classifyOwner({
-            ownerKey,
-            owner,
-            plan,
-            policyPlan: member,
-            policyPlans: Object.freeze([member]),
-          }),
-        }) ?? Object.freeze({
-          ...coordinate,
-          policyKind: member.kind,
-          resourceKind: classifyOwner({
-            ownerKey,
-            owner: coordinate,
-            plan,
-            policyPlan: member,
-            policyPlans: Object.freeze([member]),
-          }),
-          classificationRevision,
-        });
-      }));
-      descriptorsByPolicy.set(member.kind, new Map(
-        descriptors.map(descriptor => [descriptor.ownerKey, descriptor]),
+    const policyDiffs = policyPlan.memberPolicyPlans.map(member => {
+      const previousDescriptors = latestPolicyDescriptorMaps.get(member.kind) ?? new Map();
+      const nextOwnerSet = new Set(member.allOwnerKeys);
+      const resourceKindHints = member.resourceKindEntries === null
+        ? null : new Map(member.resourceKindEntries);
+      const resourceKindTransitions = resourceKindHints === null ? new Set() : new Set(
+        member.allOwnerKeys.filter(ownerKey => {
+          const previous = previousDescriptors.get(ownerKey);
+          return previous && previous.resourceKind !== resourceKindHints.get(ownerKey);
+        }),
+      );
+      const enteringOwnerKeys = member.allOwnerKeys.filter(ownerKey => (
+        !previousDescriptors.has(ownerKey) || resourceKindTransitions.has(ownerKey)
       ));
-      counts.resourceKindClassifications += descriptors.length;
+      const leavingOwnerKeys = [...previousDescriptors.keys()].filter(ownerKey => (
+        !nextOwnerSet.has(ownerKey) || resourceKindTransitions.has(ownerKey)
+      ));
+      return {
+        member,
+        previousDescriptors,
+        nextOwnerSet,
+        resourceKindHints,
+        enteringOwnerKeys,
+        leavingOwnerKeys,
+        unchangedOwnerCount: member.allOwnerKeys.length - enteringOwnerKeys.length,
+      };
+    });
+    const enteringOwnerCount = policyDiffs.reduce(
+      (sum, diff) => sum + diff.enteringOwnerKeys.length, 0,
+    );
+    const leavingOwnerCount = policyDiffs.reduce(
+      (sum, diff) => sum + diff.leavingOwnerKeys.length, 0,
+    );
+    const unchangedOwnerCount = policyDiffs.reduce(
+      (sum, diff) => sum + diff.unchangedOwnerCount, 0,
+    );
+    // Callers without a stable coverage revision may provide classifiers whose
+    // output changes independently from owner coverage. Preserve that generic
+    // fallback when the owner sets alone cannot expose the change.
+    const forceFullClassification = latestPlan !== null
+      && ownerMetadataRevision === null
+      && policyDiffs.some(diff => diff.resourceKindHints === null)
+      && enteringOwnerCount === 0
+      && leavingOwnerCount === 0;
+    const changedPolicyOwners = new Set();
+    const descriptorsByPolicy = new Map();
+    const retainedClassificationDescriptors = [];
+    let classifiedOwnerCount = 0;
+    const nextPolicyResourceKindEntries = Object.freeze(policyDiffs.map(diff => {
+      const descriptors = new Map();
+      const entering = new Set(diff.enteringOwnerKeys);
+      for (const ownerKey of diff.leavingOwnerKeys) changedPolicyOwners.add(ownerKey);
+      for (const ownerKey of diff.member.allOwnerKeys) {
+        let descriptor = !forceFullClassification && !entering.has(ownerKey)
+          ? diff.previousDescriptors.get(ownerKey) : null;
+        if (!descriptor) {
+          const coordinate = coordinateFor(ownerKey);
+          descriptor = ownerMetadataCache?.classify({
+            ownerKey,
+            policyKind: diff.member.kind,
+            revision: classificationRevision,
+            path: 'static-object-stream:policy-classification',
+            classifier: owner => classifyOwner({
+              ownerKey,
+              owner,
+              plan,
+              policyPlan: diff.member,
+              policyPlans: Object.freeze([diff.member]),
+            }),
+          }) ?? Object.freeze({
+            ...coordinate,
+            policyKind: diff.member.kind,
+            resourceKind: classifyOwner({
+              ownerKey,
+              owner: coordinate,
+              plan,
+              policyPlan: diff.member,
+              policyPlans: Object.freeze([diff.member]),
+            }),
+            classificationRevision,
+          });
+          classifiedOwnerCount += 1;
+          changedPolicyOwners.add(ownerKey);
+        }
+        descriptors.set(ownerKey, descriptor);
+        retainedClassificationDescriptors.push(descriptor);
+      }
+      descriptorsByPolicy.set(diff.member.kind, descriptors);
       return Object.freeze({
-        policyKind: member.kind,
-        resourceKindEntries: Object.freeze(descriptors.map(descriptor => Object.freeze([
-          descriptor.ownerKey,
-          descriptor.resourceKind,
-        ]))),
+        policyKind: diff.member.kind,
+        resourceKindEntries: Object.freeze(diff.member.allOwnerKeys.map(ownerKey => {
+          const descriptor = descriptors.get(ownerKey);
+          return Object.freeze([descriptor.ownerKey, descriptor.resourceKind]);
+        })),
       });
     }));
     const nextOwnerDescriptors = Object.freeze(policyPlan.allOwnerKeys.map(ownerKey => {
-      const policyDescriptors = selectedPolicyPlans
+      const previous = latestOwnerDescriptorByKey.get(ownerKey);
+      if (!changedPolicyOwners.has(ownerKey) && previous) return previous;
+      const policyDescriptors = policyPlan.memberPolicyPlans
         .filter(member => descriptorsByPolicy.get(member.kind).has(ownerKey))
         .map(member => descriptorsByPolicy.get(member.kind).get(ownerKey));
       const resourceKinds = Object.freeze(policyDescriptors.map(value => value.resourceKind));
@@ -913,6 +1033,7 @@ export function createStaticObjectStream({
       if (typeof resourceKind !== 'string' || !resourceKind) {
         throw new Error(`Static Object Stream cannot combine resource kinds for ${ownerKey}`);
       }
+      if (previous?.resourceKind === resourceKind) return previous;
       return Object.freeze({ ...coordinateFor(ownerKey), resourceKind });
     }));
     const nextOwnerDescriptorByKey = new Map(
@@ -921,25 +1042,61 @@ export function createStaticObjectStream({
     const nextResourceKindEntries = Object.freeze(nextOwnerDescriptors.map(descriptor => (
       Object.freeze([descriptor.ownerKey, descriptor.resourceKind])
     )));
-    counts.coverageOwnerEntryAllocations += nextResourceKindEntries.length;
     const nextResourceKindByOwner = new Map(nextResourceKindEntries);
     const nextSignature = ownerMetadataRevision === null
       ? coverageSignature(plan, policyPlan, nextResourceKindEntries, ownerMetadataCache)
       : `immutable-coverage:${ownerMetadataRevision}`;
-    if (ownerMetadataRevision === null) counts.coverageSignatures += 1;
+    const stagedPublicationContextChanged = stagedPublicationContext !== latestPublicationContext;
     if (nextSignature === latestCoverageSignature) {
+      if (applyAttempt !== applyAttemptSequence) {
+        counts.supersededApplies += 1;
+        return false;
+      }
+      ownerMetadataCache?.retainClassificationRevision({
+        revision: classificationRevision,
+        descriptors: retainedClassificationDescriptors.filter(descriptor => (
+          descriptor.classificationRevision === classificationRevision
+        )),
+      });
+      if (stagedPublicationContextChanged) {
+        latestPublicationContext = stagedPublicationContext;
+        counts.publicationContextUpdates += 1;
+        if (latestCoverageSignature !== null) counts.publicationFastPathUpdates += 1;
+      }
+      publicationContextPendingForPlan = false;
       latestPlan = plan;
+      latestPolicyDescriptorMaps = descriptorsByPolicy;
+      latestPolicyResourceKindEntries = nextPolicyResourceKindEntries;
       planRevision += 1;
       counts.unchangedPlans += 1;
+      counts.coverageMerges += 1;
+      counts.resourceKindClassifications += classifiedOwnerCount;
+      counts.coverageOwnerEntryAllocations += nextResourceKindEntries.length;
+      if (ownerMetadataRevision === null) counts.coverageSignatures += 1;
+      counts.enteringOwners += enteringOwnerCount;
+      counts.leavingOwners += leavingOwnerCount;
+      counts.unchangedOwners += unchangedOwnerCount;
+      latestApplyDiff = Object.freeze({
+        enteringOwnerCount,
+        leavingOwnerCount,
+        unchangedOwnerCount,
+        classifiedOwnerCount,
+        sortTargetOwnerCount: 0,
+        queueCandidateCount: 0,
+        queueInsertionCount: 0,
+      });
       cancelMatureStaleTasks();
       pump();
       return false;
     }
     const required = new Set(policyPlan.requiredOwnerKeys);
-    const requestedOwnerKeys = [
-      ...policyPlan.requiredOwnerKeys,
-      ...policyPlan.prefetchedOwnerKeys,
-    ].sort((left, right) => {
+    const previousRequiredOwnerKeys = latestRequiredOwnerKeys;
+    const nextRequestedOwnerKeys = new Set(policyPlan.requestOwnerKeys);
+    const queueCandidateOwnerKeys = policyPlan.requestOwnerKeys.filter(ownerKey => (
+      !latestRequestedOwnerKeys.has(ownerKey)
+        || latestResourceKindByOwner.get(ownerKey) !== nextResourceKindByOwner.get(ownerKey)
+    ));
+    const compareRequestPriority = (left, right) => {
       const leftOwner = nextOwnerDescriptorByKey.get(left);
       const rightOwner = nextOwnerDescriptorByKey.get(right);
       const leftX = (leftOwner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.x;
@@ -950,8 +1107,9 @@ export function createStaticObjectStream({
         || leftX * leftX + leftZ * leftZ - (rightX * rightX + rightZ * rightZ)
         || leftOwner.chunkZ - rightOwner.chunkZ
         || leftOwner.chunkX - rightOwner.chunkX;
-    });
-    const requested = requestedOwnerKeys.map(ownerKey => ({
+    };
+    queueCandidateOwnerKeys.sort(compareRequestPriority);
+    const requested = queueCandidateOwnerKeys.map(ownerKey => ({
       ownerKey,
       ownerX: nextOwnerDescriptorByKey.get(ownerKey).ownerX,
       ownerZ: nextOwnerDescriptorByKey.get(ownerKey).ownerZ,
@@ -969,9 +1127,25 @@ export function createStaticObjectStream({
       counts.queueOverflows += 1;
       throw new RangeError(`Static Object Stream queue capacity exceeded: ${queueCapacity}`);
     }
-    // Everything above is immutable staging. Only commit the new coverage
-    // after classification, signature construction, ordering, and capacity
-    // validation have all succeeded.
+    if (applyAttempt !== applyAttemptSequence) {
+      counts.supersededApplies += 1;
+      return false;
+    }
+    ownerMetadataCache?.retainClassificationRevision({
+      revision: classificationRevision,
+      descriptors: retainedClassificationDescriptors.filter(descriptor => (
+        descriptor.classificationRevision === classificationRevision
+      )),
+    });
+    // No stream plan state has changed above. Only commit the new coverage
+    // after classification, signature construction, ordering, cache retention,
+    // and capacity validation have all succeeded.
+    if (stagedPublicationContextChanged) {
+      latestPublicationContext = stagedPublicationContext;
+      counts.publicationContextUpdates += 1;
+      if (latestCoverageSignature !== null) counts.publicationFastPathUpdates += 1;
+    }
+    publicationContextPendingForPlan = false;
     epoch += 1;
     coverageGeneration += 1;
     planRevision += 1;
@@ -982,14 +1156,29 @@ export function createStaticObjectStream({
     latestResourceKindByOwner = nextResourceKindByOwner;
     latestOwnerDescriptorByKey = nextOwnerDescriptorByKey;
     latestPolicyResourceKindEntries = nextPolicyResourceKindEntries;
-    ownerMetadataCache?.retainClassificationRevision({
-      revision: classificationRevision,
-      descriptors: nextPolicyResourceKindEntries.flatMap(entry => (
-        entry.resourceKindEntries.map(([ownerKey]) => descriptorsByPolicy
-          .get(entry.policyKind).get(ownerKey))
-      )),
-    });
+    latestPolicyDescriptorMaps = descriptorsByPolicy;
+    latestRequestedOwnerKeys = nextRequestedOwnerKeys;
+    latestRequiredOwnerKeys = required;
     counts.plans += 1;
+    counts.coverageMerges += 1;
+    counts.ownerSorts += Number(queueCandidateOwnerKeys.length > 1);
+    counts.resourceKindClassifications += classifiedOwnerCount;
+    counts.coverageOwnerEntryAllocations += nextResourceKindEntries.length;
+    if (ownerMetadataRevision === null) counts.coverageSignatures += 1;
+    counts.enteringOwners += enteringOwnerCount;
+    counts.leavingOwners += leavingOwnerCount;
+    counts.unchangedOwners += unchangedOwnerCount;
+    counts.sortTargetOwners += queueCandidateOwnerKeys.length;
+    counts.queueInsertions += newTaskKeys.size;
+    latestApplyDiff = Object.freeze({
+      enteringOwnerCount,
+      leavingOwnerCount,
+      unchangedOwnerCount,
+      classifiedOwnerCount,
+      sortTargetOwnerCount: queueCandidateOwnerKeys.length,
+      queueCandidateCount: requested.length,
+      queueInsertionCount: newTaskKeys.size,
+    });
     const retained = new Set(policyPlan.allOwnerKeys);
     for (const task of tasks.values()) {
       const retainedWithCurrentKind = retained.has(task.ownerKey)
@@ -1022,7 +1211,32 @@ export function createStaticObjectStream({
         counts.staleResultDiscards += 1;
       }
     }
+    for (const task of tasks.values()) {
+      if (!retained.has(task.ownerKey)
+        || nextResourceKindByOwner.get(task.ownerKey) !== task.resourceKind) continue;
+      const nextRequired = required.has(task.ownerKey);
+      task.required = nextRequired;
+      task.deadlineAtMs = nextRequired
+        ? policyPlan.deadline.requiredAtMs : policyPlan.deadline.prefetchedAtMs;
+      if (nextRequired && !previousRequiredOwnerKeys.has(task.ownerKey)) promoteQueuedTask(task);
+    }
+    const previouslyQueuedTaskKeys = new Set(queue.map(task => task.key));
     for (const descriptor of requested) enqueue({ ...descriptor, pumpNow: false });
+    const enteringQueuedTasks = queue.filter(task => !previouslyQueuedTaskKeys.has(task.key));
+    if (enteringQueuedTasks.length > 0) {
+      const enteringQueuedTaskKeys = new Set(enteringQueuedTasks.map(task => task.key));
+      const stableQueuedTasks = queue.filter(task => !enteringQueuedTaskKeys.has(task.key));
+      const firstStablePrefetch = stableQueuedTasks.findIndex(task => !task.required);
+      const stableRequired = firstStablePrefetch < 0
+        ? stableQueuedTasks : stableQueuedTasks.slice(0, firstStablePrefetch);
+      const stablePrefetched = firstStablePrefetch < 0
+        ? [] : stableQueuedTasks.slice(firstStablePrefetch);
+      queue.splice(0, queue.length,
+        ...stableRequired,
+        ...enteringQueuedTasks.filter(task => task.required),
+        ...stablePrefetched,
+        ...enteringQueuedTasks.filter(task => !task.required));
+    }
     cancelMatureStaleTasks();
     pump();
     return true;
@@ -1197,6 +1411,7 @@ export function createStaticObjectStream({
         stateRevision: currentStateRevision(),
         originGeneration: currentOriginGeneration(),
       }))),
+      latestApplyDiff,
       counts: Object.freeze({ ...counts }),
       disposed,
     });
@@ -1248,6 +1463,8 @@ export function createStaticObjectStream({
       requestedCount: counts.requested,
       readyHitCount: counts.readyHits,
       pendingReuseCount: counts.pendingReuse,
+      latestApplyDiff,
+      counts: Object.freeze({ ...counts }),
       cancelledCount: counts.cancelled,
       failedCount: counts.failed,
       invalidationCount: counts.invalidations,
@@ -1261,6 +1478,18 @@ export function createStaticObjectStream({
     latestResourceKindByOwner = new Map();
     latestOwnerDescriptorByKey = new Map();
     latestPolicyResourceKindEntries = Object.freeze([]);
+    latestPolicyDescriptorMaps = new Map();
+    latestRequestedOwnerKeys = new Set();
+    latestRequiredOwnerKeys = new Set();
+    latestApplyDiff = Object.freeze({
+      enteringOwnerCount: 0,
+      leavingOwnerCount: 0,
+      unchangedOwnerCount: 0,
+      classifiedOwnerCount: 0,
+      sortTargetOwnerCount: 0,
+      queueCandidateCount: 0,
+      queueInsertionCount: 0,
+    });
     ownerMetadataCache?.invalidateClassifications();
     latestPlan = null;
     latestPolicyPlan = null;

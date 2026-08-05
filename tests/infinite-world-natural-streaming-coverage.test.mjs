@@ -286,7 +286,9 @@ test('480-frame deterministic workload keeps plan/application work below ten per
   assert.equal(streamSnapshot.counts.plans, staticApplyCalls);
   assert.equal(streamSnapshot.counts.coverageMerges, staticApplyCalls);
   assert.equal(streamSnapshot.counts.coverageSignatures, staticApplyCalls);
-  assert.equal(streamSnapshot.counts.ownerSorts, staticApplyCalls * 6);
+  assert.ok(streamSnapshot.counts.ownerSorts <= staticApplyCalls);
+  assert.ok(streamSnapshot.counts.sortTargetOwners
+    <= streamSnapshot.counts.resourceKindClassifications);
   const percentile = (values, ratio) => [...values].sort((a, b) => a - b)[
     Math.min(values.length - 1, Math.ceil(values.length * ratio) - 1)
   ];
@@ -298,6 +300,10 @@ test('480-frame deterministic workload keeps plan/application work below ten per
     staticApplyCalls,
     ownerMergeCalls: streamSnapshot.counts.coverageMerges,
     ownerSortCalls: streamSnapshot.counts.ownerSorts,
+    sortTargetOwners: streamSnapshot.counts.sortTargetOwners,
+    enteringOwners: streamSnapshot.counts.enteringOwners,
+    leavingOwners: streamSnapshot.counts.leavingOwners,
+    unchangedOwners: streamSnapshot.counts.unchangedOwners,
     resourceKindClassifications: streamSnapshot.counts.resourceKindClassifications,
     coverageSignatureBuilds: streamSnapshot.counts.coverageSignatures,
     coverageOwnerEntryAllocations:

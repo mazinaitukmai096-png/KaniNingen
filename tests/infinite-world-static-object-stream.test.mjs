@@ -99,6 +99,213 @@ test('a high-speed turn replaces the prefetched corridor while retaining current
   assert.ok(north.prefetchedOwnerKeys.some(key => Number(key.split(',')[1]) < -1));
 });
 
+test('incremental apply classifies and sorts only entering policy-owner identities', async t => {
+  const runtime = createPolicyRuntime();
+  const planner = createPlanner(runtime.policy);
+  const requestedObjects = new Map();
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    requestOwner: request => {
+      const key = `${request.resourceKind}:${request.ownerKey}`;
+      const value = requestedObjects.get(key) ?? Object.freeze({ key, stableId: `id:${key}` });
+      requestedObjects.set(key, value);
+      return Promise.resolve(value);
+    },
+  });
+  const scenarios = [
+    { name: 'tiny-walk', player: { x: 0, z: 0 }, velocity: { x: 4, z: 0 } },
+    { name: 'mid-walk', player: { x: 0, z: 0 }, velocity: { x: 12, z: 0 } },
+    { name: 'max-walk', player: { x: 0, z: 0 }, velocity: { x: 33, z: 0 } },
+    { name: 'max-sprint', player: { x: 0, z: 0 }, velocity: { x: 66, z: 0 } },
+    { name: 'turn', player: { x: 0, z: 0 }, velocity: { x: 0, z: -33 } },
+    { name: 'return', player: { x: 0, z: 0 }, velocity: { x: -33, z: 0 } },
+    { name: 'stop', player: { x: 0, z: 0 }, velocity: { x: 0, z: 0 } },
+    { name: 'tiny-again', player: { x: 0, z: 0 }, velocity: { x: 4, z: 0 } },
+  ];
+  const reports = [];
+  for (const scenario of scenarios) {
+    const plan = planner({ player: scenario.player, velocity: scenario.velocity });
+    const member = policyPlan(plan);
+    stream.applyPlan({
+      plan,
+      policyPlan: member,
+      ownerMetadataRevision: plan.planId,
+    });
+    const actual = new Map(stream.policyResourceKindEntries()[0].resourceKindEntries);
+    const expected = new Map(member.allOwnerKeys.map(ownerKey => [
+      ownerKey,
+      runtime.classifyOwner({ ownerKey, plan, policyPlan: member }),
+    ]));
+    assert.deepEqual(actual, expected, `${scenario.name} resource coverage changed`);
+    assert.equal(actual.size, member.allOwnerKeys.length);
+    const diff = stream.snapshot().latestApplyDiff;
+    assert.equal(diff.classifiedOwnerCount, diff.enteringOwnerCount);
+    assert.equal(diff.enteringOwnerCount + diff.unchangedOwnerCount,
+      member.allOwnerKeys.length);
+    assert.equal(diff.sortTargetOwnerCount, diff.queueCandidateCount);
+    assert.equal(new Set(actual.keys()).size, actual.size);
+    reports.push({ name: scenario.name, ...diff });
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await waitFor(() => stream.snapshot().backlog === 0, 'incremental requests did not settle');
+  const finalPlan = planner({ player: { x: 0, z: 0 }, velocity: { x: 4, z: 0 } });
+  const finalMember = policyPlan(finalPlan);
+  const ownerKey = finalMember.requiredOwnerKeys[0];
+  const resourceKind = runtime.classifyOwner({
+    ownerKey,
+    plan: finalPlan,
+    policyPlan: finalMember,
+  });
+  const reused = await stream.requestOrReuse({
+    ownerKey,
+    resourceKind,
+    fallback: () => assert.fail('canonical object identity was orphaned'),
+  });
+  assert.equal(reused, requestedObjects.get(`${resourceKind}:${ownerKey}`));
+  t.diagnostic(JSON.stringify(reports));
+  await stream.dispose();
+});
+
+test('apply staging keeps the prior generation intact when entering classification throws', () => {
+  const runtime = createPolicyRuntime();
+  const planner = createPlanner(runtime.policy);
+  let rejectedPlanId = null;
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: input => {
+      if (input.plan.planId === rejectedPlanId) throw new Error('staged classification failed');
+      return runtime.classifyOwner(input);
+    },
+    maximumConcurrentRequests: 1,
+    requestOwner: () => ({ promise: new Promise(() => {}), cancel: () => true }),
+  });
+  const first = planner({ player: { x: 0, z: 0 }, velocity: { x: 4, z: 0 } });
+  stream.applyPlan({
+    plan: first,
+    policyPlan: policyPlan(first),
+    ownerMetadataRevision: first.planId,
+  });
+  const before = stream.snapshot();
+  const beforeEntries = stream.resourceKindEntries();
+  const rejected = planner({ player: { x: 512, z: 512 }, velocity: { x: 33, z: 0 } });
+  rejectedPlanId = rejected.planId;
+  assert.throws(() => stream.applyPlan({
+    plan: rejected,
+    policyPlan: policyPlan(rejected),
+    ownerMetadataRevision: rejected.planId,
+  }), /staged classification failed/);
+  const after = stream.snapshot();
+  assert.equal(after.latestPlanId, before.latestPlanId);
+  assert.equal(after.coverageGeneration, before.coverageGeneration);
+  assert.equal(after.planRevision, before.planRevision);
+  assert.equal(after.queuedCount, before.queuedCount);
+  assert.equal(after.ticketCount, before.ticketCount);
+  assert.equal(stream.resourceKindEntries(), beforeEntries);
+});
+
+test('a reentrant supersede discards the older staged diff before commit', () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const older = planner({ player: { x: 0, z: 0 }, velocity: { x: 4, z: 0 } });
+  const latest = planner({ player: { x: 512, z: 512 }, velocity: { x: 33, z: 0 } });
+  let superseded = false;
+  let stream;
+  stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: input => {
+      if (!superseded && input.plan.planId === older.planId) {
+        superseded = true;
+        stream.applyPlan({
+          plan: latest,
+          policyPlan: policyPlan(latest),
+          ownerMetadataRevision: latest.planId,
+        });
+      }
+      return runtime.classifyOwner(input);
+    },
+    maximumConcurrentRequests: 1,
+    requestOwner: () => ({ promise: new Promise(() => {}), cancel: () => true }),
+  });
+  assert.equal(stream.applyPlan({
+    plan: older,
+    policyPlan: policyPlan(older),
+    ownerMetadataRevision: older.planId,
+  }), false);
+  const snapshot = stream.snapshot();
+  assert.equal(snapshot.latestPlanId, latest.planId);
+  assert.equal(snapshot.coverageGeneration, 1);
+  assert.equal(snapshot.counts.supersededApplies, 1);
+  assert.deepEqual(stream.resourceKindEntries().map(([ownerKey]) => ownerKey),
+    policyPlan(latest).allOwnerKeys);
+});
+
+test('unchanged merged coverage still commits the latest policy-owner diff baseline', () => {
+  const policyKinds = ['test-static-first', 'test-static-second'];
+  const member = (kind, ownerKey) => Object.freeze({
+    kind,
+    stream: 'static-object',
+    generatorKind: 'static-object',
+    publicationGroup: 'shared-static',
+    publicationDependencies: Object.freeze([]),
+    requiredOwnerKeys: Object.freeze([ownerKey]),
+    prefetchedOwnerKeys: Object.freeze([]),
+    retainedOwnerKeys: Object.freeze([ownerKey]),
+    allOwnerKeys: Object.freeze([ownerKey]),
+    deadline: Object.freeze({ requiredAtMs: 1_000, prefetchedAtMs: 2_000 }),
+    velocityCorridor: null,
+    resourceKindEntries: Object.freeze([Object.freeze([ownerKey, 'canonical'])]),
+  });
+  const worldPlan = (planId, policyPlans) => Object.freeze({
+    schemaVersion: 'world-streaming-plan-1',
+    planId,
+    signatureHash: planId,
+    generatedAtMs: 1_000,
+    stateRevision: 0,
+    originGeneration: 0,
+    renderDistancePreset: 'current',
+    player: Object.freeze({ x: 0, z: 0 }),
+    policyPlans: Object.freeze(policyPlans),
+  });
+  const first = worldPlan('first', [
+    member(policyKinds[0], '0,0'),
+    member(policyKinds[1], '1,0'),
+  ]);
+  const swapped = worldPlan('swapped', [
+    member(policyKinds[0], '1,0'),
+    member(policyKinds[1], '0,0'),
+  ]);
+  const repeated = worldPlan('repeated', swapped.policyPlans);
+  const stream = createStaticObjectStream({
+    policyKind: policyKinds[0],
+    policyKinds,
+    classifyOwner: () => 'canonical',
+    requestOwner: () => Promise.resolve(Object.freeze({})),
+  });
+
+  assert.equal(stream.applyPlan({ plan: first, policyPlans: first.policyPlans }), true);
+  assert.equal(stream.applyPlan({ plan: swapped, policyPlans: swapped.policyPlans }), false);
+  assert.deepEqual(stream.snapshot().latestApplyDiff, {
+    enteringOwnerCount: 2,
+    leavingOwnerCount: 2,
+    unchangedOwnerCount: 0,
+    classifiedOwnerCount: 2,
+    sortTargetOwnerCount: 0,
+    queueCandidateCount: 0,
+    queueInsertionCount: 0,
+  });
+  assert.equal(stream.applyPlan({ plan: repeated, policyPlans: repeated.policyPlans }), false);
+  assert.deepEqual(stream.snapshot().latestApplyDiff, {
+    enteringOwnerCount: 0,
+    leavingOwnerCount: 0,
+    unchangedOwnerCount: 2,
+    classifiedOwnerCount: 0,
+    sortTargetOwnerCount: 0,
+    queueCandidateCount: 0,
+    queueInsertionCount: 0,
+  });
+});
+
 test('Current stationary and MAX corridors remain inside policy-derived owner capacity', () => {
   const worldSeedHash = 'static-natural-capacity-policy';
   const horizonPredicate = createW8ForestHorizonOwnerPredicate(worldSeedHash);
