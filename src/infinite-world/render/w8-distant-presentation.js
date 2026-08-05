@@ -4602,6 +4602,16 @@ export async function createW8DistantPresentation({
   let runtimePresentationHandoffMaximumMatrixUpdatesPerFrame = 0;
   let runtimePresentationHandoffMaximumBufferUpdatesPerFrame = 0;
   let runtimePresentationHandoffMaximumDisposePerFrame = 0;
+  let runtimePresentationCommittedRenderedKeys = null;
+  let runtimePresentationCommittedNearStableIds = null;
+  let runtimePresentationCoverageBarrierRequestedCount = 0;
+  let runtimePresentationCoverageBarrierReleasedCount = 0;
+  let runtimePresentationCoverageBarrierSupersededCount = 0;
+  let runtimePresentationCoverageBarrierRetryCount = 0;
+  let runtimePresentationCoverageBarrierMaximumHeldMs = 0;
+  let runtimePresentationCoverageBarrierBlankFrameCount = 0;
+  let runtimePresentationCoverageBarrierDuplicateFrameCount = 0;
+  let runtimePresentationCoverageBarrierLastRelease = null;
 
   const recordPersistentTreeFrameSample = sample => {
     if (!streamingTelemetry) return;
@@ -5604,6 +5614,215 @@ export async function createW8DistantPresentation({
     return Object.freeze({ remainingMs: 0, buildStarted: true });
   };
 
+  const runtimeHandoffSourceDescriptor = object => {
+    const featureType = object?.record?.featureType ?? null;
+    const lodPolicy = object?.record?.lodPolicy ?? null;
+    if (lodPolicy && lodPolicy.outer === null && lodPolicy.far === null) return null;
+    if (featureType === 'settlement-building') {
+      return Object.freeze({
+        kind: 'building',
+        stableId: object.stableId,
+        sourceIdentity: object.stableId,
+        projectionIdentity: object.stableId,
+        ownerKey: object.ownerKey,
+      });
+    }
+    if (featureType === 'settlement-road') {
+      return Object.freeze({
+        kind: 'road',
+        stableId: object.stableId,
+        sourceIdentity: object.record.sourceStableId
+          ?? object.record.sourceSegmentStableId ?? object.stableId,
+        projectionIdentity: object.stableId,
+        ownerKey: object.ownerKey,
+      });
+    }
+    return null;
+  };
+
+  const runtimeHandoffDescriptorKey = descriptor => [
+    descriptor.kind,
+    descriptor.sourceIdentity,
+    descriptor.projectionIdentity,
+    descriptor.ownerKey,
+  ].join('\n');
+
+  const createRuntimePresentationCoverageBarrier = ({
+    generation,
+    previousRenderedKeys,
+    previousNearStableIds,
+    renderedKeys,
+    carriedBarrier = null,
+  }) => {
+    const nextRendered = new Set(renderedKeys);
+    const outgoingOwners = new Set([...previousRenderedKeys]
+      .filter(ownerKey => !nextRendered.has(ownerKey)));
+    const descriptors = new Map();
+    for (const descriptor of carriedBarrier?.descriptors ?? []) {
+      if (!nextRendered.has(descriptor.ownerKey)) {
+        descriptors.set(runtimeHandoffDescriptorKey(descriptor), descriptor);
+        outgoingOwners.add(descriptor.ownerKey);
+      }
+    }
+    for (const object of generation?.canonicalObjects?.values?.() ?? []) {
+      if (!outgoingOwners.has(object.ownerKey)
+        || isFeatureDestroyed(object.stableId)
+        || (!previousNearStableIds.has(object.stableId) && object.visibleLod !== 'near')) continue;
+      const descriptor = runtimeHandoffSourceDescriptor(object);
+      if (descriptor) descriptors.set(runtimeHandoffDescriptorKey(descriptor), descriptor);
+    }
+    if (descriptors.size === 0) return null;
+    const requestedAtMs = carriedBarrier?.requestedAtMs ?? monotonicNow();
+    const barrier = {
+      sequence: runtimePresentationCoverageBarrierRequestedCount + 1,
+      requestedAtMs,
+      descriptors: Object.freeze([...descriptors.values()].sort((left, right) => (
+        runtimeHandoffDescriptorKey(left).localeCompare(runtimeHandoffDescriptorKey(right))
+      ))),
+      ownerKeys: new Set([...outgoingOwners].filter(ownerKey => (
+        [...descriptors.values()].some(descriptor => descriptor.ownerKey === ownerKey)
+      ))),
+      generation,
+      generationEpoch: generation?.epoch ?? null,
+      publishedAtMs: null,
+      releasedAtMs: null,
+      released: false,
+      retryCount: carriedBarrier?.retryCount ?? 0,
+    };
+    runtimePresentationCoverageBarrierRequestedCount += 1;
+    recordDiagnosticEvent('near-distant-coverage-barrier-created', {
+      sequence: barrier.sequence,
+      generationEpoch: barrier.generationEpoch,
+      ownerKeys: Object.freeze(sortedKeyList(barrier.ownerKeys)),
+      buildingSourceCount: barrier.descriptors.filter(value => value.kind === 'building').length,
+      roadSourceCount: barrier.descriptors.filter(value => value.kind === 'road').length,
+    });
+    return barrier;
+  };
+
+  const runtimeHandoffDescriptorCovered = (generation, descriptor) => {
+    const object = generation?.canonicalObjects?.get?.(descriptor.stableId) ?? null;
+    if (!object || object.ownerKey !== descriptor.ownerKey
+      || !['mid', 'far'].includes(object.visibleLod)) return false;
+    return object.instances.some(instance => (
+      instance.bucket.mesh?.visible !== false
+      && (instance.bucket.mesh?.userData?.canonicalStableIds ?? [])
+        .includes(descriptor.projectionIdentity)
+    ));
+  };
+
+  const inspectRuntimePresentationCoverageBarrier = (generation, barrier) => {
+    if (!barrier) return Object.freeze({ covered: true, missing: Object.freeze([]) });
+    const missing = barrier.descriptors.filter(descriptor => (
+      !runtimeHandoffDescriptorCovered(generation, descriptor)
+    ));
+    return Object.freeze({ covered: missing.length === 0, missing: Object.freeze(missing) });
+  };
+
+  const publishRuntimePresentationCoverageBarrier = ({
+    generation,
+    barrier,
+    activeDataKeys,
+    renderedKeys,
+    playerLogicalX,
+    playerLogicalZ,
+  }) => {
+    if (!generation || !barrier || barrier.released) return false;
+    generation.activeKeys = new Set(activeDataKeys);
+    generation.renderedKeys = new Set(renderedKeys);
+    updateCanonicalVisibility(
+      generation,
+      playerLogicalX,
+      playerLogicalZ,
+      { compose: false },
+    );
+    const descriptorIds = new Set(barrier.descriptors.map(value => value.stableId));
+    const criticalBuckets = new Set();
+    for (const stableId of descriptorIds) {
+      const object = generation.canonicalObjects.get(stableId);
+      for (const instance of object?.instances ?? []) {
+        criticalBuckets.add(instance.bucket);
+        if (instance.bucket.persistent === true && Number.isSafeInteger(instance.item.slot)) {
+          instance.bucket.dirtySlots ??= new Set();
+          instance.bucket.dirtySlots.add(instance.item.slot);
+        }
+      }
+    }
+    let composedBuckets = 0;
+    let matrixUpdates = 0;
+    let bufferUpdates = 0;
+    for (const bucket of criticalBuckets) {
+      if (generation.persistentDistant === true && bucket.persistent === true) {
+        const work = createCanonicalBucketComposeWork(generation, bucket);
+        const composed = advanceCanonicalBucketComposeWork(work, {
+          budgetStartedAtMs: monotonicNow(),
+          budgetMs: Number.POSITIVE_INFINITY,
+          unitLimit: Number.POSITIVE_INFINITY,
+        });
+        composedBuckets += 1;
+        matrixUpdates += composed.matrices;
+        bufferUpdates += composed.attributes;
+      } else {
+        const composed = composeCanonicalBucket(generation, bucket);
+        composedBuckets += composed.composed;
+        matrixUpdates += composed.matrices;
+        bufferUpdates += composed.attributes;
+      }
+    }
+    if (criticalBuckets.size) {
+      finishCanonicalCompose(generation, composedBuckets, matrixUpdates);
+      runtimePresentationHandoffMatrixUpdateCount += matrixUpdates;
+      runtimePresentationHandoffBufferUpdateCount += bufferUpdates;
+    }
+    const coverage = inspectRuntimePresentationCoverageBarrier(generation, barrier);
+    if (!coverage.covered) {
+      barrier.retryCount += 1;
+      runtimePresentationCoverageBarrierRetryCount += 1;
+      return false;
+    }
+    const publishedAtMs = monotonicNow();
+    const nearVisible = readNearVisibleSnapshotState().stableIds;
+    const duplicateCount = barrier.descriptors.filter(descriptor => (
+      nearVisible.has(descriptor.stableId)
+        && runtimeHandoffDescriptorCovered(generation, descriptor)
+    )).length;
+    runtimePresentationCoverageBarrierDuplicateFrameCount += Number(duplicateCount > 0);
+    barrier.generation = generation;
+    barrier.generationEpoch = generation.epoch ?? null;
+    barrier.publishedAtMs = publishedAtMs;
+    barrier.releasedAtMs = publishedAtMs;
+    barrier.released = true;
+    runtimePresentationCoverageBarrierReleasedCount += 1;
+    const heldMs = Math.max(0, publishedAtMs - barrier.requestedAtMs);
+    runtimePresentationCoverageBarrierMaximumHeldMs = Math.max(
+      runtimePresentationCoverageBarrierMaximumHeldMs,
+      heldMs,
+    );
+    runtimePresentationCoverageBarrierLastRelease = Object.freeze({
+      sequence: barrier.sequence,
+      generationEpoch: barrier.generationEpoch,
+      ownerKeys: Object.freeze(sortedKeyList(barrier.ownerKeys)),
+      buildingSources: Object.freeze(barrier.descriptors
+        .filter(value => value.kind === 'building')
+        .map(value => Object.freeze({ ...value }))),
+      roadSources: Object.freeze(barrier.descriptors
+        .filter(value => value.kind === 'road')
+        .map(value => Object.freeze({ ...value }))),
+      nearReleaseAtMs: publishedAtMs,
+      distantPublishAtMs: publishedAtMs,
+      coverageGapMs: 0,
+      heldMs,
+      finalReleaseAtMs: publishedAtMs,
+      blankFrames: 0,
+      duplicateFrames: Number(duplicateCount > 0),
+      retryCount: barrier.retryCount,
+    });
+    recordDiagnosticEvent('near-distant-coverage-barrier-released', {
+      ...runtimePresentationCoverageBarrierLastRelease,
+    });
+    return true;
+  };
+
   const queueRuntimePresentationHandoff = ({
     transitionContract,
     activeDataKeys,
@@ -5613,6 +5832,7 @@ export async function createW8DistantPresentation({
     playerLogicalX,
     playerLogicalZ,
     initialStage = 'local-terrain',
+    coverageBarrier = null,
   }) => {
     if (pendingRuntimePresentationHandoff) {
       runtimePresentationHandoffSupersededCount += 1;
@@ -5635,6 +5855,7 @@ export async function createW8DistantPresentation({
       composedBuckets: 0,
       matrixUpdates: 0,
       bufferUpdates: 0,
+      coverageBarrier,
     };
     runtimePresentationHandoffRequestedCount += 1;
     return pendingRuntimePresentationHandoff;
@@ -5675,7 +5896,19 @@ export async function createW8DistantPresentation({
     };
 
     if (handoff.targetGeneration && handoff.targetGeneration !== activeGeneration) {
-      complete({ superseded: true });
+      if (handoff.coverageBarrier && !handoff.coverageBarrier.released && activeGeneration) {
+        runtimePresentationHandoffSupersededCount += 1;
+        runtimePresentationCoverageBarrierSupersededCount += 1;
+        handoff.targetGeneration = activeGeneration;
+        handoff.stage = 'ownership';
+        handoff.dirtyBuckets = [];
+        handoff.dirtyBucketIndex = 0;
+        handoff.bucketWork = null;
+        handoff.composedBuckets = 0;
+        handoff.matrixUpdates = 0;
+      } else {
+        complete({ superseded: true });
+      }
     } else if (handoff.stage === 'local-terrain') {
       if (handoff.targetLocalTerrainGeneration === activeLocalTerrainGeneration) {
         if (applyLocalTerrainOwnerHandoff(
@@ -5736,7 +5969,20 @@ export async function createW8DistantPresentation({
         handoff.composedBuckets,
         handoff.matrixUpdates,
       );
-      complete();
+      if (!handoff.coverageBarrier || handoff.coverageBarrier.released) complete();
+      else handoff.stage = 'coverage';
+    } else if (handoff.stage === 'coverage') {
+      if (handoff.coverageBarrier && !handoff.coverageBarrier.released) {
+        publishRuntimePresentationCoverageBarrier({
+          generation: handoff.targetGeneration,
+          barrier: handoff.coverageBarrier,
+          activeDataKeys: handoff.activeDataKeys,
+          renderedKeys: handoff.renderedKeys,
+          playerLogicalX: handoff.playerLogicalX,
+          playerLogicalZ: handoff.playerLogicalZ,
+        });
+      }
+      if (!handoff.coverageBarrier || handoff.coverageBarrier.released) complete();
     }
 
     const durationMs = monotonicNow() - startedAt;
@@ -5781,6 +6027,23 @@ export async function createW8DistantPresentation({
       renderedKeys,
     });
     if (!acceptRuntimeTransitionContract(acceptedTransition)) return false;
+    const previousRenderedKeys = new Set(
+      runtimePresentationCommittedRenderedKeys
+        ?? pendingRuntimePresentationHandoff?.renderedKeys
+        ?? activeGeneration?.renderedKeys
+        ?? [],
+    );
+    const previousNearStableIds = new Set(
+      runtimePresentationCommittedNearStableIds
+        ?? activeGeneration?.nearVisibleStableIds
+        ?? [],
+    );
+    runtimePresentationCommittedNearStableIds = new Set(
+      readNearVisibleSnapshotState().stableIds,
+    );
+    const carriedBarrier = pendingRuntimePresentationHandoff?.coverageBarrier?.released === false
+      ? pendingRuntimePresentationHandoff.coverageBarrier : null;
+    runtimePresentationCommittedRenderedKeys = new Set(renderedKeys);
     positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
     positionGenerationForOrigin(activeGeneration, renderOrigin);
     if (incrementalStaticTreePages) {
@@ -5795,6 +6058,26 @@ export async function createW8DistantPresentation({
       // Suppress matching Building slots before this commit can be rendered;
       // the remaining ownership/visibility compose stays frame-budgeted.
       suppressPublishedNearDistantBuildings();
+      const coverageGeneration = pendingDistantPublication?.previous
+        ?? persistentDistantPublishedGeneration
+        ?? activeGeneration;
+      const coverageBarrier = createRuntimePresentationCoverageBarrier({
+        generation: coverageGeneration,
+        previousRenderedKeys,
+        previousNearStableIds,
+        renderedKeys,
+        carriedBarrier,
+      });
+      if (coverageBarrier) {
+        publishRuntimePresentationCoverageBarrier({
+          generation: coverageGeneration,
+          barrier: coverageBarrier,
+          activeDataKeys,
+          renderedKeys,
+          playerLogicalX,
+          playerLogicalZ,
+        });
+      }
       queueRuntimePresentationHandoff({
         transitionContract: acceptedTransition,
         activeDataKeys,
@@ -5804,6 +6087,7 @@ export async function createW8DistantPresentation({
         playerLogicalX,
         playerLogicalZ,
         initialStage: 'ownership',
+        coverageBarrier,
       });
       return true;
     }
@@ -9180,6 +9464,21 @@ export async function createW8DistantPresentation({
         runtimePresentationHandoffMaximumMatrixUpdatesPerFrame,
         runtimePresentationHandoffMaximumBufferUpdatesPerFrame,
         runtimePresentationHandoffMaximumDisposePerFrame,
+        runtimePresentationCoverageBarrierPending: Boolean(
+          pendingRuntimePresentationHandoff?.coverageBarrier?.released === false,
+        ),
+        runtimePresentationCoverageBarrierHeldOwnerKeys: Object.freeze(sortedKeyList(
+          pendingRuntimePresentationHandoff?.coverageBarrier?.released === false
+            ? pendingRuntimePresentationHandoff.coverageBarrier.ownerKeys : [],
+        )),
+        runtimePresentationCoverageBarrierRequestedCount,
+        runtimePresentationCoverageBarrierReleasedCount,
+        runtimePresentationCoverageBarrierSupersededCount,
+        runtimePresentationCoverageBarrierRetryCount,
+        runtimePresentationCoverageBarrierMaximumHeldMs,
+        runtimePresentationCoverageBarrierBlankFrameCount,
+        runtimePresentationCoverageBarrierDuplicateFrameCount,
+        runtimePresentationCoverageBarrierLastRelease,
         runtimePresentationHandoffDirtyBucketCount:
           pendingRuntimePresentationHandoff?.dirtyBuckets.length ?? 0,
         runtimePresentationHandoffDirtyBucketIndex:

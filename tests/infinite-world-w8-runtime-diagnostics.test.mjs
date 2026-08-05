@@ -1934,6 +1934,171 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
   presentation.dispose();
 });
 
+test('Near to Distant coverage barrier publishes Building and Road sources before release', async t => {
+  const road = Object.freeze({
+    schemaVersion: 'w8-canonical-major-road-chunk-feature-1',
+    stableId: 'major-road-v1:coverage-barrier:segment:0:chunk:5:0',
+    sourceStableId: 'major-road-v1:coverage-barrier',
+    sourceSegmentStableId: 'major-road-v1:coverage-barrier:segment:0',
+    featureType: 'settlement-road',
+    canonicalMajorRoad: true,
+    settlementId: CANONICAL_SETTLEMENT_ID,
+    settlementIds: Object.freeze([CANONICAL_SETTLEMENT_ID]),
+    roadKind: 'MAJOR',
+    widthMeters: 2.25,
+    start: Object.freeze({ x: 84, y: 0, z: 8 }),
+    end: Object.freeze({ x: 92, y: 0, z: 8 }),
+    worldPosition: Object.freeze({ x: 88, y: 0, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+  });
+  const source = canonicalChunk(5, 0, [CANONICAL_BUILDING, road]);
+  let nearVisibleStableIds = [CANONICAL_BUILDING_ID, road.stableId];
+  const presentation = await createLocalTerrainTestPresentation(new DistantTestGroup(), {
+    incrementalStaticTreePages: true,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has('5,0')) result.chunks.set('5,0', source);
+    return result;
+  };
+  const near = coverage(4);
+  assert.equal(await presentation.sync({
+    ...near,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  const before = presentation.canonicalAuditSnapshot();
+  assert.equal(before.find(value => value.identity.stableId === CANONICAL_BUILDING_ID)
+    .composedInstanceCount, 0);
+  assert.equal(before.find(value => value.identity.stableId === road.stableId)
+    .composedInstanceCount, 0);
+
+  const distant = coverage(3);
+  nearVisibleStableIds = [];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: distant.activeDataKeys,
+    renderedKeys: distant.renderedKeys,
+    renderOrigin: distant.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  const afterCommit = presentation.snapshot();
+  const audit = presentation.canonicalAuditSnapshot();
+  const building = audit.find(value => value.identity.stableId === CANONICAL_BUILDING_ID);
+  const publishedRoad = audit.find(value => value.identity.stableId === road.stableId);
+  assert.ok(building.composedInstanceCount > 0);
+  assert.ok(publishedRoad.composedInstanceCount > 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierPending, false);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierReleasedCount, 1);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  assert.deepEqual(afterCommit.runtimePresentationCoverageBarrierLastRelease.ownerKeys, ['5,0']);
+  assert.deepEqual(
+    afterCommit.runtimePresentationCoverageBarrierLastRelease.buildingSources
+      .map(value => value.sourceIdentity),
+    [CANONICAL_BUILDING_ID],
+  );
+  assert.deepEqual(
+    afterCommit.runtimePresentationCoverageBarrierLastRelease.roadSources.map(value => ({
+      sourceIdentity: value.sourceIdentity,
+      projectionIdentity: value.projectionIdentity,
+    })),
+    [{ sourceIdentity: road.sourceStableId, projectionIdentity: road.stableId }],
+  );
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.coverageGapMs, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.blankFrames, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.duplicateFrames, 0);
+
+  assert.equal(await presentation.sync({
+    ...distant,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  for (let frame = 0; frame < 128 && (
+    presentation.snapshot().runtimePresentationHandoffPending
+      || presentation.snapshot().distantPersistentPublicationPending
+  ); frame += 1) {
+    presentation.update(56, 8, distant.renderOrigin);
+    presentation.markFirstDraw();
+  }
+  const completed = presentation.snapshot();
+  assert.equal(completed.runtimePresentationHandoffPending, false);
+  assert.equal(completed.distantPersistentPublicationPending, false);
+  assert.equal(completed.runtimePresentationCoverageBarrierReleasedCount, 1);
+  assert.equal(completed.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(completed.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  assert.equal(completed.duplicateVisibleStableIdCount, 0);
+
+  nearVisibleStableIds = [CANONICAL_BUILDING_ID, road.stableId];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: near.activeDataKeys,
+    renderedKeys: near.renderedKeys,
+    renderOrigin: near.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(await presentation.sync({
+    ...near,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.snapshot().distantPersistentPublicationPending, true);
+  nearVisibleStableIds = [];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: distant.activeDataKeys,
+    renderedKeys: distant.renderedKeys,
+    renderOrigin: distant.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(presentation.snapshot().runtimePresentationCoverageBarrierPending, false,
+    'a live previous generation covers the handoff while persistent publication is pending');
+  assert.equal(await presentation.sync({
+    ...distant,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(await presentation.sync({
+    ...distant,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  for (let frame = 0; frame < 256 && (
+    presentation.snapshot().runtimePresentationHandoffPending
+      || presentation.snapshot().distantPersistentPublicationPending
+  ); frame += 1) {
+    presentation.update(56, 8, distant.renderOrigin);
+    presentation.markFirstDraw();
+  }
+  const superseded = presentation.snapshot();
+  assert.equal(superseded.runtimePresentationHandoffPending, false);
+  assert.equal(superseded.distantPersistentPublicationPending, false);
+  assert.equal(superseded.runtimePresentationCoverageBarrierReleasedCount, 2);
+  assert.equal(superseded.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(superseded.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  assert.equal(superseded.duplicateVisibleStableIdCount, 0);
+  assert.ok(superseded.distantPersistentPublicationCount > 0);
+  t.diagnostic(JSON.stringify(superseded.runtimePresentationCoverageBarrierLastRelease));
+  presentation.dispose();
+});
+
 test('persistent Distant reuses Settlement slots while Natural remains on Static Stream', async t => {
   const ownerX = 5;
   const ownerZ = 0;
