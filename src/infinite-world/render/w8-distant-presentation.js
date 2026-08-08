@@ -120,6 +120,9 @@ const PRESENTATION_SLICE_BUDGET_MS = 8;
 const PRESENTATION_SLICE_UNIT_LIMIT = 256;
 const NATURAL_STREAM_REVEAL_MS = 900;
 const STATIC_TREE_PAGE_FRAME_BUDGET_MS = 3;
+const NATURAL_VISIBILITY_FRAME_BUDGET_MS = 1.5;
+const NATURAL_VISIBILITY_LEAVING_AGE_FRAMES = 8;
+const NATURAL_VISIBILITY_STARVATION_FRAMES = 120;
 const STATIC_TREE_PAGE_UNIT_LIMIT = 512;
 const PERSISTENT_DISTANT_BUCKET_CAPACITY = 4_096;
 const PERSISTENT_NATURAL_MAXIMUM_BUCKET_SLOTS_PER_OWNER = Object.freeze({
@@ -137,6 +140,8 @@ const STATIC_TREE_DISPOSE_BUDGET_MS = 2;
 const STATIC_TREE_OWNER_DISPOSE_LIMIT = 1;
 const STATIC_TREE_OWNER_PUBLICATION_LIMIT = 1;
 const RUNTIME_PRESENTATION_FRAME_BUDGET_MS = PRESENTATION_SLICE_BUDGET_MS;
+const ROAD_PRESENTATION_FRAME_BUDGET_MS = 2;
+const ROAD_PRESENTATION_STARVATION_FRAMES = 120;
 const DISTANT_PERSISTENT_MESH_ADMISSION_LIMIT = 1;
 const DISTANT_PERSISTENT_UPLOAD_BUDGET_BYTES = 512 * 1024;
 const TREE_RENDER_PATH = Object.freeze({
@@ -3226,9 +3231,7 @@ export async function createW8DistantPresentation({
   const isSettlementRoadBucket = bucket => bucket.geometry === '__road__'
     && bucket.material === 'road' && bucket.name === 'road';
 
-  const createSettlementRoadBucketGeometry = (items, generation) => {
-    const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
-    const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
+  const settlementRoadOwnerEntries = items => {
     const itemsByOwner = new Map();
     for (const item of items) {
       const owner = item.object.record.owningChunkCoordinate;
@@ -3237,36 +3240,42 @@ export async function createW8DistantPresentation({
       ownerItems.push(item);
       itemsByOwner.set(key, ownerItems);
     }
-    const parts = [...itemsByOwner.entries()].sort(([left], [right]) => left.localeCompare(right))
-      .map(([ownerKey, ownerItems]) => {
-        const [chunkX, chunkZ] = ownerKey.split(',').map(Number);
-        const roads = ownerItems.map(item => item.object.record);
-        const elevationByStableId = new Map(ownerItems.map(item => [
-          item.object.stableId,
-          item.object.renderRoadElevation,
-        ]));
-        const heightAt = createRoadRibbonHeightSampler(roads, (road, _point, endpoint) => {
-          const elevation = elevationByStableId.get(road.stableId);
-          return endpoint === 'start' ? elevation?.startY : elevation?.endY;
-        });
-        return {
-          ownerKey,
-          meshData: buildSettlementRoadRibbonMeshData({
-            roads,
-            heightAt,
-            originX: generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS,
-            originZ: generation.buildOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS,
-            unitsPerMeter: UNITS_PER_METER,
-            surfaceOffsetMeters: 0.075,
-            clipBounds: {
-              minX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
-              minZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
-              maxX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
-              maxZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
-            },
-          }),
-        };
-      });
+    return [...itemsByOwner.entries()].sort(([left], [right]) => left.localeCompare(right));
+  };
+
+  const buildSettlementRoadOwnerPart = (ownerKey, ownerItems, generation) => {
+    const [chunkX, chunkZ] = ownerKey.split(',').map(Number);
+    const roads = ownerItems.map(item => item.object.record);
+    const elevationByStableId = new Map(ownerItems.map(item => [
+      item.object.stableId,
+      item.object.renderRoadElevation,
+    ]));
+    const heightAt = createRoadRibbonHeightSampler(roads, (road, _point, endpoint) => {
+      const elevation = elevationByStableId.get(road.stableId);
+      return endpoint === 'start' ? elevation?.startY : elevation?.endY;
+    });
+    return {
+      ownerKey,
+      meshData: buildSettlementRoadRibbonMeshData({
+        roads,
+        heightAt,
+        originX: generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS,
+        originZ: generation.buildOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS,
+        unitsPerMeter: UNITS_PER_METER,
+        surfaceOffsetMeters: 0.075,
+        clipBounds: {
+          minX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
+          minZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+          maxX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
+          maxZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
+        },
+      }),
+    };
+  };
+
+  const createSettlementRoadGeometryFromParts = (parts, items, generation) => {
+    const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
+    const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
     const positions = [];
     const normals = [];
     const indices = [];
@@ -3313,6 +3322,25 @@ export async function createW8DistantPresentation({
     return geometry;
   };
 
+  const createSettlementRoadBucketGeometry = (items, generation) => {
+    const parts = settlementRoadOwnerEntries(items).map(([ownerKey, ownerItems]) => (
+      buildSettlementRoadOwnerPart(ownerKey, ownerItems, generation)
+    ));
+    return createSettlementRoadGeometryFromParts(parts, items, generation);
+  };
+
+  const disposeSettlementRoadGeometry = (geometry, generation) => {
+    if (!geometry) return false;
+    if (disposedRoadGeometries.has(geometry)) {
+      roadPresentationDoubleDisposeCount += 1;
+      return false;
+    }
+    disposedRoadGeometries.add(geometry);
+    generation.ownedGeometries.delete(geometry);
+    geometry.dispose?.();
+    return true;
+  };
+
   const replaceSettlementRoadBucketGeometry = (bucket, generation, items) => {
     const signature = items.map(item => item.object.stableId).sort().join('\n');
     if (bucket.roadRibbonSignature === signature && bucket.mesh?.geometry) return false;
@@ -3322,8 +3350,7 @@ export async function createW8DistantPresentation({
     bucket.roadRibbonSignature = signature;
     if (bucket.mesh) bucket.mesh.geometry = geometry;
     if (previous && previous !== geometry) {
-      generation.ownedGeometries.delete(previous);
-      previous.dispose?.();
+      disposeSettlementRoadGeometry(previous, generation);
     }
     return true;
   };
@@ -3804,9 +3831,202 @@ export async function createW8DistantPresentation({
     });
   };
 
+  const activeSettlementRoadItems = (generation, bucket) => {
+    const nearStableIds = generation.nearVisibleStableIds ?? new Set();
+    return bucket.items.filter(item => {
+      const opacity = canonicalInstanceOpacity(item.object, item);
+      return ['mid', 'far'].includes(item.object.visibleLod)
+        && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
+        && opacity > 0;
+    });
+  };
+
+  const settlementRoadWorkRemaining = work => {
+    if (!work || work.done || work.cancelled) return 0;
+    if (work.stage === 'initialize') return 2;
+    if (work.stage === 'owners') {
+      return Math.max(0, work.ownerEntries.length - work.ownerIndex) + 1;
+    }
+    return Number(work.stage === 'publish');
+  };
+
+  const discardSettlementRoadComposeWork = work => {
+    if (!work || work.done || work.cancelled) return 0;
+    const discarded = settlementRoadWorkRemaining(work);
+    work.cancelled = true;
+    roadPresentationSupersededDiscardCount += discarded;
+    if (work.bucket?.pendingRoadComposeSequence === work.sequence) {
+      work.bucket.pendingRoadComposeSequence = null;
+    }
+    return discarded;
+  };
+
+  const createSettlementRoadComposeWork = (generation, bucket) => {
+    const work = {
+      sequence: ++roadPresentationWorkSequence,
+      generation,
+      generationEpoch: generation?.epoch ?? null,
+      bucket,
+      bucketRevision: bucket.roadComposeRevision ?? 0,
+      stage: 'initialize',
+      activeItems: null,
+      signature: null,
+      ownerEntries: [],
+      ownerIndex: 0,
+      parts: [],
+      createdFrame: roadPresentationFrameSequence,
+      accumulatedMs: 0,
+      statsCommitted: false,
+      done: false,
+      cancelled: false,
+    };
+    bucket.pendingRoadComposeSequence = work.sequence;
+    roadPresentationMaximumQueueLength = Math.max(
+      roadPresentationMaximumQueueLength,
+      settlementRoadWorkRemaining(work),
+    );
+    return work;
+  };
+
+  const settlementRoadComposeWorkCurrent = work => (
+    !work.cancelled
+      && work.bucket?.pendingRoadComposeSequence === work.sequence
+      && (work.bucket.roadComposeRevision ?? 0) === work.bucketRevision
+      && (work.generation?.epoch ?? null) === work.generationEpoch
+  );
+
+  const initializeSettlementRoadComposeWork = work => {
+    work.activeItems = activeSettlementRoadItems(work.generation, work.bucket);
+    work.signature = work.activeItems.map(item => item.object.stableId).sort().join('\n');
+    work.ownerEntries = settlementRoadOwnerEntries(work.activeItems);
+    work.ownerIndex = 0;
+    work.parts = [];
+    work.stage = work.bucket.roadRibbonSignature === work.signature
+      && work.bucket.mesh?.geometry ? 'publish' : 'owners';
+    roadPresentationMaximumQueueLength = Math.max(
+      roadPresentationMaximumQueueLength,
+      settlementRoadWorkRemaining(work),
+    );
+  };
+
+  const publishSettlementRoadComposeWork = work => {
+    if (!settlementRoadComposeWorkCurrent(work)) return false;
+    const { bucket, generation } = work;
+    const previous = bucket.roadRibbonGeometry ?? null;
+    let geometry = bucket.mesh?.geometry ?? previous;
+    if (bucket.roadRibbonSignature !== work.signature || !geometry) {
+      geometry = createSettlementRoadGeometryFromParts(
+        work.parts,
+        work.activeItems,
+        generation,
+      );
+      if (!settlementRoadComposeWorkCurrent(work)) {
+        roadPresentationOrphanGeometryCount += 1;
+        disposeSettlementRoadGeometry(geometry, generation);
+        return false;
+      }
+      bucket.roadRibbonGeometry = geometry;
+      bucket.roadRibbonSignature = work.signature;
+      if (bucket.mesh) bucket.mesh.geometry = geometry;
+      if (previous && previous !== geometry) {
+        disposeSettlementRoadGeometry(previous, generation);
+      }
+    }
+    const mesh = bucket.mesh;
+    mesh.count = work.activeItems.length;
+    mesh.userData.visibleInstanceCount = work.activeItems.length;
+    mesh.userData.canonicalStableIds = work.activeItems.map(item => item.object.stableId);
+    mesh.userData.canonicalObjects = work.activeItems.map(item => item.object.record);
+    mesh.userData.canonicalOpacities = work.activeItems.map(item => (
+      canonicalInstanceOpacity(item.object, item)
+    ));
+    mesh.userData.roadRibbon = mesh.geometry.userData?.roadRibbon ?? null;
+    mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
+    work.done = true;
+    work.stage = 'done';
+    if (bucket.pendingRoadComposeSequence === work.sequence) {
+      bucket.pendingRoadComposeSequence = null;
+    }
+    const waitFrames = Math.max(0, roadPresentationFrameSequence - work.createdFrame);
+    roadPresentationMaximumWaitFrames = Math.max(
+      roadPresentationMaximumWaitFrames,
+      waitFrames,
+    );
+    if (waitFrames > ROAD_PRESENTATION_STARVATION_FRAMES) {
+      roadPresentationStarvationCount += 1;
+    }
+    roadPresentationBucketComposeCount += 1;
+    roadPresentationRecordComposeCount += work.activeItems.length;
+    return true;
+  };
+
+  const advanceSettlementRoadComposeWork = (
+    work,
+    {
+      budgetStartedAtMs = monotonicNow(),
+      budgetMs = ROAD_PRESENTATION_FRAME_BUDGET_MS,
+    } = {},
+  ) => {
+    const sliceStartedAt = monotonicNow();
+    let units = 0;
+    let published = false;
+    if (!settlementRoadComposeWorkCurrent(work)) {
+      discardSettlementRoadComposeWork(work);
+      return Object.freeze({
+        done: true,
+        stale: true,
+        matrices: 0,
+        attributes: 0,
+        bytes: 0,
+      });
+    }
+    while (!work.done && !work.cancelled
+      && (units === 0 || monotonicNow() - budgetStartedAtMs < budgetMs)) {
+      const unitStartedAt = monotonicNow();
+      if (work.stage === 'initialize') {
+        initializeSettlementRoadComposeWork(work);
+      } else if (work.stage === 'owners') {
+        const entry = work.ownerEntries[work.ownerIndex];
+        if (entry) {
+          work.parts.push(buildSettlementRoadOwnerPart(entry[0], entry[1], work.generation));
+          work.ownerIndex += 1;
+          roadPresentationOwnerWorkCount += 1;
+        }
+        if (work.ownerIndex >= work.ownerEntries.length) work.stage = 'publish';
+      } else if (work.stage === 'publish') {
+        published = publishSettlementRoadComposeWork(work);
+        if (!published) discardSettlementRoadComposeWork(work);
+      }
+      const unitMs = monotonicNow() - unitStartedAt;
+      work.accumulatedMs += unitMs;
+      if (work.done && !work.statsCommitted) {
+        work.generation.stats.canonicalRoadMatrixComposeMs += work.accumulatedMs;
+        work.statsCommitted = true;
+      }
+      roadPresentationMaximumUnitMs = Math.max(roadPresentationMaximumUnitMs, unitMs);
+      units += 1;
+    }
+    const durationMs = monotonicNow() - sliceStartedAt;
+    roadPresentationMaximumSliceMs = Math.max(roadPresentationMaximumSliceMs, durationMs);
+    roadPresentationMaximumQueueLength = Math.max(
+      roadPresentationMaximumQueueLength,
+      settlementRoadWorkRemaining(work),
+    );
+    return Object.freeze({
+      done: work.done || work.cancelled,
+      stale: work.cancelled && !work.done,
+      matrices: 0,
+      attributes: published ? 2 : 0,
+      bytes: published ? Number(work.bucket.mesh?.geometry?.userData
+        ?.roadRibbon?.uploadBytes ?? 0) : 0,
+    });
+  };
+
   const createCanonicalBucketComposeWork = (generation, bucket) => ({
     generation,
     bucket,
+    roadWork: isSettlementRoadBucket(bucket)
+      ? createSettlementRoadComposeWork(generation, bucket) : null,
     slots: generation.persistentDistant === true && bucket.persistent === true
       ? [...(bucket.dirtySlots ?? [])].sort((left, right) => left - right)
       : null,
@@ -3830,6 +4050,12 @@ export async function createW8DistantPresentation({
     const { generation, bucket } = work;
     const mesh = bucket.mesh;
     if (!mesh) return Object.freeze({ done: true, matrices: 0, attributes: 0 });
+    if (work.roadWork) {
+      return advanceSettlementRoadComposeWork(work.roadWork, {
+        budgetStartedAtMs,
+        budgetMs: Math.min(budgetMs, ROAD_PRESENTATION_FRAME_BUDGET_MS),
+      });
+    }
     const nearStableIds = generation.nearVisibleStableIds ?? new Set();
     let frameMatrices = 0;
     let units = 0;
@@ -4339,6 +4565,252 @@ export async function createW8DistantPresentation({
     return policy;
   };
 
+  const evaluatePersistentNaturalVisibility = (
+    generation,
+    object,
+    playerX,
+    playerZ,
+    nearVisibleStableIds,
+  ) => {
+    const distanceMeters = Math.hypot(object.worldX - playerX, object.worldZ - playerZ);
+    const naturalKind = object.naturalKind;
+    const tree = naturalKind === W8_VEGETATION_LOD_KINDS.TREE;
+    const bush = naturalKind === W8_VEGETATION_LOD_KINDS.BUSH;
+    const grass = naturalKind === W8_VEGETATION_LOD_KINDS.GRASS;
+    const rock = naturalKind === W8_VEGETATION_LOD_KINDS.ROCK;
+    const naturalLodPolicy = object.persistentNaturalLodPolicy
+      ?? (object.persistentNaturalLodPolicy = naturalLodPolicyFor(generation, naturalKind));
+    const exactNaturalVisibility = Number.isFinite(
+      object.persistentNaturalExactVisibilityMeters,
+    ) ? object.persistentNaturalExactVisibilityMeters : (
+        object.persistentNaturalExactVisibilityMeters = Math.min(
+          object.record.lodPolicy
+            ? resolveW8ObjectVisibilityMeters(
+              object.record,
+              generation.renderDistancePreset,
+            )
+            : (generation.renderDistancePolicy
+              ?? resolveW8RenderDistancePolicy(generation.renderDistancePreset))
+              .naturalVisibilityMeters,
+          naturalLodPolicy.visibilityMeters,
+        )
+      );
+    const objectNaturalVisibility = Number.isFinite(
+      object.persistentNaturalVisibilityMeters,
+    ) ? object.persistentNaturalVisibilityMeters : (
+        object.persistentNaturalVisibilityMeters = tree && object.forestHorizonEligible
+          ? Math.max(exactNaturalVisibility, naturalLodPolicy.horizonVisibilityMeters ?? 0)
+          : exactNaturalVisibility
+      );
+    const insideNaturalVisibility = distanceMeters < objectNaturalVisibility;
+    const hasLocalPresentation = object.persistentNaturalHasLocalPresentation
+      ?? object.instances.some(instance => (
+        instance.item.visibilityTiers.includes('full')
+          || instance.item.visibilityTiers.includes('horizon')
+          || instance.item.visibilityTiers.includes('natural-lod')
+      ));
+    let nextLod = 'hidden';
+    if (object.destructible && isFeatureDestroyed(object.stableId)) {
+      nextLod = 'destroyed';
+    } else if (nearVisibleStableIds.has(object.stableId)
+      || (hasLocalPresentation && generation.renderedKeys.has(object.ownerKey))) {
+      nextLod = 'near';
+    } else if (hasLocalPresentation && generation.activeKeys.has(object.ownerKey)
+      && object.record.lodPolicy?.outer !== null && insideNaturalVisibility) {
+      nextLod = 'mid';
+    } else if (hasLocalPresentation && object.farEligible
+      && object.record.lodPolicy?.far !== null && insideNaturalVisibility) {
+      nextLod = 'far';
+    }
+    const distantVisible = nextLod === 'far' || nextLod === 'mid';
+    const naturalBlend = evaluateW8VegetationLodBlend(
+      naturalLodPolicy,
+      distanceMeters,
+      object.naturalBlend ?? {},
+    );
+    if (tree && object.naturalHorizonOnly) {
+      naturalBlend.full = 0;
+      naturalBlend.forest = 0;
+      naturalBlend.atmospheric = 0;
+      naturalBlend.totalOpacity = naturalBlend.horizon;
+      naturalBlend.crossFade = false;
+      naturalBlend.dominantTier = naturalBlend.horizon > 0 ? 'horizon' : null;
+      naturalBlend.visible = naturalBlend.horizon > 0
+        && distanceMeters < naturalLodPolicy.horizonVisibilityMeters;
+    } else if (tree && !object.forestHorizonEligible && naturalBlend.horizon > 0) {
+      naturalBlend.horizon = 0;
+      naturalBlend.totalOpacity = Math.round((
+        naturalBlend.full + naturalBlend.forest + naturalBlend.atmospheric
+      ) * 1e6) / 1e6;
+      naturalBlend.crossFade = Number(naturalBlend.full > 0)
+        + Number(naturalBlend.forest > 0)
+        + Number(naturalBlend.atmospheric > 0) > 1;
+      naturalBlend.visible = naturalBlend.totalOpacity > 0
+        && distanceMeters < exactNaturalVisibility;
+      if (naturalBlend.dominantTier === 'horizon') {
+        naturalBlend.dominantTier = naturalBlend.atmospheric > 0
+          ? 'atmospheric' : naturalBlend.forest > 0 ? 'forest'
+            : naturalBlend.full > 0 ? 'full' : null;
+      }
+    }
+    let presentationTier = distantVisible && naturalBlend.visible ? 'natural-lod' : null;
+    if (nextLod === 'near') {
+      presentationTier = object.record.lodPolicy?.outer === null ? null : 'full';
+    }
+    if (distantVisible && !presentationTier) {
+      nextLod = 'hidden';
+      presentationTier = null;
+    }
+    return {
+      nextLod,
+      presentationTier,
+      naturalBlend,
+      naturalLodPolicy,
+      distanceMeters,
+      distantVisible: nextLod === 'far' || nextLod === 'mid',
+      tree,
+      bush,
+      grass,
+      rock,
+    };
+  };
+
+  const applyPersistentNaturalVisibility = (generation, object, state, sequence) => {
+    const changed = object.visibleLod !== state.nextLod
+      || object.presentationTier !== state.presentationTier;
+    object.localBuildingHandoff = false;
+    if (state.nextLod === 'near') {
+      object.fullPresentationOpacity = state.presentationTier ? 1 : 0;
+      object.horizonPresentationOpacity = 0;
+      object.remotePresentationOpacity = 0;
+    } else {
+      object.remotePresentationOpacity = 0;
+    }
+    object.naturalBlend = state.naturalBlend;
+    object.visibleLod = state.nextLod;
+    object.presentationTier = state.presentationTier;
+    object.visibilitySequence = sequence;
+    if (!changed) return false;
+    for (const instance of object.instances) {
+      if (instance.bucket.persistent === true && Number.isSafeInteger(instance.item.slot)) {
+        instance.bucket.dirtySlots ??= new Set();
+        instance.bucket.dirtySlots.add(instance.item.slot);
+      }
+    }
+    if (state.tree) {
+      generation.treeVisibilityChangeCount = (generation.treeVisibilityChangeCount ?? 0) + 1;
+    }
+    return true;
+  };
+
+  const createPersistentNaturalVisibilityStats = () => ({
+    farCount: 0,
+    midCount: 0,
+    nearCount: 0,
+    hiddenCount: 0,
+    destroyedCount: 0,
+    visibleCount: 0,
+    visibleVegetationCount: 0,
+    visibleTreeCount: 0,
+    visibleShrubCount: 0,
+    visibleGrassCount: 0,
+    visibleRockCount: 0,
+    visibleFullTreeCount: 0,
+    visibleSilhouetteTreeCount: 0,
+    visibleUltraTreeCount: 0,
+    visibleTreePartInstanceCount: 0,
+    visibleTreeMidBandCount: 0,
+    visibleTreeOuterBandCount: 0,
+    visibleTreeUltraInnerBandCount: 0,
+    visibleTreeUltraOuterBandCount: 0,
+    visibleNaturalCrossFadeCount: 0,
+    visibleForestInstanceCount: 0,
+    visibleAtmosphericInstanceCount: 0,
+    visibleForestHorizonInstanceCount: 0,
+    activeOwners: new Set(),
+    renderedOwners: new Set(),
+  });
+
+  const accumulatePersistentNaturalVisibilityStats = (stats, generation, object, state) => {
+    stats[`${state.nextLod}Count`] += 1;
+    if (generation.activeKeys.has(object.ownerKey)) stats.activeOwners.add(object.ownerKey);
+    if (generation.renderedKeys.has(object.ownerKey)) stats.renderedOwners.add(object.ownerKey);
+    if (state.distantVisible) stats.visibleCount += 1;
+    if (!['far', 'mid', 'near'].includes(state.nextLod)) return;
+    if (!state.rock) stats.visibleVegetationCount += 1;
+    if (state.tree) stats.visibleTreeCount += 1;
+    else if (state.bush) stats.visibleShrubCount += 1;
+    else if (state.grass) stats.visibleGrassCount += 1;
+    else if (state.rock) stats.visibleRockCount += 1;
+    if (state.distantVisible && state.naturalBlend.crossFade) {
+      stats.visibleNaturalCrossFadeCount += 1;
+    }
+    if (state.distantVisible && state.naturalBlend.forest > 0) {
+      stats.visibleForestInstanceCount += 1;
+    }
+    if (state.distantVisible && state.naturalBlend.atmospheric > 0) {
+      stats.visibleAtmosphericInstanceCount += 1;
+    }
+    if (state.distantVisible && state.naturalBlend.horizon > 0) {
+      stats.visibleForestHorizonInstanceCount += 1;
+    }
+    if (!state.tree) return;
+    if (state.distantVisible
+      && state.distanceMeters >= state.naturalLodPolicy.fullToForest.maximum
+      && state.distanceMeters < state.naturalLodPolicy.forestToAtmospheric.minimum) {
+      stats.visibleTreeMidBandCount += 1;
+    } else if (state.distantVisible
+      && state.distanceMeters >= state.naturalLodPolicy.forestToAtmospheric.minimum
+      && state.distanceMeters < state.naturalLodPolicy.forestToAtmospheric.maximum) {
+      stats.visibleTreeOuterBandCount += 1;
+    } else if (state.distantVisible
+      && state.distanceMeters >= state.naturalLodPolicy.forestToAtmospheric.maximum
+      && state.distanceMeters < state.naturalLodPolicy.atmosphericFade.minimum) {
+      stats.visibleTreeUltraInnerBandCount += 1;
+    } else if (state.distantVisible
+      && state.distanceMeters >= state.naturalLodPolicy.atmosphericFade.minimum
+      && state.distanceMeters < state.naturalLodPolicy.visibilityMeters) {
+      stats.visibleTreeUltraOuterBandCount += 1;
+    }
+    const dominantTier = state.nextLod === 'near' ? 'full' : state.naturalBlend.dominantTier;
+    if (dominantTier === 'forest') stats.visibleSilhouetteTreeCount += 1;
+    else if (dominantTier === 'atmospheric' || dominantTier === 'horizon') {
+      stats.visibleUltraTreeCount += 1;
+    } else stats.visibleFullTreeCount += 1;
+    stats.visibleTreePartInstanceCount += state.nextLod === 'near'
+      ? object.instances.filter(instance => instance.bucket.name === 'natural-full-tree').length
+      : object.instances.length;
+  };
+
+  const commitPersistentNaturalVisibilityStats = (generation, counters) => {
+    generation.stats.canonicalFarObjectCount = counters.farCount;
+    generation.stats.canonicalMidObjectCount = counters.midCount;
+    generation.stats.canonicalNearObjectCount = counters.nearCount;
+    generation.stats.canonicalHiddenObjectCount = counters.hiddenCount;
+    generation.stats.canonicalDestroyedObjectCount = counters.destroyedCount;
+    generation.stats.canonicalActiveOwnerCount = counters.activeOwners.size;
+    generation.stats.canonicalRenderedOwnerCount = counters.renderedOwners.size;
+    generation.stats.visibleCanonicalObjectCount = counters.visibleCount;
+    generation.stats.visibleCanonicalVegetationCount = counters.visibleVegetationCount;
+    generation.stats.visibleCanonicalTreeCount = counters.visibleTreeCount;
+    generation.stats.visibleCanonicalShrubCount = counters.visibleShrubCount;
+    generation.stats.visibleCanonicalGrassCount = counters.visibleGrassCount;
+    generation.stats.visibleCanonicalRockCount = counters.visibleRockCount;
+    generation.stats.visibleCanonicalFullTreeCount = counters.visibleFullTreeCount;
+    generation.stats.visibleCanonicalSilhouetteTreeCount = counters.visibleSilhouetteTreeCount;
+    generation.stats.visibleCanonicalUltraTreeCount = counters.visibleUltraTreeCount;
+    generation.stats.visibleCanonicalTreePartInstanceCount = counters.visibleTreePartInstanceCount;
+    generation.stats.visibleCanonicalTreeMidBandCount = counters.visibleTreeMidBandCount;
+    generation.stats.visibleCanonicalTreeOuterBandCount = counters.visibleTreeOuterBandCount;
+    generation.stats.visibleCanonicalTreeUltraInnerBandCount = counters.visibleTreeUltraInnerBandCount;
+    generation.stats.visibleCanonicalTreeUltraOuterBandCount = counters.visibleTreeUltraOuterBandCount;
+    generation.stats.visibleCanonicalNaturalCrossFadeCount = counters.visibleNaturalCrossFadeCount;
+    generation.stats.visibleCanonicalForestInstanceCount = counters.visibleForestInstanceCount;
+    generation.stats.visibleCanonicalAtmosphericInstanceCount = counters.visibleAtmosphericInstanceCount;
+    generation.stats.visibleCanonicalForestHorizonInstanceCount =
+      counters.visibleForestHorizonInstanceCount;
+  };
+
   const updateCanonicalVisibility = (
     generation,
     playerX,
@@ -4394,6 +4866,10 @@ export async function createW8DistantPresentation({
     const markObjectDirty = object => {
       for (const instance of object.instances) {
         dirtyBuckets.set(canonicalBucketVisibilityKey(instance.bucket), instance.bucket);
+        if (isSettlementRoadBucket(instance.bucket)) {
+          instance.bucket.roadComposeRevision =
+            (instance.bucket.roadComposeRevision ?? 0) + 1;
+        }
         if (instance.bucket.persistent === true && Number.isSafeInteger(instance.item.slot)) {
           instance.bucket.dirtySlots ??= new Set();
           instance.bucket.dirtySlots.add(instance.item.slot);
@@ -4730,6 +5206,7 @@ export async function createW8DistantPresentation({
   };
 
   let persistentTreeGeneration = null;
+  let persistentNaturalVisibilityRetainedGeneration = null;
   let stagedPersistentNaturalRenderDistancePreset = null;
   const persistentTreePages = new Map();
   const pendingPersistentTreePages = new Map();
@@ -4779,6 +5256,33 @@ export async function createW8DistantPresentation({
   let persistentTreeVisibilityMatrixInvalidationCount = 0;
   let persistentNaturalCoverageApplyCount = 0;
   let persistentNaturalFrameAdvanceCount = 0;
+  let persistentNaturalVisibilityJob = null;
+  let persistentNaturalVisibilitySequence = 0;
+  let persistentNaturalVisibilityObjectRevision = 0;
+  let persistentNaturalVisibilityFrameSequence = 0;
+  let persistentNaturalVisibilityMaximumQueueLength = 0;
+  let persistentNaturalVisibilityMaximumSliceMs = 0;
+  let persistentNaturalVisibilityMaximumUnitMs = 0;
+  let persistentNaturalVisibilityMaximumCoverageWaitFrames = 0;
+  let persistentNaturalVisibilityMaximumEnteringWaitFrames = 0;
+  let persistentNaturalVisibilityMaximumLeavingWaitFrames = 0;
+  let persistentNaturalVisibilitySupersededDiscardCount = 0;
+  let persistentNaturalVisibilityStaleDiscardCount = 0;
+  let persistentNaturalVisibilityStaleApplicationCount = 0;
+  let persistentNaturalVisibilityStarvationCount = 0;
+  let persistentNaturalVisibilityCoverageGapCount = 0;
+  let persistentNaturalVisibilityCompletedSequence = 0;
+  let persistentNaturalVisibilityCompletedInputKey = null;
+  let persistentNaturalVisibilityBaselineStartedCount = 0;
+  let persistentNaturalVisibilityBaselineCompletedCount = 0;
+  let persistentNaturalVisibilityBaselineSynchronousScanCount = 0;
+  let persistentNaturalVisibilityRetainedGenerationReleaseCount = 0;
+  let persistentNaturalVisibilityCoverageBarrier = null;
+  let persistentNaturalVisibilityCoverageBarrierReleasedCount = 0;
+  let persistentNaturalVisibilityCoverageBarrierSupersededCount = 0;
+  let persistentNaturalVisibilityCoverageBarrierSupersededDiscardCount = 0;
+  let persistentNaturalVisibilityCoverageBarrierMaximumLength = 0;
+  let persistentNaturalVisibilityCoverageBarrierMaximumHeldFrames = 0;
   let pendingRuntimePresentationHandoff = null;
   let runtimePresentationHandoffSequence = 0;
   let runtimePresentationHandoffRequestedCount = 0;
@@ -4802,6 +5306,21 @@ export async function createW8DistantPresentation({
   let runtimePresentationCoverageBarrierBlankFrameCount = 0;
   let runtimePresentationCoverageBarrierDuplicateFrameCount = 0;
   let runtimePresentationCoverageBarrierLastRelease = null;
+  let roadPresentationWorkSequence = 0;
+  let roadPresentationFrameSequence = 0;
+  let roadPresentationMaximumQueueLength = 0;
+  let roadPresentationMaximumWaitFrames = 0;
+  let roadPresentationMaximumSliceMs = 0;
+  let roadPresentationMaximumUnitMs = 0;
+  let roadPresentationOwnerWorkCount = 0;
+  let roadPresentationBucketComposeCount = 0;
+  let roadPresentationRecordComposeCount = 0;
+  let roadPresentationSupersededDiscardCount = 0;
+  let roadPresentationStalePublishCount = 0;
+  let roadPresentationStarvationCount = 0;
+  let roadPresentationOrphanGeometryCount = 0;
+  let roadPresentationDoubleDisposeCount = 0;
+  const disposedRoadGeometries = new WeakSet();
 
   const recordPersistentTreeFrameSample = sample => {
     if (!streamingTelemetry) return;
@@ -4875,7 +5394,454 @@ export async function createW8DistantPresentation({
       })])),
       naturalPolicyCoverageProvided: false,
       surfacePolicy: currentCanonicalSurfacePolicy,
+      visibilityDesiredInput: null,
+      visibilityBaselineComplete: false,
+      visibilityBaselineOwnerKeys: new Set(),
     };
+  };
+
+  const persistentNaturalVisibilityInputKey = (generation, nearSignature) => [
+    generation.renderDistancePreset,
+    persistentTreeStateRevision ?? '',
+    persistentNaturalVisibilityObjectRevision,
+    generation.playerX,
+    generation.playerZ,
+    nearSignature,
+    sortedKeyList(generation.activeKeys).join('|'),
+    sortedKeyList(generation.renderedKeys).join('|'),
+  ].join('::');
+
+  const persistentNaturalStableIdsForOwners = ownerKeys => {
+    const stableIds = [];
+    for (const ownerKey of sortedKeyList(ownerKeys)) {
+      stableIds.push(...(persistentTreePages.get(ownerKey)?.stableIds ?? []));
+    }
+    return stableIds;
+  };
+
+  const persistentNaturalVisibilityQueueLength = job => {
+    if (!job) return 0;
+    return Math.max(0, job.coverageIds.length - job.coverageIndex)
+      + Math.max(0, job.enteringIds.length - job.enteringIndex)
+      + Math.max(0, job.leavingIds.length - job.leavingIndex)
+      + Math.max(0, job.scanRemaining);
+  };
+
+  const persistentNaturalCoverageBlocksStableIds = stableIds => (
+    persistentNaturalVisibilityCoverageBarrier?.generation === persistentTreeGeneration
+      && stableIds.some(stableId => (
+        persistentNaturalVisibilityCoverageBarrier.stableIds.has(stableId)
+      ))
+  );
+
+  const persistentNaturalBaselineBlocksStableIds = stableIds => {
+    const job = persistentNaturalVisibilityJob;
+    return job?.baseline === true && job.generation === persistentTreeGeneration
+      && stableIds.some(stableId => (
+        (persistentTreeGeneration.canonicalObjects.get(stableId)?.visibilitySequence ?? 0)
+          < job.sequence
+      ));
+  };
+
+  const startPersistentNaturalVisibilityJob = (
+    generation,
+    nearState = readNearVisibleSnapshotState(),
+    { reason = 'dirty', force = false, baseline = false } = {},
+  ) => {
+    if (!generation || generation !== persistentTreeGeneration) return null;
+    const inputKey = persistentNaturalVisibilityInputKey(generation, nearState.signature);
+    if (!force && persistentNaturalVisibilityJob?.inputKey === inputKey) {
+      persistentNaturalVisibilityJob.playerX = generation.playerX;
+      persistentNaturalVisibilityJob.playerZ = generation.playerZ;
+      persistentTreeVisibilityDirty = false;
+      return persistentNaturalVisibilityJob;
+    }
+    if (!force && !persistentNaturalVisibilityJob
+      && persistentNaturalVisibilityCompletedInputKey === inputKey) {
+      persistentTreeVisibilityDirty = false;
+      return null;
+    }
+    const previousInput = generation.visibilityDesiredInput ?? {
+      nearVisibleStableIds: generation.nearVisibleStableIds ?? new Set(),
+      activeKeys: new Set(),
+      renderedKeys: new Set(),
+    };
+    const nearVisibleStableIds = new Set(nearState.stableIds);
+    const activeKeys = new Set(generation.activeKeys);
+    const renderedKeys = new Set(generation.renderedKeys);
+    const unique = values => [...new Set(values)].filter(stableId => (
+      generation.canonicalObjects.has(stableId)
+    ));
+    const carriedCoverageIds = persistentNaturalVisibilityCoverageBarrier?.generation === generation
+      ? [...persistentNaturalVisibilityCoverageBarrier.stableIds]
+        .filter(stableId => !nearVisibleStableIds.has(stableId))
+      : [];
+    const nearEnteringDistant = baseline ? [] : [...previousInput.nearVisibleStableIds]
+      .filter(stableId => !nearVisibleStableIds.has(stableId));
+    const nearEnteringNear = baseline ? [] : [...nearVisibleStableIds]
+      .filter(stableId => !previousInput.nearVisibleStableIds.has(stableId));
+    const activeEnteringOwners = baseline ? new Set() : new Set([...activeKeys]
+      .filter(ownerKey => !previousInput.activeKeys.has(ownerKey) && !renderedKeys.has(ownerKey)));
+    const renderedEnteringOwners = baseline ? new Set() : new Set([...renderedKeys]
+      .filter(ownerKey => !previousInput.renderedKeys.has(ownerKey)));
+    const leavingOwners = baseline ? new Set() : new Set([
+      ...[...previousInput.activeKeys].filter(ownerKey => !activeKeys.has(ownerKey)),
+      ...[...previousInput.renderedKeys].filter(ownerKey => !renderedKeys.has(ownerKey)),
+    ]);
+    const coverageIds = unique([...carriedCoverageIds, ...nearEnteringDistant]);
+    const coverageSet = new Set(coverageIds);
+    const enteringIds = unique(persistentNaturalStableIdsForOwners(activeEnteringOwners))
+      .filter(stableId => !coverageSet.has(stableId));
+    const enteringSet = new Set(enteringIds);
+    const leavingIds = unique([
+      ...nearEnteringNear,
+      ...persistentNaturalStableIdsForOwners(renderedEnteringOwners),
+      ...persistentNaturalStableIdsForOwners(leavingOwners),
+    ]).filter(stableId => !coverageSet.has(stableId) && !enteringSet.has(stableId));
+    if (persistentNaturalVisibilityJob) {
+      persistentNaturalVisibilitySupersededDiscardCount +=
+        persistentNaturalVisibilityQueueLength(persistentNaturalVisibilityJob);
+    }
+    const sequence = ++persistentNaturalVisibilitySequence;
+    if (persistentNaturalVisibilityCoverageBarrier?.generation === generation) {
+      for (const stableId of persistentNaturalVisibilityCoverageBarrier.stableIds) {
+        if (nearVisibleStableIds.has(stableId) || !generation.canonicalObjects.has(stableId)) {
+          persistentNaturalVisibilityCoverageBarrier.stableIds.delete(stableId);
+        }
+      }
+      if (persistentNaturalVisibilityCoverageBarrier.stableIds.size === 0) {
+        persistentNaturalVisibilityCoverageBarrierReleasedCount += 1;
+        persistentNaturalVisibilityCoverageBarrier = null;
+      }
+    }
+    if (coverageIds.length > 0) {
+      if (persistentNaturalVisibilityCoverageBarrier) {
+        persistentNaturalVisibilityCoverageBarrierSupersededCount += 1;
+      }
+      persistentNaturalVisibilityCoverageBarrier = {
+        generation,
+        sequence,
+        stableIds: new Set(coverageIds),
+        createdFrame: persistentNaturalVisibilityFrameSequence,
+        allowHiddenRelease: false,
+      };
+      persistentNaturalVisibilityCoverageBarrierMaximumLength = Math.max(
+        persistentNaturalVisibilityCoverageBarrierMaximumLength,
+        coverageIds.length,
+      );
+    } else if (persistentNaturalVisibilityCoverageBarrier?.generation !== generation) {
+      persistentNaturalVisibilityCoverageBarrier = null;
+    }
+    const job = {
+      sequence,
+      generation,
+      inputKey,
+      reason,
+      baseline,
+      playerX: generation.playerX,
+      playerZ: generation.playerZ,
+      nearVisibleStableIds,
+      nearSignature: nearState.signature,
+      activeKeys,
+      renderedKeys,
+      objectRevision: persistentNaturalVisibilityObjectRevision,
+      coverageIds,
+      coverageIndex: 0,
+      enteringIds,
+      enteringIndex: 0,
+      leavingIds,
+      leavingIndex: 0,
+      leavingSet: new Set(leavingIds),
+      scanRemaining: generation.canonicalObjects.size,
+      scanIterator: generation.canonicalObjects.keys(),
+      agedLeavingServedFrame: -1,
+      processedIds: new Set(),
+      stats: createPersistentNaturalVisibilityStats(),
+      createdFrame: persistentNaturalVisibilityFrameSequence,
+      commitStats: true,
+    };
+    generation.visibilityDesiredInput = {
+      nearVisibleStableIds,
+      activeKeys,
+      renderedKeys,
+    };
+    generation.nearVisibleStableIds = nearVisibleStableIds;
+    generation.nearVisibleStableSignature = nearState.signature;
+    persistentNaturalVisibilityJob = job;
+    if (baseline) {
+      generation.visibilityBaselineComplete = false;
+      persistentNaturalVisibilityBaselineStartedCount += 1;
+    }
+    persistentTreeVisibilityDirty = false;
+    persistentNaturalVisibilityMaximumQueueLength = Math.max(
+      persistentNaturalVisibilityMaximumQueueLength,
+      persistentNaturalVisibilityQueueLength(job),
+    );
+    return job;
+  };
+
+  const nextPersistentNaturalVisibilityCandidate = job => {
+    const nextFrom = (values, indexName, source) => {
+      while (job[indexName] < values.length) {
+        const stableId = values[job[indexName]++];
+        if (!job.processedIds.has(stableId)) return { stableId, source };
+      }
+      return null;
+    };
+    const coverage = nextFrom(job.coverageIds, 'coverageIndex', 'coverage');
+    if (coverage) return coverage;
+    const entering = nextFrom(job.enteringIds, 'enteringIndex', 'entering');
+    if (entering) return entering;
+    const ageFrames = persistentNaturalVisibilityFrameSequence - job.createdFrame;
+    if (ageFrames >= NATURAL_VISIBILITY_LEAVING_AGE_FRAMES
+      && job.agedLeavingServedFrame !== persistentNaturalVisibilityFrameSequence) {
+      const agedLeaving = nextFrom(job.leavingIds, 'leavingIndex', 'leaving');
+      if (agedLeaving) {
+        job.agedLeavingServedFrame = persistentNaturalVisibilityFrameSequence;
+        return agedLeaving;
+      }
+    }
+    while (job.scanRemaining > 0) {
+      let next = job.scanIterator.next();
+      if (next.done) {
+        job.scanIterator = job.generation.canonicalObjects.keys();
+        next = job.scanIterator.next();
+        if (next.done) {
+          job.scanRemaining = 0;
+          break;
+        }
+      }
+      job.scanRemaining -= 1;
+      const stableId = next.value;
+      return {
+        stableId,
+        source: 'scan',
+        skipped: job.processedIds.has(stableId) || job.leavingSet.has(stableId),
+      };
+    }
+    return nextFrom(job.leavingIds, 'leavingIndex', 'leaving');
+  };
+
+  const processPersistentNaturalVisibility = (generation, budgetMs) => {
+    if (!generation || generation !== persistentTreeGeneration || !(budgetMs > 0)) {
+      return Object.freeze({ processed: 0, remaining: persistentNaturalVisibilityQueueLength(
+        persistentNaturalVisibilityJob,
+      ), durationMs: 0 });
+    }
+    const startedAt = monotonicNow();
+    persistentNaturalVisibilityFrameSequence += 1;
+    updateNaturalLodPlayerUniforms(generation, generation.playerX, generation.playerZ);
+    if (persistentNaturalVisibilityJob
+      && (persistentNaturalVisibilityJob.playerX !== generation.playerX
+        || persistentNaturalVisibilityJob.playerZ !== generation.playerZ)) {
+      persistentNaturalVisibilitySupersededDiscardCount +=
+        persistentNaturalVisibilityQueueLength(persistentNaturalVisibilityJob);
+      persistentNaturalVisibilityJob.playerX = generation.playerX;
+      persistentNaturalVisibilityJob.playerZ = generation.playerZ;
+      persistentNaturalVisibilityJob.sequence = ++persistentNaturalVisibilitySequence;
+      if (persistentNaturalVisibilityCoverageBarrier?.generation === generation) {
+        persistentNaturalVisibilityCoverageBarrier.sequence =
+          persistentNaturalVisibilityJob.sequence;
+        persistentNaturalVisibilityCoverageBarrier.allowHiddenRelease = true;
+        persistentNaturalVisibilityCoverageBarrierSupersededCount += 1;
+      }
+      persistentNaturalVisibilityJob.inputKey = persistentNaturalVisibilityInputKey(
+        generation,
+        persistentNaturalVisibilityJob.nearSignature,
+      );
+      persistentNaturalVisibilityJob.coverageIds = [
+        ...(persistentNaturalVisibilityCoverageBarrier?.generation === generation
+          ? persistentNaturalVisibilityCoverageBarrier.stableIds : []),
+      ];
+      persistentNaturalVisibilityJob.coverageIndex = 0;
+      persistentNaturalVisibilityJob.scanRemaining = generation.canonicalObjects.size;
+      persistentNaturalVisibilityJob.scanIterator = generation.canonicalObjects.keys();
+      persistentNaturalVisibilityJob.processedIds = new Set();
+      persistentNaturalVisibilityJob.stats = createPersistentNaturalVisibilityStats();
+      persistentNaturalVisibilityJob.commitStats = true;
+    }
+    if (persistentTreeVisibilityDirty) {
+      startPersistentNaturalVisibilityJob(generation, readNearVisibleSnapshotState(), {
+        baseline: persistentNaturalVisibilityJob?.baseline === true,
+      });
+    } else if (!persistentNaturalVisibilityJob) {
+      const nearState = readNearVisibleSnapshotState();
+      if (persistentNaturalVisibilityCompletedInputKey
+        !== persistentNaturalVisibilityInputKey(generation, nearState.signature)) {
+        startPersistentNaturalVisibilityJob(generation, nearState, { reason: 'player' });
+      }
+    }
+    const job = persistentNaturalVisibilityJob;
+    if (!job) return Object.freeze({ processed: 0, remaining: 0, durationMs: 0 });
+    if (job.generation !== generation
+      || job.objectRevision !== persistentNaturalVisibilityObjectRevision) {
+      persistentNaturalVisibilityStaleDiscardCount += persistentNaturalVisibilityQueueLength(job);
+      persistentNaturalVisibilityJob = null;
+      startPersistentNaturalVisibilityJob(generation, readNearVisibleSnapshotState(), {
+        reason: 'object-revision',
+        force: true,
+        baseline: job.baseline === true,
+      });
+      return Object.freeze({
+        processed: 0,
+        remaining: persistentNaturalVisibilityQueueLength(persistentNaturalVisibilityJob),
+        durationMs: monotonicNow() - startedAt,
+      });
+    }
+    let processed = 0;
+    let attempted = 0;
+    while (attempted === 0 || monotonicNow() - startedAt < budgetMs) {
+      if (persistentNaturalVisibilityJob !== job || job.generation !== persistentTreeGeneration) {
+        persistentNaturalVisibilityStaleDiscardCount += 1;
+        break;
+      }
+      const unitStartedAt = monotonicNow();
+      const finishUnit = () => {
+        persistentNaturalVisibilityMaximumUnitMs = Math.max(
+          persistentNaturalVisibilityMaximumUnitMs,
+          monotonicNow() - unitStartedAt,
+        );
+      };
+      const candidate = nextPersistentNaturalVisibilityCandidate(job);
+      if (!candidate) break;
+      attempted += 1;
+      if (candidate.skipped) {
+        finishUnit();
+        continue;
+      }
+      const object = generation.canonicalObjects.get(candidate.stableId);
+      if (!object) {
+        finishUnit();
+        continue;
+      }
+      if ((object.visibilitySequence ?? 0) > job.sequence) {
+        persistentNaturalVisibilityStaleApplicationCount += 1;
+        finishUnit();
+        continue;
+      }
+      job.processedIds.add(candidate.stableId);
+      const state = evaluatePersistentNaturalVisibility(
+        generation,
+        object,
+        job.playerX,
+        job.playerZ,
+        job.nearVisibleStableIds,
+      );
+      applyPersistentNaturalVisibility(generation, object, state, job.sequence);
+      if (job.commitStats) {
+        accumulatePersistentNaturalVisibilityStats(job.stats, generation, object, state);
+      }
+      const waitFrames = persistentNaturalVisibilityFrameSequence - job.createdFrame;
+      if (candidate.source === 'coverage') {
+        persistentNaturalVisibilityMaximumCoverageWaitFrames = Math.max(
+          persistentNaturalVisibilityMaximumCoverageWaitFrames,
+          waitFrames,
+        );
+      } else if (candidate.source === 'entering') {
+        persistentNaturalVisibilityMaximumEnteringWaitFrames = Math.max(
+          persistentNaturalVisibilityMaximumEnteringWaitFrames,
+          waitFrames,
+        );
+      } else if (candidate.source === 'leaving') {
+        persistentNaturalVisibilityMaximumLeavingWaitFrames = Math.max(
+          persistentNaturalVisibilityMaximumLeavingWaitFrames,
+          waitFrames,
+        );
+        if (waitFrames > NATURAL_VISIBILITY_STARVATION_FRAMES) {
+          persistentNaturalVisibilityStarvationCount += 1;
+        }
+      }
+      processed += 1;
+      finishUnit();
+    }
+    const remaining = persistentNaturalVisibilityQueueLength(job);
+    persistentNaturalVisibilityMaximumQueueLength = Math.max(
+      persistentNaturalVisibilityMaximumQueueLength,
+      remaining,
+    );
+    if (remaining === 0 && persistentNaturalVisibilityJob === job) {
+      if (job.commitStats) commitPersistentNaturalVisibilityStats(generation, job.stats);
+      persistentNaturalVisibilityCompletedSequence = job.sequence;
+      persistentNaturalVisibilityCompletedInputKey = job.inputKey;
+      if (job.baseline) {
+        generation.visibilityBaselineComplete = true;
+        persistentNaturalVisibilityBaselineCompletedCount += 1;
+      }
+      persistentNaturalVisibilityJob = null;
+    }
+    if (processed > 0) {
+      generation.treeLastUpdateAtMs = monotonicNow();
+      if (treeLodDiagnosticsEnabled && !generation.treeLodDiagnostics) {
+        createTreeLodDiagnostics(generation);
+      } else if (generation.treeLodDiagnostics) {
+        updateTreeLodDiagnostics(generation);
+      }
+    }
+    const durationMs = monotonicNow() - startedAt;
+    persistentNaturalVisibilityMaximumSliceMs = Math.max(
+      persistentNaturalVisibilityMaximumSliceMs,
+      durationMs,
+    );
+    return Object.freeze({ processed, remaining, durationMs });
+  };
+
+  const releaseComposedPersistentNaturalCoverage = generation => {
+    const barrier = persistentNaturalVisibilityCoverageBarrier;
+    if (!barrier || barrier.generation !== generation) return 0;
+    const nearVisibleStableIds = readNearVisibleSnapshotState().stableIds;
+    let released = 0;
+    for (const stableId of barrier.stableIds) {
+      if (nearVisibleStableIds.has(stableId)) {
+        barrier.stableIds.delete(stableId);
+        released += 1;
+        continue;
+      }
+      const object = generation.canonicalObjects.get(stableId);
+      if (!object || (object.visibilitySequence ?? 0) < barrier.sequence) continue;
+      const stillDirty = object.instances.some(instance => (
+        instance.bucket.dirtySlots?.has(instance.item.slot)
+      ));
+      if (stillDirty) continue;
+      const distantVisible = (object.visibleLod === 'far' || object.visibleLod === 'mid')
+        && object.presentationTier !== null
+        && object.instances.some(instance => canonicalInstanceOpacity(object, instance.item) > 0);
+      if (!distantVisible) {
+        if (barrier.allowHiddenRelease) {
+          barrier.stableIds.delete(stableId);
+          persistentNaturalVisibilityCoverageBarrierSupersededDiscardCount += 1;
+          released += 1;
+          continue;
+        }
+        persistentNaturalVisibilityCoverageGapCount += 1;
+        continue;
+      }
+      barrier.stableIds.delete(stableId);
+      released += 1;
+    }
+    if (barrier.stableIds.size === 0) {
+      persistentNaturalVisibilityCoverageBarrierReleasedCount += 1;
+      persistentNaturalVisibilityCoverageBarrierMaximumHeldFrames = Math.max(
+        persistentNaturalVisibilityCoverageBarrierMaximumHeldFrames,
+        persistentNaturalVisibilityFrameSequence - barrier.createdFrame,
+      );
+      persistentNaturalVisibilityCoverageBarrier = null;
+    }
+    return released;
+  };
+
+  const releasePersistentNaturalBaselineCoverage = generation => {
+    if (!persistentNaturalVisibilityRetainedGeneration
+      || generation !== persistentTreeGeneration
+      || generation?.visibilityBaselineComplete !== true
+      || persistentNaturalVisibilityCoverageBarrier) return false;
+    const ownersReady = [...generation.visibilityBaselineOwnerKeys].every(ownerKey => (
+      persistentTreePublishedOwners.has(ownerKey) || !persistentTreePages.has(ownerKey)
+    ));
+    if (!ownersReady) return false;
+    deferGenerationDispose(persistentNaturalVisibilityRetainedGeneration);
+    persistentNaturalVisibilityRetainedGeneration = null;
+    persistentNaturalVisibilityRetainedGenerationReleaseCount += 1;
+    return true;
   };
 
   const applyPersistentNaturalRenderDistancePreset = renderDistancePreset => {
@@ -4978,10 +5944,12 @@ export async function createW8DistantPresentation({
     if (persistentTreeGeneration.activeDataKeysIdentity !== activeDataKeys) {
       persistentTreeGeneration.activeDataKeysIdentity = activeDataKeys;
       persistentTreeGeneration.activeKeys = new Set(activeDataKeys);
+      persistentTreeVisibilityDirty = true;
     }
     if (persistentTreeGeneration.renderedKeysIdentity !== renderedKeys) {
       persistentTreeGeneration.renderedKeysIdentity = renderedKeys;
       persistentTreeGeneration.renderedKeys = new Set(renderedKeys);
+      persistentTreeVisibilityDirty = true;
     }
     const retained = persistentTreeRetainedOwnerKeys;
     for (const page of readyPages) {
@@ -5000,7 +5968,9 @@ export async function createW8DistantPresentation({
       if (existing?.resourceKind === page.resourceKind
         && existing.contentHash === (page.value?.contentHash ?? null)) {
         persistentTreeOwnerReuseCount += 1;
-        if (persistentTreePublishedOwners.has(page.ownerKey)) {
+        if (persistentTreePublishedOwners.has(page.ownerKey)
+          && !persistentNaturalCoverageBlocksStableIds(existing.stableIds)
+          && !persistentNaturalBaselineBlocksStableIds(existing.stableIds)) {
           publishStaticOwnerTickets?.({
             ownerKeys: Object.freeze([page.ownerKey]),
             publicationGroup: 'natural-static',
@@ -5255,6 +6225,8 @@ export async function createW8DistantPresentation({
     pendingPersistentTreePublications.delete(ownerKey);
     persistentTreePublishedOwners.delete(ownerKey);
     persistentTreeOwnerDisposeCount += 1;
+    persistentNaturalVisibilityObjectRevision += 1;
+    persistentTreeVisibilityDirty = true;
     return true;
   };
 
@@ -5371,8 +6343,18 @@ export async function createW8DistantPresentation({
       scheduler,
     });
     const stableIds = stagedGeneration.currentPageStableIds;
+    for (const object of stagedGeneration.canonicalObjects.values()) {
+      object.persistentNaturalHasLocalPresentation = false;
+    }
     for (const bucket of stagedGeneration.canonicalBuckets.values()) {
-      for (const item of bucket.items) item.object.instances.push({ bucket, item });
+      for (const item of bucket.items) {
+        item.object.instances.push({ bucket, item });
+        if (item.visibilityTiers.includes('full')
+          || item.visibilityTiers.includes('horizon')
+          || item.visibilityTiers.includes('natural-lod')) {
+          item.object.persistentNaturalHasLocalPresentation = true;
+        }
+      }
     }
     updateCanonicalVisibility(
       stagedGeneration,
@@ -5380,6 +6362,21 @@ export async function createW8DistantPresentation({
       generation.playerZ,
       { compose: false, objectStableIds: stableIds, updateStats: false },
     );
+    for (const object of stagedGeneration.canonicalObjects.values()) {
+      const naturalLodPolicy = naturalLodPolicyFor(generation, object.naturalKind);
+      const exactNaturalVisibility = Math.min(
+        object.record.lodPolicy
+          ? resolveW8ObjectVisibilityMeters(object.record, generation.renderDistancePreset)
+          : generation.renderDistancePolicy.naturalVisibilityMeters,
+        naturalLodPolicy.visibilityMeters,
+      );
+      object.persistentNaturalLodPolicy = naturalLodPolicy;
+      object.persistentNaturalExactVisibilityMeters = exactNaturalVisibility;
+      object.persistentNaturalVisibilityMeters = object.naturalKind
+          === W8_VEGETATION_LOD_KINDS.TREE && object.forestHorizonEligible
+        ? Math.max(exactNaturalVisibility, naturalLodPolicy.horizonVisibilityMeters ?? 0)
+        : exactNaturalVisibility;
+    }
 
     const previousPage = persistentTreePages.get(page.ownerKey) ?? null;
     const previousStableIds = new Set(previousPage?.stableIds ?? []);
@@ -5496,6 +6493,8 @@ export async function createW8DistantPresentation({
       contentHash: page.value.contentHash ?? null,
       stableIds: Object.freeze(stableIds),
     }));
+    persistentNaturalVisibilityObjectRevision += 1;
+    persistentTreeVisibilityDirty = true;
     pendingPersistentTreePublications.set(page.ownerKey, { page, stableIds });
     if (!streamingTelemetry) {
       persistentTreeOwnerBuildCount += 1;
@@ -5573,7 +6572,9 @@ export async function createW8DistantPresentation({
           instance.bucket.dirtySlots?.has(instance.item.slot)
         )) === true;
       });
-      if (stillDirty) continue;
+      if (stillDirty
+        || persistentNaturalCoverageBlocksStableIds(pending.stableIds)
+        || persistentNaturalBaselineBlocksStableIds(pending.stableIds)) continue;
       pendingPersistentTreePublications.delete(ownerKey);
       publishPersistentNaturalOwner(pending.page, pending.stableIds, composeResult);
       published += 1;
@@ -5624,6 +6625,11 @@ export async function createW8DistantPresentation({
       bufferRangeUpdates: 0,
       bufferUploadBytes: 0,
       visibilityMs: 0,
+      visibilityQueueBefore: persistentNaturalVisibilityQueueLength(
+        persistentNaturalVisibilityJob,
+      ),
+      visibilityQueueAfter: 0,
+      visibilityObjectsProcessed: 0,
       composeMs: 0,
       disposeMs: 0,
       buildMs: 0,
@@ -5640,6 +6646,9 @@ export async function createW8DistantPresentation({
       frameSample.pendingPagesAfter = pendingPersistentTreePages.size;
       frameSample.pendingPublicationsAfter = pendingPersistentTreePublications.size;
       frameSample.disposeBacklogAfter = persistentTreeDisposeOwners.length;
+      frameSample.visibilityQueueAfter = persistentNaturalVisibilityQueueLength(
+        persistentNaturalVisibilityJob,
+      );
       frameSample.totalMs = monotonicNow() - frameSample.startedAtMs;
       recordPersistentTreeFrameSample(frameSample);
       if (diagnosticsEnabled) recordDiagnosticWork('persistent-natural-frame', {
@@ -5662,6 +6671,9 @@ export async function createW8DistantPresentation({
         allocatedInstances: frameSample.allocatedInstances,
         allocatedBuckets: frameSample.allocatedBuckets,
         visibilityMs: frameSample.visibilityMs,
+        visibilityQueueBefore: frameSample.visibilityQueueBefore,
+        visibilityQueueAfter: frameSample.visibilityQueueAfter,
+        visibilityObjectsProcessed: frameSample.visibilityObjectsProcessed,
         composeMs: frameSample.composeMs,
         disposeMs: frameSample.disposeMs,
         buildMs: frameSample.buildMs,
@@ -5696,22 +6708,12 @@ export async function createW8DistantPresentation({
     const dirtyBeforeVisibility = streamingTelemetry || diagnosticsEnabled
       ? dirtySlotCount() : 0;
     const visibilityStartedAt = monotonicNow();
+    let visibilityWork = Object.freeze({ processed: 0, remaining: 0, durationMs: 0 });
     if (withinBudget()) {
-      if (persistentTreeVisibilityDirty) {
-        updateCanonicalVisibility(
-          persistentTreeGeneration,
-          persistentTreeGeneration.playerX,
-          persistentTreeGeneration.playerZ,
-          { compose: false },
-        );
-        persistentTreeVisibilityDirty = false;
-      } else {
-        updateNaturalLodPlayerUniforms(
-          persistentTreeGeneration,
-          persistentTreeGeneration.playerX,
-          persistentTreeGeneration.playerZ,
-        );
-      }
+      visibilityWork = processPersistentNaturalVisibility(
+        persistentTreeGeneration,
+        Math.min(NATURAL_VISIBILITY_FRAME_BUDGET_MS, remainingBudgetMs()),
+      );
     }
     const visibilityMs = monotonicNow() - visibilityStartedAt;
     const visibilityInvalidations = streamingTelemetry || diagnosticsEnabled
@@ -5737,12 +6739,16 @@ export async function createW8DistantPresentation({
         bufferUploadBytes: 0,
         durationMs: 0,
       });
+    releaseComposedPersistentNaturalCoverage(persistentTreeGeneration);
     const publishedOwners = flushPersistentNaturalPublications(composeResult, {
       limit: STATIC_TREE_OWNER_PUBLICATION_LIMIT,
       canContinue: withinBudget,
     });
+    releasePersistentNaturalBaselineCoverage(persistentTreeGeneration);
     if (frameSample) {
       frameSample.visibilityMs = visibilityMs;
+      frameSample.visibilityObjectsProcessed = visibilityWork.processed;
+      frameSample.visibilityQueueAfter = visibilityWork.remaining;
       frameSample.visibilityMatrixInvalidations = visibilityInvalidations;
       frameSample.composeMs = composeResult.durationMs;
       frameSample.matrixUpdates = composeResult.matrices;
@@ -5878,6 +6884,13 @@ export async function createW8DistantPresentation({
       releasedAtMs: null,
       released: false,
       retryCount: carriedBarrier?.retryCount ?? 0,
+      prepared: false,
+      composeFinished: false,
+      roadWorks: [],
+      roadWorkIndex: 0,
+      composedBuckets: 0,
+      matrixUpdates: 0,
+      bufferUpdates: 0,
     };
     runtimePresentationCoverageBarrierRequestedCount += 1;
     recordDiagnosticEvent('near-distant-coverage-barrier-created', {
@@ -5909,6 +6922,28 @@ export async function createW8DistantPresentation({
     return Object.freeze({ covered: missing.length === 0, missing: Object.freeze(missing) });
   };
 
+  const discardRuntimePresentationBarrierRoadWork = barrier => {
+    if (!barrier) return 0;
+    let discarded = 0;
+    for (const work of barrier.roadWorks ?? []) {
+      discarded += discardSettlementRoadComposeWork(work);
+    }
+    barrier.roadWorks = [];
+    barrier.roadWorkIndex = 0;
+    return discarded;
+  };
+
+  const resetRuntimePresentationCoverageBarrierWork = (barrier, generation) => {
+    discardRuntimePresentationBarrierRoadWork(barrier);
+    barrier.generation = generation;
+    barrier.generationEpoch = generation?.epoch ?? null;
+    barrier.prepared = false;
+    barrier.composeFinished = false;
+    barrier.composedBuckets = 0;
+    barrier.matrixUpdates = 0;
+    barrier.bufferUpdates = 0;
+  };
+
   const publishRuntimePresentationCoverageBarrier = ({
     generation,
     barrier,
@@ -5918,51 +6953,99 @@ export async function createW8DistantPresentation({
     playerLogicalZ,
   }) => {
     if (!generation || !barrier || barrier.released) return false;
-    generation.activeKeys = new Set(activeDataKeys);
-    generation.renderedKeys = new Set(renderedKeys);
-    updateCanonicalVisibility(
-      generation,
-      playerLogicalX,
-      playerLogicalZ,
-      { compose: false },
-    );
-    const descriptorIds = new Set(barrier.descriptors.map(value => value.stableId));
-    const criticalBuckets = new Set();
-    for (const stableId of descriptorIds) {
-      const object = generation.canonicalObjects.get(stableId);
-      for (const instance of object?.instances ?? []) {
-        criticalBuckets.add(instance.bucket);
-        if (instance.bucket.persistent === true && Number.isSafeInteger(instance.item.slot)) {
-          instance.bucket.dirtySlots ??= new Set();
-          instance.bucket.dirtySlots.add(instance.item.slot);
+    if (barrier.prepared && (barrier.generation !== generation
+      || barrier.generationEpoch !== (generation.epoch ?? null))) {
+      resetRuntimePresentationCoverageBarrierWork(barrier, generation);
+    }
+    if (!barrier.prepared) {
+      generation.activeKeys = new Set(activeDataKeys);
+      generation.renderedKeys = new Set(renderedKeys);
+      updateCanonicalVisibility(
+        generation,
+        playerLogicalX,
+        playerLogicalZ,
+        { compose: false },
+      );
+      const descriptorIds = new Set(barrier.descriptors.map(value => value.stableId));
+      const criticalBuckets = new Set();
+      for (const stableId of descriptorIds) {
+        const object = generation.canonicalObjects.get(stableId);
+        for (const instance of object?.instances ?? []) {
+          criticalBuckets.add(instance.bucket);
+          if (instance.bucket.persistent === true && Number.isSafeInteger(instance.item.slot)) {
+            instance.bucket.dirtySlots ??= new Set();
+            instance.bucket.dirtySlots.add(instance.item.slot);
+          }
         }
       }
-    }
-    let composedBuckets = 0;
-    let matrixUpdates = 0;
-    let bufferUpdates = 0;
-    for (const bucket of criticalBuckets) {
-      if (generation.persistentDistant === true && bucket.persistent === true) {
-        const work = createCanonicalBucketComposeWork(generation, bucket);
-        const composed = advanceCanonicalBucketComposeWork(work, {
-          budgetStartedAtMs: monotonicNow(),
-          budgetMs: Number.POSITIVE_INFINITY,
-          unitLimit: Number.POSITIVE_INFINITY,
-        });
-        composedBuckets += 1;
-        matrixUpdates += composed.matrices;
-        bufferUpdates += composed.attributes;
-      } else {
-        const composed = composeCanonicalBucket(generation, bucket);
-        composedBuckets += composed.composed;
-        matrixUpdates += composed.matrices;
-        bufferUpdates += composed.attributes;
+      barrier.roadWorks = [];
+      barrier.roadWorkIndex = 0;
+      for (const bucket of criticalBuckets) {
+        if (isSettlementRoadBucket(bucket)) {
+          barrier.roadWorks.push(createSettlementRoadComposeWork(generation, bucket));
+        } else if (generation.persistentDistant === true && bucket.persistent === true) {
+          const work = createCanonicalBucketComposeWork(generation, bucket);
+          const composed = advanceCanonicalBucketComposeWork(work, {
+            budgetStartedAtMs: monotonicNow(),
+            budgetMs: Number.POSITIVE_INFINITY,
+            unitLimit: Number.POSITIVE_INFINITY,
+          });
+          barrier.composedBuckets += 1;
+          barrier.matrixUpdates += composed.matrices;
+          barrier.bufferUpdates += composed.attributes;
+        } else {
+          const composed = composeCanonicalBucket(generation, bucket);
+          barrier.composedBuckets += composed.composed;
+          barrier.matrixUpdates += composed.matrices;
+          barrier.bufferUpdates += composed.attributes;
+        }
       }
+      barrier.generation = generation;
+      barrier.generationEpoch = generation.epoch ?? null;
+      barrier.prepared = true;
+      const queued = barrier.roadWorks.reduce(
+        (total, work) => total + settlementRoadWorkRemaining(work),
+        0,
+      );
+      roadPresentationMaximumQueueLength = Math.max(
+        roadPresentationMaximumQueueLength,
+        queued,
+      );
+      if (barrier.roadWorks.length > 0) return false;
     }
-    if (criticalBuckets.size) {
-      finishCanonicalCompose(generation, composedBuckets, matrixUpdates);
-      runtimePresentationHandoffMatrixUpdateCount += matrixUpdates;
-      runtimePresentationHandoffBufferUpdateCount += bufferUpdates;
+    const roadStartedAt = monotonicNow();
+    while (barrier.roadWorkIndex < barrier.roadWorks.length
+      && (barrier.roadWorkIndex === 0
+        || monotonicNow() - roadStartedAt < ROAD_PRESENTATION_FRAME_BUDGET_MS)) {
+      const roadWork = barrier.roadWorks[barrier.roadWorkIndex];
+      const composed = advanceSettlementRoadComposeWork(roadWork, {
+        budgetStartedAtMs: roadStartedAt,
+        budgetMs: ROAD_PRESENTATION_FRAME_BUDGET_MS,
+      });
+      if (composed.stale) {
+        roadPresentationMaximumSliceMs = Math.max(
+          roadPresentationMaximumSliceMs,
+          monotonicNow() - roadStartedAt,
+        );
+        resetRuntimePresentationCoverageBarrierWork(barrier, generation);
+        return false;
+      }
+      barrier.matrixUpdates += composed.matrices;
+      barrier.bufferUpdates += composed.attributes;
+      if (!composed.done) break;
+      barrier.composedBuckets += 1;
+      barrier.roadWorkIndex += 1;
+    }
+    roadPresentationMaximumSliceMs = Math.max(
+      roadPresentationMaximumSliceMs,
+      monotonicNow() - roadStartedAt,
+    );
+    if (barrier.roadWorkIndex < barrier.roadWorks.length) return false;
+    if (!barrier.composeFinished && barrier.composedBuckets > 0) {
+      finishCanonicalCompose(generation, barrier.composedBuckets, barrier.matrixUpdates);
+      runtimePresentationHandoffMatrixUpdateCount += barrier.matrixUpdates;
+      runtimePresentationHandoffBufferUpdateCount += barrier.bufferUpdates;
+      barrier.composeFinished = true;
     }
     const coverage = inspectRuntimePresentationCoverageBarrier(generation, barrier);
     if (!coverage.covered) {
@@ -6025,6 +7108,10 @@ export async function createW8DistantPresentation({
     coverageBarrier = null,
   }) => {
     if (pendingRuntimePresentationHandoff) {
+      discardSettlementRoadComposeWork(pendingRuntimePresentationHandoff.bucketWork?.roadWork);
+      discardRuntimePresentationBarrierRoadWork(
+        pendingRuntimePresentationHandoff.coverageBarrier,
+      );
       runtimePresentationHandoffSupersededCount += 1;
     }
     pendingRuntimePresentationHandoff = {
@@ -6062,6 +7149,7 @@ export async function createW8DistantPresentation({
       uploadBytes: 0,
       localTerrainHandoffs: 0,
     });
+    roadPresentationFrameSequence += 1;
     if (pendingDistantPublication?.generation === handoff.targetGeneration) {
       return Object.freeze({
         processed: false,
@@ -6090,6 +7178,10 @@ export async function createW8DistantPresentation({
         runtimePresentationHandoffSupersededCount += 1;
         runtimePresentationCoverageBarrierSupersededCount += 1;
         handoff.targetGeneration = activeGeneration;
+        resetRuntimePresentationCoverageBarrierWork(
+          handoff.coverageBarrier,
+          activeGeneration,
+        );
         handoff.stage = 'ownership';
         handoff.dirtyBuckets = [];
         handoff.dirtyBucketIndex = 0;
@@ -6258,16 +7350,6 @@ export async function createW8DistantPresentation({
         renderedKeys,
         carriedBarrier,
       });
-      if (coverageBarrier) {
-        publishRuntimePresentationCoverageBarrier({
-          generation: coverageGeneration,
-          barrier: coverageBarrier,
-          activeDataKeys,
-          renderedKeys,
-          playerLogicalX,
-          playerLogicalZ,
-        });
-      }
       queueRuntimePresentationHandoff({
         transitionContract: acceptedTransition,
         activeDataKeys,
@@ -8556,7 +9638,13 @@ export async function createW8DistantPresentation({
         if (!persistentTreeGeneration
           || persistentTreeGeneration.quality !== quality
           || persistentTreeGeneration.renderDistancePreset !== requestedRenderDistancePreset) {
-          if (persistentTreeGeneration) deferGenerationDispose(persistentTreeGeneration);
+          if (persistentTreeGeneration) {
+            if (persistentNaturalVisibilityRetainedGeneration) {
+              deferGenerationDispose(persistentTreeGeneration);
+            } else {
+              persistentNaturalVisibilityRetainedGeneration = persistentTreeGeneration;
+            }
+          }
           persistentTreeGeneration = createPersistentNaturalGeneration({
             quality,
             renderDistancePreset: requestedRenderDistancePreset,
@@ -8569,6 +9657,10 @@ export async function createW8DistantPresentation({
           persistentTreeDisposeOwners.length = 0;
           persistentTreeDesiredResourceKinds.clear();
           persistentTreeVisibilityDirty = true;
+          persistentNaturalVisibilityJob = null;
+          persistentNaturalVisibilityCompletedInputKey = null;
+          persistentNaturalVisibilityObjectRevision += 1;
+          persistentNaturalVisibilityCoverageBarrier = null;
         }
         persistentTreeGeneration.playerX = playerLogicalX;
         persistentTreeGeneration.playerZ = playerLogicalZ;
@@ -8595,13 +9687,14 @@ export async function createW8DistantPresentation({
             planRevision: persistentTreePlanRevision,
           });
         }
-        updateCanonicalVisibility(
+        startPersistentNaturalVisibilityJob(
           persistentTreeGeneration,
-          playerLogicalX,
-          playerLogicalZ,
-          { compose: false },
+          readNearVisibleSnapshotState(),
+          { reason: 'sync-baseline', force: true, baseline: true },
         );
-        persistentTreeVisibilityDirty = false;
+        persistentTreeGeneration.visibilityBaselineOwnerKeys = new Set(
+          persistentTreePages.keys(),
+        );
       }
 
       const stagingRoot = new Group();
@@ -9035,6 +10128,10 @@ export async function createW8DistantPresentation({
         || persistentTreeGeneration.quality !== quality
         || persistentTreeGeneration.renderDistancePreset !== requestedPreset;
       if (reset) {
+        if (persistentNaturalVisibilityRetainedGeneration) {
+          deferGenerationDispose(persistentNaturalVisibilityRetainedGeneration);
+          persistentNaturalVisibilityRetainedGeneration = null;
+        }
         if (persistentTreeGeneration) deferGenerationDispose(persistentTreeGeneration);
         persistentTreeGeneration = createPersistentNaturalGeneration({
           quality,
@@ -9049,6 +10146,10 @@ export async function createW8DistantPresentation({
         persistentTreeDesiredResourceKinds.clear();
         persistentTreeRetainedOwnerKeys = new Set();
         persistentTreeVisibilityDirty = true;
+        persistentNaturalVisibilityJob = null;
+        persistentNaturalVisibilityCompletedInputKey = null;
+        persistentNaturalVisibilityObjectRevision += 1;
+        persistentNaturalVisibilityCoverageBarrier = null;
         persistentTreeRootResetCount += 1;
       }
       persistentTreeCoverageGeneration = coverageGeneration;
@@ -9612,6 +10713,54 @@ export async function createW8DistantPresentation({
         staticTreeOlderCoveragePageCount: persistentTreeOlderCoveragePageCount,
         staticTreeRootResetCount: persistentTreeRootResetCount,
         staticTreeMaximumVisibilitySliceMs: persistentTreeMaximumVisibilitySliceMs,
+        naturalVisibilityFrameBudgetMs: NATURAL_VISIBILITY_FRAME_BUDGET_MS,
+        naturalVisibilitySequence: persistentNaturalVisibilitySequence,
+        naturalVisibilityCompletedSequence: persistentNaturalVisibilityCompletedSequence,
+        naturalVisibilityQueueLength: persistentNaturalVisibilityQueueLength(
+          persistentNaturalVisibilityJob,
+        ),
+        naturalVisibilityMaximumQueueLength: persistentNaturalVisibilityMaximumQueueLength,
+        naturalVisibilityMaximumSliceMs: persistentNaturalVisibilityMaximumSliceMs,
+        naturalVisibilityMaximumUnitMs: persistentNaturalVisibilityMaximumUnitMs,
+        naturalVisibilityMaximumCoverageWaitFrames:
+          persistentNaturalVisibilityMaximumCoverageWaitFrames,
+        naturalVisibilityMaximumEnteringWaitFrames:
+          persistentNaturalVisibilityMaximumEnteringWaitFrames,
+        naturalVisibilityMaximumLeavingWaitFrames:
+          persistentNaturalVisibilityMaximumLeavingWaitFrames,
+        naturalVisibilitySupersededDiscardCount:
+          persistentNaturalVisibilitySupersededDiscardCount,
+        naturalVisibilityStaleDiscardCount: persistentNaturalVisibilityStaleDiscardCount,
+        naturalVisibilityStaleApplicationCount:
+          persistentNaturalVisibilityStaleApplicationCount,
+        naturalVisibilityStarvationCount: persistentNaturalVisibilityStarvationCount,
+        naturalVisibilityCoverageGapCount: persistentNaturalVisibilityCoverageGapCount,
+        naturalVisibilityBaselinePending:
+          persistentNaturalVisibilityJob?.baseline === true,
+        naturalVisibilityBaselineComplete:
+          persistentTreeGeneration?.visibilityBaselineComplete === true,
+        naturalVisibilityBaselineStartedCount:
+          persistentNaturalVisibilityBaselineStartedCount,
+        naturalVisibilityBaselineCompletedCount:
+          persistentNaturalVisibilityBaselineCompletedCount,
+        naturalVisibilityBaselineSynchronousScanCount:
+          persistentNaturalVisibilityBaselineSynchronousScanCount,
+        naturalVisibilityRetainedGenerationPending:
+          persistentNaturalVisibilityRetainedGeneration !== null,
+        naturalVisibilityRetainedGenerationReleaseCount:
+          persistentNaturalVisibilityRetainedGenerationReleaseCount,
+        naturalVisibilityCoverageBarrierLength:
+          persistentNaturalVisibilityCoverageBarrier?.stableIds.size ?? 0,
+        naturalVisibilityCoverageBarrierReleasedCount:
+          persistentNaturalVisibilityCoverageBarrierReleasedCount,
+        naturalVisibilityCoverageBarrierSupersededCount:
+          persistentNaturalVisibilityCoverageBarrierSupersededCount,
+        naturalVisibilityCoverageBarrierSupersededDiscardCount:
+          persistentNaturalVisibilityCoverageBarrierSupersededDiscardCount,
+        naturalVisibilityCoverageBarrierMaximumLength:
+          persistentNaturalVisibilityCoverageBarrierMaximumLength,
+        naturalVisibilityCoverageBarrierMaximumHeldFrames:
+          persistentNaturalVisibilityCoverageBarrierMaximumHeldFrames,
         staticTreeMaximumDisposeSliceMs: persistentTreeMaximumDisposeSliceMs,
         staticTreeAllocatedObjectCount: persistentTreeAllocatedObjectCount,
         staticTreeAllocatedInstanceCount: persistentTreeAllocatedInstanceCount,
@@ -9640,6 +10789,23 @@ export async function createW8DistantPresentation({
         staticNaturalOrphanObjectCount: persistentNaturalOrphanStableIds.length,
         staticNaturalOrphanSlotCount: persistentNaturalOrphanSlotCount,
         runtimePresentationFrameBudgetMs: RUNTIME_PRESENTATION_FRAME_BUDGET_MS,
+        roadPresentationFrameBudgetMs: ROAD_PRESENTATION_FRAME_BUDGET_MS,
+        roadPresentationQueueLength:
+          settlementRoadWorkRemaining(pendingRuntimePresentationHandoff?.bucketWork?.roadWork)
+          + (pendingRuntimePresentationHandoff?.coverageBarrier?.roadWorks ?? [])
+            .reduce((total, work) => total + settlementRoadWorkRemaining(work), 0),
+        roadPresentationMaximumQueueLength,
+        roadPresentationMaximumWaitFrames,
+        roadPresentationMaximumSliceMs,
+        roadPresentationMaximumUnitMs,
+        roadPresentationOwnerWorkCount,
+        roadPresentationBucketComposeCount,
+        roadPresentationRecordComposeCount,
+        roadPresentationSupersededDiscardCount,
+        roadPresentationStalePublishCount,
+        roadPresentationStarvationCount,
+        roadPresentationOrphanGeometryCount,
+        roadPresentationDoubleDisposeCount,
         runtimePresentationHandoffPending: pendingRuntimePresentationHandoff !== null,
         runtimePresentationHandoffStage: pendingRuntimePresentationHandoff?.stage ?? null,
         runtimePresentationHandoffSequence,
@@ -10185,12 +11351,18 @@ export async function createW8DistantPresentation({
       activeLocalTerrainGeneration = null;
       disposeGeneration(persistentTreeGeneration);
       persistentTreeGeneration = null;
+      disposeGeneration(persistentNaturalVisibilityRetainedGeneration);
+      persistentNaturalVisibilityRetainedGeneration = null;
       pendingPersistentTreePages.clear();
       pendingPersistentTreePublications.clear();
       persistentTreePublishedOwners.clear();
       persistentTreePages.clear();
       persistentTreeRetainedOwnerKeys.clear();
       pendingStaticTreeFirstDraw.length = 0;
+      discardSettlementRoadComposeWork(pendingRuntimePresentationHandoff?.bucketWork?.roadWork);
+      discardRuntimePresentationBarrierRoadWork(
+        pendingRuntimePresentationHandoff?.coverageBarrier,
+      );
       pendingRuntimePresentationHandoff = null;
       while (deferredGenerationDisposals.length) {
         disposeGeneration(deferredGenerationDisposals.shift().generation);

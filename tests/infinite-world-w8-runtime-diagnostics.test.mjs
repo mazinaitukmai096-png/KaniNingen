@@ -1763,22 +1763,52 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
     variation: index % 3,
     owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
   })));
-  const naturalChunk = canonicalChunk(5, 0, []);
-  naturalChunk.vegetationCandidates = Object.freeze([...trees, ...bushes]);
-  naturalChunk.rockCandidates = rocks;
-  naturalChunk.ambientDetails = grass;
-  naturalChunk.presentationLayers.natural = {
-    vegetation: naturalChunk.vegetationCandidates,
-    rocks,
+  const naturalChunkFor = (chunkX, chunkZ) => {
+    const suffix = `${chunkX}:${chunkZ}`;
+    const translateCandidate = candidate => Object.freeze({
+      ...candidate,
+      candidateId: `${candidate.candidateId}:${suffix}`,
+      worldPosition: Object.freeze({
+        ...candidate.worldPosition,
+        x: candidate.worldPosition.x + (chunkX - 5) * LEGACY_CHUNK_SIZE_METERS,
+        z: candidate.worldPosition.z + chunkZ * LEGACY_CHUNK_SIZE_METERS,
+      }),
+      owningChunkCoordinate: Object.freeze({ x: chunkX, z: chunkZ }),
+    });
+    const translatedTrees = Object.freeze(trees.map(translateCandidate));
+    const translatedBushes = Object.freeze(bushes.map(translateCandidate));
+    const translatedRocks = Object.freeze(rocks.map(translateCandidate));
+    const translatedGrass = Object.freeze(grass.map(candidate => Object.freeze({
+      ...candidate,
+      stableId: `${candidate.stableId}:${suffix}`,
+      worldPosition: Object.freeze({
+        ...candidate.worldPosition,
+        x: candidate.worldPosition.x + (chunkX - 5) * LEGACY_CHUNK_SIZE_METERS,
+        z: candidate.worldPosition.z + chunkZ * LEGACY_CHUNK_SIZE_METERS,
+      }),
+      owningChunkCoordinate: Object.freeze({ x: chunkX, z: chunkZ }),
+    })));
+    const chunk = canonicalChunk(chunkX, chunkZ, []);
+    chunk.vegetationCandidates = Object.freeze([...translatedTrees, ...translatedBushes]);
+    chunk.rockCandidates = translatedRocks;
+    chunk.ambientDetails = translatedGrass;
+    chunk.presentationLayers.natural = {
+      vegetation: chunk.vegetationCandidates,
+      rocks: translatedRocks,
+    };
+    chunk.presentationLayers.ambientDetails = translatedGrass;
+    return chunk;
   };
-  naturalChunk.presentationLayers.ambientDetails = grass;
+  const naturalChunk = naturalChunkFor(5, 0);
   const scene = new DistantTestGroup();
   const presentation = await createLocalTerrainTestPresentation(scene, {
     incrementalStaticTreePages: true,
     yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
   });
   const initial = localTerrainCoverageFixture(4, 0);
-  initial.chunks.set('5,0', naturalChunk);
+  for (const chunkX of [2, 3, 4, 5, 6]) {
+    initial.chunks.set(`${chunkX},0`, naturalChunkFor(chunkX, 0));
+  }
   assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
   assert.equal(await presentation.sync({
     ...initial,
@@ -1787,13 +1817,50 @@ test('runtime presentation handoff slices stop-reaccelerate and continuous cross
     playerLogicalX: 72,
     playerLogicalZ: 8,
   }), true);
+  const queuedBaseline = presentation.snapshot();
+  assert.equal(queuedBaseline.naturalVisibilityBaselinePending, true);
+  assert.equal(queuedBaseline.naturalVisibilityBaselineComplete, false);
+  assert.equal(queuedBaseline.naturalVisibilityBaselineStartedCount, 1);
+  assert.equal(queuedBaseline.naturalVisibilityBaselineCompletedCount, 0);
+  assert.equal(queuedBaseline.naturalVisibilityBaselineSynchronousScanCount, 0);
+  assert.ok(queuedBaseline.naturalVisibilityQueueLength > 0,
+    'sync must register baseline work without scanning the canonical set');
+  presentation.update(73, 8, initial.renderOrigin);
+  const supersededBaseline = presentation.snapshot();
+  assert.equal(supersededBaseline.naturalVisibilityBaselinePending, true);
+  assert.ok(supersededBaseline.naturalVisibilitySupersededDiscardCount > 0);
+  assert.equal(supersededBaseline.naturalVisibilityStaleApplicationCount, 0);
+  assert.equal(await presentation.sync({
+    ...initial,
+    quality: 'medium',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  const supersedingGeneration = presentation.snapshot();
+  assert.equal(supersedingGeneration.naturalVisibilityBaselinePending, true);
+  assert.equal(supersedingGeneration.naturalVisibilityRetainedGenerationPending, true);
+  assert.equal(supersedingGeneration.naturalVisibilityBaselineStartedCount, 2);
+  let baselineSliceCount = 1;
   for (let frame = 0; frame < 64
-    && presentation.snapshot().runtimePresentationHandoffPending; frame += 1) {
+    && (presentation.snapshot().runtimePresentationHandoffPending
+      || presentation.snapshot().naturalVisibilityBaselinePending
+      || presentation.snapshot().naturalVisibilityRetainedGenerationPending); frame += 1) {
     presentation.update(72, 8, initial.renderOrigin);
+    baselineSliceCount += 1;
   }
   presentation.markFirstDraw();
   const baseline = presentation.snapshot();
   assert.equal(baseline.runtimePresentationHandoffPending, false);
+  assert.equal(baseline.naturalVisibilityBaselinePending, false);
+  assert.equal(baseline.naturalVisibilityBaselineComplete, true);
+  assert.equal(baseline.naturalVisibilityBaselineCompletedCount, 1);
+  assert.equal(baseline.naturalVisibilityRetainedGenerationPending, false);
+  assert.equal(baseline.naturalVisibilityRetainedGenerationReleaseCount, 1);
+  assert.equal(baseline.naturalVisibilityBaselineSynchronousScanCount, 0);
+  assert.ok(baselineSliceCount > 1, 'baseline must carry over across visibility slices');
+  assert.ok(baseline.naturalVisibilityMaximumSliceMs
+    <= baseline.naturalVisibilityFrameBudgetMs + baseline.naturalVisibilityMaximumUnitMs + 0.1);
   assert.ok(baseline.canonicalShrubRecordCount >= bushes.length);
   assert.ok(baseline.canonicalGrassRecordCount >= grass.length);
   assert.ok(baseline.canonicalRockRecordCount >= rocks.length);
@@ -1990,31 +2057,55 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     playerLogicalZ: 8,
   }), true);
   const afterCommit = presentation.snapshot();
+  const queuedAudit = presentation.canonicalAuditSnapshot();
+  const queuedBuilding = queuedAudit.find(value => (
+    value.identity.stableId === CANONICAL_BUILDING_ID
+  ));
+  const queuedRoad = queuedAudit.find(value => value.identity.stableId === road.stableId);
+  assert.equal(queuedBuilding.composedInstanceCount, 0);
+  assert.equal(queuedRoad.composedInstanceCount, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierPending, true);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierReleasedCount, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(afterCommit.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  let roadQueueFrames = 0;
+  while (presentation.snapshot().runtimePresentationCoverageBarrierPending
+    && roadQueueFrames < 64) {
+    presentation.update(56, 8, distant.renderOrigin);
+    presentation.markFirstDraw();
+    roadQueueFrames += 1;
+  }
+  const afterRoadPublish = presentation.snapshot();
   const audit = presentation.canonicalAuditSnapshot();
   const building = audit.find(value => value.identity.stableId === CANONICAL_BUILDING_ID);
   const publishedRoad = audit.find(value => value.identity.stableId === road.stableId);
   assert.ok(building.composedInstanceCount > 0);
   assert.ok(publishedRoad.composedInstanceCount > 0);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierPending, false);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierReleasedCount, 1);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierBlankFrameCount, 0);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
-  assert.deepEqual(afterCommit.runtimePresentationCoverageBarrierLastRelease.ownerKeys, ['5,0']);
+  assert.ok(roadQueueFrames > 0);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierPending, false);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierReleasedCount, 1);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  assert.deepEqual(afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.ownerKeys, ['5,0']);
   assert.deepEqual(
-    afterCommit.runtimePresentationCoverageBarrierLastRelease.buildingSources
+    afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.buildingSources
       .map(value => value.sourceIdentity),
     [CANONICAL_BUILDING_ID],
   );
   assert.deepEqual(
-    afterCommit.runtimePresentationCoverageBarrierLastRelease.roadSources.map(value => ({
+    afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.roadSources.map(value => ({
       sourceIdentity: value.sourceIdentity,
       projectionIdentity: value.projectionIdentity,
     })),
     [{ sourceIdentity: road.sourceStableId, projectionIdentity: road.stableId }],
   );
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.coverageGapMs, 0);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.blankFrames, 0);
-  assert.equal(afterCommit.runtimePresentationCoverageBarrierLastRelease.duplicateFrames, 0);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.coverageGapMs, 0);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.blankFrames, 0);
+  assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierLastRelease.duplicateFrames, 0);
+  assert.equal(afterRoadPublish.roadPresentationStalePublishCount, 0);
+  assert.equal(afterRoadPublish.roadPresentationStarvationCount, 0);
+  assert.equal(afterRoadPublish.roadPresentationOrphanGeometryCount, 0);
+  assert.equal(afterRoadPublish.roadPresentationDoubleDisposeCount, 0);
 
   assert.equal(await presentation.sync({
     ...distant,
@@ -2064,8 +2155,8 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     playerLogicalX: 56,
     playerLogicalZ: 8,
   }), true);
-  assert.equal(presentation.snapshot().runtimePresentationCoverageBarrierPending, false,
-    'a live previous generation covers the handoff while persistent publication is pending');
+  assert.equal(presentation.snapshot().runtimePresentationCoverageBarrierPending, true,
+    'the previous generation remains the release barrier while publication is pending');
   assert.equal(await presentation.sync({
     ...distant,
     quality: 'high',
@@ -2095,7 +2186,147 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
   assert.equal(superseded.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
   assert.equal(superseded.duplicateVisibleStableIdCount, 0);
   assert.ok(superseded.distantPersistentPublicationCount > 0);
-  t.diagnostic(JSON.stringify(superseded.runtimePresentationCoverageBarrierLastRelease));
+  assert.ok(superseded.roadPresentationMaximumQueueLength > 0);
+  assert.ok(superseded.roadPresentationMaximumWaitFrames <= 120);
+  assert.ok(superseded.roadPresentationMaximumSliceMs
+    <= superseded.roadPresentationFrameBudgetMs
+      + superseded.roadPresentationMaximumUnitMs + 0.1);
+  assert.equal(superseded.roadPresentationStalePublishCount, 0);
+  assert.equal(superseded.roadPresentationStarvationCount, 0);
+  assert.equal(superseded.roadPresentationOrphanGeometryCount, 0);
+  assert.equal(superseded.roadPresentationDoubleDisposeCount, 0);
+  t.diagnostic(JSON.stringify({
+    coverage: superseded.runtimePresentationCoverageBarrierLastRelease,
+    roadQueue: {
+      budgetMs: superseded.roadPresentationFrameBudgetMs,
+      maximumLength: superseded.roadPresentationMaximumQueueLength,
+      maximumWaitFrames: superseded.roadPresentationMaximumWaitFrames,
+      maximumSliceMs: superseded.roadPresentationMaximumSliceMs,
+      maximumUnitMs: superseded.roadPresentationMaximumUnitMs,
+      ownerWorkCount: superseded.roadPresentationOwnerWorkCount,
+      bucketComposeCount: superseded.roadPresentationBucketComposeCount,
+      recordComposeCount: superseded.roadPresentationRecordComposeCount,
+      supersededDiscardCount: superseded.roadPresentationSupersededDiscardCount,
+    },
+  }));
+  presentation.dispose();
+});
+
+test('Road presentation queue discards superseded owner work without stale publish or coverage gap', async t => {
+  const roads = Object.freeze(Array.from({ length: 48 }, (_, index) => {
+    const lane = index % 12;
+    const row = Math.floor(index / 12);
+    return Object.freeze({
+      schemaVersion: 'w8-canonical-major-road-chunk-feature-1',
+      stableId: `major-road-v1:queued-supersede:${index}:chunk:5:0`,
+      sourceStableId: `major-road-v1:queued-supersede:${index}`,
+      sourceSegmentStableId: `major-road-v1:queued-supersede:${index}:segment:0`,
+      featureType: 'settlement-road',
+      canonicalMajorRoad: true,
+      settlementId: CANONICAL_SETTLEMENT_ID,
+      settlementIds: Object.freeze([CANONICAL_SETTLEMENT_ID]),
+      roadKind: 'MAJOR',
+      routeId: `queued-route:${row}`,
+      widthMeters: 1.75 + row * 0.1,
+      start: Object.freeze({ x: 80 + lane, y: 0, z: 2 + row * 3 }),
+      end: Object.freeze({ x: 84 + lane, y: 0, z: 2.5 + row * 3 }),
+      worldPosition: Object.freeze({ x: 82 + lane, y: 0, z: 2.25 + row * 3 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    });
+  }));
+  const source = canonicalChunk(5, 0, roads);
+  let nearVisibleStableIds = roads.map(road => road.stableId);
+  const presentation = await createLocalTerrainTestPresentation(new DistantTestGroup(), {
+    incrementalStaticTreePages: true,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has('5,0')) result.chunks.set('5,0', source);
+    return result;
+  };
+  const near = coverage(4);
+  const distant = coverage(3);
+  assert.equal(await presentation.sync({
+    ...near,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  nearVisibleStableIds = [];
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: distant.activeDataKeys,
+    renderedKeys: distant.renderedKeys,
+    renderOrigin: distant.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  let queuedFrames = 0;
+  while (queuedFrames < 64) {
+    presentation.update(56, 8, distant.renderOrigin);
+    queuedFrames += 1;
+    const state = presentation.snapshot();
+    if (state.roadPresentationOwnerWorkCount > 0
+      && state.roadPresentationQueueLength > 0) break;
+  }
+  const queued = presentation.snapshot();
+  assert.ok(queued.roadPresentationOwnerWorkCount > 0);
+  assert.ok(queued.roadPresentationQueueLength > 0,
+    'an over-budget owner unit must yield before Road publish');
+  assert.equal(queued.runtimePresentationCoverageBarrierPending, true);
+
+  nearVisibleStableIds = roads.map(road => road.stableId);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: near.activeDataKeys,
+    renderedKeys: near.renderedKeys,
+    renderOrigin: near.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+  const superseded = presentation.snapshot();
+  assert.ok(superseded.roadPresentationSupersededDiscardCount > 0);
+  for (let frame = 0; frame < 128
+    && presentation.snapshot().runtimePresentationHandoffPending; frame += 1) {
+    presentation.update(72, 8, near.renderOrigin);
+    presentation.markFirstDraw();
+  }
+  const completed = presentation.snapshot();
+  assert.equal(completed.runtimePresentationHandoffPending, false);
+  assert.equal(completed.roadPresentationQueueLength, 0);
+  assert.equal(completed.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(completed.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
+  assert.equal(completed.roadPresentationStalePublishCount, 0);
+  assert.equal(completed.roadPresentationStarvationCount, 0);
+  assert.equal(completed.roadPresentationOrphanGeometryCount, 0);
+  assert.equal(completed.roadPresentationDoubleDisposeCount, 0);
+  assert.equal(completed.duplicateVisibleStableIdCount, 0);
+  assert.equal(completed.canonicalRoadRecordCount, roads.length);
+  assert.equal(new Set(presentation.canonicalAuditSnapshot()
+    .filter(value => value.identity.featureType === 'settlement-road')
+    .map(value => value.identity.stableId)).size, roads.length);
+  t.diagnostic(JSON.stringify({
+    roadQueue: {
+      budgetMs: completed.roadPresentationFrameBudgetMs,
+      maximumLength: completed.roadPresentationMaximumQueueLength,
+      maximumWaitFrames: completed.roadPresentationMaximumWaitFrames,
+      maximumSliceMs: completed.roadPresentationMaximumSliceMs,
+      maximumUnitMs: completed.roadPresentationMaximumUnitMs,
+      ownerWorkCount: completed.roadPresentationOwnerWorkCount,
+      bucketComposeCount: completed.roadPresentationBucketComposeCount,
+      recordComposeCount: completed.roadPresentationRecordComposeCount,
+      supersededDiscardCount: completed.roadPresentationSupersededDiscardCount,
+    },
+    coverage: {
+      blankFrames: completed.runtimePresentationCoverageBarrierBlankFrameCount,
+      duplicateFrames: completed.runtimePresentationCoverageBarrierDuplicateFrameCount,
+    },
+  }));
   presentation.dispose();
 });
 
@@ -5589,7 +5820,7 @@ test('incremental Tree pages publish per owner within dirty-range frame budgets'
 
 test('incremental Tree stop-drain-reaccelerate harness enforces unified per-frame work limits', async t => {
   const ownerCount = 160;
-  const treesPerOwner = 8;
+  const treesPerOwner = 12;
   const createPage = ownerX => {
     const vegetation = Object.freeze(Array.from({ length: treesPerOwner }, (_, index) => (
       Object.freeze({
@@ -5636,6 +5867,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   });
   const publishedOwners = [];
   const publishedAtByOwner = new Map();
+  let nearVisibleStableIds = [];
   const presentation = await createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene: new DistantTestGroup(),
@@ -5645,6 +5877,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
     resolveTemplate: async () => null,
     getCanonicalChunkData: async () => null,
     incrementalStaticTreePages: true,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
     telemetry,
     yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
     publishStaticOwnerTickets: input => {
@@ -5804,7 +6037,8 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
     const state = presentation.snapshot();
     return sourceReadyPages.length === 0
       && state.staticTreePendingOwnerCount === 0
-      && state.staticTreeCurrentPublishedOwnerCount === ownerCount;
+      && state.staticTreeCurrentPublishedOwnerCount === ownerCount
+      && state.naturalVisibilityQueueLength === 0;
   });
   snapshot = presentation.snapshot();
   const stoppedSequence = snapshot.staticTreeFrameSamples.at(-1)?.frameSequence ?? movingSequence;
@@ -5834,7 +6068,8 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
     return sourceReadyPages.length === 0
       && state.staticTreePendingOwnerCount === 0
       && state.staticTreeDisposeOwnerCount === 0
-      && state.staticTreeCurrentPublishedOwnerCount === ownerCount;
+      && state.staticTreeCurrentPublishedOwnerCount === ownerCount
+      && state.naturalVisibilityQueueLength === 0;
   });
   snapshot = presentation.snapshot();
   const accelerated = summarize(snapshot.staticTreeFrameSamples.filter(sample => (
@@ -5886,6 +6121,72 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   const maximumBacklogDrop = Math.max(0, ...accelerationBacklogs.slice(1).map((value, index) => (
     accelerationBacklogs[index] - value
   )));
+  const visibilityState = () => presentation.canonicalAuditSnapshot()
+    .filter(object => object.naturalLod)
+    .map(object => Object.freeze({
+      stableId: object.identity.stableId,
+      visibleLod: object.visibleLod,
+      presentationTier: object.presentationTier,
+      fullOpacity: object.naturalLod.fullOpacity,
+      forestOpacity: object.naturalLod.forestOpacity,
+      atmosphericOpacity: object.naturalLod.atmosphericOpacity,
+      horizonOpacity: object.naturalLod.horizonOpacity,
+    }));
+  const beforeDirectionChanges = visibilityState();
+  const supersededBeforeDirectionChanges = snapshot.naturalVisibilitySupersededDiscardCount;
+  const coverageStableIds = beforeDirectionChanges.slice(0, 1_500).map(value => value.stableId);
+  nearVisibleStableIds = coverageStableIds;
+  presentation.advanceStaticNaturalFrame({
+    coverageGeneration: activeCoverageGeneration,
+    planRevision,
+    planId: `tree-stream-harness:${activeCoverageGeneration}:${planRevision}`,
+    destructionRevision: 'none',
+    playerLogicalX: 8,
+    playerLogicalZ: 8,
+    activeDataKeys: [],
+    renderedKeys: [],
+  });
+  presentation.update(8, 8, renderOrigin);
+  await driveUntil(() => presentation.snapshot().naturalVisibilityQueueLength === 0);
+  nearVisibleStableIds = [];
+  presentation.update(8, 8, renderOrigin);
+  const heldCoverage = presentation.snapshot();
+  assert.ok(heldCoverage.naturalVisibilityCoverageBarrierLength > 0,
+    'coverage entering must carry over instead of bypassing the frame budget');
+  assert.ok(heldCoverage.naturalVisibilityQueueLength > 0);
+  assert.equal(heldCoverage.naturalVisibilityCoverageGapCount, 0);
+  presentation.update(320, 8, renderOrigin);
+  const supersededCoverage = presentation.snapshot();
+  assert.ok(supersededCoverage.naturalVisibilityCoverageBarrierSupersededCount > 0);
+  assert.ok(supersededCoverage.naturalVisibilityCoverageBarrierLength > 0);
+  await driveUntil(() => {
+    const state = presentation.snapshot();
+    return state.naturalVisibilityQueueLength === 0
+      && state.naturalVisibilityCoverageBarrierLength === 0;
+  });
+  const completedCoverage = presentation.snapshot();
+  assert.equal(completedCoverage.naturalVisibilityCoverageGapCount, 0);
+  assert.ok(completedCoverage.naturalVisibilityCoverageBarrierReleasedCount > 0);
+  assert.ok(completedCoverage.naturalVisibilityCoverageBarrierMaximumLength
+    >= coverageStableIds.length);
+  assert.ok(completedCoverage.naturalVisibilityMaximumSliceMs
+    <= completedCoverage.naturalVisibilityFrameBudgetMs
+      + completedCoverage.naturalVisibilityMaximumUnitMs + 0.1);
+  for (const playerLogicalX of [320, -320, 8]) {
+    presentation.advanceStaticNaturalFrame({
+      coverageGeneration: activeCoverageGeneration,
+      planRevision,
+      planId: `tree-stream-harness:${activeCoverageGeneration}:${planRevision}`,
+      destructionRevision: 'none',
+      playerLogicalX,
+      playerLogicalZ: 8,
+      activeDataKeys: [],
+      renderedKeys: [],
+    });
+    presentation.update(playerLogicalX, 8, renderOrigin);
+  }
+  await driveUntil(() => presentation.snapshot().naturalVisibilityQueueLength === 0);
+  const directionSnapshot = presentation.snapshot();
 
   assert.equal(movingState.resident < ownerCount, true);
   assert.equal(movingState.pending > 0, true);
@@ -5916,6 +6217,19 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   assert.equal(maximumBacklogDrop <= NATURAL_OWNER_BUILD_QUEUE_MAXIMUM + 1, true);
   assert.equal(accelerated.visibilityMatrixInvalidationCount, 0);
   assert.equal(snapshot.staticTreeVisibilityMatrixInvalidationCount, 0);
+  assert.equal(directionSnapshot.naturalVisibilityCompletedSequence,
+    directionSnapshot.naturalVisibilitySequence);
+  assert.equal(directionSnapshot.naturalVisibilityMaximumQueueLength > 0, true);
+  assert.equal(directionSnapshot.naturalVisibilityMaximumSliceMs
+    < directionSnapshot.staticTreeFrameBudgetMs, true);
+  assert.equal(directionSnapshot.naturalVisibilityMaximumEnteringWaitFrames <= 1, true);
+  assert.equal(directionSnapshot.naturalVisibilityMaximumLeavingWaitFrames <= 120, true);
+  assert.equal(directionSnapshot.naturalVisibilitySupersededDiscardCount
+    > supersededBeforeDirectionChanges, true);
+  assert.equal(directionSnapshot.naturalVisibilityStaleApplicationCount, 0);
+  assert.equal(directionSnapshot.naturalVisibilityStarvationCount, 0);
+  assert.equal(directionSnapshot.naturalVisibilityCoverageGapCount, 0);
+  assert.deepEqual(visibilityState(), beforeDirectionChanges);
   assert.equal(accelerated.visibilityMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
   assert.equal(accelerated.composeMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
   assert.equal(accelerated.disposeMaximumMs < snapshot.staticTreeFrameBudgetMs, true);
@@ -5998,6 +6312,20 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
       allocatedInstances: snapshot.staticTreeAllocatedInstanceCount,
       allocatedBuckets: snapshot.staticTreeAllocatedBucketCount,
       heapDeltaBytes: heapAfter - heapBefore,
+    },
+    visibilityQueue: {
+      budgetMs: directionSnapshot.naturalVisibilityFrameBudgetMs,
+      maximumSliceMs: directionSnapshot.naturalVisibilityMaximumSliceMs,
+      maximumLength: directionSnapshot.naturalVisibilityMaximumQueueLength,
+      maximumEnteringWaitFrames:
+        directionSnapshot.naturalVisibilityMaximumEnteringWaitFrames,
+      maximumLeavingWaitFrames:
+        directionSnapshot.naturalVisibilityMaximumLeavingWaitFrames,
+      supersededDiscardCount:
+        directionSnapshot.naturalVisibilitySupersededDiscardCount,
+      staleApplicationCount: directionSnapshot.naturalVisibilityStaleApplicationCount,
+      starvationCount: directionSnapshot.naturalVisibilityStarvationCount,
+      coverageGapCount: directionSnapshot.naturalVisibilityCoverageGapCount,
     },
     capacityWindows,
   }));
