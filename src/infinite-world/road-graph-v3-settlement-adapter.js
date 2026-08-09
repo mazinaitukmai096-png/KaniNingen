@@ -1,4 +1,5 @@
 import { ROAD_KINDS } from '../road-town-structure.js';
+import { SETTLEMENT_TYPES } from '../settlement-type.js';
 import {
   FINITE_WORLD_UNITS_PER_METER,
   MIGRATED_SETTLEMENT_PROFILES,
@@ -25,6 +26,7 @@ import {
   SETTLEMENT_LOT_V2_GENERATOR_ID,
   SETTLEMENT_LOT_V2_PLACEMENT_SOURCES,
   buildDeterministicFrontageFallbackBuildingsV2,
+  buildDeterministicRuralFrontageFallbackBuildingsV2,
   decorateLotV2Buildings,
 } from './settlement-lot-v2.js';
 
@@ -299,7 +301,20 @@ export async function createRoadGraphV3SettlementTemplate({
       roadOverlapCount: 0,
       junctionClearanceFailureCount: 0,
     });
-    if (closedBlockCount === 0) {
+    if (closedBlockCount === 0 && town.settlementType === SETTLEMENT_TYPES.RURAL) {
+      const fallback = await buildDeterministicRuralFrontageFallbackBuildingsV2({
+        worldSeedHash,
+        town,
+        settlementId: candidate.settlementId,
+        roadGraph: graph,
+        candidate,
+        blocks,
+        lots,
+        lotBuildings,
+      });
+      frontageFallbackBuildings = fallback.buildings;
+      fallbackValidation = fallback.validation;
+    } else if (closedBlockCount === 0) {
       legacyScatterBuildings = scatterBuildingResult.buildings;
     } else {
       const fallback = await buildDeterministicFrontageFallbackBuildingsV2({
@@ -335,7 +350,7 @@ export async function createRoadGraphV3SettlementTemplate({
       usedLotCount: lotBuildings.length,
       lotUtilization: lots.length === 0 ? 0 : q6(lotBuildings.length / lots.length),
       scatterFallbackBlockCount: blockResults.filter(result => result.mode === 'EMPTY').length
-        + (blocks.length === 0 ? 1 : 0),
+        + (blocks.length === 0 && legacyScatterBuildings.length > 0 ? 1 : 0),
       scatterFallbackBuildingCount: legacyScatterBuildings.length,
       frontageFallbackBuildingCount: frontageFallbackBuildings.length,
       legacyScatterBuildingCount: legacyScatterBuildings.length,
