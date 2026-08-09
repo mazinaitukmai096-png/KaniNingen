@@ -38,8 +38,32 @@ export const SETTLEMENT_LOT_V2_PLACEMENT_SOURCES = Object.freeze({
 export const RURAL_FRONTAGE_FALLBACK_PLACEMENT_MODE = 'RURAL_FRONTAGE_FALLBACK_V1';
 export const RURAL_FRONTAGE_JUNCTION_CLEARANCE_METERS = 5;
 
-// This is deliberately one placement grammar.  The class only changes its local
-// density envelope; every candidate still uses the same frontage/lot adapter.
+export const RURAL_VILLAGE_CORE_DENSITY_GRADIENT = Object.freeze({
+  nearCoreRadiusRatio: 0.78,
+  middleCoreRadiusRatio: 1.25,
+  localDistancePenaltyRatio: 0.8,
+  deadEndDistancePenaltyRatio: 1.2,
+  candidateIntervals: Object.freeze({
+    collector: Object.freeze({
+      CORE: Object.freeze({ intervalMeters: 4, intervalJitter: 0.12 }),
+      MIDDLE: Object.freeze({ intervalMeters: 5.5, intervalJitter: 0.25 }),
+      OUTER: Object.freeze({ intervalMeters: 8.25, intervalJitter: 0.2 }),
+    }),
+    local: Object.freeze({
+      CORE: Object.freeze({ intervalMeters: 6.5, intervalJitter: 0.25 }),
+      MIDDLE: Object.freeze({ intervalMeters: 9, intervalJitter: 0.65 }),
+      OUTER: Object.freeze({ intervalMeters: 12, intervalJitter: 0.25 }),
+    }),
+    'alley/dead-end': Object.freeze({
+      CORE: Object.freeze({ intervalMeters: 14, intervalJitter: 0.15 }),
+      MIDDLE: Object.freeze({ intervalMeters: 20, intervalJitter: 0.24 }),
+      OUTER: Object.freeze({ intervalMeters: 26, intervalJitter: 0.15 }),
+    }),
+  }),
+});
+
+// This is deliberately one placement grammar.  Road class and village-core band
+// only change density envelopes; every candidate still uses the same frontage/lot adapter.
 export const RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE = Object.freeze({
   collector: Object.freeze({
     priority: 0,
@@ -334,7 +358,15 @@ function placementAtSetback(placement, type, setbackMeters) {
   });
 }
 
-async function createRuralFrontageFallbackSlots({ worldSeedHash, settlementId, roadGraph, candidate }) {
+async function createRuralFrontageFallbackSlots({
+  worldSeedHash,
+  settlementId,
+  roadGraph,
+  candidate,
+  villageCore,
+  villageCoreTraversal,
+  villageCoreBands,
+}) {
   const [intervalRandom, setbackRandom, sideRandom] = await Promise.all([
     createSemanticIdKeyedRandom({
       worldSeedHash,
@@ -378,6 +410,14 @@ async function createRuralFrontageFallbackSlots({ worldSeedHash, settlementId, r
     .sort((left, right) => (
       RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE[left.edgeClass].priority
         - RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE[right.edgeClass].priority
+      || villageCoreRoadDistanceAt({
+        frontageEdgeId: left.segment.edgeId,
+        roadT: 0.5,
+      }, roadGraph, villageCoreTraversal, villageCore)
+        - villageCoreRoadDistanceAt({
+          frontageEdgeId: right.segment.edgeId,
+          roadT: 0.5,
+        }, roadGraph, villageCoreTraversal, villageCore)
       || left.segment.edgeId.localeCompare(right.segment.edgeId)
     ));
   const slots = [];
@@ -391,13 +431,28 @@ async function createRuralFrontageFallbackSlots({ worldSeedHash, settlementId, r
     while (frontageInterval < length) {
       const intervalKey = `${segment.edgeId}:anchor:${anchorIndex}`;
       const intervalUnit = await intervalRandom.float01(intervalKey);
-      const baseInterval = table.intervalMeters * (
-        1 + (intervalUnit * 2 - 1) * table.intervalJitter
+      const probeDistance = villageCoreRoadDistanceAt({
+        frontageEdgeId: segment.edgeId,
+        roadT: Math.min(1, frontageInterval / length),
+      }, roadGraph, villageCoreTraversal, villageCore);
+      const probeBand = villageCoreBandForDistance(probeDistance, villageCoreBands);
+      const intervalConfig = RURAL_VILLAGE_CORE_DENSITY_GRADIENT
+        .candidateIntervals[edgeClass][probeBand];
+      const baseInterval = intervalConfig.intervalMeters * (
+        1 + (intervalUnit * 2 - 1) * intervalConfig.intervalJitter
       );
       const startOffset = anchorIndex === 0 ? baseInterval * table.firstIntervalFraction : 0;
       frontageInterval += anchorIndex === 0 ? startOffset : baseInterval;
       if (frontageInterval >= length) break;
       const roadT = frontageInterval / length;
+      const villageCoreDistanceMeters = villageCoreRoadDistanceAt({
+        frontageEdgeId: segment.edgeId,
+        roadT,
+      }, roadGraph, villageCoreTraversal, villageCore);
+      const villageCoreBand = villageCoreBandForDistance(
+        villageCoreDistanceMeters,
+        villageCoreBands,
+      );
       const position = Object.freeze({
         x: segment.start.x + (segment.end.x - segment.start.x) * roadT,
         z: segment.start.z + (segment.end.z - segment.start.z) * roadT,
@@ -430,6 +485,8 @@ async function createRuralFrontageFallbackSlots({ worldSeedHash, settlementId, r
             side: sideUnit < 0.5 ? -1 : 1,
             setbackMeters,
             junctionDistanceMeters: q6(junctionDistance),
+            villageCoreDistanceMeters,
+            villageCoreBand,
             sourceOwner: segment.sourceOwner,
             road: Object.freeze({
               ...localRoad(segment, candidate),
@@ -447,6 +504,285 @@ async function createRuralFrontageFallbackSlots({ worldSeedHash, settlementId, r
     }
   }
   return Object.freeze(slots);
+}
+
+function villageCoreRoadEdges(roadGraph) {
+  return roadGraph.edges.filter(edge => (
+    edge.class === ROAD_GRAPH_CLASSES.COLLECTOR
+    || edge.class === ROAD_GRAPH_CLASSES.LOCAL
+    || edge.class === ROAD_GRAPH_CLASSES.ALLEY
+  ));
+}
+
+async function semanticVillageCoreRank(settlementId, kind, stableIdentity) {
+  return stableId('rural-village-core-rank-v1', {
+    settlementId,
+    kind,
+    stableIdentity,
+  });
+}
+
+async function selectRuralVillageCore({ settlementId, roadGraph }) {
+  const eligibleEdges = villageCoreRoadEdges(roadGraph);
+  const incidentEdges = new Map(roadGraph.nodes.map(node => [node.nodeId, []]));
+  for (const edge of eligibleEdges) {
+    incidentEdges.get(edge.startNodeId)?.push(edge);
+    incidentEdges.get(edge.endNodeId)?.push(edge);
+  }
+  const nodeCandidates = roadGraph.nodes.map(node => {
+    const incident = incidentEdges.get(node.nodeId) ?? [];
+    const collectorCount = incident.filter(edge => (
+      edge.class === ROAD_GRAPH_CLASSES.COLLECTOR
+    )).length;
+    const localCount = incident.filter(edge => edge.class === ROAD_GRAPH_CLASSES.LOCAL).length;
+    return { node, incident, collectorCount, localCount };
+  });
+  // A core is a semantic Road Graph location only.  It never creates a Building;
+  // downstream candidate generation may only use its graph distance as a density input.
+  const candidateTiers = [
+    {
+      kind: 'PRIMARY_COLLECTOR_JUNCTION',
+      candidates: nodeCandidates.filter(value => (
+        value.collectorCount >= 2 && value.incident.length >= 3
+      )),
+    },
+    {
+      kind: 'COLLECTOR_LOCAL_JUNCTION',
+      candidates: nodeCandidates.filter(value => (
+        value.collectorCount >= 1 && value.localCount >= 1
+      )),
+    },
+  ];
+  for (const tier of candidateTiers) {
+    if (tier.candidates.length === 0) continue;
+    const ranked = await Promise.all(tier.candidates.map(async value => ({
+      ...value,
+      semanticRank: await semanticVillageCoreRank(
+        settlementId,
+        tier.kind,
+        value.node.stableId,
+      ),
+    })));
+    ranked.sort((left, right) => (
+      left.semanticRank.localeCompare(right.semanticRank)
+      || left.node.stableId.localeCompare(right.node.stableId)
+    ));
+    const selected = ranked[0];
+    const collectorEdges = selected.incident.filter(edge => (
+      edge.class === ROAD_GRAPH_CLASSES.COLLECTOR
+    ));
+    const rankedEdges = await Promise.all(collectorEdges.map(async edge => ({
+      edge,
+      semanticRank: await semanticVillageCoreRank(
+        settlementId,
+        `${tier.kind}:EDGE`,
+        edge.stableId,
+      ),
+    })));
+    rankedEdges.sort((left, right) => (
+      left.semanticRank.localeCompare(right.semanticRank)
+      || left.edge.stableId.localeCompare(right.edge.stableId)
+    ));
+    const coreEdge = rankedEdges[0]?.edge ?? selected.incident
+      .slice().sort((left, right) => left.stableId.localeCompare(right.stableId))[0];
+    const coreStableId = await stableId('rural-village-core-v1', {
+      settlementId,
+      kind: tier.kind,
+      nodeStableId: selected.node.stableId,
+      edgeStableId: coreEdge.stableId,
+    });
+    return Object.freeze({
+      stableId: coreStableId,
+      kind: tier.kind,
+      nodeId: selected.node.nodeId,
+      nodeStableId: selected.node.stableId,
+      edgeStableId: coreEdge.stableId,
+      position: selected.node.position,
+      edgeT: coreEdge.startNodeId === selected.node.nodeId ? 0 : 1,
+    });
+  }
+
+  const collectorSegments = roadGraph.segments.filter(segment => (
+    segment.class === ROAD_GRAPH_CLASSES.COLLECTOR
+  ));
+  if (collectorSegments.length === 0) {
+    throw new Error('RURAL village core requires a collector edge');
+  }
+  const routes = new Map();
+  for (const segment of collectorSegments) {
+    const route = routes.get(segment.flags.routeId) ?? [];
+    route.push(segment);
+    routes.set(segment.flags.routeId, route);
+  }
+  const rankedRoutes = await Promise.all([...routes].map(async ([routeId, segments]) => ({
+    routeId,
+    segments: segments.sort((left, right) => (
+      left.flags.routeOrder - right.flags.routeOrder
+      || left.stableId.localeCompare(right.stableId)
+    )),
+    length: segments.reduce((sum, segment) => sum + Math.hypot(
+      segment.end.x - segment.start.x,
+      segment.end.z - segment.start.z,
+    ), 0),
+    semanticRank: await semanticVillageCoreRank(
+      settlementId,
+      'PRIMARY_COLLECTOR_ROUTE',
+      routeId,
+    ),
+  })));
+  rankedRoutes.sort((left, right) => (
+    right.length - left.length
+    || left.semanticRank.localeCompare(right.semanticRank)
+    || left.routeId.localeCompare(right.routeId)
+  ));
+  const primaryRoute = rankedRoutes[0];
+  const midpointDistance = primaryRoute.length / 2;
+  let traversed = 0;
+  let coreSegment = primaryRoute.segments[0];
+  let edgeT = 0.5;
+  for (const segment of primaryRoute.segments) {
+    const length = Math.hypot(segment.end.x - segment.start.x, segment.end.z - segment.start.z);
+    if (traversed + length >= midpointDistance) {
+      coreSegment = segment;
+      edgeT = length <= 1e-9 ? 0.5 : (midpointDistance - traversed) / length;
+      break;
+    }
+    traversed += length;
+  }
+  const edge = roadGraph.edges.find(value => value.edgeId === coreSegment.edgeId);
+  const position = Object.freeze({
+    x: q6(coreSegment.start.x + (coreSegment.end.x - coreSegment.start.x) * edgeT),
+    z: q6(coreSegment.start.z + (coreSegment.end.z - coreSegment.start.z) * edgeT),
+  });
+  const coreStableId = await stableId('rural-village-core-v1', {
+    settlementId,
+    kind: 'PRIMARY_COLLECTOR_MIDPOINT',
+    edgeStableId: edge.stableId,
+    edgeT: q6(edgeT),
+  });
+  return Object.freeze({
+    stableId: coreStableId,
+    kind: 'PRIMARY_COLLECTOR_MIDPOINT',
+    nodeId: null,
+    nodeStableId: null,
+    edgeStableId: edge.stableId,
+    position,
+    edgeT: q6(edgeT),
+  });
+}
+
+function roadGraphDistancesFromVillageCore(roadGraph, core) {
+  const edges = villageCoreRoadEdges(roadGraph);
+  const nodeIds = roadGraph.nodes.map(node => node.nodeId).sort();
+  const distances = new Map(nodeIds.map(nodeId => [nodeId, Infinity]));
+  const coreEdge = edges.find(edge => edge.edgeId === core.edgeStableId);
+  if (!coreEdge) throw new Error('RURAL village core edge is missing from the Road Graph');
+  const nodeById = new Map(roadGraph.nodes.map(node => [node.nodeId, node]));
+  const edgeLength = edge => {
+    const start = nodeById.get(edge.startNodeId)?.position;
+    const end = nodeById.get(edge.endNodeId)?.position;
+    return Math.hypot(end.x - start.x, end.z - start.z);
+  };
+  const coreEdgeLength = edgeLength(coreEdge);
+  distances.set(coreEdge.startNodeId, coreEdgeLength * core.edgeT);
+  distances.set(coreEdge.endNodeId, coreEdgeLength * (1 - core.edgeT));
+  if (core.nodeId) distances.set(core.nodeId, 0);
+  const unvisited = new Set(nodeIds);
+  while (unvisited.size > 0) {
+    const current = [...unvisited].sort((left, right) => (
+      distances.get(left) - distances.get(right) || left.localeCompare(right)
+    ))[0];
+    const currentDistance = distances.get(current);
+    unvisited.delete(current);
+    if (!Number.isFinite(currentDistance)) break;
+    for (const edge of edges) {
+      let neighbour = null;
+      if (edge.startNodeId === current) neighbour = edge.endNodeId;
+      else if (edge.endNodeId === current) neighbour = edge.startNodeId;
+      if (!neighbour || !unvisited.has(neighbour)) continue;
+      distances.set(neighbour, Math.min(
+        distances.get(neighbour),
+        currentDistance + edgeLength(edge),
+      ));
+    }
+  }
+  return Object.freeze({ distances, edgeLength });
+}
+
+function villageCoreRoadDistanceAt(value, roadGraph, traversal, core) {
+  const edge = roadGraph.edges.find(candidateEdge => (
+    candidateEdge.edgeId === value.frontageEdgeId
+  ));
+  if (!edge) throw new Error('RURAL frontage candidate edge is missing from the Road Graph');
+  const length = traversal.edgeLength(edge);
+  const alongFromStart = length * value.roadT;
+  const endpointDistance = Math.min(
+    traversal.distances.get(edge.startNodeId) + alongFromStart,
+    traversal.distances.get(edge.endNodeId) + length - alongFromStart,
+  );
+  const directCoreEdgeDistance = edge.edgeId === core.edgeStableId
+    ? Math.abs(value.roadT - core.edgeT) * length
+    : Infinity;
+  const distance = Math.min(endpointDistance, directCoreEdgeDistance);
+  if (!Number.isFinite(distance)) {
+    throw new Error('RURAL frontage candidate is disconnected from its village core');
+  }
+  return q6(distance);
+}
+
+function villageCoreBandForDistance(distanceMeters, bands) {
+  return distanceMeters <= bands.nearMaximumMeters
+    ? 'CORE' : distanceMeters <= bands.middleMaximumMeters ? 'MIDDLE' : 'OUTER';
+}
+
+function candidateVillageCoreRoadDistance(value, roadGraph, traversal, core) {
+  return villageCoreRoadDistanceAt({
+    frontageEdgeId: value.slot.frontageEdgeId,
+    roadT: value.slot.road.roadT,
+  }, roadGraph, traversal, core);
+}
+
+function measureRuralUsableFrontage({
+  roadGraph,
+  villageCore,
+  villageCoreTraversal,
+  villageCoreBands,
+}) {
+  const junctions = junctionPositions(roadGraph);
+  const sampleStepMeters = 0.25;
+  let totalUsableMeters = 0;
+  let coreUsableMeters = 0;
+  for (const segment of roadGraph.segments.filter(value => (
+    value.flags?.frontageEligible === true
+  ))) {
+    const length = Math.hypot(
+      segment.end.x - segment.start.x,
+      segment.end.z - segment.start.z,
+    );
+    const sampleCount = Math.max(1, Math.ceil(length / sampleStepMeters));
+    const sampleLength = length / sampleCount;
+    for (let index = 0; index < sampleCount; index += 1) {
+      const roadT = (index + 0.5) / sampleCount;
+      const position = {
+        x: segment.start.x + (segment.end.x - segment.start.x) * roadT,
+        z: segment.start.z + (segment.end.z - segment.start.z) * roadT,
+      };
+      if (nearestJunctionDistance(position, junctions)
+        < RURAL_FRONTAGE_JUNCTION_CLEARANCE_METERS) continue;
+      totalUsableMeters += sampleLength;
+      const distance = villageCoreRoadDistanceAt({
+        frontageEdgeId: segment.edgeId,
+        roadT,
+      }, roadGraph, villageCoreTraversal, villageCore);
+      if (villageCoreBandForDistance(distance, villageCoreBands) === 'CORE') {
+        coreUsableMeters += sampleLength;
+      }
+    }
+  }
+  return Object.freeze({
+    totalMeters: q6(totalUsableMeters),
+    coreMeters: q6(coreUsableMeters),
+  });
 }
 
 function lotVisualRecord(building, town) {
@@ -695,11 +1031,31 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
     throw new TypeError('RURAL frontage fallback requires world, Settlement, Road Graph, and candidate');
   }
   const requestedBuildingCount = Math.round((town.coreRadius * town.coreRadius) / 36_000);
+  const villageCore = await selectRuralVillageCore({ settlementId, roadGraph });
+  const villageCoreTraversal = roadGraphDistancesFromVillageCore(roadGraph, villageCore);
+  const coreRadiusMeters = meters(town.coreRadius);
+  const villageCoreBands = Object.freeze({
+    nearMaximumMeters: q6(
+      coreRadiusMeters * RURAL_VILLAGE_CORE_DENSITY_GRADIENT.nearCoreRadiusRatio,
+    ),
+    middleMaximumMeters: q6(
+      coreRadiusMeters * RURAL_VILLAGE_CORE_DENSITY_GRADIENT.middleCoreRadiusRatio,
+    ),
+  });
   const slots = await createRuralFrontageFallbackSlots({
     worldSeedHash,
     settlementId,
     roadGraph,
     candidate,
+    villageCore,
+    villageCoreTraversal,
+    villageCoreBands,
+  });
+  const usableFrontage = measureRuralUsableFrontage({
+    roadGraph,
+    villageCore,
+    villageCoreTraversal,
+    villageCoreBands,
   });
   const closedBlockPolygons = blocks
     .filter(block => block.isClosed === true)
@@ -873,6 +1229,18 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
   const viableCandidates = rawCandidates.filter(value => (
     value.immutableRejectReasons.length === 0
   ));
+  for (const value of rawCandidates) {
+    value.villageCoreDistanceMeters = candidateVillageCoreRoadDistance(
+      value,
+      roadGraph,
+      villageCoreTraversal,
+      villageCore,
+    );
+    value.villageCoreBand = villageCoreBandForDistance(
+      value.villageCoreDistanceMeters,
+      villageCoreBands,
+    );
+  }
   const candidatesByEdge = new Map();
   for (const value of viableCandidates) {
     const edgeCandidates = candidatesByEdge.get(value.slot.frontageEdgeId) ?? [];
@@ -915,7 +1283,7 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
       }
     }
   }
-  const priorityTuple = value => {
+  const baselinePriorityTuple = value => {
     const table = RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE[value.slot.edgeClass];
     const moderateJunctionMinimum = RURAL_FRONTAGE_JUNCTION_CLEARANCE_METERS + 3;
     const moderateJunctionMaximum = table.junctionInfluenceMeters;
@@ -932,9 +1300,24 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
       value.buildingStableId,
     ]);
   };
-  const comparePriority = (left, right) => {
-    const leftPriority = left.priority;
-    const rightPriority = right.priority;
+  const villageCorePriorityTuple = value => {
+    const classPenaltyRatio = value.slot.edgeClass === 'collector'
+      ? 0 : value.slot.edgeClass === 'local'
+        ? RURAL_VILLAGE_CORE_DENSITY_GRADIENT.localDistancePenaltyRatio
+        : RURAL_VILLAGE_CORE_DENSITY_GRADIENT.deadEndDistancePenaltyRatio;
+    const weightedCoreDistance = value.villageCoreDistanceMeters
+      + coreRadiusMeters * classPenaltyRatio;
+    return Object.freeze([
+      q6(weightedCoreDistance),
+      RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE[value.slot.edgeClass].priority,
+      value.conflictStableIds.size,
+      value.distributionRank,
+      value.buildingStableId,
+    ]);
+  };
+  const comparePriority = priorityKey => (left, right) => {
+    const leftPriority = left[priorityKey];
+    const rightPriority = right[priorityKey];
     for (let index = 0; index < leftPriority.length - 1; index += 1) {
       if (leftPriority[index] !== rightPriority[index]) {
         return leftPriority[index] - rightPriority[index];
@@ -942,7 +1325,10 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
     }
     return leftPriority.at(-1).localeCompare(rightPriority.at(-1));
   };
-  for (const value of viableCandidates) value.priority = priorityTuple(value);
+  for (const value of viableCandidates) {
+    value.baselinePriority = baselinePriorityTuple(value);
+    value.villageCorePriority = villageCorePriorityTuple(value);
+  }
   const selectGreedy = ordered => {
     const selected = [];
     const selectedIds = new Set();
@@ -972,7 +1358,12 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
     legacyPlacedSpots.push(value.spot);
     legacyOccupiedRectangles.push(value.buildingLot);
   }
-  const selectedCandidates = selectGreedy([...viableCandidates].sort(comparePriority));
+  const preVillageCoreSelection = selectGreedy(
+    [...viableCandidates].sort(comparePriority('baselinePriority')),
+  );
+  const selectedCandidates = selectGreedy(
+    [...viableCandidates].sort(comparePriority('villageCorePriority')),
+  );
   const selectedClassCounts = Object.fromEntries(
     Object.keys(RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE).map(edgeClass => [
       edgeClass,
@@ -1040,6 +1431,9 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
     owner: building.slot.sourceOwner,
     frontageEdgeClass: building.slot.edgeClass,
     junctionDistanceMeters: building.slot.junctionDistanceMeters,
+    villageCoreStableId: villageCore.stableId,
+    villageCoreDistanceMeters: building.villageCoreDistanceMeters,
+    villageCoreBand: building.villageCoreBand,
     visual: building.visual,
     lot: convertFallbackLot(
       building.buildingLot,
@@ -1066,12 +1460,23 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
     z: meters(value.spot.z),
     rotationY: q6(value.spot.rotationY),
   });
-  const [candidateSetHash, selectedSetHash] = await Promise.all([
+  const [candidateSetHash, preVillageCoreSelectedSetHash, selectedSetHash] = await Promise.all([
     sha256Hex(canonicalizeJson(rawCandidates.map(candidateSnapshot)
+      .sort((left, right) => left.stableId.localeCompare(right.stableId)))),
+    sha256Hex(canonicalizeJson(preVillageCoreSelection.map(candidateSnapshot)
       .sort((left, right) => left.stableId.localeCompare(right.stableId)))),
     sha256Hex(canonicalizeJson(selectedCandidates.map(candidateSnapshot)
       .sort((left, right) => left.stableId.localeCompare(right.stableId)))),
   ]);
+  const selectionCounts = selection => Object.freeze({
+    total: selection.length,
+    collector: selection.filter(value => value.slot.edgeClass === 'collector').length,
+    local: selection.filter(value => value.slot.edgeClass === 'local').length,
+    deadEnd: selection.filter(value => value.slot.edgeClass === 'alley/dead-end').length,
+    core: selection.filter(value => value.villageCoreBand === 'CORE').length,
+    middle: selection.filter(value => value.villageCoreBand === 'MIDDLE').length,
+    outer: selection.filter(value => value.villageCoreBand === 'OUTER').length,
+  });
   return Object.freeze({
     requestedBuildingCount,
     buildings: Object.freeze(buildings),
@@ -1085,8 +1490,27 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
       roadOverlapCount: 0,
       junctionClearanceFailureCount: 0,
       legacyScatterBuildingCount: 0,
-      selectionMode: 'RURAL_FRONTAGE_DETERMINISTIC_GREEDY_V1',
+      selectionMode: 'RURAL_FRONTAGE_VILLAGE_CORE_GREEDY_V1',
+      candidateDensityMode: 'RURAL_FRONTAGE_VILLAGE_CORE_DENSITY_GRADIENT_V1',
+      villageCore: Object.freeze({
+        ...villageCore,
+        distanceMode: 'ROAD_GRAPH_SHORTEST_PATH',
+        bands: villageCoreBands,
+      }),
+      villageCoreCandidateIntervals: RURAL_VILLAGE_CORE_DENSITY_GRADIENT.candidateIntervals,
+      usableFrontageMeters: usableFrontage,
       rawCandidateCount: rawCandidates.length,
+      rawCandidateBandCounts: Object.freeze({
+        core: rawCandidates.filter(value => value.villageCoreBand === 'CORE').length,
+        middle: rawCandidates.filter(value => value.villageCoreBand === 'MIDDLE').length,
+        outer: rawCandidates.filter(value => value.villageCoreBand === 'OUTER').length,
+      }),
+      rawCandidateClassCounts: Object.freeze(Object.fromEntries(
+        Object.keys(RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE).map(edgeClass => [
+          edgeClass,
+          rawCandidates.filter(value => value.slot.edgeClass === edgeClass).length,
+        ]),
+      )),
       materializedCandidateVariantCount: candidateIdentities.flat().length,
       preferredSideImmutableRejectedCandidateCount: preferredSideCandidates.filter(value => (
         value.immutableRejectReasons.length > 0
@@ -1096,12 +1520,31 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
       )).length,
       immutableRejectedCandidateCount: rawCandidates.length - viableCandidates.length,
       immutableRejectReasonCounts: Object.freeze(immutableRejectReasonCounts),
+      roadOverlapRejectBandCounts: Object.freeze({
+        core: rawCandidates.filter(value => value.villageCoreBand === 'CORE'
+          && value.immutableRejectReasons.includes('ROAD_OVERLAP')).length,
+        middle: rawCandidates.filter(value => value.villageCoreBand === 'MIDDLE'
+          && value.immutableRejectReasons.includes('ROAD_OVERLAP')).length,
+        outer: rawCandidates.filter(value => value.villageCoreBand === 'OUTER'
+          && value.immutableRejectReasons.includes('ROAD_OVERLAP')).length,
+      }),
       viableCandidateCount: viableCandidates.length,
       candidateConflictPairCount,
       candidateConflictReasonPairCounts: Object.freeze(candidateConflictReasonPairCounts),
       legacySequentialSelectedCount: legacySequentialSelection.length,
+      preVillageCoreSelectionCounts: selectionCounts(preVillageCoreSelection),
       selectedCandidateCount: selectedCandidates.length,
       selectedClassCounts: Object.freeze(selectedClassCounts),
+      selectedVillageCoreBandCounts: Object.freeze({
+        core: selectedCandidates.filter(value => value.villageCoreBand === 'CORE').length,
+        middle: selectedCandidates.filter(value => value.villageCoreBand === 'MIDDLE').length,
+        outer: selectedCandidates.filter(value => value.villageCoreBand === 'OUTER').length,
+      }),
+      selectedVillageCoreDistancesMeters: Object.freeze(selectedCandidates.map(value => Object.freeze({
+        stableId: value.buildingStableId,
+        band: value.villageCoreBand,
+        distanceMeters: value.villageCoreDistanceMeters,
+      })).sort((left, right) => left.stableId.localeCompare(right.stableId))),
       alternateSideCandidateCount: rawCandidates.filter(value => (
         value.sidePreferenceRank === 1
       )).length,
@@ -1110,6 +1553,7 @@ export async function buildDeterministicRuralFrontageFallbackBuildingsV2({
       )).length,
       candidateConflictRejectedCount: viableCandidates.length - selectedCandidates.length,
       candidateSetHash: `sha256:${candidateSetHash}`,
+      preVillageCoreSelectedSetHash: `sha256:${preVillageCoreSelectedSetHash}`,
       selectedSetHash: `sha256:${selectedSetHash}`,
     }),
   });

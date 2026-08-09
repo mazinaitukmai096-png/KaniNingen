@@ -20,6 +20,7 @@ import {
   SETTLEMENT_LOT_V2_PLACEMENT_SOURCES,
   RURAL_FRONTAGE_FALLBACK_PLACEMENT_MODE,
   RURAL_FRONTAGE_JUNCTION_CLEARANCE_METERS,
+  RURAL_VILLAGE_CORE_DENSITY_GRADIENT,
   buildDeterministicFrontageFallbackBuildingsV2,
   buildDeterministicRuralFrontageFallbackBuildingsV2,
 } from '../src/infinite-world/settlement-lot-v2.js';
@@ -179,8 +180,10 @@ function ruralSelectionSnapshot(template) {
   }
   const validation = template.lotSummary.fallbackValidation;
   return Object.freeze({
+    villageCore: validation.villageCore,
     rawCandidateCount: validation.rawCandidateCount,
     candidateSetHash: validation.candidateSetHash,
+    preVillageCoreSelectedSetHash: validation.preVillageCoreSelectedSetHash,
     selectedSetHash: validation.selectedSetHash,
     selectedCandidateCount: validation.selectedCandidateCount,
   });
@@ -331,7 +334,7 @@ test('CITY/TOWN baseline fixtures use only Lots and validated frontage fallback'
   assert.ok(metricRows.every(row => row.v2BuildingCount < row.v1BuildingCount));
 });
 
-test('production default RURAL uses bounded side feasibility and deterministic conflict selection', async t => {
+test('production default RURAL applies a Road Graph village-core candidate density gradient', async t => {
   const common = {
     worldSeed: 'KaniNingen Infinite Natural World',
     settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
@@ -357,33 +360,106 @@ test('production default RURAL uses bounded side feasibility and deterministic c
     const validation = selected.lotSummary.fallbackValidation;
     assert.equal(selected.blocks.length, 0);
     assert.equal(scatter.buildings.length, 28);
-    assert.equal(validation.rawCandidateCount, 21);
-    assert.equal(validation.materializedCandidateVariantCount, 42);
+    assert.equal(validation.rawCandidateCount, 24);
+    assert.equal(validation.materializedCandidateVariantCount, 48);
     assert.equal(validation.preferredSideImmutableRejectedCandidateCount, 12);
     assert.equal(validation.preferredSideRoadOverlapCount, 12);
-    assert.equal(validation.legacySequentialSelectedCount, 6);
-    assert.equal(validation.immutableRejectedCandidateCount, 6);
-    assert.equal(validation.immutableRejectReasonCounts.ROAD_OVERLAP, 6);
-    assert.equal(validation.candidateConflictPairCount, 7);
+    assert.equal(validation.legacySequentialSelectedCount, 9);
+    assert.equal(validation.immutableRejectedCandidateCount, 8);
+    assert.equal(validation.immutableRejectReasonCounts.ROAD_OVERLAP, 8);
+    assert.equal(validation.candidateConflictPairCount, 8);
     assert.deepEqual(validation.candidateConflictReasonPairCounts, {
       FRONTAGE: 6,
-      BUILDING: 6,
+      BUILDING: 7,
     });
     assert.equal(validation.candidateConflictRejectedCount, 6);
-    assert.equal(validation.selectedCandidateCount, 9);
-    assert.equal(selected.buildings.length, 9);
+    assert.equal(validation.candidateSetHash,
+      'sha256:a7786a3ff8428829ad3286bf7859d1cf15507f0222d949d1e805573fc189b70d');
+    assert.equal(validation.preVillageCoreSelectedSetHash,
+      'sha256:8f5b81b06483f480742c25be2790402b017b25c77636be6170e032805523e495');
+    assert.equal(validation.selectedSetHash,
+      'sha256:22af32aa597f6d5b34f8390dc04030d4ea09c4c6220335a6b9aff24d0cf95a9c');
+    assert.deepEqual(validation.preVillageCoreSelectionCounts, {
+      total: 11,
+      collector: 7,
+      local: 4,
+      deadEnd: 0,
+      core: 5,
+      middle: 4,
+      outer: 2,
+    });
+    assert.equal(validation.selectionMode, 'RURAL_FRONTAGE_VILLAGE_CORE_GREEDY_V1');
+    assert.equal(validation.candidateDensityMode,
+      'RURAL_FRONTAGE_VILLAGE_CORE_DENSITY_GRADIENT_V1');
+    assert.deepEqual(validation.villageCoreCandidateIntervals,
+      RURAL_VILLAGE_CORE_DENSITY_GRADIENT.candidateIntervals);
+    assert.deepEqual(validation.villageCore, {
+      stableId: 'rural-village-core-v1:5c7ceac4f9796b325ef0e5b7',
+      kind: 'PRIMARY_COLLECTOR_JUNCTION',
+      nodeId: 'settlement-semantic-v1:road-node:5b9b233045898d9b905970cc251e84ca',
+      nodeStableId: 'settlement-semantic-v1:road-node:5b9b233045898d9b905970cc251e84ca',
+      edgeStableId: 'settlement-semantic-v1:road-edge:df29e709d678cbf0ccda392c669159bb',
+      position: { x: 562.762989, z: 394.413389 },
+      edgeT: 0,
+      distanceMode: 'ROAD_GRAPH_SHORTEST_PATH',
+      bands: { nearMaximumMeters: 35.1, middleMaximumMeters: 56.25 },
+    });
+    assert.equal(validation.selectedCandidateCount, 10);
+    assert.equal(selected.buildings.length, 10);
     assert.deepEqual(validation.selectedClassCounts, {
-      collector: 6,
+      collector: 7,
       local: 3,
       'alley/dead-end': 0,
     });
-    assert.equal(validation.alternateSideCandidateCount, 6);
-    assert.equal(validation.selectedAlternateSideCandidateCount, 3);
+    assert.deepEqual(validation.selectedVillageCoreBandCounts, {
+      core: 5,
+      middle: 3,
+      outer: 2,
+    });
+    assert.equal(validation.alternateSideCandidateCount, 4);
+    assert.equal(validation.selectedAlternateSideCandidateCount, 4);
+    assert.deepEqual(validation.usableFrontageMeters, {
+      totalMeters: 121.430911,
+      coreMeters: 52.909434,
+    });
+    assert.deepEqual(validation.rawCandidateBandCounts, { core: 15, middle: 5, outer: 4 });
+    assert.deepEqual(validation.rawCandidateClassCounts, {
+      collector: 18,
+      local: 6,
+      'alley/dead-end': 0,
+    });
+    assert.deepEqual(validation.roadOverlapRejectBandCounts, {
+      core: 5,
+      middle: 1,
+      outer: 2,
+    });
     assert.equal(selected.lotSummary.legacyScatterBuildingCount, 0);
     assert.ok(selected.buildings.every(building => (
       building.placementMode === RURAL_FRONTAGE_FALLBACK_PLACEMENT_MODE
       && building.frontageEdgeId
+      && building.villageCoreStableId === validation.villageCore.stableId
+      && Number.isFinite(building.villageCoreDistanceMeters)
+      && ['CORE', 'MIDDLE', 'OUTER'].includes(building.villageCoreBand)
     )));
+    assert.deepEqual(validation.selectedVillageCoreDistancesMeters,
+      selected.buildings.map(building => ({
+        stableId: building.stableId,
+        band: building.villageCoreBand,
+        distanceMeters: building.villageCoreDistanceMeters,
+      })).sort((left, right) => left.stableId.localeCompare(right.stableId)));
+    const nearestBuildingDistances = selected.buildings.map((building, index) => Math.min(
+      ...selected.buildings.filter((_, otherIndex) => otherIndex !== index).map(other => Math.hypot(
+        building.x - other.x,
+        building.z - other.z,
+      )),
+    ));
+    const coreBuildings = selected.buildings.filter(building => building.villageCoreBand === 'CORE');
+    const nearestCoreBuildingDistances = coreBuildings.map((building, index) => Math.min(
+      ...coreBuildings.filter((_, otherIndex) => otherIndex !== index).map(other => Math.hypot(
+        building.x - other.x,
+        building.z - other.z,
+      )),
+    ));
     const frontageEdgeBuildingCounts = Object.fromEntries([...new Set(
       selected.buildings.map(building => building.frontageEdgeId),
     )].sort().map(edgeId => [
@@ -395,13 +471,49 @@ test('production default RURAL uses bounded side feasibility and deterministic c
       oldScatterBuildingCount: scatter.buildings.length,
       legacySequentialBuildingCount: validation.legacySequentialSelectedCount,
       rawCandidateCount: validation.rawCandidateCount,
+      rawCandidateBandCounts: validation.rawCandidateBandCounts,
+      viableCandidateCount: validation.viableCandidateCount,
+      usableFrontageMeters: validation.usableFrontageMeters,
       immutableRejectedCandidateCount: validation.immutableRejectedCandidateCount,
       immutableRejectReasonCounts: validation.immutableRejectReasonCounts,
       candidateConflictPairCount: validation.candidateConflictPairCount,
       candidateConflictReasonPairCounts: validation.candidateConflictReasonPairCounts,
       candidateConflictRejectedCount: validation.candidateConflictRejectedCount,
+      villageCore: validation.villageCore,
+      beforeVillageCore: validation.preVillageCoreSelectionCounts,
       selectedCandidateCount: validation.selectedCandidateCount,
       selectedClassCounts: validation.selectedClassCounts,
+      selectedVillageCoreBandCounts: validation.selectedVillageCoreBandCounts,
+      selectedVillageCoreDistancesMeters: validation.selectedVillageCoreDistancesMeters,
+      nearestBuildingSpacingMeters: {
+        min: q6(Math.min(...nearestBuildingDistances)),
+        median: median(nearestBuildingDistances),
+        max: q6(Math.max(...nearestBuildingDistances)),
+      },
+      nearestCoreBuildingSpacingMeters: {
+        min: q6(Math.min(...nearestCoreBuildingDistances)),
+        median: median(nearestCoreBuildingDistances),
+        max: q6(Math.max(...nearestCoreBuildingDistances)),
+      },
+      comparison: {
+        A_withoutVillageCore: {
+          rawCandidateCount: 21,
+          selectedCandidateCount: 9,
+        },
+        B_selectionWeightingOnly: {
+          rawCandidateCount: 21,
+          selectedCandidateCount: 10,
+          bands: { core: 5, middle: 3, outer: 2 },
+          classes: { collector: 6, local: 4, 'alley/dead-end': 0 },
+        },
+        C_candidateDensityGradient: {
+          rawCandidateCount: validation.rawCandidateCount,
+          viableCandidateCount: validation.viableCandidateCount,
+          selectedCandidateCount: validation.selectedCandidateCount,
+          bands: validation.selectedVillageCoreBandCounts,
+          classes: validation.selectedClassCounts,
+        },
+      },
       frontageEdgeBuildingCounts,
     }));
   } finally {
@@ -413,6 +525,7 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
   const metricRows = [];
   const allSetbacks = [];
   const allNearestBuildingDistances = [];
+  const allNearestCoreBuildingDistances = [];
   const allFrontageDirectionErrors = [];
   for (const fixturePromise of fixturePromises) {
     const fixture = await fixturePromise;
@@ -430,9 +543,17 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     const segments = new Map(v2.roadGraph.segments.map(segment => [segment.edgeId, segment]));
     const allJunctions = junctions(v2.roadGraph);
     const classCounts = { collector: 0, local: 0, 'alley/dead-end': 0 };
+    const villageCoreBandCounts = { CORE: 0, MIDDLE: 0, OUTER: 0 };
     const sideCounts = { left: 0, right: 0 };
     const setbacks = [];
     const nearestBuildingDistances = [];
+    const coreBuildings = v2.buildings.filter(building => building.villageCoreBand === 'CORE');
+    const nearestCoreBuildingDistances = coreBuildings.map((building, index) => Math.min(
+      ...coreBuildings.filter((_, otherIndex) => otherIndex !== index).map(other => Math.hypot(
+        building.x - other.x,
+        building.z - other.z,
+      )),
+    ));
     let junctionNearbyCount = 0;
     let frontageDirectionOverThirtyCount = 0;
     let roadOverlapCount = 0;
@@ -453,6 +574,10 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
       assert.equal(building.placementSourceOwner.frontageEdgeId, building.frontageEdgeId);
       assert.equal(building.placementSourceOwner.sourceOwner.settlementId, candidate.settlementId);
       classCounts[building.frontageEdgeClass] += 1;
+      assert.equal(building.villageCoreStableId,
+        v2.lotSummary.fallbackValidation.villageCore.stableId);
+      assert.ok(Number.isFinite(building.villageCoreDistanceMeters));
+      villageCoreBandCounts[building.villageCoreBand] += 1;
       if (building.frontageSide < 0) sideCounts.left += 1;
       else sideCounts.right += 1;
       setbacks.push(building.setbackMeters);
@@ -487,6 +612,7 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     }
     allSetbacks.push(...setbacks);
     allNearestBuildingDistances.push(...nearestBuildingDistances);
+    allNearestCoreBuildingDistances.push(...nearestCoreBuildingDistances);
     assert.equal(frontageDirectionOverThirtyCount, 0);
     assert.equal(roadOverlapCount, 0);
     assert.equal(buildingOverlapCount, 0);
@@ -495,15 +621,25 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     metricRows.push(Object.freeze({
       seed: fixture.worldSeed,
       blockCount: v2.blocks.length,
+      rawCandidateCount: v2.lotSummary.fallbackValidation.rawCandidateCount,
+      viableCandidateCount: v2.lotSummary.fallbackValidation.viableCandidateCount,
       buildingCount: v2.buildings.length,
       collectorFrontageCount: classCounts.collector,
       localFrontageCount: classCounts.local,
       deadEndFrontageCount: classCounts['alley/dead-end'],
+      villageCoreKind: v2.lotSummary.fallbackValidation.villageCore.kind,
+      villageCoreStableId: v2.lotSummary.fallbackValidation.villageCore.stableId,
+      coreBuildingCount: villageCoreBandCounts.CORE,
+      middleBuildingCount: villageCoreBandCounts.MIDDLE,
+      outerBuildingCount: villageCoreBandCounts.OUTER,
       legacyScatterCount: v2.lotSummary.legacyScatterBuildingCount,
       averageBuildingSpacingMeters: mean(nearestBuildingDistances),
       minimumBuildingSpacingMeters: q6(Math.min(...nearestBuildingDistances)),
       medianBuildingSpacingMeters: median(nearestBuildingDistances),
       maximumBuildingSpacingMeters: q6(Math.max(...nearestBuildingDistances)),
+      minimumCoreBuildingSpacingMeters: q6(Math.min(...nearestCoreBuildingDistances)),
+      medianCoreBuildingSpacingMeters: median(nearestCoreBuildingDistances),
+      maximumCoreBuildingSpacingMeters: q6(Math.max(...nearestCoreBuildingDistances)),
       setbackMinMeters: q6(Math.min(...setbacks)),
       setbackMedianMeters: median(setbacks),
       setbackMaxMeters: q6(Math.max(...setbacks)),
@@ -522,7 +658,7 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
   assert.equal(metricRows.length, 12);
   assert.ok(metricRows.every(row => row.blockCount === 0));
   assert.ok(metricRows.every(row => row.legacyScatterCount === 0));
-  assert.ok(metricRows.every(row => row.buildingCount >= 6 && row.buildingCount <= 16));
+  assert.ok(metricRows.every(row => row.buildingCount >= 8 && row.buildingCount <= 15));
   assert.ok(metricRows.every(row => row.roadOverlapCount === 0
     && row.buildingOverlapCount === 0 && row.orphanCount === 0
     && row.duplicateStableIdCount === 0 && row.frontageDirectionOverThirtyCount === 0));
@@ -531,6 +667,9 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     collector: result.collector + row.collectorFrontageCount,
     local: result.local + row.localFrontageCount,
     deadEnd: result.deadEnd + row.deadEndFrontageCount,
+    core: result.core + row.coreBuildingCount,
+    middle: result.middle + row.middleBuildingCount,
+    outer: result.outer + row.outerBuildingCount,
     left: result.left + row.leftCount,
     right: result.right + row.rightCount,
     roadOverlap: result.roadOverlap + row.roadOverlapCount,
@@ -540,7 +679,8 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     overThirty: result.overThirty + row.frontageDirectionOverThirtyCount,
     legacyScatter: result.legacyScatter + row.legacyScatterCount,
   }), {
-    building: 0, collector: 0, local: 0, deadEnd: 0, left: 0, right: 0,
+    building: 0, collector: 0, local: 0, deadEnd: 0, core: 0, middle: 0, outer: 0,
+    left: 0, right: 0,
     roadOverlap: 0, buildingOverlap: 0, orphan: 0, duplicate: 0, overThirty: 0,
     legacyScatter: 0,
   });
@@ -550,11 +690,35 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
     buildingCount: Object.freeze({
       min: Math.min(...buildingCounts), median: median(buildingCounts), max: Math.max(...buildingCounts),
     }),
+    rawCandidateCount: Object.freeze({
+      min: Math.min(...metricRows.map(row => row.rawCandidateCount)),
+      median: median(metricRows.map(row => row.rawCandidateCount)),
+      max: Math.max(...metricRows.map(row => row.rawCandidateCount)),
+    }),
+    viableCandidateCount: Object.freeze({
+      min: Math.min(...metricRows.map(row => row.viableCandidateCount)),
+      median: median(metricRows.map(row => row.viableCandidateCount)),
+      max: Math.max(...metricRows.map(row => row.viableCandidateCount)),
+    }),
     classCount: Object.freeze({
       collector: totals.collector, local: totals.local, deadEnd: totals.deadEnd,
       collectorRatio: q6(totals.collector / totals.building),
       localRatio: q6(totals.local / totals.building),
     }),
+    villageCoreBandCount: Object.freeze({
+      core: totals.core,
+      middle: totals.middle,
+      outer: totals.outer,
+      coreRatio: q6(totals.core / totals.building),
+      middleRatio: q6(totals.middle / totals.building),
+      outerRatio: q6(totals.outer / totals.building),
+    }),
+    villageCoreKindCount: Object.freeze(Object.fromEntries(
+      [...new Set(metricRows.map(row => row.villageCoreKind))].sort().map(kind => [
+        kind,
+        metricRows.filter(row => row.villageCoreKind === kind).length,
+      ]),
+    )),
     sideCount: Object.freeze({
       left: totals.left, right: totals.right, leftRatio: q6(totals.left / totals.building),
     }),
@@ -565,6 +729,11 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
       min: q6(Math.min(...allNearestBuildingDistances)),
       median: median(allNearestBuildingDistances),
       max: q6(Math.max(...allNearestBuildingDistances)),
+    }),
+    nearestCoreBuildingSpacingMeters: Object.freeze({
+      min: q6(Math.min(...allNearestCoreBuildingDistances)),
+      median: median(allNearestCoreBuildingDistances),
+      max: q6(Math.max(...allNearestCoreBuildingDistances)),
     }),
     frontageDirectionErrorDegrees: Object.freeze({
       min: q6(Math.min(...allFrontageDirectionErrors)),
@@ -580,13 +749,65 @@ test('RURAL Block 0 uses deterministic frontage placement with no legacy scatter
       orphanCount: totals.orphan,
       duplicateStableIdCount: totals.duplicate,
     }),
+    comparison: Object.freeze({
+      A_withoutVillageCore: Object.freeze({
+        rawCandidateCount: { min: 18, median: 22.5, max: 24 },
+        viableCandidateCount: { min: 10, median: 14, max: 16 },
+        buildingCount: { min: 8, median: 10.5, max: 15 },
+        collectorRatio: 0.653226,
+        localRatio: 0.346774,
+        nearestBuildingSpacingMedianMeters: 11.496903,
+      }),
+      B_selectionWeightingOnly: Object.freeze({
+        rawCandidateCount: { min: 18, median: 22.5, max: 24 },
+        viableCandidateCount: { min: 10, median: 14, max: 16 },
+        buildingCount: { min: 8, median: 10, max: 15 },
+        collectorRatio: 0.663934,
+        localRatio: 0.336066,
+        coreRatio: 0.532787,
+        middleRatio: 0.311475,
+        outerRatio: 0.155738,
+        nearestBuildingSpacingMedianMeters: 11.264369,
+      }),
+      C_candidateDensityGradient: Object.freeze({
+        rawCandidateCount: {
+          min: Math.min(...metricRows.map(row => row.rawCandidateCount)),
+          median: median(metricRows.map(row => row.rawCandidateCount)),
+          max: Math.max(...metricRows.map(row => row.rawCandidateCount)),
+        },
+        viableCandidateCount: {
+          min: Math.min(...metricRows.map(row => row.viableCandidateCount)),
+          median: median(metricRows.map(row => row.viableCandidateCount)),
+          max: Math.max(...metricRows.map(row => row.viableCandidateCount)),
+        },
+        buildingCount: {
+          min: Math.min(...buildingCounts),
+          median: median(buildingCounts),
+          max: Math.max(...buildingCounts),
+        },
+        collectorRatio: q6(totals.collector / totals.building),
+        localRatio: q6(totals.local / totals.building),
+        coreRatio: q6(totals.core / totals.building),
+        middleRatio: q6(totals.middle / totals.building),
+        outerRatio: q6(totals.outer / totals.building),
+        nearestBuildingSpacingMedianMeters: median(allNearestBuildingDistances),
+        nearestCoreBuildingSpacingMedianMeters: median(allNearestCoreBuildingDistances),
+      }),
+    }),
   });
   assert.ok(summary.buildingCount.min >= 6);
   assert.ok(summary.buildingCount.median >= 9 && summary.buildingCount.median <= 12);
   assert.ok(summary.buildingCount.max <= 16);
-  assert.ok(summary.classCount.collectorRatio >= 0.65
+  assert.ok(summary.classCount.collectorRatio >= 0.7
     && summary.classCount.collectorRatio <= 0.8);
-  assert.ok(summary.classCount.localRatio >= 0.2 && summary.classCount.localRatio <= 0.35);
+  assert.ok(summary.classCount.localRatio >= 0.2 && summary.classCount.localRatio <= 0.3);
+  assert.equal(totals.core + totals.middle + totals.outer, totals.building);
+  assert.ok(summary.villageCoreBandCount.coreRatio >= 0.55
+    && summary.villageCoreBandCount.coreRatio <= 0.7);
+  assert.ok(summary.villageCoreBandCount.middleRatio >= 0.2
+    && summary.villageCoreBandCount.middleRatio <= 0.35);
+  assert.ok(summary.villageCoreBandCount.outerRatio >= 0.05
+    && summary.villageCoreBandCount.outerRatio <= 0.15);
   t.diagnostic(JSON.stringify({ rows: metricRows, summary }));
 });
 
@@ -728,9 +949,17 @@ test('lot-v2 ignores repetition, settlement order, Block order, edge order, and 
       rotationY: building.rotationY,
     })), expected);
     if (input.candidate.settlementType === SETTLEMENT_TYPES.RURAL && blocks.length === 0) {
+      assert.deepEqual(
+        fallback.validation.villageCore,
+        template.lotSummary.fallbackValidation.villageCore,
+      );
       assert.equal(
         fallback.validation.candidateSetHash,
         template.lotSummary.fallbackValidation.candidateSetHash,
+      );
+      assert.equal(
+        fallback.validation.preVillageCoreSelectedSetHash,
+        template.lotSummary.fallbackValidation.preVillageCoreSelectedSetHash,
       );
       assert.equal(
         fallback.validation.selectedSetHash,
