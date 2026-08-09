@@ -63,6 +63,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkZ = 0;
     this.loaded = new Map();
     this.provisionalTerrain = new Map();
+    this.settlementPresentationHolds = new Map();
     this.disposedChunkGeometries = new WeakSet();
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
@@ -214,7 +215,10 @@ export class ChunkRenderAdapter {
   }
 
   setFeatureDestroyed(stableId, destroyed = true) {
-    const entry = this.featureInstances.get(stableId);
+    const entry = this.featureInstances.get(stableId)
+      ?? [...this.settlementPresentationHolds.values()]
+        .map(held => held.featureEntries.get(stableId))
+        .find(Boolean);
     if (!entry) return false;
     const nextDestroyed = destroyed === true;
     const visibilityChanged = entry.destroyed !== nextDestroyed;
@@ -388,6 +392,7 @@ export class ChunkRenderAdapter {
     this.renderOriginChunkZ = origin.renderOriginChunkZ;
     for (const projected of this.loaded.values()) this.#positionGroup(projected);
     for (const projected of this.provisionalTerrain.values()) this.#positionGroup(projected);
+    for (const held of this.settlementPresentationHolds.values()) this.#positionGroup(held);
     if (origin.rebaseCount > this.counts.rebased) this.counts.rebased = origin.rebaseCount;
   }
 
@@ -402,6 +407,129 @@ export class ChunkRenderAdapter {
       this.renderChunkSize,
     );
     projected.group.position.set(position.x, 0, position.z);
+  }
+
+  presentationHoldSnapshot() {
+    return Object.freeze([...this.settlementPresentationHolds.values()].map(held => Object.freeze({
+      ownerKey: held.key,
+      heldAtMs: held.heldAtMs,
+      descriptors: held.descriptors,
+    })));
+  }
+
+  releaseSettlementPresentationHolds({ ownerKeys = [], descriptors = [], reason = 'covered' } = {}) {
+    const requestedOwners = new Set(ownerKeys);
+    for (const descriptor of descriptors) {
+      if (typeof descriptor?.ownerKey === 'string') requestedOwners.add(descriptor.ownerKey);
+    }
+    const descriptorKey = descriptor => [
+      descriptor.kind,
+      descriptor.sourceIdentity,
+      descriptor.projectionIdentity,
+      descriptor.ownerKey,
+    ].join('\n');
+    const requestedDescriptorKeys = new Set(descriptors.map(descriptorKey));
+    const releaseAllForOwner = requestedDescriptorKeys.size === 0;
+    const releasedOwnerKeys = [];
+    const releasedProjectionIdentities = [];
+    for (const ownerKey of requestedOwners) {
+      const held = this.settlementPresentationHolds.get(ownerKey);
+      if (!held) continue;
+      for (const [kind, component] of [...held.components]) {
+        const componentRequested = releaseAllForOwner || component.descriptors.every(descriptor => (
+          requestedDescriptorKeys.has(descriptorKey(descriptor))
+        ));
+        if (!componentRequested) continue;
+        for (const mesh of component.meshes) {
+          held.group.remove(mesh);
+          mesh.dispose?.();
+        }
+        for (const geometry of component.ownedGeometries) {
+          geometry.dispose?.();
+          this.disposedChunkGeometries.add(geometry);
+          this.counts.chunkOwnedGeometriesDisposed += 1;
+        }
+        for (const descriptor of component.descriptors) {
+          held.featureEntries.delete(descriptor.projectionIdentity);
+          releasedProjectionIdentities.push(descriptor.projectionIdentity);
+        }
+        held.components.delete(kind);
+      }
+      held.descriptors = Object.freeze([...held.components.values()]
+        .flatMap(component => component.descriptors));
+      if (held.components.size === 0) {
+        this.worldRoot.remove(held.group);
+        for (const child of held.group.children ?? []) child.dispose?.();
+        held.group.clear?.();
+        held.lifecycle = 'released';
+        held.releaseReason = reason;
+        this.settlementPresentationHolds.delete(ownerKey);
+        releasedOwnerKeys.push(ownerKey);
+      }
+    }
+    const remainingDescriptorKeys = new Set(
+      [...this.settlementPresentationHolds.values()]
+        .flatMap(held => held.descriptors.map(descriptorKey)),
+    );
+    const released = releaseAllForOwner
+      ? [...requestedOwners].every(ownerKey => !this.settlementPresentationHolds.has(ownerKey))
+      : [...requestedDescriptorKeys].every(key => !remainingDescriptorKeys.has(key));
+    if (releasedProjectionIdentities.length > 0) this.#invalidateVisibleStableIds();
+    return Object.freeze({
+      released,
+      releasedAtMs: releasedProjectionIdentities.length > 0
+        ? globalThis.performance?.now?.() ?? Date.now() : null,
+      releasedOwnerKeys: Object.freeze(releasedOwnerKeys),
+      releasedProjectionIdentities: Object.freeze(releasedProjectionIdentities),
+    });
+  }
+
+  #holdSettlementPresentation(projected) {
+    const presentation = projected.settlementPresentation;
+    if (!presentation?.meshes?.length || !presentation.descriptors?.length) return false;
+    this.releaseSettlementPresentationHolds({
+      ownerKeys: [projected.key],
+      reason: 'replaced-hold',
+    });
+    const heldMeshes = new Set(presentation.meshes);
+    const heldGeometries = new Set(presentation.ownedGeometries ?? []);
+    const heldFeatureEntries = new Map();
+    for (const descriptor of presentation.descriptors) {
+      const entry = this.featureInstances.get(descriptor.projectionIdentity);
+      if (entry) heldFeatureEntries.set(descriptor.projectionIdentity, entry);
+    }
+    this.#removeProjectedRegistry(projected);
+    for (const child of [...(projected.group.children ?? [])]) {
+      if (heldMeshes.has(child)) continue;
+      projected.group.remove(child);
+      child.dispose?.();
+    }
+    for (const geometry of projected.ownedGeometries ?? []) {
+      if (heldGeometries.has(geometry)) continue;
+      geometry.dispose?.();
+      this.disposedChunkGeometries.add(geometry);
+      this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
+    const held = {
+      key: projected.key,
+      chunkX: projected.chunkX,
+      chunkZ: projected.chunkZ,
+      group: projected.group,
+      descriptors: presentation.descriptors,
+      components: new Map(presentation.components.map(component => [component.kind, {
+        ...component,
+      }])),
+      featureEntries: heldFeatureEntries,
+      heldAtMs: globalThis.performance?.now?.() ?? Date.now(),
+      lifecycle: 'held',
+    };
+    this.settlementPresentationHolds.set(projected.key, held);
+    this.loaded.delete(projected.key);
+    projected.lifecycle = 'presentation-held';
+    this.pendingFirstDrawByChunk.delete(projected.key);
+    this.#invalidateVisibleStableIds();
+    this.counts.unloaded += 1;
+    return true;
   }
 
   #createNaturalTerrainGeometry(chunkData) {
@@ -681,6 +809,7 @@ export class ChunkRenderAdapter {
       roads: [], lots: [], buildings: [], water: [], formalDetails: [],
       vegetation: [], rocks: [], ambientDetails: [],
     };
+    const settlementPresentationDescriptors = [];
     let roadRibbonGeometry = null;
 
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
@@ -846,6 +975,16 @@ export class ChunkRenderAdapter {
           sourceRoadStableIds: Object.freeze(roads.map(road => road.stableId).sort()),
         };
         layerMeshes.roads.push(roadMesh);
+        for (const road of roads) {
+          settlementPresentationDescriptors.push(Object.freeze({
+            kind: 'road',
+            stableId: road.stableId,
+            sourceIdentity: road.sourceStableId
+              ?? road.sourceSegmentStableId ?? road.stableId,
+            projectionIdentity: road.stableId,
+            ownerKey: key,
+          }));
+        }
       }
 
       const residentialLotSurfaces = [];
@@ -902,6 +1041,14 @@ export class ChunkRenderAdapter {
           ? resolveW8CanonicalWorldObject(building) : null;
         const position = canonical?.position ?? building.worldPosition;
         const rotationY = canonical?.rotation.y ?? building.rotationY;
+        const stableId = canonical?.stableId ?? building.stableId;
+        settlementPresentationDescriptors.push(Object.freeze({
+          kind: 'building',
+          stableId,
+          sourceIdentity: stableId,
+          projectionIdentity: stableId,
+          ownerKey: key,
+        }));
         const matrixDimensions = canonical ? {
           width: canonical.widthMeters,
           height: canonical.heightMeters,
@@ -924,7 +1071,7 @@ export class ChunkRenderAdapter {
         if (!descriptors) throw new Error(`unsupported production building visual: ${building.buildingType}`);
         for (const descriptor of descriptors) {
           buildingParts.push({
-            stableId: canonical?.stableId ?? building.stableId,
+            stableId,
             canonicalObject: canonical,
             part: descriptor,
             matrix: createPartMatrix({
@@ -1134,6 +1281,30 @@ export class ChunkRenderAdapter {
         ...(naturalTerrain ? [terrainGeometry] : []),
         ...(roadRibbonGeometry ? [roadRibbonGeometry] : []),
       ],
+      settlementPresentation: Object.freeze({
+        descriptors: Object.freeze(settlementPresentationDescriptors),
+        meshes: Object.freeze([
+          ...layerMeshes.roads,
+          ...layerMeshes.buildings,
+        ]),
+        ownedGeometries: Object.freeze(roadRibbonGeometry ? [roadRibbonGeometry] : []),
+        components: Object.freeze([
+          Object.freeze({
+            kind: 'building',
+            descriptors: Object.freeze(settlementPresentationDescriptors
+              .filter(descriptor => descriptor.kind === 'building')),
+            meshes: Object.freeze([...layerMeshes.buildings]),
+            ownedGeometries: Object.freeze([]),
+          }),
+          Object.freeze({
+            kind: 'road',
+            descriptors: Object.freeze(settlementPresentationDescriptors
+              .filter(descriptor => descriptor.kind === 'road')),
+            meshes: Object.freeze([...layerMeshes.roads]),
+            ownedGeometries: Object.freeze(roadRibbonGeometry ? [roadRibbonGeometry] : []),
+          }),
+        ].filter(component => component.descriptors.length > 0)),
+      }),
       registry: this.projectionStaging,
       lifecycle: 'staged',
     };
@@ -1150,6 +1321,10 @@ export class ChunkRenderAdapter {
     if (projected.lifecycle !== 'staged') {
       throw new Error(`render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`);
     }
+    this.releaseSettlementPresentationHolds({
+      ownerKeys: [projected.key],
+      reason: 'owner-returned-near',
+    });
     if (this.loaded.has(projected.key)) throw new Error(`render chunk already loaded: ${projected.key}`);
     const provisional = this.provisionalTerrain.get(projected.key) ?? null;
     const projectedTerrain = (projected.group.children ?? []).find(child => (
@@ -1277,9 +1452,10 @@ export class ChunkRenderAdapter {
     return this.transparencyEnabled;
   }
 
-  async unloadChunk(key) {
+  async unloadChunk(key, { deferSettlementPresentation = false } = {}) {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
+    if (deferSettlementPresentation && this.#holdSettlementPresentation(projected)) return;
     this.worldRoot.remove(projected.group);
     if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
       this.treePathAudit.disposeCount += 1;
@@ -1443,15 +1619,29 @@ export class ChunkRenderAdapter {
 
   visibleStableIdsSnapshot() {
     if (this.visibleStableIdsCache) return this.visibleStableIdsCache;
-    this.visibleStableIdsCache = Object.freeze([...this.featureInstances]
+    const visible = new Set([...this.featureInstances]
       .filter(([, entry]) => entry.destroyed !== true)
-      .map(([stableId]) => stableId)
+      .map(([stableId]) => stableId));
+    for (const projected of this.loaded.values()) {
+      for (const descriptor of projected.settlementPresentation?.descriptors ?? []) {
+        if (this.isFeatureDestroyed(descriptor.projectionIdentity)) continue;
+        visible.add(descriptor.projectionIdentity);
+      }
+    }
+    for (const held of this.settlementPresentationHolds.values()) {
+      for (const descriptor of held.descriptors) {
+        const entry = held.featureEntries.get(descriptor.projectionIdentity);
+        if (entry?.destroyed === true || this.isFeatureDestroyed(descriptor.projectionIdentity)) continue;
+        visible.add(descriptor.projectionIdentity);
+      }
+    }
+    this.visibleStableIdsCache = Object.freeze([...visible]
       .sort((left, right) => left.localeCompare(right)));
     return this.visibleStableIdsCache;
   }
 
   visibleSettlementStableIdsSnapshot() {
-    return Object.freeze([...this.featureInstances]
+    const visible = new Set([...this.featureInstances]
       .filter(([stableId, entry]) => {
         if (this.isFeatureDestroyed(stableId)) return false;
         const object = entry.canonicalObject;
@@ -1460,7 +1650,15 @@ export class ChunkRenderAdapter {
           ?? object?.extension?.settlementId
           ?? object?.extension?.parentSettlementId) === 'string';
       })
-      .map(([stableId]) => stableId)
+      .map(([stableId]) => stableId));
+    for (const held of this.settlementPresentationHolds.values()) {
+      for (const descriptor of held.descriptors) {
+        if (descriptor.kind !== 'building'
+          || this.isFeatureDestroyed(descriptor.projectionIdentity)) continue;
+        visible.add(descriptor.projectionIdentity);
+      }
+    }
+    return Object.freeze([...visible]
       .sort((left, right) => left.localeCompare(right)));
   }
 
@@ -1474,6 +1672,16 @@ export class ChunkRenderAdapter {
         ?? entry.canonicalObject?.extension?.parentSettlementId;
       if (typeof settlementId === 'string' && settlementId) settlementIds.add(settlementId);
     }
+    for (const held of this.settlementPresentationHolds.values()) {
+      for (const entry of held.featureEntries.values()) {
+        if (entry.destroyed === true || this.isFeatureDestroyed(entry.stableId)) continue;
+        const settlementId = entry.canonicalObject?.settlementId
+          ?? entry.canonicalObject?.parentSettlementId
+          ?? entry.canonicalObject?.extension?.settlementId
+          ?? entry.canonicalObject?.extension?.parentSettlementId;
+        if (typeof settlementId === 'string' && settlementId) settlementIds.add(settlementId);
+      }
+    }
     return Object.freeze([...settlementIds].sort((left, right) => left.localeCompare(right)));
   }
 
@@ -1481,6 +1689,9 @@ export class ChunkRenderAdapter {
     const visualResources = this.visualAssets.snapshot();
     return Object.freeze({
       liveChunkGroups: this.loaded.size,
+      heldSettlementPresentationOwnerCount: this.settlementPresentationHolds.size,
+      heldSettlementPresentationDescriptorCount: [...this.settlementPresentationHolds.values()]
+        .reduce((total, held) => total + held.descriptors.length, 0),
       provisionalTerrainGroupCount: this.provisionalTerrain.size,
       sharedGeometryCount: Object.keys(this.geometries).length
         + (this.settlementResources ? Object.keys(this.settlementResources.geometries).length : 0)
@@ -1511,6 +1722,10 @@ export class ChunkRenderAdapter {
 
   async shutdown() {
     if (this.disposed) return;
+    this.releaseSettlementPresentationHolds({
+      ownerKeys: [...this.settlementPresentationHolds.keys()],
+      reason: 'shutdown',
+    });
     for (const key of [...this.loaded.keys()]) await this.unloadChunk(key);
     for (const key of [...this.provisionalTerrain.keys()]) await this.unloadProvisionalTerrain(key);
     this.scene.remove(this.worldRoot);

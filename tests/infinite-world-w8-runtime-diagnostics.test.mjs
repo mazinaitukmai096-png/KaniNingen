@@ -542,6 +542,78 @@ async function createLocalTerrainTestPresentation(scene = new DistantTestGroup()
   });
 }
 
+function createNearPresentationHoldHarness() {
+  const nearStableIds = new Set();
+  const holds = new Map();
+  const descriptorKey = descriptor => [
+    descriptor.kind,
+    descriptor.sourceIdentity,
+    descriptor.projectionIdentity,
+    descriptor.ownerKey,
+  ].join('\n');
+  return Object.freeze({
+    publishNear(descriptors) {
+      for (const descriptor of descriptors) nearStableIds.add(descriptor.projectionIdentity);
+    },
+    hold(ownerKey, descriptors) {
+      const values = Object.freeze(descriptors.map(descriptor => Object.freeze({ ...descriptor })));
+      holds.set(ownerKey, Object.freeze({
+        ownerKey,
+        heldAtMs: performance.now(),
+        descriptors: values,
+      }));
+      for (const descriptor of values) nearStableIds.add(descriptor.projectionIdentity);
+    },
+    returnNear(ownerKey, descriptors) {
+      holds.delete(ownerKey);
+      for (const descriptor of descriptors) nearStableIds.add(descriptor.projectionIdentity);
+    },
+    getNearVisibleStableIds: () => Object.freeze([...nearStableIds].sort()),
+    getNearPresentationHolds: () => Object.freeze([...holds.values()]),
+    releaseNearPresentationHolds({ ownerKeys = [], descriptors = [] } = {}) {
+      const requested = new Set(descriptors.map(descriptorKey));
+      const releaseAll = descriptors.length === 0;
+      const releasedOwnerKeys = [];
+      let releasedDescriptorCount = 0;
+      for (const ownerKey of ownerKeys) {
+        const held = holds.get(ownerKey);
+        if (!held) continue;
+        const remaining = [];
+        for (const descriptor of held.descriptors) {
+          if (releaseAll || requested.has(descriptorKey(descriptor))) {
+            nearStableIds.delete(descriptor.projectionIdentity);
+            releasedDescriptorCount += 1;
+          } else remaining.push(descriptor);
+        }
+        if (remaining.length === 0) {
+          holds.delete(ownerKey);
+          releasedOwnerKeys.push(ownerKey);
+        } else {
+          holds.set(ownerKey, Object.freeze({
+            ...held,
+            descriptors: Object.freeze(remaining),
+          }));
+        }
+      }
+      return Object.freeze({
+        released: releaseAll
+          ? releasedOwnerKeys.length === ownerKeys.length
+          : releasedDescriptorCount === descriptors.length,
+        releasedAtMs: releasedDescriptorCount ? performance.now() : null,
+        releasedOwnerKeys: Object.freeze(releasedOwnerKeys),
+      });
+    },
+    snapshot: () => Object.freeze({
+      nearStableIds: Object.freeze([...nearStableIds].sort()),
+      heldOwnerKeys: Object.freeze([...holds.keys()].sort()),
+    }),
+    dispose() {
+      nearStableIds.clear();
+      holds.clear();
+    },
+  });
+}
+
 async function waitForControlledYield(queue, maximumTurns = 2_000) {
   for (let turn = 0; turn < maximumTurns && !queue.length; turn += 1) {
     await new Promise(resolve => setImmediate(resolve));
@@ -2019,10 +2091,25 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
   });
   const source = canonicalChunk(5, 0, [CANONICAL_BUILDING, road]);
-  let nearVisibleStableIds = [CANONICAL_BUILDING_ID, road.stableId];
+  const handoffDescriptors = Object.freeze([
+    Object.freeze({
+      kind: 'building', stableId: CANONICAL_BUILDING_ID,
+      sourceIdentity: CANONICAL_BUILDING_ID,
+      projectionIdentity: CANONICAL_BUILDING_ID, ownerKey: '5,0',
+    }),
+    Object.freeze({
+      kind: 'road', stableId: road.stableId,
+      sourceIdentity: road.sourceStableId,
+      projectionIdentity: road.stableId, ownerKey: '5,0',
+    }),
+  ]);
+  const nearHold = createNearPresentationHoldHarness();
+  nearHold.publishNear(handoffDescriptors);
   const presentation = await createLocalTerrainTestPresentation(new DistantTestGroup(), {
     incrementalStaticTreePages: true,
-    getNearVisibleStableIds: () => nearVisibleStableIds,
+    getNearVisibleStableIds: nearHold.getNearVisibleStableIds,
+    getNearPresentationHolds: nearHold.getNearPresentationHolds,
+    releaseNearPresentationHolds: nearHold.releaseNearPresentationHolds,
     getCanonicalChunkData: async (chunkX, chunkZ) => (
       chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
     ),
@@ -2047,7 +2134,7 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     .composedInstanceCount, 0);
 
   const distant = coverage(3);
-  nearVisibleStableIds = [];
+  nearHold.hold('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: distant.activeDataKeys,
     renderedKeys: distant.renderedKeys,
@@ -2064,6 +2151,9 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
   const queuedRoad = queuedAudit.find(value => value.identity.stableId === road.stableId);
   assert.equal(queuedBuilding.composedInstanceCount, 0);
   assert.equal(queuedRoad.composedInstanceCount, 0);
+  assert.deepEqual(nearHold.snapshot().heldOwnerKeys, ['5,0']);
+  assert.deepEqual(nearHold.snapshot().nearStableIds,
+    [CANONICAL_BUILDING_ID, road.stableId].sort());
   assert.equal(afterCommit.runtimePresentationCoverageBarrierPending, true);
   assert.equal(afterCommit.runtimePresentationCoverageBarrierReleasedCount, 0);
   assert.equal(afterCommit.runtimePresentationCoverageBarrierBlankFrameCount, 0);
@@ -2073,6 +2163,14 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     && roadQueueFrames < 64) {
     presentation.update(56, 8, distant.renderOrigin);
     presentation.markFirstDraw();
+    const frameNear = new Set(nearHold.snapshot().nearStableIds);
+    const frameAudit = presentation.canonicalAuditSnapshot();
+    for (const stableId of [CANONICAL_BUILDING_ID, road.stableId]) {
+      const distantCovered = (frameAudit.find(value => value.identity.stableId === stableId)
+        ?.composedInstanceCount ?? 0) > 0;
+      assert.equal(frameNear.has(stableId) || distantCovered, true,
+        `Near or Distant coverage must remain visible for ${stableId}`);
+    }
     roadQueueFrames += 1;
   }
   const afterRoadPublish = presentation.snapshot();
@@ -2081,7 +2179,9 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
   const publishedRoad = audit.find(value => value.identity.stableId === road.stableId);
   assert.ok(building.composedInstanceCount > 0);
   assert.ok(publishedRoad.composedInstanceCount > 0);
-  assert.ok(roadQueueFrames > 0);
+  assert.deepEqual(nearHold.snapshot().nearStableIds, []);
+  assert.deepEqual(nearHold.snapshot().heldOwnerKeys, []);
+  assert.ok(roadQueueFrames > 1, 'Road coverage must remain held across multiple budget frames');
   assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierPending, false);
   assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierReleasedCount, 1);
   assert.equal(afterRoadPublish.runtimePresentationCoverageBarrierBlankFrameCount, 0);
@@ -2129,7 +2229,7 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
   assert.equal(completed.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
   assert.equal(completed.duplicateVisibleStableIdCount, 0);
 
-  nearVisibleStableIds = [CANONICAL_BUILDING_ID, road.stableId];
+  nearHold.returnNear('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: near.activeDataKeys,
     renderedKeys: near.renderedKeys,
@@ -2146,7 +2246,7 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     playerLogicalZ: 8,
   }), true);
   assert.equal(presentation.snapshot().distantPersistentPublicationPending, true);
-  nearVisibleStableIds = [];
+  nearHold.hold('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: distant.activeDataKeys,
     renderedKeys: distant.renderedKeys,
@@ -2210,10 +2310,72 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     },
   }));
   presentation.dispose();
+  nearHold.dispose();
+});
+
+test('Building handoff keeps Near coverage when Distant publish fails and releases it on dispose', async () => {
+  const source = canonicalChunk(5, 0, [CANONICAL_BUILDING]);
+  const descriptor = Object.freeze({
+    kind: 'building', stableId: CANONICAL_BUILDING_ID,
+    sourceIdentity: CANONICAL_BUILDING_ID,
+    projectionIdentity: CANONICAL_BUILDING_ID, ownerKey: '5,0',
+  });
+  const nearHold = createNearPresentationHoldHarness();
+  nearHold.publishNear([descriptor]);
+  let failCoveredRelease = true;
+  const presentation = await createLocalTerrainTestPresentation(new DistantTestGroup(), {
+    incrementalStaticTreePages: true,
+    getNearVisibleStableIds: nearHold.getNearVisibleStableIds,
+    getNearPresentationHolds: nearHold.getNearPresentationHolds,
+    releaseNearPresentationHolds: request => {
+      if (request.reason === 'distant-covered' && failCoveredRelease) {
+        failCoveredRelease = false;
+        throw new Error('forced Near release failure');
+      }
+      return nearHold.releaseNearPresentationHolds(request);
+    },
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has('5,0')) result.chunks.set('5,0', source);
+    return result;
+  };
+  const near = coverage(4);
+  const distant = coverage(3);
+  assert.equal(await presentation.sync({
+    ...near, quality: 'high', renderDistancePreset: 'current',
+    playerLogicalX: 72, playerLogicalZ: 8,
+  }), true);
+  nearHold.hold('5,0', [descriptor]);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: distant.activeDataKeys,
+    renderedKeys: distant.renderedKeys,
+    renderOrigin: distant.renderOrigin,
+    quality: 'high', playerLogicalX: 56, playerLogicalZ: 8,
+  }), true);
+  let failure = null;
+  for (let frame = 0; frame < 32 && failure === null; frame += 1) {
+    try { presentation.update(56, 8, distant.renderOrigin); } catch (error) { failure = error; }
+    const frameNear = new Set(nearHold.snapshot().nearStableIds);
+    const distantCovered = (presentation.canonicalAuditSnapshot()
+      .find(value => value.identity.stableId === CANONICAL_BUILDING_ID)
+      ?.composedInstanceCount ?? 0) > 0;
+    assert.equal(frameNear.has(CANONICAL_BUILDING_ID) || distantCovered, true);
+  }
+  assert.match(failure?.message ?? '', /forced Near release failure/);
+  assert.deepEqual(nearHold.snapshot().heldOwnerKeys, ['5,0']);
+  assert.equal(presentation.snapshot().runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  presentation.dispose();
+  assert.deepEqual(nearHold.snapshot().heldOwnerKeys, []);
+  assert.deepEqual(nearHold.snapshot().nearStableIds, []);
+  nearHold.dispose();
 });
 
 test('Road presentation queue discards superseded owner work without stale publish or coverage gap', async t => {
-  const roads = Object.freeze(Array.from({ length: 48 }, (_, index) => {
+  const roads = Object.freeze(Array.from({ length: 192 }, (_, index) => {
     const lane = index % 12;
     const row = Math.floor(index / 12);
     return Object.freeze({
@@ -2235,10 +2397,18 @@ test('Road presentation queue discards superseded owner work without stale publi
     });
   }));
   const source = canonicalChunk(5, 0, roads);
-  let nearVisibleStableIds = roads.map(road => road.stableId);
+  const handoffDescriptors = Object.freeze(roads.map(road => Object.freeze({
+    kind: 'road', stableId: road.stableId,
+    sourceIdentity: road.sourceStableId,
+    projectionIdentity: road.stableId, ownerKey: '5,0',
+  })));
+  const nearHold = createNearPresentationHoldHarness();
+  nearHold.publishNear(handoffDescriptors);
   const presentation = await createLocalTerrainTestPresentation(new DistantTestGroup(), {
     incrementalStaticTreePages: true,
-    getNearVisibleStableIds: () => nearVisibleStableIds,
+    getNearVisibleStableIds: nearHold.getNearVisibleStableIds,
+    getNearPresentationHolds: nearHold.getNearPresentationHolds,
+    releaseNearPresentationHolds: nearHold.releaseNearPresentationHolds,
     getCanonicalChunkData: async (chunkX, chunkZ) => (
       chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
     ),
@@ -2257,7 +2427,7 @@ test('Road presentation queue discards superseded owner work without stale publi
     playerLogicalX: 72,
     playerLogicalZ: 8,
   }), true);
-  nearVisibleStableIds = [];
+  nearHold.hold('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: distant.activeDataKeys,
     renderedKeys: distant.renderedKeys,
@@ -2270,6 +2440,14 @@ test('Road presentation queue discards superseded owner work without stale publi
   while (queuedFrames < 64) {
     presentation.update(56, 8, distant.renderOrigin);
     queuedFrames += 1;
+    const frameNear = new Set(nearHold.snapshot().nearStableIds);
+    const frameAudit = presentation.canonicalAuditSnapshot();
+    for (const road of roads) {
+      const distantCovered = (frameAudit.find(value => value.identity.stableId === road.stableId)
+        ?.composedInstanceCount ?? 0) > 0;
+      assert.equal(frameNear.has(road.stableId) || distantCovered, true,
+        `queued Road must retain Near or publish Distant coverage: ${road.stableId}`);
+    }
     const state = presentation.snapshot();
     if (state.roadPresentationOwnerWorkCount > 0
       && state.roadPresentationQueueLength > 0) break;
@@ -2280,7 +2458,7 @@ test('Road presentation queue discards superseded owner work without stale publi
     'an over-budget owner unit must yield before Road publish');
   assert.equal(queued.runtimePresentationCoverageBarrierPending, true);
 
-  nearVisibleStableIds = roads.map(road => road.stableId);
+  nearHold.returnNear('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: near.activeDataKeys,
     renderedKeys: near.renderedKeys,
@@ -2328,6 +2506,7 @@ test('Road presentation queue discards superseded owner work without stale publi
     },
   }));
   presentation.dispose();
+  nearHold.dispose();
 });
 
 test('persistent Distant reuses Settlement slots while Natural remains on Static Stream', async t => {

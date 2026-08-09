@@ -1586,7 +1586,9 @@ export async function bootInfiniteWorldSandbox({
             ownerKey: key,
           });
           const result = diagnostics.measure(
-            'chunk-unload', () => renderAdapter.unloadChunk(key),
+            'chunk-unload', () => renderAdapter.unloadChunk(key, {
+              deferSettlementPresentation: true,
+            }),
           );
           diagnostics.recordEvent('near-terrain-old-released', {
             ...nearTerrainDiagnosticContext(),
@@ -1831,6 +1833,11 @@ export async function bootInfiniteWorldSandbox({
       getNearVisibleStableIds: () =>
         renderAdapter.visibleStableIdsSnapshot?.() ?? [],
       getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
+      getNearPresentationHolds: () => renderAdapter.presentationHoldSnapshot?.() ?? [],
+      releaseNearPresentationHolds: request => (
+        renderAdapter.releaseSettlementPresentationHolds?.(request)
+        ?? Object.freeze({ released: true, releasedAtMs: clock() })
+      ),
       measure: (stage, operation) => diagnostics.measure(stage, operation),
       telemetry: streamingTelemetry,
       diagnosticsEnabled: diagnostics.enabled,

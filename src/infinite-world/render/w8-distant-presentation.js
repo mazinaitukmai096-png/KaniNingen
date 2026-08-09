@@ -484,6 +484,11 @@ export async function createW8DistantPresentation({
   isFeatureDestroyed = () => false,
   getNearVisibleStableIds = () => [],
   getNearVisibleSettlementIds = () => [],
+  getNearPresentationHolds = () => [],
+  releaseNearPresentationHolds = () => Object.freeze({
+    released: true,
+    releasedAtMs: monotonicNow(),
+  }),
   measure = (_stage, operation) => operation(),
   yieldToMainThread = () => new Promise(resolve => globalThis.setTimeout(resolve, 0)),
   telemetry = null,
@@ -524,7 +529,9 @@ export async function createW8DistantPresentation({
     throw new TypeError('Distant diagnostic hooks must be functions');
   }
   if (typeof getNearVisibleStableIds !== 'function'
-    || typeof getNearVisibleSettlementIds !== 'function') {
+    || typeof getNearVisibleSettlementIds !== 'function'
+    || typeof getNearPresentationHolds !== 'function'
+    || typeof releaseNearPresentationHolds !== 'function') {
     throw new TypeError('Near presentation identity providers must be functions');
   }
   const streamingTelemetry = telemetry?.enabled === true ? telemetry : null;
@@ -4815,7 +4822,12 @@ export async function createW8DistantPresentation({
     generation,
     playerX,
     playerZ,
-    { compose = true, objectStableIds = null, updateStats = objectStableIds === null } = {},
+    {
+      compose = true,
+      objectStableIds = null,
+      updateStats = objectStableIds === null,
+      ignoreNearStableIds = null,
+    } = {},
   ) => {
     if (!generation) return;
     const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
@@ -4877,7 +4889,10 @@ export async function createW8DistantPresentation({
       }
     };
     const nearVisibleState = readNearVisibleSnapshotState();
-    const nearVisibleStableIds = nearVisibleState.stableIds;
+    const nearVisibleStableIds = ignoreNearStableIds === null
+      ? nearVisibleState.stableIds
+      : new Set([...nearVisibleState.stableIds]
+        .filter(stableId => !ignoreNearStableIds.has(stableId)));
     const selectedObjects = objectStableIds === null
       ? [...generation.canonicalObjects.values()]
       : objectStableIds.map(stableId => generation.canonicalObjects.get(stableId)).filter(Boolean);
@@ -4887,7 +4902,9 @@ export async function createW8DistantPresentation({
         .filter(object => nearVisibleStableIds.has(object.stableId))
         .map(object => object.settlementId)
         .filter(Boolean));
-    const nearStableSignature = nearVisibleState.signature;
+    const nearStableSignature = ignoreNearStableIds === null
+      ? nearVisibleState.signature
+      : [...nearVisibleStableIds].sort((left, right) => left.localeCompare(right)).join('\n');
     if (nearStableSignature !== generation.nearVisibleStableSignature) {
       if (generation.persistentTree === true) {
         const previousNear = generation.nearVisibleStableIds ?? new Set();
@@ -6854,6 +6871,26 @@ export async function createW8DistantPresentation({
     const outgoingOwners = new Set([...previousRenderedKeys]
       .filter(ownerKey => !nextRendered.has(ownerKey)));
     const descriptors = new Map();
+    const heldDescriptorKeys = new Set();
+    for (const held of getNearPresentationHolds() ?? []) {
+      if (!held || nextRendered.has(held.ownerKey)) continue;
+      outgoingOwners.add(held.ownerKey);
+      for (const descriptor of held.descriptors ?? []) {
+        if (descriptor?.ownerKey !== held.ownerKey
+          || !['building', 'road'].includes(descriptor?.kind)
+          || typeof descriptor?.sourceIdentity !== 'string'
+          || typeof descriptor?.projectionIdentity !== 'string') continue;
+        const key = runtimeHandoffDescriptorKey(descriptor);
+        heldDescriptorKeys.add(key);
+        descriptors.set(key, Object.freeze({
+          kind: descriptor.kind,
+          stableId: descriptor.stableId ?? descriptor.projectionIdentity,
+          sourceIdentity: descriptor.sourceIdentity,
+          projectionIdentity: descriptor.projectionIdentity,
+          ownerKey: descriptor.ownerKey,
+        }));
+      }
+    }
     for (const descriptor of carriedBarrier?.descriptors ?? []) {
       if (!nextRendered.has(descriptor.ownerKey)) {
         descriptors.set(runtimeHandoffDescriptorKey(descriptor), descriptor);
@@ -6891,6 +6928,12 @@ export async function createW8DistantPresentation({
       composedBuckets: 0,
       matrixUpdates: 0,
       bufferUpdates: 0,
+      blankFrames: carriedBarrier?.blankFrames ?? 0,
+      duplicateFrames: carriedBarrier?.duplicateFrames ?? 0,
+      distantPublishAtMs: null,
+      nearReleaseAtMs: null,
+      releasedDescriptorKeys: new Set([...(carriedBarrier?.releasedDescriptorKeys ?? [])]
+        .filter(key => !heldDescriptorKeys.has(key))),
     };
     runtimePresentationCoverageBarrierRequestedCount += 1;
     recordDiagnosticEvent('near-distant-coverage-barrier-created', {
@@ -6920,6 +6963,67 @@ export async function createW8DistantPresentation({
       !runtimeHandoffDescriptorCovered(generation, descriptor)
     ));
     return Object.freeze({ covered: missing.length === 0, missing: Object.freeze(missing) });
+  };
+
+  const recordRuntimePresentationCoverageFrame = (generation, barrier) => {
+    if (!barrier || barrier.released) return;
+    const nearVisible = readNearVisibleSnapshotState().stableIds;
+    let blank = false;
+    let duplicate = false;
+    for (const descriptor of barrier.descriptors) {
+      const nearCovered = nearVisible.has(descriptor.projectionIdentity);
+      const distantCovered = runtimeHandoffDescriptorCovered(generation, descriptor);
+      if (!nearCovered && !distantCovered) blank = true;
+      if (nearCovered && distantCovered) duplicate = true;
+    }
+    if (blank) {
+      barrier.blankFrames += 1;
+      runtimePresentationCoverageBarrierBlankFrameCount += 1;
+    }
+    if (duplicate) {
+      barrier.duplicateFrames += 1;
+      runtimePresentationCoverageBarrierDuplicateFrameCount += 1;
+    }
+  };
+
+  const releaseCoveredNearPresentation = ({ generation, barrier, kinds = null }) => {
+    const nearVisible = readNearVisibleSnapshotState().stableIds;
+    const candidates = barrier.descriptors.filter(descriptor => (
+      !barrier.releasedDescriptorKeys.has(runtimeHandoffDescriptorKey(descriptor))
+        && (kinds === null || kinds.has(descriptor.kind))
+        && nearVisible.has(descriptor.projectionIdentity)
+        && runtimeHandoffDescriptorCovered(generation, descriptor)
+    ));
+    if (candidates.length === 0) return true;
+    if (candidates.some(descriptor => descriptor.kind === 'road')) {
+      const heldRoads = barrier.descriptors.filter(descriptor => (
+        descriptor.kind === 'road'
+          && !barrier.releasedDescriptorKeys.has(runtimeHandoffDescriptorKey(descriptor))
+          && nearVisible.has(descriptor.projectionIdentity)
+      ));
+      if (heldRoads.some(descriptor => !runtimeHandoffDescriptorCovered(generation, descriptor))) {
+        return true;
+      }
+    }
+    const coveredAtMs = monotonicNow();
+    const releaseResult = releaseNearPresentationHolds({
+      ownerKeys: Object.freeze(sortedKeyList(new Set(
+        candidates.map(descriptor => descriptor.ownerKey),
+      ))),
+      descriptors: Object.freeze(candidates),
+      reason: 'distant-covered',
+      distantPublishAtMs: coveredAtMs,
+    });
+    if (releaseResult && typeof releaseResult.then === 'function') {
+      throw new TypeError('Near presentation release must complete synchronously');
+    }
+    if (releaseResult?.released !== true) return false;
+    for (const descriptor of candidates) {
+      barrier.releasedDescriptorKeys.add(runtimeHandoffDescriptorKey(descriptor));
+    }
+    barrier.distantPublishAtMs = coveredAtMs;
+    barrier.nearReleaseAtMs = releaseResult.releasedAtMs ?? monotonicNow();
+    return true;
   };
 
   const discardRuntimePresentationBarrierRoadWork = barrier => {
@@ -6964,7 +7068,12 @@ export async function createW8DistantPresentation({
         generation,
         playerLogicalX,
         playerLogicalZ,
-        { compose: false },
+        {
+          compose: false,
+          ignoreNearStableIds: new Set(
+            barrier.descriptors.map(descriptor => descriptor.projectionIdentity),
+          ),
+        },
       );
       const descriptorIds = new Set(barrier.descriptors.map(value => value.stableId));
       const criticalBuckets = new Set();
@@ -7011,6 +7120,11 @@ export async function createW8DistantPresentation({
         roadPresentationMaximumQueueLength,
         queued,
       );
+      if (!releaseCoveredNearPresentation({
+        generation,
+        barrier,
+        kinds: new Set(['building']),
+      })) return false;
       if (barrier.roadWorks.length > 0) return false;
     }
     const roadStartedAt = monotonicNow();
@@ -7041,6 +7155,7 @@ export async function createW8DistantPresentation({
       monotonicNow() - roadStartedAt,
     );
     if (barrier.roadWorkIndex < barrier.roadWorks.length) return false;
+    if (!releaseCoveredNearPresentation({ generation, barrier })) return false;
     if (!barrier.composeFinished && barrier.composedBuckets > 0) {
       finishCanonicalCompose(generation, barrier.composedBuckets, barrier.matrixUpdates);
       runtimePresentationHandoffMatrixUpdateCount += barrier.matrixUpdates;
@@ -7053,20 +7168,49 @@ export async function createW8DistantPresentation({
       runtimePresentationCoverageBarrierRetryCount += 1;
       return false;
     }
-    const publishedAtMs = monotonicNow();
-    const nearVisible = readNearVisibleSnapshotState().stableIds;
+    const distantPublishAtMs = barrier.distantPublishAtMs ?? monotonicNow();
+    const nearVisibleBeforeRelease = readNearVisibleSnapshotState().stableIds;
+    const heldDescriptors = barrier.descriptors.filter(descriptor => (
+      nearVisibleBeforeRelease.has(descriptor.projectionIdentity)
+    ));
+    const releaseResult = heldDescriptors.length > 0
+      ? releaseNearPresentationHolds({
+        ownerKeys: Object.freeze(sortedKeyList(new Set(
+          heldDescriptors.map(descriptor => descriptor.ownerKey),
+        ))),
+        descriptors: Object.freeze(heldDescriptors),
+        reason: 'distant-covered',
+        distantPublishAtMs,
+      })
+      : Object.freeze({ released: true, releasedAtMs: distantPublishAtMs });
+    if (releaseResult && typeof releaseResult.then === 'function') {
+      throw new TypeError('Near presentation release must complete synchronously');
+    }
+    if (releaseResult?.released !== true) {
+      barrier.retryCount += 1;
+      runtimePresentationCoverageBarrierRetryCount += 1;
+      return false;
+    }
+    const nearReleaseAtMs = barrier.nearReleaseAtMs
+      ?? releaseResult.releasedAtMs ?? monotonicNow();
+    const nearVisibleAfterRelease = readNearVisibleSnapshotState().stableIds;
     const duplicateCount = barrier.descriptors.filter(descriptor => (
-      nearVisible.has(descriptor.stableId)
+      nearVisibleAfterRelease.has(descriptor.projectionIdentity)
         && runtimeHandoffDescriptorCovered(generation, descriptor)
     )).length;
-    runtimePresentationCoverageBarrierDuplicateFrameCount += Number(duplicateCount > 0);
+    if (duplicateCount > 0) {
+      barrier.duplicateFrames += 1;
+      runtimePresentationCoverageBarrierDuplicateFrameCount += 1;
+    }
     barrier.generation = generation;
     barrier.generationEpoch = generation.epoch ?? null;
-    barrier.publishedAtMs = publishedAtMs;
-    barrier.releasedAtMs = publishedAtMs;
+    barrier.publishedAtMs = distantPublishAtMs;
+    barrier.distantPublishAtMs = distantPublishAtMs;
+    barrier.nearReleaseAtMs = nearReleaseAtMs;
+    barrier.releasedAtMs = nearReleaseAtMs;
     barrier.released = true;
     runtimePresentationCoverageBarrierReleasedCount += 1;
-    const heldMs = Math.max(0, publishedAtMs - barrier.requestedAtMs);
+    const heldMs = Math.max(0, nearReleaseAtMs - barrier.requestedAtMs);
     runtimePresentationCoverageBarrierMaximumHeldMs = Math.max(
       runtimePresentationCoverageBarrierMaximumHeldMs,
       heldMs,
@@ -7081,13 +7225,13 @@ export async function createW8DistantPresentation({
       roadSources: Object.freeze(barrier.descriptors
         .filter(value => value.kind === 'road')
         .map(value => Object.freeze({ ...value }))),
-      nearReleaseAtMs: publishedAtMs,
-      distantPublishAtMs: publishedAtMs,
-      coverageGapMs: 0,
+      nearReleaseAtMs,
+      distantPublishAtMs,
+      coverageGapMs: Math.max(0, distantPublishAtMs - nearReleaseAtMs),
       heldMs,
-      finalReleaseAtMs: publishedAtMs,
-      blankFrames: 0,
-      duplicateFrames: Number(duplicateCount > 0),
+      finalReleaseAtMs: nearReleaseAtMs,
+      blankFrames: barrier.blankFrames,
+      duplicateFrames: barrier.duplicateFrames,
       retryCount: barrier.retryCount,
     });
     recordDiagnosticEvent('near-distant-coverage-barrier-released', {
@@ -7151,6 +7295,10 @@ export async function createW8DistantPresentation({
     });
     roadPresentationFrameSequence += 1;
     if (pendingDistantPublication?.generation === handoff.targetGeneration) {
+      recordRuntimePresentationCoverageFrame(
+        handoff.targetGeneration,
+        handoff.coverageBarrier,
+      );
       return Object.freeze({
         processed: false,
         durationMs: 0,
@@ -7266,6 +7414,11 @@ export async function createW8DistantPresentation({
       }
       if (!handoff.coverageBarrier || handoff.coverageBarrier.released) complete();
     }
+
+    recordRuntimePresentationCoverageFrame(
+      handoff.targetGeneration,
+      handoff.coverageBarrier,
+    );
 
     const durationMs = monotonicNow() - startedAt;
     runtimePresentationHandoffMatrixUpdateCount += frameMatrixUpdates;
@@ -11363,6 +11516,16 @@ export async function createW8DistantPresentation({
       discardRuntimePresentationBarrierRoadWork(
         pendingRuntimePresentationHandoff?.coverageBarrier,
       );
+      const heldNearOwners = (getNearPresentationHolds() ?? [])
+        .map(held => held?.ownerKey)
+        .filter(ownerKey => typeof ownerKey === 'string');
+      if (heldNearOwners.length > 0) {
+        releaseNearPresentationHolds({
+          ownerKeys: Object.freeze([...new Set(heldNearOwners)]),
+          descriptors: Object.freeze([]),
+          reason: 'distant-dispose',
+        });
+      }
       pendingRuntimePresentationHandoff = null;
       while (deferredGenerationDisposals.length) {
         disposeGeneration(deferredGenerationDisposals.shift().generation);

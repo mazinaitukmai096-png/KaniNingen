@@ -455,6 +455,91 @@ test('Settlement projection preserves finite layer order and renders ribbon, ent
   await adapter.shutdown();
 });
 
+test('Settlement presentation hold releases Terrain and collision while retaining Building and Road until covered', async () => {
+  const scene = new Scene();
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
+  const road = {
+    stableId: 'road-hold-projection',
+    sourceStableId: 'road-hold-source',
+    featureType: 'settlement-road', widthMeters: 2,
+    start: { x: 2, z: 8 }, end: { x: 8, z: 8 }, worldPosition: { x: 5, y: 0, z: 8 },
+  };
+  const building = {
+    stableId: 'building-hold-projection',
+    featureType: 'settlement-building', buildingType: 'house',
+    worldPosition: { x: 11, y: 0, z: 8 }, rotationY: 0,
+    widthMeters: 6.5, heightMeters: 4.5, depthMeters: 5.25,
+  };
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'settlement-hold-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementLandmarks: [], streetDetails: [], settlementFeatures: [road, building],
+  };
+  const projected = await adapter.projectChunk(chunk);
+  const roadGeometry = projected.group.children
+    .find(child => child.name === 'infinite-settlement-roads').geometry;
+  await adapter.loadProjected(projected);
+  assert.equal(adapter.resourceSnapshot().cameraCollisionBoundCount, 1);
+
+  await adapter.unloadChunk('0,0', { deferSettlementPresentation: true });
+  const held = adapter.presentationHoldSnapshot();
+  assert.equal(projected.lifecycle, 'presentation-held');
+  assert.equal(held.length, 1);
+  assert.deepEqual(held[0].descriptors.map(value => value.projectionIdentity).sort(),
+    [building.stableId, road.stableId].sort());
+  assert.deepEqual(adapter.visibleStableIdsSnapshot(), [building.stableId, road.stableId].sort());
+  assert.equal(adapter.resourceSnapshot().liveChunkGroups, 0);
+  assert.equal(adapter.resourceSnapshot().heldSettlementPresentationOwnerCount, 1);
+  assert.equal(adapter.resourceSnapshot().cameraCollisionBoundCount, 0,
+    'presentation hold must not retain camera/collision ownership');
+  assert.equal(projected.group.children.some(child => /terrain/.test(child.name)), false);
+  assert.equal(projected.group.children.some(child => /lot-paths/.test(child.name)), false);
+  assert.equal(roadGeometry.disposed, false);
+
+  await adapter.rebase({ renderOriginChunkX: 2, renderOriginChunkZ: -1, rebaseCount: 1 });
+  assert.deepEqual({ x: projected.group.position.x, z: projected.group.position.z }, {
+    x: -2 * adapter.renderChunkSize,
+    z: adapter.renderChunkSize,
+  });
+
+  const buildingDescriptor = held[0].descriptors.find(value => value.kind === 'building');
+  const buildingRelease = adapter.releaseSettlementPresentationHolds({
+    ownerKeys: ['0,0'], descriptors: [buildingDescriptor], reason: 'building-covered',
+  });
+  assert.equal(buildingRelease.released, true);
+  assert.deepEqual(adapter.visibleStableIdsSnapshot(), [road.stableId]);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1);
+
+  const roadDescriptor = adapter.presentationHoldSnapshot()[0].descriptors[0];
+  const roadRelease = adapter.releaseSettlementPresentationHolds({
+    ownerKeys: ['0,0'], descriptors: [roadDescriptor], reason: 'road-covered',
+  });
+  assert.equal(roadRelease.released, true);
+  assert.deepEqual(adapter.visibleStableIdsSnapshot(), []);
+  assert.equal(adapter.presentationHoldSnapshot().length, 0);
+  assert.equal(roadGeometry.disposed, true);
+  const repeatedRoadRelease = adapter.releaseSettlementPresentationHolds({
+    ownerKeys: ['0,0'], descriptors: [roadDescriptor], reason: 'covered-repeat',
+  });
+  assert.equal(repeatedRoadRelease.released, true);
+  assert.equal(roadGeometry.disposed, true, 'an already released Road must not be disposed twice');
+
+  const returnedNear = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(returnedNear);
+  assert.equal(adapter.presentationHoldSnapshot().length, 0,
+    'an owner returning Near releases its stale presentation hold before publish');
+  assert.deepEqual(adapter.visibleStableIdsSnapshot(), [building.stableId, road.stableId].sort());
+  await adapter.unloadChunk('0,0', { deferSettlementPresentation: true });
+  assert.equal(adapter.presentationHoldSnapshot().length, 1);
+  await adapter.shutdown();
+  assert.equal(adapter.presentationHoldSnapshot().length, 0);
+});
+
 test('canonical MAJOR projection seams do not become artificial road junctions', async () => {
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
   const segment = (stableId, sourceSegmentStableId, startX, endX) => ({
