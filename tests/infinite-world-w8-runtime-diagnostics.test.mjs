@@ -4473,11 +4473,12 @@ test('remote Settlement Horizon preserves every canonical Building Stable ID and
   assert.ok(remoteMeshes.every(mesh => (
     mesh.geometry.attributes.w8RemoteAnchorXZ instanceof DistantTestInstancedBufferAttribute
   )));
+  assert.ok(remoteMeshes.every(mesh => (
+    mesh.geometry.attributes.w8RemoteSourceColor instanceof DistantTestInstancedBufferAttribute
+  )));
   const remoteMaterial = remoteMeshes[0].material;
   const remoteUniforms = remoteMaterial.userData.remoteAtmosphereUniforms;
-  assert.equal(remoteUniforms.w8RemoteSilhouetteColor.value.isColor, true);
   assert.equal(remoteUniforms.w8RemoteFogColor.value.isColor, true);
-  assert.ok(remoteUniforms.w8RemoteSilhouetteColor.value.r < (0x3a / 0xff));
   assert.ok(remoteUniforms.w8RemoteFogColor.value.r < (0x5d / 0xff));
   const compiledShader = {
     uniforms: {},
@@ -4486,9 +4487,13 @@ test('remote Settlement Horizon preserves every canonical Building Stable ID and
   };
   remoteMaterial.onBeforeCompile(compiledShader);
   assert.match(compiledShader.vertexShader, /attribute vec2 w8RemoteAnchorXZ/);
+  assert.match(compiledShader.vertexShader, /attribute vec3 w8RemoteSourceColor/);
+  assert.match(compiledShader.vertexShader, /vW8RemoteSourceColor = w8RemoteSourceColor/);
   assert.match(compiledShader.vertexShader, /vW8RemoteDistanceMeters = length/);
+  assert.match(compiledShader.fragmentShader, /mix\(vW8RemoteSourceColor, w8RemoteFogColor/);
+  assert.doesNotMatch(compiledShader.fragmentShader, /w8RemoteSilhouetteColor/);
   assert.match(compiledShader.fragmentShader, /diffuseColor\.a \*= w8RemoteOpacity/);
-  assert.equal(remoteMaterial.customProgramCacheKey(), 'w8-remote-building-atmosphere-v1');
+  assert.equal(remoteMaterial.customProgramCacheKey(), 'w8-remote-building-atmosphere-v2');
   const baselineIdentityById = new Map(presentation.canonicalAuditSnapshot()
     .filter(object => buildings.some(building => building.stableId === object.identity.stableId))
     .map(object => [object.identity.stableId, object.identity]));
@@ -4595,6 +4600,168 @@ test('remote Settlement Horizon preserves every canonical Building Stable ID and
   }), true);
   assert.equal(presentation.snapshot().visibleRemoteHorizonSettlementCount, 1);
   assert.ok(remoteMeshes.some(mesh => mesh.count > 0));
+  presentation.dispose();
+});
+
+test('Remote Horizon carries canonical wall and roof tints per instance without multiplying materials', async () => {
+  const settlementId = 'settlement-v1:remote-source-tints';
+  const centerX = 401;
+  const ownerX = Math.floor(centerX / LEGACY_CHUNK_SIZE_METERS);
+  const wallPart = Object.freeze({
+    ...CANONICAL_HOUSE_PART,
+    material: 'houseWall',
+    materialRole: 'wall',
+  });
+  const roofPart = Object.freeze({
+    geometry: 'pyramid',
+    material: 'houseRoof',
+    position: Object.freeze([0, 0.9, 0]),
+    scale: Object.freeze([1, 0.35, 1]),
+    rotation: Object.freeze([0, 0, 0]),
+    materialRole: 'roof',
+  });
+  const palettes = Object.freeze([
+    Object.freeze({ wallColor: 0x9a8569, roofColor: 0x66615a, visualVariant: 'canonical-a' }),
+    Object.freeze({ wallColor: 0xc2a06c, roofColor: 0x714238, visualVariant: 'canonical-b' }),
+  ]);
+  const buildings = Object.freeze(palettes.map((visual, index) => Object.freeze({
+    stableId: index === 0
+      ? 'settlement-building-v1:c0ad6ce14b0c8967945b4bbf'
+      : `${settlementId}:building:${index}`,
+    settlementId,
+    buildingType: 'house',
+    x: centerX + index * 12,
+    z: 8 + index * 2,
+    rotationY: index * 0.2,
+    widthMeters: 6,
+    heightMeters: 4,
+    depthMeters: 5,
+    visual,
+  })));
+  const candidate = Object.freeze({
+    settlementId,
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: Object.freeze({ x: centerX, z: 8 }),
+    radiusMeters: 12,
+  });
+  const template = Object.freeze({
+    ...candidate,
+    buildings,
+    roads: Object.freeze([]),
+  });
+  const canonicalBuildings = buildings.map(building => Object.freeze({
+    ...building,
+    featureType: 'settlement-building',
+    worldPosition: Object.freeze({ x: building.x, y: 0, z: building.z }),
+    owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+  }));
+  const visualAssets = createDistantTestVisualAssets();
+  visualAssets.geometries.pyramid = new DistantTestGeometry();
+  visualAssets.materials.houseWall = new DistantTestMaterial({ color: new DistantTestColor(0xffffff) });
+  visualAssets.materials.houseRoof = new DistantTestMaterial({ color: new DistantTestColor(0xffffff) });
+  visualAssets.featureParts.house = [wallPart, roofPart];
+  visualAssets.resolveBuildingParts = record => (
+    record.buildingType === 'house' ? [wallPart, roofPart] : null
+  );
+  const scene = new DistantTestGroup();
+  let nearStableIds = [];
+  let includeRemoteCandidate = true;
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets,
+    findSettlementsNear: async () => (includeRemoteCandidate ? [candidate] : []),
+    resolveTemplate: async () => template,
+    getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(
+      chunkX,
+      chunkZ,
+      chunkX === ownerX && chunkZ === 0 ? canonicalBuildings : [],
+    ),
+    getNearVisibleStableIds: () => nearStableIds,
+  });
+  assert.equal(await presentation.sync({
+    activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    centerChunkX: 0, centerChunkZ: 0, quality: 'high',
+    playerLogicalX: 0, playerLogicalZ: 0,
+    includeFarNatural: false, includeUltraNatural: false,
+  }), true);
+  const remoteMeshes = scene.children[0].children[0].children.filter(child => (
+    child.name.includes('remote-horizon-building')
+  ));
+  assert.equal(remoteMeshes.length, 2);
+  assert.equal(new Set(remoteMeshes.map(mesh => mesh.material)).size, 1);
+  assert.equal(presentation.snapshot().remoteHorizonMaterialCount, 1);
+  const assertPartTints = (mesh, role) => {
+    const attribute = mesh.geometry.attributes.w8RemoteSourceColor;
+    assert.equal(attribute.itemSize, 3);
+    for (let slot = 0; slot < mesh.count; slot += 1) {
+      const stableId = mesh.userData.canonicalStableIds[slot];
+      const buildingIndex = buildings.findIndex(building => building.stableId === stableId);
+      assert.notEqual(buildingIndex, -1);
+      const expected = new DistantTestColor(palettes[buildingIndex][`${role}Color`]);
+      const actual = attribute.values.slice(slot * 3, slot * 3 + 3);
+      assert.ok(actual.every(Number.isFinite));
+      for (const [componentIndex, expectedValue] of [expected.r, expected.g, expected.b].entries()) {
+        assert.ok(Math.abs(actual[componentIndex] - expectedValue) < 1e-7);
+      }
+    }
+  };
+  assertPartTints(remoteMeshes.find(mesh => mesh.name.includes('-box-')), 'wall');
+  assertPartTints(remoteMeshes.find(mesh => mesh.name.includes('-pyramid-')), 'roof');
+  const auditById = new Map(presentation.canonicalAuditSnapshot().map(entry => (
+    [entry.identity.stableId, entry]
+  )));
+  for (let index = 0; index < buildings.length; index += 1) {
+    const audit = auditById.get(buildings[index].stableId);
+    assert.equal(audit.presentationTier, 'remote-horizon');
+    assert.deepEqual(audit.identity.visual, palettes[index]);
+  }
+  assert.notDeepEqual(
+    [...remoteMeshes.find(mesh => mesh.name.includes('-box-'))
+      .geometry.attributes.w8RemoteSourceColor.values.slice(0, 3)],
+    [...remoteMeshes.find(mesh => mesh.name.includes('-pyramid-'))
+      .geometry.attributes.w8RemoteSourceColor.values.slice(0, 3)],
+  );
+  const allocatedTintBytes = remoteMeshes.reduce((sum, mesh) => (
+    sum + mesh.geometry.attributes.w8RemoteSourceColor.values.byteLength
+  ), 0);
+  assert.equal(
+    allocatedTintBytes,
+    buildings.length * 2 * 3 * Float32Array.BYTES_PER_ELEMENT,
+  );
+  includeRemoteCandidate = false;
+  assert.equal(await presentation.sync({
+    activeDataKeys: [`${ownerX},0`], renderedKeys: [],
+    getChunkData: (chunkX, chunkZ) => (chunkX === ownerX && chunkZ === 0
+      ? canonicalChunk(ownerX, 0, canonicalBuildings) : null),
+    renderOrigin: { renderOriginChunkX: ownerX, renderOriginChunkZ: 0 },
+    centerChunkX: ownerX, centerChunkZ: 0, quality: 'high',
+    playerLogicalX: centerX, playerLogicalZ: 8,
+    includeFarNatural: false, includeUltraNatural: false,
+  }), true);
+  const midAuditById = new Map(presentation.canonicalAuditSnapshot().map(entry => (
+    [entry.identity.stableId, entry]
+  )));
+  for (let index = 0; index < buildings.length; index += 1) {
+    const audit = midAuditById.get(buildings[index].stableId);
+    assert.deepEqual(audit.identity.visual, palettes[index]);
+    assert.notEqual(audit.presentationTier, 'remote-horizon');
+  }
+  nearStableIds = buildings.map(building => building.stableId);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: [`${ownerX},0`], renderedKeys: [`${ownerX},0`],
+    renderOrigin: { renderOriginChunkX: ownerX, renderOriginChunkZ: 0 },
+    quality: 'high', playerLogicalX: centerX, playerLogicalZ: 8,
+  }), true);
+  const nearAuditById = new Map(presentation.canonicalAuditSnapshot().map(entry => (
+    [entry.identity.stableId, entry]
+  )));
+  for (let index = 0; index < buildings.length; index += 1) {
+    assert.deepEqual(nearAuditById.get(buildings[index].stableId).identity.visual, palettes[index]);
+  }
   presentation.dispose();
 });
 

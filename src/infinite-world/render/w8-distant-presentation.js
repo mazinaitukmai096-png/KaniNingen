@@ -1219,6 +1219,10 @@ export async function createW8DistantPresentation({
       && opacity > 0;
     return `${visible ? 1 : 0}:${opacity}`;
   };
+  const remoteSourceColorsEqual = (left, right) => (
+    left === right || (left != null && right != null
+      && left.r === right.r && left.g === right.g && left.b === right.b)
+  );
   const assignPersistentItemKeys = bucket => {
     const ordinals = new Map();
     for (const item of bucket.items) {
@@ -1266,6 +1270,7 @@ export async function createW8DistantPresentation({
       nextSlotByKey.set(item.persistentKey, slot);
       const changed = !previousItem
         || !matricesEqual(previousItem.matrix, item.matrix)
+        || !remoteSourceColorsEqual(previousItem.remoteSourceColor, item.remoteSourceColor)
         || itemVisibilitySignature(activeGeneration ?? generation, previousItem)
           !== itemVisibilitySignature(generation, item);
       if (changed) operations.push({ slot, previousItem, desiredItem: item });
@@ -1330,6 +1335,7 @@ export async function createW8DistantPresentation({
       work.live.mesh.setMatrixAt(operation.slot, visible ? item.matrix : hidden);
       if (item) {
         writeRemoteBuildingAnchor(work.live, operation.slot, item.object, publication.previous);
+        writeRemoteSourceColor(work.live, operation.slot, item);
         writeNaturalAnchor(work.live, operation.slot, item.object, publication.previous);
         writeNaturalInitialReveal(work.live, operation.slot, item.object, publication.previous);
         writeLocalHandoffOpacity(work.live, operation.slot, visible ? opacity : 0);
@@ -1386,6 +1392,7 @@ export async function createW8DistantPresentation({
         work.live.mesh.setMatrixAt(operation.slot, visible ? item.matrix : hidden);
         if (item) {
           writeRemoteBuildingAnchor(work.live, operation.slot, item.object, work.generation);
+          writeRemoteSourceColor(work.live, operation.slot, item);
           writeNaturalAnchor(work.live, operation.slot, item.object, work.generation);
           writeNaturalInitialReveal(work.live, operation.slot, item.object, work.generation);
           writeLocalHandoffOpacity(work.live, operation.slot, visible ? opacity : 0);
@@ -1397,6 +1404,7 @@ export async function createW8DistantPresentation({
       if (work.cursor >= work.operations.length) {
         const slotBytes = 16 * 4
           + Number(Boolean(work.live.remoteAnchorAttribute)) * 2 * 4
+          + Number(Boolean(work.live.remoteSourceColorAttribute)) * 3 * 4
           + Number(Boolean(work.live.naturalAnchorAttribute)) * 2 * 4
           + Number(Boolean(work.live.naturalInitialRevealAttribute)) * 4
           + Number(Boolean(work.live.localHandoffOpacityAttribute)) * 4;
@@ -1405,6 +1413,11 @@ export async function createW8DistantPresentation({
           const slots = [...new Set(work.preparedSlots)].sort((left, right) => left - right);
           const matrixUpload = markAttributeRanges(work.live.mesh.instanceMatrix, slots, 16);
           const remoteUpload = markAttributeRanges(work.live.remoteAnchorAttribute, slots, 2);
+          const remoteColorUpload = markAttributeRanges(
+            work.live.remoteSourceColorAttribute,
+            slots,
+            3,
+          );
           const anchorUpload = markAttributeRanges(work.live.naturalAnchorAttribute, slots, 2);
           const revealUpload = markAttributeRanges(
             work.live.naturalInitialRevealAttribute,
@@ -1418,12 +1431,14 @@ export async function createW8DistantPresentation({
           );
           uploadBytes += (matrixUpload?.byteCount ?? 0)
             + (remoteUpload?.byteCount ?? 0)
+            + (remoteColorUpload?.byteCount ?? 0)
             + (anchorUpload?.byteCount ?? 0)
             + (revealUpload?.byteCount ?? 0)
             + (handoffUpload?.byteCount ?? 0);
           bufferUpdates += [
             matrixUpload,
             remoteUpload,
+            remoteColorUpload,
             anchorUpload,
             revealUpload,
             handoffUpload,
@@ -1995,6 +2010,7 @@ export async function createW8DistantPresentation({
     matrix,
     visibilityTiers = Object.freeze(['full']),
     context,
+    remoteSourceColor = null,
   ) => {
     const key = `${geometry}:${material}:${name}`;
     const persistentDistant = context.generation.persistentDistant === true
@@ -2025,6 +2041,7 @@ export async function createW8DistantPresentation({
       object,
       matrix: matrix.clone?.() ?? structuredClone(matrix),
       visibilityTiers,
+      remoteSourceColor,
     };
     bucket.items.push(item);
     if (context.generation.persistentNatural === true
@@ -2196,6 +2213,24 @@ export async function createW8DistantPresentation({
     return (quality === 'high' ? [body, cap] : [body]).filter(Boolean);
   };
 
+  const remoteHorizonSourceColor = (record, part, kind, policy) => {
+    const visualColor = kind === 'building'
+      ? (part.materialRole === 'wall' ? record.visual?.wallColor
+        : part.materialRole === 'roof' ? record.visual?.roofColor : null)
+      : null;
+    const materialColor = visualAssets.materials?.[part.material]?.color;
+    const source = Number.isFinite(visualColor)
+      ? visualColor
+      : materialColor?.isColor === true
+        ? materialColor
+        : policy.atmosphere.silhouetteColorHex;
+    const color = source?.isColor === true ? source : new Color(source);
+    if (![color.r, color.g, color.b].every(Number.isFinite)) {
+      throw new Error(`remote Settlement source tint is invalid: ${record.stableId}/${part.materialRole ?? part.material}`);
+    }
+    return Object.freeze({ r: color.r, g: color.g, b: color.b });
+  };
+
   const remoteHorizonRecord = ({
     source,
     candidate,
@@ -2345,6 +2380,12 @@ export async function createW8DistantPresentation({
             canonicalPartMatrix(record, part, dimensions, origin),
             Object.freeze(['remote-horizon']),
             context,
+            remoteHorizonSourceColor(
+              record,
+              part,
+              kind,
+              context.generation.settlementPresentationPolicy.remote,
+            ),
           );
         }
         context.generation.remotePartBudgetRemaining -= horizonParts.length;
@@ -3089,9 +3130,6 @@ export async function createW8DistantPresentation({
       w8RemoteFogEdgeBlend: { value: policy.atmosphere.fogEdgeBlend },
       w8RemoteFogEdgeOpacity: { value: policy.atmosphere.fogEdgeOpacity },
       w8RemoteMaximumFogBlend: { value: policy.atmosphere.maximumFogBlend },
-      w8RemoteSilhouetteColor: {
-        value: new Color(policy.atmosphere.silhouetteColorHex),
-      },
       w8RemoteFogColor: {
         value: new Color(policy.atmosphere.fogColorHex),
       },
@@ -3125,11 +3163,13 @@ export async function createW8DistantPresentation({
         'uniform vec2 w8RemotePlayerLocalXZ;',
         'uniform float w8RemoteUnitsPerMeter;',
         'attribute vec2 w8RemoteAnchorXZ;',
+        'attribute vec3 w8RemoteSourceColor;',
         'varying float vW8RemoteDistanceMeters;',
+        'varying vec3 vW8RemoteSourceColor;',
         shader.vertexShader,
       ].join('\n').replace(
         vertexAnchor,
-        `${vertexAnchor}\nvW8RemoteDistanceMeters = length(w8RemoteAnchorXZ - w8RemotePlayerLocalXZ) / w8RemoteUnitsPerMeter;`,
+        `${vertexAnchor}\nvW8RemoteDistanceMeters = length(w8RemoteAnchorXZ - w8RemotePlayerLocalXZ) / w8RemoteUnitsPerMeter;\nvW8RemoteSourceColor = w8RemoteSourceColor;`,
       );
       shader.fragmentShader = [
         'uniform float w8RemoteFadeStart;',
@@ -3139,9 +3179,9 @@ export async function createW8DistantPresentation({
         'uniform float w8RemoteFogEdgeBlend;',
         'uniform float w8RemoteFogEdgeOpacity;',
         'uniform float w8RemoteMaximumFogBlend;',
-        'uniform vec3 w8RemoteSilhouetteColor;',
         'uniform vec3 w8RemoteFogColor;',
         'varying float vW8RemoteDistanceMeters;',
+        'varying vec3 vW8RemoteSourceColor;',
         shader.fragmentShader,
       ].join('\n').replace(fragmentColor, [
         fragmentColor,
@@ -3154,11 +3194,11 @@ export async function createW8DistantPresentation({
         '  w8RemoteOpacity = w8RemoteFogEdgeOpacity * (1.0 - w8RemoteHorizonProgress);',
         '}',
         'if (vW8RemoteDistanceMeters >= w8RemoteHidden) w8RemoteOpacity = 0.0;',
-        'diffuseColor.rgb = mix(w8RemoteSilhouetteColor, w8RemoteFogColor, w8RemoteFogBlend);',
+        'diffuseColor.rgb = mix(vW8RemoteSourceColor, w8RemoteFogColor, w8RemoteFogBlend);',
         'diffuseColor.a *= w8RemoteOpacity;',
       ].join('\n'));
     };
-    material.customProgramCacheKey = () => 'w8-remote-building-atmosphere-v1';
+    material.customProgramCacheKey = () => 'w8-remote-building-atmosphere-v2';
     return material;
   };
 
@@ -3174,8 +3214,14 @@ export async function createW8DistantPresentation({
       new Float32Array((bucket.capacity ?? bucket.items.length) * 2),
       2,
     );
+    const sourceColorAttribute = new InstancedBufferAttribute(
+      new Float32Array((bucket.capacity ?? bucket.items.length) * 3),
+      3,
+    );
     geometry.setAttribute('w8RemoteAnchorXZ', anchorAttribute);
+    geometry.setAttribute('w8RemoteSourceColor', sourceColorAttribute);
     bucket.remoteAnchorAttribute = anchorAttribute;
+    bucket.remoteSourceColorAttribute = sourceColorAttribute;
     context.generation.ownedGeometries.add(geometry);
     return geometry;
   };
@@ -3597,6 +3643,24 @@ export async function createW8DistantPresentation({
     bucket.remoteAnchorAttribute?.array ?? bucket.remoteAnchorAttribute?.values ?? null
   );
 
+  const remoteSourceColorValues = bucket => (
+    bucket.remoteSourceColorAttribute?.array
+      ?? bucket.remoteSourceColorAttribute?.values
+      ?? null
+  );
+
+  const writeRemoteSourceColor = (bucket, index, item) => {
+    const values = remoteSourceColorValues(bucket);
+    if (!values) return;
+    const color = item.remoteSourceColor;
+    if (!color || ![color.r, color.g, color.b].every(Number.isFinite)) {
+      throw new Error(`remote Settlement instance source tint is invalid: ${item.object.stableId}`);
+    }
+    values[index * 3] = color.r;
+    values[index * 3 + 1] = color.g;
+    values[index * 3 + 2] = color.b;
+  };
+
   const writeRemoteBuildingAnchor = (bucket, index, object, generation) => {
     const values = remoteAnchorValues(bucket);
     if (!values) return;
@@ -3611,6 +3675,7 @@ export async function createW8DistantPresentation({
   const finishRemoteBuildingAnchorWrite = (bucket, mesh, canonicalObjects) => {
     if (!remoteAnchorValues(bucket)) return;
     bucket.remoteAnchorAttribute.needsUpdate = true;
+    bucket.remoteSourceColorAttribute.needsUpdate = true;
     // setMatrixAt() does not invalidate InstancedMesh bounds in Three r160.
     // Force the renderer to derive bounds from the newly compacted instances.
     mesh.boundingBox = null;
@@ -3766,6 +3831,7 @@ export async function createW8DistantPresentation({
           && opacity > 0;
         mesh.setMatrixAt(slot, visible ? item.matrix : hidden);
         writeRemoteBuildingAnchor(bucket, slot, item.object, generation);
+        writeRemoteSourceColor(bucket, slot, item);
         writeNaturalAnchor(bucket, slot, item.object, generation);
         writeNaturalInitialReveal(bucket, slot, item.object, generation);
         writeLocalHandoffOpacity(bucket, slot, visible ? opacity : 0);
@@ -3790,6 +3856,7 @@ export async function createW8DistantPresentation({
         matrices: bucket.items.length,
         attributes: Number(Boolean(mesh.instanceMatrix))
           + Number(Boolean(bucket.remoteAnchorAttribute))
+          + Number(Boolean(bucket.remoteSourceColorAttribute))
           + Number(Boolean(bucket.naturalAnchorAttribute))
           + Number(Boolean(bucket.naturalInitialRevealAttribute))
           + Number(Boolean(bucket.localHandoffOpacityAttribute)),
@@ -3807,6 +3874,7 @@ export async function createW8DistantPresentation({
         || !(opacity > 0)) continue;
       mesh.setMatrixAt(count, item.matrix);
       writeRemoteBuildingAnchor(bucket, count, item.object, generation);
+      writeRemoteSourceColor(bucket, count, item);
       writeNaturalAnchor(bucket, count, item.object, generation);
       writeNaturalInitialReveal(bucket, count, item.object, generation);
       writeLocalHandoffOpacity(bucket, count, opacity);
@@ -3832,6 +3900,7 @@ export async function createW8DistantPresentation({
       matrices: count,
       attributes: Number(Boolean(mesh.instanceMatrix))
         + Number(Boolean(bucket.remoteAnchorAttribute))
+        + Number(Boolean(bucket.remoteSourceColorAttribute))
         + Number(Boolean(bucket.naturalAnchorAttribute))
         + Number(Boolean(bucket.naturalInitialRevealAttribute))
         + Number(Boolean(bucket.localHandoffOpacityAttribute)),
@@ -4081,6 +4150,7 @@ export async function createW8DistantPresentation({
         mesh.setMatrixAt(slot, visible ? item.matrix : hidden);
         if (item) {
           writeRemoteBuildingAnchor(bucket, slot, item.object, generation);
+          writeRemoteSourceColor(bucket, slot, item);
           writeNaturalAnchor(bucket, slot, item.object, generation);
           writeNaturalInitialReveal(bucket, slot, item.object, generation);
           writeLocalHandoffOpacity(bucket, slot, visible ? opacity : 0);
@@ -4098,6 +4168,11 @@ export async function createW8DistantPresentation({
       mesh.count = bucket.items.length;
       const matrixUpload = markAttributeRanges(mesh.instanceMatrix, processedSlots, 16);
       const remoteUpload = markAttributeRanges(bucket.remoteAnchorAttribute, processedSlots, 2);
+      const remoteColorUpload = markAttributeRanges(
+        bucket.remoteSourceColorAttribute,
+        processedSlots,
+        3,
+      );
       const anchorUpload = markAttributeRanges(bucket.naturalAnchorAttribute, processedSlots, 2);
       const revealUpload = markAttributeRanges(
         bucket.naturalInitialRevealAttribute,
@@ -4109,7 +4184,14 @@ export async function createW8DistantPresentation({
         processedSlots,
         1,
       );
-      const bufferUploads = [matrixUpload, remoteUpload, anchorUpload, revealUpload, handoffUpload]
+      const bufferUploads = [
+        matrixUpload,
+        remoteUpload,
+        remoteColorUpload,
+        anchorUpload,
+        revealUpload,
+        handoffUpload,
+      ]
         .filter(Boolean);
       const bytes = bufferUploads.reduce((sum, upload) => sum + upload.byteCount, 0);
       if (bytes > DISTANT_PERSISTENT_UPLOAD_BUDGET_BYTES) {
@@ -4146,6 +4228,7 @@ export async function createW8DistantPresentation({
         && opacity > 0) {
         mesh.setMatrixAt(work.count, item.matrix);
         writeRemoteBuildingAnchor(bucket, work.count, item.object, generation);
+        writeRemoteSourceColor(bucket, work.count, item);
         writeNaturalAnchor(bucket, work.count, item.object, generation);
         writeNaturalInitialReveal(bucket, work.count, item.object, generation);
         writeLocalHandoffOpacity(bucket, work.count, opacity);
@@ -4179,6 +4262,7 @@ export async function createW8DistantPresentation({
       matrices: frameMatrices,
       attributes: Number(Boolean(mesh.instanceMatrix))
         + Number(Boolean(bucket.remoteAnchorAttribute))
+        + Number(Boolean(bucket.remoteSourceColorAttribute))
         + Number(Boolean(bucket.naturalAnchorAttribute))
         + Number(Boolean(bucket.naturalInitialRevealAttribute))
         + Number(Boolean(bucket.localHandoffOpacityAttribute)),
@@ -4268,6 +4352,7 @@ export async function createW8DistantPresentation({
             && opacity > 0;
           mesh.setMatrixAt(slot, visible ? item.matrix : hidden);
           writeRemoteBuildingAnchor(bucket, slot, item.object, generation);
+          writeRemoteSourceColor(bucket, slot, item);
           writeNaturalAnchor(bucket, slot, item.object, generation);
           writeNaturalInitialReveal(bucket, slot, item.object, generation);
           writeLocalHandoffOpacity(bucket, slot, visible ? opacity : 0);
@@ -4307,6 +4392,7 @@ export async function createW8DistantPresentation({
           && opacity > 0) {
           mesh.setMatrixAt(count, item.matrix);
           writeRemoteBuildingAnchor(bucket, count, item.object, generation);
+          writeRemoteSourceColor(bucket, count, item);
           writeNaturalAnchor(bucket, count, item.object, generation);
           writeNaturalInitialReveal(bucket, count, item.object, generation);
           writeLocalHandoffOpacity(bucket, count, opacity);
