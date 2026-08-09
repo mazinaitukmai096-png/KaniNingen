@@ -314,9 +314,14 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     landingRing: new (requireType(THREE, 'RingGeometry', 'CylinderGeometry'))(0.1, 1, 20),
   });
   const settlementPaletteMaterials = {};
+  const settlementRoofColors = new Set(Object.values(SETTLEMENT_BUILDING_PALETTES)
+    .flatMap(palette => palette.roof));
   for (const palette of Object.values(SETTLEMENT_BUILDING_PALETTES)) {
     for (const color of [...palette.wall, ...palette.roof]) {
-      settlementPaletteMaterials[settlementMaterialKey(color)] ??= phong(color);
+      settlementPaletteMaterials[settlementMaterialKey(color)] ??= phong(
+        color,
+        settlementRoofColors.has(color) ? { specular: 0x000000 } : {},
+      );
     }
   }
   const supplementalMaterials = {

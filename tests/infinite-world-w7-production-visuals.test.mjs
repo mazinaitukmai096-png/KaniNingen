@@ -21,6 +21,7 @@ import {
 import { W8_HOUSE_HUMAN_SCALE_VISUAL_PROFILE } from '../src/infinite-world/render/house-human-scale-visual-profile.js';
 import { GameplayRenderAdapter } from '../src/infinite-world/render/gameplay-render-adapter.js';
 import { W7_NUCLEAR_CONTRACT } from '../src/infinite-world/gameplay-contract.js';
+import { SETTLEMENT_BUILDING_PALETTES } from '../src/settlement-building-visuals.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const provenancePath = resolve(repoRoot, 'docs/infinite-world/W7-VISUAL-PROVENANCE.json');
@@ -127,6 +128,10 @@ test('W7A production Player, Human, and Tank share bounded resources and dispose
 
 test('W8 settlement and atmosphere materials use the finite visual baseline', () => {
   const assets = createW8ParityVisualAssetLibrary({ THREE: FakeThree });
+  const initialResourceCounts = {
+    geometry: assets.snapshot().sharedGeometryCount,
+    material: assets.snapshot().sharedMaterialCount,
+  };
   assert.ok(assets.materials.road instanceof MeshPhongMaterial);
   assert.deepEqual(assets.materials.road.options, { color: 0xc2a878, shininess: 3 });
   assert.equal(assets.materials.houseWall.options.color, 0xeeeeee);
@@ -143,15 +148,46 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
   assert.ok(W8_PARITY_FEATURE_PARTS.militaryBase.length >= 18);
   assert.ok(W8_PARITY_FEATURE_PARTS.barn.length >= 7);
   const visualBuilding = {
-    stableId: 'palette-building',
+    stableId: 'settlement-building-v1:c0ad6ce14b0c8967945b4bbf',
     buildingType: 'house',
     visual: { wallColor: 0x80634c, roofColor: 0x536247, roofScale: 1.1 },
   };
   const resolved = assets.resolveBuildingParts(visualBuilding);
   const wall = resolved.find(part => part.materialRole === 'wall');
   const roof = resolved.find(part => part.materialRole === 'roof');
-  assert.equal(assets.materials[wall.material].options.color, visualBuilding.visual.wallColor);
-  assert.equal(assets.materials[roof.material].options.color, visualBuilding.visual.roofColor);
+  const wallMaterial = assets.materials[wall.material];
+  const roofMaterial = assets.materials[roof.material];
+  assert.ok(wallMaterial instanceof MeshPhongMaterial);
+  assert.ok(roofMaterial instanceof MeshPhongMaterial);
+  assert.equal(wallMaterial.options.color, visualBuilding.visual.wallColor);
+  assert.equal('specular' in wallMaterial.options, false);
+  assert.equal(roofMaterial.options.color, visualBuilding.visual.roofColor);
+  assert.equal(roofMaterial.options.specular, 0x000000);
+  assert.equal(roof.geometry, 'pyramid');
+  for (const [settlementType, palette] of Object.entries(SETTLEMENT_BUILDING_PALETTES)) {
+    for (let index = 0; index < palette.wall.length; index += 1) {
+      const paletteParts = assets.resolveBuildingParts({
+        stableId: `palette-building:${settlementType}:${index}`,
+        buildingType: 'house',
+        visual: { wallColor: palette.wall[index], roofColor: palette.roof[index] },
+      });
+      const paletteWall = assets.materials[paletteParts
+        .find(part => part.materialRole === 'wall').material];
+      const paletteRoof = assets.materials[paletteParts
+        .find(part => part.materialRole === 'roof').material];
+      assert.ok(paletteWall instanceof MeshPhongMaterial);
+      assert.ok(paletteRoof instanceof MeshPhongMaterial);
+      assert.deepEqual(paletteWall.options, { color: palette.wall[index] });
+      assert.deepEqual(paletteRoof.options, {
+        color: palette.roof[index],
+        specular: 0x000000,
+      });
+    }
+  }
+  assert.deepEqual({
+    geometry: assets.snapshot().sharedGeometryCount,
+    material: assets.snapshot().sharedMaterialCount,
+  }, initialResourceCounts);
   const unscaledRoof = assets.resolveBuildingParts({
     ...visualBuilding, visual: { ...visualBuilding.visual, roofScale: 1 },
   }).find(part => part.materialRole === 'roof');
