@@ -7,12 +7,14 @@ import vm from 'node:vm';
 import {
   bootInfiniteWorldSandbox,
   createOriginTransformDiagnosticRing,
+  createTerrainLagSpikeDiagnosticCapture,
   createSandboxBootState,
   createSandboxEntryController,
   createW8ScenePresentation,
   gatePlayerMovementByTerrainCoverage,
   isW8GameplaySimulationEnabled,
   recordSandboxBootFailure,
+  terrainPresentationWorldCoverageComplete,
   w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
@@ -69,7 +71,30 @@ test('origin transform diagnostics retain only bounded anomaly pre/post frames',
   assert.equal(snapshot.buildIdentity.sourceRevision, 'w8-real-webgl-draw-audit-1');
 });
 
-test('Player terrain coverage gate retains the last formal position and height until ready', () => {
+test('Terrain lag spike diagnostics freeze a bounded five-second window at 4/8/16 Chunk markers', () => {
+  const capture = createTerrainLagSpikeDiagnosticCapture({
+    enabled: true,
+    preWindowMs: 5_000,
+    postWindowMs: 5_000,
+  });
+  for (let timestampMs = 0; timestampMs <= 12_000; timestampMs += 100) {
+    capture.record({
+      timestampMs,
+      frameSequence: timestampMs / 100,
+      lagChunks: timestampMs < 6_000 ? 0 : timestampMs < 7_000 ? 4
+        : timestampMs < 8_000 ? 8 : 16,
+    });
+  }
+  const snapshot = capture.snapshot();
+  assert.equal(snapshot.frozen, true);
+  assert.deepEqual(snapshot.markers.map(marker => marker.threshold), [4, 8, 16]);
+  assert.equal(snapshot.preFrames[0].timestampMs, 1_000);
+  assert.equal(snapshot.preFrames.at(-1).timestampMs, 6_000);
+  assert.equal(snapshot.postFrames.at(-1).timestampMs, 11_000);
+  assert.equal(snapshot.frameCount, 101);
+});
+
+test('Player terrain coverage fallback preserves movement and retains a safe height until ready', () => {
   const samples = [];
   const blocked = gatePlayerMovementByTerrainCoverage({
     horizontalMovement: Object.freeze({ x: 48.25, z: -3, collided: false }),
@@ -82,8 +107,10 @@ test('Player terrain coverage gate retains the last formal position and height u
     isTerrainCoveragePublished: () => true,
   });
   assert.deepEqual(samples, [[48.25, -3], [47.75, -3]]);
-  assert.equal(blocked.terrainCoverageBlocked, true);
-  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 47.75, z: -3 });
+  assert.equal(blocked.terrainCoverageBlocked, false);
+  assert.equal(blocked.movementBlockedByTerrain, false);
+  assert.equal(blocked.collisionCoverageMiss, true);
+  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 48.25, z: -3 });
   assert.equal(blocked.terrainHeightMeters, 12.5);
   assert.equal(blocked.terrainCoverageOwner.key, '3,-1');
 
@@ -99,7 +126,7 @@ test('Player terrain coverage gate retains the last formal position and height u
   assert.equal(ready.terrainHeightMeters, 14.25);
 });
 
-test('Player terrain coverage gate rejects cached Terrain until its owner is published', () => {
+test('visual publication state does not gate canonical Terrain collision sampling', () => {
   const sampledOwners = [];
   const publishedOwners = new Set(['2,-1']);
   const blocked = gatePlayerMovementByTerrainCoverage({
@@ -114,9 +141,12 @@ test('Player terrain coverage gate rejects cached Terrain until its owner is pub
     isTerrainCoveragePublished: owner => publishedOwners.has(owner.key),
   });
 
-  assert.equal(blocked.terrainCoverageBlocked, true);
-  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 47.75, z: -3 });
-  assert.deepEqual(sampledOwners, ['2,-1'], 'an unpublished cache entry is never sampled as visible Terrain');
+  assert.equal(blocked.terrainCoverageBlocked, false);
+  assert.equal(blocked.terrainPresentationFallback, true);
+  assert.equal(blocked.collisionCoverageMiss, false);
+  assert.deepEqual({ x: blocked.x, z: blocked.z }, { x: 48.25, z: -3 });
+  assert.deepEqual(sampledOwners, ['3,-1'],
+    'authoritative collision data is independent of visual publication');
 
   publishedOwners.add('3,-1');
   const ready = gatePlayerMovementByTerrainCoverage({
@@ -128,6 +158,81 @@ test('Player terrain coverage gate rejects cached Terrain until its owner is pub
   });
   assert.equal(ready.terrainCoverageBlocked, false);
   assert.deepEqual({ x: ready.x, z: ready.z }, { x: 48.25, z: -3 });
+});
+
+test('Terrain visual coverage diagnostics reject a structurally complete but spatially stale root', () => {
+  assert.equal(terrainPresentationWorldCoverageComplete({
+    complete: true,
+    worldCoverageComplete: false,
+  }), false);
+  assert.equal(terrainPresentationWorldCoverageComplete({
+    complete: true,
+    worldCoverageComplete: true,
+  }), true);
+  assert.equal(terrainPresentationWorldCoverageComplete({ complete: true }), true,
+    'legacy coverage providers retain their structural fallback contract');
+  assert.equal(terrainPresentationWorldCoverageComplete({ complete: false }), false);
+});
+
+test('700ms Terrain presentation lag never blocks 334ms MAX arrivals or creates a blank', () => {
+  const frameMs = 50;
+  const generationMs = 700;
+  const maxSprintMetersPerSecond = 47.85;
+  let elapsedMs = 0;
+  let playerX = 15;
+  let playerZ = 0;
+  let fallbackFrames = 0;
+  let collisionCoverageMisses = 0;
+  let movementBlocks = 0;
+  let blankFrames = 0;
+  let presentationSwaps = 0;
+  let oldCompleteVisible = true;
+  let newCompleteVisible = false;
+  for (let frame = 0; frame < 20; frame += 1) {
+    const startX = playerX;
+    const startZ = playerZ;
+    const direction = frame < 6 ? { x: 1, z: 0 }
+      : frame < 10 ? { x: Math.SQRT1_2, z: Math.SQRT1_2 }
+        : frame < 14 ? { x: 0, z: 1 }
+          : { x: 0, z: frame % 2 === 0 ? -1 : 1 };
+    elapsedMs += frameMs;
+    if (!newCompleteVisible && elapsedMs >= generationMs) {
+      newCompleteVisible = true;
+      oldCompleteVisible = false;
+      presentationSwaps += 1;
+    }
+    const result = gatePlayerMovementByTerrainCoverage({
+      horizontalMovement: Object.freeze({
+        x: startX + direction.x * maxSprintMetersPerSecond * frameMs / 1000,
+        z: startZ + direction.z * maxSprintMetersPerSecond * frameMs / 1000,
+        collided: false,
+      }),
+      startX,
+      startZ,
+      sampleCanonicalTerrainHeight: () => 8.5,
+      sampleFallbackTerrainHeight: () => 8,
+      fallbackTerrainHeightMeters: 8,
+      isTerrainCoveragePublished: () => newCompleteVisible,
+    });
+    playerX = result.x;
+    playerZ = result.z;
+    fallbackFrames += Number(result.terrainPresentationFallback);
+    collisionCoverageMisses += Number(result.collisionCoverageMiss);
+    movementBlocks += Number(result.movementBlockedByTerrain);
+    blankFrames += Number(!oldCompleteVisible && !newCompleteVisible);
+    assert.ok(Math.hypot(playerX - startX, playerZ - startZ) > 0,
+      `frame ${frame} must advance Player input`);
+    assert.ok(Number.isFinite(result.terrainHeightMeters));
+  }
+  assert.ok(playerX > 15 + maxSprintMetersPerSecond * 0.334,
+    'Player crosses the first Chunk-arrival interval before generation completes');
+  assert.equal(movementBlocks, 0);
+  assert.equal(fallbackFrames, 13);
+  assert.equal(collisionCoverageMisses, 0);
+  assert.equal(blankFrames, 0);
+  assert.equal(presentationSwaps, 1);
+  assert.equal(oldCompleteVisible, false);
+  assert.equal(newCompleteVisible, true);
 });
 
 class Triple {
@@ -1410,7 +1515,7 @@ test('persistent Tree publication A/B flag preserves Near and Distant warm while
     }
   });
 
-test('MAX Player movement waits for formal destination Terrain and resumes after transition',
+test('MAX Player movement continues while destination Terrain presentation is pending',
   async () => {
     const environment = installBrowserEquivalentEnvironment();
     const controls = installExperienceControls();
@@ -1502,7 +1607,6 @@ test('MAX Player movement waits for formal destination Terrain and resumes after
         x: sandbox.logicalPlayer.x,
         z: sandbox.logicalPlayer.z,
       });
-      const retainedHeight = sandbox.snapshot().experience.playerVertical.terrainHeightMeters;
       const maxStepMeters = getW6ScaleProfile('MAX').movementMetersPerSecond * 1.45 * 0.05;
       const candidateX = retainedPosition.x + directionX * maxStepMeters;
       const candidateZ = retainedPosition.z + directionZ * maxStepMeters;
@@ -1518,13 +1622,32 @@ test('MAX Player movement waits for formal destination Terrain and resumes after
       frameNow += 50;
       environment.rafCallbacks.at(-1)(frameNow);
 
-      assert.deepEqual({ x: sandbox.logicalPlayer.x, z: sandbox.logicalPlayer.z }, retainedPosition);
-      assert.equal(
+      assert.ok(Math.hypot(
+        sandbox.logicalPlayer.x - retainedPosition.x,
+        sandbox.logicalPlayer.z - retainedPosition.z,
+      ) > 0, 'Terrain presentation wait must not cancel Player movement');
+      assert.equal(Number.isFinite(
         sandbox.snapshot().experience.playerVertical.terrainHeightMeters,
-        retainedHeight,
-      );
+      ), true);
       assert.deepEqual(prepareRequests, [blockedOwnerKey]);
       assert.deepEqual(transitionRequests, [blockedOwnerKey]);
+      assert.equal(
+        sandbox.snapshot().terrainCoverageDiagnostics.movementBlockedByTerrain,
+        0,
+      );
+      assert.equal(sandbox.snapshot().terrainCoverageDiagnostics.visualBlankFrame, 0);
+      assert.equal(
+        sandbox.snapshot().chunkDataSubscriberDiagnostics.schemaVersion,
+        'runtime-terrain-ready-chunk-data-subscribers-1',
+      );
+      assert.equal(
+        sandbox.snapshot().terrainDependencyDiagnostics.schemaVersion,
+        'runtime-terrain-dependency-batch-diagnostics-1',
+      );
+      assert.equal(
+        sandbox.snapshot().terrainDependencyDiagnostics.terrainDependencyOwnerCount,
+        25,
+      );
       assert.equal(sandbox.snapshot().boot.status, 'ready');
       assert.equal(environment.rafCallbacks.length, frameCountBeforeBlockedMove + 1,
         'a blocked Terrain candidate must not stop the animation loop');
@@ -1544,7 +1667,7 @@ test('MAX Player movement waits for formal destination Terrain and resumes after
           sandbox.logicalPlayer.z - retainedPosition.z,
         ) > 0,
         true,
-        'MAX movement must resume once destination canonical Terrain is ready',
+        'MAX movement remains continuous after destination Terrain becomes current',
       );
       assert.equal(Number.isFinite(
         sandbox.snapshot().experience.playerVertical.terrainHeightMeters,

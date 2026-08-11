@@ -14,7 +14,7 @@ import {
   logicalWorldToRenderLocal,
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
-import { planNextChunkBoundaryPrefetch } from './chunk-streaming-plan.js';
+import { planRuntimeTerrainReadySet } from './chunk-streaming-plan.js';
 import { sameRuntimeTransitionContract } from './runtime-transition-contract.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import {
@@ -77,9 +77,6 @@ import {
 } from './natural-streaming-coverage.js';
 import { createStreamingOwnerMetadataCache } from './streaming-owner-metadata.js';
 import { resolveNaturalOwnerBuildQueueTarget } from './streaming-capacity-budget.js';
-import {
-  createW8ForestHorizonOwnerPredicate,
-} from './forest-horizon-owner-policy.js';
 import {
   W8_VEGETATION_LOD_KINDS,
   resolveW8VegetationVisibilityContract,
@@ -207,6 +204,86 @@ export function createOriginTransformDiagnosticRing({
   });
 }
 
+export function createTerrainLagSpikeDiagnosticCapture({
+  enabled = false,
+  preWindowMs = 5_000,
+  postWindowMs = 5_000,
+} = {}) {
+  for (const [name, value] of Object.entries({ preWindowMs, postWindowMs })) {
+    if (!Number.isFinite(value) || value < 1_000) {
+      throw new RangeError(`${name} must be at least 1000ms`);
+    }
+  }
+  const preFrames = [];
+  const postFrames = [];
+  const markers = new Map();
+  let triggerAtMs = null;
+  let frozenAtMs = null;
+  let frozen = false;
+  const freezeFrame = frame => Object.freeze({ ...frame });
+  const recordMarker = frame => {
+    for (const threshold of [4, 8, 16]) {
+      if (frame.lagChunks < threshold || markers.has(threshold)) continue;
+      markers.set(threshold, Object.freeze({
+        threshold,
+        timestampMs: frame.timestampMs,
+        frameSequence: frame.frameSequence,
+        lagChunks: frame.lagChunks,
+      }));
+    }
+  };
+  return Object.freeze({
+    record(frame) {
+      if (!enabled || frozen || !Number.isFinite(frame?.timestampMs)) return false;
+      const sample = freezeFrame(frame);
+      if (triggerAtMs === null) {
+        preFrames.push(sample);
+        while (preFrames.length > 1
+          && preFrames[0].timestampMs < sample.timestampMs - preWindowMs) preFrames.shift();
+        if (sample.lagChunks >= 4) {
+          triggerAtMs = sample.timestampMs;
+          recordMarker(sample);
+        }
+        return true;
+      }
+      postFrames.push(sample);
+      recordMarker(sample);
+      if (sample.timestampMs - triggerAtMs >= postWindowMs) {
+        frozen = true;
+        frozenAtMs = sample.timestampMs;
+      }
+      return true;
+    },
+    reset() {
+      preFrames.length = 0;
+      postFrames.length = 0;
+      markers.clear();
+      triggerAtMs = null;
+      frozenAtMs = null;
+      frozen = false;
+    },
+    isFrozen() {
+      return frozen;
+    },
+    snapshot() {
+      return Object.freeze({
+        schemaVersion: 'terrain-lag-spike-diagnostic-capture-1',
+        enabled,
+        triggered: triggerAtMs !== null,
+        frozen,
+        triggerAtMs,
+        frozenAtMs,
+        preWindowMs,
+        postWindowMs,
+        markers: Object.freeze([...markers.values()]),
+        preFrames: Object.freeze([...preFrames]),
+        postFrames: Object.freeze([...postFrames]),
+        frameCount: preFrames.length + postFrames.length,
+      });
+    },
+  });
+}
+
 export function shouldDeferAutosaveForStreaming(streamingState, { force = false } = {}) {
   if (force) return false;
   return streamingState?.transitionPending === true
@@ -289,6 +366,8 @@ export function gatePlayerMovementByTerrainCoverage({
   startX,
   startZ,
   sampleCanonicalTerrainHeight,
+  sampleFallbackTerrainHeight = () => null,
+  fallbackTerrainHeightMeters = null,
   isTerrainCoveragePublished,
 }) {
   if (!Number.isFinite(horizontalMovement?.x) || !Number.isFinite(horizontalMovement?.z)) {
@@ -300,35 +379,56 @@ export function gatePlayerMovementByTerrainCoverage({
   if (typeof isTerrainCoveragePublished !== 'function') {
     throw new TypeError('Player terrain coverage gate requires a publication predicate');
   }
+  if (typeof sampleFallbackTerrainHeight !== 'function') {
+    throw new TypeError('Player terrain coverage gate fallback sampler must be a function');
+  }
   const owner = decomposeLogicalWorldPosition(horizontalMovement.x, horizontalMovement.z);
-  const candidateTerrainHeightMeters = isTerrainCoveragePublished(owner)
-    ? sampleCanonicalTerrainHeight(horizontalMovement.x, horizontalMovement.z)
-    : null;
-  if (Number.isFinite(candidateTerrainHeightMeters)) {
-    return Object.freeze({
-      ...horizontalMovement,
-      terrainHeightMeters: candidateTerrainHeightMeters,
-      terrainCoverageBlocked: false,
-      terrainCoverageOwner: owner,
-    });
+  const terrainCoveragePublished = isTerrainCoveragePublished(owner);
+  const candidateTerrainHeightMeters = sampleCanonicalTerrainHeight(
+    horizontalMovement.x,
+    horizontalMovement.z,
+  );
+  const collisionCoverageMiss = !Number.isFinite(candidateTerrainHeightMeters);
+  let terrainHeightMeters = candidateTerrainHeightMeters;
+  let terrainHeightSource = 'canonical';
+  if (!Number.isFinite(terrainHeightMeters)) {
+    terrainHeightMeters = sampleFallbackTerrainHeight(
+      horizontalMovement.x,
+      horizontalMovement.z,
+    );
+    terrainHeightSource = 'coarse-presentation';
   }
   const retainedOwner = decomposeLogicalWorldPosition(startX, startZ);
-  const retainedTerrainHeightMeters = isTerrainCoveragePublished(retainedOwner)
-    ? sampleCanonicalTerrainHeight(startX, startZ)
-    : null;
-  if (!Number.isFinite(retainedTerrainHeightMeters)) {
-    throw new Error(`formal Terrain is not active for Player Chunk ${retainedOwner.key}`);
+  if (!Number.isFinite(terrainHeightMeters)) {
+    terrainHeightMeters = sampleCanonicalTerrainHeight(startX, startZ);
+    terrainHeightSource = 'retained-canonical';
+  }
+  if (!Number.isFinite(terrainHeightMeters)) {
+    terrainHeightMeters = sampleFallbackTerrainHeight(startX, startZ);
+    terrainHeightSource = 'retained-coarse-presentation';
+  }
+  if (!Number.isFinite(terrainHeightMeters) && Number.isFinite(fallbackTerrainHeightMeters)) {
+    terrainHeightMeters = fallbackTerrainHeightMeters;
+    terrainHeightSource = 'last-safe';
+  }
+  if (!Number.isFinite(terrainHeightMeters)) {
+    throw new Error(`no safe Terrain height is available for Player Chunk ${retainedOwner.key}`);
   }
   return Object.freeze({
     ...horizontalMovement,
-    x: startX,
-    z: startZ,
-    terrainHeightMeters: retainedTerrainHeightMeters,
-    terrainCoverageBlocked: true,
+    terrainHeightMeters,
+    terrainHeightSource,
+    terrainCoverageBlocked: false,
+    movementBlockedByTerrain: false,
+    terrainPresentationFallback: !terrainCoveragePublished,
+    terrainCoveragePublished,
+    collisionCoverageMiss,
     terrainCoverageOwner: owner,
-    blockedCandidateX: horizontalMovement.x,
-    blockedCandidateZ: horizontalMovement.z,
   });
+}
+
+export function terrainPresentationWorldCoverageComplete(coverage) {
+  return coverage?.worldCoverageComplete ?? coverage?.complete === true;
 }
 
 export function isW8GameplaySimulationEnabled(measurementMode, runPhase, paused = false) {
@@ -920,8 +1020,12 @@ export async function bootInfiniteWorldSandbox({
   diagnosticRunNumber = parseDiagnosticRunNumber(
     new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnosticRun'),
   ),
+  terrainLagSpikeDiagnosticsEnabled = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('terrainLagSpikeDiagnostics') === '1',
   diagnosticsEnabled = measurementMode !== null
     || new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnostics') === '1'
+    || terrainLagSpikeDiagnosticsEnabled
     || diagnosticProfile.profileId !== 'baseline',
   forceFirstWebGLDiagnosticIncident = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
@@ -978,6 +1082,7 @@ export async function bootInfiniteWorldSandbox({
       'incrementalStaticTreePages:true',
       `persistentStaticNatural:${!disablePersistentTreePublication}`,
       `diagnostics:${diagnosticsEnabled}`,
+      `terrainLagSpikeDiagnostics:${terrainLagSpikeDiagnosticsEnabled}`,
     ].join(',');
   }
 
@@ -1002,6 +1107,9 @@ export async function bootInfiniteWorldSandbox({
   let diagnostics = null;
   let webglRenderDiagnostics = null;
   const originTransformDiagnostics = createOriginTransformDiagnosticRing();
+  const terrainLagSpikeDiagnostics = createTerrainLagSpikeDiagnosticCapture({
+    enabled: terrainLagSpikeDiagnosticsEnabled,
+  });
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
@@ -1014,7 +1122,6 @@ export async function bootInfiniteWorldSandbox({
   let naturalStaticStreamSuspended = false;
   let latestNaturalCoverageState = null;
   let canonicalWorldSeedHash = null;
-  let forestHorizonOwnerPredicate = null;
   let availableSaveSnapshot = null;
   let experienceSpawn = null;
   let running = false;
@@ -1146,14 +1253,7 @@ export async function bootInfiniteWorldSandbox({
           )),
         ),
         distanceProfileResolver,
-        horizonOwnerPredicate: coordinates => {
-          if (kind !== W8_VEGETATION_LOD_KINDS.TREE) return false;
-          forestHorizonOwnerPredicate ??= createW8ForestHorizonOwnerPredicate(
-            canonicalWorldSeedHash,
-          );
-          return forestHorizonOwnerPredicate(coordinates);
-        },
-        horizonOwnerDensity: kind === W8_VEGETATION_LOD_KINDS.TREE ? 4 : 1,
+        horizonOwnerDensity: 1,
         ownerMetadataCache: streamingOwnerMetadataCache,
       });
       worldStreamingPolicyRegistry.register(runtime.policy);
@@ -1361,10 +1461,6 @@ export async function bootInfiniteWorldSandbox({
             );
           } finally { chunkGenerationMs += Math.max(0, clock() - startedAt); }
         },
-        generateForestHorizonManifest: request =>
-          workerTransport.generateForestHorizonManifest(request),
-        cancelForestHorizonRequests: options =>
-          workerTransport.cancelForestHorizonRequests(options),
         cancelGenerationRequest: options =>
           workerTransport.cancelGenerationRequest(options),
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
@@ -1634,9 +1730,12 @@ export async function bootInfiniteWorldSandbox({
           policyPlan,
         })
       ),
-      combineResourceKinds: ({ resourceKinds }) => (
-        resourceKinds.includes('canonical') ? 'canonical' : 'manifest'
-      ),
+      combineResourceKinds: ({ resourceKinds }) => {
+        if (resourceKinds.some(kind => kind !== 'canonical')) {
+          throw new Error('Static Natural requires canonical ChunkData for every owner');
+        }
+        return 'canonical';
+      },
       ownerMetadataCache: streamingOwnerMetadataCache,
       clock,
       requestOwner: ({
@@ -1665,50 +1764,23 @@ export async function bootInfiniteWorldSandbox({
           throw new TypeError(`Static Object Stream missing parsed owner metadata: ${ownerKey}`);
         }
         const consumerId = `static-object-stream:natural-static:${ownerKey}`;
-        if (resourceKind === 'canonical') {
-          const existing = runtime.getChunkData(chunkX, chunkZ);
-          if (existing) return observeReady(Object.freeze({
-            promise: Promise.resolve(existing), cancel: () => false,
-          }));
-          return observeReady(chunkDataService.requestChunk({
-            chunkX,
-            chunkZ,
-            priority,
-            required,
-            deadlineAtMs,
-            consumerId,
-            epoch,
-            telemetryTarget: WORLD_STREAMING_TARGET.TREE,
-            telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
-          }));
+        if (resourceKind !== 'canonical') {
+          throw new Error(`Static Natural no longer accepts Remote Tree resources: ${resourceKind}`);
         }
-        const promise = traceGenerationBoundary({
-          target: WORLD_STREAMING_TARGET.TREE,
-          resourceKey: ownerKey,
-          ownerKey,
-          metadata: {
-            consumerId,
-            epoch,
-            planId,
-            manifest: 'forest-horizon',
-          },
-        }, schedulerOptions => chunkGeneratorTransport.generateForestHorizonManifest({
+        const existing = runtime.getChunkData(chunkX, chunkZ);
+        if (existing) return observeReady(Object.freeze({
+          promise: Promise.resolve(existing), cancel: () => false,
+        }));
+        return observeReady(chunkDataService.requestChunk({
           chunkX,
           chunkZ,
-          consumerId,
-          epoch,
           priority,
           required,
           deadlineAtMs,
-          ...schedulerOptions,
-        }));
-        return observeReady(Object.freeze({
-          promise,
-          cancel: reason => chunkGeneratorTransport.cancelForestHorizonRequests({
-            consumerId,
-            epoch,
-            reason: reason ?? 'static-plan-superseded',
-          }) > 0,
+          consumerId,
+          epoch,
+          telemetryTarget: WORLD_STREAMING_TARGET.TREE,
+          telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
         }));
       },
     });
@@ -1790,34 +1862,8 @@ export async function bootInfiniteWorldSandbox({
           fallback,
         });
       },
-      getForestHorizonManifest: (chunkX, chunkZ, request = {}) => {
-        const ownerKey = `${chunkX},${chunkZ}`;
-        const fallback = () => traceGenerationBoundary({
-          target: WORLD_STREAMING_TARGET.TREE,
-          resourceKey: ownerKey,
-          ownerKey,
-          metadata: {
-            consumerId: request.consumerId ?? 'distant-owner-query',
-            epoch: request.epoch ?? 0,
-            manifest: 'forest-horizon',
-          },
-        }, schedulerOptions => chunkGeneratorTransport.generateForestHorizonManifest({
-            chunkX,
-            chunkZ,
-            consumerId: request.consumerId ?? 'distant-owner-query',
-            epoch: request.epoch ?? 0,
-            ...schedulerOptions,
-          }));
-        if (naturalStaticStreamSuspended) return fallback();
-        return naturalStaticStream.requestOrReuse({
-          ownerKey,
-          resourceKind: 'manifest',
-          fallback,
-        });
-      },
       cancelCanonicalChunkRequests: options => {
         const cancelled = chunkDataService.cancelConsumer(options);
-        chunkGeneratorTransport.cancelForestHorizonRequests(options);
         return cancelled;
       },
       publishStaticOwnerTickets: ({ ownerKeys }) => {
@@ -2052,8 +2098,153 @@ export async function bootInfiniteWorldSandbox({
     let transitionTargetKey = null;
     let transitionRetryTimer = null;
     const directionalPrefetchPending = new Set();
+    let terrainReadyRequestedSignature = null;
     let transitionError = null;
     let lastTerrainCoverageMissOwnerKey = null;
+    let lastSafePlayerTerrainHeightMeters = sampleCanonicalTerrainHeightMeters(
+      logicalPlayer.x,
+      logicalPlayer.z,
+    );
+    let terrainFallbackStartedAtMs = null;
+    let lastTerrainFallbackOwnerKey = null;
+    const terrainMovementDiagnostics = {
+      movementBlockedByTerrain: 0,
+      movementBlockedByTerrainMs: 0,
+      terrainFallbackFrame: 0,
+      terrainFallbackMaxDuration: 0,
+      fallbackGenerationAge: 0,
+      maximumFallbackGenerationAge: 0,
+      latestGenerationLagChunks: 0,
+      maximumGenerationLagChunks: 0,
+      presentationSwapCount: 0,
+      preparedMissCount: 0,
+      visualBlankFrame: 0,
+      visualWorldCoverageMiss: 0,
+      collisionCoverageMiss: 0,
+      latestVisualCoverage: null,
+    };
+    let lastTerrainPresentationSwapAtMs = null;
+    let terrainLagSpikeCapturePublished = false;
+    const publishTerrainLagSpikeCapture = reason => {
+      if (!terrainLagSpikeDiagnosticsEnabled || terrainLagSpikeCapturePublished) return false;
+      const documentObject = globalObject.document;
+      if (!documentObject?.createElement || !documentObject.documentElement) return false;
+      const runtimeSnapshot = runtime.snapshot();
+      const payload = Object.freeze({
+        schemaVersion: 'terrain-lag-spike-browser-capture-1',
+        reason,
+        publishedAtMs: clock(),
+        browser: Object.freeze({
+          visibilityState: documentObject.visibilityState ?? null,
+          hasFocus: documentObject.hasFocus?.() ?? null,
+        }),
+        capture: terrainLagSpikeDiagnostics.snapshot(),
+        terrainCoverage: Object.freeze({ ...terrainMovementDiagnostics }),
+        terrainScheduler: distantPresentation.terrainPresentationSchedulerSnapshot?.() ?? null,
+        terrainPresentation: runtimeSnapshot.terrainReady?.terrainPresentationScheduling ?? null,
+        terrainDependencies: runtimeSnapshot.terrainReady?.terrainDependencyDiagnostics ?? null,
+        chunkData: chunkDataService.snapshot(),
+        diagnostics: diagnostics.snapshot(),
+      });
+      const element = documentObject.createElement('script');
+      element.id = 'terrain-lag-spike-capture';
+      element.type = 'application/json';
+      element.textContent = JSON.stringify(payload);
+      documentObject.documentElement.append(element);
+      terrainLagSpikeCapturePublished = true;
+      return true;
+    };
+    const recordTerrainLagSpikeFrame = ({ frameNow, rawFrameMs, schedulerFrame }) => {
+      if (!terrainLagSpikeDiagnosticsEnabled) return false;
+      const runtimeSpike = runtime.terrainLagSpikeDiagnosticSnapshot?.() ?? null;
+      const scheduler = distantPresentation.terrainPresentationSchedulerSnapshot?.() ?? null;
+      const frameDiagnostics = diagnostics.currentFrameSnapshot?.() ?? null;
+      const chunkCounts = chunkDataService.counts ?? {};
+      const playerOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      const usedHeapBytes = Number(globalObject.performance?.memory?.usedJSHeapSize);
+      const activeSchedulerGeneration = scheduler?.activeGenerations?.[0] ?? null;
+      const recorded = terrainLagSpikeDiagnostics.record({
+        timestampMs: frameNow,
+        frameSequence: frameDiagnostics?.sequence ?? settlementStreamingFrameSequence,
+        frameMs: rawFrameMs,
+        rafIntervalMs: rawFrameMs,
+        lagChunks: terrainMovementDiagnostics.latestGenerationLagChunks,
+        playerCenter: Object.freeze({
+          chunkX: playerOwner.chunkX,
+          chunkZ: playerOwner.chunkZ,
+          key: playerOwner.key,
+        }),
+        activeTerrainCenter: terrainMovementDiagnostics.latestVisualCoverage === null
+          ? null : Object.freeze({
+            chunkX: terrainMovementDiagnostics.latestVisualCoverage.activeCenterChunkX,
+            chunkZ: terrainMovementDiagnostics.latestVisualCoverage.activeCenterChunkZ,
+          }),
+        pendingCenter: runtimeSpike?.pending ?? null,
+        inFlightCenter: runtimeSpike?.inFlight ?? null,
+        runtimeCenter: runtimeSpike?.runtimeCenter ?? null,
+        generation: runtimeSpike?.generation ?? null,
+        currentGeneration: activeSchedulerGeneration === null && runtimeSpike?.inFlight === null
+          ? null : Object.freeze({
+            ...(runtimeSpike?.inFlight ?? {}),
+            scheduler: activeSchedulerGeneration,
+          }),
+        scheduler: scheduler === null ? null : Object.freeze({
+          pumpCalled: schedulerFrame !== null,
+          pumpResumed: schedulerFrame?.resumed ?? 0,
+          pumpAllowance: schedulerFrame?.allowance ?? 0,
+          pumpPending: schedulerFrame?.pending ?? 0,
+          terrainSliceCount: scheduler.terrainSliceCount,
+          resumeWaitP95Ms: scheduler.terrainResumeWaitP95Ms,
+          resumeWaitMaxMs: scheduler.terrainResumeWaitMaxMs,
+          deadlineMissCount: scheduler.terrainDeadlineMissCount,
+          deadlineMissMaxMs: scheduler.terrainDeadlineMissMaxMs,
+          frameSequence: scheduler.frameSequence,
+        }),
+        dependency: Object.freeze({
+          ...(runtimeSpike?.dependency ?? {}),
+          inFlightDataReadyCount: runtimeSpike?.inFlight?.dataReadyCount ?? null,
+          inFlightDataRequiredCount: runtimeSpike?.inFlight?.dataRequiredCount ?? null,
+          inFlightRenderReadyCount: runtimeSpike?.inFlight?.renderReadyCount ?? null,
+          inFlightRenderRequiredCount: runtimeSpike?.inFlight?.renderRequiredCount ?? null,
+          pendingDataReadyCount: runtimeSpike?.pending?.dataReadyCount ?? null,
+          pendingDataRequiredCount: runtimeSpike?.pending?.dataRequiredCount ?? null,
+          pendingRenderReadyCount: runtimeSpike?.pending?.renderReadyCount ?? null,
+          pendingRenderRequiredCount: runtimeSpike?.pending?.renderRequiredCount ?? null,
+        }),
+        chunkData: Object.freeze({
+          queueLength: chunkDataService.queue?.reduce?.(
+            (count, entry) => count + Number(entry.state === 'queued'),
+            0,
+          ) ?? 0,
+          pendingCount: chunkDataService.pending?.size ?? 0,
+          inFlightCount: Number(chunkDataService.inFlight !== null)
+            + Number(chunkDataService.requiredLookahead !== null)
+            + (chunkDataService.requiredLookaheadQueue?.length ?? 0),
+          cacheSize: chunkDataService.completed?.size ?? 0,
+          requests: chunkCounts.requests ?? 0,
+          cacheHits: chunkCounts.completedCacheHits ?? 0,
+          pendingDedupeHits: chunkCounts.pendingDedupeHits ?? 0,
+          completed: chunkCounts.completedOperations ?? 0,
+        }),
+        presentation: Object.freeze({
+          swapCount: terrainMovementDiagnostics.presentationSwapCount,
+          lastSwapAtMs: lastTerrainPresentationSwapAtMs,
+          fallbackFrames: terrainMovementDiagnostics.terrainFallbackFrame,
+          visualCoverageMiss: terrainMovementDiagnostics.visualWorldCoverageMiss,
+        }),
+        mainThread: frameDiagnostics,
+        memory: Object.freeze({
+          usedHeapBytes: Number.isFinite(usedHeapBytes) ? usedHeapBytes : null,
+        }),
+        browser: Object.freeze({
+          visibilityState: globalObject.document?.visibilityState ?? null,
+          hasFocus: globalObject.document?.hasFocus?.() ?? null,
+        }),
+      });
+      if (terrainLagSpikeDiagnostics.isFrozen()) publishTerrainLagSpikeCapture('lag-threshold');
+      else if (measurement.status === 'complete') publishTerrainLagSpikeCapture('measurement-complete');
+      return recorded;
+    };
     let playerRelocationInProgress = false;
     let lastTelemetryArrival = null;
     const recordPlayerArrival = (owner, arrivedAt) => {
@@ -2244,6 +2435,44 @@ export async function bootInfiniteWorldSandbox({
       playerLogicalZ: logicalPlayer.z,
     });
 
+    if (typeof distantPresentation.prepareTerrainPresentationGeneration === 'function'
+      && typeof distantPresentation.claimTerrainPresentationGeneration === 'function'
+      && typeof distantPresentation.discardTerrainPresentationGeneration === 'function') {
+      runtime.configureTerrainPresentationAdapter?.({
+      revision: () => distantRenderDistance,
+      prepare: ({
+        identity,
+        centerChunkX,
+        centerChunkZ,
+        activeDataKeys,
+        renderedKeys,
+        getChunkData,
+        renderOrigin,
+        isCurrent,
+        isUrgent,
+      }) => distantPresentation.prepareTerrainPresentationGeneration({
+        coverageEpoch: ++localTerrainCoverageEpoch,
+        presentationGenerationIdentity: identity,
+        activeDataKeys,
+        renderedKeys,
+        getChunkData,
+        renderOrigin,
+        centerChunkX,
+        centerChunkZ,
+        renderDistancePreset: distantRenderDistance,
+        isPresentationGenerationCurrent: isCurrent,
+        isTerrainPresentationUrgent: isUrgent,
+      }),
+      claim: options => distantPresentation.claimTerrainPresentationGeneration({
+        ...options,
+        renderDistancePreset: distantRenderDistance,
+      }),
+      discard: presentationGeneration => (
+        distantPresentation.discardTerrainPresentationGeneration(presentationGeneration)
+      ),
+      });
+    }
+
     const isSameCommittedRuntimeState = (workEpoch, runtimeSnapshot) => {
       if (!running || workEpoch !== postCommitRequestedEpoch) return false;
       const current = runtime.getCommittedChunkState();
@@ -2414,15 +2643,24 @@ export async function bootInfiniteWorldSandbox({
     }
 
     function getPlayerTerrainHeightMeters(logicalWorldX, logicalWorldZ) {
-      const owner = decomposeLogicalWorldPosition(logicalWorldX, logicalWorldZ);
-      if (!runtime.getChunkData(owner.chunkX, owner.chunkZ)) {
-        throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
+      const canonicalHeight = sampleCanonicalTerrainHeightMeters(logicalWorldX, logicalWorldZ);
+      if (Number.isFinite(canonicalHeight)) {
+        lastSafePlayerTerrainHeightMeters = canonicalHeight;
+        return canonicalHeight;
       }
-      const height = sampleCanonicalTerrainHeightMeters(logicalWorldX, logicalWorldZ);
-      if (!Number.isFinite(height)) {
-        throw new Error(`formal Terrain is not active for Player Chunk ${owner.key}`);
+      const coarseHeight = distantPresentation.sampleTerrainFallbackHeightMeters?.(
+        logicalWorldX,
+        logicalWorldZ,
+      );
+      if (Number.isFinite(coarseHeight)) {
+        lastSafePlayerTerrainHeightMeters = coarseHeight;
+        return coarseHeight;
       }
-      return height;
+      if (Number.isFinite(lastSafePlayerTerrainHeightMeters)) {
+        return lastSafePlayerTerrainHeightMeters;
+      }
+      lastSafePlayerTerrainHeightMeters = 0.4;
+      return lastSafePlayerTerrainHeightMeters;
     }
 
     function isPlayerTerrainCoveragePublished(owner) {
@@ -2430,6 +2668,90 @@ export async function bootInfiniteWorldSandbox({
       return committed.transitionContract !== null
         && (runtime.isTerrainCoveragePublished?.(owner.chunkX, owner.chunkZ)
           ?? committed.renderedKeys.includes(owner.key));
+    }
+
+    function recordTerrainCoverageFrame(owner, gateResult, deltaSeconds) {
+      const coverage = distantPresentation.terrainPresentationCoverageForOwner?.(
+        owner.chunkX,
+        owner.chunkZ,
+      ) ?? Object.freeze({
+        complete: true,
+        worldCoverageComplete: true,
+        fallback: gateResult?.terrainPresentationFallback === true,
+        lagChunks: 0,
+        generationAgeMs: 0,
+      });
+      const blocked = gateResult?.movementBlockedByTerrain === true
+        || gateResult?.terrainCoverageBlocked === true;
+      if (blocked) {
+        terrainMovementDiagnostics.movementBlockedByTerrain += 1;
+        terrainMovementDiagnostics.movementBlockedByTerrainMs += Math.max(
+          0,
+          deltaSeconds * 1000,
+        );
+      }
+      if (gateResult?.collisionCoverageMiss === true) {
+        terrainMovementDiagnostics.collisionCoverageMiss += 1;
+      }
+      const fallback = coverage.fallback === true
+        || gateResult?.terrainPresentationFallback === true;
+      if (fallback) {
+        terrainMovementDiagnostics.terrainFallbackFrame += 1;
+        if (terrainFallbackStartedAtMs === null) terrainFallbackStartedAtMs = clock();
+        terrainMovementDiagnostics.terrainFallbackMaxDuration = Math.max(
+          terrainMovementDiagnostics.terrainFallbackMaxDuration,
+          clock() - terrainFallbackStartedAtMs,
+        );
+        if (owner.key !== lastTerrainFallbackOwnerKey) {
+          terrainMovementDiagnostics.preparedMissCount += 1;
+          lastTerrainFallbackOwnerKey = owner.key;
+        }
+      } else {
+        if (terrainFallbackStartedAtMs !== null) {
+          terrainMovementDiagnostics.terrainFallbackMaxDuration = Math.max(
+            terrainMovementDiagnostics.terrainFallbackMaxDuration,
+            clock() - terrainFallbackStartedAtMs,
+          );
+        }
+        terrainFallbackStartedAtMs = null;
+        lastTerrainFallbackOwnerKey = null;
+      }
+      terrainMovementDiagnostics.fallbackGenerationAge = Number.isFinite(
+        coverage.generationAgeMs,
+      ) ? coverage.generationAgeMs : 0;
+      terrainMovementDiagnostics.maximumFallbackGenerationAge = Math.max(
+        terrainMovementDiagnostics.maximumFallbackGenerationAge,
+        terrainMovementDiagnostics.fallbackGenerationAge,
+      );
+      terrainMovementDiagnostics.latestGenerationLagChunks = Number.isFinite(
+        coverage.lagChunks,
+      ) ? coverage.lagChunks : 0;
+      terrainMovementDiagnostics.maximumGenerationLagChunks = Math.max(
+        terrainMovementDiagnostics.maximumGenerationLagChunks,
+        terrainMovementDiagnostics.latestGenerationLagChunks,
+      );
+      const worldCoverageComplete = terrainPresentationWorldCoverageComplete(coverage);
+      terrainMovementDiagnostics.latestVisualCoverage = Object.freeze({
+        structurallyComplete: coverage.complete === true,
+        worldCoverageComplete,
+        activeCenterChunkX: coverage.centerChunkX ?? null,
+        activeCenterChunkZ: coverage.centerChunkZ ?? null,
+        requiredChunkX: coverage.requiredChunkX ?? owner.chunkX,
+        requiredChunkZ: coverage.requiredChunkZ ?? owner.chunkZ,
+        clipmapExtentMeters: coverage.clipmapExtentMeters ?? null,
+        nearOuterCoverageHalfExtentMeters:
+          coverage.nearOuterCoverageHalfExtentMeters ?? null,
+        requiredVisibleHalfExtentMeters:
+          coverage.requiredVisibleHalfExtentMeters ?? null,
+        distanceXMeters: coverage.distanceXMeters ?? null,
+        distanceZMeters: coverage.distanceZMeters ?? null,
+        withinCameraVisibleExtent: coverage.withinCameraVisibleExtent ?? null,
+        coverageDeficitMeters: coverage.coverageDeficitMeters ?? null,
+      });
+      if (!worldCoverageComplete) {
+        terrainMovementDiagnostics.visualBlankFrame += 1;
+        terrainMovementDiagnostics.visualWorldCoverageMiss += 1;
+      }
     }
 
     function assertRuntimePreparedForPlayer(owner) {
@@ -2654,6 +2976,7 @@ export async function bootInfiniteWorldSandbox({
 
     const beginRenderDistancePublication = nextRenderDistance => {
       const revision = ++renderDistanceRequestRevision;
+      runtime.invalidateTerrainPresentationGenerations?.();
       distantPresentation.discardPreparedRenderDistancePreset?.();
       distantPresentation.stageStaticNaturalRenderDistancePreset?.(nextRenderDistance);
       localTerrainCoverageEpoch = Math.max(
@@ -2783,9 +3106,13 @@ export async function bootInfiniteWorldSandbox({
           startX: input.startX,
           startZ: input.startZ,
           sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+          sampleFallbackTerrainHeight:
+            distantPresentation.sampleTerrainFallbackHeightMeters,
+          fallbackTerrainHeightMeters: lastSafePlayerTerrainHeightMeters,
           isTerrainCoveragePublished: isPlayerTerrainCoveragePublished,
         });
-        if (gatedMovement.terrainCoverageBlocked) {
+        lastSafePlayerTerrainHeightMeters = gatedMovement.terrainHeightMeters;
+        if (gatedMovement.terrainPresentationFallback) {
           requestPlayerTerrainCoverage(gatedMovement.terrainCoverageOwner, {
             speedMetersPerSecond: null,
             attemptedDisplacementMeters: Math.hypot(
@@ -3020,7 +3347,11 @@ export async function bootInfiniteWorldSandbox({
         'chunk-transition',
         () => runtime.transitionToChunk(owner.chunkX, owner.chunkZ, { required }),
       )
-        .then(async () => {
+        .then(async transition => {
+          if (transition?.terrainPresentationClaimed === true) {
+            terrainMovementDiagnostics.presentationSwapCount += 1;
+            lastTerrainPresentationSwapAtMs = clock();
+          }
           const nextState = runtime.getCommittedChunkState();
           if (diagnostics.enabled) diagnostics.recordEvent('chunk-transition-runtime-ready', {
             ownerKey: owner.key,
@@ -3061,9 +3392,8 @@ export async function bootInfiniteWorldSandbox({
 
     function requestPlayerTerrainCoverage(owner, movement = null) {
       if (!owner || (transitionTargetKey && transitionTargetKey !== owner.key)) return;
-      void runtime.publishTraversalTerrain?.(owner.chunkX, owner.chunkZ);
       if (transitionTargetKey !== owner.key && !directionalPrefetchPending.has(owner.key)) {
-        if (diagnostics.enabled) diagnostics.recordEvent('terrain-gate-prefetch-requested', {
+        if (diagnostics.enabled) diagnostics.recordEvent('terrain-fallback-prefetch-requested', {
           ownerKey: owner.key,
           chunkX: owner.chunkX,
           chunkZ: owner.chunkZ,
@@ -3083,46 +3413,54 @@ export async function bootInfiniteWorldSandbox({
       requestTransition(owner, movement, { required: true });
     }
 
-    function requestDirectionalPrefetch(movement) {
+    function requestTerrainReadySet(movement) {
       const streaming = runtime.getStreamingState();
-      if (streaming.centerChunkX === null || transitionTargetKey || movement.speedMetersPerSecond <= 0) return;
-      const plan = planNextChunkBoundaryPrefetch({
-        centerChunkX: streaming.centerChunkX,
-        centerChunkZ: streaming.centerChunkZ,
-        logicalX: logicalPlayer.x,
-        logicalZ: logicalPlayer.z,
-        velocityX: movement.velocityX,
-        velocityZ: movement.velocityZ,
-        speedMetersPerSecond: movement.speedMetersPerSecond,
-        scaleStageId: movement.scaleStageId,
-        sprint: movement.sprint,
-      });
-      if (!plan || directionalPrefetchPending.has(plan.targetKey)) return;
-      if (diagnostics.enabled) diagnostics.recordEvent('chunk-corridor-prefetch-requested', {
-        ownerKey: plan.targetKey,
-        fromChunkX: plan.fromChunkX,
-        fromChunkZ: plan.fromChunkZ,
-        targetChunkX: plan.targetChunkX,
-        targetChunkZ: plan.targetChunkZ,
+      if (streaming.centerChunkX === null) return;
+      let plan;
+      try {
+        plan = planRuntimeTerrainReadySet({
+          centerChunkX: streaming.centerChunkX,
+          centerChunkZ: streaming.centerChunkZ,
+          logicalX: logicalPlayer.x,
+          logicalZ: logicalPlayer.z,
+          velocityX: movement.velocityX,
+          velocityZ: movement.velocityZ,
+          speedMetersPerSecond: movement.speedMetersPerSecond,
+          scaleStageId: movement.scaleStageId,
+          sprint: movement.sprint,
+        });
+      } catch (error) {
+        transitionError = error;
+        return;
+      }
+      if (plan.signature === terrainReadyRequestedSignature) return;
+      terrainReadyRequestedSignature = plan.signature;
+      if (diagnostics.enabled) diagnostics.recordEvent('runtime-terrain-ready-set-requested', {
+        ownerKey: `${plan.visibleCenterChunkX},${plan.visibleCenterChunkZ}`,
+        fromChunkX: plan.requestedFromChunkX,
+        fromChunkZ: plan.requestedFromChunkZ,
+        visibleCenterChunkX: plan.visibleCenterChunkX,
+        visibleCenterChunkZ: plan.visibleCenterChunkZ,
         playerLogicalX: logicalPlayer.x,
         playerLogicalZ: logicalPlayer.z,
-        corridorEndpointOwnerKey: plan.targetKey,
+        corridorEndpointOwnerKey: plan.corridorEndpointOwnerKey,
+        corridorCenterCount: plan.corridorCenters.length,
         velocityX: plan.velocityX,
         velocityZ: plan.velocityZ,
         speedMetersPerSecond: plan.speedMetersPerSecond,
         scaleStageId: plan.scaleStageId,
         sprint: plan.sprint,
         leadSeconds: plan.leadSeconds,
-        firstBoundarySeconds: plan.firstBoundarySeconds,
-        enteringDataOwnerKeys: plan.enteringDataCoordinates.map(value => value.key),
-        enteringRenderOwnerKeys: plan.enteringRenderCoordinates.map(value => value.key),
+        dataOwnerCount: plan.dataCoordinates.length,
+        renderOwnerCount: plan.renderCoordinates.length,
       });
-      directionalPrefetchPending.add(plan.targetKey);
       void diagnostics.measureAsync(
         'chunk-prefetch',
-        () => runtime.prepareTransition(plan.targetChunkX, plan.targetChunkZ),
-      ).catch(error => { transitionError = error; })
-        .finally(() => directionalPrefetchPending.delete(plan.targetKey));
+        () => runtime.updateTerrainReadySet(plan),
+      ).catch(error => {
+        if (terrainReadyRequestedSignature === plan.signature) terrainReadyRequestedSignature = null;
+        transitionError = error;
+      });
     }
 
     function updatePlayer(
@@ -3152,12 +3490,16 @@ export async function bootInfiniteWorldSandbox({
           startX,
           startZ,
           sampleCanonicalTerrainHeight: sampleCanonicalTerrainHeightMeters,
+          sampleFallbackTerrainHeight:
+            distantPresentation.sampleTerrainFallbackHeightMeters,
+          fallbackTerrainHeightMeters: lastSafePlayerTerrainHeightMeters,
           isTerrainCoveragePublished: isPlayerTerrainCoveragePublished,
         });
         terrainCoverageGateResult = gatedMovement;
+        lastSafePlayerTerrainHeightMeters = gatedMovement.terrainHeightMeters;
         logicalPlayer.x = gatedMovement.x;
         logicalPlayer.z = gatedMovement.z;
-        if (gatedMovement.terrainCoverageBlocked) {
+        if (gatedMovement.terrainPresentationFallback) {
           requestPlayerTerrainCoverage(gatedMovement.terrainCoverageOwner, {
             velocityX: intendedVelocityX,
             velocityZ: 0,
@@ -3188,21 +3530,32 @@ export async function bootInfiniteWorldSandbox({
       }
       if (diagnostics.enabled) diagnostics.recordTerrainGate({
         blocked: terrainCoverageGateResult?.terrainCoverageBlocked === true,
+        fallback: terrainCoverageGateResult?.terrainPresentationFallback === true,
+        collisionCoverageMiss: terrainCoverageGateResult?.collisionCoverageMiss === true,
         ownerKey: terrainCoverageGateResult?.terrainCoverageOwner?.key ?? null,
       });
-      if (diagnostics.enabled && terrainCoverageGateResult?.terrainCoverageBlocked === true) {
+      if (terrainCoverageGateResult?.terrainCoverageBlocked === true) {
+        const missingOwner = terrainCoverageGateResult.terrainCoverageOwner;
+        if (missingOwner) runtime.recordTerrainCoverageGateBlocked?.(
+          missingOwner.chunkX,
+          missingOwner.chunkZ,
+        );
+      } else runtime.recordTerrainCoverageGateRestored?.();
+      if (diagnostics.enabled
+        && terrainCoverageGateResult?.terrainPresentationFallback === true) {
         const missingOwner = terrainCoverageGateResult.terrainCoverageOwner;
         if (missingOwner?.key && missingOwner.key !== lastTerrainCoverageMissOwnerKey) {
           const committed = runtime.getCommittedChunkState();
           const nearCoverage = renderAdapter.renderCoverageSnapshot?.() ?? null;
-          diagnostics.recordEvent('player-prepared-coverage-miss', {
+          diagnostics.recordEvent('player-terrain-presentation-fallback', {
             ownerKey: missingOwner.key,
             chunkX: missingOwner.chunkX,
             chunkZ: missingOwner.chunkZ,
             playerLogicalX: logicalPlayer.x,
             playerLogicalZ: logicalPlayer.z,
-            blockedCandidateX: terrainCoverageGateResult.blockedCandidateX ?? null,
-            blockedCandidateZ: terrainCoverageGateResult.blockedCandidateZ ?? null,
+            terrainHeightSource: terrainCoverageGateResult.terrainHeightSource ?? null,
+            collisionCoverageMiss:
+              terrainCoverageGateResult.collisionCoverageMiss === true,
             transitionTargetKey,
             transitionGeneration: committed.transitionContract?.generation ?? null,
             coverageSignature: committed.transitionContract?.coverageSignature ?? null,
@@ -3216,7 +3569,7 @@ export async function bootInfiniteWorldSandbox({
           lastTerrainCoverageMissOwnerKey = missingOwner.key;
         }
       } else if (diagnostics.enabled && lastTerrainCoverageMissOwnerKey !== null) {
-        diagnostics.recordEvent('player-prepared-coverage-restored', {
+        diagnostics.recordEvent('player-terrain-presentation-current', {
           ownerKey: lastTerrainCoverageMissOwnerKey,
           playerLogicalX: logicalPlayer.x,
           playerLogicalZ: logicalPlayer.z,
@@ -3224,7 +3577,8 @@ export async function bootInfiniteWorldSandbox({
         lastTerrainCoverageMissOwnerKey = null;
       }
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-      requestDirectionalPrefetch(movement);
+      recordTerrainCoverageFrame(owner, terrainCoverageGateResult, deltaSeconds);
+      requestTerrainReadySet(movement);
       requestTransition(owner, movement);
       const renderLocal = logicalWorldToRenderLocal(
         logicalPlayer.x,
@@ -3634,6 +3988,12 @@ export async function bootInfiniteWorldSandbox({
       const diagnosticText = diagnostics.enabled
         ? `\nDiagnostic: ${diagnosticProfile.profileId} run ${diagnosticRunNumber}  hitch ${(measurementReport.hitchRatio * 100).toFixed(2)}%\nMeasurement frame count/p50/p95/p99/max: ${measurementReport.frame.count} / ${number(measurementReport.frame.p50)} / ${number(measurementReport.frame.p95)} / ${number(measurementReport.frame.p99)} / ${number(measurementReport.frame.max)} ms\nLong Tasks count/max: ${measurementReport.longTaskCount} / ${number(longTaskMaximum)} ms  Resources draw/triangles/geometry/material/scene: ${measurementReport.resources.drawCalls ?? 'n/a'} / ${measurementReport.resources.triangles ?? 'n/a'} / ${measurementReport.resources.geometries ?? 'n/a'} / ${measurementReport.resources.materials ?? 'n/a'} / ${measurementReport.resources.sceneObjects ?? 'n/a'}\nStage p95 ms: transition ${stageP95('chunk-transition')}  prefetch ${stageP95('chunk-prefetch')}  distant ${stageP95('distant-sync')}  gameplay-sync ${stageP95('gameplay-sync')}  gameplay-update ${stageP95('gameplay-update')}  save ${stageP95('save-total')}  render ${stageP95('render')}\nDistant p95 ms: clear ${stageP95('distant-clear')}  terrain ${stageP95('distant-midground-terrain')}  features ${stageP95('distant-midground-features')}  clipmap ${stageP95('distant-clipmap')}  proxies ${stageP95('distant-feature-proxies')}`
         : '';
+      const terrainSchedulerSnapshot = presentationSnapshot.terrainScheduler;
+      const terrainPresentationScheduling = runtimeSnapshot.terrainReady
+        ?.terrainPresentationScheduling;
+      const terrainSchedulerText = diagnostics.enabled && terrainSchedulerSnapshot
+        ? `\nTerrain Scheduler: slice count/cpu/p50/p95/max ${terrainSchedulerSnapshot.terrainSliceCount}/${number(terrainSchedulerSnapshot.terrainSliceCpuMs)}/${number(terrainSchedulerSnapshot.terrainSliceP50Ms)}/${number(terrainSchedulerSnapshot.terrainSliceP95Ms)}/${number(terrainSchedulerSnapshot.terrainSliceMaxMs)}ms  resume p50/p95/max ${number(terrainSchedulerSnapshot.terrainResumeWaitP50Ms)}/${number(terrainSchedulerSnapshot.terrainResumeWaitP95Ms)}/${number(terrainSchedulerSnapshot.terrainResumeWaitMaxMs)}ms  deadline miss/max ${terrainSchedulerSnapshot.terrainDeadlineMissCount}/${number(terrainSchedulerSnapshot.terrainDeadlineMissMaxMs)}ms\nTerrain Generation: count cpu/wait/wall/avg/p95 ${terrainSchedulerSnapshot.terrainGenerationCount}/${number(terrainSchedulerSnapshot.terrainGenerationCpuMs)}/${number(terrainSchedulerSnapshot.terrainGenerationYieldWaitMs)}/${number(terrainSchedulerSnapshot.terrainGenerationWallMs)}/${number(terrainSchedulerSnapshot.terrainGenerationWallAverageMs)}/${number(terrainSchedulerSnapshot.terrainGenerationWallP95Ms)}ms  scheduler slices T/N/R ${terrainSchedulerSnapshot.presentationSchedulerTerrainSlices}/${presentationSnapshot.presentationSchedulerNaturalSlices}/${presentationSnapshot.presentationSchedulerRoadSlices}\nTerrain Movement: blocked/count-ms ${terrainMovementDiagnostics.movementBlockedByTerrain}/${number(terrainMovementDiagnostics.movementBlockedByTerrainMs)}  lag latest/max ${terrainMovementDiagnostics.latestGenerationLagChunks}/${terrainMovementDiagnostics.maximumGenerationLagChunks}  fallback ${terrainMovementDiagnostics.terrainFallbackFrame}/${number(terrainMovementDiagnostics.terrainFallbackMaxDuration)}ms  swaps ${terrainMovementDiagnostics.presentationSwapCount}  prepared/visual/collision miss ${terrainMovementDiagnostics.preparedMissCount}/${terrainMovementDiagnostics.visualWorldCoverageMiss}/${terrainMovementDiagnostics.collisionCoverageMiss}\nTerrain Safety Ring: active/coverage ${presentationSnapshot.safetyRingActive}/${presentationSnapshot.safetyRingCoverageComplete}  center ${presentationSnapshot.safetyRingCenter?.chunkX ?? 'n/a'},${presentationSnapshot.safetyRingCenter?.chunkZ ?? 'n/a'}  safety/high-detail/hole miss ${presentationSnapshot.safetyRingCoverageMiss}/${presentationSnapshot.highDetailCoverageMiss}/${presentationSnapshot.visibleTerrainHoleFrame}  reuse/updated ${number(presentationSnapshot.safetyRingReuseRatio)}/${presentationSnapshot.safetyRingUpdatedSamples}  area ${number(presentationSnapshot.safetyRingVisibleArea)}m2  build/max-slice ${number(presentationSnapshot.safetyRingLastBuildDurationMs)}/${number(presentationSnapshot.safetyRingMaximumSliceMs)}ms  error ${presentationSnapshot.safetyRingLastError ?? 'none'}\nTerrain Jump/Reuse: 1 ${terrainPresentationScheduling?.terrainPresentationJumpHistogram?.['1'] ?? 0}/${number(terrainPresentationScheduling?.terrainPresentationReuseRatioByJump?.['1'])}  2 ${terrainPresentationScheduling?.terrainPresentationJumpHistogram?.['2'] ?? 0}/${number(terrainPresentationScheduling?.terrainPresentationReuseRatioByJump?.['2'])}  3-5 ${terrainPresentationScheduling?.terrainPresentationJumpHistogram?.['3-5'] ?? 0}/${number(terrainPresentationScheduling?.terrainPresentationReuseRatioByJump?.['3-5'])}  6+ ${terrainPresentationScheduling?.terrainPresentationJumpHistogram?.['6+'] ?? 0}/${number(terrainPresentationScheduling?.terrainPresentationReuseRatioByJump?.['6+'])}`
+        : '';
       const warningText = runtimeSnapshot.warnings.length ? `\n警告: ${runtimeSnapshot.warnings.join(' / ')}` : '';
       const errorText = transitionError ? `\nERROR: ${transitionError.message}` : '';
       const worldStreamingSnapshot = worldStreamingCoordinator.snapshot();
@@ -3702,7 +4062,7 @@ Load ms latest/p50/p95/max: ${number(metrics.load.latest)} / ${number(metrics.lo
 Unload ms latest/p50/p95/max: ${number(metrics.unload.latest)} / ${number(metrics.unload.p50)} / ${number(metrics.unload.p95)} / ${number(metrics.unload.max)}
 Rebase ms latest/p50/p95/max: ${number(metrics.rebase.latest)} / ${number(metrics.rebase.p50)} / ${number(metrics.rebase.p95)} / ${number(metrics.rebase.max)}
 Frame ms latest/p50/p95/max: ${number(metrics.frame.latest)} / ${number(metrics.frame.p50)} / ${number(metrics.frame.p95)} / ${number(metrics.frame.max)}
-Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${staticStreamingDiagnosticText}${measurementText}${diagnosticText}${shadowDiagnosticText}${escapeHtml(warningText)}${escapeHtml(errorText)}`;
+Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderInfo?.memory?.geometries ?? 'n/a'}  material ${renderResources.sharedMaterialCount}  scene ${countSceneObjects(scene)}${staticStreamingDiagnosticText}${measurementText}${diagnosticText}${terrainSchedulerText}${shadowDiagnosticText}${escapeHtml(warningText)}${escapeHtml(errorText)}`;
       experienceShell.renderHud({
         fps: metrics.frame.latest > 0 ? 1000 / metrics.frame.latest : 0,
         gameplaySnapshot,
@@ -4035,6 +4395,17 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
         diagnostics.startFrame(frameNow);
         diagnosticFrameStarted = diagnostics.enabled;
+        const terrainSchedulerFrame = distantPresentation
+          .pumpTerrainPresentationScheduler?.() ?? null;
+        if (diagnostics.enabled && terrainSchedulerFrame) {
+          diagnostics.recordWork('terrain-presentation-scheduler', {
+            calls: 1,
+            resumed: terrainSchedulerFrame.resumed,
+            allowance: terrainSchedulerFrame.allowance,
+            urgent: Number(terrainSchedulerFrame.urgent === true),
+            pending: terrainSchedulerFrame.pending,
+          });
+        }
         const deltaSeconds = Math.min(rawFrameMs / 1000, 0.05);
         lastFrameAt = frameNow;
         if (measurement.protocolStartedAt === null) measurement.protocolStartedAt = frameNow;
@@ -4046,6 +4417,28 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           originTransformDiagnostics.reset();
           webglRenderDiagnostics?.reset();
           streamingTelemetry.clear();
+          distantPresentation.resetTerrainPresentationSchedulerDiagnostics?.();
+          Object.assign(terrainMovementDiagnostics, {
+            movementBlockedByTerrain: 0,
+            movementBlockedByTerrainMs: 0,
+            terrainFallbackFrame: 0,
+            terrainFallbackMaxDuration: 0,
+            fallbackGenerationAge: 0,
+            maximumFallbackGenerationAge: 0,
+            latestGenerationLagChunks: 0,
+            maximumGenerationLagChunks: 0,
+            presentationSwapCount: 0,
+            preparedMissCount: 0,
+            visualBlankFrame: 0,
+            visualWorldCoverageMiss: 0,
+            collisionCoverageMiss: 0,
+          });
+          terrainFallbackStartedAtMs = null;
+          lastTerrainFallbackOwnerKey = null;
+          lastTerrainPresentationSwapAtMs = null;
+          terrainLagSpikeDiagnostics.reset();
+          terrainLagSpikeCapturePublished = false;
+          globalObject.document?.querySelector?.('#terrain-lag-spike-capture')?.remove?.();
           streamingAcceptanceMetrics = null;
           diagnostics.startFrame(frameNow);
           diagnosticFrameStarted = diagnostics.enabled;
@@ -4082,6 +4475,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         if (playerRelocationInProgress) {
           renderActiveScene();
           sealDiagnosticFrame();
+          recordTerrainLagSpikeFrame({ frameNow, rawFrameMs, schedulerFrame: terrainSchedulerFrame });
           animationFrameId = requestAnimationFrameFn(frame);
           return;
         }
@@ -4128,6 +4522,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           lastHudAt = frameNow;
         }
         sealDiagnosticFrame();
+        recordTerrainLagSpikeFrame({ frameNow, rawFrameMs, schedulerFrame: terrainSchedulerFrame });
         animationFrameId = requestAnimationFrameFn(frame);
       } catch (error) {
         if (diagnostics.enabled) {
@@ -4227,6 +4622,12 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const observedRenderDistancePresets = Object.values(renderDistancePresets)
           .filter(value => value !== null);
         const renderDistanceMixed = new Set(observedRenderDistancePresets).size > 1;
+        const terrainFallbackMaxDuration = terrainFallbackStartedAtMs === null
+          ? terrainMovementDiagnostics.terrainFallbackMaxDuration
+          : Math.max(
+            terrainMovementDiagnostics.terrainFallbackMaxDuration,
+            clock() - terrainFallbackStartedAtMs,
+          );
         return {
           boot: snapshotSandboxBootState(state),
           runtime: runtimeSnapshot,
@@ -4264,6 +4665,18 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           save: saveStore.snapshot(),
           audio: audioDirector.snapshot(),
           presentation: presentationSnapshot,
+          terrainCoverageDiagnostics: Object.freeze({
+            schemaVersion: 'terrain-movement-coverage-diagnostics-1',
+            ...terrainMovementDiagnostics,
+            terrainFallbackMaxDuration,
+          }),
+          terrainPresentationDiagnostics:
+            runtimeSnapshot.terrainReady?.terrainPresentationScheduling ?? null,
+          terrainLagSpikeDiagnostics: terrainLagSpikeDiagnostics.snapshot(),
+          chunkDataSubscriberDiagnostics:
+            runtimeSnapshot.terrainReady?.chunkDataSubscriberDiagnostics ?? null,
+          terrainDependencyDiagnostics:
+            runtimeSnapshot.terrainReady?.terrainDependencyDiagnostics ?? null,
           runtimeBuildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
           originTransformDiagnostics: originTransformDiagnostics.snapshot(),
           webglRenderDiagnostics: webglRenderDiagnostics?.snapshot() ?? Object.freeze({

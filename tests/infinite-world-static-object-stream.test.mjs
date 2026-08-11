@@ -931,6 +931,38 @@ test('ready owner pages drain incrementally without waiting for the full coverag
   await stream.dispose();
 });
 
+test('ready owner reuse does not allocate or enqueue the same publication page twice', async () => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const plan = createPlanner(runtime.policy)({});
+  const member = policyPlan(plan);
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  stream.applyPlan({ plan, policyPlan: member });
+  await waitFor(() => stream.snapshot().backlog === 0, 'ready cache did not settle');
+  const ownerKey = member.requiredOwnerKeys[0];
+  const resourceKind = runtime.classifyOwner({ ownerKey, plan, policyPlan: member });
+  const before = stream.snapshot();
+  await stream.requestOrReuse({
+    ownerKey,
+    resourceKind,
+    fallback: () => assert.fail('ready owner must not use fallback'),
+  });
+  await stream.requestOrReuse({
+    ownerKey,
+    resourceKind,
+    fallback: () => assert.fail('ready owner must not use fallback'),
+  });
+  const after = stream.snapshot();
+  assert.equal(after.readyPageQueueCount, before.readyPageQueueCount);
+  assert.equal(after.counts.readyPageQueueCalls, before.counts.readyPageQueueCalls + 2);
+  assert.equal(after.counts.readyPageQueueInsertions, before.counts.readyPageQueueInsertions);
+  assert.equal(after.counts.readyPageQueueReuses, before.counts.readyPageQueueReuses + 2);
+  await stream.dispose();
+});
+
 test('ready, queue, ticket, and Worker bounds are explicit and enforced', () => {
   const runtime = createPolicyRuntime({ horizon: false });
   const plan = createPlanner(runtime.policy)({ velocity: { x: 32, z: 0 } });

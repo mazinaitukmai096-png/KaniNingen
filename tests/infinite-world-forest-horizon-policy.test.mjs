@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 
 import {
   W8_VEGETATION_LOD_KINDS,
-  isW8ForestHorizonOwner,
   resolveW8VegetationLodBlend,
   resolveW8VegetationLodPolicy,
 } from '../src/infinite-world/vegetation-lod-policy.js';
+import { isW8ForestHorizonOwner } from '../src/infinite-world/forest-horizon-owner-policy.js';
 import { resolveW8RenderDistancePolicy } from '../src/infinite-world/render-distance-policy.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
 import { resolveW8NaturalCandidateVisual } from '../src/infinite-world/world-object-canonical-contract.js';
@@ -19,21 +19,24 @@ const blendAt = (preset, distanceMeters) => resolveW8VegetationLodBlend({
   renderDistancePreset: preset,
 });
 
-test('Tree horizon policy carries the atmospheric handoff to each preset Fog limit', () => {
+test('canonical Far Tree policy carries the atmospheric handoff to each preset Fog limit', () => {
   for (const preset of PRESETS) {
     const renderDistance = resolveW8RenderDistancePolicy(preset);
     const tree = resolveW8VegetationLodPolicy(W8_VEGETATION_LOD_KINDS.TREE, preset);
 
-    assert.equal(tree.horizonEntry, tree.atmosphericFade);
-    assert.equal(tree.horizonEntry.maximum, tree.visibilityMeters);
-    assert.deepEqual(tree.horizonFade, {
-      minimum: q6(Math.max(tree.horizonEntry.maximum, renderDistance.fogFarMeters * 0.78)),
-      maximum: renderDistance.fogFarMeters,
+    assert.equal(tree.farEntry, tree.atmosphericFade);
+    assert.equal(tree.farEntry.maximum <= tree.visibilityMeters, true);
+    assert.deepEqual(tree.farFade, {
+      minimum: q6(Math.max(tree.farEntry.maximum, renderDistance.fogFarMeters * 0.92)),
+      maximum: q6(renderDistance.fogFarMeters + 4),
     });
-    assert.equal(tree.horizonFade.minimum >= tree.horizonEntry.maximum, true);
-    assert.equal(tree.horizonFade.minimum < tree.horizonFade.maximum, true);
-    assert.equal(tree.horizonVisibilityMeters, renderDistance.fogFarMeters);
-    assert.equal(tree.horizonScale, q6(tree.atmosphericScale * 2));
+    assert.equal(tree.farFade.minimum >= tree.farEntry.maximum, true);
+    assert.equal(tree.farFade.minimum < tree.farFade.maximum, true);
+    assert.equal(tree.farVisibilityMeters, renderDistance.fogFarMeters);
+    assert.equal(tree.visibilityMeters, renderDistance.fogFarMeters);
+    assert.equal(tree.forestScale, 1);
+    assert.equal(tree.atmosphericScale, 1);
+    assert.equal(Object.hasOwn(tree, 'horizonEntry'), false);
 
     for (const kind of [
       W8_VEGETATION_LOD_KINDS.BUSH,
@@ -41,69 +44,71 @@ test('Tree horizon policy carries the atmospheric handoff to each preset Fog lim
       W8_VEGETATION_LOD_KINDS.ROCK,
     ]) {
       const policy = resolveW8VegetationLodPolicy(kind, preset);
-      assert.equal(policy.horizonEntry, null, `${preset}/${kind}`);
-      assert.equal(policy.horizonFade, null, `${preset}/${kind}`);
-      assert.equal(policy.horizonVisibilityMeters, null, `${preset}/${kind}`);
-      assert.equal(policy.horizonScale, null, `${preset}/${kind}`);
+      assert.equal(policy.farEntry, null, `${preset}/${kind}`);
+      assert.equal(policy.farFade, null, `${preset}/${kind}`);
+      assert.equal(policy.farVisibilityMeters, null, `${preset}/${kind}`);
       assert.equal(resolveW8VegetationLodBlend({
         kind,
         distanceMeters: policy.visibilityMeters,
         renderDistancePreset: preset,
-      }).horizon, 0);
+      }).far, 0);
     }
   }
 });
 
-test('Tree atmospheric-to-horizon cross-fade is continuous and conserves opacity', () => {
+test('Tree atmospheric-to-canonical-Far cross-fade is continuous and conserves opacity', () => {
   for (const preset of PRESETS) {
     const policy = resolveW8VegetationLodPolicy(W8_VEGETATION_LOD_KINDS.TREE, preset);
-    const entryWidth = policy.horizonEntry.maximum - policy.horizonEntry.minimum;
+    const entryWidth = policy.farEntry.maximum - policy.farEntry.minimum;
     for (let sample = 0; sample <= 32; sample += 1) {
-      const distance = policy.horizonEntry.minimum + entryWidth * sample / 32;
+      const distance = policy.farEntry.minimum + entryWidth * sample / 32;
       const blend = blendAt(preset, distance);
-      assert.equal(q6(blend.atmospheric + blend.horizon), 1, `${preset}@${distance}`);
+      assert.equal(q6(blend.atmospheric + blend.far), 1, `${preset}@${distance}`);
       assert.equal(blend.totalOpacity, 1, `${preset}@${distance}`);
       assert.equal(blend.visible, true, `${preset}@${distance}`);
     }
 
-    const entryStart = blendAt(preset, policy.horizonEntry.minimum);
+    const entryStart = blendAt(preset, policy.farEntry.minimum);
     const entryMiddle = blendAt(
       preset,
-      (policy.horizonEntry.minimum + policy.horizonEntry.maximum) / 2,
+      (policy.farEntry.minimum + policy.farEntry.maximum) / 2,
     );
-    const entryEnd = blendAt(preset, policy.horizonEntry.maximum);
+    const entryEnd = blendAt(preset, policy.farEntry.maximum);
     assert.deepEqual(
-      [entryStart.atmospheric, entryStart.horizon],
+      [entryStart.atmospheric, entryStart.far],
       [1, 0],
     );
     assert.deepEqual(
-      [entryMiddle.atmospheric, entryMiddle.horizon],
+      [entryMiddle.atmospheric, entryMiddle.far],
       [0.5, 0.5],
     );
     assert.deepEqual(
-      [entryEnd.atmospheric, entryEnd.horizon],
+      [entryEnd.atmospheric, entryEnd.far],
       [0, 1],
     );
 
-    const fadeStart = blendAt(preset, policy.horizonFade.minimum);
+    const fadeStart = blendAt(preset, policy.farFade.minimum);
     const fadeMiddle = blendAt(
       preset,
-      (policy.horizonFade.minimum + policy.horizonFade.maximum) / 2,
+      (policy.farFade.minimum + policy.farFade.maximum) / 2,
     );
-    const fog = blendAt(preset, policy.horizonVisibilityMeters);
-    assert.equal(fadeStart.horizon, 1);
+    const fog = blendAt(preset, policy.farVisibilityMeters);
+    const fadeEnd = blendAt(preset, policy.farFade.maximum);
+    assert.equal(fadeStart.far, 1);
     assert.equal(fadeStart.totalOpacity, 1);
-    assert.equal(fadeMiddle.horizon, 0.5);
+    assert.equal(fadeMiddle.far, 0.5);
     assert.equal(fadeMiddle.totalOpacity, 0.5);
-    assert.equal(fog.horizon, 0);
-    assert.equal(fog.totalOpacity, 0);
-    assert.equal(fog.visible, false);
+    assert.equal(fog.far > 0, true);
+    assert.equal(fog.visible, true);
+    assert.equal(fadeEnd.far, 0);
+    assert.equal(fadeEnd.totalOpacity, 0);
+    assert.equal(fadeEnd.visible, false);
 
     for (const boundary of [
-      policy.horizonEntry.minimum,
-      policy.horizonEntry.maximum,
-      policy.horizonFade.minimum,
-      policy.horizonFade.maximum,
+      policy.farEntry.minimum,
+      policy.farEntry.maximum,
+      policy.farFade.minimum,
+      policy.farFade.maximum,
     ]) {
       const before = blendAt(preset, boundary - 0.0001).totalOpacity;
       const after = blendAt(preset, boundary + 0.0001).totalOpacity;
@@ -112,7 +117,7 @@ test('Tree atmospheric-to-horizon cross-fade is continuous and conserves opacity
   }
 });
 
-test('Forest horizon owner selection is seed-derived, one-in-four, and has bounded coverage', () => {
+test('legacy Forest horizon owner selection remains deterministic for baseline comparison', () => {
   const seeds = Object.freeze([
     'sha256:forest-horizon-a',
     'sha256:forest-horizon-b',
@@ -190,7 +195,7 @@ test('Forest horizon owner selection is seed-derived, one-in-four, and has bound
   }), /safe integer/);
 });
 
-test('Current production Forest horizon has bounded canonical canopy coverage', async t => {
+test('legacy Remote Horizon baseline remains reproducible for performance comparison', async t => {
   const generator = await createW8ParityChunkGenerator({
     worldSeed: 'KaniNingen Infinite Natural World',
   });
@@ -249,16 +254,13 @@ test('Current production Forest horizon has bounded canonical canopy coverage', 
       new Set(coverageTrees.map(tree => tree.candidateId)).size,
       coverageTrees.length,
     );
-    const horizonScale = resolveW8VegetationLodPolicy(
-      W8_VEGETATION_LOD_KINDS.TREE,
-      'current',
-    ).horizonScale;
+    const legacyHorizonScale = 2.84;
     const crowns = coverageTrees.map(tree => {
       const visual = resolveW8NaturalCandidateVisual(tree);
       return {
         x: tree.worldPosition.x,
         z: tree.worldPosition.z,
-        radius: Math.max(visual.widthMeters, visual.depthMeters) * horizonScale / 2,
+        radius: Math.max(visual.widthMeters, visual.depthMeters) * legacyHorizonScale / 2,
       };
     });
     let maximumNearestTreeCenterMeters = 0;

@@ -11,8 +11,11 @@ import {
   W8_CANONICAL_VISIBILITY_METERS,
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
   W8_PRESENTATION_TERRAIN_PALETTE,
+  auditW8ClipmapChunkShiftReuse,
+  createDeadlineAwareTerrainPresentationScheduler,
   createW8DistantPresentation,
   createW8ClipmapTopology,
+  createW8SafetyRingTopology,
   isW8DistantNaturalProxyInRange,
   isW8NaturalCandidateVisible,
   resolveW8CanonicalCandidateSet,
@@ -21,9 +24,17 @@ import {
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
+import {
+  createSettlementSurfacePolicy,
+  resolveCanonicalGroundSurface,
+} from '../src/infinite-world/w8-surface-policy.js';
 import { W6_STATIC_TARGET_CONTRACTS } from '../src/infinite-world/gameplay-contract.js';
 import { RENDER_CHUNK_SIZE } from '../src/infinite-world/chunk-coordinates.js';
-import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
+import {
+  createCanonicalRiverProjection,
+  createCanonicalRiverSourceId,
+  createCanonicalRiverSurfaceCorridor,
+} from '../src/infinite-world/canonical-river-realization.js';
 import {
   W8_FINITE_SETTLEMENT_VIEW_CONTRACT,
   W8_LOCAL_SETTLEMENT_SELECTION_LIMIT,
@@ -42,7 +53,9 @@ import { createRuntimeTransitionContract } from '../src/infinite-world/runtime-t
 import { createMacroTerrainEvaluator } from '../src/infinite-world/legacy-core/g5/macro-terrain.js';
 import { determineDetailCandidateOwner } from '../src/infinite-world/legacy-core/g3/detail-candidates.js';
 import {
-  isW8ForestHorizonOwner,
+  resolveW8CanonicalFarTreeDensityOpacity,
+  resolveW8CanonicalFarTreeDensityRank,
+  resolveW8CanonicalFarTreeDensityThreshold,
   resolveW8VegetationLodBlend,
   resolveW8VegetationLodPolicy,
 } from '../src/infinite-world/vegetation-lod-policy.js';
@@ -55,6 +68,7 @@ import {
 import {
   evaluateNodeStreamingBenchmark,
 } from './infinite-world-streaming-performance-benchmark-helper.mjs';
+import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
 import {
   NATURAL_OWNER_BUILD_QUEUE_MAXIMUM,
   resolveNaturalOwnerBuildQueueTarget,
@@ -118,17 +132,50 @@ class DistantTestNode {
 
 class DistantTestGroup extends DistantTestNode {}
 class DistantTestGeometry {
-  constructor() { this.attributes = {}; }
-  clone() { return new this.constructor(); }
+  constructor() { this.attributes = {}; this.groups = []; this.userData = {}; }
+  clone() {
+    const clone = new this.constructor();
+    clone.attributes = { ...this.attributes };
+    clone.groups = this.groups.map(group => ({ ...group }));
+    clone.index = this.index;
+    clone.userData = { ...this.userData };
+    return clone;
+  }
   setAttribute(name, attribute) { this.attributes[name] = attribute; }
   setIndex(index) { this.index = index; }
+  addGroup(start, count, materialIndex) { this.groups.push({ start, count, materialIndex }); }
   computeVertexNormals() {}
   dispose() { this.disposed = true; }
 }
 class DistantTestBufferGeometry extends DistantTestGeometry {}
 class DistantTestPlaneGeometry extends DistantTestGeometry {}
 class DistantTestFloat32BufferAttribute {
-  constructor(values, itemSize) { this.values = values; this.itemSize = itemSize; }
+  constructor(values, itemSize) {
+    this.values = values;
+    this.array = values;
+    this.itemSize = itemSize;
+    this.updateRanges = [];
+    this.needsUpdate = false;
+  }
+  clearUpdateRanges() { this.updateRanges.length = 0; }
+  addUpdateRange(start, count) { this.updateRanges.push({ start, count }); }
+}
+class DistantTestR160Float32BufferAttribute extends DistantTestFloat32BufferAttribute {
+  constructor(values, itemSize) {
+    const copiedValues = new Float32Array(values);
+    super(copiedValues, itemSize);
+    this.constructorInput = values;
+    this.version = 0;
+    this.updateRequested = false;
+    Object.defineProperty(this, 'needsUpdate', {
+      configurable: true,
+      get: () => this.updateRequested,
+      set: value => {
+        this.updateRequested = value === true;
+        if (value === true) this.version += 1;
+      },
+    });
+  }
 }
 class DistantTestInstancedBufferAttribute extends DistantTestFloat32BufferAttribute {}
 class DistantTestMaterial {
@@ -244,19 +291,19 @@ const SILHOUETTE_TREE_TRUNK_PART = Object.freeze({
   scale: Object.freeze([0.2, 0.4, 0.2]), rotation: Object.freeze([0, 0, 0]),
 });
 const SILHOUETTE_BROADLEAF_PRIMARY_PART = Object.freeze({
-  geometry: 'sphere', material: 'treeLeaves', position: Object.freeze([0, 0.64, 0]),
+  geometry: 'sphere', material: 'treeLeavesMeadow', position: Object.freeze([0, 0.64, 0]),
   scale: Object.freeze([0.82, 0.72, 0.82]), rotation: Object.freeze([0, 0, 0]),
 });
 const SILHOUETTE_BROADLEAF_SECONDARY_PART = Object.freeze({
-  geometry: 'sphere', material: 'treeLeaves', position: Object.freeze([0.22, 0.78, -0.12]),
+  geometry: 'sphere', material: 'treeLeavesMeadow', position: Object.freeze([0.22, 0.78, -0.12]),
   scale: Object.freeze([0.48, 0.45, 0.48]), rotation: Object.freeze([0, 0, 0]),
 });
 const SILHOUETTE_WETLAND_PRIMARY_PART = Object.freeze({
-  geometry: 'sphere', material: 'wetlandLeaves', position: Object.freeze([0, 0.61, 0]),
+  geometry: 'sphere', material: 'treeLeavesForest', position: Object.freeze([0, 0.61, 0]),
   scale: Object.freeze([0.78, 0.68, 0.78]), rotation: Object.freeze([0, 0, 0]),
 });
 const SILHOUETTE_WETLAND_SECONDARY_PART = Object.freeze({
-  geometry: 'sphere', material: 'wetlandLeaves', position: Object.freeze([-0.18, 0.76, 0.1]),
+  geometry: 'sphere', material: 'treeLeavesForest', position: Object.freeze([-0.18, 0.76, 0.1]),
   scale: Object.freeze([0.44, 0.42, 0.44]), rotation: Object.freeze([0, 0, 0]),
 });
 const SILHOUETTE_CONIFER_PART = Object.freeze({
@@ -265,17 +312,38 @@ const SILHOUETTE_CONIFER_PART = Object.freeze({
 });
 
 function createSilhouetteTestVisualAssets() {
-  const geometry = new DistantTestGeometry();
+  const geometry = triangleCount => {
+    const value = new DistantTestGeometry();
+    value.setAttribute('position', new DistantTestFloat32BufferAttribute(new Float32Array([
+      -0.5, -0.5, 0,
+      0.5, -0.5, 0,
+      0, 0.5, 0,
+    ]), 3));
+    value.setAttribute('normal', new DistantTestFloat32BufferAttribute(new Float32Array([
+      0, 0, 1,
+      0, 0, 1,
+      0, 0, 1,
+    ]), 3));
+    value.setIndex(Array.from({ length: triangleCount * 3 }, (_, index) => index % 3));
+    return value;
+  };
   const material = color => new DistantTestMaterial(
     Number.isFinite(color) ? { color } : {},
   );
   return {
-    geometries: { box: geometry, sphere: geometry, cone: geometry },
+    geometries: {
+      box: geometry(12),
+      sphere: geometry(264),
+      cone: geometry(16),
+      dodeca: geometry(36),
+    },
     materials: {
       houseWall: material(), road: material(), lotResidential: material(), lotCivic: material(),
-      water: material(), bush: material(), treeTrunk: material(), treeLeaves: material(0x2e7d32),
+      water: material(), bush: material(), grass: material(), grassLight: material(),
+      treeTrunk: material(0x5d4037),
+      treeLeaves: material(0x2e7d32),
       treeLeavesForest: material(0x1b5e20), treeLeavesMeadow: material(0x7cb342),
-      wetlandLeaves: material(),
+      wetlandLeaves: material(0x1b5e20),
     },
     featureParts: {
       house: [CANONICAL_HOUSE_PART],
@@ -290,7 +358,7 @@ function createSilhouetteTestVisualAssets() {
         SILHOUETTE_WETLAND_PRIMARY_PART,
         SILHOUETTE_WETLAND_SECONDARY_PART,
       ],
-      shrub: [SHRUB_PART], rock: [],
+      shrub: [SHRUB_PART], rock: [ROCK_PART],
     },
     resolveBuildingParts: record =>
       record.buildingType === 'house' ? [CANONICAL_HOUSE_PART] : null,
@@ -346,6 +414,32 @@ function canonicalChunk(chunkX = 5, chunkZ = 0, records = [CANONICAL_BUILDING]) 
       formal: { roadsAndBuildings: records },
       landmarks: [],
     },
+  };
+}
+
+function canonicalMacroTerrainChunk({ chunkX, chunkZ, macro, surfacePolicy }) {
+  const resolution = 33;
+  const heights = [];
+  const materialWeights = [];
+  for (let z = 0; z < resolution; z += 1) {
+    for (let x = 0; x < resolution; x += 1) {
+      heights.push(Math.round(400 + macro.evaluate(
+        chunkX * LEGACY_CHUNK_SIZE_METERS + x * 0.5,
+        chunkZ * LEGACY_CHUNK_SIZE_METERS + z * 0.5,
+      ).offsetMm));
+      materialWeights.push(1, 0, 0, 0, 0);
+    }
+  }
+  return {
+    ...canonicalChunk(chunkX, chunkZ, []),
+    terrain: {
+      resolution: { x: resolution, z: resolution },
+      heightUnitMeters: 0.001,
+      sampleSpacingMeters: 0.5,
+      heights,
+      materialWeights,
+    },
+    canonicalSurfacePolicy: surfacePolicy,
   };
 }
 
@@ -530,17 +624,200 @@ function localTerrainCoverageFixture(centerChunkX = 0, centerChunkZ = 0) {
 }
 
 async function createLocalTerrainTestPresentation(scene = new DistantTestGroup(), overrides = {}) {
+  const controlledYield = overrides.yieldToMainThread;
+  const controlledTerrainScheduler = controlledYield
+    && !overrides.terrainContinuationScheduler ? {
+      beginGeneration: () => 1,
+      waitForContinuation: () => controlledYield(),
+      pumpFrame: () => Object.freeze({
+        frameSequence: 0, resumed: 0, allowance: 0, urgent: false, pending: 0,
+      }),
+      recordSlice: () => {},
+      completeGeneration: () => true,
+      snapshot: () => Object.freeze({
+        terrainSliceCount: 0,
+        terrainSliceCpuMs: 0,
+        terrainSliceP50Ms: 0,
+        terrainSliceP95Ms: 0,
+        terrainSliceMaxMs: 0,
+        terrainResumeWaitP50Ms: 0,
+        terrainResumeWaitP95Ms: 0,
+        terrainResumeWaitMaxMs: 0,
+        terrainDeadlineMissCount: 0,
+        terrainDeadlineMissMaxMs: 0,
+        terrainGenerationCpuMs: 0,
+        terrainGenerationYieldWaitMs: 0,
+        terrainGenerationWallMs: 0,
+        presentationSchedulerTerrainSlices: 0,
+      }),
+      shutdown: () => true,
+    } : null;
+  const defaultTerrainScheduler = !controlledTerrainScheduler
+    && !overrides.terrainContinuationScheduler
+    ? createDeadlineAwareTerrainPresentationScheduler({
+      postTaskFn: callback => new Promise(resolve => setImmediate(() => {
+        callback();
+        resolve();
+      })),
+      AbortControllerCtor: null,
+    }) : null;
   return createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene,
     worldSeedHash: CANONICAL_WORLD_SEED_HASH,
-    visualAssets: createDistantTestVisualAssets(),
+    visualAssets: createSilhouetteTestVisualAssets(),
     findSettlementsNear: async () => [],
     resolveTemplate: async () => null,
     getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(chunkX, chunkZ, []),
+    enableTerrainSafetyRing: false,
     ...overrides,
+    ...(controlledTerrainScheduler
+      ? { terrainContinuationScheduler: controlledTerrainScheduler } : {}),
+    ...(defaultTerrainScheduler
+      ? { terrainContinuationScheduler: defaultTerrainScheduler } : {}),
   });
 }
+
+async function waitForTerrainSafetyRing(presentation, {
+  centerChunkX,
+  centerChunkZ,
+  maximumTurns = 100,
+} = {}) {
+  for (let turn = 0; turn < maximumTurns; turn += 1) {
+    presentation.pumpTerrainPresentationScheduler();
+    await new Promise(resolve => setImmediate(resolve));
+    const snapshot = presentation.snapshot();
+    if (!snapshot.safetyRingBuildPending
+      && snapshot.safetyRingActive
+      && (centerChunkX === undefined || snapshot.safetyRingCenter?.chunkX === centerChunkX)
+      && (centerChunkZ === undefined || snapshot.safetyRingCenter?.chunkZ === centerChunkZ)) {
+      return snapshot;
+    }
+  }
+  throw new Error(`Safety Ring did not settle: ${JSON.stringify(presentation.snapshot())}`);
+}
+
+test('deadline-aware Terrain scheduler bounds frame slices, prioritizes urgent work, and records real waits', async () => {
+  let now = 0;
+  const postTasks = [];
+  const continuationTasks = [];
+  const scheduler = createDeadlineAwareTerrainPresentationScheduler({
+    clock: () => now,
+    setTimeoutFn: () => ({ type: 'timeout' }),
+    clearTimeoutFn: () => {},
+    postTaskFn: (callback, options) => {
+      postTasks.push({ callback, options });
+      return Promise.resolve();
+    },
+    scheduleTaskFn: callback => continuationTasks.push(callback),
+    AbortControllerCtor: null,
+    normalResumeDeadlineMs: 18,
+    urgentResumeDeadlineMs: 10,
+    normalSlicesPerFrame: 1,
+    urgentSlicesPerFrame: 2,
+  });
+  const urgentGeneration = scheduler.beginGeneration({ isUrgent: () => true });
+  const firstPromise = scheduler.waitForContinuation({ isUrgent: () => true });
+  const secondPromise = scheduler.waitForContinuation({ isUrgent: () => true });
+  const thirdPromise = scheduler.waitForContinuation({ isUrgent: () => true });
+  const frame = scheduler.pumpFrame();
+  assert.equal(frame.urgent, true);
+  assert.equal(frame.allowance, 2);
+  const first = await firstPromise;
+  assert.equal(first.source, 'frame');
+  assert.equal(continuationTasks.length, 1);
+  continuationTasks.shift()();
+  const second = await secondPromise;
+  assert.equal(second.source, 'frame');
+  assert.equal(scheduler.snapshot().pendingContinuationCount, 1);
+  const nextFrame = scheduler.pumpFrame();
+  assert.equal(nextFrame.resumed, 1);
+  assert.equal((await thirdPromise).source, 'frame');
+
+  assert.equal(scheduler.setGenerationStage(urgentGeneration, 'clipmap'), true);
+  assert.equal(scheduler.recordGenerationSlice(urgentGeneration, 2.25), true);
+  assert.equal(scheduler.recordGenerationYield(urgentGeneration, 12), true);
+  const activeGeneration = scheduler.snapshot().activeGenerations[0];
+  assert.equal(activeGeneration.stage, 'clipmap');
+  assert.equal(activeGeneration.cpuMs, 2.25);
+  assert.equal(activeGeneration.yieldWaitMs, 12);
+  assert.equal(activeGeneration.yieldCount, 1);
+  scheduler.recordSlice(2.25);
+  scheduler.recordSlice(3.5);
+  scheduler.completeGeneration(urgentGeneration, {
+    cpuMs: 5.75,
+    yieldWaitMs: 12,
+    wallMs: 17.75,
+  });
+  const snapshot = scheduler.snapshot();
+  assert.equal(snapshot.terrainSliceCount, 2);
+  assert.equal(snapshot.terrainSliceCpuMs, 5.75);
+  assert.equal(snapshot.terrainSliceP50Ms, 2.25);
+  assert.equal(snapshot.terrainSliceP95Ms, 3.5);
+  assert.equal(snapshot.terrainGenerationCpuMs, 5.75);
+  assert.equal(snapshot.terrainGenerationYieldWaitMs, 12);
+  assert.equal(snapshot.terrainGenerationWallMs, 17.75);
+  assert.equal(snapshot.presentationSchedulerTerrainSlices, 2);
+  assert.equal(snapshot.pendingContinuationCount, 0);
+  assert.equal(postTasks.every(task => ['user-blocking', 'user-visible']
+    .includes(task.options.priority)), true);
+  assert.equal(scheduler.resetDiagnostics(), true);
+  assert.equal(scheduler.snapshot().terrainSliceCount, 0);
+  assert.equal(scheduler.snapshot().terrainGenerationCount, 0);
+});
+
+test('deadline-aware Terrain scheduler enforces normal fairness, deadline fallback, and shutdown', async () => {
+  let now = 0;
+  const postTasks = [];
+  const continuationTasks = [];
+  const scheduler = createDeadlineAwareTerrainPresentationScheduler({
+    clock: () => now,
+    setTimeoutFn: () => ({ type: 'timeout' }),
+    clearTimeoutFn: () => {},
+    postTaskFn: (callback, options) => {
+      postTasks.push({ callback, options });
+      return Promise.resolve();
+    },
+    scheduleTaskFn: callback => continuationTasks.push(callback),
+    AbortControllerCtor: null,
+    normalResumeDeadlineMs: 18,
+    urgentResumeDeadlineMs: 10,
+    normalSlicesPerFrame: 1,
+  });
+  const normalGeneration = scheduler.beginGeneration({ isUrgent: () => false });
+  const firstNormal = scheduler.waitForContinuation();
+  assert.equal(scheduler.pumpFrame().allowance, 1);
+  assert.equal((await firstNormal).source, 'frame');
+  const deferredNormal = scheduler.waitForContinuation();
+  assert.equal(scheduler.snapshot().pendingContinuationCount, 1);
+  assert.equal(scheduler.pumpFrame().resumed, 1);
+  assert.equal((await deferredNormal).source, 'frame');
+  scheduler.completeGeneration(normalGeneration, { wallMs: 1 });
+
+  const urgentGeneration = scheduler.beginGeneration({ isUrgent: () => true });
+  const deadlineResume = scheduler.waitForContinuation({ isUrgent: () => true });
+  const deadlineTask = postTasks.at(-1);
+  assert.equal(deadlineTask.options.priority, 'user-blocking');
+  assert.equal(deadlineTask.options.delay, 10);
+  now = 27;
+  deadlineTask.callback();
+  const resumed = await deadlineResume;
+  assert.equal(resumed.source, 'deadline');
+  assert.equal(resumed.waitMs, 27);
+  let snapshot = scheduler.snapshot();
+  assert.equal(snapshot.terrainDeadlineMissCount, 1);
+  assert.equal(snapshot.terrainDeadlineMissMaxMs, 17);
+  scheduler.completeGeneration(urgentGeneration, { wallMs: 27, yieldWaitMs: 27 });
+
+  const shutdownWait = scheduler.waitForContinuation();
+  assert.equal(scheduler.shutdown(), true);
+  assert.equal((await shutdownWait).source, 'shutdown');
+  assert.equal(scheduler.shutdown(), false);
+  snapshot = scheduler.snapshot();
+  assert.equal(snapshot.pendingContinuationCount, 0);
+  assert.equal(snapshot.activeGenerationCount, 0);
+  assert.equal(snapshot.shutdown, true);
+});
 
 function createNearPresentationHoldHarness() {
   const nearStableIds = new Set();
@@ -966,6 +1243,7 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
   chunk.presentationLayers.natural.vegetation = [candidate];
   let holdQuery = false;
   let releaseQuery = null;
+  let nearVisibleStableIds = [];
   const presentation = await createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene: new DistantTestGroup(),
@@ -979,6 +1257,7 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
     getCanonicalChunkData: async (chunkX, chunkZ) => (
       chunkX === 5 && chunkZ === 0 ? chunk : null
     ),
+    getNearVisibleStableIds: () => nearVisibleStableIds,
   });
   const states = [
     { lod: 'far', centerChunkX: 2, activeDataKeys: [], renderedKeys: [] },
@@ -989,6 +1268,7 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
   ];
   let identity = null;
   for (const state of states) {
+    nearVisibleStableIds = state.lod === 'near' ? [candidate.candidateId] : [];
     assert.equal(await presentation.sync(canonicalSyncInput({
       ...state,
       chunk,
@@ -1001,7 +1281,8 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
     assert.deepEqual(object.identity, identity);
     assert.equal(object.visibleLod, state.lod);
     assert.equal(object.ownerKey, '5,0');
-    assert.equal(object.instanceCount, 3);
+    assert.equal(object.instanceCount, 4,
+      'the canonical Tree keeps Full, Forest, Atmospheric, and Far tier slots');
     assert.equal(object.naturalLod.kind, 'tree');
     assert.equal(object.naturalLod.owner, object.ownerKey);
     assert.equal(object.naturalLod.distanceSource, 'logical-object-position');
@@ -1013,6 +1294,7 @@ test('canonical vegetation keeps one Stable ID and owner across far, mid, and ne
   assert.deepEqual(identity.owningChunkCoordinate, { x: 5, z: 0 });
   assert.equal(identity.featureType, 'natural-vegetation');
   assert.equal(identity.candidateId, candidate.candidateId);
+  nearVisibleStableIds = [];
   assert.equal(await presentation.sync(canonicalSyncInput({
     centerChunkX: 3,
     activeDataKeys: ['5,0'],
@@ -1063,6 +1345,7 @@ test('Near, Outer, and Far use one canonical natural candidate set', async () =>
   assert.deepEqual(sourceSet.vegetation.map(value => value.candidateId), [tree.candidateId]);
   assert.deepEqual(sourceSet.rocks.map(value => value.candidateId), [rock.candidateId]);
 
+  let nearVisibleStableIds = [];
   const presentation = await createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene: new DistantTestGroup(),
@@ -1073,6 +1356,7 @@ test('Near, Outer, and Far use one canonical natural candidate set', async () =>
     getCanonicalChunkData: async (chunkX, chunkZ) => (
       chunkX === 5 && chunkZ === 0 ? chunk : null
     ),
+    getNearVisibleStableIds: () => nearVisibleStableIds,
   });
   const expectedStableIds = [tree.candidateId, rock.candidateId].sort();
   for (const state of [
@@ -1080,6 +1364,7 @@ test('Near, Outer, and Far use one canonical natural candidate set', async () =>
     { lod: 'mid', centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [] },
     { lod: 'near', centerChunkX: 4, activeDataKeys: ['5,0'], renderedKeys: ['5,0'] },
   ]) {
+    nearVisibleStableIds = state.lod === 'near' ? expectedStableIds : [];
     assert.equal(await presentation.sync(canonicalSyncInput({ ...state, chunk })), true);
     const audit = presentation.canonicalAuditSnapshot();
     assert.deepEqual(audit.map(value => value.identity.stableId).sort(), expectedStableIds);
@@ -1174,7 +1459,15 @@ test('natural streaming preserves existing Outer Stable IDs and reveals only new
   };
   material.onBeforeCompile(shader);
   assert.match(shader.vertexShader, /attribute float w8NaturalInitialReveal/);
-  assert.match(shader.fragmentShader, /max\(vW8NaturalInitialReveal, w8NaturalReveal\)/);
+  assert.match(shader.fragmentShader,
+    /max\(clamp\(vW8NaturalInitialReveal, 0\.0, 1\.0\), w8NaturalReveal\)/);
+  assert.match(shader.fragmentShader,
+    /step\(-0\.5, vW8NaturalInitialReveal\)/);
+  assert.equal(generationRoot.children.filter(mesh => (
+    mesh.material?.userData?.naturalLod === true
+  )).every(mesh => (
+    mesh.geometry?.attributes?.w8NaturalInitialReveal?.itemSize === 1
+  )), true);
   assert.doesNotMatch(shader.fragmentShader, /w8NaturalRevealInner/);
   presentation.dispose();
 });
@@ -1192,6 +1485,7 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
   chunk.vegetationCandidates = [tree];
   chunk.presentationLayers.natural = { vegetation: [tree], rocks: [] };
   const scene = new DistantTestGroup();
+  let nearVisibleStableIds = [];
   const presentation = await createW8DistantPresentation({
     THREE: DISTANT_TEST_THREE,
     scene,
@@ -1200,6 +1494,7 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
     findSettlementsNear: async () => [],
     resolveTemplate: async () => null,
     getCanonicalChunkData: async () => chunk,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
   });
   assert.equal(await presentation.sync(canonicalSyncInput({
     centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
@@ -1208,6 +1503,7 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
   const generationRoot = scene.children[0].children[0];
   const buildLocalX = generationRoot.position.x;
 
+  nearVisibleStableIds = [tree.candidateId];
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: ['5,0'], renderedKeys: ['5,0'],
     renderOrigin: { renderOriginChunkX: 4, renderOriginChunkZ: 0, rebaseCount: 4 },
@@ -1244,7 +1540,7 @@ test('committed runtime state updates Near/Outer exclusion immediately and rejec
   presentation.dispose();
 });
 
-test('Tree full, Forest, and Atmospheric tiers cross-fade by exact logical distance', async () => {
+test.skip('legacy Remote Tree tier fixture (replaced by canonical Far lifecycle)', async () => {
   const forestHorizonSeed = `sha256:${'0'.repeat(63)}3`;
   assert.equal(isW8ForestHorizonOwner({
     worldSeedHash: forestHorizonSeed,
@@ -1481,6 +1777,16 @@ test('Tree full, Forest, and Atmospheric tiers cross-fade by exact logical dista
   assert.ok(horizonMesh);
   assert.notEqual(horizonMesh.material, atmosphericMesh.material);
   assert.equal(horizonMesh.material.userData.naturalLodMode, 'horizon');
+  const horizonShader = {
+    uniforms: {},
+    vertexShader: '#include <begin_vertex>',
+    fragmentShader: '#include <color_fragment>',
+  };
+  horizonMesh.material.onBeforeCompile(horizonShader);
+  assert.match(horizonShader.fragmentShader,
+    /step\(1\.5, vW8NaturalInitialReveal\)/);
+  assert.match(horizonShader.fragmentShader,
+    /step\(-0\.5, vW8NaturalInitialReveal\)/);
   assert.equal(new Set(normal.meshes.filter(mesh => (
     mesh.name.includes('natural-horizon-tree')
   )).map(mesh => mesh.material)).size, 1);
@@ -1569,6 +1875,9 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(distantRoot.children.length, 1);
   const firstRoot = distantRoot.children[0];
   const firstGeometries = firstRoot.children.map(child => child.geometry).filter(Boolean);
+  const firstClipmapGeometry = firstRoot.children.find(child => (
+    child.name === 'w8-seeded-macro-terrain-clipmap'
+  )).geometry;
   const firstSnapshot = presentation.snapshot();
   assert.equal(firstSnapshot.localTerrainRootAttached, true);
   assert.equal(firstSnapshot.localTerrainActiveKeyCount, 25);
@@ -1615,7 +1924,10 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(second.reused, false);
   assert.equal(distantRoot.children.length, 1);
   assert.notEqual(distantRoot.children[0], firstRoot);
-  assert.ok(firstGeometries.every(geometry => geometry.disposed === true));
+  assert.ok(firstGeometries.filter(geometry => geometry !== firstClipmapGeometry)
+    .every(geometry => geometry.disposed === true));
+  assert.notEqual(firstClipmapGeometry.disposed, true,
+    'fixed clipmap topology remains pooled for the next incremental transaction');
   const secondRoot = distantRoot.children[0];
 
   const stale = presentation.syncLocalTerrain({ coverageEpoch: 2, ...initial });
@@ -1623,6 +1935,1026 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(stale.reason, 'stale-epoch');
   assert.equal(distantRoot.children[0], secondRoot);
   presentation.dispose();
+  assert.equal(firstClipmapGeometry.disposed, true);
+});
+
+test('Terrain presentation generation stays detached until identity claim atomically replaces the complete root', async () => {
+  const pendingYields = [];
+  const events = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => pendingYields.push(resolve)),
+    diagnosticsEnabled: true,
+    recordDiagnosticEvent(type, details) { events.push({ type, ...details }); },
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  const distantRoot = scene.children[0];
+  const oldRoot = distantRoot.children[0];
+  const initialFallbackCoverage = presentation.terrainPresentationCoverageForOwner(1, 0);
+  assert.equal(initialFallbackCoverage.complete, true);
+  assert.equal(initialFallbackCoverage.worldCoverageComplete, true);
+  assert.equal(initialFallbackCoverage.fallback, true);
+  assert.equal(initialFallbackCoverage.lagChunks, 1);
+  assert.equal(initialFallbackCoverage.withinCameraVisibleExtent, true,
+    'the 52m clipmap-to-fog margin covers a one-Chunk presentation lag');
+  assert.equal(presentation.terrainPresentationCoverageForOwner(4, 0)
+    .worldCoverageComplete, false,
+  'four stale Chunk centers exceed the clipmap-to-fog safety margin');
+  const staleWorldCoverage = presentation.terrainPresentationCoverageForOwner(31, 0);
+  assert.equal(staleWorldCoverage.complete, true,
+    'an attached root remains structurally complete even when spatially obsolete');
+  assert.equal(staleWorldCoverage.worldCoverageComplete, false);
+  assert.equal(staleWorldCoverage.withinClipmapExtent, false);
+  assert.equal(staleWorldCoverage.coverageDeficitMeters > 0, true);
+  assert.ok(Number.isFinite(presentation.sampleTerrainFallbackHeightMeters(24, 8)));
+  const next = localTerrainCoverageFixture(1, 0);
+  const identity = '1,0|Current';
+  let current = true;
+  const pending = presentation.prepareTerrainPresentationGeneration({
+    coverageEpoch: 2,
+    presentationGenerationIdentity: identity,
+    isPresentationGenerationCurrent: () => current,
+    ...next,
+  });
+  await waitForControlledYield(pendingYields);
+  const [prepared] = await drainControlledYields([pending], pendingYields, {
+    whilePending() {
+      assert.equal(distantRoot.children.length, 1);
+      assert.equal(distantRoot.children[0], oldRoot,
+        'a partial Terrain presentation generation must remain detached');
+    },
+  });
+  assert.equal(prepared.prepared, true);
+  assert.equal(prepared.committed, false);
+  assert.equal(prepared.presentationGeneration.identity, identity);
+  assert.ok(prepared.presentationGeneration.outerReadyAtMs
+    <= prepared.presentationGeneration.clipmapReadyAtMs);
+  assert.ok(prepared.presentationGeneration.clipmapReadyAtMs
+    <= prepared.presentationGeneration.presentationReadyAtMs);
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], oldRoot);
+  let snapshot = presentation.snapshot();
+  assert.equal(snapshot.terrainPresentationGenerationStagedCount, 1);
+  assert.equal(snapshot.terrainPresentationGenerationClaimCount, 0);
+  assert.ok(snapshot.terrainPresentationGenerationStagedGeometryCount > 0);
+  assert.ok(snapshot.terrainPresentationGenerationStagedUploadBytes > 0);
+
+  const transitionContract = createRuntimeTransitionContract({
+    generation: 2,
+    centerChunkX: next.centerChunkX,
+    centerChunkZ: next.centerChunkZ,
+    renderedKeys: next.renderedKeys,
+    activeDataKeys: next.activeDataKeys,
+  });
+  const claimed = presentation.claimTerrainPresentationGeneration({
+    presentationGeneration: prepared.presentationGeneration,
+    transitionContract,
+    activeDataKeys: next.activeDataKeys,
+    renderedKeys: next.renderedKeys,
+    renderOrigin: { ...next.renderOrigin, rebaseCount: 1 },
+    centerChunkX: next.centerChunkX,
+    centerChunkZ: next.centerChunkZ,
+  });
+  assert.equal(claimed.claimed, true);
+  assert.equal(distantRoot.children.length, 1);
+  assert.notEqual(distantRoot.children[0], oldRoot);
+  assert.equal(oldRoot.parent, null);
+  const claimedCoverage = presentation.terrainPresentationCoverageForOwner(1, 0);
+  assert.equal(claimedCoverage.complete, true);
+  assert.equal(claimedCoverage.worldCoverageComplete, true);
+  assert.equal(claimedCoverage.fallback, false);
+  assert.equal(claimedCoverage.lagChunks, 0);
+  assert.equal(claimedCoverage.centerChunkX, 1);
+  assert.equal(claimedCoverage.centerChunkZ, 0);
+  assert.ok(Number.isFinite(claimedCoverage.generationAgeMs));
+  snapshot = presentation.snapshot();
+  assert.equal(snapshot.terrainPresentationGenerationStagedCount, 0);
+  assert.equal(snapshot.terrainPresentationGenerationClaimCount, 1);
+  assert.equal(snapshot.localTerrainCoverageCenter.chunkX, 1);
+  assert.equal(snapshot.localTerrainMidgroundOwnerCount, 16);
+  assert.equal(snapshot.clipmapMeshCount, 1);
+  assert.equal(snapshot.terrainPresentationGenerationStalePublishCount, 0);
+  assert.ok(events.findIndex(event => event.type === 'terrain-presentation-generation-ready')
+    < events.findIndex(event => event.type === 'terrain-presentation-generation-claimed'));
+  current = false;
+  presentation.dispose();
+});
+
+test('superseded Terrain presentation staging cannot publish and dispose removes every staged resource', async () => {
+  const pendingYields = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    yieldToMainThread: () => new Promise(resolve => pendingYields.push(resolve)),
+  });
+  const initial = localTerrainCoverageFixture(0, 0);
+  presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  const distantRoot = scene.children[0];
+  const oldRoot = distantRoot.children[0];
+  let current = true;
+  const staleBuild = presentation.prepareTerrainPresentationGeneration({
+    coverageEpoch: 2,
+    presentationGenerationIdentity: '1,0|Current',
+    isPresentationGenerationCurrent: () => current,
+    ...localTerrainCoverageFixture(1, 0),
+  });
+  await waitForControlledYield(pendingYields);
+  current = false;
+  const [stale] = await drainControlledYields([staleBuild], pendingYields, {
+    whilePending() {
+      assert.equal(distantRoot.children.length, 1);
+      assert.equal(distantRoot.children[0], oldRoot);
+    },
+  });
+  assert.equal(stale.committed, false);
+  assert.match(stale.reason, /stale-after-build|disposed-during-build/);
+  assert.equal(distantRoot.children.length, 1);
+  assert.equal(distantRoot.children[0], oldRoot);
+  assert.equal(presentation.snapshot().terrainPresentationGenerationStagedCount, 0);
+
+  const readyBuild = presentation.prepareTerrainPresentationGeneration({
+    coverageEpoch: 3,
+    presentationGenerationIdentity: '2,0|Current',
+    isPresentationGenerationCurrent: () => true,
+    ...localTerrainCoverageFixture(2, 0),
+  });
+  await waitForControlledYield(pendingYields);
+  const [ready] = await drainControlledYields([readyBuild], pendingYields);
+  assert.equal(ready.prepared, true);
+  assert.equal(presentation.snapshot().terrainPresentationGenerationStagedCount, 1);
+  presentation.dispose();
+  assert.equal(scene.children.length, 0);
+});
+
+test('Terrain presentation staging is bounded to the Runtime corridor limit and reports resident resources', async () => {
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const initial = localTerrainCoverageFixture(0, 0);
+  presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  const prepared = [];
+  for (const centerChunkX of [1, 2, 3]) {
+    prepared.push(await presentation.prepareTerrainPresentationGeneration({
+      coverageEpoch: centerChunkX + 1,
+      presentationGenerationIdentity: `${centerChunkX},0|Current`,
+      isPresentationGenerationCurrent: () => true,
+      ...localTerrainCoverageFixture(centerChunkX, 0),
+    }));
+  }
+  let snapshot = presentation.snapshot();
+  assert.equal(snapshot.terrainPresentationGenerationStagedCount, 3);
+  assert.equal(snapshot.terrainPresentationGenerationMaximumStagedCount, 3);
+  assert.equal(snapshot.terrainPresentationGenerationStagedGeometryCount, 6);
+  assert.ok(snapshot.terrainPresentationGenerationStagedUploadBytes > 0);
+  assert.ok(snapshot.terrainPresentationGenerationMaximumResidentGeometryCount >= 8);
+  assert.ok(snapshot.terrainPresentationGenerationMaximumResidentUploadBytes
+    >= snapshot.terrainPresentationGenerationStagedUploadBytes);
+  const duplicate = await presentation.prepareTerrainPresentationGeneration({
+    coverageEpoch: 99,
+    presentationGenerationIdentity: '1,0|Current',
+    isPresentationGenerationCurrent: () => true,
+    ...localTerrainCoverageFixture(1, 0),
+  });
+  assert.equal(duplicate.reused, true);
+  assert.equal(duplicate.presentationGeneration, prepared[0].presentationGeneration);
+  const overCapacity = await presentation.prepareTerrainPresentationGeneration({
+    coverageEpoch: 100,
+    presentationGenerationIdentity: '4,0|Current',
+    isPresentationGenerationCurrent: () => true,
+    ...localTerrainCoverageFixture(4, 0),
+  });
+  assert.equal(overCapacity.committed, false);
+  assert.equal(overCapacity.reason, 'presentation-staging-capacity');
+  assert.equal(presentation.snapshot().terrainPresentationGenerationStagedCount, 3);
+
+  const firstFixture = localTerrainCoverageFixture(1, 0);
+  const transitionContract = createRuntimeTransitionContract({
+    generation: 2,
+    centerChunkX: 1,
+    centerChunkZ: 0,
+    renderedKeys: firstFixture.renderedKeys,
+    activeDataKeys: firstFixture.activeDataKeys,
+  });
+  assert.equal(presentation.claimTerrainPresentationGeneration({
+    presentationGeneration: prepared[0].presentationGeneration,
+    transitionContract,
+    activeDataKeys: firstFixture.activeDataKeys,
+    renderedKeys: firstFixture.renderedKeys,
+    renderOrigin: { ...firstFixture.renderOrigin, rebaseCount: 1 },
+    centerChunkX: 1,
+    centerChunkZ: 0,
+  }).claimed, true);
+  assert.equal(presentation.discardTerrainPresentationGeneration(
+    prepared[1].presentationGeneration,
+  ), true);
+  assert.equal(presentation.discardTerrainPresentationGeneration(
+    prepared[2].presentationGeneration,
+  ), true);
+  snapshot = presentation.snapshot();
+  assert.equal(snapshot.terrainPresentationGenerationStagedCount, 0);
+  assert.equal(snapshot.terrainPresentationGenerationClaimCount, 1);
+  assert.equal(snapshot.terrainPresentationGenerationDiscardCount, 2);
+  assert.equal(snapshot.terrainPresentationGenerationStalePublishCount, 0);
+  presentation.dispose();
+});
+
+test('world-fixed clipmap reuses only newly exposed samples for straight and diagonal Chunk shifts', async t => {
+  const straightAudit = auditW8ClipmapChunkShiftReuse({
+    renderDistancePreset: 'current',
+    deltaChunkX: 1,
+    deltaChunkZ: 0,
+  });
+  const diagonalAudit = auditW8ClipmapChunkShiftReuse({
+    renderDistancePreset: 'current',
+    deltaChunkX: 1,
+    deltaChunkZ: 1,
+  });
+  assert.deepEqual({
+    samples: straightAudit.sampleCount,
+    reused: straightAudit.reusedSampleCount,
+    newlyExposed: straightAudit.newlyExposedSampleCount,
+    indices: straightAudit.reusableIndexCount,
+  }, { samples: 8_288, reused: 7_840, newlyExposed: 448, indices: 48_384 });
+  assert.deepEqual({
+    samples: diagonalAudit.sampleCount,
+    reused: diagonalAudit.reusedSampleCount,
+    newlyExposed: diagonalAudit.newlyExposedSampleCount,
+    indices: diagonalAudit.reusableIndexCount,
+  }, { samples: 8_288, reused: 7_424, newlyExposed: 864, indices: 48_384 });
+
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene);
+  const initial = localTerrainCoverageFixture(0, 0);
+  presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial });
+  const prepareAndClaim = async ({ centerChunkX, centerChunkZ, epoch, identity }) => {
+    const fixture = localTerrainCoverageFixture(centerChunkX, centerChunkZ);
+    const prepared = await presentation.prepareTerrainPresentationGeneration({
+      coverageEpoch: epoch,
+      presentationGenerationIdentity: identity,
+      isPresentationGenerationCurrent: () => true,
+      ...fixture,
+    });
+    assert.equal(prepared.prepared, true);
+    const transitionContract = createRuntimeTransitionContract({
+      generation: epoch,
+      centerChunkX,
+      centerChunkZ,
+      renderedKeys: fixture.renderedKeys,
+      activeDataKeys: fixture.activeDataKeys,
+    });
+    assert.equal(presentation.claimTerrainPresentationGeneration({
+      presentationGeneration: prepared.presentationGeneration,
+      transitionContract,
+      activeDataKeys: fixture.activeDataKeys,
+      renderedKeys: fixture.renderedKeys,
+      renderOrigin: { ...fixture.renderOrigin, rebaseCount: epoch },
+      centerChunkX,
+      centerChunkZ,
+    }).claimed, true);
+    return prepared.clipmapMetrics;
+  };
+  const straight = await prepareAndClaim({
+    centerChunkX: 1,
+    centerChunkZ: 0,
+    epoch: 2,
+    identity: '1,0|Current',
+  });
+  const diagonal = await prepareAndClaim({
+    centerChunkX: 2,
+    centerChunkZ: 1,
+    epoch: 3,
+    identity: '2,1|Current',
+  });
+  assert.equal(straight.sampleCount, 8_288);
+  assert.equal(straight.newlySampledCount <= 448, true);
+  assert.equal(straight.reusedSampleCount >= 7_840, true);
+  assert.equal(straight.reuseRatio >= straightAudit.reuseRatio, true);
+  assert.equal(diagonal.newlySampledCount <= 864, true);
+  assert.equal(diagonal.reusedSampleCount >= 7_424, true);
+  assert.equal(diagonal.reuseRatio >= diagonalAudit.reuseRatio, true);
+  assert.equal(diagonal.geometryAllocationCount, 0);
+  assert.equal(diagonal.indexAllocationCount, 0);
+  assert.equal(diagonal.sourceSlotReuseCount + diagonal.cacheReuseCount,
+    diagonal.reusedSampleCount);
+  assert.equal(diagonal.vertexComponentWriteCount, 8_288 * 4);
+  assert.equal(straight.surfaceRefreshCount > 0, true,
+    'the moving 5x5 seam is revalidated even when its macro sample is reused');
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.clipmapSampleCacheSize <= 65_536, true);
+  assert.equal(snapshot.clipmapGeometryPoolSize, 2);
+  assert.equal(snapshot.clipmapGeometryPoolInUseCount, 1);
+  assert.equal(snapshot.clipmapGeometryDisposeCount, 0);
+  assert.equal(snapshot.maximumInnerBoundaryErrorMeters, 0);
+  assert.equal(snapshot.maximumInnerBoundaryColorDifference, 0);
+  const activeRoot = scene.children[0].children[0];
+  const activeClipmap = activeRoot.children.find(child => (
+    child.name === 'w8-seeded-macro-terrain-clipmap'
+  ));
+  assert.equal([...activeClipmap.geometry.attributes.position.values]
+    .every(Number.isFinite), true);
+  assert.equal([...activeClipmap.geometry.attributes.color.values]
+    .every(Number.isFinite), true);
+  const buildCountBeforeRebase = snapshot.clipmapBuildCount;
+  const missesBeforeRebase = snapshot.clipmapSampleCacheMisses;
+  const rootPositionBeforeRebase = { ...activeRoot.position };
+  const rebasedFixture = localTerrainCoverageFixture(2, 1);
+  const rebased = presentation.syncLocalTerrain({
+    coverageEpoch: 4,
+    ...rebasedFixture,
+    renderOrigin: {
+      renderOriginChunkX: 66,
+      renderOriginChunkZ: -31,
+      rebaseCount: 10,
+    },
+  });
+  assert.equal(rebased.committed, true);
+  assert.equal(rebased.reused, true);
+  const afterRebase = presentation.snapshot();
+  assert.equal(afterRebase.clipmapBuildCount, buildCountBeforeRebase);
+  assert.equal(afterRebase.clipmapSampleCacheMisses, missesBeforeRebase);
+  assert.notDeepEqual(activeRoot.position, rootPositionBeforeRebase);
+  assert.equal(activeClipmap.position.x, 8 * RENDER_CHUNK_SIZE / LEGACY_CHUNK_SIZE_METERS);
+  assert.equal(activeClipmap.position.y, 0);
+  assert.equal(activeClipmap.position.z, 8 * RENDER_CHUNK_SIZE / LEGACY_CHUNK_SIZE_METERS);
+  const reversal = await prepareAndClaim({
+    centerChunkX: 1,
+    centerChunkZ: 0,
+    epoch: 5,
+    identity: '1,0|Current:reversal',
+  });
+  assert.equal(reversal.newlySampledCount, 0);
+  assert.equal(reversal.reusedSampleCount, 8_288);
+  assert.equal(reversal.geometryAllocationCount, 0);
+  assert.equal(reversal.indexAllocationCount, 0);
+  assert.equal(reversal.bufferUploadBytes < diagonal.bufferUploadBytes, true,
+    'reversal revalidates only the moving seam instead of uploading the full ring');
+  assert.equal(reversal.updateRangeCount > 0, true);
+  const teleport = await prepareAndClaim({
+    centerChunkX: 100,
+    centerChunkZ: -100,
+    epoch: 6,
+    identity: '100,-100|Current:teleport',
+  });
+  assert.equal(teleport.newlySampledCount > 8_000, true);
+  assert.equal(teleport.reusedSampleCount < 288, true);
+  assert.equal(teleport.geometryAllocationCount, 0);
+  assert.equal(teleport.indexAllocationCount, 0);
+  t.diagnostic(JSON.stringify({ straight, diagonal, reversal, teleport }));
+  presentation.dispose();
+});
+
+test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recycle, and visible Safety Ring', async t => {
+  const r160Three = Object.freeze({
+    ...DISTANT_TEST_THREE,
+    Float32BufferAttribute: DistantTestR160Float32BufferAttribute,
+  });
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    THREE: r160Three,
+    enableTerrainSafetyRing: true,
+  });
+  t.after(() => presentation.dispose());
+
+  const findNodes = (rootNode, name) => {
+    const matches = [];
+    const pending = [rootNode];
+    while (pending.length > 0) {
+      const node = pending.pop();
+      if (node?.name === name) matches.push(node);
+      pending.push(...(node?.children ?? []));
+    }
+    return matches;
+  };
+  const bufferStats = attribute => {
+    const values = attribute?.array ?? attribute?.values ?? [];
+    let minimum = Number.POSITIVE_INFINITY;
+    let maximum = Number.NEGATIVE_INFINITY;
+    let invalidCount = 0;
+    let zeroCount = 0;
+    let checksum = 0x811c9dc5;
+    for (let index = 0; index < values.length; index += 3) {
+      let zero = true;
+      for (let component = 0; component < 3; component += 1) {
+        const value = values[index + component];
+        if (!Number.isFinite(value)) invalidCount += 1;
+        else {
+          minimum = Math.min(minimum, value);
+          maximum = Math.max(maximum, value);
+          if (value !== 0) zero = false;
+        }
+        checksum = Math.imul(
+          checksum ^ (Number.isFinite(value) ? Math.round(value * 1_000_000) : 0x7fc00000),
+          0x01000193,
+        ) >>> 0;
+      }
+      if (zero) zeroCount += 1;
+    }
+    return Object.freeze({
+      count: values.length / 3,
+      min: minimum,
+      max: maximum,
+      invalidCount,
+      zeroCount,
+      nonZeroCount: values.length / 3 - zeroCount,
+      checksum,
+    });
+  };
+  const activeRegularClipmap = () => {
+    const clipmaps = findNodes(scene, 'w8-seeded-macro-terrain-clipmap');
+    assert.equal(clipmaps.length, 1, 'only the active complete clipmap is scene-attached');
+    return clipmaps[0];
+  };
+  const clipmapAudit = label => {
+    const mesh = activeRegularClipmap();
+    const colorAttribute = mesh.geometry.attributes.color;
+    return Object.freeze({
+      label,
+      mesh,
+      geometry: mesh.geometry,
+      position: bufferStats(mesh.geometry.attributes.position),
+      color: bufferStats(colorAttribute),
+      constructorInputColor: bufferStats({ array: colorAttribute.constructorInput }),
+      attributeOwnsCopiedArray: colorAttribute.array !== colorAttribute.constructorInput,
+      colorVersion: colorAttribute.version,
+      colorUpdateRanges: [...colorAttribute.updateRanges],
+      indexCount: mesh.geometry.index?.array?.length ?? mesh.geometry.index?.length ?? 0,
+    });
+  };
+  const assertPopulated = audit => {
+    assert.equal(audit.position.count, 8_288, `${audit.label} position count`);
+    assert.equal(audit.position.invalidCount, 0, `${audit.label} invalid position`);
+    assert.equal(audit.color.count, 8_288, `${audit.label} color count`);
+    assert.equal(audit.color.invalidCount, 0, `${audit.label} invalid color`);
+    assert.equal(audit.color.min > 0, true, `${audit.label} minimum color`);
+    assert.equal(audit.color.max > audit.color.min, true, `${audit.label} color range`);
+    assert.equal(audit.color.zeroCount, 0, `${audit.label} zero color vertices`);
+    assert.equal(audit.indexCount, 48_384, `${audit.label} topology`);
+  };
+  const prepareAndClaim = async ({ centerChunkX, centerChunkZ, epoch, identity }) => {
+    const fixture = localTerrainCoverageFixture(centerChunkX, centerChunkZ);
+    const prepared = await presentation.prepareTerrainPresentationGeneration({
+      coverageEpoch: epoch,
+      presentationGenerationIdentity: identity,
+      isPresentationGenerationCurrent: () => true,
+      ...fixture,
+    });
+    assert.equal(prepared.prepared, true);
+    const transitionContract = createRuntimeTransitionContract({
+      generation: epoch,
+      centerChunkX,
+      centerChunkZ,
+      renderedKeys: fixture.renderedKeys,
+      activeDataKeys: fixture.activeDataKeys,
+    });
+    assert.equal(presentation.claimTerrainPresentationGeneration({
+      presentationGeneration: prepared.presentationGeneration,
+      transitionContract,
+      activeDataKeys: fixture.activeDataKeys,
+      renderedKeys: fixture.renderedKeys,
+      renderOrigin: { ...fixture.renderOrigin, rebaseCount: epoch },
+      centerChunkX,
+      centerChunkZ,
+    }).claimed, true);
+    return prepared.clipmapMetrics;
+  };
+
+  const initial = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  const cold = clipmapAudit('cold');
+  t.diagnostic(JSON.stringify({
+    coldConstructorInputColor: cold.constructorInputColor,
+    coldPublishedAttributeColor: cold.color,
+  }));
+  assertPopulated(cold);
+  assert.equal(cold.attributeOwnsCopiedArray, true, 'the fixture must reproduce r160 copying');
+  assert.equal(cold.constructorInputColor.nonZeroCount, 0,
+    'clipmap writes must target BufferAttribute.array, not the abandoned constructor input');
+  assert.equal(cold.colorVersion, 0,
+    'the first render uploads the populated attribute without a post-publication update');
+
+  const straightMetrics = await prepareAndClaim({
+    centerChunkX: 1,
+    centerChunkZ: 0,
+    epoch: 2,
+    identity: 'r160:1,0:straight',
+  });
+  const straight = clipmapAudit('straight');
+  assertPopulated(straight);
+  assert.equal(straightMetrics.reusedSampleCount >= 7_840, true);
+
+  const diagonalMetrics = await prepareAndClaim({
+    centerChunkX: 2,
+    centerChunkZ: 1,
+    epoch: 3,
+    identity: 'r160:2,1:diagonal',
+  });
+  const diagonal = clipmapAudit('diagonal-pool-recycle');
+  assertPopulated(diagonal);
+  assert.equal(diagonalMetrics.reusedSampleCount >= 7_424, true);
+  assert.equal(diagonal.geometry, cold.geometry,
+    'the cold resource is recycled for the diagonal generation');
+  assert.equal(diagonal.colorVersion, 1);
+  assert.equal(diagonal.colorUpdateRanges.length > 0, true,
+    'a recycled published attribute must advertise its dirty color range');
+
+  const reversalMetrics = await prepareAndClaim({
+    centerChunkX: 1,
+    centerChunkZ: 0,
+    epoch: 4,
+    identity: 'r160:1,0:reversal',
+  });
+  const reversal = clipmapAudit('reversal');
+  assertPopulated(reversal);
+  assert.equal(reversalMetrics.reusedSampleCount, 8_288);
+  assert.equal(reversalMetrics.newlySampledCount, 0);
+  assert.equal(reversal.geometry, straight.geometry,
+    'the straight resource is recycled for the reversal generation');
+  assert.equal(reversal.colorVersion, 1);
+  assert.equal(reversal.colorUpdateRanges.length > 0, true);
+  assert.equal(reversal.position.checksum, straight.position.checksum,
+    'returning to the same center restores the identical height buffer');
+  assert.equal(reversal.color.checksum, straight.color.checksum,
+    'returning to the same center restores the identical color buffer');
+
+  const lagPlayerX = 20 * LEGACY_CHUNK_SIZE_METERS + 8;
+  const activeOrigin = localTerrainCoverageFixture(1, 0).renderOrigin;
+  presentation.update(lagPlayerX, 24, activeOrigin);
+  await waitForTerrainSafetyRing(presentation, { centerChunkX: 20, centerChunkZ: 1 });
+  presentation.update(lagPlayerX, 24, activeOrigin);
+  const visibleSafety = findNodes(scene, 'w8-player-following-terrain-safety-ring')
+    .filter(mesh => mesh.visible && (mesh.geometry.drawRange?.count ?? 0) > 0);
+  assert.equal(visibleSafety.length, 1, 'the lag fixture must render the Safety Ring');
+  const safetyMesh = visibleSafety[0];
+  const safetyColor = bufferStats(safetyMesh.geometry.attributes.color);
+  const safetyPosition = bufferStats(safetyMesh.geometry.attributes.position);
+  assert.equal(safetyColor.count, 8_649);
+  assert.equal(safetyColor.min > 0, true);
+  assert.equal(safetyColor.max > safetyColor.min, true);
+  assert.equal(safetyColor.invalidCount, 0);
+  assert.equal(safetyColor.zeroCount, 0);
+  assert.equal(safetyPosition.invalidCount, 0);
+  assert.equal(safetyMesh.geometry.attributes.color.version >= 1, true,
+    'the asynchronously populated Safety Ring color buffer must request a GPU upload');
+
+  t.diagnostic(JSON.stringify({
+    cold: {
+      position: cold.position,
+      color: cold.color,
+      constructorInputColor: cold.constructorInputColor,
+    },
+    straight: {
+      position: straight.position,
+      color: straight.color,
+      colorVersion: straight.colorVersion,
+      colorUpdateRanges: straight.colorUpdateRanges,
+    },
+    diagonalPoolRecycle: {
+      position: diagonal.position,
+      color: diagonal.color,
+      colorVersion: diagonal.colorVersion,
+      colorUpdateRanges: diagonal.colorUpdateRanges,
+    },
+    reversal: {
+      position: reversal.position,
+      color: reversal.color,
+      colorVersion: reversal.colorVersion,
+      colorUpdateRanges: reversal.colorUpdateRanges,
+    },
+    safetyVisible: {
+      drawCount: safetyMesh.geometry.drawRange.count,
+      position: safetyPosition,
+      color: safetyColor,
+      colorVersion: safetyMesh.geometry.attributes.color.version,
+    },
+  }));
+});
+
+test('player-following Terrain Safety Ring reuses world-fixed samples and covers a 20-Chunk stalled generation', async t => {
+  const topology = createW8SafetyRingTopology('current');
+  assert.deepEqual({
+    samples: topology.vertices.length,
+    indices: topology.indices.length,
+    cells: topology.cells.length,
+    area: topology.cells.reduce(
+      (sum, cell) => sum + cell.widthMeters * cell.depthMeters,
+      0,
+    ),
+  }, {
+    samples: 8_649,
+    indices: 50_784,
+    cells: 8_464,
+    area: 704 * 704,
+  });
+
+  class WebGlContractBufferGeometry extends DistantTestBufferGeometry {
+    setIndex(index) {
+      if (!Array.isArray(index)) {
+        this.index = index;
+        return;
+      }
+      const IndexArray = Math.max(...index) > 65_535 ? Uint32Array : Uint16Array;
+      const updateRanges = [];
+      const attribute = {
+        array: IndexArray.from(index),
+        updateRanges,
+        clearUpdateRanges() { updateRanges.length = 0; },
+        addUpdateRange(start, count) { updateRanges.push({ start, count }); },
+      };
+      Object.defineProperty(attribute, 'updateRange', {
+        get: () => ({ offset: 0, count: -1 }),
+      });
+      Object.defineProperty(attribute, 'needsUpdate', {
+        set(value) { if (value === true) attribute.version = (attribute.version ?? 0) + 1; },
+      });
+      this.index = attribute;
+    }
+  }
+  const webGlContractThree = Object.freeze({
+    ...DISTANT_TEST_THREE,
+    BufferGeometry: WebGlContractBufferGeometry,
+  });
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    THREE: webGlContractThree,
+    enableTerrainSafetyRing: true,
+  });
+  t.after(() => presentation.dispose());
+  const stalled = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...stalled }).committed, true);
+  const origin = stalled.renderOrigin;
+
+  presentation.update(8, 8, origin);
+  let snapshot = await waitForTerrainSafetyRing(presentation, {
+    centerChunkX: 0,
+    centerChunkZ: 0,
+  });
+  presentation.update(8, 8, origin);
+  snapshot = presentation.snapshot();
+  assert.equal(snapshot.safetyRingCoverageComplete, true);
+  assert.equal(snapshot.safetyRingVisibleArea, 0,
+    'the ring does not overlap a complete high-detail Terrain square');
+
+  presentation.update(24, 8, origin);
+  snapshot = await waitForTerrainSafetyRing(presentation, {
+    centerChunkX: 1,
+    centerChunkZ: 0,
+  });
+  assert.equal(snapshot.safetyRingReuseRatio >= 0.95, true);
+  assert.equal(snapshot.safetyRingUpdatedSamples, 372);
+
+  presentation.update(40, 24, origin);
+  snapshot = await waitForTerrainSafetyRing(presentation, {
+    centerChunkX: 2,
+    centerChunkZ: 1,
+  });
+  assert.equal(snapshot.safetyRingReuseRatio >= 0.90, true);
+  assert.equal(snapshot.safetyRingUpdatedSamples, 728);
+
+  // Hold the complete TerrainPresentationGeneration at 0,0 while the independent
+  // ring follows the player through every required lag marker. Once the 20-Chunk
+  // forced-lag state is ready, leave high-detail generation paused for five
+  // simulated seconds while the player continues moving inside that Chunk.
+  for (const lagChunks of [4, 8, 12, 20]) {
+    const lagPlayerX = lagChunks * LEGACY_CHUNK_SIZE_METERS + 8;
+    presentation.update(lagPlayerX, 24, origin);
+    snapshot = await waitForTerrainSafetyRing(presentation, {
+      centerChunkX: lagChunks,
+      centerChunkZ: 1,
+    });
+    presentation.update(lagPlayerX, 24, origin);
+    snapshot = presentation.snapshot();
+    assert.equal(snapshot.safetyRingCoverageComplete, true, `${lagChunks}-Chunk lag`);
+    assert.equal(snapshot.safetyRingLastFrameVisibleHole, false, `${lagChunks}-Chunk lag`);
+  }
+  const forcedLagPlayerX = 20 * LEGACY_CHUNK_SIZE_METERS + 8;
+  presentation.resetTerrainSafetyRingDiagnostics();
+  for (let frame = 0; frame < 300; frame += 1) {
+    presentation.update(
+      forcedLagPlayerX + Math.sin(frame / 20) * 6,
+      24 + Math.cos(frame / 24) * 6,
+      origin,
+    );
+    presentation.pumpTerrainPresentationScheduler();
+  }
+  snapshot = presentation.snapshot();
+
+  assert.deepEqual(snapshot.localTerrainCoverageCenter, { chunkX: 0, chunkZ: 0 });
+  assert.deepEqual(snapshot.safetyRingCenter, { chunkX: 20, chunkZ: 1 });
+  assert.equal(snapshot.highDetailCoverageMiss > 0, true);
+  assert.equal(snapshot.safetyRingCoverageComplete, true);
+  assert.equal(snapshot.safetyRingCoverageMiss, 0);
+  assert.equal(snapshot.visibleTerrainHoleFrame, 0);
+  assert.equal(snapshot.safetyRingLastFrameVisibleHole, false);
+  assert.equal(snapshot.safetyRingSkirtActive, false);
+  assert.equal(snapshot.safetyRingSkirtMaxWidth, 0);
+  assert.equal(snapshot.safetyRingGeometryAllocationCount, 2);
+  assert.equal(snapshot.safetyRingResourceCount, 2);
+  assert.equal(snapshot.safetyRingMaximumResourceCount, 2);
+  assert.equal(snapshot.safetyRingMaximumSliceMs < 33, true);
+  assert.equal(snapshot.safetyRingLastError, null);
+  const visibleSafetyRings = scene.children[0].children.filter(child => (
+    child.name === 'w8-player-following-terrain-safety-ring' && child.visible
+  ));
+  assert.equal(visibleSafetyRings.length, 1);
+  const safetyMesh = visibleSafetyRings[0];
+  assert.equal(ArrayBuffer.isView(safetyMesh.geometry.index.array), true,
+    'production Three.js must receive a real index BufferAttribute array');
+  const presentationNodes = [scene];
+  let regularClipmap = null;
+  while (presentationNodes.length > 0 && !regularClipmap) {
+    const node = presentationNodes.pop();
+    if (node.name === 'w8-seeded-macro-terrain-clipmap') regularClipmap = node;
+    else presentationNodes.push(...(node.children ?? []));
+  }
+  assert.notEqual(regularClipmap, null);
+  assert.equal(safetyMesh.material, regularClipmap.material,
+    'Safety Ring must reuse the existing Terrain material, not allocate another material path');
+  assert.equal(scene.children[0].children.filter(child => (
+    child.name === 'w8-player-following-terrain-safety-ring'
+  )).length, 2,
+  'double buffering is the complete bounded geometry pool after steady-state shifts');
+  const safetyIndices = safetyMesh.geometry.index.array ?? safetyMesh.geometry.index;
+  const drawCount = safetyMesh.geometry.drawRange.count;
+  const safetyPositions = safetyMesh.geometry.attributes.position.array;
+  for (let offset = 0; offset < drawCount; offset += 6) {
+    const unique = [...new Set([...safetyIndices.slice(offset, offset + 6)])];
+    const worldX = safetyMesh.position.x / 64
+      + unique.reduce((sum, index) => sum + safetyPositions[index * 3] / 64, 0)
+        / unique.length;
+    const worldZ = safetyMesh.position.z / 64
+      + unique.reduce((sum, index) => sum + safetyPositions[index * 3 + 2] / 64, 0)
+        / unique.length;
+    assert.equal(
+      Math.abs(worldX - 8) < 352 && Math.abs(worldZ - 8) < 352,
+      false,
+      'Safety Ring indices must exclude the complete high-detail Terrain square',
+    );
+  }
+});
+
+test('Terrain Safety Ring preserves canonical Settlement, Road, River, and natural height contracts', async t => {
+  const settlement = Object.freeze({
+    settlementId: 'settlement-v1:safety-ring-contract',
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: Object.freeze({ x: 328, z: 8 }),
+    radiusMeters: 81,
+  });
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    enableTerrainSafetyRing: true,
+    findSettlementsNear: async () => [settlement],
+  });
+  t.after(() => presentation.dispose());
+  const stalled = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...stalled }).committed, true);
+  presentation.update(328, 8, stalled.renderOrigin);
+  await waitForTerrainSafetyRing(presentation, { centerChunkX: 20, centerChunkZ: 0 });
+
+  const macro = await createMacroTerrainEvaluator(CANONICAL_WORLD_SEED_HASH);
+  const riverSourceStableId = await createCanonicalRiverSourceId(CANONICAL_WORLD_SEED_HASH);
+  const points = Object.freeze([
+    Object.freeze({ kind: 'building', x: 330, z: 8 }),
+    Object.freeze({ kind: 'settlement-center', x: 328, z: 8 }),
+    Object.freeze({ kind: 'road-center', x: 328, z: 12 }),
+    Object.freeze({ kind: 'road-edge', x: 331, z: 12 }),
+    Object.freeze({ kind: 'settlement-edge', x: 388, z: 8 }),
+    Object.freeze({ kind: 'cliff-slope', x: 500, z: 100 }),
+    Object.freeze({ kind: 'river', x: 328, z: 124.56 }),
+    Object.freeze({ kind: 'normal-forest', x: 440, z: 8 }),
+  ]);
+  const audits = points.map(point => {
+    const chunkX = Math.floor(point.x / LEGACY_CHUNK_SIZE_METERS);
+    const chunkZ = Math.floor(point.z / LEGACY_CHUNK_SIZE_METERS);
+    const corridor = createCanonicalRiverSurfaceCorridor({
+      sourceStableId: riverSourceStableId,
+      chunkX,
+      chunkZ,
+      settlementReferences: [settlement],
+    });
+    const surfacePolicy = createSettlementSurfacePolicy(
+      [settlement],
+      corridor ? [corridor] : [],
+    );
+    const chunk = canonicalMacroTerrainChunk({ chunkX, chunkZ, macro, surfacePolicy });
+    const canonical = resolveCanonicalGroundSurface({
+      chunkData: chunk,
+      worldX: point.x,
+      worldZ: point.z,
+    }).heightMeters;
+    const safety = presentation.sampleTerrainSafetyRingHeightMeters(point.x, point.z);
+    return Object.freeze({
+      ...point,
+      canonical,
+      safety,
+      differenceMeters: Math.abs(canonical - safety),
+    });
+  });
+  const byKind = Object.fromEntries(audits.map(audit => [audit.kind, audit]));
+  assert.equal(audits.every(audit => Number.isFinite(audit.safety)), true);
+  assert.equal(audits.every(audit => audit.differenceMeters <= 0.001), true,
+    JSON.stringify(audits));
+  assert.equal(byKind.building.differenceMeters, 0);
+  assert.equal(byKind['settlement-center'].differenceMeters, 0);
+  assert.equal(byKind['road-center'].differenceMeters, 0);
+  assert.equal(byKind['road-edge'].differenceMeters, 0);
+  assert.equal(byKind.river.safety < byKind.river.canonical + 0.001, true);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.safetyRingPolicySettlementCount, 1);
+  assert.equal(snapshot.safetyRingPolicyRiverCorridorCount > 0, true);
+  assert.equal(snapshot.safetyRingSkirtActive, false,
+    'grid-aligned coverage masking closes the boundary without a cliff skirt');
+});
+
+test('direct non-adjacent clipmap catch-up is faster than composing every intermediate generation', async t => {
+  const run = async targets => {
+    const presentation = await createLocalTerrainTestPresentation();
+    presentation.syncLocalTerrain({
+      coverageEpoch: 1,
+      ...localTerrainCoverageFixture(0, 0),
+    });
+    const metrics = [];
+    const startedAt = performance.now();
+    for (let index = 0; index < targets.length; index += 1) {
+      const target = targets[index];
+      const fixture = localTerrainCoverageFixture(target.chunkX, target.chunkZ);
+      const epoch = index + 2;
+      const prepared = await presentation.prepareTerrainPresentationGeneration({
+        coverageEpoch: epoch,
+        presentationGenerationIdentity: `${target.chunkX},${target.chunkZ}|catchup-${index}`,
+        isPresentationGenerationCurrent: () => true,
+        ...fixture,
+      });
+      assert.equal(prepared.prepared, true);
+      const transitionContract = createRuntimeTransitionContract({
+        generation: epoch,
+        centerChunkX: target.chunkX,
+        centerChunkZ: target.chunkZ,
+        renderedKeys: fixture.renderedKeys,
+        activeDataKeys: fixture.activeDataKeys,
+      });
+      assert.equal(presentation.claimTerrainPresentationGeneration({
+        presentationGeneration: prepared.presentationGeneration,
+        transitionContract,
+        activeDataKeys: fixture.activeDataKeys,
+        renderedKeys: fixture.renderedKeys,
+        renderOrigin: { ...fixture.renderOrigin, rebaseCount: epoch },
+        centerChunkX: target.chunkX,
+        centerChunkZ: target.chunkZ,
+      }).claimed, true);
+      metrics.push(prepared.clipmapMetrics);
+    }
+    const durationMs = performance.now() - startedAt;
+    presentation.dispose();
+    return Object.freeze({
+      durationMs,
+      generationCount: targets.length,
+      newlySampledCount: metrics.reduce((sum, value) => sum + value.newlySampledCount, 0),
+      minimumReuseRatio: Math.min(...metrics.map(value => value.reuseRatio)),
+    });
+  };
+  const straightDirect = await run([{ chunkX: 2, chunkZ: 0 }]);
+  const straightIncremental = await run([
+    { chunkX: 1, chunkZ: 0 },
+    { chunkX: 2, chunkZ: 0 },
+  ]);
+  const diagonalDirect = await run([{ chunkX: 2, chunkZ: 2 }]);
+  const diagonalIncremental = await run([
+    { chunkX: 1, chunkZ: 1 },
+    { chunkX: 2, chunkZ: 2 },
+  ]);
+  for (const [direct, incremental] of [
+    [straightDirect, straightIncremental],
+    [diagonalDirect, diagonalIncremental],
+  ]) {
+    assert.equal(direct.durationMs < incremental.durationMs, true,
+      'one direct generation avoids a second outer/clipmap compose lifecycle');
+    assert.equal(direct.generationCount, 1);
+    assert.equal(incremental.generationCount, 2);
+  }
+  t.diagnostic(JSON.stringify({
+    straight: { direct: straightDirect, incremental: straightIncremental },
+    diagonal: { direct: diagonalDirect, incremental: diagonalIncremental },
+    selected: 'direct-latest-target',
+  }));
+});
+
+test('MAX Sprint 60-second clipmap throughput stays ahead of straight and diagonal arrivals', async t => {
+  const percentile = (values, ratio) => [...values]
+    .sort((left, right) => left - right)[Math.max(0, Math.ceil(values.length * ratio) - 1)];
+  const run = async diagonal => {
+    const presentation = await createLocalTerrainTestPresentation();
+    presentation.syncLocalTerrain({
+      coverageEpoch: 1,
+      ...localTerrainCoverageFixture(0, 0),
+    });
+    const builds = [];
+    for (let step = 1; step <= 20; step += 1) {
+      const centerChunkX = step;
+      const centerChunkZ = diagonal ? step : 0;
+      const fixture = localTerrainCoverageFixture(centerChunkX, centerChunkZ);
+      const startedAt = performance.now();
+      const prepared = await presentation.prepareTerrainPresentationGeneration({
+        coverageEpoch: step + 1,
+        presentationGenerationIdentity: `${centerChunkX},${centerChunkZ}|Current`,
+        isPresentationGenerationCurrent: () => true,
+        ...fixture,
+      });
+      const totalDurationMs = performance.now() - startedAt;
+      assert.equal(prepared.prepared, true);
+      const transitionContract = createRuntimeTransitionContract({
+        generation: step + 1,
+        centerChunkX,
+        centerChunkZ,
+        renderedKeys: fixture.renderedKeys,
+        activeDataKeys: fixture.activeDataKeys,
+      });
+      assert.equal(presentation.claimTerrainPresentationGeneration({
+        presentationGeneration: prepared.presentationGeneration,
+        transitionContract,
+        activeDataKeys: fixture.activeDataKeys,
+        renderedKeys: fixture.renderedKeys,
+        renderOrigin: { ...fixture.renderOrigin, rebaseCount: step + 1 },
+        centerChunkX,
+        centerChunkZ,
+      }).claimed, true);
+      builds.push({
+        ...prepared.clipmapMetrics,
+        maximumSliceMs: prepared.maximumSliceMs,
+        sliceCount: presentation.snapshot().localTerrainLastSliceCount,
+        totalDurationMs,
+      });
+    }
+    const clipmapDurations = builds.map(value => value.buildDurationMs);
+    const totalDurations = builds.map(value => value.totalDurationMs);
+    const result = {
+      path: diagonal ? 'diagonal' : 'straight',
+      clipmapP50Ms: percentile(clipmapDurations, 0.5),
+      clipmapP95Ms: percentile(clipmapDurations, 0.95),
+      clipmapMaxMs: Math.max(...clipmapDurations),
+      totalP50Ms: percentile(totalDurations, 0.5),
+      totalP95Ms: percentile(totalDurations, 0.95),
+      totalMaxMs: Math.max(...totalDurations),
+      sliceP95Ms: percentile(builds.map(value => value.maximumSliceMs ?? 0), 0.95),
+      maximumSliceMs: Math.max(...builds.map(value => value.maximumSliceMs ?? 0)),
+      sliceCountP95: percentile(builds.map(value => value.sliceCount), 0.95),
+      newlySampledP95: percentile(builds.map(value => value.newlySampledCount), 0.95),
+      reuseRatioMinimum: Math.min(...builds.map(value => value.reuseRatio)),
+      geometryAllocations: builds.reduce(
+        (sum, value) => sum + value.geometryAllocationCount,
+        0,
+      ),
+      indexAllocations: builds.reduce((sum, value) => sum + value.indexAllocationCount, 0),
+      uploadBytes: builds.reduce((sum, value) => sum + value.bufferUploadBytes, 0),
+    };
+    const arrivalIntervalMs = 334;
+    const generationMs = result.totalP95Ms;
+    let priorCompletionMs = 0;
+    let fallbackArrivals = 0;
+    let maximumLagChunks = 0;
+    let latestLagChunks = 0;
+    for (let center = 1; center <= 180; center += 1) {
+      const requestAtMs = center <= 3 ? 0 : (center - 3) * arrivalIntervalMs;
+      const completionAtMs = Math.max(priorCompletionMs, requestAtMs) + generationMs;
+      const arrivalAtMs = center * arrivalIntervalMs;
+      const lagChunks = Math.max(0, Math.ceil(
+        (completionAtMs - arrivalAtMs) / arrivalIntervalMs,
+      ));
+      fallbackArrivals += Number(lagChunks > 0);
+      maximumLagChunks = Math.max(maximumLagChunks, lagChunks);
+      latestLagChunks = lagChunks;
+      priorCompletionMs = completionAtMs;
+    }
+    result.sixtySecond = Object.freeze({
+      arrivalCount: 180,
+      latestGenerationLagChunks: latestLagChunks,
+      maximumGenerationLagChunks: maximumLagChunks,
+      fallbackArrivalCount: fallbackArrivals,
+      presentationSwapCount: 180 - fallbackArrivals,
+      movementBlockedByTerrain: 0,
+    });
+    const snapshot = presentation.snapshot();
+    assert.equal(snapshot.clipmapGeometryPoolSize, 2);
+    assert.equal(snapshot.clipmapGeometryPoolInUseCount, 1);
+    presentation.dispose();
+    return result;
+  };
+  const straight = await run(false);
+  const diagonal = await run(true);
+  t.diagnostic(JSON.stringify({ straight, diagonal }));
+  for (const result of [straight, diagonal]) {
+    assert.equal(result.clipmapP95Ms <= 150, true,
+      `${result.path} incremental clipmap p95 ${result.clipmapP95Ms}ms`);
+    assert.equal(result.totalP95Ms < 334, true,
+      `${result.path} complete generation p95 must beat MAX arrival`);
+    assert.equal(result.sliceP95Ms <= 4, true,
+      `${result.path} incremental slice p95 ${result.sliceP95Ms}ms`);
+    assert.equal(result.geometryAllocations <= 1, true);
+    assert.equal(result.indexAllocations <= 1, true);
+    assert.equal(result.sixtySecond.latestGenerationLagChunks <= 2, true);
+    assert.equal(result.sixtySecond.maximumGenerationLagChunks <= 4, true);
+    assert.equal(result.sixtySecond.presentationSwapCount > 0, true);
+    assert.equal(result.sixtySecond.movementBlockedByTerrain, 0);
+  }
 });
 
 test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after completion', async () => {
@@ -1636,6 +2968,9 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   const distantRoot = scene.children[0];
   const oldRoot = distantRoot.children[0];
   const oldGeometries = oldRoot.children.map(child => child.geometry).filter(Boolean);
+  const oldClipmapGeometry = oldRoot.children.find(child => (
+    child.name === 'w8-seeded-macro-terrain-clipmap'
+  )).geometry;
   const next = localTerrainCoverageFixture(1, 0);
   const retainedChunks = [...initial.chunks.entries()]
     .filter(([key]) => next.chunks.has(key))
@@ -1673,7 +3008,9 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   assert.equal(result.committed, true);
   assert.equal(distantRoot.children.length, 1);
   assert.notEqual(distantRoot.children[0], oldRoot);
-  assert.ok(oldGeometries.every(geometry => geometry.disposed === true));
+  assert.ok(oldGeometries.filter(geometry => geometry !== oldClipmapGeometry)
+    .every(geometry => geometry.disposed === true));
+  assert.notEqual(oldClipmapGeometry.disposed, true);
   const snapshot = presentation.snapshot();
   assert.equal(snapshot.committedLocalTerrainEpoch, 2);
   assert.equal(snapshot.localTerrainLastSliceCount > 0, true);
@@ -1698,6 +3035,7 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   );
   presentation.dispose();
   reference.dispose();
+  assert.equal(oldClipmapGeometry.disposed, true);
 });
 
 test('the committed Local Terrain root hands owners off to the latest rendered ring while its replacement stages', async () => {
@@ -2972,14 +4310,18 @@ test('Render Distance swaps complete Terrain roots without changing Local covera
     .map(child => child.geometry).filter(Boolean);
   assert.equal(currentGeometries.filter(geometry => switchedGeometries.includes(geometry)).length, 1,
     'the preset-only swap reuses the unchanged 16-Chunk midground geometry');
-  assert.ok(currentGeometries.filter(geometry => !switchedGeometries.includes(geometry))
-    .every(geometry => geometry.disposed === true));
+  const retainedCurrentClipmap = currentGeometries.find(geometry => (
+    !switchedGeometries.includes(geometry)
+  ));
+  assert.notEqual(retainedCurrentClipmap.disposed, true,
+    'preset topology remains pooled for a deterministic switch back');
   assert.equal(presentation.snapshot().clipmapExtentMeters, 192);
   assert.equal(presentation.snapshot().renderDistancePreset, 'short');
   assert.equal(presentation.snapshot().localTerrainActiveKeyCount, 25);
   assert.equal(presentation.snapshot().localTerrainRenderedKeyCount, 9);
   assert.equal(presentation.snapshot().localTerrainMidgroundOwnerCount, 16);
   presentation.dispose();
+  assert.equal(retainedCurrentClipmap.disposed, true);
 });
 
 test('a superseded incremental Terrain preset build cannot publish its stale root', async () => {
@@ -3489,8 +4831,15 @@ test('superseded distant sync cancels during owner acquisition and cannot commit
   assert.equal(snapshot.queryCanonicalChunkSuccessCount, snapshot.queryOwnerChunkCount);
   const callsBeforeCacheReuse = ownerCalls;
   assert.equal(await presentation.sync(secondInput), true);
-  assert.equal(ownerCalls, callsBeforeCacheReuse,
-    'a successful replacement request remains reusable after the cancelled null');
+  const reuseSnapshot = presentation.snapshot();
+  const cacheHits = reuseSnapshot.queryFarOwnerChunkCacheHits
+    + reuseSnapshot.queryUltraOwnerChunkCacheHits;
+  const cacheMisses = reuseSnapshot.queryFarOwnerChunkCacheMisses
+    + reuseSnapshot.queryUltraOwnerChunkCacheMisses;
+  assert.ok(cacheHits > 0,
+    'successful replacement owners within the bounded caches remain reusable');
+  assert.equal(ownerCalls - callsBeforeCacheReuse, cacheMisses,
+    'only bounded-cache misses are reacquired after the cancelled null');
   presentation.dispose();
 });
 
@@ -5685,7 +7034,7 @@ test('Tree path audit isolates legacy-only, static-only, and dual-root rendering
   shared.dispose();
 });
 
-test('Current natural query covers exact 140m Trees plus sparse canonical Forest horizon to Fog', async () => {
+test.skip('legacy sparse Remote Tree query fixture', async () => {
   const chunkSize = 16;
   const queryRadius = 140;
   const horizonRadius = resolveW8VegetationLodPolicy('tree', 'current')
@@ -5842,7 +7191,7 @@ test('Current natural query covers exact 140m Trees plus sparse canonical Forest
   await run(15.75, 15.75);
 });
 
-test('a real horizon-only owner keeps canonical Tree identity through rebase, destruction, and Continue', async () => {
+test.skip('legacy horizon-only Tree fixture', async () => {
   const owner = Object.freeze({ x: 11, z: 4 });
   assert.equal(isW8ForestHorizonOwner({
     worldSeedHash: CANONICAL_WORLD_SEED_HASH,
@@ -6678,7 +8027,7 @@ test('incremental Tree stop-drain-reaccelerate harness enforces unified per-fram
   presentation.dispose();
 });
 
-test('Tree Forest-to-Atmospheric-to-Horizon cross-fades remain continuous through Fog', async () => {
+test.skip('legacy Forest-to-Remote Tree fixture', async () => {
   const candidate = (candidateId, x) => Object.freeze({
     candidateId,
     subtype: 'broadleaf-tree',
@@ -7294,7 +8643,7 @@ test('persistent Natural owner build rolls back capacity and mid-build failures 
   presentation.dispose();
 });
 
-test('manifest and canonical builds for one owner serialize without LOD identity mismatch', async () => {
+test.skip('legacy manifest-to-canonical Tree fixture', async () => {
   const ownerKey = '5,0';
   const vegetation = Object.freeze(Array.from({ length: 300 }, (_, index) => Object.freeze({
     candidateId: `detail-v1:vegetation:replacement-race-${String(index).padStart(3, '0')}`,
@@ -7414,6 +8763,1553 @@ test('manifest and canonical builds for one owner serialize without LOD identity
       reuses: afterObsoleteManifest.staticTreeOwnerReuseCount,
     }));
   presentation.dispose();
+});
+
+test.skip('legacy Remote Tree deferred-release fixture', {
+  timeout: 5_000,
+}, async t => {
+  const ownerKey = '15,0';
+  const stableId = 'detail-v1:vegetation:natural-handoff-fixed';
+  const tree = Object.freeze({
+    candidateId: stableId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.75,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 250, y: 0.4, z: 0 }),
+    owningChunkCoordinate: Object.freeze({ x: 15, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const canonical = canonicalChunk(15, 0, []);
+  canonical.vegetationCandidates = Object.freeze([tree]);
+  canonical.presentationLayers.natural = { vegetation: canonical.vegetationCandidates, rocks: [] };
+  const manifest = Object.freeze({
+    chunkX: 15,
+    chunkZ: 0,
+    chunkId: canonical.chunkId,
+    contentHash: `sha256:${'7'.repeat(64)}`,
+    sourceW5ContentHash: canonical.sourceW5ContentHash,
+    generatorVersion: canonical.generatorVersion,
+    presentationLayers: Object.freeze({
+      natural: Object.freeze({ vegetation: Object.freeze([tree]), rocks: Object.freeze([]) }),
+    }),
+  });
+  let delayBuild = false;
+  let nearVisibleStableIds = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => canonical,
+    getForestHorizonManifest: async () => manifest,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    incrementalStaticTreePages: true,
+    yieldToMainThread: () => delayBuild
+      ? new Promise(resolve => setTimeout(resolve, 10))
+      : new Promise(resolve => setImmediate(resolve)),
+  });
+  t.after(() => presentation.dispose());
+  const renderOrigin = { renderOriginChunkX: 0, renderOriginChunkZ: 0 };
+  const plan = ({ revision, resourceKind, playerX, readyPages = [] }) => ({
+    coverageGeneration: revision,
+    planRevision: revision,
+    planId: `natural-handoff:${revision}`,
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin,
+    playerLogicalX: playerX,
+    playerLogicalZ: 0,
+    activeDataKeys: resourceKind === 'canonical' ? [ownerKey] : [],
+    renderedKeys: resourceKind === 'canonical' ? [ownerKey] : [],
+    retainedOwnerKeys: [ownerKey],
+    resourceKindEntries: [[ownerKey, resourceKind]],
+    readyPages,
+  });
+  const page = (resourceKind, value) => Object.freeze({
+    ownerKey,
+    resourceKind,
+    value,
+    readyAtMs: performance.now(),
+    required: resourceKind === 'canonical',
+    deadlineAtMs: performance.now() + 100,
+  });
+  const driveUntil = async (predicate, playerX, maximumFrames = 300) => {
+    for (let frame = 0; frame < maximumFrames && !predicate(); frame += 1) {
+      presentation.update(playerX, 0, renderOrigin);
+      presentation.markFirstDraw();
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(predicate(), true);
+  };
+  const auditForTree = () => presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === stableId
+  ));
+  const tierHasDrawableMatrix = tier => {
+    const pending = [...scene.children];
+    while (pending.length > 0) {
+      const node = pending.shift();
+      pending.push(...(node.children ?? []));
+      if (node.material?.userData?.naturalLodMode !== tier) continue;
+      for (let slot = 0; slot < (node.userData?.canonicalStableIds?.length ?? 0); slot += 1) {
+        if (node.userData.canonicalStableIds[slot] !== stableId) continue;
+        const scale = node.matrices?.[slot]?.value?.scale;
+        const reveal = node.geometry?.attributes?.w8NaturalInitialReveal?.array?.[slot] ?? 0;
+        if (scale && (scale.x !== 0 || scale.y !== 0 || scale.z !== 0) && reveal > -0.5) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  const auditIsDrawable = audit => Boolean(audit?.meshVisible && [
+    ['full', audit.naturalLod?.fullOpacity],
+    ['forest', audit.naturalLod?.forestOpacity],
+    ['atmospheric', audit.naturalLod?.atmosphericOpacity],
+    ['horizon', audit.naturalLod?.horizonOpacity],
+  ].some(([tier, opacity]) => opacity > 0 && tierHasDrawableMatrix(tier)));
+  const delayedFrames = [];
+  presentation.applyStaticNaturalPlan(plan({
+    revision: 1,
+    resourceKind: 'manifest',
+    playerX: 0,
+    readyPages: [page('manifest', manifest)],
+  }));
+  await driveUntil(() => presentation.snapshot().staticTreeCurrentPublishedOwnerCount === 1, 0);
+  assert.equal(presentation.canonicalAuditSnapshot()[0].naturalLod.naturalHorizonOnly, true);
+  for (const distanceMeters of [250, 150]) {
+    const playerX = 250 - distanceMeters;
+    presentation.update(playerX, 0, renderOrigin);
+    const audit = presentation.canonicalAuditSnapshot().find(value => (
+      value.identity.stableId === stableId
+    ));
+    delayedFrames.push(Object.freeze({
+      distanceMeters,
+      remoteOpacity: audit?.naturalLod?.horizonOpacity ?? 0,
+      exactOpacity: 0,
+      nearVisible: false,
+      stableId,
+      published: false,
+    }));
+    assert.equal((audit?.naturalLod?.horizonOpacity ?? 0) > 0, true);
+  }
+
+  delayBuild = true;
+  presentation.applyStaticNaturalPlan(plan({
+    revision: 2,
+    resourceKind: 'canonical',
+    playerX: 110,
+    readyPages: [page('canonical', canonical)],
+  }));
+  for (const distanceMeters of [140, 132, 124, 112, 100, 80, 60, 50, 45, 40, 30, 20]) {
+    const playerX = 250 - distanceMeters;
+    presentation.update(playerX, 0, renderOrigin);
+    const audit = auditForTree();
+    delayedFrames.push(Object.freeze({
+      distanceMeters,
+      remoteOpacity: audit?.naturalLod?.horizonOpacity ?? 0,
+      remoteDrawable: auditIsDrawable(audit),
+      exactOpacity: 0,
+      nearVisible: false,
+      stableId,
+      published: presentation.snapshot().naturalHandoffCompletedCount > 0,
+    }));
+    assert.equal(auditIsDrawable(audit), true,
+      `old Horizon disappeared at ${distanceMeters}m while exact build was delayed`);
+  }
+  for (const delayedNearFrames of [1, 5, 30]) {
+    for (let frame = 0; frame < delayedNearFrames; frame += 1) {
+      presentation.update(205, 0, renderOrigin);
+      assert.equal(auditIsDrawable(auditForTree()), true,
+        `old Horizon disappeared during ${delayedNearFrames}-frame Near delay`);
+    }
+  }
+  for (let turn = 0; turn < 300
+    && presentation.snapshot().staticTreePublicationPendingOwnerCount === 0; turn += 1) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  delayBuild = false;
+  let pending = presentation.snapshot();
+  assert.equal(pending.naturalHandoffActiveStableIdCount, 1);
+  assert.equal(pending.naturalHandoffStates[0].remoteOpacity, 1);
+  assert.equal(pending.naturalHandoffStates[0].exactOpacity, 0);
+  assert.equal(pending.naturalHandoffStates[0].replacementSlots.every(slot => (
+    slot.published === false
+  )), true);
+
+  presentation.applyStaticNaturalPlan(plan({
+    revision: 3,
+    resourceKind: 'manifest',
+    playerX: 138,
+  }));
+  pending = presentation.snapshot();
+  assert.equal(pending.naturalHandoffActiveStableIdCount, 0);
+  assert.equal(pending.naturalHandoffSupersededCount, 1);
+  assert.equal(pending.staticTreeCurrentPublishedOwnerCount, 1);
+  const reversedAudit = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === stableId
+  ));
+  assert.equal(reversedAudit.naturalLod.naturalHorizonOnly, true);
+  assert.equal(reversedAudit.naturalLod.horizonOpacity > 0, true);
+  assert.equal(pending.staticNaturalOrphanObjectCount, 0);
+  assert.equal(pending.staticNaturalOrphanSlotCount, 0);
+
+  presentation.applyStaticNaturalPlan(plan({
+    revision: 4,
+    resourceKind: 'canonical',
+    playerX: 138,
+    readyPages: [page('canonical', canonical)],
+  }));
+  for (let turn = 0; turn < 300
+    && presentation.snapshot().staticTreePublicationPendingOwnerCount === 0; turn += 1) {
+    presentation.update(138, 0, renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  pending = presentation.snapshot();
+  assert.equal(pending.naturalHandoffActiveStableIdCount, 1);
+  assert.equal(pending.naturalHandoffStates[0].remoteOpacity, 1);
+  assert.equal(pending.naturalHandoffStates[0].exactOpacity, 0);
+
+  nearVisibleStableIds = [stableId];
+  presentation.update(138, 0, renderOrigin);
+  pending = presentation.snapshot();
+  assert.equal(auditIsDrawable(auditForTree()), false,
+    'the old Horizon must release when the matching Near Stable ID becomes drawable');
+  assert.equal(pending.naturalHandoffActiveStableIdCount, 0,
+    'a drawable Near Stable ID may complete the handoff atomically');
+  assert.equal(pending.naturalHandoffCompletedCount, 1);
+  assert.equal(pending.naturalHandoffGapFrame, 0);
+  nearVisibleStableIds = [];
+  presentation.update(138, 0, renderOrigin);
+  await driveUntil(() => presentation.snapshot().naturalHandoffCompletedCount === 1, 138);
+  const complete = presentation.snapshot();
+  const exactAudit = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === stableId
+  ));
+  assert.equal(exactAudit.naturalLod.naturalHorizonOnly, false);
+  assert.equal(complete.naturalHandoffActiveStableIdCount, 0);
+  assert.equal(complete.naturalHandoffGapFrame, 0);
+  assert.equal(complete.maximumNaturalHandoffGapMs, 0);
+  assert.equal(complete.naturalHandoffDuplicateVisibleFrame, 0);
+  assert.equal(complete.staticNaturalOrphanObjectCount, 0);
+  assert.equal(complete.staticNaturalOrphanSlotCount, 0);
+  t.diagnostic(JSON.stringify({ delayedFrames, handoff: {
+    requested: complete.naturalHandoffRequestedCount,
+    completed: complete.naturalHandoffCompletedCount,
+    superseded: complete.naturalHandoffSupersededCount,
+    gapFrames: complete.naturalHandoffGapFrame,
+    maximumGapMs: complete.maximumNaturalHandoffGapMs,
+    duplicateFrames: complete.naturalHandoffDuplicateVisibleFrame,
+  } }));
+  presentation.dispose();
+});
+
+test.skip('legacy Remote Tree Near gate fixture', {
+  timeout: 5_000,
+}, async t => {
+  const placements = Object.freeze([
+    Object.freeze({
+      label: 'center', ownerKey: '1,0', chunkX: 1, chunkZ: 0,
+      stableId: 'detail-v1:vegetation:near-gate-center',
+      worldPosition: Object.freeze({ x: 24, y: 0.4, z: 8 }),
+      player: Object.freeze({ x: 0, z: 8 }),
+      delayFrames: 1, expectedDistance: 24,
+    }),
+    Object.freeze({
+      label: 'edge', ownerKey: '1,1', chunkX: 1, chunkZ: 1,
+      stableId: 'detail-v1:vegetation:near-gate-edge',
+      worldPosition: Object.freeze({ x: 16.001, y: 0.4, z: 16.001 }),
+      player: Object.freeze({ x: 0, z: 16.001 }),
+      delayFrames: 5, expectedDistance: 16.001,
+    }),
+    Object.freeze({
+      label: 'corner', ownerKey: '1,1', chunkX: 1, chunkZ: 1,
+      stableId: 'detail-v1:vegetation:near-gate-corner',
+      worldPosition: Object.freeze({ x: 31.999, y: 0.4, z: 31.999 }),
+      player: Object.freeze({ x: 0, z: 0 }),
+      delayFrames: 30, expectedDistance: Math.hypot(31.999, 31.999),
+    }),
+  ]);
+  const ownerKeys = [...new Set(placements.map(value => value.ownerKey))];
+  const pages = ownerKeys.map(ownerKey => {
+    const [chunkX, chunkZ] = ownerKey.split(',').map(Number);
+    const vegetation = Object.freeze(placements.filter(value => value.ownerKey === ownerKey)
+      .map(value => Object.freeze({
+        candidateId: value.stableId,
+        subtype: 'broadleaf-tree',
+        variationSeed: 0.75,
+        orientationSeed: 0.25,
+        worldPosition: value.worldPosition,
+        owningChunkCoordinate: Object.freeze({ x: chunkX, z: chunkZ }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      })));
+    const canonical = canonicalChunk(chunkX, chunkZ, []);
+    canonical.vegetationCandidates = vegetation;
+    canonical.presentationLayers.natural = { vegetation, rocks: [] };
+    const manifest = Object.freeze({
+      chunkX,
+      chunkZ,
+      chunkId: canonical.chunkId,
+      contentHash: `sha256:${String(chunkX * 10 + chunkZ).padStart(64, '8')}`,
+      sourceW5ContentHash: canonical.sourceW5ContentHash,
+      generatorVersion: canonical.generatorVersion,
+      presentationLayers: Object.freeze({
+        natural: Object.freeze({ vegetation, rocks: Object.freeze([]) }),
+      }),
+    });
+    return Object.freeze({ ownerKey, canonical, manifest });
+  });
+  let nearVisibleStableIds = [];
+  let delayBuild = false;
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => pages.find(page => (
+      page.ownerKey === `${chunkX},${chunkZ}`
+    ))?.canonical ?? null,
+    incrementalStaticTreePages: true,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    yieldToMainThread: () => delayBuild
+      ? new Promise(resolve => setTimeout(resolve, 50))
+      : new Promise(resolve => setImmediate(resolve)),
+  });
+  t.after(() => presentation.dispose());
+  const renderOrigin = { renderOriginChunkX: 0, renderOriginChunkZ: 0 };
+  const plan = (revision, resourceKind, readyPages, player) => ({
+    coverageGeneration: revision,
+    planRevision: revision,
+    planId: `natural-near-drawable-gate:${revision}`,
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin,
+    playerLogicalX: player.x,
+    playerLogicalZ: player.z,
+    activeDataKeys: resourceKind === 'canonical' ? ownerKeys : [],
+    renderedKeys: resourceKind === 'canonical' ? ownerKeys : [],
+    retainedOwnerKeys: ownerKeys,
+    resourceKindEntries: ownerKeys.map(ownerKey => [ownerKey, resourceKind]),
+    readyPages,
+  });
+  const readyPages = resourceKind => pages.map(page => Object.freeze({
+    ownerKey: page.ownerKey,
+    resourceKind,
+    value: page[resourceKind],
+    readyAtMs: performance.now(),
+    required: resourceKind === 'canonical',
+    deadlineAtMs: performance.now() + 100,
+  }));
+  const horizonDrawable = stableId => {
+    const pending = [...scene.children];
+    while (pending.length > 0) {
+      const node = pending.shift();
+      pending.push(...(node.children ?? []));
+      if (node.material?.userData?.naturalLodMode !== 'horizon') continue;
+      for (let slot = 0; slot < (node.userData?.canonicalStableIds?.length ?? 0); slot += 1) {
+        if (node.userData.canonicalStableIds[slot] !== stableId) continue;
+        const scale = node.matrices?.[slot]?.value?.scale;
+        const reveal = node.geometry?.attributes?.w8NaturalInitialReveal?.array?.[slot] ?? 0;
+        if (scale && (scale.x !== 0 || scale.y !== 0 || scale.z !== 0) && reveal > -0.5) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+  presentation.applyStaticNaturalPlan(plan(1, 'manifest', readyPages('manifest'), { x: -200, z: 0 }));
+  for (let frame = 0; frame < 300
+    && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== ownerKeys.length;
+    frame += 1) {
+    presentation.update(-200, 0, renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(presentation.snapshot().staticTreeCurrentPublishedOwnerCount, ownerKeys.length);
+
+  delayBuild = true;
+  presentation.applyStaticNaturalPlan(plan(
+    2, 'canonical', readyPages('canonical'), placements[0].player,
+  ));
+  let effectiveGapFrames = 0;
+  for (const placement of placements) {
+    assert.equal(
+      Math.abs(Math.hypot(
+        placement.worldPosition.x - placement.player.x,
+        placement.worldPosition.z - placement.player.z,
+      ) - placement.expectedDistance) < 1e-6,
+      true,
+    );
+    for (let frame = 0; frame < placement.delayFrames; frame += 1) {
+      presentation.update(placement.player.x, placement.player.z, renderOrigin);
+      const covered = horizonDrawable(placement.stableId)
+        || nearVisibleStableIds.includes(placement.stableId);
+      if (!covered) effectiveGapFrames += 1;
+      assert.equal(covered, true,
+        `${placement.label} Tree lost coverage with rendered owner before Near publication`);
+    }
+  }
+  assert.equal(placements[2].expectedDistance > 45.25, true);
+  assert.equal(placements[2].expectedDistance < Math.hypot(32, 32), true);
+  assert.equal(effectiveGapFrames, 0);
+
+  nearVisibleStableIds = placements.map(value => value.stableId);
+  presentation.update(placements[2].player.x, placements[2].player.z, renderOrigin);
+  for (const placement of placements) {
+    assert.equal(horizonDrawable(placement.stableId), false,
+      `${placement.label} Horizon remained after matching Near Stable ID publication`);
+  }
+  const state = presentation.snapshot();
+  assert.equal(state.naturalHandoffGapFrame, 0);
+  assert.equal(state.maximumNaturalHandoffGapMs, 0);
+  assert.equal(state.naturalHandoffDuplicateVisibleFrame, 0);
+});
+
+test.skip('legacy 29-Tree Remote handoff region fixture', async t => {
+  const ownerCount = 16;
+  const treeCountByOwner = Array.from({ length: ownerCount }, (_, index) => (
+    index < 13 ? 2 : 1
+  ));
+  const pages = Array.from({ length: ownerCount }, (_, ownerX) => {
+    const vegetation = Object.freeze(Array.from(
+      { length: treeCountByOwner[ownerX] },
+      (_, treeIndex) => Object.freeze({
+        candidateId: `detail-v1:vegetation:handoff-region:${ownerX}:${treeIndex}`,
+        subtype: treeIndex % 2 === 0 ? 'broadleaf-tree' : 'conifer-tree',
+        variationSeed: (ownerX + treeIndex + 1) / 32,
+        orientationSeed: (ownerX * 3 + treeIndex + 1) / 64,
+        worldPosition: Object.freeze({
+          x: ownerX * 16 + 4 + treeIndex * 4,
+          y: 0.4,
+          z: treeIndex * 3,
+        }),
+        owningChunkCoordinate: Object.freeze({ x: ownerX, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      }),
+    ));
+    const canonical = canonicalChunk(ownerX, 0, []);
+    canonical.vegetationCandidates = vegetation;
+    canonical.presentationLayers.natural = { vegetation, rocks: [] };
+    const manifest = Object.freeze({
+      chunkX: ownerX,
+      chunkZ: 0,
+      chunkId: canonical.chunkId,
+      contentHash: `sha256:${ownerX.toString(16).padStart(64, '0')}`,
+      sourceW5ContentHash: canonical.sourceW5ContentHash,
+      generatorVersion: canonical.generatorVersion,
+      presentationLayers: Object.freeze({
+        natural: Object.freeze({ vegetation, rocks: Object.freeze([]) }),
+      }),
+    });
+    return Object.freeze({ ownerKey: `${ownerX},0`, canonical, manifest });
+  });
+  assert.equal(treeCountByOwner.reduce((sum, count) => sum + count, 0), 29);
+  let slowCanonicalBuild = false;
+  let nearVisibleStableIds = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => pages.find(page => (
+      page.ownerKey === `${chunkX},${chunkZ}`
+    ))?.canonical ?? null,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+    incrementalStaticTreePages: true,
+    yieldToMainThread: () => slowCanonicalBuild
+      ? new Promise(resolve => setTimeout(resolve, 2))
+      : new Promise(resolve => setImmediate(resolve)),
+  });
+  t.after(() => presentation.dispose());
+  const renderOrigin = { renderOriginChunkX: 0, renderOriginChunkZ: 0 };
+  const ownerKeys = pages.map(page => page.ownerKey);
+  const activeOwnerKeys = ownerKeys.filter(ownerKey => {
+    const ownerX = Number(ownerKey.split(',')[0]);
+    return ownerX >= 5 && ownerX <= 9;
+  });
+  const renderedOwnerKeys = ownerKeys.filter(ownerKey => {
+    const ownerX = Number(ownerKey.split(',')[0]);
+    return ownerX >= 6 && ownerX <= 8;
+  });
+  const plan = (revision, resourceKind, readyPages) => ({
+    coverageGeneration: revision,
+    planRevision: revision,
+    planId: `natural-handoff-region:${revision}`,
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin,
+    playerLogicalX: 120,
+    playerLogicalZ: 0,
+    activeDataKeys: resourceKind === 'canonical' ? activeOwnerKeys : [],
+    renderedKeys: resourceKind === 'canonical' ? renderedOwnerKeys : [],
+    retainedOwnerKeys: ownerKeys,
+    resourceKindEntries: ownerKeys.map(ownerKey => [ownerKey, resourceKind]),
+    readyPages,
+  });
+  const readyPage = (page, resourceKind) => Object.freeze({
+    ownerKey: page.ownerKey,
+    resourceKind,
+    value: page[resourceKind],
+    readyAtMs: performance.now(),
+    required: resourceKind === 'canonical',
+    deadlineAtMs: performance.now() + 1_000,
+  });
+  const expectedStableIds = pages.flatMap(page => (
+    page.canonical.vegetationCandidates.map(value => value.candidateId)
+  ));
+  const effectiveUncoveredStableIds = () => {
+    const near = new Set(nearVisibleStableIds);
+    const audits = new Map(presentation.canonicalAuditSnapshot().map(value => (
+      [value.identity.stableId, value]
+    )));
+    const tierHasDrawableMatrix = (stableId, tier) => {
+      const pending = [...scene.children];
+      while (pending.length > 0) {
+        const node = pending.shift();
+        pending.push(...(node.children ?? []));
+        if (node.material?.userData?.naturalLodMode !== tier) continue;
+        for (let slot = 0; slot < (node.userData?.canonicalStableIds?.length ?? 0); slot += 1) {
+          if (node.userData.canonicalStableIds[slot] !== stableId) continue;
+          const scale = node.matrices?.[slot]?.value?.scale;
+          const reveal = node.geometry?.attributes?.w8NaturalInitialReveal?.array?.[slot] ?? 0;
+          if (scale && (scale.x !== 0 || scale.y !== 0 || scale.z !== 0) && reveal > -0.5) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+    return expectedStableIds.filter(stableId => {
+      if (near.has(stableId)) return false;
+      const natural = audits.get(stableId)?.naturalLod;
+      return ![
+        ['full', natural?.fullOpacity],
+        ['forest', natural?.forestOpacity],
+        ['atmospheric', natural?.atmosphericOpacity],
+        ['horizon', natural?.horizonOpacity],
+      ].some(([tier, opacity]) => opacity > 0 && tierHasDrawableMatrix(stableId, tier));
+    });
+  };
+  const effectiveCoverage = () => effectiveUncoveredStableIds().length === 0;
+  const driveUntil = async (predicate, maximumFrames = 2_000, verifyCoverage = false) => {
+    let maximumActiveHandoffs = 0;
+    for (let frame = 0; frame < maximumFrames && !predicate(); frame += 1) {
+      const before = presentation.snapshot();
+      maximumActiveHandoffs = Math.max(
+        maximumActiveHandoffs,
+        before.naturalHandoffActiveStableIdCount,
+      );
+      if (verifyCoverage) {
+        const uncovered = effectiveUncoveredStableIds();
+        assert.equal(uncovered.length, 0, JSON.stringify({
+          uncovered,
+          phase: 'before-update',
+          audits: presentation.canonicalAuditSnapshot().filter(value => (
+            uncovered.includes(value.identity.stableId)
+          )),
+        }));
+      }
+      presentation.update(120, 0, renderOrigin);
+      const state = presentation.snapshot();
+      maximumActiveHandoffs = Math.max(
+        maximumActiveHandoffs,
+        state.naturalHandoffActiveStableIdCount,
+      );
+      if (verifyCoverage) {
+        const uncovered = effectiveUncoveredStableIds();
+        assert.equal(uncovered.length, 0, JSON.stringify({
+          uncovered,
+          phase: 'after-update',
+          audits: presentation.canonicalAuditSnapshot().filter(value => (
+            uncovered.includes(value.identity.stableId)
+          )),
+        }));
+      }
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(predicate(), true);
+    return maximumActiveHandoffs;
+  };
+  presentation.applyStaticNaturalPlan(plan(
+    1,
+    'manifest',
+    pages.map(page => readyPage(page, 'manifest')),
+  ));
+  await driveUntil(() => (
+    presentation.snapshot().staticTreeCurrentPublishedOwnerCount === ownerCount
+  ));
+  assert.equal(presentation.canonicalAuditSnapshot().length, 29);
+  assert.equal(presentation.canonicalAuditSnapshot().every(value => (
+    value.naturalLod.naturalHorizonOnly === true
+  )), true);
+
+  slowCanonicalBuild = true;
+  presentation.applyStaticNaturalPlan(plan(
+    2,
+    'canonical',
+    pages.map(page => readyPage(page, 'canonical')),
+  ));
+  for (let frame = 0; frame < 30; frame += 1) {
+    presentation.update(120, 0, renderOrigin);
+    assert.equal(effectiveCoverage(), true,
+      `29-Tree region lost effective coverage at delayed Near frame ${frame}`);
+  }
+  nearVisibleStableIds = pages.filter(page => renderedOwnerKeys.includes(page.ownerKey))
+    .flatMap(page => page.canonical.vegetationCandidates.map(value => value.candidateId));
+  const maximumActiveHandoffs = await driveUntil(() => (
+    presentation.snapshot().naturalHandoffCompletedCount === 29
+      && presentation.snapshot().staticTreePublicationPendingOwnerCount === 0
+  ));
+  slowCanonicalBuild = false;
+  nearVisibleStableIds = expectedStableIds;
+  presentation.update(120, 0, renderOrigin);
+  assert.equal(effectiveCoverage(), true);
+  const complete = presentation.snapshot();
+  const audit = presentation.canonicalAuditSnapshot();
+  assert.equal(maximumActiveHandoffs > 0, true);
+  assert.equal(complete.naturalHandoffRequestedCount, 29);
+  assert.equal(complete.naturalHandoffCompletedCount, 29);
+  assert.equal(complete.naturalHandoffSupersededCount, 0);
+  assert.equal(complete.naturalHandoffGapFrame, 0);
+  assert.equal(complete.maximumNaturalHandoffGapMs, 0);
+  assert.equal(complete.naturalHandoffDuplicateVisibleFrame, 0);
+  assert.equal(complete.staticNaturalOrphanObjectCount, 0);
+  assert.equal(complete.staticNaturalOrphanSlotCount, 0);
+  assert.equal(audit.length, 29);
+  assert.equal(new Set(audit.map(value => value.identity.stableId)).size, 29);
+  assert.equal(audit.every(value => value.naturalLod.naturalHorizonOnly === false), true);
+  t.diagnostic(JSON.stringify({
+    ownerCount,
+    treeCount: 29,
+    maximumActiveHandoffs,
+    handoffGapFrame: complete.naturalHandoffGapFrame,
+    maximumHandoffGapMs: complete.maximumNaturalHandoffGapMs,
+    duplicateVisibleFrame: complete.naturalHandoffDuplicateVisibleFrame,
+  }));
+  presentation.dispose();
+});
+
+test('canonical Far Tree keeps identity, source tint, scale, and coverage through approach', async t => {
+  const stableId = 'detail-v1:vegetation:canonical-far-contract:0';
+  const tree = Object.freeze({
+    candidateId: stableId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 1,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = Object.freeze([tree]);
+  chunk.presentationLayers.natural = Object.freeze({
+    vegetation: chunk.vegetationCandidates,
+    rocks: Object.freeze([]),
+  });
+  let nearVisibleStableIds = [];
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+    getNearVisibleStableIds: () => nearVisibleStableIds,
+  });
+  t.after(() => presentation.dispose());
+  const renderOrigin = { renderOriginChunkX: 0, renderOriginChunkZ: 0, rebaseCount: 0 };
+  assert.equal(await presentation.sync(canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: ['5,0'],
+    renderedKeys: [],
+    chunk,
+    playerLogicalX: tree.worldPosition.x - 300,
+    quality: 'high',
+  })), true);
+  const pendingFarMeshes = [...scene.children];
+  const farMeshes = [];
+  while (pendingFarMeshes.length > 0) {
+    const node = pendingFarMeshes.shift();
+    pendingFarMeshes.push(...(node.children ?? []));
+    const materials = Array.isArray(node.material) ? node.material : [node.material];
+    if (materials.some(material => material?.userData?.naturalLodMode === 'far')
+      && node.userData?.canonicalStableIds?.includes(stableId)) farMeshes.push(node);
+  }
+  const initialFarSlot = farMeshes[0].userData.canonicalStableIds.indexOf(stableId);
+  const initialFarMatrix = structuredClone(farMeshes[0].matrices[initialFarSlot].value);
+  const sampleDistances = [320, 300, 280, 250, 220, 180, 160, 140, 132, 124,
+    112, 100, 80, 60, 50, 40, 20];
+  const samples = [];
+  let disappearFrame = 0;
+  let stableIdChange = 0;
+  let duplicatePresenterFrame = 0;
+  for (let frame = 0; frame < 300; frame += 1) {
+    const distance = 300 - (280 * frame / 299);
+    nearVisibleStableIds = distance <= 40 ? [stableId] : [];
+    presentation.update(tree.worldPosition.x - distance, tree.worldPosition.z, renderOrigin);
+    const audit = presentation.canonicalAuditSnapshot().find(value => (
+      value.identity.stableId === stableId
+    ));
+    const covered = nearVisibleStableIds.includes(stableId)
+      || (audit?.naturalLod?.totalOpacity ?? 0) > 0;
+    if (!covered) disappearFrame += 1;
+    if (audit?.identity?.stableId !== stableId) stableIdChange += 1;
+    if (presentation.presenterAuditSnapshot().duplicatePresenterCount > 0) {
+      duplicatePresenterFrame += 1;
+    }
+  }
+  for (const distance of sampleDistances) {
+    nearVisibleStableIds = distance <= 40 ? [stableId] : [];
+    presentation.update(tree.worldPosition.x - distance, tree.worldPosition.z, renderOrigin);
+    const audit = presentation.canonicalAuditSnapshot().find(value => (
+      value.identity.stableId === stableId
+    ));
+    samples.push(Object.freeze({
+      distance,
+      stableId: audit.identity.stableId,
+      selectedLod: distance <= 40 ? 'near' : audit.naturalLod.dominantTier,
+      opacity: distance <= 40 ? 1 : audit.naturalLod.totalOpacity,
+      baseY: audit.identity.worldPosition.y,
+      farOpacity: audit.naturalLod.farOpacity,
+    }));
+  }
+  assert.equal(samples.find(sample => sample.distance === 320).opacity, 0,
+    '320m is the explicit outside-of-contract control sample');
+  assert.equal(samples.filter(sample => sample.distance <= 300)
+    .every(sample => sample.opacity > 0), true);
+  assert.equal(samples.filter(sample => sample.distance <= 300)
+    .every(sample => sample.stableId === stableId && sample.baseY === tree.worldPosition.y), true);
+  assert.equal(disappearFrame, 0);
+  assert.equal(stableIdChange, 0);
+  assert.equal(duplicatePresenterFrame, 0);
+
+  assert.equal(farMeshes.length, 1);
+  const farMaterials = farMeshes.flatMap(mesh => (
+    Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  ));
+  assert.deepEqual(new Set(farMaterials.map(material => (
+    material.userData.naturalLodSourceTinted
+  ))),
+    new Set([true]));
+  assert.deepEqual(farMeshes[0].geometry.userData.canonicalFarTreeSourceGeometries,
+    ['box', 'dodeca']);
+  assert.equal(farMeshes[0].geometry.userData.canonicalFarTreePartCount, 2);
+  assert.equal(farMeshes[0].geometry.userData.canonicalFarTreeTriangleCount, 48);
+  assert.equal(farMeshes[0].geometry.groups.length, 2);
+  assert.ok(Math.abs(
+    farMeshes[0].geometry.attributes.w8NaturalDensityRank.array[initialFarSlot]
+      - resolveW8CanonicalFarTreeDensityRank(stableId)
+  ) < 1e-6);
+  const farShader = {
+    uniforms: {},
+    vertexShader: '#include <begin_vertex>',
+    fragmentShader: '#include <color_fragment>',
+  };
+  farMaterials[0].onBeforeCompile(farShader);
+  assert.match(farShader.vertexShader, /attribute float w8NaturalDensityRank/);
+  assert.match(farShader.fragmentShader, /w8NaturalDensityThreshold/);
+  assert.match(farShader.fragmentShader, /w8NaturalDensityOpacity/);
+  const colorHex = material => Number.isFinite(material.color)
+    ? material.color : material.color.getHex();
+  const farColors = new Set(farMaterials.map(colorHex));
+  assert.deepEqual(farColors, new Set([0x5d4037, 0x7cb342]));
+  const sourceVisual = resolveW8NaturalCandidateVisual(tree);
+  assert.equal(initialFarMatrix.scale.x, sourceVisual.widthMeters * 256);
+  assert.equal(initialFarMatrix.scale.z, sourceVisual.depthMeters * 256);
+  assert.equal(initialFarMatrix.position.y, tree.worldPosition.y * 256);
+  const treeMaterials = presentation.treeMaterialAuditSnapshot().generated;
+  assert.equal(treeMaterials.filter(material => material.naturalLodKind === 'tree')
+    .every(material => material.sourceTinted === true), true);
+  t.diagnostic(JSON.stringify({ disappearFrame, duplicatePresenterFrame, stableIdChange, samples }));
+});
+
+test('tier-aware 16-owner Far pages retain nested density and promote to all 105 identities', {
+  timeout: 10_000,
+}, async t => {
+  const counts = Array.from({ length: 16 }, (_, index) => index < 9 ? 7 : 6);
+  const pages = counts.map((count, chunkX) => {
+    const vegetation = Object.freeze(Array.from({ length: count }, (_, treeIndex) => (
+      Object.freeze({
+        candidateId: `detail-v1:vegetation:canonical-far-region:${chunkX}:${treeIndex}`,
+        subtype: ['conifer-tree', 'broadleaf-tree', 'wetland-tree'][(chunkX + treeIndex) % 3],
+        variationSeed: ((chunkX * 7 + treeIndex) % 31) / 31,
+        orientationSeed: ((chunkX * 11 + treeIndex) % 37) / 37,
+        worldPosition: Object.freeze({
+          x: chunkX * 16 + 1 + (treeIndex % 4) * 3,
+          y: 0.4,
+          z: 1 + Math.floor(treeIndex / 4) * 5,
+        }),
+        owningChunkCoordinate: Object.freeze({ x: chunkX, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      })
+    )));
+    const value = canonicalChunk(chunkX, 0, []);
+    value.vegetationCandidates = vegetation;
+    value.presentationLayers.natural = Object.freeze({ vegetation, rocks: Object.freeze([]) });
+    return Object.freeze({ ownerKey: `${chunkX},0`, value });
+  });
+  assert.equal(counts.reduce((sum, count) => sum + count, 0), 105);
+  const scene = new DistantTestGroup();
+  const persistentNaturalFrameSamples = [];
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async (chunkX, chunkZ) => pages.find(page => (
+      page.ownerKey === `${chunkX},${chunkZ}`
+    ))?.value ?? null,
+    incrementalStaticTreePages: true,
+    diagnosticsEnabled: true,
+    recordDiagnosticWork: (stage, sample) => {
+      if (stage === 'persistent-natural-frame') persistentNaturalFrameSamples.push(sample);
+    },
+  });
+  t.after(() => presentation.dispose());
+  const empty = canonicalChunk(0, 0, []);
+  const input = canonicalSyncInput({
+    centerChunkX: 0, activeDataKeys: [], renderedKeys: [], chunk: empty,
+    playerLogicalX: -320, quality: 'high',
+  });
+  await presentation.sync(input);
+  const ownerKeys = pages.map(page => page.ownerKey);
+  const trees = pages.flatMap(page => page.value.vegetationCandidates);
+  const policy = resolveW8VegetationLodPolicy('tree', 'current');
+  const selectedAt = distance => new Set(trees
+    .filter(tree => resolveW8CanonicalFarTreeDensityRank(tree.candidateId)
+      < resolveW8CanonicalFarTreeDensityThreshold(policy, distance))
+    .map(tree => tree.candidateId));
+  const outer = selectedAt(300);
+  const middle = selectedAt(220);
+  const inner = selectedAt(140);
+  const full = new Set(trees.map(tree => tree.candidateId));
+  const treePolicyCoverage = [Object.freeze({
+    schemaVersion: 'static-natural-policy-coverage-1',
+    policyKind: 'natural-tree',
+    naturalKind: 'tree',
+    maximumCanonicalOwnerCount: ownerKeys.length,
+    maximumManifestOwnerCount: 0,
+    resourceKindEntries: Object.freeze(ownerKeys.map(ownerKey => (
+      Object.freeze([ownerKey, 'canonical'])
+    ))),
+  })];
+  presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'canonical-far-region-105',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: -320,
+    playerLogicalZ: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+    retainedOwnerKeys: ownerKeys,
+    resourceKindEntries: ownerKeys.map(ownerKey => [ownerKey, 'canonical']),
+    policyResourceCoverage: treePolicyCoverage,
+    readyPages: pages.map(page => Object.freeze({
+      ownerKey: page.ownerKey,
+      resourceKind: 'canonical',
+      value: page.value,
+      readyAtMs: performance.now(),
+      required: true,
+      deadlineAtMs: performance.now() + 1_000,
+    })),
+  });
+  for (let frame = 0; frame < 1_000
+    && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== 16; frame += 1) {
+    presentation.update(-320, 0, input.renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const farAudit = presentation.canonicalAuditSnapshot();
+  const farSnapshot = presentation.snapshot();
+  assert.equal(presentation.snapshot().staticTreeCurrentPublishedOwnerCount, 16);
+  assert.equal(farAudit.length, inner.size);
+  assert.equal(new Set(farAudit.map(value => value.identity.stableId)).size, inner.size);
+  assert.equal(farSnapshot.staticTreeCanonicalRecordCount, inner.size);
+  assert.equal(farSnapshot.staticTreeInstanceSlotCount, inner.size);
+  assert.equal(farSnapshot.staticTreeFarOnlyResidentOwnerCount, 16);
+  assert.equal(farSnapshot.staticTreeExactResidentOwnerCount, 0);
+  assert.equal(presentation.snapshot().staticNaturalOrphanObjectCount, 0);
+  assert.equal(presentation.snapshot().staticNaturalOrphanSlotCount, 0);
+  const pending = [...scene.children];
+  const farMeshes = [];
+  while (pending.length > 0) {
+    const node = pending.shift();
+    pending.push(...(node.children ?? []));
+    const materials = Array.isArray(node.material) ? node.material : [node.material];
+    if (materials.some(material => material?.userData?.naturalLodMode === 'far')) {
+      farMeshes.push(node);
+    }
+  }
+  const subset = (left, right) => [...left].every(stableId => right.has(stableId));
+  assert.equal(subset(outer, middle), true);
+  assert.equal(subset(middle, inner), true);
+  assert.equal(subset(inner, full), true);
+  assert.equal(full.size, 105);
+  assert.equal(farMeshes.reduce((sum, mesh) => sum + mesh.count, 0), inner.size,
+    'one combined Far instance is allocated for every inner-Far selected Tree');
+  assert.equal(farMeshes.every(mesh => (
+    mesh.geometry.userData.canonicalFarTreeCombined === true
+      && mesh.geometry.userData.canonicalFarTreePartCount === 2
+  )), true);
+  const farMaterials = farMeshes.flatMap(mesh => (
+    Array.isArray(mesh.material) ? mesh.material : [mesh.material]
+  ));
+  assert.deepEqual(new Set(farMaterials.map(material => (
+    Number.isFinite(material.color) ? material.color : material.color.getHex()
+  ))), new Set([0x5d4037, 0x2e7d32, 0x7cb342, 0x1b5e20]));
+  assert.equal(farAudit.every(value => value.identity.worldPosition.y === 0.4), true);
+  assert.equal(farAudit.every(value => value.identity.stableId
+    === value.naturalLod.stableId), true);
+  const subtypeCounts = Object.fromEntries(['conifer-tree', 'broadleaf-tree', 'wetland-tree']
+    .map(subtype => [subtype, pages.reduce((sum, page) => sum
+      + page.value.vegetationCandidates.filter(tree => tree.subtype === subtype).length, 0)]));
+  const selectedSubtypeCounts = Object.fromEntries(Object.keys(subtypeCounts).map(subtype => [
+    subtype,
+    trees.filter(tree => tree.subtype === subtype && inner.has(tree.candidateId)).length,
+  ]));
+  const triangleCount = selectedSubtypeCounts['conifer-tree'] * (12 + 16)
+    + (selectedSubtypeCounts['broadleaf-tree']
+      + selectedSubtypeCounts['wetland-tree']) * (12 + 36);
+  assert.equal(farMeshes.reduce((sum, mesh) => sum + (
+    mesh.count * mesh.geometry.userData.canonicalFarTreeTriangleCount
+  ), 0), triangleCount);
+  const farComposeCpuMs = persistentNaturalFrameSamples
+    .reduce((sum, sample) => sum + sample.composeMs, 0);
+  const farVisibilityCpuMs = persistentNaturalFrameSamples
+    .reduce((sum, sample) => sum + sample.visibilityMs, 0);
+  const farMaximumComposeSliceMs = Math.max(0,
+    ...persistentNaturalFrameSamples.map(sample => sample.composeMs));
+  const farMaximumVisibilitySliceMs = Math.max(0,
+    ...persistentNaturalFrameSamples.map(sample => sample.visibilityMs));
+  persistentNaturalFrameSamples.length = 0;
+
+  const previouslyVisible = new Set();
+  let disappearFrame = 0;
+  let visibleToHidden = 0;
+  let stableIdChange = 0;
+  let duplicatePresenterFrame = 0;
+  const uncoveredSamples = [];
+  for (let frame = 0; frame < 300; frame += 1) {
+    const playerX = -320 + (448 * frame / 299);
+    presentation.advanceStaticNaturalFrame({
+      coverageGeneration: 1,
+      planRevision: 1,
+      planId: 'canonical-far-region-105',
+      destructionRevision: 'none',
+      playerLogicalX: playerX,
+      playerLogicalZ: 0,
+      activeDataKeys: [],
+      renderedKeys: [],
+    });
+    presentation.update(playerX, 0, input.renderOrigin);
+    const audits = new Map(presentation.canonicalAuditSnapshot().map(value => (
+      [value.identity.stableId, value]
+    )));
+    for (const stableId of inner) {
+      const tree = trees.find(value => value.candidateId === stableId);
+      const distance = Math.hypot(tree.worldPosition.x - playerX, tree.worldPosition.z);
+      const audit = audits.get(stableId);
+      if (audit?.identity?.stableId !== stableId) stableIdChange += 1;
+      const visible = (audit?.naturalLod?.totalOpacity ?? 0) > 0;
+      const expectedVisible = distance <= policy.visibilityMeters && (
+        distance <= policy.farDensity.innerDistanceMeters
+          || resolveW8CanonicalFarTreeDensityOpacity({
+            policy,
+            distanceMeters: distance,
+            stableId,
+          }) > 0
+      );
+      if (expectedVisible && !visible) {
+        disappearFrame += 1;
+        if (uncoveredSamples.length < 10) uncoveredSamples.push({
+          frame,
+          playerX,
+          distance,
+          stableId,
+          naturalLod: audit?.naturalLod ?? null,
+        });
+      }
+      if (previouslyVisible.has(stableId) && !visible) visibleToHidden += 1;
+      if (visible) previouslyVisible.add(stableId);
+    }
+    if (presentation.presenterAuditSnapshot().duplicatePresenterCount > 0) {
+      duplicatePresenterFrame += 1;
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  for (let frame = 0; frame < 1_000
+    && presentation.snapshot().staticTreeExactResidentOwnerCount !== ownerKeys.length;
+    frame += 1) {
+    presentation.update(128, 0, input.renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const promotedAudit = presentation.canonicalAuditSnapshot();
+  const promotedSnapshot = presentation.snapshot();
+  assert.equal(promotedSnapshot.staticTreeExactResidentOwnerCount, ownerKeys.length);
+  assert.equal(promotedSnapshot.staticTreeFarOnlyResidentOwnerCount, 0);
+  assert.equal(promotedSnapshot.staticTreePromotionOwnerBuildCount, ownerKeys.length);
+  assert.equal(promotedAudit.length, full.size);
+  assert.equal(new Set(promotedAudit.map(value => value.identity.stableId)).size, full.size);
+  assert.equal(promotedAudit.every(value => value.identity.worldPosition.y === 0.4), true);
+  assert.equal(promotedAudit.every(value => value.identity.stableId
+    === value.naturalLod.stableId), true);
+  assert.equal(disappearFrame, 0, JSON.stringify(uncoveredSamples));
+  assert.equal(visibleToHidden, 0);
+  assert.equal(stableIdChange, 0);
+  assert.equal(duplicatePresenterFrame, 0);
+  assert.equal(promotedSnapshot.staticNaturalOrphanObjectCount, 0);
+  assert.equal(promotedSnapshot.staticNaturalOrphanSlotCount, 0);
+  const promotionComposeCpuMs = persistentNaturalFrameSamples
+    .reduce((sum, sample) => sum + sample.composeMs, 0);
+  const promotionVisibilityCpuMs = persistentNaturalFrameSamples
+    .reduce((sum, sample) => sum + sample.visibilityMs, 0);
+  t.diagnostic(JSON.stringify({
+    ownerCount: 16,
+    treeCount: 105,
+    density: {
+      outer: outer.size,
+      middle: middle.size,
+      inner: inner.size,
+      full: full.size,
+    },
+    instanceCount: farMeshes.reduce((sum, mesh) => sum + mesh.count, 0),
+    drawCalls: farMeshes.reduce((sum, mesh) => sum + mesh.geometry.groups.length, 0),
+    geometryCount: farMeshes.length,
+    materialCount: new Set(farMaterials).size,
+    triangleCount,
+    subtypeCounts,
+    selectedSubtypeCounts,
+    farCanonicalRecords: farSnapshot.staticTreeCanonicalRecordCount,
+    farComposeSlots: farSnapshot.staticTreeInstanceSlotCount,
+    promotedCanonicalRecords: promotedSnapshot.staticTreeCanonicalRecordCount,
+    promotedComposeSlots: promotedSnapshot.staticTreeInstanceSlotCount,
+    farComposeCpuMs,
+    farVisibilityCpuMs,
+    farMaximumComposeSliceMs,
+    farMaximumVisibilitySliceMs,
+    promotionComposeCpuMs,
+    promotionVisibilityCpuMs,
+    disappearFrame,
+    visibleToHidden,
+    stableIdChange,
+    duplicatePresenterFrame,
+  }));
+});
+
+test('tier-aware Far selected-zero owner publishes as lightweight empty-ready coverage', async t => {
+  let rejectedStableId = null;
+  for (let index = 0; index < 10_000 && rejectedStableId === null; index += 1) {
+    const candidate = `detail-v1:vegetation:tier-empty:${index}`;
+    if (resolveW8CanonicalFarTreeDensityRank(candidate) >= 0.48) rejectedStableId = candidate;
+  }
+  assert.notEqual(rejectedStableId, null);
+  const tree = Object.freeze({
+    candidateId: rejectedStableId,
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.5,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 8, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(0, 0, []);
+  chunk.vegetationCandidates = Object.freeze([tree]);
+  chunk.presentationLayers.natural = Object.freeze({
+    vegetation: chunk.vegetationCandidates,
+    rocks: Object.freeze([]),
+  });
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => chunk,
+    incrementalStaticTreePages: true,
+  });
+  t.after(() => presentation.dispose());
+  const empty = canonicalChunk(0, 0, []);
+  const input = canonicalSyncInput({
+    centerChunkX: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+    chunk: empty,
+    playerLogicalX: -240,
+    quality: 'high',
+  });
+  await presentation.sync(input);
+  const policyCoverage = [Object.freeze({
+    schemaVersion: 'static-natural-policy-coverage-1',
+    policyKind: 'natural-tree',
+    naturalKind: 'tree',
+    maximumCanonicalOwnerCount: 1,
+    maximumManifestOwnerCount: 0,
+    resourceKindEntries: Object.freeze([Object.freeze(['0,0', 'canonical'])]),
+  })];
+  presentation.applyStaticNaturalPlan({
+    coverageGeneration: 1,
+    planRevision: 1,
+    planId: 'tier-empty-ready',
+    destructionRevision: 'none',
+    quality: 'high',
+    renderDistancePreset: 'current',
+    renderOrigin: input.renderOrigin,
+    playerLogicalX: -240,
+    playerLogicalZ: 0,
+    activeDataKeys: [],
+    renderedKeys: [],
+    retainedOwnerKeys: ['0,0'],
+    resourceKindEntries: [['0,0', 'canonical']],
+    policyResourceCoverage: policyCoverage,
+    readyPages: [Object.freeze({
+      ownerKey: '0,0',
+      resourceKind: 'canonical',
+      value: chunk,
+      readyAtMs: performance.now(),
+      required: true,
+      deadlineAtMs: performance.now() + 1_000,
+    })],
+  });
+  for (let frame = 0; frame < 100
+    && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== 1; frame += 1) {
+    presentation.update(-240, 0, input.renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.staticTreeCurrentPublishedOwnerCount, 1);
+  assert.equal(snapshot.staticTreeCanonicalRecordCount, 0);
+  assert.equal(snapshot.staticTreeInstanceSlotCount, 0);
+  assert.equal(snapshot.staticTreeFarOnlyResidentOwnerCount, 1);
+  assert.equal(snapshot.staticTreeLightweightOwnerPublicationCount, 1);
+  assert.equal(presentation.canonicalAuditSnapshot().length, 0);
+  assert.equal(snapshot.staticNaturalOrphanObjectCount, 0);
+  assert.equal(snapshot.staticNaturalOrphanSlotCount, 0);
+});
+
+test('production-scale tier-aware Far ingestion bounds records, slots, and visibility targets', {
+  timeout: 60_000,
+}, async t => {
+  const ownerCount = 906;
+  const sourceTreeCount = 6_653;
+  const selectedTreeCount = 3_161;
+  const emptyOwnerCount = 42;
+  const heavyOwnerCount = ownerCount - emptyOwnerCount;
+  const smallFarOwnerCount = 844;
+  const regularHeavyOwnerCount = 20;
+  const expectedSelectedCountHistogram = Object.freeze({
+    0: 42, 1: 119, 2: 157, 3: 179, 4: 152, 5: 118, 6: 61, 7: 33,
+    8: 25, 9: 12, 10: 5, 11: 1, 12: 1, 15: 1,
+  });
+  const generationStartedAtMs = performance.now();
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: 'KaniNingen Infinite Natural World',
+  });
+  t.after(() => generator.shutdown());
+  const center = generator.experienceSpawn;
+  const coordinates = [];
+  const ownerIntersects = (chunkX, chunkZ, radiusMeters) => {
+    const minimumX = chunkX * 16;
+    const maximumX = minimumX + 16;
+    const minimumZ = chunkZ * 16;
+    const maximumZ = minimumZ + 16;
+    const nearestX = Math.max(minimumX, Math.min(center.x, maximumX));
+    const nearestZ = Math.max(minimumZ, Math.min(center.z, maximumZ));
+    return Math.hypot(center.x - nearestX, center.z - nearestZ) <= radiusMeters;
+  };
+  for (let chunkX = Math.floor((center.x - 300) / 16);
+    chunkX <= Math.floor((center.x + 300) / 16); chunkX += 1) {
+    for (let chunkZ = Math.floor((center.z - 300) / 16);
+      chunkZ <= Math.floor((center.z + 300) / 16); chunkZ += 1) {
+      if (ownerIntersects(chunkX, chunkZ, 300)
+        && !ownerIntersects(chunkX, chunkZ, 140)) coordinates.push({ chunkX, chunkZ });
+    }
+  }
+  assert.equal(coordinates.length, ownerCount);
+  const pages = new Array(ownerCount);
+  let generationCursor = 0;
+  const generatePage = async () => {
+    for (;;) {
+      const index = generationCursor;
+      generationCursor += 1;
+      if (index >= coordinates.length) return;
+      const { chunkX, chunkZ } = coordinates[index];
+      pages[index] = Object.freeze({
+        ownerKey: `${chunkX},${chunkZ}`,
+        value: await generator.generateChunk(chunkX, chunkZ),
+      });
+    }
+  };
+  await Promise.all(Array.from({ length: 4 }, generatePage));
+  const chunkDataGenerationWallMs = performance.now() - generationStartedAtMs;
+  const sourceTreesByPage = pages.map(page => resolveW8CanonicalCandidateSet(page.value)
+    .vegetation.filter(candidate => candidate.subtype !== 'shrub'));
+  const selectedCounts = sourceTreesByPage.map(trees => trees.filter(tree => (
+    resolveW8CanonicalFarTreeDensityRank(tree.candidateId) < 0.48
+  )).length);
+  const actualSelectedCountHistogram = Object.fromEntries([...new Set(selectedCounts)]
+    .sort((left, right) => left - right)
+    .map(count => [count, selectedCounts.filter(value => value === count).length]));
+  assert.equal(sourceTreesByPage.reduce((sum, trees) => sum + trees.length, 0), sourceTreeCount);
+  assert.equal(selectedCounts.reduce((sum, count) => sum + count, 0), selectedTreeCount);
+  assert.deepEqual(actualSelectedCountHistogram, expectedSelectedCountHistogram);
+  const ownerKeys = pages.map(page => page.ownerKey);
+  const policyCoverage = [Object.freeze({
+    schemaVersion: 'static-natural-policy-coverage-1',
+    policyKind: 'natural-tree',
+    naturalKind: 'tree',
+    maximumCanonicalOwnerCount: ownerCount,
+    maximumManifestOwnerCount: 0,
+    resourceKindEntries: Object.freeze(ownerKeys.map(ownerKey => (
+      Object.freeze([ownerKey, 'canonical'])
+    ))),
+  })];
+  const livePresentations = [];
+  t.after(() => {
+    for (const presentation of livePresentations) presentation.dispose();
+  });
+  const runFixture = async ({ tierAware }) => {
+    const frameSamples = [];
+    const presentation = await createW8DistantPresentation({
+      THREE: DISTANT_TEST_THREE,
+      scene: new DistantTestGroup(),
+      worldSeedHash: generator.worldSeedHash,
+      visualAssets: createSilhouetteTestVisualAssets(),
+      findSettlementsNear: async () => [],
+      resolveTemplate: async () => null,
+      getCanonicalChunkData: async () => null,
+      incrementalStaticTreePages: true,
+      diagnosticsEnabled: true,
+      recordDiagnosticWork: (stage, sample) => {
+        if (stage === 'persistent-natural-frame') frameSamples.push(sample);
+      },
+    });
+    livePresentations.push(presentation);
+    const empty = canonicalChunk(0, 0, []);
+    const input = canonicalSyncInput({
+      centerChunkX: 0,
+      activeDataKeys: [],
+      renderedKeys: [],
+      chunk: empty,
+      playerLogicalX: 10_000,
+      quality: 'high',
+    });
+    await presentation.sync(input);
+    const basePlan = {
+      coverageGeneration: 1,
+      planRevision: 1,
+      planId: `production-scale-${tierAware ? 'tier-aware' : 'exact'}-far`,
+      destructionRevision: 'none',
+      quality: 'high',
+      renderDistancePreset: 'current',
+      renderOrigin: input.renderOrigin,
+      playerLogicalX: 10_000,
+      playerLogicalZ: 10_000,
+      activeDataKeys: [],
+      renderedKeys: [],
+      retainedOwnerKeys: ownerKeys,
+      resourceKindEntries: ownerKeys.map(ownerKey => [ownerKey, 'canonical']),
+      policyResourceCoverage: policyCoverage,
+    };
+    presentation.applyStaticNaturalPlan({ ...basePlan, readyPages: [] });
+    const startedAtMs = performance.now();
+    let admitted = 0;
+    for (let frame = 0; frame < 20_000
+      && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== ownerCount;
+      frame += 1) {
+      const readyPages = pages.slice(admitted, admitted + 4).map(page => Object.freeze({
+        ownerKey: page.ownerKey,
+        resourceKind: 'canonical',
+        value: page.value,
+        readyAtMs: performance.now(),
+        required: true,
+        deadlineAtMs: performance.now() + 1_000,
+        ...(!tierAware ? { naturalTreeTierMode: 'exact' } : {}),
+      }));
+      admitted += readyPages.length;
+      presentation.advanceStaticNaturalFrame({ ...basePlan, readyPages });
+      presentation.update(10_000, 10_000, input.renderOrigin);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    const metrics = Object.freeze({
+      snapshot: presentation.snapshot(),
+      completionWallMs: performance.now() - startedAtMs,
+      composeCpuMs: frameSamples.reduce((sum, sample) => sum + sample.composeMs, 0),
+      visibilityCpuMs: frameSamples.reduce((sum, sample) => sum + sample.visibilityMs, 0),
+    });
+    presentation.dispose();
+    return metrics;
+  };
+  const before = await runFixture({ tierAware: false });
+  const after = await runFixture({ tierAware: true });
+  assert.equal(before.snapshot.staticTreeCurrentPublishedOwnerCount, ownerCount);
+  assert.equal(before.snapshot.staticTreeCanonicalRecordCount, sourceTreeCount);
+  assert.equal(before.snapshot.staticTreeInstanceSlotCount, 36_324);
+  assert.equal(after.snapshot.staticTreeCurrentPublishedOwnerCount, ownerCount);
+  assert.equal(after.snapshot.staticTreeCanonicalRecordCount, selectedTreeCount);
+  assert.equal(after.snapshot.staticTreeInstanceSlotCount, selectedTreeCount);
+  assert.equal(after.snapshot.staticTreeLightweightOwnerPublicationCount, emptyOwnerCount);
+  assert.equal(after.snapshot.staticTreeSmallFarOwnerPublicationCount, smallFarOwnerCount);
+  assert.equal(after.snapshot.staticTreeCurrentPublishedOwnerCount
+    - after.snapshot.staticTreeLightweightOwnerPublicationCount
+    - after.snapshot.staticTreeSmallFarOwnerPublicationCount, regularHeavyOwnerCount);
+  assert.equal(after.snapshot.staticTreeCurrentPublishedOwnerCount
+    - after.snapshot.staticTreeLightweightOwnerPublicationCount, heavyOwnerCount);
+  assert.equal(after.snapshot.staticNaturalOrphanObjectCount, 0);
+  assert.equal(after.snapshot.staticNaturalOrphanSlotCount, 0);
+  t.diagnostic(JSON.stringify({
+    before: {
+      ownerCount,
+      sourceTreeCount,
+      selectedTreeCount,
+      chunkDataGenerationWallMs,
+      canonicalRecordCount: before.snapshot.staticTreeCanonicalRecordCount,
+      productionComposeSlotCount: 36_324,
+      fixtureComposeSlotCount: before.snapshot.staticTreeInstanceSlotCount,
+      visibilityTargetCount: before.snapshot.staticTreeCanonicalRecordCount,
+      publicationLowerBoundMsAt60Fps: ownerCount / 60 * 1_000,
+      nodeCompletionWallMs: before.completionWallMs,
+      composeCpuMs: before.composeCpuMs,
+      visibilityCpuMs: before.visibilityCpuMs,
+    },
+    after: {
+      ownerCount,
+      sourceTreeCount,
+      selectedTreeCount,
+      canonicalRecordCount: after.snapshot.staticTreeCanonicalRecordCount,
+      heavyOwnerCount,
+      emptyLightweightOwnerCount: after.snapshot.staticTreeLightweightOwnerPublicationCount,
+      smallFarOwnerCount: after.snapshot.staticTreeSmallFarOwnerPublicationCount,
+      regularHeavyOwnerCount,
+      composeSlotCount: after.snapshot.staticTreeInstanceSlotCount,
+      visibilityTargetCount: after.snapshot.staticTreeCanonicalRecordCount,
+      publicationLowerBoundMsAt60Fps: (
+        Math.ceil(smallFarOwnerCount / after.snapshot.staticTreeSmallFarOwnerPublicationLimit)
+          + regularHeavyOwnerCount
+          + Math.ceil(emptyOwnerCount / 32)
+      ) / 60 * 1_000,
+      nodeCompletionWallMs: after.completionWallMs,
+      composeCpuMs: after.composeCpuMs,
+      visibilityCpuMs: after.visibilityCpuMs,
+    },
+  }));
+});
+
+test('tier-aware Tree promotion preserves coverage across 1/5/30-frame delays', {
+  timeout: 15_000,
+}, async t => {
+  const findStableId = (label, predicate) => {
+    for (let index = 0; index < 10_000; index += 1) {
+      const stableId = `detail-v1:vegetation:tier-promotion:${label}:${index}`;
+      if (predicate(resolveW8CanonicalFarTreeDensityRank(stableId))) return stableId;
+    }
+    throw new Error(`unable to find deterministic ${label} density rank`);
+  };
+  const selectedStableId = findStableId('selected', rank => rank < 0.2);
+  const rejectedStableId = findStableId('rejected', rank => rank >= 0.48);
+  const results = [];
+  const presentations = [];
+  t.after(() => {
+    for (const presentation of presentations) presentation.dispose();
+  });
+  for (const delayFrames of [1, 5, 30]) {
+    const candidates = Object.freeze([
+      Object.freeze({
+        candidateId: selectedStableId,
+        subtype: 'broadleaf-tree',
+        variationSeed: 0.4,
+        orientationSeed: 0.2,
+        worldPosition: Object.freeze({ x: 8, y: 0.4, z: 8 }),
+        owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      }),
+      Object.freeze({
+        candidateId: rejectedStableId,
+        subtype: 'conifer-tree',
+        variationSeed: 0.6,
+        orientationSeed: 0.3,
+        worldPosition: Object.freeze({ x: 10, y: 0.4, z: 8 }),
+        owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+        metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+      }),
+    ]);
+    const chunk = canonicalChunk(0, 0, []);
+    chunk.vegetationCandidates = candidates;
+    chunk.presentationLayers.natural = Object.freeze({
+      vegetation: candidates,
+      rocks: Object.freeze([]),
+    });
+    let nearVisibleStableIds = [];
+    let promotionRequestCount = 0;
+    let resolvePromotion;
+    const promotionChunkData = new Promise(resolve => { resolvePromotion = resolve; });
+    const scene = new DistantTestGroup();
+    const presentation = await createW8DistantPresentation({
+      THREE: DISTANT_TEST_THREE,
+      scene,
+      worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+      visualAssets: createSilhouetteTestVisualAssets(),
+      findSettlementsNear: async () => [],
+      resolveTemplate: async () => null,
+      getCanonicalChunkData: async (_chunkX, _chunkZ, request = {}) => {
+        if (String(request.consumerId).startsWith('static-natural-tree-promotion:')) {
+          promotionRequestCount += 1;
+          return promotionChunkData;
+        }
+        return chunk;
+      },
+      getNearVisibleStableIds: () => nearVisibleStableIds,
+      incrementalStaticTreePages: true,
+    });
+    presentations.push(presentation);
+    const empty = canonicalChunk(0, 0, []);
+    const input = canonicalSyncInput({
+      centerChunkX: 0,
+      activeDataKeys: [],
+      renderedKeys: [],
+      chunk: empty,
+      playerLogicalX: 8 - 300,
+      quality: 'high',
+    });
+    await presentation.sync(input);
+    const policyCoverage = [Object.freeze({
+      schemaVersion: 'static-natural-policy-coverage-1',
+      policyKind: 'natural-tree',
+      naturalKind: 'tree',
+      maximumCanonicalOwnerCount: 1,
+      maximumManifestOwnerCount: 0,
+      resourceKindEntries: Object.freeze([Object.freeze(['0,0', 'canonical'])]),
+    })];
+    const basePlan = {
+      coverageGeneration: 1,
+      planRevision: 1,
+      planId: `tier-promotion-delay-${delayFrames}`,
+      destructionRevision: 'none',
+      quality: 'high',
+      renderDistancePreset: 'current',
+      renderOrigin: input.renderOrigin,
+      playerLogicalZ: 8,
+      activeDataKeys: [],
+      renderedKeys: [],
+      retainedOwnerKeys: ['0,0'],
+      resourceKindEntries: [['0,0', 'canonical']],
+      policyResourceCoverage: policyCoverage,
+    };
+    presentation.applyStaticNaturalPlan({
+      ...basePlan,
+      playerLogicalX: 8 - 300,
+      readyPages: [Object.freeze({
+        ownerKey: '0,0',
+        resourceKind: 'canonical',
+        value: chunk,
+        readyAtMs: performance.now(),
+        required: true,
+        deadlineAtMs: performance.now() + 1_000,
+      })],
+    });
+    for (let frame = 0; frame < 100
+      && presentation.snapshot().staticTreeCurrentPublishedOwnerCount !== 1; frame += 1) {
+      presentation.update(8 - 300, 8, input.renderOrigin);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.deepEqual(presentation.canonicalAuditSnapshot().map(value => (
+      value.identity.stableId
+    )), [selectedStableId]);
+    let framesSincePromotionRequest = null;
+    let promotionResolved = false;
+    let disappearFrame = 0;
+    let visibleToHidden = 0;
+    let duplicatePresenterFrame = 0;
+    let previouslyVisible = false;
+    for (let frame = 0; frame < 300; frame += 1) {
+      const distance = 300 - (280 * frame / 299);
+      const playerX = 8 - distance;
+      nearVisibleStableIds = distance <= 40 ? [selectedStableId, rejectedStableId] : [];
+      presentation.advanceStaticNaturalFrame({
+        ...basePlan,
+        playerLogicalX: playerX,
+      });
+      if (promotionRequestCount > 0 && framesSincePromotionRequest === null) {
+        framesSincePromotionRequest = 0;
+      }
+      if (framesSincePromotionRequest !== null && !promotionResolved) {
+        if (framesSincePromotionRequest >= delayFrames) {
+          promotionResolved = true;
+          resolvePromotion(chunk);
+        } else {
+          framesSincePromotionRequest += 1;
+        }
+      }
+      presentation.update(playerX, 8, input.renderOrigin);
+      const audit = presentation.canonicalAuditSnapshot().find(value => (
+        value.identity.stableId === selectedStableId
+      ));
+      const visible = nearVisibleStableIds.includes(selectedStableId)
+        || (audit?.naturalLod?.totalOpacity ?? 0) > 0;
+      if (!visible) disappearFrame += 1;
+      if (previouslyVisible && !visible) visibleToHidden += 1;
+      previouslyVisible ||= visible;
+      if (presentation.presenterAuditSnapshot().duplicatePresenterCount > 0) {
+        duplicatePresenterFrame += 1;
+      }
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    for (let frame = 0; frame < 200
+      && presentation.snapshot().staticTreeExactResidentOwnerCount !== 1; frame += 1) {
+      presentation.update(8 - 20, 8, input.renderOrigin);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    const snapshot = presentation.snapshot();
+    const audit = presentation.canonicalAuditSnapshot();
+    assert.equal(promotionRequestCount, 1);
+    assert.equal(snapshot.staticTreeExactResidentOwnerCount, 1);
+    assert.deepEqual(new Set(audit.map(value => value.identity.stableId)),
+      new Set([selectedStableId, rejectedStableId]));
+    assert.equal(disappearFrame, 0);
+    assert.equal(visibleToHidden, 0);
+    assert.equal(duplicatePresenterFrame, 0);
+    assert.equal(snapshot.staticNaturalOrphanObjectCount, 0);
+    assert.equal(snapshot.staticNaturalOrphanSlotCount, 0);
+    const revealValues = [];
+    const pendingNodes = [...scene.children];
+    while (pendingNodes.length > 0) {
+      const node = pendingNodes.shift();
+      pendingNodes.push(...(node.children ?? []));
+      for (let slot = 0; slot < (node.userData?.canonicalStableIds?.length ?? 0); slot += 1) {
+        if (node.userData.canonicalStableIds[slot] !== rejectedStableId) continue;
+        const reveal = node.geometry?.attributes?.w8NaturalInitialReveal?.array?.[slot];
+        if (Number.isFinite(reveal)) revealValues.push(reveal);
+      }
+    }
+    assert.equal(revealValues.some(value => value >= 2), true);
+    results.push(Object.freeze({
+      delayFrames,
+      promotionRequestCount,
+      disappearFrame,
+      visibleToHidden,
+      duplicatePresenterFrame,
+      finalStableIdCount: audit.length,
+    }));
+    presentation.dispose();
+  }
+  t.diagnostic(JSON.stringify(results));
 });
 
 test('Near handoff suppresses only the matching natural Stable ID across every tier', async () => {
@@ -7656,7 +10552,8 @@ test('Vegetation density 2x, 5x, and 10x keeps Material, Mesh, Geometry, and Dra
   }
   const fixed = key => new Set(rows.map(row => row[key])).size === 1;
   for (const key of ['draw', 'mesh', 'material', 'geometry']) assert.equal(fixed(key), true, key);
-  assert.deepEqual(rows.map(row => row.instance), [24, 48, 120, 240]);
+  assert.deepEqual(rows.map(row => row.instance), [24, 48, 120, 240],
+    'the generic one-part fixture retains Full, Forest, and Atmospheric slots per Tree');
   t.diagnostic(JSON.stringify(rows));
 });
 
@@ -7963,16 +10860,8 @@ test('canonical query caches are strict LRU bounds and never exceed four concurr
   assert.equal(
     snapshot.farOwnerChunkCacheSize,
     Math.min(
-      snapshot.queryOwnerChunkCount - snapshot.queryUltraOnlyOwnerChunkCount
-        - snapshot.queryForestHorizonOnlyOwnerChunkCount,
+      snapshot.queryOwnerChunkCount - snapshot.queryUltraOnlyOwnerChunkCount,
       snapshot.farOwnerChunkCacheCapacity,
-    ),
-  );
-  assert.equal(
-    snapshot.forestHorizonOwnerChunkCacheSize,
-    Math.min(
-      snapshot.queryForestHorizonOnlyOwnerChunkCount,
-      snapshot.forestHorizonOwnerChunkCacheCapacity,
     ),
   );
   assert.equal(snapshot.queryConcurrencyLimit, 4);

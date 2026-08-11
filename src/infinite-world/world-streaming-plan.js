@@ -31,6 +31,7 @@ function normalizePosition(value, label) {
 
 function normalizeOwnerKeys(values, label, ownerMetadataCache = null) {
   if (!Array.isArray(values)) throw new TypeError(`${label} must be an array`);
+  if (ownerMetadataCache?.isNormalizedOwnerKeys(values)) return values;
   const cached = normalizedOwnerKeyArrayCache.get(values);
   if (cached) return cached;
   const coordinates = new Map();
@@ -45,31 +46,96 @@ function normalizeOwnerKeys(values, label, ownerMetadataCache = null) {
   const normalized = Object.freeze([...coordinates.values()]
     .sort((left, right) => left.chunkZ - right.chunkZ || left.chunkX - right.chunkX)
     .map(value => value.key));
+  ownerMetadataCache?.markNormalizedOwnerKeys(normalized);
   if (Object.isFrozen(values)) normalizedOwnerKeyArrayCache.set(values, normalized);
   return normalized;
 }
 
-function unionOwnerKeys(...sets) {
-  if (sets.length === 1) return sets[0];
-  if (sets.length === 2 && Object.isFrozen(sets[0]) && Object.isFrozen(sets[1])) {
-    let byRight = ownerKeyUnionCache.get(sets[0]);
+function mergeNormalizedOwnerKeyPair(left, right, ownerMetadataCache = null) {
+  if (left === right || right.length === 0) return left;
+  if (left.length === 0) return right;
+  if (Object.isFrozen(left) && Object.isFrozen(right)) {
+    let byRight = ownerKeyUnionCache.get(left);
     if (!byRight) {
       byRight = new WeakMap();
-      ownerKeyUnionCache.set(sets[0], byRight);
+      ownerKeyUnionCache.set(left, byRight);
     }
-    const cached = byRight.get(sets[1]);
-    if (cached) return cached;
-    const union = normalizeOwnerKeys([...sets[0], ...sets[1]], 'owner key union');
-    byRight.set(sets[1], union);
-    return union;
+    const cached = byRight.get(right);
+    if (cached) {
+      ownerMetadataCache?.markNormalizedOwnerKeys(cached);
+      return cached;
+    }
   }
-  return normalizeOwnerKeys(sets.flat(), 'owner key union');
+  const localCoordinates = ownerMetadataCache === null ? new Map() : null;
+  const compare = ownerMetadataCache?.compareOwnerKeys
+    ? (a, b) => ownerMetadataCache.compareOwnerKeys(a, b, {
+      path: 'world-streaming-plan:merge',
+    })
+    : (a, b) => {
+      let leftCoordinate = localCoordinates.get(a);
+      if (!leftCoordinate) {
+        leftCoordinate = parseChunkKey(a);
+        localCoordinates.set(a, leftCoordinate);
+      }
+      let rightCoordinate = localCoordinates.get(b);
+      if (!rightCoordinate) {
+        rightCoordinate = parseChunkKey(b);
+        localCoordinates.set(b, rightCoordinate);
+      }
+      return leftCoordinate.chunkZ - rightCoordinate.chunkZ
+        || leftCoordinate.chunkX - rightCoordinate.chunkX;
+    };
+  const merged = [];
+  let leftIndex = 0;
+  let rightIndex = 0;
+  while (leftIndex < left.length || rightIndex < right.length) {
+    const leftKey = left[leftIndex];
+    const rightKey = right[rightIndex];
+    if (leftKey === undefined) {
+      if (merged.at(-1) !== rightKey) merged.push(rightKey);
+      rightIndex += 1;
+    } else if (rightKey === undefined) {
+      if (merged.at(-1) !== leftKey) merged.push(leftKey);
+      leftIndex += 1;
+    } else {
+      const comparison = compare(leftKey, rightKey);
+      const key = comparison <= 0 ? leftKey : rightKey;
+      if (merged.at(-1) !== key) merged.push(key);
+      if (comparison <= 0) leftIndex += 1;
+      if (comparison >= 0) rightIndex += 1;
+    }
+  }
+  const result = Object.freeze(merged);
+  ownerMetadataCache?.markNormalizedOwnerKeys(result);
+  if (Object.isFrozen(left) && Object.isFrozen(right)) {
+    ownerKeyUnionCache.get(left).set(right, result);
+  }
+  return result;
+}
+
+export function unionNormalizedOwnerKeys(ownerMetadataCache, ...sets) {
+  if (sets.length === 0) return Object.freeze([]);
+  return sets.slice(1).reduce(
+    (merged, values) => mergeNormalizedOwnerKeyPair(merged, values, ownerMetadataCache),
+    sets[0],
+  );
+}
+
+function unionOwnerKeys(...sets) {
+  const normalized = sets.map((values, index) => normalizeOwnerKeys(
+    values,
+    `owner key union[${index}]`,
+  ));
+  return unionNormalizedOwnerKeys(null, ...normalized);
 }
 
 function unionOwnerKeysWithMetadata(ownerMetadataCache, ...sets) {
-  if (ownerMetadataCache === null) return unionOwnerKeys(...sets);
-  if (sets.length === 1) return sets[0];
-  return normalizeOwnerKeys(sets.flat(), 'owner key union', ownerMetadataCache);
+  const normalized = sets.map((values, index) => normalizeOwnerKeys(
+    values,
+    `owner key union[${index}]`,
+    ownerMetadataCache,
+  ));
+  return unionNormalizedOwnerKeys(ownerMetadataCache, ...normalized);
 }
 
 function differenceOwnerKeys(values, excluded) {
@@ -290,11 +356,15 @@ export function createWorldStreamingPlan({
       velocityCorridor,
     };
     Object.defineProperty(policyPlan, 'sourceSnapshot', {
-      value: resolved?.sourceSnapshot ?? null,
+      value: resolved?.sourceSnapshot ?? resolved ?? null,
       enumerable: false,
     });
     Object.defineProperty(policyPlan, 'resourceKindEntries', {
       value: resolved?.resourceKindEntries ?? null,
+      enumerable: false,
+    });
+    Object.defineProperty(policyPlan, 'resourceKindFor', {
+      value: resolved?.resourceKindFor ?? null,
       enumerable: false,
     });
     return Object.freeze(policyPlan);

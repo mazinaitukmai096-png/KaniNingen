@@ -12,6 +12,16 @@ import { createWorldStreamingPolicyRegistry } from '../src/infinite-world/world-
 import {
   createNaturalCoverageKey,
 } from '../src/infinite-world/natural-streaming-coverage.js';
+import {
+  createLegacyRuntimeChunkStreamingPolicy,
+} from '../src/infinite-world/world-streaming-plan.js';
+import { W8_RENDER_DISTANCE_PRESETS } from '../src/infinite-world/render-distance-policy.js';
+import {
+  W8_VEGETATION_LOD_KINDS,
+  resolveW8VegetationVisibilityContract,
+} from '../src/infinite-world/vegetation-lod-policy.js';
+import { createW8ForestHorizonOwnerPredicate } from '../src/infinite-world/forest-horizon-owner-policy.js';
+import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
 
 function createIntegratedRuntime(cache) {
   const runtime = createCircularStaticStreamingPolicy({
@@ -54,6 +64,120 @@ async function waitFor(predicate, message) {
 function percentile(values, ratio) {
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * ratio) - 1)];
+}
+
+function createProductionNaturalBenchmarkRuntime() {
+  const cache = createStreamingOwnerMetadataCache({ diagnosticsEnabled: true });
+  const registry = createWorldStreamingPolicyRegistry();
+  registry.register(createLegacyRuntimeChunkStreamingPolicy({ ownerMetadataCache: cache }));
+  const horizonOwnerPredicate = createW8ForestHorizonOwnerPredicate(
+    'production-static-spike-benchmark',
+  );
+  const runtimes = new Map(Object.values(W8_VEGETATION_LOD_KINDS).map(kind => {
+    const distanceProfileResolver = renderDistancePreset => (
+      resolveW8VegetationVisibilityContract(renderDistancePreset).byKind[kind]
+    );
+    const runtime = createCircularStaticStreamingPolicy({
+      kind: `natural-${kind}`,
+      publicationGroup: 'natural-static',
+      maximumRequiredDistanceMeters: Math.max(
+        ...Object.keys(W8_RENDER_DISTANCE_PRESETS).map(renderDistancePreset => Math.max(
+          distanceProfileResolver(renderDistancePreset).exactDistanceMeters,
+          distanceProfileResolver(renderDistancePreset).horizonDistanceMeters ?? 0,
+        )),
+      ),
+      distanceProfileResolver,
+      horizonOwnerPredicate: coordinate => (
+        kind === W8_VEGETATION_LOD_KINDS.TREE && horizonOwnerPredicate(coordinate)
+      ),
+      horizonOwnerDensity: kind === W8_VEGETATION_LOD_KINDS.TREE ? 4 : 1,
+      ownerMetadataCache: cache,
+    });
+    registry.register(runtime.policy);
+    return [runtime.policy.kind, runtime];
+  }));
+  registry.freeze();
+  let now = 1_000;
+  const coordinator = createWorldStreamingCoordinator({
+    registry,
+    ownerMetadataCache: cache,
+    clock: () => now,
+  });
+  const policyKinds = [...runtimes.keys()];
+  const stream = createStaticObjectStream({
+    policyKind: policyKinds[0],
+    policyKinds,
+    classifyOwner: ({ ownerKey, owner, plan, policyPlan }) => (
+      runtimes.get(policyPlan.kind).classifyOwner({ ownerKey, owner, plan, policyPlan })
+    ),
+    combineResourceKinds: ({ resourceKinds }) => (
+      resourceKinds.includes('canonical') ? 'canonical' : 'manifest'
+    ),
+    ownerMetadataCache: cache,
+    queueCapacity: 4096,
+    readyCapacity: 4096,
+    requestOwner: () => ({ promise: new Promise(() => {}), cancel: () => true }),
+  });
+  const apply = ({ frame, player, velocity }) => {
+    cache.beginFrame(frame);
+    now += 16;
+    const beforeMetadata = cache.snapshot();
+    const beforeStream = stream.diagnostics();
+    const planStartedAt = performance.now();
+    const plan = coordinator.createShadowPlan({
+      player,
+      velocity,
+      renderDistancePreset: 'current',
+    });
+    const planDurationMs = performance.now() - planStartedAt;
+    const naturalPolicyPlans = plan.policyPlans.filter(policy => runtimes.has(policy.kind));
+    const applyStartedAt = performance.now();
+    stream.applyPlan({
+      plan,
+      policyPlans: naturalPolicyPlans,
+      ownerMetadataRevision: plan.planId,
+    });
+    const applyPlanDurationMs = performance.now() - applyStartedAt;
+    const afterMetadata = cache.snapshot();
+    const afterStream = stream.diagnostics();
+    const delta = (before, after, key) => after[key] - before[key];
+    return Object.freeze({
+      planDurationMs,
+      applyPlanDurationMs,
+      maxStreamingSliceMs: planDurationMs + applyPlanDurationMs,
+      parseCalls: delta(beforeMetadata, afterMetadata, 'parseCalls'),
+      parseExecutions: delta(beforeMetadata, afterMetadata, 'parseExecutions'),
+      parseSameFrameDuplicates: delta(
+        beforeMetadata,
+        afterMetadata,
+        'parseSameFrameDuplicates',
+      ),
+      descriptorAllocations: delta(
+        beforeMetadata,
+        afterMetadata,
+        'descriptorAllocations',
+      ),
+      coverageOwnerEntryAllocations: delta(
+        beforeStream.counts,
+        afterStream.counts,
+        'coverageOwnerEntryAllocations',
+      ),
+      enqueueCalls: delta(beforeStream.counts, afterStream.counts, 'enqueueCalls'),
+      readyPageQueueCalls: delta(
+        beforeStream.counts,
+        afterStream.counts,
+        'readyPageQueueCalls',
+      ),
+      ...afterStream.latestApplyDiff,
+      normalizedOwnerCount: naturalPolicyPlans.reduce(
+        (sum, policy) => sum + policy.allOwnerKeys.length,
+        0,
+      ),
+      duplicateQueuedTaskCount: stream.snapshot().queuedTaskKeys.length
+        - new Set(stream.snapshot().queuedTaskKeys).size,
+    });
+  };
+  return { cache, coordinator, runtimes, stream, apply };
 }
 
 async function runIntegratedPerformanceWorkload({ reuse }) {
@@ -401,9 +525,9 @@ test('deterministic owner metadata workload reduces parse and allocation work', 
   assert.equal(optimized.planBuilds, baseline.planBuilds);
   assert.equal(optimized.staticApplyCalls, baseline.staticApplyCalls);
   assert.equal(optimized.classifyCalls, baseline.classifyCalls);
+  assert.ok(optimized.parseCalls < baseline.parseCalls * 0.2);
   assert.ok(optimized.parseExecutions < baseline.parseExecutions * 0.1);
   assert.ok(optimized.descriptorAllocations < baseline.descriptorAllocations * 0.2);
-  assert.ok(optimized.parseHitRate > 0.9);
   t.diagnostic(JSON.stringify({
     schemaVersion: 'streaming-owner-metadata-benchmark-1',
     environment: 'node-deterministic-work-count',
@@ -412,3 +536,92 @@ test('deterministic owner metadata workload reduces parse and allocation work', 
     optimized,
   }));
 });
+
+test('production Natural coverage processes only the steady-state owner delta in 12 profiles',
+  async t => {
+    const reports = [];
+    for (const stageId of ['TINY', 'MID', 'MAX']) {
+      for (const sprint of [false, true]) {
+        for (const path of ['straight', 'diagonal']) {
+          const runtime = createProductionNaturalBenchmarkRuntime();
+          const profile = getW6ScaleProfile(stageId);
+          const speedMetersPerSecond = profile.movementMetersPerSecond
+            * (sprint ? profile.sprintMultiplier : 1);
+          const axisSpeed = path === 'diagonal'
+            ? speedMetersPerSecond / Math.SQRT2 : speedMetersPerSecond;
+          const velocity = {
+            x: axisSpeed,
+            z: path === 'diagonal' ? axisSpeed : 0,
+          };
+          runtime.apply({ frame: 0, player: { x: 8, z: 8 }, velocity });
+          const measured = runtime.apply({
+            frame: 1,
+            player: { x: 24, z: path === 'diagonal' ? 24 : 8 },
+            velocity,
+          });
+          assert.equal(measured.classifiedOwnerCount, measured.enteringOwnerCount);
+          assert.equal(measured.sortTargetOwnerCount, measured.queueCandidateCount);
+          assert.equal(measured.enqueueCalls, measured.queueCandidateCount);
+          assert.ok(measured.queueInsertionCount <= measured.queueCandidateCount);
+          assert.ok(measured.parseCalls < 512, JSON.stringify({ stageId, sprint, path, measured }));
+          assert.ok(measured.parseSameFrameDuplicates < 256);
+          assert.equal(measured.duplicateQueuedTaskCount, 0);
+          reports.push({ stageId, sprint, path, ...measured });
+          await runtime.stream.dispose();
+        }
+      }
+    }
+    t.diagnostic(JSON.stringify(reports));
+  });
+
+test('unchanged production Natural source coverage bypasses merge, classify, and enqueue', async () => {
+  const runtime = createProductionNaturalBenchmarkRuntime();
+  const velocity = { x: getW6ScaleProfile('MAX').sprintMetersPerSecond, z: 0 };
+  runtime.apply({ frame: 0, player: { x: 8, z: 8 }, velocity });
+  const first = runtime.stream.diagnostics();
+  const repeated = runtime.apply({ frame: 1, player: { x: 8, z: 8 }, velocity });
+  const second = runtime.stream.diagnostics();
+  assert.equal(repeated.enteringOwnerCount, 0);
+  assert.equal(repeated.leavingOwnerCount, 0);
+  assert.equal(repeated.classifiedOwnerCount, 0);
+  assert.equal(repeated.queueCandidateCount, 0);
+  assert.equal(repeated.enqueueCalls, 0);
+  assert.equal(second.counts.sourceCoverageFastPaths, first.counts.sourceCoverageFastPaths + 1);
+  assert.equal(second.coverageGeneration, first.coverageGeneration);
+  await runtime.stream.dispose();
+});
+
+test('production Natural delta survives reversal, rapid turn, stop, and restart without duplicate work',
+  async t => {
+    const runtime = createProductionNaturalBenchmarkRuntime();
+    const speed = getW6ScaleProfile('MAX').sprintMetersPerSecond;
+    const scenarios = [
+      { name: 'east', player: { x: 8, z: 8 }, velocity: { x: speed, z: 0 } },
+      { name: 'reverse-west', player: { x: 8, z: 8 }, velocity: { x: -speed, z: 0 } },
+      { name: 'rapid-turn-north', player: { x: 8, z: 8 }, velocity: { x: 0, z: -speed } },
+      { name: 'stop', player: { x: 8, z: 8 }, velocity: { x: 0, z: 0 } },
+      { name: 'restart-east', player: { x: 8, z: 8 }, velocity: { x: speed, z: 0 } },
+      { name: 'rapid-movement', player: { x: 56, z: 8 }, velocity: { x: speed, z: 0 } },
+    ];
+    const reports = scenarios.map((scenario, frame) => ({
+      name: scenario.name,
+      ...runtime.apply({ frame, player: scenario.player, velocity: scenario.velocity }),
+    }));
+    t.diagnostic(JSON.stringify(reports));
+    for (const report of reports) {
+      assert.equal(report.classifiedOwnerCount, report.enteringOwnerCount);
+      assert.equal(report.duplicateQueuedTaskCount, 0);
+      assert.ok(report.queueInsertionCount <= report.queueCandidateCount);
+      // Canonical Far Tree retains every 300m Tree owner (plus the existing
+      // velocity corridor) instead of the former 1/4 Remote manifest lattice.
+      // Bound parse work to the actual canonical working set rather than the
+      // old sparse-manifest absolute owner count.
+      assert.ok(report.parseCalls < Math.max(512, report.normalizedOwnerCount * 1.25),
+        JSON.stringify(report));
+    }
+    const snapshot = runtime.stream.snapshot();
+    assert.equal(new Set(snapshot.queuedTaskKeys).size, snapshot.queuedTaskKeys.length);
+    assert.equal(snapshot.counts.failed, 0);
+    assert.equal(snapshot.counts.queueOverflows, 0);
+    await runtime.stream.dispose();
+  });

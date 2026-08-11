@@ -2,11 +2,6 @@ import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
-export {
-  createW8ForestHorizonOwnerPredicate,
-  isW8ForestHorizonOwner,
-} from './forest-horizon-owner-policy.js';
-
 export const W8_VEGETATION_LOD_KINDS = Object.freeze({
   TREE: 'tree',
   BUSH: 'bush',
@@ -18,7 +13,7 @@ export const W8_VEGETATION_LOD_TIERS = Object.freeze({
   FULL: 'full',
   FOREST: 'forest',
   ATMOSPHERIC: 'atmospheric',
-  HORIZON: 'horizon',
+  FAR: 'far',
 });
 
 export const W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA =
@@ -29,8 +24,10 @@ export const W8_ATMOSPHERIC_VEGETATION_COLOR_HEX = 0x49674f;
 
 const CURRENT_NATURAL_VISIBILITY_METERS = 140;
 const NEAR_OWNER_HANDOFF_SAFE_METERS = 48;
-const FOREST_HORIZON_FADE_START_RATIO = 0.78;
-const FOREST_HORIZON_OWNER_DENSITY = 4;
+const CANONICAL_FAR_FADE_START_RATIO = 0.92;
+const CANONICAL_FAR_TREE_OUTER_DENSITY = 0.24;
+const CANONICAL_FAR_TREE_INNER_DENSITY = 0.48;
+const CANONICAL_FAR_TREE_DENSITY_FADE = 0.012;
 const q6 = value => Math.round(value * 1e6) / 1e6;
 const clamp = value => Math.max(0, Math.min(1, value));
 const smoothstep = value => {
@@ -46,11 +43,10 @@ const handoffSafeBand = (minimum, maximum, scale) => {
   });
 };
 
-const noHorizon = Object.freeze({
-  horizonEntry: null,
-  horizonFade: null,
-  horizonVisibilityMeters: null,
-  horizonScale: null,
+const noFar = Object.freeze({
+  farEntry: null,
+  farFade: null,
+  farVisibilityMeters: null,
 });
 
 const profileFor = (kind, renderDistance) => {
@@ -67,30 +63,36 @@ const profileFor = (kind, renderDistance) => {
       minimum: q6(Math.max(forestToAtmospheric.maximum + 8, 124 * scale)),
       maximum: naturalVisibilityMeters,
     });
-    const horizonFade = Object.freeze({
+    const farFade = Object.freeze({
       minimum: q6(Math.max(
         atmosphericFade.maximum,
-        renderDistance.fogFarMeters * FOREST_HORIZON_FADE_START_RATIO,
+        renderDistance.fogFarMeters * CANONICAL_FAR_FADE_START_RATIO,
       )),
-      maximum: renderDistance.fogFarMeters,
+      // Keep the 300m boundary drawable; visibility itself remains capped at
+      // fogFar, while the fade curve would reach zero just outside that cap.
+      maximum: q6(renderDistance.fogFarMeters + 4),
     });
-    const atmosphericScale = 1.42;
     return Object.freeze({
       kind,
       fullToForest,
       forestToAtmospheric,
       atmosphericFade,
-      visibilityMeters: naturalVisibilityMeters,
-      // Primary crowns overlap at the formal 2m proposal spacing so the tier
-      // reads as one canopy field instead of isolated Tree dots.
-      forestScale: 1.28,
-      atmosphericScale,
-      horizonEntry: atmosphericFade,
-      horizonFade,
-      horizonVisibilityMeters: renderDistance.fogFarMeters,
-      // One canonical owner in four is retained on a bounded-coverage lattice.
-      // sqrt(4) preserves projected canopy area without inventing anonymous Trees.
-      horizonScale: q6(atmosphericScale * Math.sqrt(FOREST_HORIZON_OWNER_DENSITY)),
+      visibilityMeters: renderDistance.fogFarMeters,
+      // Every canonical Tree tier keeps the same physical silhouette. Distance
+      // changes geometry complexity and fog, never object scale.
+      forestScale: 1,
+      atmosphericScale: 1,
+      farEntry: atmosphericFade,
+      farFade,
+      farVisibilityMeters: renderDistance.fogFarMeters,
+      farDensity: Object.freeze({
+        schemaVersion: 'w8-canonical-far-tree-density-1',
+        innerDistanceMeters: atmosphericFade.maximum,
+        outerDistanceMeters: renderDistance.fogFarMeters,
+        innerDensity: CANONICAL_FAR_TREE_INNER_DENSITY,
+        outerDensity: CANONICAL_FAR_TREE_OUTER_DENSITY,
+        rankFadeWidth: CANONICAL_FAR_TREE_DENSITY_FADE,
+      }),
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
@@ -111,7 +113,7 @@ const profileFor = (kind, renderDistance) => {
       visibilityMeters: naturalVisibilityMeters,
       forestScale: 1.12,
       atmosphericScale: 1.18,
-      ...noHorizon,
+      ...noFar,
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.GRASS) {
@@ -132,7 +134,7 @@ const profileFor = (kind, renderDistance) => {
       visibilityMeters,
       forestScale: 1.2,
       atmosphericScale: 1.3,
-      ...noHorizon,
+      ...noFar,
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.ROCK) {
@@ -148,7 +150,7 @@ const profileFor = (kind, renderDistance) => {
       visibilityMeters: naturalVisibilityMeters,
       forestScale: 1,
       atmosphericScale: 1,
-      ...noHorizon,
+      ...noFar,
     });
   }
   throw new RangeError(`unsupported Vegetation LOD kind: ${kind}`);
@@ -173,6 +175,52 @@ export function resolveW8VegetationLodPolicy(
   return policy;
 }
 
+export function resolveW8CanonicalFarTreeDensityRank(stableId) {
+  if (typeof stableId !== 'string' || stableId.length === 0) {
+    throw new TypeError('canonical Far Tree density requires a Stable ID');
+  }
+  let hash = 0x811c9dc5;
+  for (const character of stableId) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  hash ^= hash >>> 16;
+  hash = Math.imul(hash, 0x7feb352d);
+  hash ^= hash >>> 15;
+  hash = Math.imul(hash, 0x846ca68b);
+  hash ^= hash >>> 16;
+  return (hash >>> 0) / 0x1_0000_0000;
+}
+
+export function resolveW8CanonicalFarTreeDensityThreshold(policy, distanceMeters) {
+  const density = policy?.farDensity;
+  if (!density) return 1;
+  const distance = Number.isFinite(distanceMeters)
+    ? distanceMeters : density.outerDistanceMeters;
+  const span = density.outerDistanceMeters - density.innerDistanceMeters;
+  const progress = span > 0
+    ? clamp((density.outerDistanceMeters - distance) / span)
+    : Number(distance <= density.innerDistanceMeters);
+  return q6(
+    density.outerDensity
+      + (density.innerDensity - density.outerDensity) * progress,
+  );
+}
+
+export function resolveW8CanonicalFarTreeDensityOpacity({
+  policy,
+  distanceMeters,
+  stableId,
+  densityRank = null,
+} = {}) {
+  const density = policy?.farDensity;
+  if (!density) return 1;
+  const rank = Number.isFinite(densityRank)
+    ? densityRank : resolveW8CanonicalFarTreeDensityRank(stableId);
+  const threshold = resolveW8CanonicalFarTreeDensityThreshold(policy, distanceMeters);
+  return q6(smoothstep((threshold - rank) / density.rankFadeWidth));
+}
+
 export function resolveW8VegetationVisibilityContract(
   renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
 ) {
@@ -186,7 +234,7 @@ export function resolveW8VegetationVisibilityContract(
       return [kind, Object.freeze({
         kind,
         exactDistanceMeters: policy.visibilityMeters,
-        horizonDistanceMeters: policy.horizonVisibilityMeters,
+        horizonDistanceMeters: null,
       })];
     }),
   ));
@@ -213,25 +261,25 @@ export function evaluateW8VegetationLodBlend(policy, distanceMeters, target = {}
     ? transitionProgress(distance, policy.forestToAtmospheric)
     : fullToForest;
   const atmosphericFade = transitionProgress(distance, policy.atmosphericFade);
-  const horizonEntry = transitionProgress(distance, policy.horizonEntry);
-  const horizonFade = transitionProgress(distance, policy.horizonFade);
+  const farEntry = transitionProgress(distance, policy.farEntry);
+  const farFade = transitionProgress(distance, policy.farFade);
   const forest = policy.forestToAtmospheric
     ? fullToForest * (1 - forestToAtmospheric)
     : 0;
   target.full = q6(1 - fullToForest);
   target.forest = q6(forest);
   target.atmospheric = q6(forestToAtmospheric * (1 - atmosphericFade));
-  target.horizon = policy.horizonEntry
-    ? q6(horizonEntry * (1 - horizonFade))
+  target.far = policy.farEntry
+    ? q6(farEntry * (1 - farFade))
     : 0;
   target.totalOpacity = q6(
-    target.full + target.forest + target.atmospheric + target.horizon,
+    target.full + target.forest + target.atmospheric + target.far,
   );
   target.dominantTier = null;
   if (target.totalOpacity > 0) {
-    if (target.horizon > target.atmospheric
-      && target.horizon >= target.forest && target.horizon >= target.full) {
-      target.dominantTier = W8_VEGETATION_LOD_TIERS.HORIZON;
+    if (target.far > target.atmospheric
+      && target.far >= target.forest && target.far >= target.full) {
+      target.dominantTier = W8_VEGETATION_LOD_TIERS.FAR;
     } else if (target.atmospheric >= target.forest
       && target.atmospheric >= target.full) {
       target.dominantTier = W8_VEGETATION_LOD_TIERS.ATMOSPHERIC;
@@ -242,9 +290,9 @@ export function evaluateW8VegetationLodBlend(policy, distanceMeters, target = {}
     }
   }
   target.crossFade = Number(target.full > 0) + Number(target.forest > 0)
-    + Number(target.atmospheric > 0) + Number(target.horizon > 0) > 1;
+    + Number(target.atmospheric > 0) + Number(target.far > 0) > 1;
   target.visible = target.totalOpacity > 0
-    && distance < (policy.horizonVisibilityMeters ?? policy.visibilityMeters);
+    && distance <= policy.visibilityMeters;
   target.policy = policy;
   return target;
 }

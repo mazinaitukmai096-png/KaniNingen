@@ -23,6 +23,21 @@ function identityOf(chunkData) {
   return Object.freeze({ chunkId: chunkData.chunkId, contentHash: chunkData.contentHash });
 }
 
+function sampleDistribution(values) {
+  if (values.length === 0) return Object.freeze({ count: 0, p50: 0, p95: 0, max: 0 });
+  const ordered = [...values].sort((left, right) => left - right);
+  const at = ratio => ordered[Math.min(
+    ordered.length - 1,
+    Math.floor((ordered.length - 1) * ratio),
+  )];
+  return Object.freeze({
+    count: ordered.length,
+    p50: at(0.5),
+    p95: at(0.95),
+    max: ordered.at(-1),
+  });
+}
+
 /**
  * The single owner of W8 ChunkData request scheduling.  Stage 2B-0 uses an
  * inline transport; Stage 2B-1 replaces only that transport with a Worker.
@@ -36,6 +51,7 @@ export class ChunkDataService {
     telemetry = null,
     onPipelineEvent = null,
     agingIntervalMs = 250,
+    requiredLookaheadCapacity = 25,
   } = {}) {
     if (typeof transport?.generateChunk !== 'function') {
       throw new TypeError('ChunkData transport.generateChunk is required');
@@ -53,6 +69,9 @@ export class ChunkDataService {
     if (!Number.isFinite(agingIntervalMs) || agingIntervalMs <= 0) {
       throw new RangeError('agingIntervalMs must be positive');
     }
+    if (!Number.isSafeInteger(requiredLookaheadCapacity) || requiredLookaheadCapacity < 1) {
+      throw new RangeError('requiredLookaheadCapacity must be a positive safe integer');
+    }
     this.transport = transport;
     this.cacheCapacity = cacheCapacity;
     this.identityAuditCapacity = identityAuditCapacity;
@@ -60,6 +79,7 @@ export class ChunkDataService {
     this.telemetry = telemetry?.enabled === true ? telemetry : null;
     this.onPipelineEvent = onPipelineEvent;
     this.agingIntervalMs = agingIntervalMs;
+    this.requiredLookaheadCapacity = requiredLookaheadCapacity;
     this.completed = new Map();
     this.identityAudit = new Map();
     this.pending = new Map();
@@ -70,7 +90,12 @@ export class ChunkDataService {
     this.dispatchScheduled = false;
     this.inFlight = null;
     this.requiredLookahead = null;
+    // The Worker remains single-threaded. This bounded feeder window only makes
+    // the authoritative 5x5 Terrain dependency batch visible to the Worker's
+    // shared priority scheduler before Natural/Distant work can queue ahead of it.
+    this.requiredLookaheadQueue = [];
     this.drainActive = false;
+    this.queueWaitSamples = [];
     this.initializePromise = null;
     this.metadata = null;
     this.isShutdown = false;
@@ -324,8 +349,14 @@ export class ChunkDataService {
       queuedCount: queued.length,
       inFlightKey: this.inFlight?.key ?? null,
       requiredLookaheadKey: this.requiredLookahead?.key ?? null,
+      requiredLookaheadKeys: Object.freeze([
+        ...(this.requiredLookahead ? [this.requiredLookahead.key] : []),
+        ...this.requiredLookaheadQueue.map(entry => entry.key),
+      ]),
+      requiredLookaheadCount: this.#requiredLookaheadCount(),
       inFlightCount: this.#inFlightCount(),
       queued: Object.freeze(queued.map(entry => Object.freeze({
+        requestId: entry.sequence,
         key: entry.key,
         priority: entry.priority,
         required: entry.required,
@@ -339,8 +370,10 @@ export class ChunkDataService {
       metadata: this.metadata,
       scheduler: Object.freeze({
         workerCount: 1,
+        requiredLookaheadCapacity: this.requiredLookaheadCapacity,
         agingIntervalMs: this.agingIntervalMs,
         backlog: queued.length + this.#inFlightCount(),
+        queueWaitMs: sampleDistribution(this.queueWaitSamples),
       }),
       isShutdown: this.isShutdown,
       counts: Object.freeze({ ...this.counts }),
@@ -381,17 +414,33 @@ export class ChunkDataService {
       epoch,
       promise,
       cancel: () => this.#cancelSubscriber(entry, subscriber),
+      cancelWithDetails: () => this.#cancelSubscriberDetailed(entry, subscriber),
     });
   }
 
   #cancelledHandle({ key, consumerId, epoch }) {
     return Object.freeze({
-      key, consumerId, epoch, cancel: () => false, promise: Promise.resolve(null),
+      key,
+      consumerId,
+      epoch,
+      cancel: () => false,
+      cancelWithDetails: () => Object.freeze({
+        subscriberCancelled: false,
+        underlyingRequestCancelled: false,
+        workerCancelRequested: false,
+      }),
+      promise: Promise.resolve(null),
     });
   }
 
-  #cancelSubscriber(entry, subscriber) {
-    if (subscriber.cancelled || !entry.subscribers.has(subscriber.id)) return false;
+  #cancelSubscriberDetailed(entry, subscriber) {
+    if (subscriber.cancelled || !entry.subscribers.has(subscriber.id)) {
+      return Object.freeze({
+        subscriberCancelled: false,
+        underlyingRequestCancelled: false,
+        workerCancelRequested: false,
+      });
+    }
     subscriber.cancelled = true;
     entry.subscribers.delete(subscriber.id);
     subscriber.resolve(null);
@@ -411,30 +460,43 @@ export class ChunkDataService {
         backlog: this.queue.length + this.#inFlightCount(),
       },
     });
+    let underlyingRequestCancelled = false;
+    let workerCancelRequested = false;
     if (entry.state === 'queued' && entry.subscribers.size === 0) {
       this.pending.delete(entry.key);
       this.queue = this.queue.filter(candidate => candidate !== entry);
       entry.state = 'cancelled';
       this.counts.queuedOperationCancels += 1;
       this.counts.cancelledOperations += 1;
+      underlyingRequestCancelled = true;
     } else if (entry.state === 'in-flight' && entry.subscribers.size === 0
       && !entry.cancelRequested) {
       entry.cancelRequested = true;
+      underlyingRequestCancelled = true;
       if (this.transport.cancelGenerationRequest?.({
         requestId: entry.sequence,
         reason: 'no-active-subscribers',
       })) {
         this.counts.inFlightOperationCancels += 1;
+        workerCancelRequested = true;
       }
     }
-    return true;
+    return Object.freeze({
+      subscriberCancelled: true,
+      underlyingRequestCancelled,
+      workerCancelRequested,
+    });
+  }
+
+  #cancelSubscriber(entry, subscriber) {
+    return this.#cancelSubscriberDetailed(entry, subscriber).subscriberCancelled;
   }
 
   #scheduleDispatch() {
     if (this.dispatchScheduled || this.isShutdown) return;
     const canDispatchPrimary = this.inFlight === null;
     const canDispatchRequiredLookahead = this.inFlight !== null
-      && this.requiredLookahead === null
+      && this.#requiredLookaheadCount() < this.requiredLookaheadCapacity
       && this.queue.some(entry => (
         entry.state === 'queued' && entry.subscribers.size > 0 && entry.required
       ));
@@ -450,7 +512,8 @@ export class ChunkDataService {
     if (this.isShutdown) return;
     this.queue = this.queue.filter(entry => entry.state === 'queued' && entry.subscribers.size > 0);
     const dispatchingRequiredLookahead = this.inFlight !== null;
-    if (dispatchingRequiredLookahead && this.requiredLookahead !== null) return;
+    if (dispatchingRequiredLookahead
+      && this.#requiredLookaheadCount() >= this.requiredLookaheadCapacity) return;
     const dispatchAtMs = this.clock();
     this.queue.sort((left, right) => compareWorldGenerationRequests(
       left,
@@ -465,7 +528,10 @@ export class ChunkDataService {
     const [entry] = this.queue.splice(entryIndex, 1);
     if (!entry) return;
     entry.state = 'in-flight';
-    if (dispatchingRequiredLookahead) this.requiredLookahead = entry;
+    if (dispatchingRequiredLookahead) {
+      if (this.requiredLookahead === null) this.requiredLookahead = entry;
+      else this.requiredLookaheadQueue.push(entry);
+    }
     else this.inFlight = entry;
     this.#startTransport(entry, dispatchAtMs);
     if (!dispatchingRequiredLookahead) void this.#drainDispatchedEntries();
@@ -477,6 +543,8 @@ export class ChunkDataService {
     const ranking = describeWorldGenerationPriority(entry.scheduler, dispatchAtMs, {
       agingIntervalMs: this.agingIntervalMs,
     });
+    this.queueWaitSamples.push(ranking.queueTimeMs);
+    if (this.queueWaitSamples.length > 512) this.queueWaitSamples.shift();
     entry.dispatchAtMs = dispatchAtMs;
     entry.ranking = ranking;
     if (this.onPipelineEvent) this.#recordPipelineEvent('chunk-worker-dispatch', {
@@ -564,7 +632,7 @@ export class ChunkDataService {
           throw new Error('ChunkData dispatch ownership changed before completion');
         }
         this.inFlight = this.requiredLookahead;
-        this.requiredLookahead = null;
+        this.requiredLookahead = this.requiredLookaheadQueue.shift() ?? null;
         this.#scheduleDispatch();
       }
     } finally {
@@ -707,7 +775,11 @@ export class ChunkDataService {
   }
 
   #inFlightCount() {
-    return Number(this.inFlight !== null) + Number(this.requiredLookahead !== null);
+    return Number(this.inFlight !== null) + this.#requiredLookaheadCount();
+  }
+
+  #requiredLookaheadCount() {
+    return Number(this.requiredLookahead !== null) + this.requiredLookaheadQueue.length;
   }
 
   #recordTelemetry(type, details) {

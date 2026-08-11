@@ -49,6 +49,7 @@ export function createStreamingOwnerMetadataCache({
   const coordinates = new Map();
   const classifications = new Map();
   const classificationsByRevision = new Map();
+  const normalizedOwnerKeyArrays = new WeakSet();
   let frameId = null;
   let frameParsedInputs = null;
   let frameClassifiedInputs = null;
@@ -122,6 +123,31 @@ export function createStreamingOwnerMetadataCache({
     return descriptor;
   };
 
+  const markNormalizedOwnerKeys = values => {
+    if (!Array.isArray(values) || !Object.isFrozen(values)) {
+      throw new TypeError('normalized owner keys must be a frozen array');
+    }
+    normalizedOwnerKeyArrays.add(values);
+    return values;
+  };
+
+  const isNormalizedOwnerKeys = values => (
+    Array.isArray(values) && normalizedOwnerKeyArrays.has(values)
+  );
+
+  // Sorted owner arrays can be merged thousands of times per coverage update.
+  // A cache hit here is metadata reuse, not another parse operation, so it
+  // deliberately avoids the diagnostic and LRU mutation performed by parse().
+  const compareOwnerKeys = (leftOwnerKey, rightOwnerKey, {
+    path = 'streaming-owner-metadata:compare',
+  } = {}) => {
+    const leftKey = nonEmptyString(leftOwnerKey, 'leftOwnerKey');
+    const rightKey = nonEmptyString(rightOwnerKey, 'rightOwnerKey');
+    const left = coordinates.get(leftKey) ?? parse(leftKey, { path });
+    const right = coordinates.get(rightKey) ?? parse(rightKey, { path });
+    return left.chunkZ - right.chunkZ || left.chunkX - right.chunkX;
+  };
+
   const deleteClassification = descriptor => {
     classifications.delete(descriptor);
     const revisionEntries = classificationsByRevision.get(descriptor.classificationRevision);
@@ -157,6 +183,7 @@ export function createStreamingOwnerMetadataCache({
     policyKind,
     revision,
     classifier,
+    coordinate = null,
     path = 'unspecified',
   } = {}) => {
     const key = nonEmptyString(ownerKey, 'ownerKey');
@@ -181,13 +208,16 @@ export function createStreamingOwnerMetadataCache({
       touch(classifications, cached, cached);
       return cached;
     }
-    const coordinate = parse(key, { path: `${path}:coordinate` });
-    const resourceKind = classifier(coordinate);
+    const parsedCoordinate = coordinate ?? parse(key, { path: `${path}:coordinate` });
+    if ((parsedCoordinate.ownerKey ?? parsedCoordinate.key) !== key) {
+      throw new Error(`streaming owner coordinate identity mismatch: ${key}`);
+    }
+    const resourceKind = classifier(parsedCoordinate);
     if (typeof resourceKind !== 'string' || !resourceKind) {
       throw new TypeError('streaming owner classifier must return a resource kind');
     }
     const descriptor = Object.freeze({
-      ...coordinate,
+      ...parsedCoordinate,
       policyKind: kind,
       resourceKind,
       classificationRevision,
@@ -304,6 +334,9 @@ export function createStreamingOwnerMetadataCache({
   return Object.freeze({
     beginFrame,
     parse,
+    compareOwnerKeys,
+    markNormalizedOwnerKeys,
+    isNormalizedOwnerKeys,
     classify,
     recordClassificationReuse,
     recordSignature,
