@@ -1,8 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { serialize } from 'node:v8';
 
 import { createPresentationOwnerGenerator } from '../src/infinite-world/presentation-owner-generator.js';
-import { createResidentWorldCoverage } from '../src/infinite-world/chunk-streaming-plan.js';
+import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
+import {
+  FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT,
+  FULL_RESIDENT_OWNER_COUNT,
+  PRESENTATION_RESIDENT_OWNER_COUNT,
+  RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT,
+  createResidentWorldCoverage,
+} from '../src/infinite-world/chunk-streaming-plan.js';
 
 const percentile = (values, ratio) => [...values]
   .sort((left, right) => left - right)[Math.floor((values.length - 1) * ratio)];
@@ -89,4 +97,79 @@ test('purpose-built Presentation generator clears throughput, payload, and initi
   assert.ok(report.payloadP50Bytes <= 4000);
   assert.ok(report.payloadP95Bytes <= 7000);
   assert.ok(report.payloadMaximumBytes <= 8000);
+});
+
+test('production Presentation cutover clears throughput and nested serialized-memory gates', async t => {
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: 'KaniNingen Infinite Natural World',
+  });
+  const coordinates = Array.from({ length: 128 }, (_, index) => ({
+    chunkX: 40 + index % 16,
+    chunkZ: 40 + Math.floor(index / 16),
+  }));
+  try {
+    for (const coordinate of coordinates.slice(0, 8)) {
+      await generator.generatePresentationOwner(coordinate.chunkX, coordinate.chunkZ);
+    }
+    const presentationPayloadBytes = [];
+    const startedAt = performance.now();
+    for (const coordinate of coordinates) {
+      const owner = await generator.generatePresentationOwner(
+        coordinate.chunkX,
+        coordinate.chunkZ,
+      );
+      presentationPayloadBytes.push(serialize(owner).byteLength);
+    }
+    const presentationWallMs = performance.now() - startedAt;
+    const presentationOwnersPerSecond = coordinates.length * 1000 / presentationWallMs;
+    const presentationP50Bytes = percentile(presentationPayloadBytes, 0.5);
+    const presentationP95Bytes = percentile(presentationPayloadBytes, 0.95);
+    const fullPayloadBytes = [];
+    const fullCoordinates = coordinates.slice(0, 24);
+    for (const coordinate of fullCoordinates) {
+      fullPayloadBytes.push(serialize(await generator.generateChunk(
+        coordinate.chunkX,
+        coordinate.chunkZ,
+      )).byteLength);
+    }
+    const fullP50Bytes = percentile(fullPayloadBytes, 0.5);
+    const fullP95Bytes = percentile(fullPayloadBytes, 0.95);
+    const toMiB = bytes => bytes / (1024 ** 2);
+    const presentationResidentMiB = toMiB(
+      PRESENTATION_RESIDENT_OWNER_COUNT * presentationP50Bytes,
+    );
+    const presentationPrefetchMiB = toMiB(
+      RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT * presentationP50Bytes,
+    );
+    const fullResidentMiB = toMiB(FULL_RESIDENT_OWNER_COUNT * fullP50Bytes);
+    const fullPrefetchMiB = toMiB(
+      FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT * fullP50Bytes,
+    );
+    const nestedTotalMiB = presentationResidentMiB + presentationPrefetchMiB
+      + fullResidentMiB + fullPrefetchMiB;
+    const snapshot = generator.snapshot().resourceGeneration;
+    const report = {
+      presentationOwnersPerSecond,
+      presentationWallMs,
+      initialFillSeconds: PRESENTATION_RESIDENT_OWNER_COUNT / presentationOwnersPerSecond,
+      presentationP50Bytes,
+      presentationP95Bytes,
+      fullP50Bytes,
+      fullP95Bytes,
+      presentationResidentMiB,
+      presentationPrefetchMiB,
+      fullResidentMiB,
+      fullPrefetchMiB,
+      nestedTotalMiB,
+      fullChunkRequestsDuringPresentation: snapshot.fullChunkRequests - fullCoordinates.length,
+    };
+    t.diagnostic(JSON.stringify(report));
+    assert.ok(presentationOwnersPerSecond >= 212.5);
+    assert.ok(report.initialFillSeconds < 10);
+    assert.equal(report.fullChunkRequestsDuringPresentation, 0);
+    assert.ok(nestedTotalMiB < 64,
+      `nested serialized memory ${nestedTotalMiB.toFixed(3)} MiB must stay below 64 MiB`);
+  } finally {
+    await generator.shutdown();
+  }
 });

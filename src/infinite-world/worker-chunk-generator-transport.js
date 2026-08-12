@@ -7,6 +7,7 @@ import {
   createChunkGeneratorRequest,
   createChunkGeneratorSchedulerEnvelope,
   createForestHorizonGeneratorRequest,
+  createPresentationOwnerGeneratorRequest,
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import { MetricSeries } from './runtime-timing.js';
@@ -101,6 +102,8 @@ export function createWorkerChunkGeneratorTransport({
   const receiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const forestHorizonGenerationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const forestHorizonReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const presentationOwnerGenerationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const presentationOwnerReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementTemplateTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
@@ -110,6 +113,7 @@ export function createWorkerChunkGeneratorTransport({
   const counts = {
     generated: 0,
     forestHorizonGenerated: 0,
+    presentationOwnersGenerated: 0,
     settlementQueries: 0,
     settlementTemplateQueries: 0,
     diagnosticQueries: 0,
@@ -373,6 +377,15 @@ export function createWorkerChunkGeneratorTransport({
       resolveOperation(message.manifest);
       return;
     }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED_PRESENTATION_OWNER) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const generationMs = Math.max(0, Number(message.generationMs) || 0);
+      presentationOwnerGenerationTimes.record(generationMs);
+      presentationOwnerReceiveTimes.record(Math.max(0, receivedMs - generationMs));
+      counts.presentationOwnersGenerated += 1;
+      resolveOperation(message.presentationOwner);
+      return;
+    }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
       const receivedMs = Math.max(0, clock() - operation.sentAt);
       const operationMs = Math.max(0, Number(message.operationMs) || 0);
@@ -619,6 +632,52 @@ export function createWorkerChunkGeneratorTransport({
         pipelineDiagnostics: onPipelineEvent !== null,
       }));
     },
+    async generatePresentationOwner({
+      chunkX,
+      chunkZ,
+      priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required = true,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      consumerId = 'presentation-owner-service',
+      epoch = 0,
+      telemetryCorrelationId = null,
+      telemetryTarget = 'distant',
+      telemetryStream = 'distant',
+      scheduler = null,
+    } = {}) {
+      await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
+      if (fallbackTransport) {
+        if (typeof fallbackTransport.generatePresentationOwner !== 'function') {
+          throw new Error('fallback transport does not expose PresentationOwner generation');
+        }
+        return fallbackTransport.generatePresentationOwner({
+          chunkX, chunkZ, priority, required, createdAtMs, deadlineAtMs,
+          consumerId, epoch, telemetryCorrelationId, telemetryTarget,
+          telemetryStream, scheduler,
+        });
+      }
+      const requestId = ++controlRequestId;
+      return requestWorker(createPresentationOwnerGeneratorRequest({
+        requestId,
+        serviceGeneration,
+        chunkX,
+        chunkZ,
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs,
+        consumerId,
+        epoch,
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        scheduler,
+        pipelineDiagnostics: onPipelineEvent !== null,
+      }));
+    },
     cancelForestHorizonRequests({
       consumerId = 'distant-owner-query',
       epoch = null,
@@ -793,6 +852,8 @@ export function createWorkerChunkGeneratorTransport({
       const receiveTiming = receiveTimes.snapshot();
       const forestHorizonGenerationTiming = forestHorizonGenerationTimes.snapshot();
       const forestHorizonReceiveTiming = forestHorizonReceiveTimes.snapshot();
+      const presentationOwnerGenerationTiming = presentationOwnerGenerationTimes.snapshot();
+      const presentationOwnerReceiveTiming = presentationOwnerReceiveTimes.snapshot();
       const settlementQueryTiming = settlementQueryTimes.snapshot();
       const settlementQueryReceiveTiming = settlementQueryReceiveTimes.snapshot();
       const settlementTemplateTiming = settlementTemplateTimes.snapshot();
@@ -814,6 +875,9 @@ export function createWorkerChunkGeneratorTransport({
         forestHorizonGenerationMsP50: forestHorizonGenerationTiming.p50,
         forestHorizonGenerationMsMaximum: forestHorizonGenerationTiming.max,
         forestHorizonReceiveMsMaximum: forestHorizonReceiveTiming.max,
+        presentationOwnerGenerationMsP50: presentationOwnerGenerationTiming.p50,
+        presentationOwnerGenerationMsMaximum: presentationOwnerGenerationTiming.max,
+        presentationOwnerReceiveMsMaximum: presentationOwnerReceiveTiming.max,
         settlementQueryMsP50: settlementQueryTiming.p50,
         settlementQueryMsMaximum: settlementQueryTiming.max,
         settlementQueryReceiveMsMaximum: settlementQueryReceiveTiming.max,
@@ -846,6 +910,8 @@ export function createWorkerChunkGeneratorTransport({
         receiveTimes,
         forestHorizonGenerationTimes,
         forestHorizonReceiveTimes,
+        presentationOwnerGenerationTimes,
+        presentationOwnerReceiveTimes,
         settlementQueryTimes,
         settlementQueryReceiveTimes,
         settlementTemplateTimes,

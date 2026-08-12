@@ -223,12 +223,13 @@ export function createLegacyRuntimeChunkStreamingPolicy({ ownerMetadataCache = n
     }),
     ownerResolver({ player, velocityCorridor, policy, residentCoverage = null }) {
       if (residentCoverage?.schemaVersion === 'resident-world-coverage-1') {
-        const required = residentCoverage.residentRequiredOwnerKeys;
+        const required = residentCoverage.fullView?.ownerKeys
+          ?? residentCoverage.residentRequiredOwnerKeys;
         return {
           required,
           prefetched: Object.freeze([]),
           retained: required,
-          sourceHash: residentCoverage.signature,
+          sourceHash: `${residentCoverage.signature}:full`,
         };
       }
       const currentOwner = logicalWorldToOwnedChunk(player.x, player.z);

@@ -6,9 +6,16 @@ import {
   PRESENTATION_OWNER_SCHEMA,
   createPresentationOwnerGenerator,
   createPresentationOwnerResource,
+  expandPresentationAuxiliaryRecord,
+  expandPresentationNaturalRecord,
+  expandPresentationStructureRecord,
   validatePresentationOwnerResource,
 } from '../src/infinite-world/presentation-owner-generator.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
+import { createNodeChunkGeneratorWorker } from '../src/infinite-world/node-worker-chunk-generator-adapter.js';
+import { createInlineChunkGeneratorTransport } from '../src/infinite-world/inline-chunk-generator-transport.js';
+import { createWorkerChunkGeneratorTransport } from '../src/infinite-world/worker-chunk-generator-transport.js';
+import { createWorldGenerationRequestEnvelope } from '../src/infinite-world/world-generation-scheduler.js';
 import { resolveCanonicalGroundSurface } from '../src/infinite-world/w8-surface-policy.js';
 import { resolveW8CanonicalWorldObject } from '../src/infinite-world/world-object-canonical-contract.js';
 
@@ -272,17 +279,208 @@ test('Presentation structure summary preserves Building and Road projection iden
   }
 });
 
+test('production Presentation provider preserves Full Natural and Structure identity without Full generation', async t => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
+  try {
+    let naturalCount = 0;
+    let structureCount = 0;
+    let expectedFullRequests = 0;
+    for (const [chunkX, chunkZ] of [[32, 24], [33, 24], [0, 0], [20, 20]]) {
+      const presentation = await generator.generatePresentationOwner(chunkX, chunkZ);
+      const beforeFull = generator.snapshot().resourceGeneration;
+      assert.equal(beforeFull.fullChunkRequests, expectedFullRequests);
+      if (chunkX === 32 && chunkZ === 24) {
+        assert.equal(beforeFull.fullChunkRequests, 0);
+        assert.equal(beforeFull.presentationOwnerRequests, 1);
+        assert.equal(beforeFull.presentationOwnerCompleted, 1);
+      }
+      const full = await generator.generateChunk(chunkX, chunkZ);
+      expectedFullRequests += 1;
+      const compactNatural = new Map(presentation.resource.natural.map(record => (
+        [record.stableId, expandPresentationNaturalRecord(record)]
+      )));
+      const fullNatural = [
+        ...full.presentationLayers.natural.vegetation,
+        ...full.presentationLayers.natural.rocks,
+      ].map(resolveW8CanonicalWorldObject);
+      assert.deepEqual([...compactNatural.keys()].sort(), fullNatural
+        .map(record => record.stableId).sort());
+      for (const source of fullNatural) {
+        const compact = compactNatural.get(source.stableId);
+        assert.deepEqual(compact.owner, source.owner);
+        assert.deepEqual(compact.position, {
+          x: q6(source.position.x),
+          y: q6(source.position.y),
+          z: q6(source.position.z),
+        });
+        assert.deepEqual(compact.rotation, { y: q6(source.rotation.y) });
+        assert.deepEqual(compact.visualBounds, {
+          width: q6(source.visualBounds.width),
+          height: q6(source.visualBounds.height),
+          depth: q6(source.visualBounds.depth),
+        });
+        assert.equal(compact.subtype, source.subtype);
+        assert.equal(compact.presentation.partSetKey, source.presentation.partSetKey);
+        naturalCount += 1;
+      }
+      const compactStructures = new Map(presentation.resource.structures.map(record => (
+        [record.stableId, expandPresentationStructureRecord(record)]
+      )));
+      assert.deepEqual([...compactStructures.keys()].sort(), full.settlementFeatures
+        .map(record => record.stableId).sort());
+      for (const source of full.settlementFeatures) {
+        const compact = compactStructures.get(source.stableId);
+        assert.deepEqual(compact.owningChunkCoordinate, source.owningChunkCoordinate);
+        assert.deepEqual(compact.worldPosition, source.worldPosition);
+        if (source.featureType === 'settlement-building') {
+          assert.equal(compact.rotationY, source.rotationY);
+          assert.equal(compact.widthMeters, source.widthMeters);
+          assert.equal(compact.heightMeters, source.heightMeters);
+          assert.equal(compact.depthMeters, source.depthMeters);
+          assert.deepEqual(compact.visual, source.visual);
+        } else {
+          assert.equal(compact.sourceStableId, source.sourceStableId ?? source.stableId);
+          assert.equal(compact.widthMeters, source.widthMeters);
+          assert.deepEqual(compact.start, source.start);
+          assert.deepEqual(compact.end, source.end);
+        }
+        structureCount += 1;
+      }
+      assert.ok(presentation.resource.water.every(record => (
+        full.waterSurfaces.some(source => source.stableId === record.stableId)
+      )));
+      assert.equal(presentation.resource.landmarks.length, full.settlementLandmarks.length);
+      const compactLandmarks = new Map(presentation.resource.landmarks.map(record => (
+        [record.stableId, expandPresentationAuxiliaryRecord(record)]
+      )));
+      for (const source of full.settlementLandmarks) {
+        const compact = compactLandmarks.get(source.stableId);
+        assert.ok(compact);
+        assert.equal(compact.parentSettlementId, source.parentSettlementId);
+        assert.equal(compact.landmarkType, source.landmarkType);
+        assert.deepEqual(compact.worldPosition, source.worldPosition);
+        assert.equal(compact.rotationY, source.rotationY);
+        assert.deepEqual(compact.owningChunkCoordinate, source.owningChunkCoordinate);
+      }
+      const compactStreet = new Map(presentation.resource.street.map(record => (
+        [record.stableId, expandPresentationAuxiliaryRecord(record)]
+      )));
+      assert.deepEqual([...compactStreet.keys()].sort(), full.streetDetails
+        .map(record => record.stableId).sort());
+      for (const source of full.streetDetails) {
+        const compact = compactStreet.get(source.stableId);
+        assert.equal(compact.parentRoadStableId, source.parentRoadStableId);
+        assert.equal(compact.detailType, source.detailType);
+        assert.deepEqual(compact.worldPosition, source.worldPosition);
+      }
+    }
+    t.diagnostic(JSON.stringify({
+      presentationOwners: 4,
+      naturalCount,
+      structureCount,
+      identityMismatch: 0,
+    }));
+  } finally {
+    await generator.shutdown();
+  }
+});
+
 function frozenExpectedPosition(position) {
   return [q6(position.x), q6(position.y), q6(position.z)];
 }
 
-test('Stage 1 remains parallel verification and does not cut production consumers over', async () => {
+test('Stage 2 cuts production Natural over to PresentationOwner and keeps Full scoped to runtime', async () => {
   const productionFiles = await Promise.all([
     '../src/infinite-world/chunk-data-service.js',
     '../src/infinite-world/chunk-runtime-manager.js',
     '../src/infinite-world/sandbox-boot.js',
     '../src/infinite-world/static-object-stream.js',
   ].map(path => readFile(new URL(path, import.meta.url), 'utf8')));
-  assert.equal(productionFiles.some(source => source.includes('presentation-owner-generator')), false);
-  assert.equal(productionFiles.some(source => source.includes(PRESENTATION_OWNER_SCHEMA)), false);
+  const sandbox = productionFiles[2];
+  assert.equal(sandbox.includes('workerTransport.generatePresentationOwner'), true);
+  assert.equal(sandbox.includes("resourceKind: 'presentation'"), true);
+  assert.equal(sandbox.includes("kind !== 'presentation'"), true);
+  assert.equal(sandbox.includes('PRESENTATION_OWNER_CACHE_CAPACITY'), true);
+  assert.equal(sandbox.includes('residentWorldCoverage.fullView.ownerKeys'), true);
+  assert.equal(sandbox.includes('cacheCapacity: 2366'), false);
 });
+
+test('production Worker transports compact PresentationOwner without invoking Full Chunk generation', async () => {
+  const transport = createWorkerChunkGeneratorTransport({
+    worldSeed: seed,
+    serviceGeneration: 822,
+    workerFactory: createNodeChunkGeneratorWorker,
+  });
+  try {
+    await transport.initialize();
+    const owner = await transport.generatePresentationOwner({
+      chunkX: 0,
+      chunkZ: 0,
+      consumerId: 'presentation-cutover-fixture',
+    });
+    assert.equal(owner.schemaVersion, 'w8-presentation-owner-data-1');
+    assert.equal(owner.resource.schemaVersion, PRESENTATION_OWNER_SCHEMA);
+    assert.equal(validatePresentationOwnerResource(owner.resource).valid, true);
+    const snapshot = transport.snapshot();
+    assert.equal(snapshot.counts.presentationOwnersGenerated, 1);
+    const generatorSnapshot = await transport.requestDiagnostics();
+    assert.equal(generatorSnapshot.resourceGeneration.fullChunkRequests, 0);
+    assert.equal(generatorSnapshot.resourceGeneration.presentationOwnerCompleted, 1);
+  } finally {
+    await transport.shutdown();
+  }
+});
+
+test('shared Inline scheduler namespaces equal Full and Presentation service request sequences', async () => {
+  const transport = createInlineChunkGeneratorTransport({
+    generator: {
+      worldSeed: seed,
+      worldSeedHash: 'presentation-inline-namespace',
+      generatorVersion: Object.freeze({ major: 8, minor: 0, patch: 0 }),
+      generateChunk: async (chunkX, chunkZ) => inlineFakeIdentity(chunkX, chunkZ, 'full'),
+      generatePresentationOwner: async (chunkX, chunkZ) => Object.freeze({
+        ...inlineFakeIdentity(chunkX, chunkZ, 'presentation'),
+        schemaVersion: 'w8-presentation-owner-data-1',
+        resource: Object.freeze({ schemaVersion: PRESENTATION_OWNER_SCHEMA }),
+      }),
+    },
+  });
+  const scheduler = createWorldGenerationRequestEnvelope({
+    requestId: 1,
+    operationKind: 'chunk',
+    priority: 1,
+    required: true,
+    createdAtMs: 0,
+    consumerId: 'full-service',
+    epoch: 0,
+  });
+  try {
+    await transport.initialize();
+    const fullPromise = transport.generateChunk({
+      requestId: 1,
+      chunkX: 0,
+      chunkZ: 0,
+      scheduler,
+    });
+    const presentationPromise = transport.generatePresentationOwner({
+      chunkX: 1,
+      chunkZ: 0,
+      scheduler,
+    });
+    const [full, presentation] = await Promise.all([fullPromise, presentationPromise]);
+    assert.equal(full.chunkId, 'full:0,0');
+    assert.equal(presentation.chunkId, 'presentation:1,0');
+    assert.equal(transport.snapshot().scheduler.counts.failed, 0);
+  } finally {
+    await transport.shutdown();
+  }
+});
+
+function inlineFakeIdentity(chunkX, chunkZ, prefix) {
+  return Object.freeze({
+    chunkX,
+    chunkZ,
+    chunkId: `${prefix}:${chunkX},${chunkZ}`,
+    contentHash: `${prefix}-hash:${chunkX},${chunkZ}`,
+  });
+}

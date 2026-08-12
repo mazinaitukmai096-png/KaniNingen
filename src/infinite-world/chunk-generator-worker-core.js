@@ -104,6 +104,18 @@ export function createChunkGeneratorWorkerCore({
         stream: 'distant',
       };
     }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_PRESENTATION_OWNER) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'presentation-owner',
+        priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+        required: true,
+        createdAtMs: clock(),
+        consumerId: 'presentation-owner-service',
+        target: 'distant',
+        stream: 'distant',
+      };
+    }
     if (request.type === CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS) {
       return {
         requestId: request.requestId,
@@ -323,6 +335,40 @@ export function createChunkGeneratorWorkerCore({
           manifest,
           generationMs: Math.max(0, completedAt - startedAt),
           scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
+          },
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_PRESENTATION_OWNER) {
+        if (typeof generator.generatePresentationOwner !== 'function') {
+          throw new Error('Chunk generator does not expose PresentationOwner generation');
+        }
+        const startedAt = clock();
+        const presentationOwner = await generator.generatePresentationOwner(
+          request.chunkX,
+          request.chunkZ,
+        );
+        execution?.checkpoint();
+        const completedAt = clock();
+        postGenerationResponse({
+          request,
+          execution,
+          requestReceivedAtMs,
+          generationStartedAtMs: startedAt,
+          generationCompletedAtMs: completedAt,
+          stageRecorder: null,
+          roadTimingContext: null,
+          response: {
+            type: CHUNK_GENERATOR_MESSAGE.GENERATED_PRESENTATION_OWNER,
+            protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+            requestId: request.requestId,
+            serviceGeneration,
+            chunkKey: createChunkDataRequestKey(request.chunkX, request.chunkZ),
+            chunkId: presentationOwner.chunkId,
+            contentHash: presentationOwner.contentHash,
+            presentationOwner,
+            generationMs: Math.max(0, completedAt - startedAt),
+            scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
           },
         });
         return;

@@ -24,6 +24,7 @@ export function createInlineChunkGeneratorTransport({
   let isShutdown = false;
   let generatedCount = 0;
   let forestHorizonGeneratedCount = 0;
+  let presentationOwnerGeneratedCount = 0;
   let initialized = false;
   let diagnosticRequestCount = 0;
   let lastGeneratorSnapshot = null;
@@ -143,6 +144,50 @@ export function createInlineChunkGeneratorTransport({
         }));
       } });
     },
+    async generatePresentationOwner({
+      chunkX,
+      chunkZ,
+      priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required = true,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      consumerId = 'presentation-owner-service',
+      epoch = 0,
+      telemetryCorrelationId = null,
+      telemetryTarget = 'distant',
+      telemetryStream = 'distant',
+      scheduler: suppliedScheduler = null,
+    } = {}) {
+      if (typeof generator.generatePresentationOwner !== 'function') {
+        throw new Error('generator does not expose PresentationOwner generation');
+      }
+      const requestId = ++controlRequestId;
+      const envelope = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'presentation-owner',
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs,
+        consumerId,
+        epoch,
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        scheduler: suppliedScheduler === null ? null : {
+          ...suppliedScheduler,
+          requestId,
+          operationKind: 'presentation-owner',
+        },
+      });
+      return runOperation({ envelope, operation: execution => {
+        presentationOwnerGeneratedCount += 1;
+        return generator.generatePresentationOwner(chunkX, chunkZ, {
+          scheduler: envelope,
+          checkpoint: execution.checkpoint,
+        });
+      } });
+    },
     cancelForestHorizonRequests({
       consumerId = 'distant-owner-query',
       epoch = null,
@@ -226,6 +271,7 @@ export function createInlineChunkGeneratorTransport({
     snapshot() {
       return Object.freeze({
         kind: 'inline', generatedCount, forestHorizonGeneratedCount,
+        presentationOwnerGeneratedCount,
         diagnosticRequestCount, initialized, isShutdown,
         scheduler: scheduler.snapshot(),
         generatorSnapshot: lastGeneratorSnapshot,

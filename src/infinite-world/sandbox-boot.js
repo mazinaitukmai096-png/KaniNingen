@@ -15,6 +15,7 @@ import {
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import {
+  PRESENTATION_OWNER_CACHE_CAPACITY,
   RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
   createResidentWorldCoverage,
   planRuntimeTerrainReadySet,
@@ -1092,6 +1093,7 @@ export async function bootInfiniteWorldSandbox({
 
   let generator = null;
   let chunkDataService = null;
+  let presentationOwnerService = null;
   let chunkGeneratorTransport = null;
   let chunkGenerationMs = 0;
   let renderAdapter = null;
@@ -1257,6 +1259,9 @@ export async function bootInfiniteWorldSandbox({
           )),
         ),
         distanceProfileResolver,
+        generatorKind: 'presentation-owner',
+        exactResourceKind: 'presentation',
+        horizonResourceKind: 'presentation',
         horizonOwnerDensity: 1,
         ownerMetadataCache: streamingOwnerMetadataCache,
       });
@@ -1467,6 +1472,8 @@ export async function bootInfiniteWorldSandbox({
         },
         cancelGenerationRequest: options =>
           workerTransport.cancelGenerationRequest(options),
+        generatePresentationOwner: request =>
+          workerTransport.generatePresentationOwner(request),
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
         resolveSettlementPresentationTemplate: (...args) =>
           workerTransport.resolveSettlementPresentationTemplate(...args),
@@ -1480,7 +1487,25 @@ export async function bootInfiniteWorldSandbox({
         telemetry: streamingTelemetry,
         onPipelineEvent: recordPipelineDiagnosticEvent,
       });
-      return chunkDataService.initialize();
+      presentationOwnerService = new ChunkDataService({
+        transport: Object.freeze({
+          initialize: () => workerTransport.initialize(),
+          generateChunk: request => workerTransport.generatePresentationOwner(request),
+          // Resident work is never cancelled. Obsolete prefetch completions
+          // remain reusable in the evictable Presentation cache.
+          cancelGenerationRequest: () => false,
+          snapshot: () => workerTransport.snapshot(),
+          // The Full service owns the shared Worker lifetime.
+          shutdown: () => Promise.resolve(),
+        }),
+        cacheCapacity: PRESENTATION_OWNER_CACHE_CAPACITY,
+        telemetry: streamingTelemetry,
+        onPipelineEvent: recordPipelineDiagnosticEvent,
+      });
+      return Promise.all([
+        chunkDataService.initialize(),
+        presentationOwnerService.initialize(),
+      ]).then(([metadata]) => metadata);
     });
     generator = Object.freeze({
       worldSeed: generatorMetadata.worldSeed,
@@ -1723,6 +1748,61 @@ export async function bootInfiniteWorldSandbox({
       centerChunkX: initialOwner.chunkX,
       centerChunkZ: initialOwner.chunkZ,
     });
+    const presentationResidentRequests = new Map();
+    const synchronizePresentationResidentCoverage = (
+      coverage,
+      prefetchCoverage = null,
+    ) => {
+      const ownerKeys = coverage.presentationView.ownerKeys;
+      presentationOwnerService.replaceProtectedOwnerKeys(ownerKeys);
+      const requestCoordinates = (coordinates, {
+        requestKind,
+        priority,
+        required,
+      }) => {
+        for (const coordinate of coordinates) {
+          const requestKey = `${requestKind}:${coordinate.key}`;
+          if (presentationOwnerService.getCompletedChunk(
+            coordinate.chunkX,
+            coordinate.chunkZ,
+          ) || presentationResidentRequests.has(requestKey)) continue;
+          const handle = presentationOwnerService.requestChunk({
+            chunkX: coordinate.chunkX,
+            chunkZ: coordinate.chunkZ,
+            priority,
+            required,
+            consumerId: `presentation-${requestKind}:${coordinate.key}`,
+            epoch: 0,
+            telemetryTarget: WORLD_STREAMING_TARGET.DISTANT,
+            telemetryStream: WORLD_STREAMING_STREAM.DISTANT,
+          });
+          presentationResidentRequests.set(requestKey, handle);
+          const releaseRequest = () => {
+            if (presentationResidentRequests.get(requestKey) === handle) {
+              presentationResidentRequests.delete(requestKey);
+            }
+          };
+          void handle.promise.then(releaseRequest, releaseRequest);
+        }
+      };
+      requestCoordinates(coverage.presentationView.ownerCoordinates, {
+        requestKind: 'resident',
+        priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+        required: true,
+      });
+      if (prefetchCoverage !== null) {
+        const residentSet = new Set(ownerKeys);
+        requestCoordinates(prefetchCoverage.presentationView.ownerCoordinates.filter(
+          coordinate => !residentSet.has(coordinate.key),
+        ), {
+          requestKind: 'prefetch',
+          priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+          required: false,
+        });
+      }
+      return coverage;
+    };
+    synchronizePresentationResidentCoverage(residentWorldCoverage);
     const resolveResidentWorldCoverage = () => {
       const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
       if (residentWorldCoverage.centerOwnerKey !== owner.key) {
@@ -1730,6 +1810,7 @@ export async function bootInfiniteWorldSandbox({
           centerChunkX: owner.chunkX,
           centerChunkZ: owner.chunkZ,
         });
+        synchronizePresentationResidentCoverage(residentWorldCoverage);
       }
       return residentWorldCoverage;
     };
@@ -1749,15 +1830,15 @@ export async function bootInfiniteWorldSandbox({
         })
       ),
       combineResourceKinds: ({ resourceKinds }) => {
-        if (resourceKinds.some(kind => kind !== 'canonical')) {
-          throw new Error('Static Natural requires canonical ChunkData for every owner');
+        if (resourceKinds.some(kind => kind !== 'presentation')) {
+          throw new Error('Static Natural requires PresentationOwner data for every owner');
         }
-        return 'canonical';
+        return 'presentation';
       },
       ownerMetadataCache: streamingOwnerMetadataCache,
-      queueCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
-      readyCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
-      ticketCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY * 2,
+      queueCapacity: PRESENTATION_OWNER_CACHE_CAPACITY,
+      readyCapacity: PRESENTATION_OWNER_CACHE_CAPACITY,
+      ticketCapacity: PRESENTATION_OWNER_CACHE_CAPACITY * 2,
       clock,
       requestOwner: ({
         ownerKey,
@@ -1785,14 +1866,14 @@ export async function bootInfiniteWorldSandbox({
           throw new TypeError(`Static Object Stream missing parsed owner metadata: ${ownerKey}`);
         }
         const consumerId = `static-object-stream:natural-static:${ownerKey}`;
-        if (resourceKind !== 'canonical') {
-          throw new Error(`Static Natural no longer accepts Remote Tree resources: ${resourceKind}`);
+        if (resourceKind !== 'presentation') {
+          throw new Error(`Static Natural requires PresentationOwner resources: ${resourceKind}`);
         }
-        const existing = runtime.getChunkData(chunkX, chunkZ);
+        const existing = presentationOwnerService.getCompletedChunk(chunkX, chunkZ);
         if (existing) return observeReady(Object.freeze({
           promise: Promise.resolve(existing), cancel: () => false,
         }));
-        return observeReady(chunkDataService.requestChunk({
+        return observeReady(presentationOwnerService.requestChunk({
           chunkX,
           chunkZ,
           priority,
@@ -1834,12 +1915,14 @@ export async function bootInfiniteWorldSandbox({
       getCanonicalChunkData: async (chunkX, chunkZ, request = {}) => {
         const ownerKey = `${chunkX},${chunkZ}`;
         const fallback = async () => {
-        const existing = runtime.getChunkData(chunkX, chunkZ);
+        const existing = runtime.getChunkData(chunkX, chunkZ)
+          ?? presentationOwnerService.getCompletedChunk(chunkX, chunkZ);
         if (!streamingTelemetry.enabled) {
-          return existing ?? chunkDataService.requestChunk({
+          return existing ?? presentationOwnerService.requestChunk({
             chunkX,
             chunkZ,
             priority: request.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+            required: request.required ?? true,
             consumerId: request.consumerId ?? 'distant-owner-query',
             epoch: request.epoch ?? 0,
           }).promise;
@@ -1865,10 +1948,11 @@ export async function bootInfiniteWorldSandbox({
           });
           return existing;
         }
-        return chunkDataService.requestChunk({
+        return presentationOwnerService.requestChunk({
           chunkX,
           chunkZ,
           priority: request.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+          required: request.required ?? true,
           consumerId: request.consumerId ?? 'distant-owner-query',
           epoch: request.epoch ?? 0,
           telemetryTarget: WORLD_STREAMING_TARGET.DISTANT,
@@ -1879,12 +1963,12 @@ export async function bootInfiniteWorldSandbox({
         if (naturalStaticStreamSuspended) return fallback();
         return naturalStaticStream.requestOrReuse({
           ownerKey,
-          resourceKind: 'canonical',
+          resourceKind: 'presentation',
           fallback,
         });
       },
       cancelCanonicalChunkRequests: options => {
-        const cancelled = chunkDataService.cancelConsumer(options);
+        const cancelled = presentationOwnerService.cancelConsumer(options);
         return cancelled;
       },
       publishStaticOwnerTickets: ({ ownerKeys }) => {
@@ -3456,6 +3540,16 @@ export async function bootInfiniteWorldSandbox({
         transitionError = error;
         return;
       }
+      const corridorEndpoint = plan.corridorCenters.at(-1);
+      synchronizePresentationResidentCoverage(
+        currentResidentCoverage,
+        corridorEndpoint.key === currentResidentCoverage.centerOwnerKey
+          ? null
+          : createResidentWorldCoverage({
+            centerChunkX: corridorEndpoint.chunkX,
+            centerChunkZ: corridorEndpoint.chunkZ,
+          }),
+      );
       if (plan.signature === terrainReadyRequestedSignature) return;
       terrainReadyRequestedSignature = plan.signature;
       if (diagnostics.enabled) diagnostics.recordEvent('runtime-terrain-ready-set-requested', {
@@ -3712,9 +3806,9 @@ export async function bootInfiniteWorldSandbox({
             residentCoverage: resolveResidentWorldCoverage(),
             currentRequests: {
               [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
-                requiredOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
-                requestOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
-                retainedOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
+                requiredOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
+                requestOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
+                retainedOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
               },
               ...(settlementStreamingObservation ? {
                 [W8_BUILDING_STREAM_POLICY_KIND]: {
@@ -4600,6 +4694,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       distantPresentation.dispose();
       await naturalStaticStream.dispose();
       await buildingSettlementStream.dispose();
+      await presentationOwnerService.shutdown();
       await chunkDataService.shutdown();
       scenePresentation.dispose();
       visualAssets.dispose();
@@ -4782,6 +4877,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           buildingSettlementShadow: buildingSettlementShadowComparison,
           buildingSettlementStreaming: buildingSettlementStream.snapshot(),
           staticObjectStreaming: naturalStaticStream.snapshot(),
+          presentationOwnerData: presentationOwnerService.snapshot(),
           treePathAudit: Object.freeze({
             treeStaticStreamActivated: naturalStaticStreamActivated,
             treeStaticStreamSuspended: naturalStaticStreamSuspended,
@@ -4817,6 +4913,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       distantPresentation?.dispose?.();
       await naturalStaticStream?.dispose?.();
       await buildingSettlementStream?.dispose?.();
+      await presentationOwnerService?.shutdown?.();
       await chunkDataService?.shutdown?.();
       scenePresentation?.dispose?.();
       visualAssets?.dispose?.();

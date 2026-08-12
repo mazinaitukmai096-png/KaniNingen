@@ -18,6 +18,8 @@ export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   INITIALIZED: 'chunk-generator:initialized',
   GENERATE: 'chunk-generator:generate',
   GENERATED: 'chunk-generator:generated',
+  GENERATE_PRESENTATION_OWNER: 'chunk-generator:generate-presentation-owner',
+  GENERATED_PRESENTATION_OWNER: 'chunk-generator:generated-presentation-owner',
   PIPELINE_TIMING: 'chunk-generator:pipeline-timing',
   GENERATE_FOREST_HORIZON: 'chunk-generator:generate-forest-horizon',
   GENERATED_FOREST_HORIZON: 'chunk-generator:generated-forest-horizon',
@@ -221,6 +223,63 @@ export function createForestHorizonGeneratorRequest({
       target,
       stream,
       scheduler,
+    }),
+  });
+}
+
+export function createPresentationOwnerGeneratorRequest({
+  requestId,
+  serviceGeneration,
+  chunkX,
+  chunkZ,
+  priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+  required = true,
+  createdAtMs = 0,
+  deadlineAtMs = null,
+  consumerId = 'presentation-owner-service',
+  epoch = 0,
+  correlationId = null,
+  target = 'distant',
+  stream = 'distant',
+  scheduler = null,
+  pipelineDiagnostics = false,
+} = {}) {
+  if (!Number.isSafeInteger(requestId) || requestId < 1) {
+    throw new RangeError('requestId must be positive');
+  }
+  createChunkDataRequestKey(chunkX, chunkZ);
+  assertChunkDataPriority(priority);
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be positive');
+  }
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE_PRESENTATION_OWNER,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration,
+    chunkX,
+    chunkZ,
+    ...(pipelineDiagnostics === true ? { pipelineDiagnostics: true } : {}),
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId,
+      operationKind: 'presentation-owner',
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+      // Presentation and Full ChunkData are separate services but share one
+      // Worker scheduler. Use the transport request identity at that shared
+      // boundary so equal per-service sequence numbers cannot collide.
+      scheduler: scheduler === null ? null : {
+        ...scheduler,
+        requestId,
+        operationKind: 'presentation-owner',
+      },
     }),
   });
 }

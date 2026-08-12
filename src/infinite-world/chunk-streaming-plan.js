@@ -137,10 +137,10 @@ export function createResidentWorldCoverage({
     presentationView,
     fullView,
     residentRequiredOwnerKeys: ownerKeys,
-    residentDataOwnerKeys: ownerKeys,
-    residentTerrainOwnerKeys: ownerKeys,
-    residentNaturalOwnerKeys: ownerKeys,
-    residentStructureOwnerKeys: ownerKeys,
+    residentDataOwnerKeys: fullView.ownerKeys,
+    residentTerrainOwnerKeys: fullView.ownerKeys,
+    residentNaturalOwnerKeys: presentationView.ownerKeys,
+    residentStructureOwnerKeys: presentationView.ownerKeys,
     signature: `resident:${centerChunkX},${centerChunkZ}:${radiusMeters}:${ownerKeys.length}`,
   });
 }
@@ -176,11 +176,24 @@ const maximumPrefetchCoverage = createResidentWorldCoverage({
 const baselineResidentKeys = new Set(baselineResidentCoverage.residentRequiredOwnerKeys);
 export const RESIDENT_WORLD_OWNER_COUNT =
   baselineResidentCoverage.residentRequiredOwnerKeys.length;
+export const PRESENTATION_RESIDENT_OWNER_COUNT =
+  baselineResidentCoverage.presentationView.ownerKeys.length;
+export const FULL_RESIDENT_OWNER_COUNT =
+  baselineResidentCoverage.fullView.ownerKeys.length;
 export const RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT =
   maximumPrefetchCoverage.residentRequiredOwnerKeys
     .filter(key => !baselineResidentKeys.has(key)).length;
-export const RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY =
+const baselineFullKeys = new Set(baselineResidentCoverage.fullView.ownerKeys);
+export const FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT =
+  maximumPrefetchCoverage.fullView.ownerKeys
+    .filter(key => !baselineFullKeys.has(key)).length;
+export const PRESENTATION_OWNER_CACHE_CAPACITY =
   RESIDENT_WORLD_OWNER_COUNT + RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT;
+export const FULL_CHUNK_DATA_CACHE_CAPACITY =
+  FULL_RESIDENT_OWNER_COUNT + FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT;
+// Compatibility name for consumers that size the Full ChunkData cache. The
+// production data-plane now protects only the nested 100 m Full view.
+export const RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY = FULL_CHUNK_DATA_CACHE_CAPACITY;
 
 function finite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
@@ -305,7 +318,8 @@ export function planRuntimeTerrainReadySet({
       || residentCoverage.centerChunkZ !== visibleCenter.chunkZ)) {
     throw new Error('Resident World coverage must match the player-owned Chunk');
   }
-  const residentCoordinates = residentCoverage?.ownerCoordinates ?? Object.freeze([]);
+  const residentCoordinates = residentCoverage?.fullView?.ownerCoordinates
+    ?? residentCoverage?.ownerCoordinates ?? Object.freeze([]);
   const endpoint = corridorCenters.at(-1);
   const residentReadyPlanCacheKey = residentCoverage === null ? null : [
     residentCoverage.signature,
@@ -333,7 +347,7 @@ export function planRuntimeTerrainReadySet({
     : null;
   const velocityPrefetchCoordinates = futureResidentCoverage === null
     ? Object.freeze([])
-    : Object.freeze(futureResidentCoverage.ownerCoordinates.filter(
+    : Object.freeze(futureResidentCoverage.fullView.ownerCoordinates.filter(
       coordinate => !residentKeySet.has(coordinate.key),
     ));
   const dataByKey = new Map();
@@ -406,7 +420,7 @@ export function planRuntimeTerrainReadySet({
   const renderCoordinates = dataCoordinates.filter(coordinate => coordinate.renderRequired);
   const signature = residentReadyPlanCacheKey ?? `${scaleStageId}:${sprint ? 'sprint' : 'walk'}:${speedMetersPerSecond.toFixed(3)}|${dataCoordinates
     .map(coordinate => `${coordinate.key}:${coordinate.priorityClass}`).join('|')}`;
-  const residentRequiredOwnerKeys = residentCoverage?.residentRequiredOwnerKeys
+  const residentRequiredOwnerKeys = residentCoverage?.fullView?.ownerKeys
     ?? Object.freeze(dataCoordinates.filter(value => value.visibleRequired).map(value => value.key));
   const velocityPrefetchOwnerKeys = Object.freeze(
     dataCoordinates.filter(value => !value.residentRequired).map(value => value.key),
@@ -430,10 +444,15 @@ export function planRuntimeTerrainReadySet({
     corridorCenters: Object.freeze(corridorCenters.map(center => Object.freeze({ ...center }))),
     residentCoverage,
     residentRequiredOwnerKeys,
+    residentPresentationOwnerKeys: residentCoverage?.presentationView?.ownerKeys
+      ?? residentRequiredOwnerKeys,
+    residentFullOwnerKeys: residentRequiredOwnerKeys,
     residentDataOwnerKeys: residentRequiredOwnerKeys,
     residentTerrainOwnerKeys: residentRequiredOwnerKeys,
-    residentNaturalOwnerKeys: residentRequiredOwnerKeys,
-    residentStructureOwnerKeys: residentRequiredOwnerKeys,
+    residentNaturalOwnerKeys: residentCoverage?.presentationView?.ownerKeys
+      ?? residentRequiredOwnerKeys,
+    residentStructureOwnerKeys: residentCoverage?.presentationView?.ownerKeys
+      ?? residentRequiredOwnerKeys,
     velocityPrefetchOwnerKeys,
     dataCoordinates: Object.freeze(dataCoordinates),
     renderCoordinates: Object.freeze(renderCoordinates),

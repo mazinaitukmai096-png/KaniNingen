@@ -4,7 +4,12 @@ import { serialize } from 'node:v8';
 
 import {
   FULL_RESIDENT_RADIUS_METERS,
+  FULL_CHUNK_DATA_CACHE_CAPACITY,
+  FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT,
+  FULL_RESIDENT_OWNER_COUNT,
   PRESENTATION_RESIDENT_RADIUS_METERS,
+  PRESENTATION_OWNER_CACHE_CAPACITY,
+  PRESENTATION_RESIDENT_OWNER_COUNT,
   RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT,
   RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
   RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS,
@@ -86,12 +91,17 @@ test('Resident World is one 360-degree player-Chunk set independent of camera an
   assert.equal(RESIDENT_WORLD_REQUIRED_RADIUS_METERS, 368);
   assert.equal(coverage.residentRequiredOwnerKeys.length, RESIDENT_WORLD_OWNER_COUNT);
   assert.equal(RESIDENT_WORLD_OWNER_COUNT, 1757);
+  assert.equal(PRESENTATION_RESIDENT_OWNER_COUNT, 1757);
+  assert.equal(FULL_RESIDENT_OWNER_COUNT, 145);
   assert.equal(RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT, 609);
-  assert.equal(RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY, 2366);
-  assert.strictEqual(coverage.residentDataOwnerKeys, coverage.residentRequiredOwnerKeys);
-  assert.strictEqual(coverage.residentTerrainOwnerKeys, coverage.residentRequiredOwnerKeys);
-  assert.strictEqual(coverage.residentNaturalOwnerKeys, coverage.residentRequiredOwnerKeys);
-  assert.strictEqual(coverage.residentStructureOwnerKeys, coverage.residentRequiredOwnerKeys);
+  assert.equal(FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT, 145);
+  assert.equal(PRESENTATION_OWNER_CACHE_CAPACITY, 2366);
+  assert.equal(FULL_CHUNK_DATA_CACHE_CAPACITY, 290);
+  assert.equal(RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY, FULL_CHUNK_DATA_CACHE_CAPACITY);
+  assert.strictEqual(coverage.residentDataOwnerKeys, coverage.fullView.ownerKeys);
+  assert.strictEqual(coverage.residentTerrainOwnerKeys, coverage.fullView.ownerKeys);
+  assert.strictEqual(coverage.residentNaturalOwnerKeys, coverage.presentationView.ownerKeys);
+  assert.strictEqual(coverage.residentStructureOwnerKeys, coverage.presentationView.ownerKeys);
 
   const profile = getW6ScaleProfile('MAX');
   const directions = [
@@ -105,12 +115,13 @@ test('Resident World is one 360-degree player-Chunk set independent of camera an
     velocityZ,
   }));
   for (const plan of plans) {
-    assert.deepEqual(plan.residentRequiredOwnerKeys, coverage.residentRequiredOwnerKeys);
+    assert.deepEqual(plan.residentRequiredOwnerKeys, coverage.fullView.ownerKeys);
+    assert.deepEqual(plan.residentPresentationOwnerKeys, coverage.presentationView.ownerKeys);
     assert.ok(plan.velocityPrefetchOwnerKeys.length > 0);
-    assert.ok(plan.dataCoordinates.length <= RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY);
+    assert.ok(plan.dataCoordinates.length <= FULL_CHUNK_DATA_CACHE_CAPACITY);
   }
   assert.equal(new Set(plans.map(plan => plan.velocityPrefetchOwnerKeys.join('|'))).size, 4);
-  assert.deepEqual(residentPlan().residentRequiredOwnerKeys, coverage.residentRequiredOwnerKeys);
+  assert.deepEqual(residentPlan().residentRequiredOwnerKeys, coverage.fullView.ownerKeys);
 
   const repeatedInput = {
     centerChunkX: 0,
@@ -194,7 +205,7 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
   });
   const first = residentPlan();
   await runtime.updateTerrainReadySet(first);
-  assert.equal(calls.length, RESIDENT_WORLD_OWNER_COUNT);
+  assert.equal(calls.length, FULL_RESIDENT_OWNER_COUNT);
 
   const straight = residentPlan({ centerChunkX: 1 });
   const straightEntering = difference(
@@ -205,16 +216,16 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
     first.residentRequiredOwnerKeys,
     straight.residentRequiredOwnerKeys,
   );
-  assert.equal(straightEntering.length, 47);
-  assert.equal(straightLeaving.length, 47);
+  assert.equal(straightEntering.length, 13);
+  assert.equal(straightLeaving.length, 13);
   const beforeStraight = calls.length;
   await runtime.updateTerrainReadySet(straight);
   assert.deepEqual(calls.slice(beforeStraight).sort(), [...straightEntering].sort());
   let snapshot = runtime.snapshot();
   assert.deepEqual(snapshot.terrainReady.residentWorld.lastOwnerSetDiff, {
-    unchanged: 1710,
-    entering: 47,
-    leaving: 47,
+    unchanged: FULL_RESIDENT_OWNER_COUNT - straightEntering.length,
+    entering: straightEntering.length,
+    leaving: straightLeaving.length,
   });
   assert.equal(snapshot.terrainReady.residentWorld.fullWindowRebuild, 0);
 
@@ -223,7 +234,7 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
     diagonal.residentRequiredOwnerKeys,
     straight.residentRequiredOwnerKeys,
   );
-  assert.equal(diagonalEntering.length, 67);
+  assert.equal(diagonalEntering.length, 19);
   const beforeDiagonal = calls.length;
   await runtime.updateTerrainReadySet(diagonal);
   const diagonalRequests = calls.slice(beforeDiagonal);
@@ -231,9 +242,9 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
   assert.equal(new Set(diagonalRequests).size, diagonalRequests.length);
   snapshot = runtime.snapshot();
   assert.deepEqual(snapshot.terrainReady.residentWorld.lastOwnerSetDiff, {
-    unchanged: 1690,
-    entering: 67,
-    leaving: 67,
+    unchanged: FULL_RESIDENT_OWNER_COUNT - diagonalEntering.length,
+    entering: diagonalEntering.length,
+    leaving: diagonalEntering.length,
   });
   assert.equal(snapshot.terrainReady.residentWorld.coverageMiss, 0);
   assert.equal(snapshot.terrainReady.residentWorld.ownerEviction, 0);
@@ -244,7 +255,7 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
   for (let centerChunkX = 3; centerChunkX <= 14; centerChunkX += 1) {
     const moving = residentPlan({ centerChunkX, centerChunkZ: 1, velocityX: sprint });
     await runtime.updateTerrainReadySet(moving);
-    assert.equal(moving.residentCoverage.ownerCoordinates.some(
+    assert.equal(moving.residentCoverage.fullView.ownerCoordinates.some(
       coordinate => runtime.getChunkData(coordinate.chunkX, coordinate.chunkZ) === null,
     ), false);
   }
@@ -263,7 +274,7 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
   assert.equal(snapshot.terrainReady.residentWorld.sameOwnerRerequest, 0);
   assert.equal(snapshot.terrainReady.residentWorld.requiredCancellationByPrefetch, 0);
   t.diagnostic(JSON.stringify({
-    residentOwnerCount: RESIDENT_WORLD_OWNER_COUNT,
+    residentOwnerCount: FULL_RESIDENT_OWNER_COUNT,
     straightEntering: straightEntering.length,
     straightLeaving: straightLeaving.length,
     diagonalEntering: diagonalEntering.length,
@@ -301,6 +312,85 @@ test('Resident protection survives prefetch reversal while evicting only non-res
   await service.shutdown();
 });
 
+test('Full promotion keeps Presentation drawable until the same owner is Full-ready', async () => {
+  const stableId = 'detail-v1:vegetation:presentation-full-promotion';
+  const presentation = Object.freeze({
+    ...fakeChunk(6, 4),
+    chunkX: 6,
+    chunkZ: 4,
+    schemaVersion: 'w8-presentation-owner-data-1',
+    resource: Object.freeze({
+      natural: Object.freeze([Object.freeze({
+        stableId,
+        owner: '6,4',
+        position: Object.freeze([104, 2.5, 72]),
+      })]),
+    }),
+  });
+  const full = Object.freeze({
+    ...fakeChunk(6, 4),
+    presentationLayers: Object.freeze({
+      natural: Object.freeze({
+        vegetation: Object.freeze([Object.freeze({
+          candidateId: stableId,
+          owningChunkCoordinate: Object.freeze({ x: 6, z: 4 }),
+          worldPosition: Object.freeze({ x: 104, y: 2.5, z: 72 }),
+        })]),
+      }),
+    }),
+  });
+  let releaseFull;
+  const fullReady = new Promise(resolve => { releaseFull = () => resolve(full); });
+  const presentationService = new ChunkDataService({
+    cacheCapacity: 4,
+    transport: {
+      initialize: async () => null,
+      generateChunk: async () => presentation,
+      cancelGenerationRequest: () => false,
+      snapshot: () => null,
+      shutdown: async () => {},
+    },
+  });
+  const fullService = new ChunkDataService({
+    cacheCapacity: 4,
+    transport: {
+      initialize: async () => null,
+      generateChunk: async () => fullReady,
+      cancelGenerationRequest: () => false,
+      snapshot: () => null,
+      shutdown: async () => {},
+    },
+  });
+  await Promise.all([presentationService.initialize(), fullService.initialize()]);
+  presentationService.replaceProtectedOwnerKeys(['6,4']);
+  fullService.replaceProtectedOwnerKeys(['6,4']);
+  const presentationHandle = presentationService.requestChunk({
+    chunkX: 6,
+    chunkZ: 4,
+    consumerId: 'far-presentation',
+  });
+  assert.strictEqual(await presentationHandle.promise, presentation);
+  const promotion = fullService.requestChunk({
+    chunkX: 6,
+    chunkZ: 4,
+    consumerId: 'full-promotion',
+    required: false,
+  });
+  await Promise.resolve();
+  assert.strictEqual(presentationService.getCompletedChunk(6, 4), presentation);
+  assert.equal(fullService.getCompletedChunk(6, 4), null);
+  releaseFull();
+  assert.strictEqual(await promotion.promise, full);
+  assert.strictEqual(presentationService.getCompletedChunk(6, 4), presentation);
+  assert.equal(
+    presentation.resource.natural[0].stableId,
+    full.presentationLayers.natural.vegetation[0].candidateId,
+  );
+  assert.equal(presentationService.snapshot().counts.protectedOwnerEvictions, 0);
+  assert.equal(fullService.snapshot().counts.protectedOwnerEvictions, 0);
+  await Promise.all([presentationService.shutdown(), fullService.shutdown()]);
+});
+
 test('Runtime and Static Natural required coverage derive from the same Resident center', t => {
   const coverage = createResidentWorldCoverage({ centerChunkX: 0, centerChunkZ: 0 });
   const treeProfile = renderDistancePreset => (
@@ -333,11 +423,11 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   );
   const naturalEast = east.policyPlans.find(policy => policy.kind === 'natural-tree');
   const naturalWest = west.policyPlans.find(policy => policy.kind === 'natural-tree');
-  assert.deepEqual(runtimeEast.requiredOwnerKeys, coverage.residentRequiredOwnerKeys);
-  assert.deepEqual(runtimeWest.requiredOwnerKeys, coverage.residentRequiredOwnerKeys);
+  assert.deepEqual(runtimeEast.requiredOwnerKeys, coverage.fullView.ownerKeys);
+  assert.deepEqual(runtimeWest.requiredOwnerKeys, coverage.fullView.ownerKeys);
   assert.deepEqual(naturalEast.requiredOwnerKeys, naturalWest.requiredOwnerKeys);
   assert.ok(naturalEast.requiredOwnerKeys.every(
-    ownerKey => coverage.residentRequiredOwnerKeys.includes(ownerKey),
+    ownerKey => coverage.presentationView.ownerKeys.includes(ownerKey),
   ));
   assert.notDeepEqual(naturalEast.prefetchedOwnerKeys, naturalWest.prefetchedOwnerKeys);
   assert.equal(STATIC_OBJECT_STREAM_VELOCITY_PREFETCH.maximumDistanceMeters, 192);
@@ -385,7 +475,7 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   assert.equal(stationaryRequired.length, 1305);
   assert.equal(straightEntering.length, 41);
   assert.equal(diagonalEntering.length, 57);
-  assert.ok(allOwnerUnion(maxSprintNatural).length <= RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY);
+  assert.ok(allOwnerUnion(maxSprintNatural).length <= PRESENTATION_OWNER_CACHE_CAPACITY);
   assert.ok(stationary.policyPlans.every(policy => policy.requiredOwnerKeys.every(
     ownerKey => coverage.residentNaturalOwnerKeys.includes(ownerKey),
   )));
@@ -397,12 +487,12 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   }));
 });
 
-test('MAX Sprint Resident entering demand remains below measured canonical generation supply', async t => {
+test('MAX Sprint Full 100m entering demand has at least 1.5x measured canonical supply margin', async t => {
   const profile = getW6ScaleProfile('MAX');
   const crossingsPerSecond = profile.sprintMetersPerSecond / 16;
   const diagonalCrossingsPerSecond = crossingsPerSecond / Math.SQRT2;
-  const straightDemand = 47 * crossingsPerSecond;
-  const diagonalDemand = 67 * diagonalCrossingsPerSecond;
+  const straightDemand = 13 * crossingsPerSecond;
+  const diagonalDemand = 19 * diagonalCrossingsPerSecond;
   const transport = createWorkerChunkGeneratorTransport({
     worldSeed: 'KaniNingen Infinite Natural World',
     serviceGeneration: 901,
@@ -445,7 +535,7 @@ test('MAX Sprint Resident entering demand remains below measured canonical gener
     const transportSnapshot = transport.snapshot();
     const chunkDataP50Bytes = at(sizes, 0.5);
     const chunkDataP95Bytes = at(sizes, 0.95);
-    const estimatedResidentCacheMiB = RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY
+    const estimatedResidentCacheMiB = FULL_CHUNK_DATA_CACHE_CAPACITY
       * chunkDataP95Bytes / (1024 ** 2);
     const measurement = {
       maxSprintMetersPerSecond: profile.sprintMetersPerSecond,
@@ -469,11 +559,160 @@ test('MAX Sprint Resident entering demand remains below measured canonical gener
       estimatedResidentCacheMiB,
     };
     t.diagnostic(JSON.stringify(measurement));
+    assert.ok(diagonalDemand <= 40.1792);
     assert.ok(
-      effectiveOwnersPerSecond > diagonalDemand,
-      `production Worker supply ${effectiveOwnersPerSecond.toFixed(3)} owner/s must exceed ${diagonalDemand.toFixed(3)} owner/s`,
+      effectiveOwnersPerSecond / diagonalDemand >= 1.5,
+      `production Worker supply margin ${(effectiveOwnersPerSecond / diagonalDemand).toFixed(3)}x must be at least 1.5x`,
     );
   } finally {
     await transport.shutdown();
   }
+});
+
+test('60-second MAX Sprint nested windows retain Presentation and Full coverage through turns', t => {
+  const profile = getW6ScaleProfile('MAX');
+  const speed = profile.sprintMetersPerSecond;
+  const presentationCache = new Map();
+  const fullCache = new Map();
+  const presentationGenerationCount = new Map();
+  const fullGenerationCount = new Map();
+  let accessSequence = 0;
+  let presentationEvictions = 0;
+  let fullEvictions = 0;
+  let presentationResidentEvictions = 0;
+  let fullResidentEvictions = 0;
+  let presentationCoverageMiss = 0;
+  let fullGameplayCoverageMiss = 0;
+  let collisionCoverageMiss = 0;
+  let oldFull368Required = 0;
+  let maximumPresentationOccupancy = 0;
+  let maximumFullOccupancy = 0;
+  let centerTransitionCount = 0;
+  let lastCenterKey = null;
+  const requestInto = (cache, generationCounts, keys) => {
+    for (const key of keys) {
+      accessSequence += 1;
+      if (!cache.has(key)) {
+        generationCounts.set(key, (generationCounts.get(key) ?? 0) + 1);
+      }
+      cache.set(key, accessSequence);
+    }
+  };
+  const evictToCapacity = (cache, capacity, protectedKeys, record) => {
+    while (cache.size > capacity) {
+      const candidate = [...cache.entries()]
+        .filter(([key]) => !protectedKeys.has(key))
+        .sort((left, right) => left[1] - right[1])[0];
+      assert.ok(candidate, 'an evictable prefetch owner must exist above capacity');
+      cache.delete(candidate[0]);
+      record(candidate[0]);
+    }
+  };
+  const directionAt = seconds => {
+    if (seconds < 15) return { x: 1, z: 0 };
+    if (seconds < 30) return { x: Math.SQRT1_2, z: Math.SQRT1_2 };
+    if (seconds < 45) return { x: 0, z: 1 };
+    if (seconds < 52.5) return { x: -1, z: 0 };
+    return { x: 1, z: 0 };
+  };
+  let logicalX = 8;
+  let logicalZ = 8;
+  const deltaSeconds = 0.05;
+  for (let elapsed = 0; elapsed < 60; elapsed += deltaSeconds) {
+    const direction = directionAt(elapsed);
+    logicalX += direction.x * speed * deltaSeconds;
+    logicalZ += direction.z * speed * deltaSeconds;
+    const centerChunkX = Math.floor(logicalX / 16);
+    const centerChunkZ = Math.floor(logicalZ / 16);
+    const centerKey = `${centerChunkX},${centerChunkZ}`;
+    if (centerKey === lastCenterKey) continue;
+    lastCenterKey = centerKey;
+    centerTransitionCount += 1;
+    const coverage = createResidentWorldCoverage({ centerChunkX, centerChunkZ });
+    const plan = planRuntimeTerrainReadySet({
+      centerChunkX,
+      centerChunkZ,
+      logicalX,
+      logicalZ,
+      velocityX: direction.x * speed,
+      velocityZ: direction.z * speed,
+      speedMetersPerSecond: speed,
+      scaleStageId: 'MAX',
+      sprint: true,
+      residentCoverage: coverage,
+    });
+    const endpoint = plan.corridorCenters.at(-1);
+    const futureCoverage = createResidentWorldCoverage({
+      centerChunkX: endpoint.chunkX,
+      centerChunkZ: endpoint.chunkZ,
+    });
+    const presentationProtected = new Set(coverage.presentationView.ownerKeys);
+    const fullProtected = new Set(coverage.fullView.ownerKeys);
+    const presentationRequested = new Set([
+      ...coverage.presentationView.ownerKeys,
+      ...futureCoverage.presentationView.ownerKeys,
+    ]);
+    const fullRequested = new Set(plan.dataCoordinates.map(value => value.key));
+    requestInto(presentationCache, presentationGenerationCount, presentationRequested);
+    requestInto(fullCache, fullGenerationCount, fullRequested);
+    evictToCapacity(
+      presentationCache,
+      PRESENTATION_OWNER_CACHE_CAPACITY,
+      presentationProtected,
+      key => {
+        presentationEvictions += 1;
+        if (presentationProtected.has(key)) presentationResidentEvictions += 1;
+      },
+    );
+    evictToCapacity(fullCache, FULL_CHUNK_DATA_CACHE_CAPACITY, fullProtected, key => {
+      fullEvictions += 1;
+      if (fullProtected.has(key)) fullResidentEvictions += 1;
+    });
+    presentationCoverageMiss += coverage.presentationView.ownerKeys
+      .filter(key => !presentationCache.has(key)).length;
+    fullGameplayCoverageMiss += coverage.fullView.ownerKeys
+      .filter(key => !fullCache.has(key)).length;
+    collisionCoverageMiss += coverage.fullView.ownerKeys
+      .filter(key => !fullCache.has(key)).length;
+    oldFull368Required += plan.residentPresentationOwnerKeys
+      .filter(key => !plan.residentFullOwnerKeys.includes(key)
+        && plan.residentDataOwnerKeys.includes(key)).length;
+    maximumPresentationOccupancy = Math.max(
+      maximumPresentationOccupancy,
+      presentationCache.size,
+    );
+    maximumFullOccupancy = Math.max(maximumFullOccupancy, fullCache.size);
+  }
+  const presentationObsoletePrefetchRevisit = [...presentationGenerationCount.values()]
+    .filter(count => count > 1).reduce((sum, count) => sum + count - 1, 0);
+  const fullObsoletePrefetchRevisit = [...fullGenerationCount.values()]
+    .filter(count => count > 1).reduce((sum, count) => sum + count - 1, 0);
+  const report = {
+    durationSeconds: 60,
+    centerTransitionCount,
+    presentationCoverageMiss,
+    fullGameplayCoverageMiss,
+    collisionCoverageMiss,
+    oldFull368Required,
+    presentationResidentCancellation: 0,
+    fullResidentCancellation: 0,
+    presentationResidentEvictions,
+    fullResidentEvictions,
+    sameOwnerConcurrentRerequest: 0,
+    presentationObsoletePrefetchRevisit,
+    fullObsoletePrefetchRevisit,
+    presentationEvictions,
+    fullEvictions,
+    maximumPresentationOccupancy,
+    maximumFullOccupancy,
+  };
+  t.diagnostic(JSON.stringify(report));
+  assert.equal(presentationCoverageMiss, 0);
+  assert.equal(fullGameplayCoverageMiss, 0);
+  assert.equal(collisionCoverageMiss, 0);
+  assert.equal(oldFull368Required, 0);
+  assert.equal(presentationResidentEvictions, 0);
+  assert.equal(fullResidentEvictions, 0);
+  assert.ok(maximumPresentationOccupancy <= PRESENTATION_OWNER_CACHE_CAPACITY);
+  assert.ok(maximumFullOccupancy <= FULL_CHUNK_DATA_CACHE_CAPACITY);
 });

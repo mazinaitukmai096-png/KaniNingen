@@ -1,14 +1,20 @@
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
 import { hashWorldSeed, normalizeWorldSeed } from './legacy-core/g0/seed.js';
 import { createChunkKey } from './chunk-coordinates.js';
+import {
+  projectMigratedSettlementTemplate,
+  settlementTemplateConflictsWithCandidate,
+} from './distributed-settlement-chunk-generator.js';
 import { createFormalNaturalCandidateKernel } from './formal-natural-chunk-generator.js';
 import { createSharedCanonicalNaturalKernel } from './natural-chunk-generator.js';
 import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
 import { resolveW8CanonicalFarTreeDensityRank } from './vegetation-lod-policy.js';
 import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
+import { createCanonicalRiverProjection } from './canonical-river-realization.js';
 import {
   W8_SHARED_CANONICAL_GROUND_REVISION,
   createSharedCanonicalGroundKernel,
+  createSettlementSurfacePolicy,
 } from './w8-surface-policy.js';
 
 export const PRESENTATION_OWNER_SCHEMA = 'w8-presentation-owner-1';
@@ -75,6 +81,7 @@ function compactRoad(source) {
     owner: ownerSummary(owner),
     projectionOwner: ownerSummary(source.projectionOwner ?? owner),
     objectType: 'road',
+    featureType: 'settlement-road',
     archetypeKey: source.roadClass ?? source.roadType ?? 'road',
     position: frozenPosition(position),
     dimensions: Object.freeze([
@@ -89,6 +96,15 @@ function compactRoad(source) {
       (source.end?.x ?? position.x) - (source.start?.x ?? position.x),
       (source.end?.z ?? position.z) - (source.start?.z ?? position.z),
     )),
+    start: source.start ? Object.freeze(Number.isFinite(source.start.y)
+      ? [q6(source.start.x), q6(source.start.y), q6(source.start.z)]
+      : [q6(source.start.x), q6(source.start.z)]) : null,
+    end: source.end ? Object.freeze(Number.isFinite(source.end.y)
+      ? [q6(source.end.x), q6(source.end.y), q6(source.end.z)]
+      : [q6(source.end.x), q6(source.end.z)]) : null,
+    settlementId: source.settlementId ?? null,
+    settlementType: source.settlementType ?? null,
+    canonicalMajorRoad: source.canonicalMajorRoad === true,
     colors: null,
   });
 }
@@ -104,15 +120,16 @@ function compactStructure(source) {
     owner: ownerSummary(canonical.owner),
     projectionOwner: ownerSummary(source.projectionOwner ?? canonical.owner),
     objectType: canonical.objectType,
+    featureType: source.featureType ?? canonical.extension?.sourceKind ?? null,
     archetypeKey: canonical.presentation.partSetKey,
     position: frozenPosition(canonical.position),
     dimensions: frozenDimensions(canonical.visualBounds),
     rotationY: q6(canonical.rotation.y),
-    colors: source.visual ? Object.freeze({
-      wall: source.visual.wallColor ?? null,
-      roof: source.visual.roofColor ?? null,
-      variant: source.visual.variant ?? source.visual.visualVariant ?? null,
-    }) : null,
+    radiusMeters: q6(source.radiusMeters ?? canonical.collision?.radiusMeters ?? 0),
+    settlementId: source.settlementId ?? canonical.extension?.settlementId ?? null,
+    settlementType: source.settlementType ?? canonical.extension?.settlementType ?? null,
+    townType: source.townType ?? canonical.extension?.townType ?? null,
+    visual: source.visual ?? null,
   });
 }
 
@@ -131,6 +148,10 @@ function compactReference(reference) {
       ? Object.freeze({ x: q6(reference.center.x), z: q6(reference.center.z) }) : null,
     radiusMeters: Number.isFinite(reference.radiusMeters)
       ? q6(reference.radiusMeters) : null,
+    influenceRadiusMeters: Number.isFinite(reference.influenceRadiusMeters)
+      ? q6(reference.influenceRadiusMeters) : null,
+    macroRegion: reference.macroRegion && Number.isSafeInteger(reference.macroRegion.x)
+      ? Object.freeze({ x: reference.macroRegion.x, z: reference.macroRegion.z }) : null,
   });
 }
 
@@ -150,6 +171,15 @@ function compactAuxiliary(record) {
       q6(record.depthMeters ?? 0),
     ]) : null,
     rotationY: q6(record.rotationY ?? 0),
+    parentSettlementId: record.parentSettlementId ?? record.settlementId ?? null,
+    settlementId: record.settlementId ?? record.parentSettlementId ?? null,
+    settlementType: record.settlementType ?? null,
+    townType: record.townType ?? null,
+    landmarkType: record.landmarkType ?? null,
+    parentRoadStableId: record.parentRoadStableId ?? null,
+    waterType: record.waterType ?? null,
+    detailType: record.detailType ?? null,
+    featureType: record.featureType ?? null,
   });
 }
 
@@ -237,6 +267,153 @@ export function validatePresentationOwnerResource(resource) {
   return Object.freeze({ valid: errors.length === 0, errors: Object.freeze(errors) });
 }
 
+function parseCompactOwner(ownerKey) {
+  const match = /^(-?\d+),(-?\d+)$/.exec(ownerKey ?? '');
+  if (!match) throw new TypeError(`invalid compact Presentation owner: ${ownerKey}`);
+  const owner = { x: Number(match[1]), z: Number(match[2]) };
+  if (!Number.isSafeInteger(owner.x) || !Number.isSafeInteger(owner.z)) {
+    throw new TypeError(`invalid compact Presentation owner: ${ownerKey}`);
+  }
+  return Object.freeze(owner);
+}
+
+const expandPosition = value => Object.freeze({
+  x: value[0], y: value[1], z: value[2],
+});
+
+/** Expands only the canonical fields required by the existing renderer. */
+export function expandPresentationNaturalRecord(record) {
+  if (!record || !['tree', 'shrub', 'rock'].includes(record.objectType)) {
+    throw new TypeError('compact Presentation Natural record is required');
+  }
+  const position = expandPosition(record.position);
+  const owner = parseCompactOwner(record.owner);
+  const resolved = resolveW8CanonicalWorldObject(Object.freeze({
+    candidateId: record.stableId,
+    candidateType: record.objectType === 'rock' ? 'rock' : 'vegetation',
+    subtype: record.subtype,
+    variationSeed: record.variationSeed,
+    orientationSeed: record.rotationY / (Math.PI * 2),
+    worldPosition: position,
+    owningChunkCoordinate: owner,
+    metadata: Object.freeze({
+      candidateRadiusMeters: record.objectType === 'rock'
+        ? record.dimensions[0] / 2 : record.objectType === 'shrub' ? 0.2 : 0.625,
+      boundsType: 'horizontal-circle',
+    }),
+  }));
+  const visualBounds = Object.freeze({
+    width: record.dimensions[0],
+    height: record.dimensions[1],
+    depth: record.dimensions[2],
+  });
+  const matrixScale = record.objectType === 'rock' ? 0.5 : 1;
+  return Object.freeze({
+    ...resolved,
+    position,
+    worldPosition: position,
+    rotation: Object.freeze({ y: record.rotationY }),
+    rotationY: record.rotationY,
+    visualBounds,
+    widthMeters: record.dimensions[0] * matrixScale,
+    heightMeters: record.dimensions[1] * matrixScale,
+    depthMeters: record.dimensions[2] * matrixScale,
+  });
+}
+
+export function expandPresentationStructureRecord(record) {
+  if (!record || !['building', 'road'].includes(record.objectType)) {
+    throw new TypeError('compact Presentation structure record is required');
+  }
+  const position = expandPosition(record.position);
+  const owner = parseCompactOwner(record.owner);
+  if (record.objectType === 'road') {
+    const start = record.start
+      ? Object.freeze({
+        x: record.start[0],
+        ...(record.start.length > 2 ? { y: record.start[1] } : {}),
+        z: record.start.at(-1),
+      }) : position;
+    const end = record.end
+      ? Object.freeze({
+        x: record.end[0],
+        ...(record.end.length > 2 ? { y: record.end[1] } : {}),
+        z: record.end.at(-1),
+      }) : position;
+    return Object.freeze({
+      stableId: record.stableId,
+      sourceStableId: record.sourceStableId,
+      featureType: 'settlement-road',
+      roadClass: record.archetypeKey,
+      settlementId: record.settlementId,
+      settlementType: record.settlementType,
+      canonicalMajorRoad: record.canonicalMajorRoad === true,
+      start,
+      end,
+      widthMeters: record.dimensions[0],
+      lengthMeters: record.dimensions[2],
+      rotationY: record.rotationY,
+      worldPosition: position,
+      owningChunkCoordinate: owner,
+    });
+  }
+  const dimensions = record.dimensions;
+  const visual = record.visual ?? (record.colors ? Object.freeze({
+    wallColor: record.colors.wall,
+    roofColor: record.colors.roof,
+    variant: record.colors.variant,
+  }) : null);
+  return resolveW8CanonicalWorldObject(Object.freeze({
+    stableId: record.stableId,
+    sourceStableId: record.sourceStableId,
+    featureType: 'settlement-building',
+    buildingType: record.archetypeKey,
+    settlementId: record.settlementId,
+    settlementType: record.settlementType,
+    townType: record.townType,
+    radiusMeters: record.radiusMeters,
+    widthMeters: dimensions[0],
+    heightMeters: dimensions[1],
+    depthMeters: dimensions[2],
+    rotationY: record.rotationY,
+    worldPosition: position,
+    owningChunkCoordinate: owner,
+    ...(visual ? { visual } : {}),
+  }));
+}
+
+export function expandPresentationAuxiliaryRecord(record) {
+  if (!record || typeof record.stableId !== 'string') {
+    throw new TypeError('compact Presentation auxiliary record is required');
+  }
+  const owner = record.owner ? parseCompactOwner(record.owner) : null;
+  const position = record.position ? expandPosition(record.position) : null;
+  return Object.freeze({
+    stableId: record.stableId,
+    ...(record.parentSettlementId ? { parentSettlementId: record.parentSettlementId } : {}),
+    ...(record.settlementId ? { settlementId: record.settlementId } : {}),
+    ...(record.settlementType ? { settlementType: record.settlementType } : {}),
+    ...(record.townType ? { townType: record.townType } : {}),
+    ...(record.landmarkType ? { landmarkType: record.landmarkType } : {}),
+    ...(record.parentRoadStableId ? { parentRoadStableId: record.parentRoadStableId } : {}),
+    ...(record.waterType ? { waterType: record.waterType } : {}),
+    ...(record.detailType ? { detailType: record.detailType } : {}),
+    ...(record.featureType ? { featureType: record.featureType } : {}),
+    ...(position ? { worldPosition: position } : {}),
+    ...(owner ? { owningChunkCoordinate: owner } : {}),
+    widthMeters: record.dimensions?.[0] ?? 0,
+    heightMeters: record.dimensions?.[1] ?? 0,
+    depthMeters: record.dimensions?.[2] ?? 0,
+    rotationY: record.rotationY ?? 0,
+  });
+}
+
+export function presentationOwnerResourceOf(value) {
+  if (value?.schemaVersion === PRESENTATION_OWNER_SCHEMA) return value;
+  if (value?.resource?.schemaVersion === PRESENTATION_OWNER_SCHEMA) return value.resource;
+  return null;
+}
+
 /**
  * Purpose-built Stage 1 generator. It evaluates only Natural lattice samples
  * reached by semantic candidates and consumes compact settlement/structure
@@ -281,35 +458,126 @@ export async function createPresentationOwnerGenerator({
       });
       const candidatesReadyAt = globalThis.performance?.now?.() ?? Date.now();
       const excluded = new Set(context.excludedNaturalStableIds ?? []);
-      const vegetation = naturalPolicy.selectVegetation({
-        candidates: candidates.vegetationCandidates.filter(candidate => !excluded.has(candidate.candidateId)),
-        settlementReferences: context.settlementReferences ?? context.settlementRegionRefs ?? [],
-        experienceSpawn,
-        introDistanceMeters: context.introDistanceMeters ?? 11,
+      const exclusionTemplates = context.naturalExclusionTemplates
+        ?? context.settlementTemplates ?? [];
+      const candidateAllowed = candidate => !excluded.has(candidate.candidateId)
+        && !exclusionTemplates.some(template => (
+          settlementTemplateConflictsWithCandidate(candidate, template)
+        ));
+      const firstProjection = (context.settlementTemplates ?? []).map(template => (
+        projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
+          sampleTerrainHeightAt: ownerSampler.sampleNaturalHeightMeters,
+        })
+      ));
+      const settlementRegionRefs = context.settlementRegionRefs
+        ?? context.settlementReferences
+        ?? firstProjection.flatMap(value => value.references);
+      const preliminarySurfacePolicy = context.canonicalSurfacePolicy
+        ?? createSettlementSurfacePolicy(settlementRegionRefs);
+      const preliminaryGround = createSharedCanonicalGroundKernel({
+        canonicalSurfacePolicy: preliminarySurfacePolicy,
+        sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
       });
-      const rocks = candidates.rockCandidates.filter(candidate => !excluded.has(candidate.candidateId));
-      const canonicalSurfacePolicy = context.canonicalSurfacePolicy ?? null;
+      const projectedSettlements = (context.settlementTemplates ?? []).map(template => (
+        projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
+          sampleTerrainHeightAt: (worldX, worldZ) => (
+            preliminaryGround.settlementGround(worldX, worldZ).heightMeters
+          ),
+        })
+      ));
+      const settlementStructures = projectedSettlements.flatMap(value => value.features);
+      const majorRoadStructures = typeof context.resolveMajorRoadFeatures === 'function'
+        ? await context.resolveMajorRoadFeatures({
+          chunkX,
+          chunkZ,
+          ground: preliminaryGround,
+          settlementReferences: settlementRegionRefs,
+          settlementStructures,
+        }) ?? [] : [];
+      const preliminaryStructures = [
+        ...settlementStructures,
+        ...majorRoadStructures,
+        ...(context.structures ?? []),
+      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+      const riverProjection = context.includeCanonicalRiver === true
+        ? await createCanonicalRiverProjection({
+          worldSeedHash,
+          chunkX,
+          chunkZ,
+          settlementReferences: settlementRegionRefs,
+          roads: preliminaryStructures,
+          sampleSurfaceHeight: (worldX, worldZ) => (
+            preliminaryGround.finalGround(worldX, worldZ).heightMeters
+          ),
+        }) : null;
+      const canonicalSurfacePolicy = context.canonicalSurfacePolicy
+        ?? createSettlementSurfacePolicy(
+          settlementRegionRefs,
+          riverProjection?.surfaceCorridor ? [riverProjection.surfaceCorridor] : [],
+        );
       const ground = createSharedCanonicalGroundKernel({
         canonicalSurfacePolicy,
         sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
       });
+      const auxiliary = typeof context.resolvePresentationAuxiliary === 'function'
+        ? await context.resolvePresentationAuxiliary({
+          chunkX,
+          chunkZ,
+          ground,
+          settlementReferences: settlementRegionRefs,
+          structures: preliminaryStructures,
+          riverProjection,
+        }) ?? {} : {};
+      const water = [
+        ...(context.water ?? []),
+        ...(auxiliary.water ?? []),
+        ...(riverProjection?.waterSurface ? [riverProjection.waterSurface] : []),
+      ];
+      const landmarks = [...(context.landmarks ?? []), ...(auxiliary.landmarks ?? [])];
+      const candidateVisible = candidate => candidateAllowed(candidate)
+        && (typeof context.isNaturalCandidateAllowed !== 'function'
+          || context.isNaturalCandidateAllowed({
+            candidate,
+            structures: preliminaryStructures,
+            water,
+            landmarks,
+            riverProjection,
+            canonicalSurfacePolicy,
+          }) !== false);
+      const vegetation = naturalPolicy.selectVegetation({
+        candidates: candidates.vegetationCandidates.filter(candidateVisible),
+        settlementReferences: settlementRegionRefs,
+        experienceSpawn,
+        introDistanceMeters: context.introDistanceMeters ?? 11,
+      });
+      const rocks = candidates.rockCandidates.filter(candidateVisible);
       const resource = createPresentationOwnerResource({
         worldSeedHash,
         chunkX,
         chunkZ,
-        naturalCandidates: [...vegetation, ...rocks],
-        structures: context.structures ?? [],
-        settlementRegionRefs: context.settlementRegionRefs ?? context.settlementReferences ?? [],
+        // Full W8 preserves the formal Natural candidate base Y and applies
+        // the shared final-ground kernel to Terrain/structures separately.
+        // Presentation must retain that same canonical object identity.
+        naturalCandidates: [...vegetation, ...rocks].map(resolveW8CanonicalWorldObject),
+        structures: preliminaryStructures,
+        settlementRegionRefs,
         riverCorridorRefs: context.riverCorridorRefs
           ?? canonicalSurfacePolicy?.riverCorridors ?? [],
-        water: context.water ?? [],
-        landmarks: context.landmarks ?? [],
-        street: context.street ?? [],
+        water,
+        landmarks,
+        street: [...(context.street ?? []), ...(auxiliary.street ?? [])],
       });
       const completedAt = globalThis.performance?.now?.() ?? Date.now();
       return Object.freeze({
+        schemaVersion: 'w8-presentation-owner-data-1',
+        chunkId: resource.identity.chunkId,
+        contentHash: `presentation:${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${chunkX},${chunkZ}`,
+        chunkX,
+        chunkZ,
         resource,
         ground,
+        canonicalSurfacePolicy,
+        riverProjection,
         diagnostics: Object.freeze({
           denseTerrainMaterialized: false,
           fullNaturalExpanded: false,

@@ -34,6 +34,12 @@ import {
   resolveW8ObjectVisibilityMeters,
 } from '../world-object-canonical-contract.js';
 import {
+  expandPresentationAuxiliaryRecord,
+  expandPresentationNaturalRecord,
+  expandPresentationStructureRecord,
+  presentationOwnerResourceOf,
+} from '../presentation-owner-generator.js';
+import {
   createSettlementSurfacePolicy,
   resolveCanonicalGroundSurface,
   resolveCanonicalSurfaceColorRgb,
@@ -115,6 +121,9 @@ const SHARED_NATURAL_SILHOUETTE_MATERIAL = '__natural-silhouette__';
 const CANONICAL_QUERY_CONCURRENCY = 4;
 const CANONICAL_QUERY_MARGIN_METERS = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS;
 const PRESENTATION_SLICE_BUDGET_MS = 8;
+const isCanonicalNaturalResourceKind = value => (
+  value === 'canonical' || value === 'presentation'
+);
 // Checkpoints occur after a small batch, so reserve one millisecond for the
 // final batch overshoot while preserving the external <=4ms slice contract.
 const TERRAIN_PRESENTATION_STAGING_SLICE_BUDGET_MS = 2.5;
@@ -703,6 +712,14 @@ const chunkAabbIntersectsCircle = (chunkX, chunkZ, centerX, centerZ, radiusMeter
 };
 
 export function resolveW8CanonicalCandidateSet(chunkData) {
+  const presentation = presentationOwnerResourceOf(chunkData);
+  if (presentation) {
+    const natural = presentation.natural.map(expandPresentationNaturalRecord);
+    return Object.freeze({
+      vegetation: Object.freeze(natural.filter(record => record.objectType !== 'rock')),
+      rocks: Object.freeze(natural.filter(record => record.objectType === 'rock')),
+    });
+  }
   const layers = chunkData?.presentationLayers;
   const vegetationSource = layers?.natural?.vegetation
     ?? chunkData?.vegetationCandidates ?? chunkData?.vegetationProxies ?? [];
@@ -3453,6 +3470,7 @@ export async function createW8DistantPresentation({
     context,
     scheduler,
   }) => {
+    const presentationResource = presentationOwnerResourceOf(chunk);
     const layers = chunk.presentationLayers;
     if (includeNatural && context.generation.excludeNatural !== true) {
       const candidates = resolveW8CanonicalCandidateSet(chunk);
@@ -3479,7 +3497,7 @@ export async function createW8DistantPresentation({
             if (resolveW8CanonicalFarTreeDensityRank(canonical.stableId)
               >= policy.farDensity.innerDensity) continue;
           }
-          const canonicalGroundY = chunk.canonicalSurfacePolicy
+          const canonicalGroundY = chunk.canonicalSurfacePolicy && !presentationResource
             ? resolveCanonicalGroundSurface({
               chunkData: chunk, worldX: canonical.position.x, worldZ: canonical.position.z,
             }).heightMeters : canonical.position.y;
@@ -3513,7 +3531,7 @@ export async function createW8DistantPresentation({
           if (naturalKindFilter
             && !naturalKindFilter.has(W8_VEGETATION_LOD_KINDS.ROCK)) continue;
           const sourceRecord = resolveW8RockCanonicalObject(candidate);
-          const groundY = chunk.canonicalSurfacePolicy ? resolveCanonicalGroundSurface({
+          const groundY = chunk.canonicalSurfacePolicy && !presentationResource ? resolveCanonicalGroundSurface({
             chunkData: chunk, worldX: sourceRecord.worldPosition.x, worldZ: sourceRecord.worldPosition.z,
           }).heightMeters : sourceRecord.worldPosition.y;
           const record = Object.freeze({
@@ -3572,7 +3590,9 @@ export async function createW8DistantPresentation({
     }
     if (context.generation.treeOnly === true || context.generation.naturalOnly === true) return;
     if (includeNearDetails) {
-      for (const detail of layers?.streetDetails ?? chunk.streetDetails ?? []) {
+      for (const detail of presentationResource?.street?.map(
+        expandPresentationAuxiliaryRecord,
+      ) ?? layers?.streetDetails ?? chunk.streetDetails ?? []) {
         try {
           if (!['streetLamp', 'roadSign'].includes(detail.detailType)) continue;
           addCanonicalRecord({
@@ -3604,6 +3624,8 @@ export async function createW8DistantPresentation({
       }
     }
     const records = [
+      ...(presentationResource?.structures ?? []).map(expandPresentationStructureRecord),
+      ...(presentationResource?.landmarks ?? []).map(expandPresentationAuxiliaryRecord),
       ...(layers?.formal?.roadsAndBuildings ?? chunk.settlementFeatures ?? []),
       ...(layers?.landmarks ?? chunk.settlementLandmarks ?? []),
     ];
@@ -6986,7 +7008,7 @@ export async function createW8DistantPresentation({
           throw new TypeError('invalid Static Natural owner resource coverage');
         }
         const [ownerKey, resourceKind] = resourceEntry;
-        if (resourceKind !== 'canonical') continue;
+        if (!isCanonicalNaturalResourceKind(resourceKind)) continue;
         if (!generation.naturalKindsByOwner.has(ownerKey)) {
           generation.naturalKindsByOwner.set(ownerKey, new Set());
         }
@@ -7082,7 +7104,7 @@ export async function createW8DistantPresentation({
         persistentTreePromotionReuseCount += 1;
         pendingPersistentTreePages.set(ownerKey, Object.freeze({
           ownerKey,
-          resourceKind: 'canonical',
+          resourceKind: persistentTreeDesiredResourceKinds.get(ownerKey) ?? 'presentation',
           value,
           readyAtMs: monotonicNow(),
           required: true,
@@ -7151,7 +7173,7 @@ export async function createW8DistantPresentation({
         isTreeTierPromotion: promotion,
       });
       if (!retained.has(page.ownerKey)) continue;
-      if (page.resourceKind !== 'canonical') {
+      if (!isCanonicalNaturalResourceKind(page.resourceKind)) {
         if (page.isTreeTierPromotion === true) {
           pendingPersistentTreePromotionRequests.delete(page.ownerKey);
         }
@@ -7841,7 +7863,7 @@ export async function createW8DistantPresentation({
     persistentTreeBuildQueuedCount += 1;
     const execute = async () => {
       if (!requestedGeneration || requestedGeneration !== persistentTreeGeneration) return null;
-      if (page.resourceKind !== 'canonical') {
+      if (!isCanonicalNaturalResourceKind(page.resourceKind)) {
         if (page.isTreeTierPromotion === true) {
           pendingPersistentTreePromotionRequests.delete(page.ownerKey);
         }
@@ -10420,6 +10442,16 @@ export async function createW8DistantPresentation({
       canonicalChunkSuccessCount: chunks.filter(value => value.chunk).length,
       naturalCandidateCount: chunks.reduce((sum, value) => {
         if ((!value.includeNaturalInner && !value.includeNaturalUltra) || !value.chunk) return sum;
+        const presentationResource = presentationOwnerResourceOf(value.chunk);
+        if (presentationResource) {
+          return sum + presentationResource.natural.filter(candidate => (
+            candidate.objectType !== 'rock'
+            && Math.hypot(
+              candidate.position[0] - naturalCenterWorldX,
+              candidate.position[2] - naturalCenterWorldZ,
+            ) <= naturalQueryRadius
+          )).length;
+        }
         const vegetation = value.chunk.presentationLayers?.natural?.vegetation
           ?? value.chunk.vegetationCandidates ?? [];
         return sum + vegetation.filter(candidate => isW8NaturalCandidateVisible(candidate)
@@ -10429,12 +10461,19 @@ export async function createW8DistantPresentation({
           ) <= naturalQueryRadius).length;
       }, 0),
       settlementFeatureCount: chunks.reduce(
-        (sum, value) => sum + (value.chunk?.settlementFeatures?.length ?? 0),
+        (sum, value) => sum + (
+          presentationOwnerResourceOf(value.chunk)?.structures?.length
+          ?? value.chunk?.settlementFeatures?.length
+          ?? 0
+        ),
         0,
       ),
       majorRoadFeatureCount: chunks.reduce(
-        (sum, value) => sum + (value.chunk?.settlementFeatures ?? [])
-          .filter(feature => feature.canonicalMajorRoad === true).length,
+        (sum, value) => sum + (
+          presentationOwnerResourceOf(value.chunk)?.structures
+          ?? value.chunk?.settlementFeatures
+          ?? []
+        ).filter(feature => feature.canonicalMajorRoad === true).length,
         0,
       ),
       landmarkCount: chunks.reduce(

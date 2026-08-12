@@ -90,7 +90,7 @@ function distanceToSegment(point, start, end) {
   return Math.hypot(point.x - start.x - dx * t, point.z - start.z - dz * t);
 }
 
-function conflictsWithTemplate(candidate, template) {
+export function settlementTemplateConflictsWithCandidate(candidate, template) {
   const radius = candidate.metadata?.candidateRadiusMeters ?? 0;
   if (Math.hypot(candidate.worldPosition.x - template.center.x, candidate.worldPosition.z - template.center.z)
     > template.influenceRadiusMeters + radius + 1) return false;
@@ -102,7 +102,17 @@ function conflictsWithTemplate(candidate, template) {
   ) <= building.radiusMeters + radius + 0.35);
 }
 
-export function projectMigratedSettlementTemplate(template, chunk) {
+export function projectMigratedSettlementTemplate(
+  template,
+  chunk,
+  { sampleTerrainHeightAt = null } = {},
+) {
+  if (sampleTerrainHeightAt !== null && typeof sampleTerrainHeightAt !== 'function') {
+    throw new TypeError('sampleTerrainHeightAt must be a function when provided');
+  }
+  const sampleHeight = point => sampleTerrainHeightAt === null
+    ? sampleTerrainHeight(chunk, point)
+    : q6(sampleTerrainHeightAt(point.x, point.z));
   const bounds = chunkBounds(chunk.chunkX, chunk.chunkZ);
   if (rectangleDistance(template.center, bounds) > template.influenceRadiusMeters) {
     return { features: [], references: [] };
@@ -122,7 +132,7 @@ export function projectMigratedSettlementTemplate(template, chunk) {
       sourceStableId: road.stableId,
       start: Object.freeze(clipped.start),
       end: Object.freeze(clipped.end),
-      worldPosition: Object.freeze({ ...midpoint, y: sampleTerrainHeight(chunk, midpoint) }),
+      worldPosition: Object.freeze({ ...midpoint, y: sampleHeight(midpoint) }),
       owningChunkCoordinate: Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ }),
     }));
   }
@@ -134,7 +144,7 @@ export function projectMigratedSettlementTemplate(template, chunk) {
       settlementType: template.settlementType,
       worldPosition: Object.freeze({
         x: building.x,
-        y: sampleTerrainHeight(chunk, building),
+        y: sampleHeight(building),
         z: building.z,
       }),
       owningChunkCoordinate: Object.freeze(owner),
@@ -337,10 +347,10 @@ export async function createDistributedSettlementChunkGenerator({
       const settlementFeatures = projections.flatMap(projection => projection.features)
         .sort((a, b) => a.stableId.localeCompare(b.stableId));
       const vegetationCandidates = formal.vegetationCandidates.filter(candidate => (
-        !templates.some(template => conflictsWithTemplate(candidate, template))
+        !templates.some(template => settlementTemplateConflictsWithCandidate(candidate, template))
       ));
       const rockCandidates = formal.rockCandidates.filter(candidate => (
-        !templates.some(template => conflictsWithTemplate(candidate, template))
+        !templates.some(template => settlementTemplateConflictsWithCandidate(candidate, template))
       ));
       if (stageRecorder) stageRecorder.end(settlementToken);
       const chunkId = createChunkId({
