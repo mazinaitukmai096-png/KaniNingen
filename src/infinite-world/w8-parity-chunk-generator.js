@@ -54,6 +54,7 @@ import {
 } from './w8-settlement-parity-overlay.js';
 import {
   createSettlementSurfacePolicy,
+  resolveCanonicalSettlementGroundSurface,
   sampleW8SurfaceHeightMeters,
 } from './w8-surface-policy.js';
 import {
@@ -2048,7 +2049,11 @@ export async function createW8ParityChunkGenerator({
     });
     const settlementGroundPosition = position => Object.freeze({
       ...position,
-      y: q6(sampleW8SurfaceHeightMeters(localSurfaceBackedChunk, position.x, position.z)),
+      y: q6(resolveCanonicalSettlementGroundSurface({
+        chunkData: localSurfaceBackedChunk,
+        worldX: position.x,
+        worldZ: position.z,
+      }).heightMeters),
     });
     const reground = record => Object.freeze({
       ...record,

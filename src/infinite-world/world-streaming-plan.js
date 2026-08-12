@@ -221,7 +221,16 @@ export function createLegacyRuntimeChunkStreamingPolicy({ ownerMetadataCache = n
       maximumDistanceMeters: 16,
       sampleIntervalSeconds: 0.1,
     }),
-    ownerResolver({ player, velocityCorridor, policy }) {
+    ownerResolver({ player, velocityCorridor, policy, residentCoverage = null }) {
+      if (residentCoverage?.schemaVersion === 'resident-world-coverage-1') {
+        const required = residentCoverage.residentRequiredOwnerKeys;
+        return {
+          required,
+          prefetched: Object.freeze([]),
+          retained: required,
+          sourceHash: residentCoverage.signature,
+        };
+      }
       const currentOwner = logicalWorldToOwnedChunk(player.x, player.z);
       const required = squareChunkCoordinates(
         currentOwner.chunkX,
@@ -275,6 +284,7 @@ export function createWorldStreamingPlan({
   originGeneration = 0,
   policies,
   ownerMetadataCache = null,
+  residentCoverage = null,
 } = {}) {
   if (!Number.isSafeInteger(sequence) || sequence < 1) {
     throw new RangeError('World Streaming plan sequence must be a positive safe integer');
@@ -289,6 +299,10 @@ export function createWorldStreamingPlan({
   }
   if (!Array.isArray(policies) || policies.length === 0) {
     throw new TypeError('at least one World Streaming policy is required');
+  }
+  if (residentCoverage !== null
+    && residentCoverage?.schemaVersion !== 'resident-world-coverage-1') {
+    throw new TypeError('residentCoverage must use the Resident World coverage contract');
   }
   const logicalPlayer = normalizePosition(player, 'player');
   const logicalVelocity = normalizePosition(velocity, 'velocity');
@@ -306,6 +320,7 @@ export function createWorldStreamingPlan({
       stateRevision,
       originGeneration,
       policy,
+      residentCoverage,
     });
     const requiredOwnerKeys = normalizeOwnerKeys(
       resolved?.required ?? [],
@@ -376,6 +391,7 @@ export function createWorldStreamingPlan({
     renderDistancePreset,
     stateRevision,
     originGeneration,
+    residentCoverage: residentCoverage?.signature ?? null,
     policies: policyPlans.map(policy => ({
       kind: policy.kind,
       ...(policy.sourceHash ? { sourceHash: policy.sourceHash } : {
@@ -412,6 +428,7 @@ export function createWorldStreamingPlan({
     renderDistancePreset,
     stateRevision,
     originGeneration,
+    residentCoverage,
     policyPlans: Object.freeze(policyPlans),
     publicationGroups: Object.freeze(publicationGroups),
     signatureHash: hashText(signature),

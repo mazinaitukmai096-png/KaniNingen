@@ -10,6 +10,7 @@ import {
 } from './world-streaming-policy-registry.js';
 import { WORLD_STREAMING_PUBLICATION_CONTEXT_SCHEMA } from './natural-streaming-coverage.js';
 import { unionNormalizedOwnerKeys } from './world-streaming-plan.js';
+import { residentOwnerKeysWithinRadius } from './chunk-streaming-plan.js';
 
 export const STATIC_OBJECT_STREAM_SCHEMA = 'static-object-stream-1';
 export const WORLD_PUBLICATION_TICKET_SCHEMA = 'world-publication-ticket-1';
@@ -205,22 +206,48 @@ export function createCircularStaticStreamingPolicy({
     });
   };
   const coverageCache = new Map();
-  const ownerResolver = ({ player, velocityCorridor, renderDistancePreset }) => {
+  const ownerResolver = ({
+    player,
+    velocityCorridor,
+    renderDistancePreset,
+    residentCoverage = null,
+  }) => {
     const playerOwner = logicalWorldToOwnedChunk(player.x, player.z);
     const endpointOwner = logicalWorldToOwnedChunk(
       velocityCorridor.endpoint.x,
       velocityCorridor.endpoint.z,
     );
-    const coverageKey = `${renderDistancePreset}:${playerOwner.key}:${endpointOwner.key}`;
+    const coverageKey = `${renderDistancePreset}:${residentCoverage?.signature
+      ?? playerOwner.key}:${endpointOwner.key}`;
     const cached = coverageCache.get(coverageKey);
     if (cached) {
       coverageCache.delete(coverageKey);
       coverageCache.set(coverageKey, cached);
       return cached;
     }
-    const required = coverageFor(player, renderDistancePreset);
     const profile = distanceProfileResolver(renderDistancePreset);
-    const exactOwnerKeys = new Set();
+    const presentationRadiusMeters = Math.max(
+      profile.exactDistanceMeters,
+      profile.horizonDistanceMeters ?? profile.exactDistanceMeters,
+    );
+    const requiredRadiusMeters = residentCoverage === null
+      ? presentationRadiusMeters
+      : Math.min(
+        residentCoverage.radiusMeters,
+        presentationRadiusMeters + LOGICAL_CHUNK_SIZE_METERS,
+      );
+    const required = residentCoverage === null
+      ? coverageFor(player, renderDistancePreset)
+      : new Set(residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters));
+    const exactOwnerKeys = residentCoverage === null
+      ? new Set()
+      : new Set(residentOwnerKeysWithinRadius(
+        residentCoverage,
+        Math.min(
+          residentCoverage.radiusMeters,
+          profile.exactDistanceMeters + LOGICAL_CHUNK_SIZE_METERS,
+        ),
+      ));
     const prefetched = collectCorridorOwners({
       start: player,
       end: velocityCorridor.endpoint,
@@ -230,7 +257,11 @@ export function createCircularStaticStreamingPolicy({
       exactOwnerKeys,
     });
     for (const ownerKey of required) prefetched.delete(ownerKey);
-    const retained = coverageFor(player, renderDistancePreset, retentionMarginMeters);
+    const retainedRadiusMeters = requiredRadiusMeters + retentionMarginMeters;
+    const retained = residentCoverage !== null
+      && retainedRadiusMeters <= residentCoverage.radiusMeters
+      ? new Set(residentOwnerKeysWithinRadius(residentCoverage, retainedRadiusMeters))
+      : coverageFor(player, renderDistancePreset, retentionMarginMeters);
     const requiredOwnerKeys = freezeCollectedOwnerKeys(required, ownerMetadataCache);
     const prefetchedOwnerKeys = freezeCollectedOwnerKeys(prefetched, ownerMetadataCache);
     const retainedOwnerKeys = unionNormalizedOwnerKeys(

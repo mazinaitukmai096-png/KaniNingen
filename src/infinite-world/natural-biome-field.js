@@ -117,10 +117,20 @@ export async function createNaturalBiomeEvaluator({ worldSeedHash }) {
     forest: seed32(seed64, 37),
   });
 
-  return Object.freeze({
-    evaluate(position, macroSample, slope) {
+  const evaluateMoisture = position => {
+      if (![position?.x, position?.z].every(Number.isFinite)) {
+        throw new TypeError('finite biome position is required');
+      }
+      return q6(clamp(0.5 + fractal(
+        seeds.moisture,
+        position.x,
+        position.z,
+        768,
+        3,
+      ) * 0.48));
+  };
+  const evaluateWithMoisture = (position, macroSample, slope, moisture) => {
       const temperature = q6(clamp(0.5 + fractal(seeds.temperature, position.x, position.z, 1536, 3) * 0.42));
-      const moisture = q6(clamp(0.5 + fractal(seeds.moisture, position.x, position.z, 768, 3) * 0.48));
       const forestPatch = q6(clamp(0.5 + fractal(seeds.forest, position.x, position.z, 224, 2) * 0.5));
       const elevationMeters = 0.4 + macroSample.offsetMm * 0.001;
       const ridge = clamp(macroSample.components.ridgesMm / 1450);
@@ -140,6 +150,17 @@ export async function createNaturalBiomeEvaluator({ worldSeedHash }) {
         primaryBiomeId: memberships[0].biomeId,
         climate: Object.freeze({ temperature, moisture, forestPatch }),
       });
+  };
+  return Object.freeze({
+    evaluateMoisture,
+    evaluateWithMoisture,
+    evaluate(position, macroSample, slope) {
+      return evaluateWithMoisture(
+        position,
+        macroSample,
+        slope,
+        evaluateMoisture(position),
+      );
     },
   });
 }

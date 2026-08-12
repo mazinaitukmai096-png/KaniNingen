@@ -14,7 +14,11 @@ import {
   logicalWorldToRenderLocal,
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
-import { planRuntimeTerrainReadySet } from './chunk-streaming-plan.js';
+import {
+  RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+  createResidentWorldCoverage,
+  planRuntimeTerrainReadySet,
+} from './chunk-streaming-plan.js';
 import { sameRuntimeTransitionContract } from './runtime-transition-contract.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import {
@@ -1472,7 +1476,7 @@ export async function bootInfiniteWorldSandbox({
       });
       chunkDataService = new ChunkDataService({
         transport: chunkGeneratorTransport,
-        cacheCapacity: 81,
+        cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
         telemetry: streamingTelemetry,
         onPipelineEvent: recordPipelineDiagnosticEvent,
       });
@@ -1703,7 +1707,7 @@ export async function bootInfiniteWorldSandbox({
       runtime = runtimeFactory({
         chunkDataService,
         renderAdapter: measuredRenderAdapter,
-        cacheCapacity: 81,
+        cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
         chunkIndex,
         onPipelineEvent: recordPipelineDiagnosticEvent,
       });
@@ -1715,6 +1719,20 @@ export async function bootInfiniteWorldSandbox({
       };
     });
     const { logicalPlayer, initialOwner } = runtimeContext;
+    let residentWorldCoverage = createResidentWorldCoverage({
+      centerChunkX: initialOwner.chunkX,
+      centerChunkZ: initialOwner.chunkZ,
+    });
+    const resolveResidentWorldCoverage = () => {
+      const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      if (residentWorldCoverage.centerOwnerKey !== owner.key) {
+        residentWorldCoverage = createResidentWorldCoverage({
+          centerChunkX: owner.chunkX,
+          centerChunkZ: owner.chunkZ,
+        });
+      }
+      return residentWorldCoverage;
+    };
 
     await runStage('Terrain', () => runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ));
     scenePresentation.rebase(runtime.snapshot().renderOrigin);
@@ -1737,6 +1755,9 @@ export async function bootInfiniteWorldSandbox({
         return 'canonical';
       },
       ownerMetadataCache: streamingOwnerMetadataCache,
+      queueCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+      readyCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+      ticketCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY * 2,
       clock,
       requestOwner: ({
         ownerKey,
@@ -3416,6 +3437,7 @@ export async function bootInfiniteWorldSandbox({
     function requestTerrainReadySet(movement) {
       const streaming = runtime.getStreamingState();
       if (streaming.centerChunkX === null) return;
+      const currentResidentCoverage = resolveResidentWorldCoverage();
       let plan;
       try {
         plan = planRuntimeTerrainReadySet({
@@ -3428,6 +3450,7 @@ export async function bootInfiniteWorldSandbox({
           speedMetersPerSecond: movement.speedMetersPerSecond,
           scaleStageId: movement.scaleStageId,
           sprint: movement.sprint,
+          residentCoverage: currentResidentCoverage,
         });
       } catch (error) {
         transitionError = error;
@@ -3686,11 +3709,12 @@ export async function bootInfiniteWorldSandbox({
             player: { x: logicalPlayer.x, z: logicalPlayer.z },
             velocity: { x: movement.velocityX, z: movement.velocityZ },
             renderDistancePreset: requestedDistantRenderDistance,
+            residentCoverage: resolveResidentWorldCoverage(),
             currentRequests: {
               [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
-                requiredOwnerKeys: committedChunkState.renderedKeys,
-                requestOwnerKeys: committedChunkState.activeDataKeys,
-                retainedOwnerKeys: committedChunkState.activeDataKeys,
+                requiredOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
+                requestOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
+                retainedOwnerKeys: residentWorldCoverage.residentRequiredOwnerKeys,
               },
               ...(settlementStreamingObservation ? {
                 [W8_BUILDING_STREAM_POLICY_KIND]: {

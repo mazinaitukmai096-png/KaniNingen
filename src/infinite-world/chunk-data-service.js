@@ -81,6 +81,7 @@ export class ChunkDataService {
     this.agingIntervalMs = agingIntervalMs;
     this.requiredLookaheadCapacity = requiredLookaheadCapacity;
     this.completed = new Map();
+    this.protectedOwnerKeys = new Set();
     this.identityAudit = new Map();
     this.pending = new Map();
     this.queue = [];
@@ -109,6 +110,8 @@ export class ChunkDataService {
       subscriberCancels: 0,
       staleSubscriberResults: 0,
       completedEvictions: 0,
+      protectedOwnerEvictions: 0,
+      protectedOwnerSetUpdates: 0,
       identityAuditEvictions: 0,
       identityMismatchCount: 0,
       shutdownLateResultCount: 0,
@@ -333,6 +336,30 @@ export class ChunkDataService {
     return this.#getCompleted(createChunkDataRequestKey(chunkX, chunkZ)) ?? null;
   }
 
+  replaceProtectedOwnerKeys(ownerKeys) {
+    if (!Array.isArray(ownerKeys) && !(ownerKeys instanceof Set)) {
+      throw new TypeError('protected owner keys must be an array or Set');
+    }
+    const next = new Set(ownerKeys);
+    if ([...next].some(key => typeof key !== 'string' || key.length === 0)) {
+      throw new TypeError('protected owner keys must be non-empty strings');
+    }
+    if (next.size > this.cacheCapacity) {
+      throw new RangeError(
+        `protected owner set exceeds ChunkData cache capacity: ${next.size}/${this.cacheCapacity}`,
+      );
+    }
+    const previous = this.protectedOwnerKeys;
+    this.protectedOwnerKeys = next;
+    this.counts.protectedOwnerSetUpdates += 1;
+    this.#trimCompletedCache();
+    return Object.freeze({
+      unchanged: [...next].filter(key => previous.has(key)).length,
+      entering: [...next].filter(key => !previous.has(key)).length,
+      leaving: [...previous].filter(key => !next.has(key)).length,
+    });
+  }
+
   snapshot() {
     const timestamp = this.clock();
     const queued = [...this.queue].filter(entry => entry.state === 'queued').sort(
@@ -344,6 +371,10 @@ export class ChunkDataService {
       cacheCapacity: this.cacheCapacity,
       completedCacheSize: this.completed.size,
       completedKeys: Object.freeze([...this.completed.keys()]),
+      protectedOwnerCount: this.protectedOwnerKeys.size,
+      protectedResidentOwnerCount: [...this.protectedOwnerKeys]
+        .filter(key => this.completed.has(key)).length,
+      protectedOwnerKeys: Object.freeze([...this.protectedOwnerKeys]),
       identityAuditSize: this.identityAudit.size,
       pendingCount: this.pending.size,
       queuedCount: queued.length,
@@ -389,6 +420,7 @@ export class ChunkDataService {
     this.queue.length = 0;
     await this.transport.shutdown?.();
     this.completed.clear();
+    this.protectedOwnerKeys.clear();
     this.identityAudit.clear();
   }
 
@@ -835,11 +867,28 @@ export class ChunkDataService {
     }
     if (cached) return cached.data;
     this.completed.set(entry.key, { data: chunkData, identity });
+    this.#trimCompletedCache();
+    return chunkData;
+  }
+
+  #trimCompletedCache() {
     while (this.completed.size > this.cacheCapacity) {
-      this.completed.delete(this.completed.keys().next().value);
+      let evictableKey;
+      for (const key of this.completed.keys()) {
+        if (this.protectedOwnerKeys.has(key)) continue;
+        evictableKey = key;
+        break;
+      }
+      if (evictableKey === undefined) {
+        throw new Error('ChunkData cache capacity is smaller than protected Resident owners');
+      }
+      if (this.protectedOwnerKeys.has(evictableKey)) {
+        this.counts.protectedOwnerEvictions += 1;
+        throw new Error(`protected Resident owner selected for eviction: ${evictableKey}`);
+      }
+      this.completed.delete(evictableKey);
       this.counts.completedEvictions += 1;
     }
-    return chunkData;
   }
 
   #getCompleted(key) {

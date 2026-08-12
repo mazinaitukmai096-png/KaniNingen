@@ -10,6 +10,8 @@ export const W8_SURFACE_POLICY_IDS = Object.freeze({
   SETTLEMENT_GRADED: 'SETTLEMENT_GRADED',
   NATURAL_TERRAIN: 'NATURAL_TERRAIN',
 });
+export const W8_SHARED_CANONICAL_GROUND_REVISION =
+  'shared-canonical-ground-kernel-1';
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
@@ -27,6 +29,7 @@ const rgb = hex => [
 ].map(channel => srgbChannelToLinear(channel / 255));
 const mixColor = (left, right, weight) => left.map((channel, index) =>
   channel + (right[index] - channel) * weight);
+const canonicalGroundKernelByChunkData = new WeakMap();
 
 export function finiteSettlementSurfaceColorRgb(worldX, worldZ) {
   const base = rgb(0x7d8f4f);
@@ -113,43 +116,106 @@ export function resolveCanonicalSurfaceWeights(policy, worldX, worldZ) {
   });
 }
 
-export function resolveCanonicalGroundSurface({ chunkData, worldX, worldZ }) {
+/**
+ * Shared canonical ground contract. Presentation data can supply a sparse
+ * Natural-height sampler while Full/Near keeps using its dense ChunkData. Road
+ * and Building callers use settlementGround (pre-river); Terrain/collision use
+ * finalGround (post-river). Both paths share grading, river, and q6 semantics.
+ */
+export function createSharedCanonicalGroundKernel({
+  sampleNaturalHeightMeters,
+  canonicalSurfacePolicy = null,
+} = {}) {
+  if (typeof sampleNaturalHeightMeters !== 'function') {
+    throw new TypeError('canonical Natural height sampler is required');
+  }
+  const resolveSettlement = (worldX, worldZ) => {
+    if (![worldX, worldZ].every(Number.isFinite)) {
+      throw new TypeError('finite world coordinates are required');
+    }
+    const naturalHeightMeters = sampleNaturalHeightMeters(worldX, worldZ);
+    if (!Number.isFinite(naturalHeightMeters)) {
+      throw new TypeError('canonical Natural height must be finite');
+    }
+    const weights = resolveCanonicalSurfaceWeights(
+      canonicalSurfacePolicy,
+      worldX,
+      worldZ,
+    );
+    const baseHeightMeters = naturalHeightMeters * weights.naturalWeight;
+    return {
+      rawBaseHeightMeters: baseHeightMeters,
+      surface: Object.freeze({
+      ...weights,
+      heightMeters: q6(baseHeightMeters),
+      baseHeightMeters: q6(baseHeightMeters),
+      naturalHeightMeters: q6(naturalHeightMeters),
+      riverStableId: null,
+      riverDistanceMeters: null,
+      riverDepthMeters: 0,
+      riverBankWeight: 0,
+      riverSurfaceHeightMeters: null,
+      }),
+    };
+  };
+  const settlementGround = (worldX, worldZ) => resolveSettlement(worldX, worldZ).surface;
+  const finalGround = (worldX, worldZ) => {
+    const resolvedSettlement = resolveSettlement(worldX, worldZ);
+    const settlement = resolvedSettlement.surface;
+    const river = resolveCanonicalRiverBed(
+      canonicalSurfacePolicy?.riverCorridors,
+      worldX,
+      worldZ,
+    );
+    return Object.freeze({
+      ...settlement,
+      heightMeters: q6(resolvedSettlement.rawBaseHeightMeters - river.depthMeters),
+      riverStableId: river.sourceStableId,
+      riverDistanceMeters: Number.isFinite(river.distanceMeters)
+        ? q6(river.distanceMeters) : null,
+      riverDepthMeters: q6(river.depthMeters),
+      riverBankWeight: q6(river.bankWeight),
+      riverSurfaceHeightMeters: river.depthMeters > 0
+        ? q6(resolvedSettlement.rawBaseHeightMeters) : null,
+    });
+  };
+  return Object.freeze({
+    schemaVersion: W8_SHARED_CANONICAL_GROUND_REVISION,
+    settlementGround,
+    finalGround,
+  });
+}
+
+export function createChunkDataCanonicalGroundKernel(chunkData) {
+  if (chunkData && typeof chunkData === 'object') {
+    const cached = canonicalGroundKernelByChunkData.get(chunkData);
+    if (cached) return cached;
+  }
   const source = chunkData?.sourceChunkData ?? chunkData;
   if (!source?.terrain) throw new TypeError('W5-backed ChunkData is required');
-  if (![worldX, worldZ].every(Number.isFinite)) throw new TypeError('finite world coordinates are required');
   const minimumX = source.chunkX * LOGICAL_CHUNK_SIZE_METERS;
   const minimumZ = source.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
   const epsilon = 1e-9;
-  const sampleX = Math.max(minimumX + epsilon,
-    Math.min(minimumX + LOGICAL_CHUNK_SIZE_METERS, worldX));
-  const sampleZ = Math.max(minimumZ + epsilon,
-    Math.min(minimumZ + LOGICAL_CHUNK_SIZE_METERS, worldZ));
-  const naturalHeightMeters = sampleFormalTerrainHeightMeters(source, sampleX, sampleZ);
-  const weights = resolveCanonicalSurfaceWeights(
-    chunkData?.canonicalSurfacePolicy,
-    worldX,
-    worldZ,
-  );
-  const baseHeightMeters = naturalHeightMeters * weights.naturalWeight;
-  const river = resolveCanonicalRiverBed(
-    chunkData?.canonicalSurfacePolicy?.riverCorridors,
-    worldX,
-    worldZ,
-  );
-  const riverSurfaceHeightMeters = river.depthMeters > 0 ? baseHeightMeters : null;
-  return Object.freeze({
-    ...weights,
-    heightMeters: q6(baseHeightMeters - river.depthMeters),
-    baseHeightMeters: q6(baseHeightMeters),
-    naturalHeightMeters: q6(naturalHeightMeters),
-    riverStableId: river.sourceStableId,
-    riverDistanceMeters: Number.isFinite(river.distanceMeters)
-      ? q6(river.distanceMeters) : null,
-    riverDepthMeters: q6(river.depthMeters),
-    riverBankWeight: q6(river.bankWeight),
-    riverSurfaceHeightMeters: riverSurfaceHeightMeters === null
-      ? null : q6(riverSurfaceHeightMeters),
+  const kernel = createSharedCanonicalGroundKernel({
+    canonicalSurfacePolicy: chunkData?.canonicalSurfacePolicy,
+    sampleNaturalHeightMeters(worldX, worldZ) {
+      const sampleX = Math.max(minimumX + epsilon,
+        Math.min(minimumX + LOGICAL_CHUNK_SIZE_METERS, worldX));
+      const sampleZ = Math.max(minimumZ + epsilon,
+        Math.min(minimumZ + LOGICAL_CHUNK_SIZE_METERS, worldZ));
+      return sampleFormalTerrainHeightMeters(source, sampleX, sampleZ);
+    },
   });
+  canonicalGroundKernelByChunkData.set(chunkData, kernel);
+  return kernel;
+}
+
+export function resolveCanonicalGroundSurface({ chunkData, worldX, worldZ }) {
+  return createChunkDataCanonicalGroundKernel(chunkData).finalGround(worldX, worldZ);
+}
+
+export function resolveCanonicalSettlementGroundSurface({ chunkData, worldX, worldZ }) {
+  return createChunkDataCanonicalGroundKernel(chunkData).settlementGround(worldX, worldZ);
 }
 
 export function sampleW8SurfaceHeightMeters(chunkData, worldX, worldZ) {

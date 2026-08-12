@@ -26,7 +26,9 @@ import {
 export const W2_GENERATOR_VERSION = parseGeneratorVersion('200.0.0');
 export const W2_CHUNK_DATA_SCHEMA = 'w2-natural-chunk-data-1';
 export const W2_TERRAIN_RESOLUTION = 33;
-const TERRAIN_STEP_METERS = LOGICAL_CHUNK_SIZE_METERS / (W2_TERRAIN_RESOLUTION - 1);
+export const W2_TERRAIN_STEP_METERS =
+  LOGICAL_CHUNK_SIZE_METERS / (W2_TERRAIN_RESOLUTION - 1);
+const TERRAIN_STEP_METERS = W2_TERRAIN_STEP_METERS;
 const HEIGHT_UNIT_METERS = 0.001;
 const EXTENDED_RESOLUTION = W2_TERRAIN_RESOLUTION + 2;
 const NATURAL_MATERIAL_ORDER = Object.freeze(['grass', 'drySoil', 'wetSoil', 'sand', 'rock']);
@@ -43,6 +45,302 @@ function extendedIndex(x, z) {
 function normalizeTerrainHeight(value) {
   const rounded = Math.round(value);
   return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+/**
+ * Shared source of truth for one canonical 0.5 m Natural lattice sample.
+ * Dense W2 generation and the lightweight Presentation sampler both call this
+ * function; only the surrounding materialization strategy differs.
+ */
+export function resolveCanonicalNaturalLatticeSample({
+  position,
+  macro,
+  eastOffsetMm,
+  westOffsetMm,
+  southOffsetMm,
+  northOffsetMm,
+  biomeEvaluator,
+}) {
+  if (![position?.x, position?.z, macro?.offsetMm, eastOffsetMm, westOffsetMm,
+    southOffsetMm, northOffsetMm].every(Number.isFinite)
+    || typeof biomeEvaluator?.evaluateMoisture !== 'function'
+    || typeof biomeEvaluator?.evaluateWithMoisture !== 'function') {
+    throw new TypeError('canonical Natural lattice inputs are required');
+  }
+  const climateMoisture = biomeEvaluator.evaluateMoisture(position);
+  const core = resolveCanonicalNaturalLatticeCoreSample({
+    position,
+    macro,
+    eastOffsetMm,
+    westOffsetMm,
+    southOffsetMm,
+    northOffsetMm,
+    climateMoisture,
+  });
+  const biome = biomeEvaluator.evaluateWithMoisture(
+    position,
+    macro,
+    core.slope,
+    climateMoisture,
+  );
+  return Object.freeze({
+    ...core,
+    materialWeights: Object.freeze(naturalMaterialWeights(
+      biome.memberships,
+      core.moisture,
+      core.rockiness,
+      core.slope,
+    )),
+    biome,
+  });
+}
+
+export function resolveCanonicalNaturalLatticeCoreSample({
+  position,
+  macro,
+  eastOffsetMm,
+  westOffsetMm,
+  southOffsetMm,
+  northOffsetMm,
+  climateMoisture,
+}) {
+  if (![position?.x, position?.z, macro?.offsetMm, eastOffsetMm, westOffsetMm,
+    southOffsetMm, northOffsetMm, climateMoisture].every(Number.isFinite)) {
+    throw new TypeError('canonical Natural lattice core inputs are required');
+  }
+  const dx = (eastOffsetMm - westOffsetMm) * HEIGHT_UNIT_METERS
+    / (2 * TERRAIN_STEP_METERS);
+  const dz = (southOffsetMm - northOffsetMm) * HEIGHT_UNIT_METERS
+    / (2 * TERRAIN_STEP_METERS);
+  const slope = q6(Math.hypot(dx, dz));
+  const heightMm = normalizeTerrainHeight(400 + macro.offsetMm);
+  const ridge = clamp(macro.components.ridgesMm / G5_MACRO_TERRAIN.ridges.amplitudeMm);
+  const steep = clamp(slope / Math.max(0.001, G5_MACRO_TERRAIN.maximumSlope));
+  return Object.freeze({
+    heightMm,
+    slope,
+    moisture: q6(clamp(climateMoisture
+      + clamp(-macro.components.valleysMm / G5_MACRO_TERRAIN.valleys.amplitudeMm) * 0.12
+      - ridge * 0.09)),
+    rockiness: q6(clamp(0.035 + ridge * 0.36 + steep * 0.58)),
+  });
+}
+
+export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEvaluator }) {
+  if (typeof macroEvaluator?.evaluate !== 'function'
+    || typeof biomeEvaluator?.evaluate !== 'function') {
+    throw new TypeError('macro and biome evaluators are required');
+  }
+  const resolveLattice = (worldX, worldZ, macroAt) => {
+    if (![worldX, worldZ].every(Number.isFinite)) {
+      throw new TypeError('finite Natural lattice coordinates are required');
+    }
+    const macro = macroAt(worldX, worldZ);
+    return resolveCanonicalNaturalLatticeSample({
+      position: { x: worldX, z: worldZ },
+      macro,
+      eastOffsetMm: macroAt(worldX + TERRAIN_STEP_METERS, worldZ).offsetMm,
+      westOffsetMm: macroAt(worldX - TERRAIN_STEP_METERS, worldZ).offsetMm,
+      southOffsetMm: macroAt(worldX, worldZ + TERRAIN_STEP_METERS).offsetMm,
+      northOffsetMm: macroAt(worldX, worldZ - TERRAIN_STEP_METERS).offsetMm,
+      biomeEvaluator,
+    });
+  };
+  const sampleLattice = (worldX, worldZ) => resolveLattice(
+    worldX,
+    worldZ,
+    (x, z) => macroEvaluator.evaluate(x, z),
+  );
+  const createOwnerSampler = (chunkX, chunkZ) => {
+    assertLogicalChunkCoordinate(chunkX, 'chunkX');
+    assertLogicalChunkCoordinate(chunkZ, 'chunkZ');
+    const originX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const originZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const coreCache = new Map();
+    const fullCache = new Map();
+    const macroCache = new Map();
+    const macroAt = (worldX, worldZ) => {
+      const gridX = Math.round((worldX - originX) / TERRAIN_STEP_METERS);
+      const gridZ = Math.round((worldZ - originZ) / TERRAIN_STEP_METERS);
+      const key = (gridZ + 2) * 40 + gridX + 2;
+      let sample = macroCache.get(key);
+      if (!sample) {
+        sample = macroEvaluator.evaluate(worldX, worldZ);
+        macroCache.set(key, sample);
+      }
+      return sample;
+    };
+    const latticeCoordinates = (x, z) => {
+      const boundedX = Math.max(0, Math.min(W2_TERRAIN_RESOLUTION - 1, x));
+      const boundedZ = Math.max(0, Math.min(W2_TERRAIN_RESOLUTION - 1, z));
+      return {
+        boundedX,
+        boundedZ,
+        key: boundedZ * W2_TERRAIN_RESOLUTION + boundedX,
+      };
+    };
+    const coreAt = (x, z) => {
+      const { boundedX, boundedZ, key } = latticeCoordinates(x, z);
+      let sample = coreCache.get(key);
+      if (!sample) {
+        const position = {
+          x: originX + boundedX * TERRAIN_STEP_METERS,
+          z: originZ + boundedZ * TERRAIN_STEP_METERS,
+        };
+        const macro = macroAt(position.x, position.z);
+        const climateMoisture = biomeEvaluator.evaluateMoisture(position);
+        sample = Object.freeze({
+          ...resolveCanonicalNaturalLatticeCoreSample({
+            position,
+            macro,
+            eastOffsetMm: macroAt(position.x + TERRAIN_STEP_METERS, position.z).offsetMm,
+            westOffsetMm: macroAt(position.x - TERRAIN_STEP_METERS, position.z).offsetMm,
+            southOffsetMm: macroAt(position.x, position.z + TERRAIN_STEP_METERS).offsetMm,
+            northOffsetMm: macroAt(position.x, position.z - TERRAIN_STEP_METERS).offsetMm,
+            climateMoisture,
+          }),
+          position,
+          macro,
+          climateMoisture,
+        });
+        coreCache.set(key, sample);
+      }
+      return sample;
+    };
+    const fullAt = (x, z) => {
+      const { key } = latticeCoordinates(x, z);
+      let sample = fullCache.get(key);
+      if (!sample) {
+        const core = coreAt(x, z);
+        const biome = biomeEvaluator.evaluateWithMoisture(
+          core.position,
+          core.macro,
+          core.slope,
+          core.climateMoisture,
+        );
+        sample = Object.freeze({
+          ...core,
+          biome,
+          materialWeights: Object.freeze(naturalMaterialWeights(
+            biome.memberships,
+            core.moisture,
+            core.rockiness,
+            core.slope,
+          )),
+        });
+        fullCache.set(key, sample);
+      }
+      return sample;
+    };
+    const coordinates = point => {
+      const localX = point.x - originX;
+      const localZ = point.z - originZ;
+      const fx = clamp(localX / LOGICAL_CHUNK_SIZE_METERS)
+        * (W2_TERRAIN_RESOLUTION - 1);
+      const fz = clamp(localZ / LOGICAL_CHUNK_SIZE_METERS)
+        * (W2_TERRAIN_RESOLUTION - 1);
+      const x0 = Math.floor(fx); const z0 = Math.floor(fz);
+      return {
+        x0,
+        z0,
+        x1: Math.min(x0 + 1, W2_TERRAIN_RESOLUTION - 1),
+        z1: Math.min(z0 + 1, W2_TERRAIN_RESOLUTION - 1),
+        tx: fx - x0,
+        tz: fz - z0,
+      };
+    };
+    const interpolate = (point, select, sampleAt = coreAt) => {
+      const { x0, z0, x1, z1, tx, tz } = coordinates(point);
+      const northwest = select(sampleAt(x0, z0));
+      const northeast = select(sampleAt(x1, z0));
+      const southwest = select(sampleAt(x0, z1));
+      const southeast = select(sampleAt(x1, z1));
+      return (northwest * (1 - tx) + northeast * tx) * (1 - tz)
+        + (southwest * (1 - tx) + southeast * tx) * tz;
+    };
+    const biomeSamples = Array.from({ length: 25 }, (_, index) => {
+      const x = (index % 5) * 8;
+      const z = Math.floor(index / 5) * 8;
+      return fullAt(x, z).biome;
+    });
+    const sampleBiomeWeights = point => {
+      const localX = point.x - originX;
+      const localZ = point.z - originZ;
+      const fx = clamp(localX / LOGICAL_CHUNK_SIZE_METERS) * 4;
+      const fz = clamp(localZ / LOGICAL_CHUNK_SIZE_METERS) * 4;
+      const x0 = Math.floor(fx); const z0 = Math.floor(fz);
+      const x1 = Math.min(x0 + 1, 4); const z1 = Math.min(z0 + 1, 4);
+      const tx = fx - x0; const tz = fz - z0;
+      const weight = (x, z, biomeId) => biomeSamples[z * 5 + x].memberships
+        .find(item => item.biomeId === biomeId)?.weight ?? 0;
+      return NATURAL_BIOME_ORDER.map(biomeId => ({
+        biomeId,
+        weight: q6((weight(x0, z0, biomeId) * (1 - tx)
+          + weight(x1, z0, biomeId) * tx) * (1 - tz)
+          + (weight(x0, z1, biomeId) * (1 - tx)
+            + weight(x1, z1, biomeId) * tx) * tz),
+      }));
+    };
+    return Object.freeze({
+      chunkX,
+      chunkZ,
+      sampleTerrain(point, { includeMaterials = true } = {}) {
+        const result = {
+          height: q6(interpolate(point, sample => sample.heightMm) * HEIGHT_UNIT_METERS),
+          slope: q6(interpolate(point, sample => sample.slope)),
+          moisture: q6(interpolate(point, sample => sample.moisture)),
+          rockiness: q6(interpolate(point, sample => sample.rockiness)),
+        };
+        if (includeMaterials) {
+          result.grassMaterial = q6(interpolate(
+            point,
+            sample => sample.materialWeights[0],
+            fullAt,
+          ));
+          result.rockMaterial = q6(interpolate(
+            point,
+            sample => sample.materialWeights[4],
+            fullAt,
+          ));
+        }
+        return Object.freeze(result);
+      },
+      sampleBiomeWeights,
+      sampleNaturalHeightMeters(worldX, worldZ) {
+        const point = { x: worldX, z: worldZ };
+        const { x0, z0, x1, z1, tx, tz } = coordinates(point);
+        const northwest = coreAt(x0, z0).heightMm * HEIGHT_UNIT_METERS;
+        const northeast = coreAt(x1, z0).heightMm * HEIGHT_UNIT_METERS;
+        const southwest = coreAt(x0, z1).heightMm * HEIGHT_UNIT_METERS;
+        const southeast = coreAt(x1, z1).heightMm * HEIGHT_UNIT_METERS;
+        if (tx + tz <= 1) {
+          return northwest + tx * (northeast - northwest)
+            + tz * (southwest - northwest);
+        }
+        return northeast * (1 - tz) + southwest * (1 - tx)
+          + southeast * (tx + tz - 1);
+      },
+      snapshot() {
+        return Object.freeze({
+          latticeSampleCount: coreCache.size,
+          fullBiomeSampleCount: fullCache.size,
+          macroSampleCount: macroCache.size,
+        });
+      },
+    });
+  };
+  return Object.freeze({ sampleLattice, createOwnerSampler });
+}
+
+export async function createSharedCanonicalNaturalKernel({ worldSeedHash }) {
+  if (typeof worldSeedHash !== 'string' || !worldSeedHash) {
+    throw new TypeError('worldSeedHash is required');
+  }
+  const [macroEvaluator, biomeEvaluator] = await Promise.all([
+    createMacroTerrainEvaluator(worldSeedHash),
+    createNaturalBiomeEvaluator({ worldSeedHash }),
+  ]);
+  return createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEvaluator });
 }
 
 async function createEdgeData(terrain) {
@@ -86,31 +384,27 @@ function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator
       const west = extended[extendedIndex(x - 1, z)].offsetMm;
       const south = extended[extendedIndex(x, z + 1)].offsetMm;
       const north = extended[extendedIndex(x, z - 1)].offsetMm;
-      const dx = (east - west) * HEIGHT_UNIT_METERS / (2 * TERRAIN_STEP_METERS);
-      const dz = (south - north) * HEIGHT_UNIT_METERS / (2 * TERRAIN_STEP_METERS);
-      const slope = q6(Math.hypot(dx, dz));
       const position = {
         x: originX + x * TERRAIN_STEP_METERS,
         z: originZ + z * TERRAIN_STEP_METERS,
       };
-      const biome = biomeEvaluator.evaluate(position, macro, slope);
-      const heightMm = normalizeTerrainHeight(400 + macro.offsetMm);
-      const ridge = clamp(macro.components.ridgesMm / G5_MACRO_TERRAIN.ridges.amplitudeMm);
-      const steep = clamp(slope / Math.max(0.001, G5_MACRO_TERRAIN.maximumSlope));
-      const rockinessValue = q6(clamp(0.035 + ridge * 0.36 + steep * 0.58));
-      const moistureValue = q6(clamp(biome.climate.moisture
-        + clamp(-macro.components.valleysMm / G5_MACRO_TERRAIN.valleys.amplitudeMm) * 0.12
-        - ridge * 0.09));
+      const sample = resolveCanonicalNaturalLatticeSample({
+        position,
+        macro,
+        eastOffsetMm: east,
+        westOffsetMm: west,
+        southOffsetMm: south,
+        northOffsetMm: north,
+        biomeEvaluator,
+      });
+      const { biome, heightMm, slope } = sample;
+      const rockinessValue = sample.rockiness;
+      const moistureValue = sample.moisture;
       heights.push(heightMm);
       finalSlopes.push(slope);
       moisture.push(moistureValue);
       rockiness.push(rockinessValue);
-      materialWeights.push(...naturalMaterialWeights(
-        biome.memberships,
-        moistureValue,
-        rockinessValue,
-        slope,
-      ));
+      materialWeights.push(...sample.materialWeights);
       minimumHeightMm = Math.min(minimumHeightMm, heightMm);
       maximumHeightMm = Math.max(maximumHeightMm, heightMm);
       if (x % 8 === 0 && z % 8 === 0) {

@@ -1,13 +1,186 @@
 import {
   LOGICAL_CHUNK_SIZE_METERS,
+  createChunkKey,
   logicalWorldToOwnedChunk,
   squareChunkCoordinates,
 } from './chunk-coordinates.js';
+import {
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  resolveW8RenderDistancePolicy,
+} from './render-distance-policy.js';
+import { resolveW8VegetationVisibilityContract } from './vegetation-lod-policy.js';
 
 const EPSILON = 1e-9;
 
+let lastResidentReadyPlanCacheKey = null;
+let lastResidentReadyPlan = null;
+
 export const RUNTIME_TERRAIN_READY_LEAD_SECONDS = 2.25;
 export const RUNTIME_TERRAIN_READY_MAXIMUM_DISTANCE_METERS = 192;
+
+const currentRenderDistance = resolveW8RenderDistancePolicy(
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+);
+const currentVegetationVisibility = resolveW8VegetationVisibilityContract(
+  W8_DEFAULT_RENDER_DISTANCE_PRESET,
+);
+
+// Remote Settlement metadata remains a sparse presentation query in Phase A.
+// The dense Resident World is sized from every continuous 360-degree visual
+// surface: Terrain, fog, general objects, and canonical Natural.
+export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS = Math.max(
+  currentRenderDistance.terrainRiverExtentMeters,
+  currentRenderDistance.fogFarMeters,
+  currentRenderDistance.generalObjectVisibilityMeters,
+  ...Object.values(currentVegetationVisibility.byKind)
+    .map(profile => profile.exactDistanceMeters),
+);
+export const RESIDENT_WORLD_REQUIRED_RADIUS_METERS =
+  RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS + LOGICAL_CHUNK_SIZE_METERS;
+export const PRESENTATION_RESIDENT_RADIUS_METERS =
+  RESIDENT_WORLD_REQUIRED_RADIUS_METERS;
+export const FULL_RESIDENT_RADIUS_METERS = 100;
+
+function chunkAabbDistanceSquared(chunkX, chunkZ, centerX, centerZ) {
+  const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+  const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+  const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+  const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+  const closestX = Math.max(minimumX, Math.min(maximumX, centerX));
+  const closestZ = Math.max(minimumZ, Math.min(maximumZ, centerZ));
+  return (closestX - centerX) ** 2 + (closestZ - centerZ) ** 2;
+}
+
+function collectResidentCoordinates(centerChunkX, centerChunkZ, radiusMeters) {
+  const centerX = centerChunkX * LOGICAL_CHUNK_SIZE_METERS
+    + LOGICAL_CHUNK_SIZE_METERS / 2;
+  const centerZ = centerChunkZ * LOGICAL_CHUNK_SIZE_METERS
+    + LOGICAL_CHUNK_SIZE_METERS / 2;
+  const minimumChunkX = Math.floor((centerX - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const maximumChunkX = Math.floor((centerX + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkZ = Math.floor((centerZ - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const maximumChunkZ = Math.floor((centerZ + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS);
+  const radiusSquared = radiusMeters ** 2;
+  const result = [];
+  for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
+    for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
+      const distanceSquared = chunkAabbDistanceSquared(chunkX, chunkZ, centerX, centerZ);
+      if (distanceSquared > radiusSquared) continue;
+      result.push(Object.freeze({
+        chunkX,
+        chunkZ,
+        key: createChunkKey(chunkX, chunkZ),
+        residentDistanceMeters: Math.sqrt(distanceSquared),
+      }));
+    }
+  }
+  return Object.freeze(result);
+}
+
+function createNamedResidentView(name, radiusMeters, ownerCoordinates) {
+  const coordinates = Object.freeze(ownerCoordinates.filter(
+    coordinate => coordinate.residentDistanceMeters <= radiusMeters,
+  ));
+  return Object.freeze({
+    schemaVersion: 'resident-world-coverage-view-1',
+    name,
+    radiusMeters,
+    ownerCoordinates: coordinates,
+    ownerKeys: Object.freeze(coordinates.map(coordinate => coordinate.key)),
+    signature: `${name}:${radiusMeters}:${coordinates.length}`,
+  });
+}
+
+/**
+ * The one player-Chunk-centered, camera/velocity-independent required World set.
+ * Category presentation radii may select subsets, but they never choose a
+ * different required center.
+ */
+export function createResidentWorldCoverage({
+  centerChunkX,
+  centerChunkZ,
+  radiusMeters = RESIDENT_WORLD_REQUIRED_RADIUS_METERS,
+} = {}) {
+  if (!Number.isSafeInteger(centerChunkX) || !Number.isSafeInteger(centerChunkZ)) {
+    throw new TypeError('Resident World center must use safe Chunk coordinates');
+  }
+  if (!Number.isFinite(radiusMeters)
+    || radiusMeters < RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS) {
+    throw new RangeError('Resident World radius must cover the maximum visible radius');
+  }
+  const ownerCoordinates = collectResidentCoordinates(
+    centerChunkX,
+    centerChunkZ,
+    radiusMeters,
+  );
+  const ownerKeys = Object.freeze(ownerCoordinates.map(value => value.key));
+  const presentationView = createNamedResidentView(
+    'presentation',
+    Math.min(PRESENTATION_RESIDENT_RADIUS_METERS, radiusMeters),
+    ownerCoordinates,
+  );
+  const fullView = createNamedResidentView(
+    'full',
+    Math.min(FULL_RESIDENT_RADIUS_METERS, radiusMeters),
+    ownerCoordinates,
+  );
+  return Object.freeze({
+    schemaVersion: 'resident-world-coverage-1',
+    centerChunkX,
+    centerChunkZ,
+    centerOwnerKey: createChunkKey(centerChunkX, centerChunkZ),
+    centerX: centerChunkX * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2,
+    centerZ: centerChunkZ * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2,
+    maximumVisibleRadiusMeters: RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS,
+    radiusMeters,
+    ownerCoordinates,
+    presentationView,
+    fullView,
+    residentRequiredOwnerKeys: ownerKeys,
+    residentDataOwnerKeys: ownerKeys,
+    residentTerrainOwnerKeys: ownerKeys,
+    residentNaturalOwnerKeys: ownerKeys,
+    residentStructureOwnerKeys: ownerKeys,
+    signature: `resident:${centerChunkX},${centerChunkZ}:${radiusMeters}:${ownerKeys.length}`,
+  });
+}
+
+export function residentOwnerKeysWithinRadius(coverage, radiusMeters) {
+  if (coverage?.schemaVersion !== 'resident-world-coverage-1') {
+    throw new TypeError('Resident World coverage is required');
+  }
+  if (!Number.isFinite(radiusMeters) || radiusMeters < 0
+    || radiusMeters > coverage.radiusMeters) {
+    throw new RangeError('Resident subset radius must be within the Resident World');
+  }
+  return Object.freeze(coverage.ownerCoordinates
+    .filter(value => value.residentDistanceMeters <= radiusMeters)
+    .map(value => value.key));
+}
+
+const baselineResidentCoverage = createResidentWorldCoverage({
+  centerChunkX: 0,
+  centerChunkZ: 0,
+});
+const maximumPrefetchPrimaryAxisShiftChunks = Math.ceil(
+  RUNTIME_TERRAIN_READY_MAXIMUM_DISTANCE_METERS / LOGICAL_CHUNK_SIZE_METERS,
+) + 1;
+// A 192 m segment can reach 13 owners on one axis only by remaining in the
+// adjacent row on the other axis. Exhaustive feasible-lattice evaluation puts
+// the maximum circular-Resident union at the (13, 1) displacement, not at the
+// geometrically impossible (13, 13) displacement.
+const maximumPrefetchCoverage = createResidentWorldCoverage({
+  centerChunkX: maximumPrefetchPrimaryAxisShiftChunks,
+  centerChunkZ: 1,
+});
+const baselineResidentKeys = new Set(baselineResidentCoverage.residentRequiredOwnerKeys);
+export const RESIDENT_WORLD_OWNER_COUNT =
+  baselineResidentCoverage.residentRequiredOwnerKeys.length;
+export const RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT =
+  maximumPrefetchCoverage.residentRequiredOwnerKeys
+    .filter(key => !baselineResidentKeys.has(key)).length;
+export const RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY =
+  RESIDENT_WORLD_OWNER_COUNT + RESIDENT_WORLD_BOUNDED_PREFETCH_OWNER_COUNT;
 
 function finite(value, name) {
   if (!Number.isFinite(value)) throw new TypeError(`${name} must be finite`);
@@ -73,14 +246,16 @@ function orderedCorridorCenters({ logicalX, logicalZ, velocityX, velocityZ, spee
 function compareReadyOwner(left, right) {
   return left.priorityClass - right.priorityClass
     || left.arrivalSeconds - right.arrivalSeconds
+    || (left.residentDistanceMeters ?? Infinity)
+      - (right.residentDistanceMeters ?? Infinity)
     || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
 }
 
 /**
- * Builds the single authoritative Runtime Terrain owner set. The current 5x5
- * data / 3x3 render coverage is unioned with the same rings along the player's
- * velocity corridor, so an owner requested by multiple centers is prepared
- * once and receives its earliest-arrival priority.
+ * Builds Runtime preparation from the authoritative Resident required set and
+ * a replaceable future-Resident prefetch candidate. Terrain's existing 5x5
+ * data / 3x3 render layers remain presentation subsets for Phase A. Callers
+ * that omit residentCoverage retain the isolated legacy-fixture contract.
  */
 export function planRuntimeTerrainReadySet({
   centerChunkX,
@@ -94,6 +269,7 @@ export function planRuntimeTerrainReadySet({
   sprint = false,
   leadSeconds = RUNTIME_TERRAIN_READY_LEAD_SECONDS,
   maximumDistanceMeters = RUNTIME_TERRAIN_READY_MAXIMUM_DISTANCE_METERS,
+  residentCoverage = null,
 } = {}) {
   for (const [value, name] of [
     [centerChunkX, 'centerChunkX'], [centerChunkZ, 'centerChunkZ'],
@@ -122,16 +298,72 @@ export function planRuntimeTerrainReadySet({
     speed: velocityMagnitude,
     distance: corridorDistanceMeters,
   });
+  const visibleCenter = corridorCenters[0];
+  if (residentCoverage !== null
+    && (residentCoverage?.schemaVersion !== 'resident-world-coverage-1'
+      || residentCoverage.centerChunkX !== visibleCenter.chunkX
+      || residentCoverage.centerChunkZ !== visibleCenter.chunkZ)) {
+    throw new Error('Resident World coverage must match the player-owned Chunk');
+  }
+  const residentCoordinates = residentCoverage?.ownerCoordinates ?? Object.freeze([]);
+  const endpoint = corridorCenters.at(-1);
+  const residentReadyPlanCacheKey = residentCoverage === null ? null : [
+    residentCoverage.signature,
+    scaleStageId,
+    sprint ? 'sprint' : 'walk',
+    speedMetersPerSecond.toFixed(3),
+    velocityX.toFixed(3),
+    velocityZ.toFixed(3),
+    leadSeconds,
+    maximumDistanceMeters,
+    corridorCenters.map(center => center.key).join(','),
+  ].join('|');
+  if (residentReadyPlanCacheKey !== null
+    && residentReadyPlanCacheKey === lastResidentReadyPlanCacheKey) {
+    return lastResidentReadyPlan;
+  }
+  const residentKeySet = new Set(residentCoordinates.map(value => value.key));
+  const futureResidentCoverage = residentCoverage !== null
+    && endpoint.key !== residentCoverage.centerOwnerKey
+    ? createResidentWorldCoverage({
+      centerChunkX: endpoint.chunkX,
+      centerChunkZ: endpoint.chunkZ,
+      radiusMeters: residentCoverage.radiusMeters,
+    })
+    : null;
+  const velocityPrefetchCoordinates = futureResidentCoverage === null
+    ? Object.freeze([])
+    : Object.freeze(futureResidentCoverage.ownerCoordinates.filter(
+      coordinate => !residentKeySet.has(coordinate.key),
+    ));
   const dataByKey = new Map();
   const renderByKey = new Map();
+  for (const coordinate of residentCoordinates) {
+    dataByKey.set(coordinate.key, {
+      ...coordinate,
+      dataArrivalSeconds: 0,
+      visibleData: false,
+      residentRequired: true,
+    });
+  }
+  for (const coordinate of velocityPrefetchCoordinates) {
+    dataByKey.set(coordinate.key, {
+      ...coordinate,
+      dataArrivalSeconds: endpoint.arrivalSeconds,
+      visibleData: false,
+      residentRequired: false,
+    });
+  }
   corridorCenters.forEach((center, centerIndex) => {
     for (const coordinate of squareChunkCoordinates(center.chunkX, center.chunkZ, 2)) {
       const current = dataByKey.get(coordinate.key);
       if (!current || center.arrivalSeconds < current.dataArrivalSeconds) {
         dataByKey.set(coordinate.key, {
+          ...current,
           ...coordinate,
           dataArrivalSeconds: center.arrivalSeconds,
           visibleData: centerIndex === 0,
+          residentRequired: current?.residentRequired === true,
         });
       } else if (centerIndex === 0) {
         current.visibleData = true;
@@ -155,7 +387,9 @@ export function planRuntimeTerrainReadySet({
     const render = renderByKey.get(coordinate.key) ?? null;
     const priorityClass = render?.visibleRender ? 0
       : coordinate.visibleData ? 1
-        : render ? 2 : 3;
+        : residentCoverage === null ? (render ? 2 : 3)
+          : coordinate.residentRequired ? 2
+            : render ? 3 : 4;
     return Object.freeze({
       chunkX: coordinate.chunkX,
       chunkZ: coordinate.chunkZ,
@@ -164,13 +398,20 @@ export function planRuntimeTerrainReadySet({
       arrivalSeconds: render?.renderArrivalSeconds ?? coordinate.dataArrivalSeconds,
       renderRequired: render !== null,
       visibleRequired: coordinate.visibleData,
+      residentRequired: coordinate.residentRequired === true,
+      residentDistanceMeters: coordinate.residentRequired
+        ? coordinate.residentDistanceMeters : null,
     });
   }).sort(compareReadyOwner);
   const renderCoordinates = dataCoordinates.filter(coordinate => coordinate.renderRequired);
-  const signature = `${scaleStageId}:${sprint ? 'sprint' : 'walk'}:${speedMetersPerSecond.toFixed(3)}|${dataCoordinates
+  const signature = residentReadyPlanCacheKey ?? `${scaleStageId}:${sprint ? 'sprint' : 'walk'}:${speedMetersPerSecond.toFixed(3)}|${dataCoordinates
     .map(coordinate => `${coordinate.key}:${coordinate.priorityClass}`).join('|')}`;
-  const endpoint = corridorCenters.at(-1);
-  return Object.freeze({
+  const residentRequiredOwnerKeys = residentCoverage?.residentRequiredOwnerKeys
+    ?? Object.freeze(dataCoordinates.filter(value => value.visibleRequired).map(value => value.key));
+  const velocityPrefetchOwnerKeys = Object.freeze(
+    dataCoordinates.filter(value => !value.residentRequired).map(value => value.key),
+  );
+  const plan = Object.freeze({
     schemaVersion: 'runtime-terrain-ready-set-1',
     signature,
     requestedFromChunkX: centerChunkX,
@@ -187,9 +428,21 @@ export function planRuntimeTerrainReadySet({
     corridorDistanceMeters,
     corridorEndpointOwnerKey: endpoint.key,
     corridorCenters: Object.freeze(corridorCenters.map(center => Object.freeze({ ...center }))),
+    residentCoverage,
+    residentRequiredOwnerKeys,
+    residentDataOwnerKeys: residentRequiredOwnerKeys,
+    residentTerrainOwnerKeys: residentRequiredOwnerKeys,
+    residentNaturalOwnerKeys: residentRequiredOwnerKeys,
+    residentStructureOwnerKeys: residentRequiredOwnerKeys,
+    velocityPrefetchOwnerKeys,
     dataCoordinates: Object.freeze(dataCoordinates),
     renderCoordinates: Object.freeze(renderCoordinates),
   });
+  if (residentReadyPlanCacheKey !== null) {
+    lastResidentReadyPlanCacheKey = residentReadyPlanCacheKey;
+    lastResidentReadyPlan = plan;
+  }
+  return plan;
 }
 
 /**

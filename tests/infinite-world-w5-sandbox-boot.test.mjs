@@ -18,6 +18,7 @@ import {
   w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
+import { RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY } from '../src/infinite-world/chunk-streaming-plan.js';
 import {
   InfiniteGameplayRuntime,
   createW6ChunkGameplay,
@@ -1876,7 +1877,7 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       const snapshot = sandbox.snapshot();
       assert.equal(snapshot.runtime.activeDataCount, 25);
       assert.equal(snapshot.runtime.renderedCount, 9);
-      assert.equal(snapshot.runtime.cacheCapacity, 81);
+      assert.equal(snapshot.runtime.cacheCapacity, RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY);
       assert.equal(snapshot.presentation.renderDistancePreset, preset);
       assert.equal(snapshot.presentation.naturalVisibilityMeters, values.natural);
       assert.equal(snapshot.presentation.clipmapExtentMeters, values.terrain);

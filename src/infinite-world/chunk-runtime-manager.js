@@ -127,6 +127,7 @@ export class ChunkRuntimeManager {
     this.terrainReadyPlanEpoch = 0;
     this.terrainReadyProjectedByKey = new Map();
     this.terrainReadyDesiredDataKeys = new Set();
+    this.residentRequiredDataKeys = new Set();
     this.terrainReadyDesiredRenderKeys = new Set();
     this.terrainReadyQueuedAtByKey = new Map();
     this.terrainReadyReadyKeys = new Set();
@@ -135,6 +136,11 @@ export class ChunkRuntimeManager {
     this.terrainDependencyLatestBatch = null;
     this.terrainDependencyWaitSamples = [];
     this.terrainReadyLastOwnerSetDiff = Object.freeze({
+      unchanged: 0,
+      entering: 0,
+      leaving: 0,
+    });
+    this.terrainReadyLastPrefetchSetDiff = Object.freeze({
       unchanged: 0,
       entering: 0,
       leaving: 0,
@@ -187,6 +193,11 @@ export class ChunkRuntimeManager {
       terrainReadyCancelledWork: 0,
       terrainReadyStaleCompletions: 0,
       terrainReadyStalePublishes: 0,
+      residentCoverageMisses: 0,
+      residentOwnerEvictions: 0,
+      residentSameOwnerRerequests: 0,
+      requiredCancellationsByPrefetch: 0,
+      residentFullWindowRebuilds: 0,
       terrainReadyMaximumQueueDepth: 0,
       terrainReadyMaximumOldestWaitMs: 0,
       chunkDataSubscribersTransferred: 0,
@@ -386,7 +397,9 @@ export class ChunkRuntimeManager {
       if (key !== coordinate.key || dataKeys.has(key)) throw new Error(`invalid duplicate READY data owner: ${key}`);
       if (!Number.isSafeInteger(coordinate.priorityClass) || coordinate.priorityClass < 0
         || !Number.isFinite(coordinate.arrivalSeconds) || coordinate.arrivalSeconds < 0
-        || typeof coordinate.renderRequired !== 'boolean') {
+        || typeof coordinate.renderRequired !== 'boolean'
+        || (coordinate.residentRequired !== undefined
+          && typeof coordinate.residentRequired !== 'boolean')) {
         throw new TypeError(`invalid READY owner descriptor: ${key}`);
       }
       dataKeys.add(key);
@@ -402,6 +415,13 @@ export class ChunkRuntimeManager {
     if (dataKeys.size > this.cacheCapacity) {
       throw new Error(`Runtime Terrain READY set exceeds cache capacity: ${dataKeys.size}/${this.cacheCapacity}`);
     }
+    const residentKeys = input.residentCoverage?.schemaVersion === 'resident-world-coverage-1'
+      ? new Set(input.residentRequiredOwnerKeys ?? [])
+      : new Set(dataKeys);
+    if (residentKeys.size === 0 || residentKeys.size > this.cacheCapacity
+      || [...residentKeys].some(key => !dataKeys.has(key))) {
+      throw new Error('Runtime Resident required coverage is invalid or exceeds cache capacity');
+    }
     const current = this.terrainReadyPlan;
     if (current?.signature === input.signature && !current.discarded && !current.failed) {
       return current.promise;
@@ -409,19 +429,41 @@ export class ChunkRuntimeManager {
 
     const now = this.clock();
     const previousDataKeys = this.terrainReadyDesiredDataKeys;
+    const previousResidentKeys = this.residentRequiredDataKeys;
+    const previousPrefetchKeys = new Set(
+      [...previousDataKeys].filter(key => !previousResidentKeys.has(key)),
+    );
+    const nextPrefetchKeys = new Set([...dataKeys].filter(key => !residentKeys.has(key)));
     const previousRenderKeys = this.terrainReadyDesiredRenderKeys;
     const previousPendingKeys = new Set([...previousDataKeys].filter(key => (
       this.#terrainReadyOwnerNeedsWork(key)
     )));
-    const unchangedKeys = new Set([...previousDataKeys].filter(key => dataKeys.has(key)));
-    const enteringKeys = new Set([...dataKeys].filter(key => !previousDataKeys.has(key)));
-    const leavingKeys = new Set([...previousDataKeys].filter(key => !dataKeys.has(key)));
+    const unchangedKeys = new Set([...residentKeys].filter(key => previousResidentKeys.has(key)));
+    const enteringKeys = new Set([...residentKeys].filter(key => !previousResidentKeys.has(key)));
+    const leavingKeys = new Set([...previousResidentKeys].filter(key => !residentKeys.has(key)));
+    const prefetchUnchangedKeys = new Set(
+      [...nextPrefetchKeys].filter(key => previousPrefetchKeys.has(key)),
+    );
+    const prefetchEnteringKeys = new Set(
+      [...nextPrefetchKeys].filter(key => !previousPrefetchKeys.has(key)),
+    );
+    const prefetchLeavingKeys = new Set(
+      [...previousPrefetchKeys].filter(key => !nextPrefetchKeys.has(key)),
+    );
     const epoch = ++this.terrainReadyPlanEpoch;
     this.terrainReadyLastOwnerSetDiff = Object.freeze({
       unchanged: unchangedKeys.size,
       entering: enteringKeys.size,
       leaving: leavingKeys.size,
     });
+    this.terrainReadyLastPrefetchSetDiff = Object.freeze({
+      unchanged: prefetchUnchangedKeys.size,
+      entering: prefetchEnteringKeys.size,
+      leaving: prefetchLeavingKeys.size,
+    });
+    if (enteringKeys.size > 0 || leavingKeys.size > 0 || previousResidentKeys.size === 0) {
+      this.chunkDataService.replaceProtectedOwnerKeys?.(residentKeys);
+    }
     if (this.terrainReadyStartedAtMs === null) this.terrainReadyStartedAtMs = now;
     this.terrainReadyLastActivityAtMs = now;
     this.counts.terrainReadyPlansRequested += 1;
@@ -429,6 +471,7 @@ export class ChunkRuntimeManager {
       current.discarded = true;
       const subscriberChanges = this.#supersedeTerrainReadyChunkDataOperations({
         desiredDataKeys: dataKeys,
+        residentRequiredKeys: residentKeys,
         nextPlanEpoch: epoch,
       });
       const obsoletePendingCount = [...previousPendingKeys].filter(key => (
@@ -440,6 +483,7 @@ export class ChunkRuntimeManager {
       );
     }
     this.terrainReadyDesiredDataKeys = dataKeys;
+    this.residentRequiredDataKeys = residentKeys;
     this.terrainReadyDesiredRenderKeys = renderKeys;
     this.#updateTerrainPresentationDesiredCenters(input);
     for (const key of [...this.terrainReadyQueuedAtByKey.keys()]) {
@@ -453,6 +497,16 @@ export class ChunkRuntimeManager {
         this.counts.terrainReadyOwnerReuses += 1;
       }
     }
+    const workCoordinates = Object.freeze(input.dataCoordinates.filter(coordinate => (
+      !previousDataKeys.has(coordinate.key)
+        || this.#terrainReadyOwnerNeedsWork(coordinate.key)
+    )));
+    if (previousResidentKeys.size > 0 && unchangedKeys.size > 0) {
+      const residentWorkCount = workCoordinates.filter(
+        coordinate => residentKeys.has(coordinate.key),
+      ).length;
+      if (residentWorkCount >= residentKeys.size) this.counts.residentFullWindowRebuilds += 1;
+    }
     const plan = {
       signature: input.signature,
       epoch,
@@ -464,6 +518,7 @@ export class ChunkRuntimeManager {
       terrainDependencyBatch: null,
       promise: null,
       startedAtMs: now,
+      workCoordinates,
     };
     this.terrainReadyPlan = plan;
     plan.terrainDependencyBatch = this.#registerTerrainDependencyBatch(plan);
@@ -488,6 +543,10 @@ export class ChunkRuntimeManager {
       corridorEndpointOwnerKey: input.corridorEndpointOwnerKey,
       corridorCenterCount: input.corridorCenters?.length ?? null,
       dataOwnerCount: dataKeys.size,
+      residentOwnerCount: residentKeys.size,
+      residentEnteringOwnerCount: enteringKeys.size,
+      residentLeavingOwnerCount: leavingKeys.size,
+      prefetchOwnerCount: nextPrefetchKeys.size,
       renderOwnerCount: renderKeys.size,
       queueDepth: this.#terrainReadyQueueDepth(),
     });
@@ -1054,6 +1113,7 @@ export class ChunkRuntimeManager {
     if (this.terrainReadyCoverageMissOwnerKey !== key) {
       this.terrainReadyCoverageMissOwnerKey = key;
       this.counts.terrainReadyCoverageMisses += 1;
+      if (this.residentRequiredDataKeys.has(key)) this.counts.residentCoverageMisses += 1;
     }
     if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-ready-coverage-miss', {
       ownerKey: key,
@@ -1238,12 +1298,12 @@ export class ChunkRuntimeManager {
     const dependencyOutcome = await plan.terrainDependencyBatch.promise;
     if (dependencyOutcome.error) throw dependencyOutcome.error;
     if (plan.discarded || dependencyOutcome.cancelled) return null;
-    for (const coordinate of plan.input.dataCoordinates) {
+    for (const coordinate of plan.workCoordinates) {
       if (coordinate.visibleRequired === true && !this.cache.has(coordinate.key)) {
         throw new Error(`latest Terrain dependency is unresolved: ${coordinate.key}`);
       }
     }
-    for (const coordinate of plan.input.dataCoordinates) {
+    for (const coordinate of plan.workCoordinates) {
       if (plan.discarded) return null;
       const requiresRender = this.terrainReadyDesiredRenderKeys.has(coordinate.key);
       let result = Object.freeze({ data: this.cache.get(coordinate.key)?.data ?? null, generated: false });
@@ -1258,7 +1318,7 @@ export class ChunkRuntimeManager {
           priority,
           plan,
           deadlineAtMs: plan.startedAtMs + coordinate.arrivalSeconds * 1000,
-          required: false,
+          required: coordinate.residentRequired === true,
         });
         if (result.generated) {
           this.counts.terrainReadyOwnersGenerated += 1;
@@ -1562,7 +1622,11 @@ export class ChunkRuntimeManager {
     return entry;
   }
 
-  #supersedeTerrainReadyChunkDataOperations({ desiredDataKeys, nextPlanEpoch }) {
+  #supersedeTerrainReadyChunkDataOperations({
+    desiredDataKeys,
+    residentRequiredKeys = this.residentRequiredDataKeys,
+    nextPlanEpoch,
+  }) {
     let subscribersTransferred = 0;
     let subscribersLeft = 0;
     for (const [key, operation] of this.terrainReadyChunkDataOperations) {
@@ -1584,6 +1648,9 @@ export class ChunkRuntimeManager {
           workerCancelRequested: false,
         });
       if (!details.subscriberCancelled) continue;
+      if (residentRequiredKeys.has(key)) {
+        this.counts.requiredCancellationsByPrefetch += 1;
+      }
       if (this.terrainReadyChunkDataOperations.get(key) === operation) {
         this.terrainReadyChunkDataOperations.delete(key);
       }
@@ -1649,7 +1716,12 @@ export class ChunkRuntimeManager {
     }
 
     const ownerDiagnostic = this.#terrainReadyOwnerDiagnostic(coordinate.key);
-    if (ownerDiagnostic.requestCount > 0) this.counts.chunkDataSameOwnerRerequestCount += 1;
+    if (ownerDiagnostic.requestCount > 0) {
+      this.counts.chunkDataSameOwnerRerequestCount += 1;
+      if (this.residentRequiredDataKeys.has(coordinate.key)) {
+        this.counts.residentSameOwnerRerequests += 1;
+      }
+    }
     ownerDiagnostic.requestCount += 1;
     const consumerId = `runtime-terrain-ready-owner:${coordinate.key}`;
     const operationEpoch = ownerDiagnostic.requestCount;
@@ -2481,11 +2553,15 @@ export class ChunkRuntimeManager {
         && !this.renderedKeys.has(key)
         && !this.provisionalTerrainKeys.has(key)
         && !this.transitionProtectedDataKeys.has(key)
-        && !this.terrainReadyDesiredDataKeys.has(key))
+        && !this.residentRequiredDataKeys.has(key))
       .sort((a, b) => a[1].lastUsed - b[1].lastUsed
         || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     for (const [key] of candidates) {
       if (this.cache.size <= this.cacheCapacity) break;
+      if (this.residentRequiredDataKeys.has(key)) {
+        this.counts.residentOwnerEvictions += 1;
+        throw new Error(`Resident owner selected for runtime eviction: ${key}`);
+      }
       this.cache.delete(key);
       this.counts.dataEvicted += 1;
     }
@@ -2691,7 +2767,7 @@ export class ChunkRuntimeManager {
       ...this.renderedKeys,
       ...this.provisionalTerrainKeys,
       ...this.transitionProtectedDataKeys,
-      ...this.terrainReadyDesiredDataKeys,
+      ...this.residentRequiredDataKeys,
     ]);
     const chunkDataOwnerDiagnostics = Object.freeze(
       [...this.terrainReadyChunkDataOwnerDiagnostics.entries()]
@@ -2705,6 +2781,7 @@ export class ChunkRuntimeManager {
     const chunkDataSubscriberDiagnostics = Object.freeze({
       schemaVersion: 'runtime-terrain-ready-chunk-data-subscribers-1',
       lastOwnerSetDiff: this.terrainReadyLastOwnerSetDiff,
+      lastPrefetchSetDiff: this.terrainReadyLastPrefetchSetDiff,
       chunkDataSubscribersTransferred: this.counts.chunkDataSubscribersTransferred,
       chunkDataSubscribersEntered: this.counts.chunkDataSubscribersEntered,
       chunkDataSubscribersLeft: this.counts.chunkDataSubscribersLeft,
@@ -2724,6 +2801,8 @@ export class ChunkRuntimeManager {
         capacity: chunkDataServiceSnapshot?.cacheCapacity ?? this.cacheCapacity,
         evictions: chunkDataServiceSnapshot?.counts?.completedEvictions
           ?? this.counts.dataEvicted,
+        residentEvictions: (chunkDataServiceSnapshot?.counts?.protectedOwnerEvictions ?? 0)
+          + this.counts.residentOwnerEvictions,
         protectedOwnerCount: protectedChunkDataKeys.size,
         protectedResidentOwnerCount: [...protectedChunkDataKeys]
           .filter(key => completedChunkDataKeys.has(key)).length,
@@ -2776,6 +2855,9 @@ export class ChunkRuntimeManager {
       planReady: this.terrainReadyPlan?.ready === true,
       planFailed: this.terrainReadyPlan?.failed === true,
       desiredDataOwnerCount: this.terrainReadyDesiredDataKeys.size,
+      residentRequiredOwnerCount: this.residentRequiredDataKeys.size,
+      velocityPrefetchOwnerCount: [...this.terrainReadyDesiredDataKeys]
+        .filter(key => !this.residentRequiredDataKeys.has(key)).length,
       desiredRenderOwnerCount: this.terrainReadyDesiredRenderKeys.size,
       readyRenderOwnerCount: readyRenderOwnerKeys.length,
       stagedProjectionCount: this.terrainReadyProjectedByKey.size,
@@ -2842,6 +2924,17 @@ export class ChunkRuntimeManager {
       }),
       terrainPresentationGenerations,
       recentTerrainPresentationGenerations,
+      residentWorld: Object.freeze({
+        requiredOwnerCount: this.residentRequiredDataKeys.size,
+        lastOwnerSetDiff: this.terrainReadyLastOwnerSetDiff,
+        lastPrefetchSetDiff: this.terrainReadyLastPrefetchSetDiff,
+        coverageMiss: this.counts.residentCoverageMisses,
+        ownerEviction: (chunkDataServiceSnapshot?.counts?.protectedOwnerEvictions ?? 0)
+          + this.counts.residentOwnerEvictions,
+        sameOwnerRerequest: this.counts.residentSameOwnerRerequests,
+        requiredCancellationByPrefetch: this.counts.requiredCancellationsByPrefetch,
+        fullWindowRebuild: this.counts.residentFullWindowRebuilds,
+      }),
     });
   }
 
@@ -2894,6 +2987,7 @@ export class ChunkRuntimeManager {
     }
     this.#supersedeTerrainReadyChunkDataOperations({
       desiredDataKeys: new Set(),
+      residentRequiredKeys: new Set(),
       nextPlanEpoch: this.terrainReadyPlanEpoch + 1,
     });
     await this.transitionChain;
@@ -2922,6 +3016,7 @@ export class ChunkRuntimeManager {
     this.deferredRenderReleaseKeys.clear();
     this.transitionProtectedDataKeys.clear();
     this.terrainReadyDesiredDataKeys.clear();
+    this.residentRequiredDataKeys.clear();
     this.terrainReadyDesiredRenderKeys.clear();
     this.terrainReadyQueuedAtByKey.clear();
     this.terrainReadyReadyKeys.clear();
@@ -2935,6 +3030,7 @@ export class ChunkRuntimeManager {
     this.chunkDataService.cancelConsumer({ consumerId: 'runtime-prefetch', epoch: 0 });
     this.chunkDataService.cancelConsumer({ consumerId: 'runtime-terrain-ready' });
     this.chunkDataService.cancelConsumer({ consumerId: 'runtime-transition' });
+    this.chunkDataService.replaceProtectedOwnerKeys?.([]);
     if (this.ownsChunkDataService) await this.chunkDataService.shutdown();
   }
 }

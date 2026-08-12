@@ -1,6 +1,9 @@
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
-import { deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
+import {
+  createDeterministicRandom,
+  deriveLocalSeed64,
+} from './legacy-core/g0/deterministic-random.js';
 import { parseGeneratorVersion } from './legacy-core/g0/generator-version.js';
 import { sha256Hex } from './legacy-core/g0/sha256.js';
 import {
@@ -122,7 +125,12 @@ function chooseVegetationSubtype(weights, terrain, subtypeRoll) {
   return 'shrub';
 }
 
-async function createVegetationCandidates(chunk, placementSeed) {
+async function createVegetationCandidates(
+  chunk,
+  placementSeed,
+  sampleTerrainAt = sampleTerrain,
+  sampleBiomeWeightsAt = sampleBiomeWeights,
+) {
   const size = W3_FORMAL_DETAILS.vegetationCellSizeMeters;
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
   const startX = chunk.chunkX * cellsPerChunk;
@@ -137,18 +145,24 @@ async function createVegetationCandidates(chunk, placementSeed) {
       };
       const owner = determineDetailCandidateOwner(point);
       if (owner.x !== chunk.chunkX || owner.z !== chunk.chunkZ) continue;
-      const terrain = sampleTerrain(chunk, point);
-      const sourceBiomeWeights = sampleBiomeWeights(chunk, point);
+      const admissionRoll = cellUnit(placementSeed, cellX, cellZ, 3);
+      // eligibility is clamped to one, so a roll outside the absolute maximum
+      // acceptance range can be rejected before any Terrain/Biome sampling.
+      if (admissionRoll >= 0.58) continue;
+      const sourceBiomeWeights = sampleBiomeWeightsAt(chunk, point);
       const weights = Object.fromEntries(sourceBiomeWeights.map(item => [item.biomeId, item.weight]));
-      const slopeFit = clamp(1 - terrain.slope / 0.34);
-      const rockPenalty = clamp(1 - terrain.rockiness * 0.78);
-      const eligibility = q6(clamp((
+      const habitatUpperBound = clamp(
         (weights['mixed-woodland'] ?? 0) * 0.92
         + (weights['temperate-grassland'] ?? 0) * 0.5
         + (weights.wetland ?? 0) * 0.66
-        + (weights['rocky-highland'] ?? 0) * 0.15
-      ) * slopeFit * rockPenalty));
-      if (cellUnit(placementSeed, cellX, cellZ, 3) >= eligibility * 0.58) continue;
+        + (weights['rocky-highland'] ?? 0) * 0.15,
+      );
+      if (admissionRoll >= habitatUpperBound * 0.58) continue;
+      const terrain = sampleTerrainAt(chunk, point, 'vegetation');
+      const slopeFit = clamp(1 - terrain.slope / 0.34);
+      const rockPenalty = clamp(1 - terrain.rockiness * 0.78);
+      const eligibility = q6(clamp(habitatUpperBound * slopeFit * rockPenalty));
+      if (admissionRoll >= eligibility * 0.58) continue;
       const subtype = chooseVegetationSubtype(
         sourceBiomeWeights,
         terrain,
@@ -195,12 +209,21 @@ async function createVegetationCandidates(chunk, placementSeed) {
   return output.sort(compareFormalDetailCandidates).slice(0, W3_FORMAL_DETAILS.maximumVegetationPerChunk);
 }
 
-async function createRockCandidates(chunk, macroEvaluator, baseProfile, placementSeed, vegetationCandidates) {
+async function createRockCandidates(
+  chunk,
+  macroEvaluator,
+  baseProfile,
+  placementSeed,
+  vegetationCandidates,
+  sampleTerrainAt = sampleTerrain,
+  sampleBiomeWeightsAt = sampleBiomeWeights,
+) {
   const size = W3_FORMAL_DETAILS.rockProposalCellSizeMeters;
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
   const startX = chunk.chunkX * cellsPerChunk;
   const startZ = chunk.chunkZ * cellsPerChunk;
   const profile = Object.freeze({ ...baseProfile, fieldCache: new Map() });
+  const fieldRandom = createDeterministicRandom(profile.fieldSeed);
   const candidateTasks = [];
   for (let localZ = 0; localZ < cellsPerChunk; localZ += 1) {
     for (let localX = 0; localX < cellsPerChunk; localX += 1) {
@@ -211,44 +234,53 @@ async function createRockCandidates(chunk, macroEvaluator, baseProfile, placemen
       };
       const owner = determineDetailCandidateOwner(point);
       if (owner.x !== chunk.chunkX || owner.z !== chunk.chunkZ) continue;
-      const terrain = sampleTerrain(chunk, point);
-      if (terrain.rockiness + terrain.rockMaterial + terrain.slope * 2 < 0.16) continue;
+      // The proposal roll is semantic and independent of Terrain. Evaluate it
+      // before sparse/dense sampling so rejected rock cells pay no height cost.
       if (cellUnit(placementSeed, proposalX, proposalZ, 23) >= 0.36) continue;
-      const macro = macroEvaluator.evaluate(point.x, point.z);
-      const step = G5_MACRO_TERRAIN.derivativeStepMeters;
-      const curvature = q6((
-        macroEvaluator.evaluate(point.x + step, point.z).offsetMm
-        + macroEvaluator.evaluate(point.x - step, point.z).offsetMm
-        + macroEvaluator.evaluate(point.x, point.z + step).offsetMm
-        + macroEvaluator.evaluate(point.x, point.z - step).offsetMm
-        - 4 * macro.offsetMm
-      ) * 0.001 / 4);
-      const sourceBiomeWeights = sampleBiomeWeights(chunk, point);
       const quantizedWorldCell = {
         x: Math.floor(point.x / G6_D_ROCK.cellSizeMeters),
         z: Math.floor(point.z / G6_D_ROCK.cellSizeMeters),
       };
-      const candidateTask = createRockCandidateG6D({
-        profile,
-        worldSeedHash: chunk.worldSeedHash,
-        quantizedWorldCell,
-        point,
-        terrain: {
-          height: terrain.height,
-          slope: terrain.slope,
-          rockiness: terrain.rockiness,
-          rockMaterial: terrain.rockMaterial,
-        },
-        macro: {
-          ridge: clamp(macro.components.ridgesMm / G5_MACRO_TERRAIN.ridges.amplitudeMm),
-          curvature,
-        },
-        river: { distance: Infinity, width: 0 },
-        vegetationCandidates,
-        sourceBiomeWeights,
-        sourceFeatureIds: [],
-      });
-      candidateTasks.push(candidateTask.then(candidate => {
+      const occupancyKey = `${quantizedWorldCell.x}:${quantizedWorldCell.z}`;
+      candidateTasks.push((async () => {
+        // Final G6-D occupancy can never exceed occupancyScale because both
+        // eligibility and subtype occupancy are <= 1. This exact upper-bound
+        // precheck avoids Terrain/field work for the other 81.3% of proposals.
+        if (await fieldRandom.float01(`occupancy:${occupancyKey}`)
+          >= G6_D_ROCK.proposal.occupancyScale) return null;
+        const terrain = sampleTerrainAt(chunk, point, 'rock');
+        if (terrain.rockiness + terrain.rockMaterial + terrain.slope * 2 < 0.16) return null;
+        const macro = macroEvaluator.evaluate(point.x, point.z);
+        const step = G5_MACRO_TERRAIN.derivativeStepMeters;
+        const curvature = q6((
+          macroEvaluator.evaluate(point.x + step, point.z).offsetMm
+          + macroEvaluator.evaluate(point.x - step, point.z).offsetMm
+          + macroEvaluator.evaluate(point.x, point.z + step).offsetMm
+          + macroEvaluator.evaluate(point.x, point.z - step).offsetMm
+          - 4 * macro.offsetMm
+        ) * 0.001 / 4);
+        const sourceBiomeWeights = sampleBiomeWeightsAt(chunk, point);
+        return createRockCandidateG6D({
+          profile,
+          worldSeedHash: chunk.worldSeedHash,
+          quantizedWorldCell,
+          point,
+          terrain: {
+            height: terrain.height,
+            slope: terrain.slope,
+            rockiness: terrain.rockiness,
+            rockMaterial: terrain.rockMaterial,
+          },
+          macro: {
+            ridge: clamp(macro.components.ridgesMm / G5_MACRO_TERRAIN.ridges.amplitudeMm),
+            curvature,
+          },
+          river: { distance: Infinity, width: 0 },
+          vegetationCandidates,
+          sourceBiomeWeights,
+          sourceFeatureIds: [],
+        });
+      })().then(candidate => {
         if (!candidate) return null;
         candidate.owningChunkCoordinate = owner;
         return Object.freeze(candidate);
@@ -315,18 +347,77 @@ export function validateW3FormalChunkData(chunkData) {
   return Object.freeze({ valid: errors.length === 0, errors: Object.freeze(errors) });
 }
 
-export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNingen Infinite Natural World' } = {}) {
-  const naturalGenerator = await createNaturalChunkGenerator({ worldSeed });
+/**
+ * One semantic candidate kernel shared by dense Full generation and the
+ * sparse PresentationOwner path. Callers may supply a lazy terrain sampler,
+ * but Stable-ID construction, admission, subtype choice, dimensions seeds,
+ * ordering, and rock/vegetation conflicts remain this single implementation.
+ */
+export async function createFormalNaturalCandidateKernel({
+  worldSeedHash,
+  macroEvaluator: sharedMacroEvaluator = null,
+} = {}) {
+  if (typeof worldSeedHash !== 'string' || !worldSeedHash) {
+    throw new TypeError('worldSeedHash is required');
+  }
   const [macroEvaluator, rockProfile, placementSeed64] = await Promise.all([
-    createMacroTerrainEvaluator(naturalGenerator.worldSeedHash),
-    createG6DRockProfile({ worldSeedHash: naturalGenerator.worldSeedHash, worldFeatures: [] }),
+    sharedMacroEvaluator ?? createMacroTerrainEvaluator(worldSeedHash),
+    createG6DRockProfile({ worldSeedHash, worldFeatures: [] }),
     deriveLocalSeed64({
-      worldSeedHash: naturalGenerator.worldSeedHash,
+      worldSeedHash,
       namespace: 'w3-formal-natural-details',
       semanticKey: W3_FORMAL_DETAILS.schemaVersion,
     }),
   ]);
   const placementSeed = seed32(placementSeed64);
+  return Object.freeze({
+    schemaVersion: 'shared-formal-natural-candidate-kernel-1',
+    worldSeedHash,
+    async generate({
+      chunk,
+      sampleTerrainAt = sampleTerrain,
+      sampleBiomeWeightsAt = sampleBiomeWeights,
+    } = {}) {
+      if (!Number.isSafeInteger(chunk?.chunkX) || !Number.isSafeInteger(chunk?.chunkZ)) {
+        throw new TypeError('candidate owner is required');
+      }
+      const candidateInput = chunk.worldSeedHash === worldSeedHash
+        ? chunk : { ...chunk, worldSeedHash };
+      const vegetationStartedAt = globalThis.performance?.now?.() ?? Date.now();
+      const vegetationCandidates = await createVegetationCandidates(
+        candidateInput,
+        placementSeed,
+        sampleTerrainAt,
+        sampleBiomeWeightsAt,
+      );
+      const vegetationReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      const rockCandidates = await createRockCandidates(
+        candidateInput,
+        macroEvaluator,
+        rockProfile,
+        placementSeed,
+        vegetationCandidates,
+        sampleTerrainAt,
+        sampleBiomeWeightsAt,
+      );
+      const rockReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      return Object.freeze({
+        vegetationCandidates: Object.freeze(vegetationCandidates),
+        rockCandidates: Object.freeze(rockCandidates),
+        timings: Object.freeze({
+          vegetationMs: q6(vegetationReadyAt - vegetationStartedAt),
+          rockMs: q6(rockReadyAt - vegetationReadyAt),
+        }),
+      });
+    },
+  });
+}
+
+export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNingen Infinite Natural World' } = {}) {
+  const naturalGenerator = await createNaturalChunkGenerator({ worldSeed });
+  const candidateKernel = await createFormalNaturalCandidateKernel({
+    worldSeedHash: naturalGenerator.worldSeedHash,
+  });
   return Object.freeze({
     worldSeed: naturalGenerator.worldSeed,
     worldSeedHash: naturalGenerator.worldSeedHash,
@@ -336,16 +427,10 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
       const natural = stageRecorder
         ? await naturalGenerator.generateChunk(chunkX, chunkZ, { stageRecorder })
         : await naturalGenerator.generateChunk(chunkX, chunkZ);
-      const candidateInput = { ...natural, worldSeedHash: naturalGenerator.worldSeedHash };
       const naturalToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.NATURAL);
-      const vegetationCandidates = await createVegetationCandidates(candidateInput, placementSeed);
-      const rockCandidates = await createRockCandidates(
-        candidateInput,
-        macroEvaluator,
-        rockProfile,
-        placementSeed,
-        vegetationCandidates,
-      );
+      const { vegetationCandidates, rockCandidates } = await candidateKernel.generate({
+        chunk: natural,
+      });
       if (stageRecorder) stageRecorder.end(naturalToken);
       const chunkId = createChunkId({
         worldSeedHash: naturalGenerator.worldSeedHash,
