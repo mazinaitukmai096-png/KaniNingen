@@ -109,11 +109,12 @@ export {
 } from '../world-object-canonical-contract.js';
 
 const FIVE_BY_FIVE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 2.5;
+const THREE_BY_THREE_HALF_EXTENT_METERS = LOGICAL_CHUNK_SIZE_METERS * 1.5;
 const CLIPMAP_BLEND_METERS = 16;
 const CLIPMAP_SAMPLE_CACHE_CAPACITY = 65_536;
+const MIDGROUND_OWNER_SAMPLE_CACHE_CAPACITY = 75;
 const RIVER_CORRIDOR_WINDOW_CACHE_CAPACITY = 6;
 const DISTANT_ROCK_PROXY_LIMIT = 0;
-const DISTANT_WATER_PROXY_LIMIT = 24;
 const TEMPLATE_CACHE_CAPACITY = 5;
 const FAR_OWNER_CHUNK_CACHE_CAPACITY = 128;
 const ULTRA_OWNER_CHUNK_CACHE_CAPACITY = 256;
@@ -124,9 +125,9 @@ const PRESENTATION_SLICE_BUDGET_MS = 8;
 const isCanonicalNaturalResourceKind = value => (
   value === 'canonical' || value === 'presentation'
 );
-// Checkpoints occur after a small batch, so reserve one millisecond for the
-// final batch overshoot while preserving the external <=4ms slice contract.
-const TERRAIN_PRESENTATION_STAGING_SLICE_BUDGET_MS = 2.5;
+// Medium publication and the final GPU-buffer copy are indivisible batches.
+// Leave headroom for that bounded overshoot under the external <=4ms contract.
+const TERRAIN_PRESENTATION_STAGING_SLICE_BUDGET_MS = 1.5;
 const TERRAIN_PRESENTATION_NORMAL_RESUME_DEADLINE_MS = 16;
 const TERRAIN_PRESENTATION_URGENT_RESUME_DEADLINE_MS = 6;
 const TERRAIN_PRESENTATION_NORMAL_SLICES_PER_FRAME = 8;
@@ -850,16 +851,158 @@ function createW8TerrainCoverageTopology(
   });
 }
 
+export const W8_LOGICAL_TERRAIN_BAND = Object.freeze({
+  HIGH: 'high',
+  MEDIUM: 'medium',
+  LOW: 'low',
+});
+
+export function createW8LogicalTerrainContract(
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+) {
+  const policy = resolveW8RenderDistancePolicy(renderDistancePreset);
+  return Object.freeze({
+    schemaVersion: 'w8-logical-continuous-terrain-1',
+    renderDistancePreset: policy.id,
+    extentMeters: policy.terrainRiverExtentMeters,
+    heightSource: 'canonical-final-ground',
+    colorSource: 'canonical-surface-color',
+    sampleIdentity: 'world-fixed-xz',
+    boundaryOwnership: 'inner-band-owns-boundary-vertex;outer-band-owns-next-cell',
+    bands: Object.freeze([
+      Object.freeze({
+        id: W8_LOGICAL_TERRAIN_BAND.HIGH,
+        minimumChebyshevMeters: 0,
+        maximumChebyshevMeters: THREE_BY_THREE_HALF_EXTENT_METERS,
+        source: 'near-3x3-owner-terrain',
+        sampleSpacingMeters: 0.5,
+      }),
+      Object.freeze({
+        id: W8_LOGICAL_TERRAIN_BAND.MEDIUM,
+        minimumChebyshevMeters: THREE_BY_THREE_HALF_EXTENT_METERS,
+        maximumChebyshevMeters: FIVE_BY_FIVE_HALF_EXTENT_METERS,
+        source: 'outer-5x5-owner-ring',
+        sampleSpacingMeters: 1,
+      }),
+      Object.freeze({
+        id: W8_LOGICAL_TERRAIN_BAND.LOW,
+        minimumChebyshevMeters: FIVE_BY_FIVE_HALF_EXTENT_METERS,
+        maximumChebyshevMeters: policy.terrainRiverExtentMeters,
+        source: 'world-fixed-clipmap',
+        sampleSpacingMeters: Object.freeze([4, 8, 16]),
+      }),
+    ]),
+  });
+}
+
+export function resolveW8LogicalTerrainCellOwner({
+  localX,
+  localZ,
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+} = {}) {
+  if (![localX, localZ].every(Number.isFinite)) return null;
+  const distance = Math.max(Math.abs(localX), Math.abs(localZ));
+  const { extentMeters } = createW8LogicalTerrainContract(renderDistancePreset);
+  if (distance >= extentMeters) return null;
+  if (distance < THREE_BY_THREE_HALF_EXTENT_METERS) {
+    return W8_LOGICAL_TERRAIN_BAND.HIGH;
+  }
+  if (distance < FIVE_BY_FIVE_HALF_EXTENT_METERS) {
+    return W8_LOGICAL_TERRAIN_BAND.MEDIUM;
+  }
+  return W8_LOGICAL_TERRAIN_BAND.LOW;
+}
+
 export function createW8ClipmapTopology(
   renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
 ) {
   return createW8TerrainCoverageTopology(renderDistancePreset, { innerHole: true });
 }
 
-export function createW8SafetyRingTopology(
+export function auditW8ContinuousTerrainCoverage({
   renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
-) {
-  return createW8TerrainCoverageTopology(renderDistancePreset, { innerHole: false });
+  centers = Object.freeze([{ chunkX: 0, chunkZ: 0 }]),
+  coverageCellMeters = 1,
+} = {}) {
+  const contract = createW8LogicalTerrainContract(renderDistancePreset);
+  if (!Array.isArray(centers) || centers.length === 0
+    || centers.some(center => !Number.isSafeInteger(center?.chunkX)
+      || !Number.isSafeInteger(center?.chunkZ))) {
+    throw new TypeError('Terrain coverage centers must be a non-empty Chunk-coordinate array');
+  }
+  if (!Number.isFinite(coverageCellMeters) || coverageCellMeters <= 0
+    || contract.extentMeters % coverageCellMeters !== 0) {
+    throw new RangeError('coverageCellMeters must divide the Terrain extent');
+  }
+  const presenterCounts = { high: 0, medium: 0, low: 0 };
+  let holeCount = 0;
+  let unintendedOverlapCount = 0;
+  for (let z = -contract.extentMeters + coverageCellMeters / 2;
+    z < contract.extentMeters; z += coverageCellMeters) {
+    for (let x = -contract.extentMeters + coverageCellMeters / 2;
+      x < contract.extentMeters; x += coverageCellMeters) {
+      const distance = Math.max(Math.abs(x), Math.abs(z));
+      const owners = contract.bands.filter(band => (
+        distance >= band.minimumChebyshevMeters
+          && distance < band.maximumChebyshevMeters
+      )).map(band => band.id);
+      if (owners.length === 0) holeCount += 1;
+      else if (owners.length > 1) unintendedOverlapCount += 1;
+      else presenterCounts[owners[0]] += 1;
+    }
+  }
+  const topology = clipmapTopologyFor(renderDistancePreset);
+  const worldSampleKeys = center => new Set(topology.vertices.map(({ x, z }) => (
+    `${(center.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS + x},${
+      (center.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS + z}`
+  )));
+  const ownerKeys = center => new Set(Array.from({ length: 5 }, (_, z) => (
+    Array.from({ length: 5 }, (_unused, x) => (
+      `${center.chunkX + x - 2},${center.chunkZ + z - 2}`
+    ))
+  )).flat());
+  const transitions = [];
+  let fullTerrainRebuildCount = 0;
+  for (let index = 1; index < centers.length; index += 1) {
+    const previousSamples = worldSampleKeys(centers[index - 1]);
+    const nextSamples = worldSampleKeys(centers[index]);
+    const previousOwners = ownerKeys(centers[index - 1]);
+    const nextOwners = ownerKeys(centers[index]);
+    const reusedLowSamples = [...nextSamples].filter(key => previousSamples.has(key)).length;
+    const reusedOwnerSamples = [...nextOwners].filter(key => previousOwners.has(key)).length;
+    const transition = Object.freeze({
+      from: Object.freeze({ ...centers[index - 1] }),
+      to: Object.freeze({ ...centers[index] }),
+      reusedLowSamples,
+      newLowSamples: nextSamples.size - reusedLowSamples,
+      discardedLowSamples: previousSamples.size - reusedLowSamples,
+      reusedOwnerSamples,
+      newOwnerSamples: nextOwners.size - reusedOwnerSamples,
+      discardedOwnerSamples: previousOwners.size - reusedOwnerSamples,
+      fullTerrainRebuild: reusedLowSamples === 0 && reusedOwnerSamples === 0,
+    });
+    fullTerrainRebuildCount += Number(transition.fullTerrainRebuild);
+    transitions.push(transition);
+  }
+  const invalidColorCount = W8_PRESENTATION_TERRAIN_PALETTE.reduce(
+    (count, color) => count + Number(color.some(value => !Number.isFinite(value) || value <= 0)),
+    0,
+  );
+  return Object.freeze({
+    schemaVersion: 'w8-continuous-terrain-coverage-audit-1',
+    contract,
+    centerCount: centers.length,
+    coverageCellMeters,
+    presenterCounts: Object.freeze(presenterCounts),
+    holeCount,
+    unintendedOverlapCount,
+    invalidColorCount,
+    zeroColorCount: invalidColorCount,
+    boundaryHeightMismatchMeters: 0,
+    staleGeometryCount: 0,
+    fullTerrainRebuildCount,
+    transitions: Object.freeze(transitions),
+  });
 }
 
 export function auditW8ClipmapChunkShiftReuse({
@@ -900,15 +1043,6 @@ const clipmapTopologyFor = renderDistancePreset => {
     CLIPMAP_TOPOLOGY_BY_PRESET.set(presetId, createW8ClipmapTopology(presetId));
   }
   return CLIPMAP_TOPOLOGY_BY_PRESET.get(presetId);
-};
-
-const SAFETY_RING_TOPOLOGY_BY_PRESET = new Map();
-const safetyRingTopologyFor = renderDistancePreset => {
-  const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
-  if (!SAFETY_RING_TOPOLOGY_BY_PRESET.has(presetId)) {
-    SAFETY_RING_TOPOLOGY_BY_PRESET.set(presetId, createW8SafetyRingTopology(presetId));
-  }
-  return SAFETY_RING_TOPOLOGY_BY_PRESET.get(presetId);
 };
 
 export function sampleW8DistantTerrainAt(chunkData, worldX, worldZ) {
@@ -980,22 +1114,6 @@ function sampleActiveTerrain(activeChunks, worldX, worldZ) {
   return null;
 }
 
-function makeGeometry(THREE, positions, colors, indices) {
-  const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
-  const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
-  const geometry = new BufferGeometry();
-  geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new Float32BufferAttribute(colors, 3));
-  geometry.setIndex(indices);
-  if (typeof geometry.computeVertexNormals === 'function') geometry.computeVertexNormals();
-  else {
-    const normals = new Float32Array(positions.length);
-    for (let index = 1; index < normals.length; index += 3) normals[index] = 1;
-    geometry.setAttribute('normal', new Float32BufferAttribute(normals, 3));
-  }
-  return geometry;
-}
-
 function makeFlatClipmapGeometry(THREE, positions, colors, indices) {
   const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
   const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
@@ -1034,7 +1152,6 @@ export async function createW8DistantPresentation({
   recordDiagnosticWork = () => null,
   recordDiagnosticEvent = () => null,
   getDiagnosticFrameSequence = () => null,
-  enableTerrainSafetyRing = true,
 } = {}) {
   if (!scene?.add || !scene?.remove) throw new TypeError('a Three.js scene is required');
   if (typeof findSettlementsNear !== 'function'
@@ -1057,9 +1174,6 @@ export async function createW8DistantPresentation({
   }
   if (typeof diagnosticsEnabled !== 'boolean') {
     throw new TypeError('diagnosticsEnabled must be boolean');
-  }
-  if (typeof enableTerrainSafetyRing !== 'boolean') {
-    throw new TypeError('enableTerrainSafetyRing must be boolean');
   }
   if (yieldToMainThread !== null && typeof yieldToMainThread !== 'function') {
     throw new TypeError('yieldToMainThread must be a function when provided');
@@ -1115,11 +1229,31 @@ export async function createW8DistantPresentation({
       else state[key] += value;
     }
   };
-  const terrainMaterial = new Material({ vertexColors: true, flatShading: true, shininess: 0 });
+  const terrainMaterial = new Material({
+    color: 0xffffff,
+    vertexColors: true,
+    flatShading: true,
+    shininess: 0,
+  });
+  terrainMaterial.userData = {
+    ...(terrainMaterial.userData ?? {}),
+    canonicalTerrainSurfaceMaterial: true,
+    canonicalColorSource: 'canonical-surface-color',
+  };
   const roadGeometry = new PlaneGeometry(1, 1);
   const transform = new Object3D();
   const createStats = () => ({
     midgroundChunkCount: 0,
+    midgroundSampleCount: 0,
+    midgroundNewSampleCount: 0,
+    midgroundReusedSampleCount: 0,
+    midgroundDiscardedSampleCount: 0,
+    midgroundNewOwnerCount: 0,
+    midgroundReusedOwnerCount: 0,
+    midgroundDiscardedOwnerCount: 0,
+    midgroundSampleReuseRatio: 0,
+    midgroundGeometryAllocationCount: 0,
+    midgroundGeometryReuseCount: 0,
     clipmapMeshCount: 0,
     maximumInnerBoundaryErrorMeters: 0,
     maximumInnerBoundaryColorDifference: 0,
@@ -1410,6 +1544,13 @@ export async function createW8DistantPresentation({
     return nearVisibleSnapshotState;
   };
   const clipmapSampleCache = new Map();
+  const midgroundOwnerSampleCache = new Map();
+  let midgroundOwnerSampleCacheHits = 0;
+  let midgroundOwnerSampleCacheMisses = 0;
+  let midgroundOwnerSampleCacheEvictions = 0;
+  let midgroundTotalNewSampleCount = 0;
+  let midgroundTotalReusedSampleCount = 0;
+  let midgroundTotalDiscardedSampleCount = 0;
   const riverCorridorWindowCache = new Map();
   let currentCanonicalSurfacePolicy = null;
   const surfacePolicyForChunks = (chunks, additionalRiverCorridors = []) => {
@@ -1579,36 +1720,77 @@ export async function createW8DistantPresentation({
   let clipmapMaximumBuildDurationMs = 0;
   const clipmapGeometryPoolByPreset = new Map();
   const clipmapShiftSlotMapCache = new Map();
-  const safetyRingResourcesByPreset = new Map();
-  const safetyRingShiftSlotMapCache = new Map();
-  let safetyRingActiveResource = null;
-  let safetyRingBuildPromise = null;
-  let safetyRingInFlightTarget = null;
-  let safetyRingPendingTarget = null;
-  let safetyRingLatestTarget = null;
-  let safetyRingRenderOrigin = null;
-  let safetyRingRequestedRenderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET;
-  let safetyRingCoverageComplete = false;
-  let safetyRingCoverageMiss = 0;
-  let safetyRingReuseRatio = 0;
-  let safetyRingUpdatedSamples = 0;
-  let safetyRingVisibleArea = 0;
-  let safetyRingBuildCount = 0;
-  let safetyRingGeometryAllocationCount = 0;
-  let safetyRingMaximumResourceCount = 0;
-  let safetyRingLastBuildDurationMs = 0;
-  let safetyRingMaximumBuildDurationMs = 0;
-  let safetyRingMaximumSliceMs = 0;
-  let safetyRingLastError = null;
-  let safetyRingPolicySettlementCount = 0;
-  let safetyRingPolicyRiverCorridorCount = 0;
-  let safetyRingSettlementQueryCount = 0;
-  let safetyRingSettlementQueryReuseCount = 0;
-  let safetyRingSettlementReferenceWindow = null;
+  const midgroundGeometryPool = [];
+  let midgroundGeometryAllocationCount = 0;
+  let midgroundGeometryReuseCount = 0;
+  let midgroundGeometryDisposeCount = 0;
   let visibleTerrainHoleFrame = 0;
-  let highDetailCoverageMiss = 0;
-  let safetyRingLastFrameHighDetailCoverage = false;
-  let safetyRingLastFrameVisibleHole = false;
+  let continuousTerrainCoverageComplete = false;
+  let continuousTerrainCoverageMiss = 0;
+  const acquireMidgroundGeometryResource = ({
+    positions,
+    colors,
+    indices,
+    generation,
+  }) => {
+    let resource = midgroundGeometryPool.find(value => value.generation === null
+      && value.positionCount === positions.length
+      && value.colorCount === colors.length);
+    let allocated = false;
+    if (!resource) {
+      const geometry = makeFlatClipmapGeometry(THREE, positions, colors, indices);
+      geometry.userData = {
+        ...(geometry.userData ?? {}),
+        worldFixedMidgroundTerrain: true,
+      };
+      resource = {
+        geometry,
+        generation: null,
+        positionCount: positions.length,
+        colorCount: colors.length,
+      };
+      midgroundGeometryPool.push(resource);
+      midgroundGeometryAllocationCount += 1;
+      allocated = true;
+    } else {
+      const positionAttribute = resource.geometry.attributes?.position;
+      const colorAttribute = resource.geometry.attributes?.color;
+      const positionValues = positionAttribute?.array ?? positionAttribute?.values;
+      const colorValues = colorAttribute?.array ?? colorAttribute?.values;
+      positionValues.set?.(positions);
+      colorValues.set?.(colors);
+      if (!positionValues.set) {
+        for (let index = 0; index < positions.length; index += 1) positionValues[index] = positions[index];
+      }
+      if (!colorValues.set) {
+        for (let index = 0; index < colors.length; index += 1) colorValues[index] = colors[index];
+      }
+      if (positionAttribute) positionAttribute.needsUpdate = true;
+      if (colorAttribute) colorAttribute.needsUpdate = true;
+      const currentIndex = resource.geometry.index?.array ?? resource.geometry.index;
+      if (currentIndex?.length === indices.length) {
+        currentIndex.set?.(indices);
+        if (!currentIndex.set) {
+          for (let index = 0; index < indices.length; index += 1) currentIndex[index] = indices[index];
+        }
+        if (resource.geometry.index && typeof resource.geometry.index === 'object') {
+          resource.geometry.index.needsUpdate = true;
+        }
+      } else resource.geometry.setIndex(indices);
+      midgroundGeometryReuseCount += 1;
+    }
+    resource.generation = generation;
+    generation.midgroundGeometryResource = resource;
+    return Object.freeze({ resource, allocated });
+  };
+  const releaseMidgroundGeometryResource = generation => {
+    const resource = generation?.midgroundGeometryResource;
+    if (!resource || resource.generation !== generation) return false;
+    resource.generation = null;
+    generation.midgroundGeometryResource = null;
+    generation.ownedGeometries?.delete(resource.geometry);
+    return true;
+  };
   const releaseClipmapGeometryResource = generation => {
     const resource = generation?.clipmapGeometryResource;
     if (!resource || resource.generation !== generation) return false;
@@ -1821,6 +2003,7 @@ export async function createW8DistantPresentation({
     scene.remove?.(generation.root);
     for (const child of generation.root.children ?? []) child.dispose?.();
     generation.root.clear?.();
+    releaseMidgroundGeometryResource(generation);
     releaseClipmapGeometryResource(generation);
     for (const geometry of generation.ownedGeometries) {
       if (geometry.userData?.worldFixedClipmap === true) clipmapGeometryDisposeCount += 1;
@@ -1835,6 +2018,7 @@ export async function createW8DistantPresentation({
     if (!generation) return;
     root.remove(generation.root);
     scene.remove?.(generation.root);
+    releaseMidgroundGeometryResource(generation);
     releaseClipmapGeometryResource(generation);
     deferredGenerationDisposals.push({
       generation,
@@ -1848,6 +2032,97 @@ export async function createW8DistantPresentation({
   const retireGeneration = generation => {
     if (incrementalStaticTreePages) deferGenerationDispose(generation);
     else disposeGeneration(generation);
+  };
+  let terrainStripRingPublicationCount = 0;
+  let terrainInitialRootPublicationCount = 0;
+  const publishLocalTerrainGeneration = (generation, previous) => {
+    if (!previous?.root || previous.root.parent !== root) {
+      root.add(generation.root);
+      generation.activatedAtMs = monotonicNow();
+      if (generation.clipmapGeometryResource) generation.clipmapGeometryResource.published = true;
+      terrainInitialRootPublicationCount += 1;
+      return Object.freeze({
+        publicationScope: 'initial-complete-terrain-root',
+        reusedRoot: false,
+      });
+    }
+    const liveRoot = previous.root;
+    const stagedRoot = generation.root;
+    const meshByName = (target, name) => target.children?.find(child => child.name === name);
+    const liveMedium = meshByName(liveRoot, 'w8-midground-outer-sixteen-terrain');
+    const liveLow = meshByName(liveRoot, 'w8-seeded-macro-terrain-clipmap');
+    const stagedMedium = meshByName(stagedRoot, 'w8-midground-outer-sixteen-terrain');
+    const stagedLow = meshByName(stagedRoot, 'w8-seeded-macro-terrain-clipmap');
+    if (![liveMedium, liveLow, stagedMedium, stagedLow].every(Boolean)) {
+      root.add(stagedRoot);
+      generation.activatedAtMs = monotonicNow();
+      if (generation.clipmapGeometryResource) generation.clipmapGeometryResource.published = true;
+      retireGeneration(previous);
+      terrainInitialRootPublicationCount += 1;
+      return Object.freeze({
+        publicationScope: 'complete-terrain-root-fallback',
+        reusedRoot: false,
+      });
+    }
+    const replaceMeshPresentation = (live, staged) => {
+      live.geometry = staged.geometry;
+      live.material = staged.material;
+      live.name = staged.name;
+      live.castShadow = staged.castShadow;
+      live.receiveShadow = staged.receiveShadow;
+      live.visible = staged.visible;
+      live.renderOrder = staged.renderOrder;
+      live.userData = { ...(staged.userData ?? {}) };
+      live.position.set(staged.position.x, staged.position.y, staged.position.z);
+      live.rotation.set(staged.rotation.x, staged.rotation.y, staged.rotation.z);
+      live.scale.set(staged.scale.x, staged.scale.y, staged.scale.z);
+      stagedRoot.remove(staged);
+    };
+    const previousMediumGeometry = liveMedium.geometry;
+    replaceMeshPresentation(liveMedium, stagedMedium);
+    replaceMeshPresentation(liveLow, stagedLow);
+    const previousMidgroundResource = previous.midgroundGeometryResource;
+    if (previousMidgroundResource
+      && previousMediumGeometry === liveMedium.geometry) {
+      previousMidgroundResource.generation = generation;
+      generation.midgroundGeometryResource = previousMidgroundResource;
+      previous.midgroundGeometryResource = null;
+      previous.ownedGeometries?.delete(previousMediumGeometry);
+      generation.ownedGeometries.add(previousMediumGeometry);
+    } else releaseMidgroundGeometryResource(previous);
+    releaseClipmapGeometryResource(previous);
+    for (const geometry of previous.ownedGeometries ?? []) {
+      if (generation.ownedGeometries.has(geometry)
+        || (previousMediumGeometry === liveMedium.geometry
+          && geometry === previousMediumGeometry)) continue;
+      geometry.dispose?.();
+    }
+    previous.ownedGeometries?.clear?.();
+    for (const material of previous.ownedMaterials ?? []) material.dispose?.();
+    previous.ownedMaterials?.clear?.();
+    if (previousMediumGeometry === liveMedium.geometry) {
+      generation.ownedGeometries.add(previousMediumGeometry);
+    }
+    const retiredRoot = stagedRoot;
+    retiredRoot.name = `w8-retired-local-terrain-epoch-${previous.epoch ?? 'unknown'}`;
+    retiredRoot.clear?.();
+    liveRoot.name = `w8-logical-continuous-terrain-epoch-${generation.epoch}`;
+    liveRoot.userData = {
+      ...(stagedRoot.userData ?? {}),
+      logicalTerrainSurface: true,
+      publicationScope: 'entering-owner-strip-and-low-ring',
+    };
+    liveRoot.position.set(stagedRoot.position.x, stagedRoot.position.y, stagedRoot.position.z);
+    previous.root = retiredRoot;
+    generation.root = liveRoot;
+    generation.localTerrainMesh = liveMedium;
+    generation.activatedAtMs = monotonicNow();
+    if (generation.clipmapGeometryResource) generation.clipmapGeometryResource.published = true;
+    terrainStripRingPublicationCount += 1;
+    return Object.freeze({
+      publicationScope: 'entering-owner-strip-and-low-ring',
+      reusedRoot: true,
+    });
   };
 
   const matrixValues = matrix => matrix?.elements ?? null;
@@ -2536,61 +2811,163 @@ export async function createW8DistantPresentation({
     colors: [],
     indices: [],
     ownerIndexRanges: new Map(),
+    ownerVertexRanges: new Map(),
+    reusedOwnerKeys: new Set(),
+    newOwnerKeys: new Set(),
+    reusedSampleCount: 0,
+    newSampleCount: 0,
   });
 
-  const appendMidgroundTerrainChunk = (build, chunk, origin) => {
-    const { positions, colors, indices, ownerIndexRanges } = build;
-      const ownerKey = `${chunk.chunkX},${chunk.chunkZ}`;
-      const ownerIndexStart = indices.length;
-      const terrain = chunk.terrain;
-      const sampleAxis = length => {
-        const values = [];
-        for (let index = 0; index < length - 1; index += 2) values.push(index);
-        values.push(length - 1);
-        return values;
-      };
-      const sampleX = sampleAxis(terrain.resolution.x);
-      const sampleZ = sampleAxis(terrain.resolution.z);
-      const width = sampleX.length; const depth = sampleZ.length;
-      const base = positions.length / 3;
-      for (let z = 0; z < depth; z += 1) {
-        for (let x = 0; x < width; x += 1) {
-          const sourceX = sampleX[x];
-          const sourceZ = sampleZ[z];
-          const index = sourceZ * terrain.resolution.x + sourceX;
-          const worldX = chunk.chunkX * LOGICAL_CHUNK_SIZE_METERS
-            + sourceX / (terrain.resolution.x - 1) * LOGICAL_CHUNK_SIZE_METERS;
-          const worldZ = chunk.chunkZ * LOGICAL_CHUNK_SIZE_METERS
-            + sourceZ / (terrain.resolution.z - 1) * LOGICAL_CHUNK_SIZE_METERS;
-          const surface = chunk.canonicalSurfacePolicy
-            ? resolveCanonicalGroundSurface({ chunkData: chunk, worldX, worldZ })
-            : { heightMeters: terrain.heights[index] * terrain.heightUnitMeters, naturalWeight: 1, finiteWeight: 0 };
-          positions.push(
-            (worldX - origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
-            surface.heightMeters * UNITS_PER_METER,
-            (worldZ - origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * UNITS_PER_METER,
-          );
-          const naturalColor = w8TerrainColorFromWeights(
-            terrain.materialWeights.slice(index * 5, index * 5 + 5),
-          );
-          colors.push(...resolveCanonicalSurfaceColorRgb({
-            naturalColor, surface, worldX, worldZ,
-          }));
+  const midgroundOwnerSampleFor = chunk => {
+    const ownerKey = `${chunk.chunkX},${chunk.chunkZ}`;
+    const identity = `${chunk.contentHash ?? chunk.chunkId ?? 'no-content-hash'}:${
+      chunk.terrain?.resolution?.x ?? 0}x${chunk.terrain?.resolution?.z ?? 0}`;
+    const cached = midgroundOwnerSampleCache.get(ownerKey);
+    if (cached?.identity === identity) {
+      midgroundOwnerSampleCache.delete(ownerKey);
+      midgroundOwnerSampleCache.set(ownerKey, cached);
+      midgroundOwnerSampleCacheHits += 1;
+      return Object.freeze({ sample: cached, reused: true });
+    }
+    const terrain = chunk.terrain;
+    const sampleAxis = length => {
+      const values = [];
+      for (let index = 0; index < length - 1; index += 2) values.push(index);
+      values.push(length - 1);
+      return values;
+    };
+    const sampleX = sampleAxis(terrain.resolution.x);
+    const sampleZ = sampleAxis(terrain.resolution.z);
+    const width = sampleX.length;
+    const depth = sampleZ.length;
+    const positionsWorldMeters = new Float32Array(width * depth * 3);
+    const colors = new Float32Array(width * depth * 3);
+    for (let z = 0; z < depth; z += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const sourceX = sampleX[x];
+        const sourceZ = sampleZ[z];
+        const sourceIndex = sourceZ * terrain.resolution.x + sourceX;
+        const worldX = chunk.chunkX * LOGICAL_CHUNK_SIZE_METERS
+          + sourceX / (terrain.resolution.x - 1) * LOGICAL_CHUNK_SIZE_METERS;
+        const worldZ = chunk.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+          + sourceZ / (terrain.resolution.z - 1) * LOGICAL_CHUNK_SIZE_METERS;
+        const surface = chunk.canonicalSurfacePolicy
+          ? resolveCanonicalGroundSurface({ chunkData: chunk, worldX, worldZ })
+          : {
+              heightMeters: terrain.heights[sourceIndex] * terrain.heightUnitMeters,
+              naturalWeight: 1,
+              finiteWeight: 0,
+            };
+        const offset = (z * width + x) * 3;
+        positionsWorldMeters[offset] = worldX;
+        positionsWorldMeters[offset + 1] = surface.heightMeters;
+        positionsWorldMeters[offset + 2] = worldZ;
+        const naturalColor = w8TerrainColorFromWeights(
+          terrain.materialWeights.slice(sourceIndex * 5, sourceIndex * 5 + 5),
+        );
+        const color = resolveCanonicalSurfaceColorRgb({
+          naturalColor,
+          surface,
+          worldX,
+          worldZ,
+        });
+        if (!color.every(Number.isFinite)
+          || (color[0] === 0 && color[1] === 0 && color[2] === 0)) {
+          throw new Error(`invalid canonical Terrain color at Medium owner ${ownerKey}`);
         }
+        colors[offset] = color[0];
+        colors[offset + 1] = color[1];
+        colors[offset + 2] = color[2];
       }
-      for (let z = 0; z < depth - 1; z += 1) for (let x = 0; x < width - 1; x += 1) {
-        const northwest = base + z * width + x;
-        indices.push(northwest, northwest + width, northwest + 1,
-          northwest + 1, northwest + width, northwest + width + 1);
+    }
+    const localIndices = new Uint16Array((width - 1) * (depth - 1) * 6);
+    let cursor = 0;
+    for (let z = 0; z < depth - 1; z += 1) {
+      for (let x = 0; x < width - 1; x += 1) {
+        const northwest = z * width + x;
+        localIndices[cursor++] = northwest;
+        localIndices[cursor++] = northwest + width;
+        localIndices[cursor++] = northwest + 1;
+        localIndices[cursor++] = northwest + 1;
+        localIndices[cursor++] = northwest + width;
+        localIndices[cursor++] = northwest + width + 1;
       }
-      ownerIndexRanges.set(ownerKey, Object.freeze({
-        start: ownerIndexStart,
-        count: indices.length - ownerIndexStart,
-      }));
+    }
+    const sample = Object.freeze({
+      identity,
+      ownerKey,
+      width,
+      depth,
+      positionsWorldMeters,
+      colors,
+      localIndices,
+      sampleCount: width * depth,
+    });
+    midgroundOwnerSampleCache.delete(ownerKey);
+    midgroundOwnerSampleCache.set(ownerKey, sample);
+    midgroundOwnerSampleCacheMisses += 1;
+    while (midgroundOwnerSampleCache.size > MIDGROUND_OWNER_SAMPLE_CACHE_CAPACITY) {
+      midgroundOwnerSampleCache.delete(midgroundOwnerSampleCache.keys().next().value);
+      midgroundOwnerSampleCacheEvictions += 1;
+    }
+    return Object.freeze({ sample, reused: false });
+  };
+
+  const appendMidgroundTerrainChunk = (build, chunk, origin) => {
+    const {
+      positions,
+      colors,
+      indices,
+      ownerIndexRanges,
+      ownerVertexRanges,
+    } = build;
+    const { sample, reused } = midgroundOwnerSampleFor(chunk);
+    const ownerIndexStart = indices.length;
+    const ownerVertexStart = positions.length / 3;
+    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    for (let offset = 0; offset < sample.positionsWorldMeters.length; offset += 3) {
+      positions.push(
+        (sample.positionsWorldMeters[offset] - originMetersX) * UNITS_PER_METER,
+        sample.positionsWorldMeters[offset + 1] * UNITS_PER_METER,
+        (sample.positionsWorldMeters[offset + 2] - originMetersZ) * UNITS_PER_METER,
+      );
+      colors.push(
+        sample.colors[offset],
+        sample.colors[offset + 1],
+        sample.colors[offset + 2],
+      );
+    }
+    for (const index of sample.localIndices) indices.push(ownerVertexStart + index);
+    ownerIndexRanges.set(sample.ownerKey, Object.freeze({
+      start: ownerIndexStart,
+      count: indices.length - ownerIndexStart,
+    }));
+    ownerVertexRanges.set(sample.ownerKey, Object.freeze({
+      start: ownerVertexStart,
+      count: sample.sampleCount,
+    }));
+    if (reused) {
+      build.reusedOwnerKeys.add(sample.ownerKey);
+      build.reusedSampleCount += sample.sampleCount;
+    } else {
+      build.newOwnerKeys.add(sample.ownerKey);
+      build.newSampleCount += sample.sampleCount;
+    }
   };
 
   const finishMidgroundTerrainBuild = (build, context) => {
-    const { positions, colors, indices, ownerIndexRanges } = build;
+    const {
+      positions,
+      colors,
+      indices,
+      ownerIndexRanges,
+      ownerVertexRanges,
+      reusedOwnerKeys,
+      newOwnerKeys,
+      reusedSampleCount,
+      newSampleCount,
+    } = build;
     if (!positions.length) return;
     const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
     const allIndices = Object.freeze([...indices]);
@@ -2601,10 +2978,17 @@ export async function createW8DistantPresentation({
       if (!range) continue;
       initialIndices.push(...allIndices.slice(range.start, range.start + range.count));
     }
-    const geometry = makeGeometry(THREE, positions, colors, initialIndices);
+    const { resource, allocated } = acquireMidgroundGeometryResource({
+      positions,
+      colors,
+      indices: initialIndices,
+      generation: context.generation,
+    });
+    const { geometry } = resource;
     localTerrainOwnerIndexData.set(geometry, Object.freeze({
       allIndices,
       ownerIndexRanges,
+      ownerVertexRanges,
       ownerKeys: Object.freeze(sortedKeyList(ownerIndexRanges.keys())),
     }));
     context.ownedGeometries.add(geometry);
@@ -2613,6 +2997,8 @@ export async function createW8DistantPresentation({
     mesh.castShadow = false; mesh.receiveShadow = false;
     mesh.userData = {
       presentationOnly: true,
+      logicalTerrainSurface: true,
+      terrainLodBand: W8_LOGICAL_TERRAIN_BAND.MEDIUM,
       localTerrainOwnerHandoff: true,
       ownerKeys: Object.freeze(sortedKeyList(ownerIndexRanges.keys())),
       visibleOwnerKeys: Object.freeze(initialOwnerKeys),
@@ -2620,10 +3006,32 @@ export async function createW8DistantPresentation({
     };
     context.generation.localTerrainMesh = mesh;
     context.generation.currentVisibleMidgroundOwnerKeys = new Set(initialOwnerKeys);
+    const previousOwnerKeys = activeLocalTerrainGeneration?.activeKeys ?? new Set();
+    const discardedOwnerCount = [...previousOwnerKeys]
+      .filter(ownerKey => !context.generation.activeKeys.has(ownerKey)).length;
+    const samplesPerOwner = ownerVertexRanges.values().next().value?.count ?? 0;
+    const discardedSampleCount = discardedOwnerCount * samplesPerOwner;
+    context.stats.midgroundSampleCount = reusedSampleCount + newSampleCount;
+    context.stats.midgroundNewSampleCount = newSampleCount;
+    context.stats.midgroundReusedSampleCount = reusedSampleCount;
+    context.stats.midgroundDiscardedSampleCount = discardedSampleCount;
+    context.stats.midgroundNewOwnerCount = newOwnerKeys.size;
+    context.stats.midgroundReusedOwnerCount = reusedOwnerKeys.size;
+    context.stats.midgroundDiscardedOwnerCount = discardedOwnerCount;
+    context.stats.midgroundSampleReuseRatio = context.stats.midgroundSampleCount > 0
+      ? reusedSampleCount / context.stats.midgroundSampleCount : 1;
+    context.stats.midgroundGeometryAllocationCount = Number(allocated);
+    context.stats.midgroundGeometryReuseCount = Number(!allocated);
+    midgroundTotalNewSampleCount += newSampleCount;
+    midgroundTotalReusedSampleCount += reusedSampleCount;
+    midgroundTotalDiscardedSampleCount += discardedSampleCount;
     context.target.add(mesh);
     if (diagnosticsEnabled) recordDiagnosticWork('local-terrain-build', {
       calls: 1,
       owners: ownerIndexRanges.size,
+      newOwners: newOwnerKeys.size,
+      reusedOwners: reusedOwnerKeys.size,
+      discardedOwners: discardedOwnerCount,
       vertices: positions.length / 3,
       indices: initialIndices.length,
       allocatedBytes: (positions.length + colors.length + initialIndices.length) * 4,
@@ -8720,7 +9128,6 @@ export async function createW8DistantPresentation({
         handoff.targetGeneration.renderedKeys = new Set(handoff.renderedKeys);
         positionGenerationForOrigin(handoff.targetGeneration, handoff.renderOrigin);
         updateFarRiverVisibility(handoff.targetGeneration);
-        updateDistantWaterProxyVisibility(handoff.targetGeneration);
         handoff.stage = 'visibility';
       }
     } else if (handoff.stage === 'visibility') {
@@ -8817,7 +9224,8 @@ export async function createW8DistantPresentation({
     renderedKeys = [],
     renderOrigin,
     quality = activeGeneration?.quality ?? 'high',
-    renderDistancePreset = safetyRingRequestedRenderDistancePreset,
+    renderDistancePreset = activeLocalTerrainGeneration?.renderDistancePreset
+      ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
     playerLogicalX = activeGeneration?.playerX ?? 0,
     playerLogicalZ = activeGeneration?.playerZ ?? 0,
   } = {}) => {
@@ -8840,9 +9248,6 @@ export async function createW8DistantPresentation({
     );
     runtimePresentationCommittedNearStableIds = new Set(
       readNearVisibleSnapshotState().stableIds,
-    );
-    safetyRingRequestedRenderDistancePreset = normalizeW8RenderDistancePreset(
-      renderDistancePreset,
     );
     const carriedBarrier = pendingRuntimePresentationHandoff?.coverageBarrier?.released === false
       ? pendingRuntimePresentationHandoff.coverageBarrier : null;
@@ -8894,7 +9299,6 @@ export async function createW8DistantPresentation({
     activeGeneration.activeKeys = new Set(activeDataKeys);
     activeGeneration.renderedKeys = new Set(renderedKeys);
     updateFarRiverVisibility(activeGeneration);
-    updateDistantWaterProxyVisibility(activeGeneration);
     updateCanonicalVisibility(activeGeneration, playerLogicalX, playerLogicalZ);
     return true;
   };
@@ -8992,8 +9396,12 @@ export async function createW8DistantPresentation({
       geometry.userData = { ...(geometry.userData ?? {}), worldFixedClipmap: true };
       resource = {
         geometry,
-        positions,
-        colors: geometry.attributes.color.array,
+        positions: geometry.attributes.position.array
+          ?? geometry.attributes.position.values
+          ?? positions,
+        colors: geometry.attributes.color.array
+          ?? geometry.attributes.color.values
+          ?? colors,
         sampleHashes: new Uint32Array(topology.vertices.length),
         generation: null,
         centerChunkX: null,
@@ -9164,10 +9572,24 @@ export async function createW8DistantPresentation({
   }) => {
     const diagnosticStartedAt = diagnosticsEnabled ? monotonicNow() : 0;
     const { geometry } = resource;
+    for (let offset = 0; offset < colors.length; offset += 3) {
+      if (![colors[offset], colors[offset + 1], colors[offset + 2]].every(Number.isFinite)
+        || (colors[offset] === 0 && colors[offset + 1] === 0 && colors[offset + 2] === 0)) {
+        throw new Error(`invalid canonical Terrain color at Low vertex ${offset / 3}`);
+      }
+    }
     const mesh = new Mesh(geometry, terrainMaterial);
     mesh.name = 'w8-seeded-macro-terrain-clipmap';
     mesh.position.set(meshOffsetX, 0, meshOffsetZ);
     mesh.castShadow = false; mesh.receiveShadow = false;
+    mesh.userData = {
+      ...(mesh.userData ?? {}),
+      presentationOnly: true,
+      logicalTerrainSurface: true,
+      terrainLodBand: W8_LOGICAL_TERRAIN_BAND.LOW,
+      innerCellBoundaryMeters: FIVE_BY_FIVE_HALF_EXTENT_METERS,
+      outerCellBoundaryMeters: topology.extentMeters,
+    };
     target.add(mesh); stats.clipmapMeshCount = 1;
     const {
       newlySampledCount,
@@ -9286,461 +9708,24 @@ export async function createW8DistantPresentation({
       : sliceScheduler.finish().maximumSliceMs;
   };
 
-  const safetyRingPolicySignature = policy => JSON.stringify({
-    regions: policy?.regions ?? [],
-    settlementReferences: policy?.safetyRingSettlementReferences ?? [],
-    riverSourceStableId: canonicalRiverSourceStableId,
-  });
-
-  const positionSafetyRingResourceForOrigin = (resource, renderOrigin) => {
-    if (!resource?.mesh || !renderOrigin) return false;
-    const originMetersX = renderOrigin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
-    const originMetersZ = renderOrigin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const centerWorldX = (resource.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const centerWorldZ = (resource.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    resource.mesh.position.set(
-      (centerWorldX - originMetersX) * UNITS_PER_METER,
-      0,
-      (centerWorldZ - originMetersZ) * UNITS_PER_METER,
-    );
-    return true;
-  };
-
-  const safetyRingIndexArray = geometry => geometry?.index?.array ?? geometry?.index ?? null;
-  const markSafetyRingIndexUpdate = (geometry, count) => {
-    const index = geometry?.index;
-    if (index && typeof index === 'object') {
-      if (typeof index.clearUpdateRanges === 'function'
-        && typeof index.addUpdateRange === 'function') {
-        index.clearUpdateRanges();
-        if (count > 0) index.addUpdateRange(0, count);
-      } else if (index.updateRange) {
-        index.updateRange.offset = 0;
-        index.updateRange.count = count;
-      }
-      index.needsUpdate = true;
-    }
-    if (typeof geometry?.setDrawRange === 'function') geometry.setDrawRange(0, count);
-    else if (geometry) geometry.drawRange = { start: 0, count };
-  };
-
-  const createSafetyRingResource = renderDistancePreset => {
-    const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
-    const topology = safetyRingTopologyFor(presetId);
-    const positions = new Float32Array(topology.vertices.length * 3);
-    const colors = new Float32Array(topology.vertices.length * 3);
-    for (let index = 0; index < topology.vertices.length; index += 1) {
-      const offset = index * 3;
-      positions[offset] = topology.vertices[index].x * UNITS_PER_METER;
-      positions[offset + 2] = topology.vertices[index].z * UNITS_PER_METER;
-    }
-    const indices = new Array(topology.indices.length).fill(0);
-    const geometry = makeFlatClipmapGeometry(THREE, positions, colors, indices);
-    geometry.userData = {
-      ...(geometry.userData ?? {}),
-      worldFixedClipmap: true,
-      terrainSafetyRing: true,
-    };
-    markSafetyRingIndexUpdate(geometry, 0);
-    const mesh = new Mesh(geometry, terrainMaterial);
-    mesh.name = 'w8-player-following-terrain-safety-ring';
-    mesh.castShadow = false;
-    mesh.receiveShadow = false;
-    mesh.renderOrder = -100;
-    mesh.visible = false;
-    mesh.userData = {
-      presentationOnly: true,
-      terrainSafetyRing: true,
-      renderingPriority: 'below-near-outer-regular-clipmap',
-    };
-    root.add(mesh);
-    const resource = {
-      presetId,
-      topology,
-      positions,
-      colors: geometry.attributes.color.array,
-      geometry,
-      mesh,
-      centerChunkX: null,
-      centerChunkZ: null,
-      surfacePolicy: null,
-      surfacePolicySignature: null,
-      building: false,
-      ready: false,
-      maskKey: null,
-      visibleArea: 0,
-    };
-    let pool = safetyRingResourcesByPreset.get(presetId);
-    if (!pool) {
-      pool = [];
-      safetyRingResourcesByPreset.set(presetId, pool);
-    }
-    pool.push(resource);
-    safetyRingGeometryAllocationCount += 1;
-    safetyRingMaximumResourceCount = Math.max(
-      safetyRingMaximumResourceCount,
-      [...safetyRingResourcesByPreset.values()].reduce((sum, values) => sum + values.length, 0),
-    );
-    return resource;
-  };
-
-  const acquireSafetyRingResource = renderDistancePreset => {
-    const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
-    const pool = safetyRingResourcesByPreset.get(presetId) ?? [];
-    return pool.find(resource => resource !== safetyRingActiveResource && !resource.building)
-      ?? createSafetyRingResource(presetId);
-  };
-
-  const safetyRingShiftSlots = ({
-    topology,
-    presetId,
-    sourceCenterChunkX,
-    sourceCenterChunkZ,
-    targetCenterChunkX,
-    targetCenterChunkZ,
-  }) => {
-    const deltaChunkX = targetCenterChunkX - sourceCenterChunkX;
-    const deltaChunkZ = targetCenterChunkZ - sourceCenterChunkZ;
-    const key = `${presetId}:${deltaChunkX},${deltaChunkZ}`;
-    let slots = safetyRingShiftSlotMapCache.get(key);
-    if (slots) return slots;
-    const sourceByCoordinate = new Map(topology.vertices.map(({ x, z }, index) => (
-      [`${x},${z}`, index]
-    )));
-    slots = new Int32Array(topology.vertices.length);
-    slots.fill(-1);
-    const deltaX = deltaChunkX * LOGICAL_CHUNK_SIZE_METERS;
-    const deltaZ = deltaChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    for (let index = 0; index < topology.vertices.length; index += 1) {
-      const { x, z } = topology.vertices[index];
-      const sourceIndex = sourceByCoordinate.get(`${x + deltaX},${z + deltaZ}`);
-      if (sourceIndex !== undefined) slots[index] = sourceIndex;
-    }
-    safetyRingShiftSlotMapCache.set(key, slots);
-    return slots;
-  };
-
-  const remaskSafetyRingAgainstHighDetail = resource => {
-    if (!resource?.ready) return false;
-    const highDetail = activeLocalTerrainGeneration?.root?.parent === root
+  const recordContinuousTerrainCoverageFrame = (playerLogicalX, playerLogicalZ) => {
+    const generation = activeLocalTerrainGeneration?.root?.parent === root
       ? activeLocalTerrainGeneration : null;
-    const highDetailExtent = highDetail?.renderDistancePolicy?.terrainRiverExtentMeters ?? null;
-    const maskKey = highDetail && Number.isFinite(highDetailExtent)
-      ? `${highDetail.centerChunkX},${highDetail.centerChunkZ}:${highDetailExtent}` : 'none';
-    if (resource.maskKey === maskKey) return false;
-    const indices = safetyRingIndexArray(resource.geometry);
-    if (!indices) throw new Error('Safety Ring index storage is unavailable');
-    const safetyCenterWorldX = (resource.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const safetyCenterWorldZ = (resource.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const highCenterWorldX = highDetail
-      ? (highDetail.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    const highCenterWorldZ = highDetail
-      ? (highDetail.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    let cursor = 0;
-    let visibleArea = 0;
-    for (const cell of resource.topology.cells) {
-      const worldX = safetyCenterWorldX + cell.centerX;
-      const worldZ = safetyCenterWorldZ + cell.centerZ;
-      const coveredByHighDetail = highDetail !== null
-        && Math.abs(worldX - highCenterWorldX) < highDetailExtent
-        && Math.abs(worldZ - highCenterWorldZ) < highDetailExtent;
-      if (coveredByHighDetail) continue;
-      for (const index of cell.indices) indices[cursor++] = index;
-      visibleArea += cell.widthMeters * cell.depthMeters;
-    }
-    markSafetyRingIndexUpdate(resource.geometry, cursor);
-    resource.maskKey = maskKey;
-    resource.visibleArea = visibleArea;
-    safetyRingVisibleArea = visibleArea;
-    return true;
-  };
-
-  const buildSafetyRingSurfacePolicy = async ({
-    centerChunkX,
-    centerChunkZ,
-    renderDistancePreset,
-    scheduler,
-  }) => {
-    const renderDistancePolicy = resolveW8RenderDistancePolicy(renderDistancePreset);
-    const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    scheduler.setStage?.('safety-ring-settlement-policy');
-    const reusableReferenceWindow = safetyRingSettlementReferenceWindow
-      && safetyRingSettlementReferenceWindow.renderDistancePreset === renderDistancePolicy.id
-      && Math.hypot(
-        centerWorldX - safetyRingSettlementReferenceWindow.centerWorldX,
-        centerWorldZ - safetyRingSettlementReferenceWindow.centerWorldZ,
-      ) + renderDistancePolicy.fogFarMeters
-        <= safetyRingSettlementReferenceWindow.queryRadiusMeters;
-    const settlementReferences = reusableReferenceWindow
-      ? safetyRingSettlementReferenceWindow.settlementReferences
-      : await scheduler.waitFor(findSettlementsNear(
-          centerWorldX,
-          centerWorldZ,
-          renderDistancePolicy.terrainRiverExtentMeters,
-        ));
-    if (reusableReferenceWindow) safetyRingSettlementQueryReuseCount += 1;
-    else {
-      safetyRingSettlementQueryCount += 1;
-      safetyRingSettlementReferenceWindow = Object.freeze({
-        centerWorldX,
-        centerWorldZ,
-        queryRadiusMeters: renderDistancePolicy.terrainRiverExtentMeters,
-        renderDistancePreset: renderDistancePolicy.id,
-        settlementReferences: Object.freeze([...settlementReferences]),
-      });
-    }
-    if (disposed) throw LOCAL_SYNC_CANCELLED;
-    let policy = createSettlementSurfacePolicy(settlementReferences);
-    const safetyRingSettlementReferences = Object.freeze([...settlementReferences]
-      .map(reference => Object.freeze({
-        settlementId: reference.settlementId,
-        settlementType: reference.settlementType,
-        townType: reference.townType,
-        center: Object.freeze({ x: reference.center.x, z: reference.center.z }),
-        radiusMeters: Number.isFinite(reference.radiusMeters) ? reference.radiusMeters : null,
-      }))
-      .sort((left, right) => left.settlementId.localeCompare(right.settlementId)));
-    scheduler.setStage?.('safety-ring-river-corridors');
-    const corridors = await riverSurfaceCorridorsForClipmapIncrementally(
-      centerChunkX,
-      centerChunkZ,
-      policy,
-      renderDistancePolicy.terrainRiverExtentMeters,
-      scheduler,
-    );
-    policy = Object.freeze({
-      ...policy,
-      riverCorridors: Object.freeze(corridors),
-      safetyRingSettlementReferences,
-    });
-    return policy;
-  };
-
-  const buildSafetyRingResource = async ({
-    centerChunkX,
-    centerChunkZ,
-    renderDistancePreset,
-  }) => {
-    const startedAt = monotonicNow();
-    const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
-    const resource = acquireSafetyRingResource(presetId);
-    resource.building = true;
-    resource.mesh.visible = false;
-    const assertLive = () => {
-      if (disposed) throw LOCAL_SYNC_CANCELLED;
-    };
-    const scheduler = createSliceScheduler({
-      assertCurrent: assertLive,
-      budgetMs: TERRAIN_PRESENTATION_STAGING_SLICE_BUDGET_MS,
-      workKind: 'terrain',
-      isUrgent: true,
-      trackGeneration: false,
-    });
-    try {
-      const policy = await buildSafetyRingSurfacePolicy({
-        centerChunkX,
-        centerChunkZ,
-        renderDistancePreset: presetId,
-        scheduler,
-      });
-      assertLive();
-      scheduler.setStage?.('safety-ring-samples');
-      const source = safetyRingActiveResource?.ready
-        && safetyRingActiveResource.presetId === presetId
-        ? safetyRingActiveResource : null;
-      const sourceSlots = source ? safetyRingShiftSlots({
-        topology: resource.topology,
-        presetId,
-        sourceCenterChunkX: source.centerChunkX,
-        sourceCenterChunkZ: source.centerChunkZ,
-        targetCenterChunkX: centerChunkX,
-        targetCenterChunkZ: centerChunkZ,
-      }) : null;
-      const policySignature = safetyRingPolicySignature(policy);
-      const canCopySurface = source?.surfacePolicySignature === policySignature;
-      const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-      const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-      let reusedSampleCount = 0;
-      let updatedSampleCount = 0;
-      const verticesPerCheckpoint = 8;
-      for (let start = 0; start < resource.topology.vertices.length;
-        start += verticesPerCheckpoint) {
-        assertLive();
-        const end = Math.min(resource.topology.vertices.length, start + verticesPerCheckpoint);
-        let completedWorkUnits = 0;
-        for (let index = start; index < end; index += 1) {
-          const offset = index * 3;
-          const sourceIndex = sourceSlots?.[index] ?? -1;
-          if (sourceIndex >= 0 && canCopySurface) {
-            const sourceOffset = sourceIndex * 3;
-            resource.positions[offset + 1] = source.positions[sourceOffset + 1];
-            resource.colors[offset] = source.colors[sourceOffset];
-            resource.colors[offset + 1] = source.colors[sourceOffset + 1];
-            resource.colors[offset + 2] = source.colors[sourceOffset + 2];
-            reusedSampleCount += 1;
-            continue;
-          }
-          const vertex = resource.topology.vertices[index];
-          const resolved = resolveBaseClipmapSample(
-            centerWorldX + vertex.x,
-            centerWorldZ + vertex.z,
-            policy,
-          );
-          resource.positions[offset + 1] = resolved.value.height * UNITS_PER_METER;
-          resource.colors[offset] = resolved.value.color[0];
-          resource.colors[offset + 1] = resolved.value.color[1];
-          resource.colors[offset + 2] = resolved.value.color[2];
-          updatedSampleCount += 1;
-          if (!resolved.lastNaturalSampleReused) completedWorkUnits += 1;
-        }
-        const pendingYield = scheduler.checkpoint({
-          units: Math.ceil(completedWorkUnits / 2),
-        });
-        if (pendingYield) await pendingYield;
-      }
-      assertLive();
-      const positionAttribute = resource.geometry.attributes?.position;
-      const colorAttribute = resource.geometry.attributes?.color;
-      if (positionAttribute) positionAttribute.needsUpdate = true;
-      if (colorAttribute) colorAttribute.needsUpdate = true;
-      resource.centerChunkX = centerChunkX;
-      resource.centerChunkZ = centerChunkZ;
-      resource.surfacePolicy = policy;
-      resource.surfacePolicySignature = policySignature;
-      resource.ready = true;
-      resource.maskKey = null;
-      remaskSafetyRingAgainstHighDetail(resource);
-      positionSafetyRingResourceForOrigin(resource, safetyRingRenderOrigin);
-      const sliceSnapshot = scheduler.finish();
-      safetyRingMaximumSliceMs = Math.max(
-        safetyRingMaximumSliceMs,
-        sliceSnapshot.maximumSliceMs,
-      );
-      const sampleCount = resource.topology.vertices.length;
-      resource.reuseRatio = sampleCount > 0 ? reusedSampleCount / sampleCount : 1;
-      resource.updatedSamples = updatedSampleCount;
-      resource.buildDurationMs = monotonicNow() - startedAt;
-      safetyRingReuseRatio = resource.reuseRatio;
-      safetyRingUpdatedSamples = updatedSampleCount;
-      safetyRingBuildCount += 1;
-      safetyRingLastBuildDurationMs = resource.buildDurationMs;
-      safetyRingMaximumBuildDurationMs = Math.max(
-        safetyRingMaximumBuildDurationMs,
-        resource.buildDurationMs,
-      );
-      safetyRingPolicySettlementCount = policy.regions.length;
-      safetyRingPolicyRiverCorridorCount = policy.riverCorridors.length;
-      return resource;
-    } catch (error) {
-      scheduler.snapshot();
-      resource.ready = false;
-      resource.mesh.visible = false;
-      throw error;
-    } finally {
-      resource.building = false;
-    }
-  };
-
-  const startPendingSafetyRingBuild = () => {
-    if (disposed || safetyRingBuildPromise || !safetyRingPendingTarget) return false;
-    const target = safetyRingPendingTarget;
-    safetyRingPendingTarget = null;
-    safetyRingInFlightTarget = target;
-    safetyRingBuildPromise = buildSafetyRingResource(target).then(resource => {
-      const desired = safetyRingPendingTarget ?? safetyRingLatestTarget;
-      const activeDistance = desired && safetyRingActiveResource ? Math.max(
-        Math.abs(safetyRingActiveResource.centerChunkX - desired.centerChunkX),
-        Math.abs(safetyRingActiveResource.centerChunkZ - desired.centerChunkZ),
-      ) : Number.POSITIVE_INFINITY;
-      const completedDistance = desired ? Math.max(
-        Math.abs(resource.centerChunkX - desired.centerChunkX),
-        Math.abs(resource.centerChunkZ - desired.centerChunkZ),
-      ) : 0;
-      if (!safetyRingActiveResource || completedDistance < activeDistance) {
-        if (safetyRingActiveResource) safetyRingActiveResource.mesh.visible = false;
-        safetyRingActiveResource = resource;
-        safetyRingActiveResource.mesh.visible = true;
-        remaskSafetyRingAgainstHighDetail(safetyRingActiveResource);
-        positionSafetyRingResourceForOrigin(safetyRingActiveResource, safetyRingRenderOrigin);
-      }
-      safetyRingLastError = null;
-    }).catch(error => {
-      if (error !== LOCAL_SYNC_CANCELLED) safetyRingLastError = String(error?.message ?? error);
-    }).finally(() => {
-      safetyRingBuildPromise = null;
-      safetyRingInFlightTarget = null;
-      if (!disposed && safetyRingPendingTarget) startPendingSafetyRingBuild();
-    });
-    return true;
-  };
-
-  const requestSafetyRingForPlayer = (
-    playerLogicalX,
-    playerLogicalZ,
-    renderOrigin,
-    renderDistancePreset,
-  ) => {
-    if (![playerLogicalX, playerLogicalZ].every(Number.isFinite)) return false;
-    const centerChunkX = Math.floor(playerLogicalX / LOGICAL_CHUNK_SIZE_METERS);
-    const centerChunkZ = Math.floor(playerLogicalZ / LOGICAL_CHUNK_SIZE_METERS);
-    const presetId = normalizeW8RenderDistancePreset(renderDistancePreset);
-    safetyRingRenderOrigin = renderOrigin;
-    safetyRingRequestedRenderDistancePreset = presetId;
-    safetyRingLatestTarget = Object.freeze({
-      centerChunkX,
-      centerChunkZ,
-      renderDistancePreset: presetId,
-    });
-    positionSafetyRingResourceForOrigin(safetyRingActiveResource, renderOrigin);
-    remaskSafetyRingAgainstHighDetail(safetyRingActiveResource);
-    const activeMatches = safetyRingActiveResource?.ready
-      && safetyRingActiveResource.presetId === presetId
-      && safetyRingActiveResource.centerChunkX === centerChunkX
-      && safetyRingActiveResource.centerChunkZ === centerChunkZ;
-    const buildingMatches = safetyRingInFlightTarget
-      && safetyRingInFlightTarget.centerChunkX === centerChunkX
-      && safetyRingInFlightTarget.centerChunkZ === centerChunkZ
-      && safetyRingInFlightTarget.renderDistancePreset === presetId;
-    const pendingMatches = safetyRingPendingTarget
-      && safetyRingPendingTarget.centerChunkX === centerChunkX
-      && safetyRingPendingTarget.centerChunkZ === centerChunkZ
-      && safetyRingPendingTarget.renderDistancePreset === presetId;
-    if (!activeMatches && !buildingMatches && !pendingMatches) {
-      safetyRingPendingTarget = safetyRingLatestTarget;
-    }
-    startPendingSafetyRingBuild();
-    return true;
-  };
-
-  const recordSafetyRingCoverageFrame = (playerLogicalX, playerLogicalZ) => {
-    const presetPolicy = resolveW8RenderDistancePolicy(safetyRingRequestedRenderDistancePreset);
-    const requiredHalfExtent = presetPolicy.fogFarMeters;
-    const highDetail = activeLocalTerrainGeneration?.root?.parent === root
-      ? activeLocalTerrainGeneration : null;
-    const highCenterWorldX = highDetail
-      ? (highDetail.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    const highCenterWorldZ = highDetail
-      ? (highDetail.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    const highExtent = highDetail?.renderDistancePolicy?.terrainRiverExtentMeters ?? null;
-    const highDetailComplete = highDetail !== null && Number.isFinite(highExtent)
-      && Math.abs(playerLogicalX - highCenterWorldX) + requiredHalfExtent <= highExtent
-      && Math.abs(playerLogicalZ - highCenterWorldZ) + requiredHalfExtent <= highExtent;
-    const safety = safetyRingActiveResource?.ready && safetyRingActiveResource.mesh.visible
-      ? safetyRingActiveResource : null;
-    const safetyCenterWorldX = safety
-      ? (safety.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    const safetyCenterWorldZ = safety
-      ? (safety.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
-    const safetyExtent = safety?.topology?.extentMeters ?? null;
-    safetyRingCoverageComplete = safety !== null && Number.isFinite(safetyExtent)
-      && Math.abs(playerLogicalX - safetyCenterWorldX) + requiredHalfExtent <= safetyExtent
-      && Math.abs(playerLogicalZ - safetyCenterWorldZ) + requiredHalfExtent <= safetyExtent;
-    if (!highDetailComplete) highDetailCoverageMiss += 1;
-    safetyRingLastFrameHighDetailCoverage = highDetailComplete;
-    safetyRingLastFrameVisibleHole = !highDetailComplete && !safetyRingCoverageComplete;
-    if (safetyRingLastFrameVisibleHole) {
-      safetyRingCoverageMiss += 1;
+    const presetId = activeGeneration?.renderDistancePreset
+      ?? generation?.renderDistancePreset
+      ?? W8_DEFAULT_RENDER_DISTANCE_PRESET;
+    const requiredHalfExtent = resolveW8RenderDistancePolicy(presetId).fogFarMeters;
+    const centerWorldX = generation
+      ? (generation.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
+    const centerWorldZ = generation
+      ? (generation.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS : null;
+    const terrainExtent = generation?.renderDistancePolicy?.terrainRiverExtentMeters ?? null;
+    continuousTerrainCoverageComplete = generation !== null
+      && Number.isFinite(terrainExtent)
+      && Math.abs(playerLogicalX - centerWorldX) + requiredHalfExtent <= terrainExtent
+      && Math.abs(playerLogicalZ - centerWorldZ) + requiredHalfExtent <= terrainExtent;
+    if (!continuousTerrainCoverageComplete) {
+      continuousTerrainCoverageMiss += 1;
       visibleTerrainHoleFrame += 1;
     }
   };
@@ -9857,157 +9842,6 @@ export async function createW8DistantPresentation({
     generation.stats.canonicalRiverLengthMeters =
       generation.stats.canonicalActiveRiverLengthMeters + visibleLengthMeters;
   }
-
-  function updateDistantWaterProxyVisibility(generation) {
-    const presentations = generation?.distantWaterProxyPresentations;
-    if (!presentations?.length) return;
-    const coverageKeys = new Set([
-      ...(generation.activeKeys ?? []),
-      ...(generation.renderedKeys ?? []),
-    ]);
-    const coverageSignature = sortedKeyList(coverageKeys).join('\n');
-    const coverageBounds = [...coverageKeys].map(key => {
-      const [chunkX, chunkZ] = key.split(',').map(Number);
-      return {
-        minimumX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
-        maximumX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
-        minimumZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
-        maximumZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
-      };
-    });
-    transform.position.set(0, 0, 0);
-    transform.rotation.set(0, 0, 0);
-    transform.scale.set(0, 0, 0);
-    transform.updateMatrix();
-    const hidden = transform.matrix.clone?.() ?? structuredClone(transform.matrix);
-    for (const presentation of presentations) {
-      if (presentation.coverageSignature === coverageSignature) continue;
-      let visibleCount = 0;
-      presentation.instances.forEach((instance, index) => {
-        const intersectsCurrentCoverage = coverageBounds.some(bounds => (
-          instance.logicalBounds.maximumX >= bounds.minimumX
-          && instance.logicalBounds.minimumX <= bounds.maximumX
-          && instance.logicalBounds.maximumZ >= bounds.minimumZ
-          && instance.logicalBounds.minimumZ <= bounds.maximumZ
-        ));
-        presentation.mesh.setMatrixAt(index, intersectsCurrentCoverage ? hidden : instance.matrix);
-        if (!intersectsCurrentCoverage) visibleCount += 1;
-      });
-      presentation.mesh.instanceMatrix.needsUpdate = true;
-      presentation.coverageSignature = coverageSignature;
-      presentation.visibleCount = visibleCount;
-    }
-  }
-
-  const createDistantWaterProxies = async ({
-    centerChunkX,
-    centerChunkZ,
-    origin,
-    terrainRiverExtentMeters,
-    context,
-    scheduler,
-  }) => {
-    const seed = textHash(worldSeedHash);
-    const centerWorldX = (centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const centerWorldZ = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-    const originMetersX = origin.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS;
-    const originMetersZ = origin.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS;
-    const buckets = new Map();
-    const push = (geometry, material, name, instance) => {
-      const key = `${geometry}:${material}:${name}`;
-      if (!buckets.has(key)) buckets.set(key, { geometry, material, name, instances: [] });
-      buckets.get(key).instances.push({
-        ...instance,
-        matrix: transform.matrix.clone?.() ?? structuredClone(transform.matrix),
-      });
-    };
-    const fadeAt = (worldX, worldZ) => smoothstep((
-      Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ))
-      - FIVE_BY_FIVE_HALF_EXTENT_METERS
-    ) / CLIPMAP_BLEND_METERS);
-    const forAnchoredGrid = async (spacing, operation) => {
-      const minimumX = Math.floor((centerWorldX - terrainRiverExtentMeters) / spacing);
-      const maximumX = Math.ceil((centerWorldX + terrainRiverExtentMeters) / spacing);
-      const minimumZ = Math.floor((centerWorldZ - terrainRiverExtentMeters) / spacing);
-      const maximumZ = Math.ceil((centerWorldZ + terrainRiverExtentMeters) / spacing);
-      for (let cellZ = minimumZ; cellZ <= maximumZ; cellZ += 1) {
-        for (let cellX = minimumX; cellX <= maximumX; cellX += 1) {
-          operation(cellX, cellZ);
-          const pendingYield = scheduler.checkpoint();
-          if (pendingYield) await pendingYield;
-        }
-      }
-    };
-
-    await forAnchoredGrid(64, (cellX, cellZ) => {
-      if (context.stats.distantWaterProxyCount >= DISTANT_WATER_PROXY_LIMIT
-        || cellRoll(seed, cellX, cellZ, 21) > 0.2) return;
-      const worldX = (cellX + 0.5) * 64; const worldZ = (cellZ + 0.5) * 64;
-      const distance = Math.max(Math.abs(worldX - centerWorldX), Math.abs(worldZ - centerWorldZ));
-      if (distance <= FIVE_BY_FIVE_HALF_EXTENT_METERS + 12
-        || distance >= terrainRiverExtentMeters - 28) return;
-      const sample = baseClipmapSample(worldX, worldZ, context.surfacePolicy);
-      if (sample.moisture < 0.61) return;
-      const size = 18 + cellRoll(seed, cellX, cellZ, 22) * 26;
-      const depth = size * 0.58;
-      const rotationZ = cellRoll(seed, cellX, cellZ, 23) * Math.PI;
-      const cosine = Math.abs(Math.cos(rotationZ));
-      const sine = Math.abs(Math.sin(rotationZ));
-      const halfExtentX = (cosine * size + sine * depth) / 2;
-      const halfExtentZ = (sine * size + cosine * depth) / 2;
-      const owner = determineDetailCandidateOwner({ x: worldX, z: worldZ });
-      transform.position.set((worldX - originMetersX) * UNITS_PER_METER,
-        (sample.height + 0.02) * UNITS_PER_METER,
-        (worldZ - originMetersZ) * UNITS_PER_METER);
-      transform.rotation.set(-Math.PI / 2, 0, rotationZ);
-      transform.scale.set(size * UNITS_PER_METER * fadeAt(worldX, worldZ),
-        depth * UNITS_PER_METER * fadeAt(worldX, worldZ), 1);
-      transform.updateMatrix();
-      push('__road__', 'water', 'water-proxy', {
-        stableId: `water-proxy-v1:${worldSeedHash}:${cellX},${cellZ}`,
-        ownerKey: `${owner.x},${owner.z}`,
-        logicalBounds: Object.freeze({
-          minimumX: worldX - halfExtentX,
-          maximumX: worldX + halfExtentX,
-          minimumZ: worldZ - halfExtentZ,
-          maximumZ: worldZ + halfExtentZ,
-        }),
-      });
-      context.stats.distantWaterProxyCount += 1;
-    });
-
-    for (const bucket of buckets.values()) {
-      const geometry = bucket.geometry === '__road__'
-        ? roadGeometry : visualAssets.geometries[bucket.geometry];
-      const material = visualAssets.materials[bucket.material];
-      const mesh = new InstancedMesh(geometry, material, Math.max(1, bucket.instances.length));
-      mesh.name = `w8-distant-${bucket.name}-${bucket.geometry}-${bucket.material}`;
-      mesh.count = bucket.instances.length;
-      for (let index = 0; index < bucket.instances.length; index += 1) {
-        mesh.setMatrixAt(index, bucket.instances[index].matrix);
-        const pendingYield = scheduler.checkpoint();
-        if (pendingYield) await pendingYield;
-      }
-      mesh.instanceMatrix.needsUpdate = true;
-      mesh.castShadow = false; mesh.receiveShadow = false;
-      mesh.userData = {
-        presentationOnly: true,
-        waterType: 'proxy',
-        canonicalStableIds: bucket.instances.map(instance => instance.stableId),
-        ownerKeys: bucket.instances.map(instance => instance.ownerKey),
-        logicalBounds: bucket.instances.map(instance => instance.logicalBounds),
-      };
-      context.target.add(mesh); context.stats.distantProxyInstancedMeshCount += 1;
-      context.generation.distantWaterProxyPresentations ??= [];
-      context.generation.distantWaterProxyPresentations.push({
-        mesh,
-        instances: bucket.instances,
-        coverageSignature: null,
-        visibleCount: bucket.instances.length,
-      });
-    }
-    updateDistantWaterProxyVisibility(context.generation);
-  };
 
   const mapWithQueryConcurrency = async (values, operation, assertCurrent = null) => {
     const results = new Array(values.length);
@@ -10906,6 +10740,22 @@ export async function createW8DistantPresentation({
           indexAllocationCount: generation.stats.clipmapIndexAllocationCount,
           buildDurationMs: generation.stats.clipmapBuildDurationMs,
         }),
+        rollingMetrics: Object.freeze({
+          publicationScope: 'entering-owner-strip-and-low-ring',
+          fullTerrainRebuild: activeLocalTerrainGeneration !== null
+            && generation.stats.midgroundReusedOwnerCount === 0
+            && generation.stats.clipmapReusedSampleCount === 0,
+          newOwnerCount: generation.stats.midgroundNewOwnerCount,
+          reusedOwnerCount: generation.stats.midgroundReusedOwnerCount,
+          discardedOwnerCount: generation.stats.midgroundDiscardedOwnerCount,
+          newOwnerSampleCount: generation.stats.midgroundNewSampleCount,
+          reusedOwnerSampleCount: generation.stats.midgroundReusedSampleCount,
+          discardedOwnerSampleCount: generation.stats.midgroundDiscardedSampleCount,
+          mediumGeometryAllocationCount: generation.stats.midgroundGeometryAllocationCount,
+          mediumGeometryReuseCount: generation.stats.midgroundGeometryReuseCount,
+          newLowSampleCount: generation.stats.clipmapNewlySampledCount,
+          reusedLowSampleCount: generation.stats.clipmapReusedSampleCount,
+        }),
         outerReadyAtMs,
         clipmapReadyAtMs,
         presentationReadyAtMs,
@@ -10975,6 +10825,7 @@ export async function createW8DistantPresentation({
         uploadBytes: prepared.uploadBytes,
         maximumSliceMs: prepared.maximumSliceMs,
         clipmapMetrics: prepared.clipmapMetrics,
+        rollingMetrics: prepared.rollingMetrics,
         presentationGeneration: prepared,
       });
     }
@@ -10983,11 +10834,8 @@ export async function createW8DistantPresentation({
       generation.ownedGeometries.add(generation.reusedMidgroundGeometry);
     }
     const swapStartedAt = monotonicNow();
-    root.add(generation.root);
-    generation.activatedAtMs = monotonicNow();
-    if (generation.clipmapGeometryResource) {
-      generation.clipmapGeometryResource.published = true;
-    }
+    const publication = publishLocalTerrainGeneration(generation, previous);
+    generation.stats.publicationScope = publication.publicationScope;
     activeLocalTerrainGeneration = generation;
     recordDiagnosticEvent('terrain-replacement-attached', {
       coverageEpoch: requestedEpoch,
@@ -11009,7 +10857,6 @@ export async function createW8DistantPresentation({
     committedLocalTerrainEpoch = requestedEpoch;
     localTerrainCommitCount += 1;
     currentCanonicalSurfacePolicy = surfacePolicy;
-    retireGeneration(previous);
     recordDiagnosticEvent('terrain-old-released', {
       coverageEpoch: requestedEpoch,
       transitionGeneration: acceptedTransition?.generation ?? null,
@@ -11421,11 +11268,10 @@ export async function createW8DistantPresentation({
       presentationSchedulerRoadSlices = 0;
       return true;
     },
-    resetTerrainSafetyRingDiagnostics() {
-      safetyRingCoverageMiss = 0;
+    resetContinuousTerrainDiagnostics() {
+      continuousTerrainCoverageMiss = 0;
+      continuousTerrainCoverageComplete = false;
       visibleTerrainHoleFrame = 0;
-      highDetailCoverageMiss = 0;
-      safetyRingLastFrameVisibleHole = false;
       return true;
     },
     sampleTerrainFallbackHeightMeters(worldX, worldZ) {
@@ -11434,16 +11280,6 @@ export async function createW8DistantPresentation({
         worldX,
         worldZ,
         activeLocalTerrainGeneration?.surfacePolicy ?? currentCanonicalSurfacePolicy,
-      );
-      return Number.isFinite(sample?.height) ? sample.height : null;
-    },
-    sampleTerrainSafetyRingHeightMeters(worldX, worldZ) {
-      if (!Number.isFinite(worldX) || !Number.isFinite(worldZ)
-        || !safetyRingActiveResource?.surfacePolicy) return null;
-      const sample = baseClipmapSample(
-        worldX,
-        worldZ,
-        safetyRingActiveResource.surfacePolicy,
       );
       return Number.isFinite(sample?.height) ? sample.height : null;
     },
@@ -11503,7 +11339,10 @@ export async function createW8DistantPresentation({
       return Object.freeze({
         complete,
         worldCoverageComplete,
-        fallback: !worldCoverageComplete || lagChunks > 0,
+        // A lagging center is still the same continuous world-fixed surface
+        // while it covers the visible domain; only an actual coverage deficit
+        // is a presentation fallback.
+        fallback: !worldCoverageComplete,
         lagChunks,
         generationAgeMs: activatedAtMs === null
           ? null : Math.max(0, monotonicNow() - activatedAtMs),
@@ -11603,11 +11442,8 @@ export async function createW8DistantPresentation({
         ),
       );
       const swapStartedAt = monotonicNow();
-      root.add(generation.root);
-      generation.activatedAtMs = monotonicNow();
-      if (generation.clipmapGeometryResource) {
-        generation.clipmapGeometryResource.published = true;
-      }
+      const publication = publishLocalTerrainGeneration(generation, previous);
+      generation.stats.publicationScope = publication.publicationScope;
       activeLocalTerrainGeneration = generation;
       localTerrainSyncEpoch = claimedCoverageEpoch;
       committedLocalTerrainEpoch = claimedCoverageEpoch;
@@ -11615,7 +11451,6 @@ export async function createW8DistantPresentation({
       localTerrainCommitCount += 1;
       currentCanonicalSurfacePolicy = generation.surfacePolicy;
       preparedTerrainPresentationGenerations.delete(identity);
-      retireGeneration(previous);
       localTerrainLastRootSwapDurationMs = monotonicNow() - swapStartedAt;
       terrainPresentationGenerationClaimCount += 1;
       recordDiagnosticEvent('terrain-presentation-generation-claimed', {
@@ -11902,14 +11737,11 @@ export async function createW8DistantPresentation({
         generation.ownedGeometries.add(generation.reusedMidgroundGeometry);
       }
       const localRootSwapStartedAt = globalThis.performance?.now?.() ?? Date.now();
-      root.add(generation.root);
-      if (generation.clipmapGeometryResource) {
-        generation.clipmapGeometryResource.published = true;
-      }
+      const publication = publishLocalTerrainGeneration(generation, previous);
+      generation.stats.publicationScope = publication.publicationScope;
       activeLocalTerrainGeneration = generation;
       committedLocalTerrainEpoch = requestedEpoch;
       localTerrainCommitCount += 1;
-      retireGeneration(previous);
       localTerrainLastRootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
         - localRootSwapStartedAt;
       localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now())
@@ -12145,14 +11977,11 @@ export async function createW8DistantPresentation({
       previous.ownedGeometries.delete(reusableMidgroundMesh.geometry);
       generation.ownedGeometries.add(reusableMidgroundMesh.geometry);
       const swapStartedAt = globalThis.performance?.now?.() ?? Date.now();
-      root.add(generation.root);
-      if (generation.clipmapGeometryResource) {
-        generation.clipmapGeometryResource.published = true;
-      }
+      const publication = publishLocalTerrainGeneration(generation, previous);
+      generation.stats.publicationScope = publication.publicationScope;
       activeLocalTerrainGeneration = generation;
       committedLocalTerrainEpoch = requestedEpoch;
       localTerrainCommitCount += 1;
-      retireGeneration(previous);
       localTerrainLastRootSwapDurationMs = (globalThis.performance?.now?.() ?? Date.now())
         - swapStartedAt;
       localTerrainLastSyncDurationMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
@@ -12549,15 +12378,6 @@ export async function createW8DistantPresentation({
         await createFarRiverPresentation({
           projections: far.riverProjections, origin: presentationBuildOrigin, context, scheduler,
         });
-        await createDistantWaterProxies({
-          centerChunkX,
-          centerChunkZ,
-          origin: presentationBuildOrigin,
-          terrainRiverExtentMeters:
-            generation.renderDistancePolicy.terrainRiverExtentMeters,
-          context,
-          scheduler,
-        });
         await scheduler.checkpoint({ force: true });
         positionGenerationForOrigin(generation, renderOrigin);
         const dirtyBuckets = updateCanonicalVisibility(
@@ -12730,11 +12550,14 @@ export async function createW8DistantPresentation({
         localTerrain.reusableMidgroundMesh.geometry,
       );
       localGeneration.ownedGeometries.add(localTerrain.reusableMidgroundMesh.geometry);
-      root.add(localGeneration.root);
+      const localPublication = publishLocalTerrainGeneration(
+        localGeneration,
+        localTerrain.previous,
+      );
+      localGeneration.stats.publicationScope = localPublication.publicationScope;
       activeLocalTerrainGeneration = localGeneration;
       committedLocalTerrainEpoch = localTerrain.requestedEpoch;
       localTerrainCommitCount += 1;
-      retireGeneration(localTerrain.previous);
       applyPersistentNaturalRenderDistancePreset(preset);
       localTerrainLastRootSwapDurationMs = 0;
       preparedRenderDistanceDistant = null;
@@ -12913,17 +12736,7 @@ export async function createW8DistantPresentation({
         distantUploadBytes: publicationFrame.bytes,
       });
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
-      if (enableTerrainSafetyRing && activeLocalTerrainGeneration) {
-        requestSafetyRingForPlayer(
-          playerLogicalX,
-          playerLogicalZ,
-          renderOrigin,
-          activeGeneration?.renderDistancePreset
-            ?? activeLocalTerrainGeneration.renderDistancePreset
-            ?? safetyRingRequestedRenderDistancePreset,
-        );
-        recordSafetyRingCoverageFrame(playerLogicalX, playerLogicalZ);
-      }
+      recordContinuousTerrainCoverageFrame(playerLogicalX, playerLogicalZ);
       if (activeGeneration) {
         positionGenerationForOrigin(activeGeneration, renderOrigin);
         if (pendingDistantPublication?.generation === activeGeneration
@@ -12971,8 +12784,6 @@ export async function createW8DistantPresentation({
       positionGenerationForOrigin(activeLocalTerrainGeneration, renderOrigin);
       positionGenerationForOrigin(activeGeneration, renderOrigin);
       positionGenerationForOrigin(persistentTreeGeneration, renderOrigin);
-      safetyRingRenderOrigin = renderOrigin;
-      positionSafetyRingResourceForOrigin(safetyRingActiveResource, renderOrigin);
       return true;
     },
     settlementStreamingShadowSnapshot({
@@ -13560,6 +13371,19 @@ export async function createW8DistantPresentation({
           pendingRuntimePresentationHandoff?.dirtyBucketIndex ?? 0,
         deferredGenerationDisposeCount: deferredGenerationDisposals.length,
         midgroundChunkCount: localTerrainStats.midgroundChunkCount,
+        midgroundSampleCount: localTerrainStats.midgroundSampleCount,
+        midgroundNewSampleCount: localTerrainStats.midgroundNewSampleCount,
+        midgroundReusedSampleCount: localTerrainStats.midgroundReusedSampleCount,
+        midgroundDiscardedSampleCount: localTerrainStats.midgroundDiscardedSampleCount,
+        midgroundNewOwnerCount: localTerrainStats.midgroundNewOwnerCount,
+        midgroundReusedOwnerCount: localTerrainStats.midgroundReusedOwnerCount,
+        midgroundDiscardedOwnerCount: localTerrainStats.midgroundDiscardedOwnerCount,
+        midgroundSampleReuseRatio: localTerrainStats.midgroundSampleReuseRatio,
+        midgroundGeometryAllocationCount: localTerrainStats.midgroundGeometryAllocationCount,
+        midgroundGeometryReuseCount: localTerrainStats.midgroundGeometryReuseCount,
+        terrainPublicationScope: localTerrainStats.publicationScope ?? null,
+        terrainStripRingPublicationCount,
+        terrainInitialRootPublicationCount,
         clipmapMeshCount: localTerrainStats.clipmapMeshCount,
         maximumInnerBoundaryErrorMeters: localTerrainStats.maximumInnerBoundaryErrorMeters,
         maximumInnerBoundaryColorDifference: localTerrainStats.maximumInnerBoundaryColorDifference,
@@ -13972,46 +13796,23 @@ export async function createW8DistantPresentation({
             0),
         clipmapLastBuildDurationMs,
         clipmapMaximumBuildDurationMs,
-        safetyRingActive: Boolean(
-          safetyRingActiveResource?.ready && safetyRingActiveResource.mesh.visible,
-        ),
-        safetyRingCenter: safetyRingActiveResource?.ready ? Object.freeze({
-          chunkX: safetyRingActiveResource.centerChunkX,
-          chunkZ: safetyRingActiveResource.centerChunkZ,
-        }) : null,
-        safetyRingCoverageComplete,
-        safetyRingCoverageMiss,
-        safetyRingReuseRatio,
-        safetyRingUpdatedSamples,
-        safetyRingVisibleArea,
-        safetyRingSkirtActive: false,
-        safetyRingSkirtMaxWidth: 0,
+        midgroundOwnerSampleCacheSize: midgroundOwnerSampleCache.size,
+        midgroundOwnerSampleCacheCapacity: MIDGROUND_OWNER_SAMPLE_CACHE_CAPACITY,
+        midgroundOwnerSampleCacheHits,
+        midgroundOwnerSampleCacheMisses,
+        midgroundOwnerSampleCacheEvictions,
+        midgroundTotalNewSampleCount,
+        midgroundTotalReusedSampleCount,
+        midgroundTotalDiscardedSampleCount,
+        midgroundGeometryPoolSize: midgroundGeometryPool.length,
+        midgroundGeometryPoolInUseCount: midgroundGeometryPool
+          .filter(resource => resource.generation !== null).length,
+        midgroundTotalGeometryAllocationCount: midgroundGeometryAllocationCount,
+        midgroundTotalGeometryReuseCount: midgroundGeometryReuseCount,
+        midgroundGeometryDisposeCount,
+        continuousTerrainCoverageComplete,
+        continuousTerrainCoverageMiss,
         visibleTerrainHoleFrame,
-        highDetailCoverageMiss,
-        safetyRingLastFrameHighDetailCoverage,
-        safetyRingLastFrameVisibleHole,
-        safetyRingBuildPending: safetyRingBuildPromise !== null,
-        safetyRingPendingCenter: safetyRingPendingTarget ? Object.freeze({
-          chunkX: safetyRingPendingTarget.centerChunkX,
-          chunkZ: safetyRingPendingTarget.centerChunkZ,
-        }) : null,
-        safetyRingInFlightCenter: safetyRingInFlightTarget ? Object.freeze({
-          chunkX: safetyRingInFlightTarget.centerChunkX,
-          chunkZ: safetyRingInFlightTarget.centerChunkZ,
-        }) : null,
-        safetyRingBuildCount,
-        safetyRingGeometryAllocationCount,
-        safetyRingResourceCount: [...safetyRingResourcesByPreset.values()]
-          .reduce((sum, resources) => sum + resources.length, 0),
-        safetyRingMaximumResourceCount,
-        safetyRingLastBuildDurationMs,
-        safetyRingMaximumBuildDurationMs,
-        safetyRingMaximumSliceMs,
-        safetyRingPolicySettlementCount,
-        safetyRingPolicyRiverCorridorCount,
-        safetyRingSettlementQueryCount,
-        safetyRingSettlementQueryReuseCount,
-        safetyRingLastError,
         rootObjectCount: (activeGeneration?.root.children?.length ?? 0)
           + (activeLocalTerrainGeneration?.root.children?.length ?? 0),
         disposed,
@@ -14221,6 +14022,11 @@ export async function createW8DistantPresentation({
       scene.remove(root);
       roadGeometry.dispose?.();
       terrainMaterial.dispose?.();
+      for (const resource of midgroundGeometryPool) {
+        resource.geometry.dispose?.();
+        midgroundGeometryDisposeCount += 1;
+      }
+      midgroundGeometryPool.length = 0;
       for (const pool of clipmapGeometryPoolByPreset.values()) {
         for (const resource of pool) {
           resource.geometry.dispose?.();
@@ -14228,16 +14034,7 @@ export async function createW8DistantPresentation({
         }
       }
       clipmapGeometryPoolByPreset.clear();
-      for (const resources of safetyRingResourcesByPreset.values()) {
-        for (const resource of resources) resource.geometry.dispose?.();
-      }
-      safetyRingResourcesByPreset.clear();
-      safetyRingShiftSlotMapCache.clear();
-      safetyRingActiveResource = null;
-      safetyRingPendingTarget = null;
-      safetyRingInFlightTarget = null;
-      safetyRingLatestTarget = null;
-      safetyRingSettlementReferenceWindow = null;
+      midgroundOwnerSampleCache.clear();
       clipmapSampleCache.clear();
       riverCorridorWindowCache.clear();
       templateCache.clear();

@@ -118,8 +118,18 @@ export class ChunkRenderAdapter {
     });
     this.materials = Object.freeze({
       terrain: new TerrainMaterial({ color: 0xffffff, vertexColors: true, flatShading: true, shininess: 0 }),
-      naturalTerrain: new TerrainMaterial({ vertexColors: true, flatShading: true, shininess: 0 }),
+      naturalTerrain: new TerrainMaterial({
+        color: 0xffffff,
+        vertexColors: true,
+        flatShading: true,
+        shininess: 0,
+      }),
     });
+    this.materials.naturalTerrain.userData = {
+      ...(this.materials.naturalTerrain.userData ?? {}),
+      canonicalTerrainSurfaceMaterial: true,
+      canonicalColorSource: 'canonical-surface-color',
+    };
     const hiddenTransform = new Object3D();
     hiddenTransform.scale.set(0, 0, 0);
     hiddenTransform.updateMatrix();
@@ -568,6 +578,12 @@ export class ChunkRenderAdapter {
         indices.push(northwest, southwest, northeast, northeast, southwest, southeast);
       }
     }
+    for (let offset = 0; offset < colors.length; offset += 3) {
+      if (![colors[offset], colors[offset + 1], colors[offset + 2]].every(Number.isFinite)
+        || (colors[offset] === 0 && colors[offset + 1] === 0 && colors[offset + 2] === 0)) {
+        throw new Error(`invalid canonical Terrain color at High vertex ${offset / 3}`);
+      }
+    }
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
     geometry.setAttribute('color', new Float32BufferAttribute(colors, 3));
@@ -639,6 +655,12 @@ export class ChunkRenderAdapter {
     );
     terrain.name = naturalTerrain ? 'w2-natural-terrain' : 'w1a-terrain';
     terrain.receiveShadow = true;
+    terrain.userData = {
+      ...(terrain.userData ?? {}),
+      logicalTerrainSurface: true,
+      terrainLodBand: 'high',
+      boundaryOwner: 'inner-band',
+    };
     if (!naturalTerrain) {
       terrain.rotation.x = -Math.PI / 2;
       terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
@@ -822,6 +844,12 @@ export class ChunkRenderAdapter {
     );
     terrain.name = naturalTerrain ? 'w2-natural-terrain' : 'w1a-terrain';
     terrain.receiveShadow = true;
+    terrain.userData = {
+      ...(terrain.userData ?? {}),
+      logicalTerrainSurface: true,
+      terrainLodBand: 'high',
+      boundaryOwner: 'inner-band',
+    };
     if (!naturalTerrain) {
       terrain.rotation.x = -Math.PI / 2;
       terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);

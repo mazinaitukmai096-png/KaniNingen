@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import {
   W8_DIAGNOSTIC_PROFILES,
   correlateW8HitchStages,
@@ -11,11 +12,12 @@ import {
   W8_CANONICAL_VISIBILITY_METERS,
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
   W8_PRESENTATION_TERRAIN_PALETTE,
+  auditW8ContinuousTerrainCoverage,
   auditW8ClipmapChunkShiftReuse,
   createDeadlineAwareTerrainPresentationScheduler,
   createW8DistantPresentation,
   createW8ClipmapTopology,
-  createW8SafetyRingTopology,
+  createW8LogicalTerrainContract,
   isW8DistantNaturalProxyInRange,
   isW8NaturalCandidateVisible,
   resolveW8CanonicalCandidateSet,
@@ -669,32 +671,12 @@ async function createLocalTerrainTestPresentation(scene = new DistantTestGroup()
     findSettlementsNear: async () => [],
     resolveTemplate: async () => null,
     getCanonicalChunkData: async (chunkX, chunkZ) => canonicalChunk(chunkX, chunkZ, []),
-    enableTerrainSafetyRing: false,
     ...overrides,
     ...(controlledTerrainScheduler
       ? { terrainContinuationScheduler: controlledTerrainScheduler } : {}),
     ...(defaultTerrainScheduler
       ? { terrainContinuationScheduler: defaultTerrainScheduler } : {}),
   });
-}
-
-async function waitForTerrainSafetyRing(presentation, {
-  centerChunkX,
-  centerChunkZ,
-  maximumTurns = 100,
-} = {}) {
-  for (let turn = 0; turn < maximumTurns; turn += 1) {
-    presentation.pumpTerrainPresentationScheduler();
-    await new Promise(resolve => setImmediate(resolve));
-    const snapshot = presentation.snapshot();
-    if (!snapshot.safetyRingBuildPending
-      && snapshot.safetyRingActive
-      && (centerChunkX === undefined || snapshot.safetyRingCenter?.chunkX === centerChunkX)
-      && (centerChunkZ === undefined || snapshot.safetyRingCenter?.chunkZ === centerChunkZ)) {
-      return snapshot;
-    }
-  }
-  throw new Error(`Safety Ring did not settle: ${JSON.stringify(presentation.snapshot())}`);
 }
 
 test('deadline-aware Terrain scheduler bounds frame slices, prioritizes urgent work, and records real waits', async () => {
@@ -1864,7 +1846,7 @@ test.skip('legacy Remote Tree tier fixture (replaced by canonical Far lifecycle)
   parallel.presentation.dispose();
 });
 
-test('Local terrain publishes only complete 25-Chunk coverage and swaps roots atomically', async () => {
+test('Local terrain publishes only complete 25-Chunk coverage into one persistent root', async () => {
   const scene = new DistantTestGroup();
   const presentation = await createLocalTerrainTestPresentation(scene);
   const initial = localTerrainCoverageFixture(0, 0);
@@ -1875,9 +1857,6 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(distantRoot.children.length, 1);
   const firstRoot = distantRoot.children[0];
   const firstGeometries = firstRoot.children.map(child => child.geometry).filter(Boolean);
-  const firstClipmapGeometry = firstRoot.children.find(child => (
-    child.name === 'w8-seeded-macro-terrain-clipmap'
-  )).geometry;
   const firstSnapshot = presentation.snapshot();
   assert.equal(firstSnapshot.localTerrainRootAttached, true);
   assert.equal(firstSnapshot.localTerrainActiveKeyCount, 25);
@@ -1923,11 +1902,9 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(second.committed, true);
   assert.equal(second.reused, false);
   assert.equal(distantRoot.children.length, 1);
-  assert.notEqual(distantRoot.children[0], firstRoot);
-  assert.ok(firstGeometries.filter(geometry => geometry !== firstClipmapGeometry)
-    .every(geometry => geometry.disposed === true));
-  assert.notEqual(firstClipmapGeometry.disposed, true,
-    'fixed clipmap topology remains pooled for the next incremental transaction');
+  assert.equal(distantRoot.children[0], firstRoot);
+  assert.ok(firstGeometries.every(geometry => geometry.disposed !== true),
+    'leaving Medium/Low buffers remain pooled for the next rolling transaction');
   const secondRoot = distantRoot.children[0];
 
   const stale = presentation.syncLocalTerrain({ coverageEpoch: 2, ...initial });
@@ -1935,10 +1912,10 @@ test('Local terrain publishes only complete 25-Chunk coverage and swaps roots at
   assert.equal(stale.reason, 'stale-epoch');
   assert.equal(distantRoot.children[0], secondRoot);
   presentation.dispose();
-  assert.equal(firstClipmapGeometry.disposed, true);
+  assert.ok(firstGeometries.every(geometry => geometry.disposed === true));
 });
 
-test('Terrain presentation generation stays detached until identity claim atomically replaces the complete root', async () => {
+test('Terrain strip/ring generation stays detached until identity claim atomically updates the live root', async () => {
   const pendingYields = [];
   const events = [];
   const scene = new DistantTestGroup();
@@ -1951,12 +1928,13 @@ test('Terrain presentation generation stays detached until identity claim atomic
   assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
   const distantRoot = scene.children[0];
   const oldRoot = distantRoot.children[0];
-  const initialFallbackCoverage = presentation.terrainPresentationCoverageForOwner(1, 0);
-  assert.equal(initialFallbackCoverage.complete, true);
-  assert.equal(initialFallbackCoverage.worldCoverageComplete, true);
-  assert.equal(initialFallbackCoverage.fallback, true);
-  assert.equal(initialFallbackCoverage.lagChunks, 1);
-  assert.equal(initialFallbackCoverage.withinCameraVisibleExtent, true,
+  const initialRollingCoverage = presentation.terrainPresentationCoverageForOwner(1, 0);
+  assert.equal(initialRollingCoverage.complete, true);
+  assert.equal(initialRollingCoverage.worldCoverageComplete, true);
+  assert.equal(initialRollingCoverage.fallback, false,
+    'a lagging but fully covered rolling surface is not a visual fallback layer');
+  assert.equal(initialRollingCoverage.lagChunks, 1);
+  assert.equal(initialRollingCoverage.withinCameraVisibleExtent, true,
     'the 52m clipmap-to-fog margin covers a one-Chunk presentation lag');
   assert.equal(presentation.terrainPresentationCoverageForOwner(4, 0)
     .worldCoverageComplete, false,
@@ -2018,8 +1996,9 @@ test('Terrain presentation generation stays detached until identity claim atomic
   });
   assert.equal(claimed.claimed, true);
   assert.equal(distantRoot.children.length, 1);
-  assert.notEqual(distantRoot.children[0], oldRoot);
-  assert.equal(oldRoot.parent, null);
+  assert.equal(distantRoot.children[0], oldRoot,
+    'claim publishes the complete entering strip/ring into the persistent logical Terrain root');
+  assert.equal(oldRoot.parent, distantRoot);
   const claimedCoverage = presentation.terrainPresentationCoverageForOwner(1, 0);
   assert.equal(claimedCoverage.complete, true);
   assert.equal(claimedCoverage.worldCoverageComplete, true);
@@ -2034,6 +2013,9 @@ test('Terrain presentation generation stays detached until identity claim atomic
   assert.equal(snapshot.localTerrainCoverageCenter.chunkX, 1);
   assert.equal(snapshot.localTerrainMidgroundOwnerCount, 16);
   assert.equal(snapshot.clipmapMeshCount, 1);
+  assert.equal(snapshot.terrainInitialRootPublicationCount, 1);
+  assert.equal(snapshot.terrainStripRingPublicationCount, 1);
+  assert.equal(snapshot.terrainPublicationScope, 'entering-owner-strip-and-low-ring');
   assert.equal(snapshot.terrainPresentationGenerationStalePublishCount, 0);
   assert.ok(events.findIndex(event => event.type === 'terrain-presentation-generation-ready')
     < events.findIndex(event => event.type === 'terrain-presentation-generation-claimed'));
@@ -2210,7 +2192,10 @@ test('world-fixed clipmap reuses only newly exposed samples for straight and dia
       centerChunkX,
       centerChunkZ,
     }).claimed, true);
-    return prepared.clipmapMetrics;
+    return Object.freeze({
+      ...prepared.clipmapMetrics,
+      rollingMetrics: prepared.rollingMetrics,
+    });
   };
   const straight = await prepareAndClaim({
     centerChunkX: 1,
@@ -2302,16 +2287,13 @@ test('world-fixed clipmap reuses only newly exposed samples for straight and dia
   presentation.dispose();
 });
 
-test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recycle, and visible Safety Ring', async t => {
+test('r160 Terrain color buffers survive cold build, shifts, reversal, and pool recycle without Safety Ring', async t => {
   const r160Three = Object.freeze({
     ...DISTANT_TEST_THREE,
     Float32BufferAttribute: DistantTestR160Float32BufferAttribute,
   });
   const scene = new DistantTestGroup();
-  const presentation = await createLocalTerrainTestPresentation(scene, {
-    THREE: r160Three,
-    enableTerrainSafetyRing: true,
-  });
+  const presentation = await createLocalTerrainTestPresentation(scene, { THREE: r160Three });
   t.after(() => presentation.dispose());
 
   const findNodes = (rootNode, name) => {
@@ -2414,7 +2396,10 @@ test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recy
       centerChunkX,
       centerChunkZ,
     }).claimed, true);
-    return prepared.clipmapMetrics;
+    return Object.freeze({
+      ...prepared.clipmapMetrics,
+      rollingMetrics: prepared.rollingMetrics,
+    });
   };
 
   const initial = localTerrainCoverageFixture(0, 0);
@@ -2440,6 +2425,17 @@ test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recy
   const straight = clipmapAudit('straight');
   assertPopulated(straight);
   assert.equal(straightMetrics.reusedSampleCount >= 7_840, true);
+  assert.deepEqual({
+    newOwners: straightMetrics.rollingMetrics.newOwnerCount,
+    reusedOwners: straightMetrics.rollingMetrics.reusedOwnerCount,
+    discardedOwners: straightMetrics.rollingMetrics.discardedOwnerCount,
+    fullTerrainRebuild: straightMetrics.rollingMetrics.fullTerrainRebuild,
+  }, {
+    newOwners: 5,
+    reusedOwners: 20,
+    discardedOwners: 5,
+    fullTerrainRebuild: false,
+  });
 
   const diagonalMetrics = await prepareAndClaim({
     centerChunkX: 2,
@@ -2450,6 +2446,11 @@ test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recy
   const diagonal = clipmapAudit('diagonal-pool-recycle');
   assertPopulated(diagonal);
   assert.equal(diagonalMetrics.reusedSampleCount >= 7_424, true);
+  assert.deepEqual({
+    newOwners: diagonalMetrics.rollingMetrics.newOwnerCount,
+    reusedOwners: diagonalMetrics.rollingMetrics.reusedOwnerCount,
+    discardedOwners: diagonalMetrics.rollingMetrics.discardedOwnerCount,
+  }, { newOwners: 9, reusedOwners: 16, discardedOwners: 9 });
   assert.equal(diagonal.geometry, cold.geometry,
     'the cold resource is recycled for the diagonal generation');
   assert.equal(diagonal.colorVersion, 1);
@@ -2475,25 +2476,19 @@ test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recy
   assert.equal(reversal.color.checksum, straight.color.checksum,
     'returning to the same center restores the identical color buffer');
 
-  const lagPlayerX = 20 * LEGACY_CHUNK_SIZE_METERS + 8;
-  const activeOrigin = localTerrainCoverageFixture(1, 0).renderOrigin;
-  presentation.update(lagPlayerX, 24, activeOrigin);
-  await waitForTerrainSafetyRing(presentation, { centerChunkX: 20, centerChunkZ: 1 });
-  presentation.update(lagPlayerX, 24, activeOrigin);
-  const visibleSafety = findNodes(scene, 'w8-player-following-terrain-safety-ring')
-    .filter(mesh => mesh.visible && (mesh.geometry.drawRange?.count ?? 0) > 0);
-  assert.equal(visibleSafety.length, 1, 'the lag fixture must render the Safety Ring');
-  const safetyMesh = visibleSafety[0];
-  const safetyColor = bufferStats(safetyMesh.geometry.attributes.color);
-  const safetyPosition = bufferStats(safetyMesh.geometry.attributes.position);
-  assert.equal(safetyColor.count, 8_649);
-  assert.equal(safetyColor.min > 0, true);
-  assert.equal(safetyColor.max > safetyColor.min, true);
-  assert.equal(safetyColor.invalidCount, 0);
-  assert.equal(safetyColor.zeroCount, 0);
-  assert.equal(safetyPosition.invalidCount, 0);
-  assert.equal(safetyMesh.geometry.attributes.color.version >= 1, true,
-    'the asynchronously populated Safety Ring color buffer must request a GPU upload');
+  assert.equal(findNodes(scene, 'w8-player-following-terrain-safety-ring').length, 0,
+    'Stage 3 removes the duplicate drawable Safety Ring');
+  const publicationSnapshot = presentation.snapshot();
+  assert.equal('safetyRingResourceCount' in publicationSnapshot, false);
+  assert.equal(publicationSnapshot.terrainInitialRootPublicationCount, 1);
+  assert.equal(publicationSnapshot.terrainStripRingPublicationCount, 3);
+  assert.equal(publicationSnapshot.terrainPublicationScope,
+    'entering-owner-strip-and-low-ring');
+  assert.equal(publicationSnapshot.midgroundGeometryPoolSize, 2,
+    'Medium Terrain uses the same bounded double-buffer pool as rolling Low Terrain');
+  assert.equal(publicationSnapshot.midgroundGeometryPoolInUseCount, 1);
+  assert.equal(publicationSnapshot.midgroundTotalGeometryAllocationCount, 2);
+  assert.equal(publicationSnapshot.midgroundTotalGeometryReuseCount >= 2, true);
 
   t.diagnostic(JSON.stringify({
     cold: {
@@ -2519,250 +2514,67 @@ test('r160 clipmap color buffers survive cold build, shifts, reversal, pool recy
       colorVersion: reversal.colorVersion,
       colorUpdateRanges: reversal.colorUpdateRanges,
     },
-    safetyVisible: {
-      drawCount: safetyMesh.geometry.drawRange.count,
-      position: safetyPosition,
-      color: safetyColor,
-      colorVersion: safetyMesh.geometry.attributes.color.version,
-    },
   }));
 });
 
-test('player-following Terrain Safety Ring reuses world-fixed samples and covers a 20-Chunk stalled generation', async t => {
-  const topology = createW8SafetyRingTopology('current');
-  assert.deepEqual({
-    samples: topology.vertices.length,
-    indices: topology.indices.length,
-    cells: topology.cells.length,
-    area: topology.cells.reduce(
-      (sum, cell) => sum + cell.widthMeters * cell.depthMeters,
-      0,
-    ),
-  }, {
-    samples: 8_649,
-    indices: 50_784,
-    cells: 8_464,
-    area: 704 * 704,
+test('continuous High/Medium/Low Terrain removes the Safety Ring without coverage regression', async t => {
+  {
+  const audit = auditW8ContinuousTerrainCoverage({
+    centers: [
+      { chunkX: 0, chunkZ: 0 },
+      { chunkX: 1, chunkZ: 0 },
+      { chunkX: 1, chunkZ: 1 },
+      { chunkX: 0, chunkZ: 1 },
+      { chunkX: 0, chunkZ: 0 },
+    ],
   });
-
-  class WebGlContractBufferGeometry extends DistantTestBufferGeometry {
-    setIndex(index) {
-      if (!Array.isArray(index)) {
-        this.index = index;
-        return;
-      }
-      const IndexArray = Math.max(...index) > 65_535 ? Uint32Array : Uint16Array;
-      const updateRanges = [];
-      const attribute = {
-        array: IndexArray.from(index),
-        updateRanges,
-        clearUpdateRanges() { updateRanges.length = 0; },
-        addUpdateRange(start, count) { updateRanges.push({ start, count }); },
-      };
-      Object.defineProperty(attribute, 'updateRange', {
-        get: () => ({ offset: 0, count: -1 }),
-      });
-      Object.defineProperty(attribute, 'needsUpdate', {
-        set(value) { if (value === true) attribute.version = (attribute.version ?? 0) + 1; },
-      });
-      this.index = attribute;
-    }
-  }
-  const webGlContractThree = Object.freeze({
-    ...DISTANT_TEST_THREE,
-    BufferGeometry: WebGlContractBufferGeometry,
-  });
+  assert.equal(audit.holeCount, 0);
+  assert.equal(audit.unintendedOverlapCount, 0);
+  assert.equal(audit.invalidColorCount, 0);
+  assert.equal(audit.boundaryHeightMismatchMeters, 0);
+  assert.equal(audit.staleGeometryCount, 0);
+  assert.equal(audit.fullTerrainRebuildCount, 0);
+  assert.ok(audit.transitions.every(transition => (
+    transition.reusedOwnerSamples === 20
+      && transition.newOwnerSamples === 5
+      && transition.discardedOwnerSamples === 5
+      && transition.reusedLowSamples >= 7_840
+  )));
   const scene = new DistantTestGroup();
-  const presentation = await createLocalTerrainTestPresentation(scene, {
-    THREE: webGlContractThree,
-    enableTerrainSafetyRing: true,
-  });
+  const presentation = await createLocalTerrainTestPresentation(scene);
   t.after(() => presentation.dispose());
-  const stalled = localTerrainCoverageFixture(0, 0);
-  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...stalled }).committed, true);
-  const origin = stalled.renderOrigin;
-
-  presentation.update(8, 8, origin);
-  let snapshot = await waitForTerrainSafetyRing(presentation, {
-    centerChunkX: 0,
-    centerChunkZ: 0,
-  });
-  presentation.update(8, 8, origin);
-  snapshot = presentation.snapshot();
-  assert.equal(snapshot.safetyRingCoverageComplete, true);
-  assert.equal(snapshot.safetyRingVisibleArea, 0,
-    'the ring does not overlap a complete high-detail Terrain square');
-
-  presentation.update(24, 8, origin);
-  snapshot = await waitForTerrainSafetyRing(presentation, {
-    centerChunkX: 1,
-    centerChunkZ: 0,
-  });
-  assert.equal(snapshot.safetyRingReuseRatio >= 0.95, true);
-  assert.equal(snapshot.safetyRingUpdatedSamples, 372);
-
-  presentation.update(40, 24, origin);
-  snapshot = await waitForTerrainSafetyRing(presentation, {
-    centerChunkX: 2,
-    centerChunkZ: 1,
-  });
-  assert.equal(snapshot.safetyRingReuseRatio >= 0.90, true);
-  assert.equal(snapshot.safetyRingUpdatedSamples, 728);
-
-  // Hold the complete TerrainPresentationGeneration at 0,0 while the independent
-  // ring follows the player through every required lag marker. Once the 20-Chunk
-  // forced-lag state is ready, leave high-detail generation paused for five
-  // simulated seconds while the player continues moving inside that Chunk.
-  for (const lagChunks of [4, 8, 12, 20]) {
-    const lagPlayerX = lagChunks * LEGACY_CHUNK_SIZE_METERS + 8;
-    presentation.update(lagPlayerX, 24, origin);
-    snapshot = await waitForTerrainSafetyRing(presentation, {
-      centerChunkX: lagChunks,
-      centerChunkZ: 1,
-    });
-    presentation.update(lagPlayerX, 24, origin);
-    snapshot = presentation.snapshot();
-    assert.equal(snapshot.safetyRingCoverageComplete, true, `${lagChunks}-Chunk lag`);
-    assert.equal(snapshot.safetyRingLastFrameVisibleHole, false, `${lagChunks}-Chunk lag`);
-  }
-  const forcedLagPlayerX = 20 * LEGACY_CHUNK_SIZE_METERS + 8;
-  presentation.resetTerrainSafetyRingDiagnostics();
-  for (let frame = 0; frame < 300; frame += 1) {
-    presentation.update(
-      forcedLagPlayerX + Math.sin(frame / 20) * 6,
-      24 + Math.cos(frame / 24) * 6,
-      origin,
-    );
-    presentation.pumpTerrainPresentationScheduler();
-  }
-  snapshot = presentation.snapshot();
-
-  assert.deepEqual(snapshot.localTerrainCoverageCenter, { chunkX: 0, chunkZ: 0 });
-  assert.deepEqual(snapshot.safetyRingCenter, { chunkX: 20, chunkZ: 1 });
-  assert.equal(snapshot.highDetailCoverageMiss > 0, true);
-  assert.equal(snapshot.safetyRingCoverageComplete, true);
-  assert.equal(snapshot.safetyRingCoverageMiss, 0);
+  const initial = localTerrainCoverageFixture(0, 0);
+  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...initial }).committed, true);
+  presentation.update(8, 8, initial.renderOrigin);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.continuousTerrainCoverageComplete, true);
+  assert.equal(snapshot.continuousTerrainCoverageMiss, 0);
   assert.equal(snapshot.visibleTerrainHoleFrame, 0);
-  assert.equal(snapshot.safetyRingLastFrameVisibleHole, false);
-  assert.equal(snapshot.safetyRingSkirtActive, false);
-  assert.equal(snapshot.safetyRingSkirtMaxWidth, 0);
-  assert.equal(snapshot.safetyRingGeometryAllocationCount, 2);
-  assert.equal(snapshot.safetyRingResourceCount, 2);
-  assert.equal(snapshot.safetyRingMaximumResourceCount, 2);
-  assert.equal(snapshot.safetyRingMaximumSliceMs < 33, true);
-  assert.equal(snapshot.safetyRingLastError, null);
-  const visibleSafetyRings = scene.children[0].children.filter(child => (
-    child.name === 'w8-player-following-terrain-safety-ring' && child.visible
-  ));
-  assert.equal(visibleSafetyRings.length, 1);
-  const safetyMesh = visibleSafetyRings[0];
-  assert.equal(ArrayBuffer.isView(safetyMesh.geometry.index.array), true,
-    'production Three.js must receive a real index BufferAttribute array');
-  const presentationNodes = [scene];
-  let regularClipmap = null;
-  while (presentationNodes.length > 0 && !regularClipmap) {
-    const node = presentationNodes.pop();
-    if (node.name === 'w8-seeded-macro-terrain-clipmap') regularClipmap = node;
-    else presentationNodes.push(...(node.children ?? []));
-  }
-  assert.notEqual(regularClipmap, null);
-  assert.equal(safetyMesh.material, regularClipmap.material,
-    'Safety Ring must reuse the existing Terrain material, not allocate another material path');
-  assert.equal(scene.children[0].children.filter(child => (
+  assert.equal(Object.keys(snapshot).some(key => key.startsWith('safetyRing')), false);
+  assert.equal(scene.children[0].children.some(child => (
     child.name === 'w8-player-following-terrain-safety-ring'
-  )).length, 2,
-  'double buffering is the complete bounded geometry pool after steady-state shifts');
-  const safetyIndices = safetyMesh.geometry.index.array ?? safetyMesh.geometry.index;
-  const drawCount = safetyMesh.geometry.drawRange.count;
-  const safetyPositions = safetyMesh.geometry.attributes.position.array;
-  for (let offset = 0; offset < drawCount; offset += 6) {
-    const unique = [...new Set([...safetyIndices.slice(offset, offset + 6)])];
-    const worldX = safetyMesh.position.x / 64
-      + unique.reduce((sum, index) => sum + safetyPositions[index * 3] / 64, 0)
-        / unique.length;
-    const worldZ = safetyMesh.position.z / 64
-      + unique.reduce((sum, index) => sum + safetyPositions[index * 3 + 2] / 64, 0)
-        / unique.length;
-    assert.equal(
-      Math.abs(worldX - 8) < 352 && Math.abs(worldZ - 8) < 352,
-      false,
-      'Safety Ring indices must exclude the complete high-detail Terrain square',
-    );
+  )), false);
   }
 });
 
-test('Terrain Safety Ring preserves canonical Settlement, Road, River, and natural height contracts', async t => {
-  const settlement = Object.freeze({
-    settlementId: 'settlement-v1:safety-ring-contract',
-    settlementType: 'RURAL',
-    townType: 'suburb',
-    center: Object.freeze({ x: 328, z: 8 }),
-    radiusMeters: 81,
-  });
-  const scene = new DistantTestGroup();
-  const presentation = await createLocalTerrainTestPresentation(scene, {
-    enableTerrainSafetyRing: true,
-    findSettlementsNear: async () => [settlement],
-  });
-  t.after(() => presentation.dispose());
-  const stalled = localTerrainCoverageFixture(0, 0);
-  assert.equal(presentation.syncLocalTerrain({ coverageEpoch: 1, ...stalled }).committed, true);
-  presentation.update(328, 8, stalled.renderOrigin);
-  await waitForTerrainSafetyRing(presentation, { centerChunkX: 20, centerChunkZ: 0 });
-
-  const macro = await createMacroTerrainEvaluator(CANONICAL_WORLD_SEED_HASH);
-  const riverSourceStableId = await createCanonicalRiverSourceId(CANONICAL_WORLD_SEED_HASH);
-  const points = Object.freeze([
-    Object.freeze({ kind: 'building', x: 330, z: 8 }),
-    Object.freeze({ kind: 'settlement-center', x: 328, z: 8 }),
-    Object.freeze({ kind: 'road-center', x: 328, z: 12 }),
-    Object.freeze({ kind: 'road-edge', x: 331, z: 12 }),
-    Object.freeze({ kind: 'settlement-edge', x: 388, z: 8 }),
-    Object.freeze({ kind: 'cliff-slope', x: 500, z: 100 }),
-    Object.freeze({ kind: 'river', x: 328, z: 124.56 }),
-    Object.freeze({ kind: 'normal-forest', x: 440, z: 8 }),
+test('logical Terrain bands share the canonical finalGround height and boundary contract', async t => {
+  const contract = createW8LogicalTerrainContract('current');
+  assert.equal(contract.heightSource, 'canonical-final-ground');
+  assert.equal(contract.colorSource, 'canonical-surface-color');
+  assert.equal(contract.sampleIdentity, 'world-fixed-xz');
+  assert.equal(
+    contract.boundaryOwnership,
+    'inner-band-owns-boundary-vertex;outer-band-owns-next-cell',
+  );
+  assert.deepEqual(contract.bands.map(band => ({
+    id: band.id,
+    minimum: band.minimumChebyshevMeters,
+    maximum: band.maximumChebyshevMeters,
+  })), [
+    { id: 'high', minimum: 0, maximum: 24 },
+    { id: 'medium', minimum: 24, maximum: 40 },
+    { id: 'low', minimum: 40, maximum: 352 },
   ]);
-  const audits = points.map(point => {
-    const chunkX = Math.floor(point.x / LEGACY_CHUNK_SIZE_METERS);
-    const chunkZ = Math.floor(point.z / LEGACY_CHUNK_SIZE_METERS);
-    const corridor = createCanonicalRiverSurfaceCorridor({
-      sourceStableId: riverSourceStableId,
-      chunkX,
-      chunkZ,
-      settlementReferences: [settlement],
-    });
-    const surfacePolicy = createSettlementSurfacePolicy(
-      [settlement],
-      corridor ? [corridor] : [],
-    );
-    const chunk = canonicalMacroTerrainChunk({ chunkX, chunkZ, macro, surfacePolicy });
-    const canonical = resolveCanonicalGroundSurface({
-      chunkData: chunk,
-      worldX: point.x,
-      worldZ: point.z,
-    }).heightMeters;
-    const safety = presentation.sampleTerrainSafetyRingHeightMeters(point.x, point.z);
-    return Object.freeze({
-      ...point,
-      canonical,
-      safety,
-      differenceMeters: Math.abs(canonical - safety),
-    });
-  });
-  const byKind = Object.fromEntries(audits.map(audit => [audit.kind, audit]));
-  assert.equal(audits.every(audit => Number.isFinite(audit.safety)), true);
-  assert.equal(audits.every(audit => audit.differenceMeters <= 0.001), true,
-    JSON.stringify(audits));
-  assert.equal(byKind.building.differenceMeters, 0);
-  assert.equal(byKind['settlement-center'].differenceMeters, 0);
-  assert.equal(byKind['road-center'].differenceMeters, 0);
-  assert.equal(byKind['road-edge'].differenceMeters, 0);
-  assert.equal(byKind.river.safety < byKind.river.canonical + 0.001, true);
-  const snapshot = presentation.snapshot();
-  assert.equal(snapshot.safetyRingPolicySettlementCount, 1);
-  assert.equal(snapshot.safetyRingPolicyRiverCorridorCount > 0, true);
-  assert.equal(snapshot.safetyRingSkirtActive, false,
-    'grid-aligned coverage masking closes the boundary without a cliff skirt');
 });
 
 test('direct non-adjacent clipmap catch-up is faster than composing every intermediate generation', async t => {
@@ -2957,7 +2769,7 @@ test('MAX Sprint 60-second clipmap throughput stays ahead of straight and diagon
   }
 });
 
-test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after completion', async () => {
+test('normal Chunk-boundary Local Terrain compose is sliced and publishes strip/ring only after completion', async () => {
   const pendingYields = [];
   const scene = new DistantTestGroup();
   const presentation = await createLocalTerrainTestPresentation(scene, {
@@ -2968,9 +2780,6 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   const distantRoot = scene.children[0];
   const oldRoot = distantRoot.children[0];
   const oldGeometries = oldRoot.children.map(child => child.geometry).filter(Boolean);
-  const oldClipmapGeometry = oldRoot.children.find(child => (
-    child.name === 'w8-seeded-macro-terrain-clipmap'
-  )).geometry;
   const next = localTerrainCoverageFixture(1, 0);
   const retainedChunks = [...initial.chunks.entries()]
     .filter(([key]) => next.chunks.has(key))
@@ -3007,15 +2816,20 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   });
   assert.equal(result.committed, true);
   assert.equal(distantRoot.children.length, 1);
-  assert.notEqual(distantRoot.children[0], oldRoot);
-  assert.ok(oldGeometries.filter(geometry => geometry !== oldClipmapGeometry)
-    .every(geometry => geometry.disposed === true));
-  assert.notEqual(oldClipmapGeometry.disposed, true);
+  assert.equal(distantRoot.children[0], oldRoot,
+    'the logical Terrain root persists while its complete Medium/Low buffers publish atomically');
+  assert.ok(oldGeometries.every(geometry => geometry.disposed !== true),
+    'leaving Medium/Low buffers remain in their bounded reuse pools');
   const snapshot = presentation.snapshot();
   assert.equal(snapshot.committedLocalTerrainEpoch, 2);
   assert.equal(snapshot.localTerrainLastSliceCount > 0, true);
   assert.equal(snapshot.presentationSliceBudgetMs, 8);
+  assert.equal(snapshot.terrainPresentationStagingSliceBudgetMs, 1.5);
   assert.equal(snapshot.localTerrainLastMaximumSliceMs >= 0, true);
+  assert.equal(snapshot.terrainInitialRootPublicationCount, 1);
+  assert.equal(snapshot.terrainStripRingPublicationCount, 1);
+  assert.equal(snapshot.midgroundGeometryPoolSize, 2);
+  assert.equal(snapshot.clipmapGeometryPoolSize, 2);
   for (const retained of retainedChunks) {
     assert.equal(next.chunks.get(retained.key), retained.chunk);
     assert.equal(retained.chunk.chunkId, retained.chunkId);
@@ -3035,7 +2849,7 @@ test('normal Chunk-boundary Local Terrain compose is sliced and swaps only after
   );
   presentation.dispose();
   reference.dispose();
-  assert.equal(oldClipmapGeometry.disposed, true);
+  assert.ok(oldGeometries.every(geometry => geometry.disposed === true));
 });
 
 test('the committed Local Terrain root hands owners off to the latest rendered ring while its replacement stages', async () => {
@@ -4182,7 +3996,7 @@ test('continuous Local Terrain boundaries discard stale builds and shutdown bloc
   assert.equal(firstResult.reason, 'stale-after-build');
   assert.equal(latestResult.committed, true);
   assert.equal(distantRoot.children.length, 1);
-  assert.notEqual(distantRoot.children[0], committedRoot);
+  assert.equal(distantRoot.children[0], committedRoot);
   assert.equal(distantRoot.children[0].userData.coverageEpoch, 3);
   assert.equal(presentation.snapshot().committedLocalTerrainEpoch, 3);
 
@@ -4245,7 +4059,7 @@ test('an older transition contract cannot roll back Local Terrain coverage or po
   presentation.dispose();
 });
 
-test('Local Terrain diagnostics prove replacement attachment precedes old-root release', async () => {
+test('Local Terrain diagnostics prove complete strip/ring readiness precedes atomic publication', async () => {
   const scene = new DistantTestGroup();
   const events = [];
   const presentation = await createLocalTerrainTestPresentation(scene, {
@@ -4274,7 +4088,8 @@ test('Local Terrain diagnostics prove replacement attachment precedes old-root r
   assert.equal(ready.rootAttached, false);
   assert.equal(ready.oldRootAttached, true);
   assert.equal(attached.rootAttached, true);
-  assert.equal(attached.oldRootAttached, true);
+  assert.equal(attached.oldRootAttached, false,
+    'the detached staging shell is retired after its buffers publish into the live root');
   assert.equal(released.newRootAttached, true);
   assert.equal(released.oldRootAttached, false);
   const roots = presentation.visibleRootRevisionSnapshot();
@@ -4283,7 +4098,7 @@ test('Local Terrain diagnostics prove replacement attachment precedes old-root r
   presentation.dispose();
 });
 
-test('Render Distance swaps complete Terrain roots without changing Local coverage', async () => {
+test('Render Distance updates the complete Terrain ring without changing Local coverage', async () => {
   const scene = new DistantTestGroup();
   const presentation = await createLocalTerrainTestPresentation(scene);
   const coverage = localTerrainCoverageFixture(0, 0);
@@ -4305,7 +4120,8 @@ test('Render Distance swaps complete Terrain roots without changing Local covera
   assert.equal(switched.committed, true);
   assert.equal(switched.reused, false);
   assert.equal(distantRoot.children.length, 1);
-  assert.notEqual(distantRoot.children[0], currentRoot);
+  assert.equal(distantRoot.children[0], currentRoot,
+    'preset changes retain the logical Terrain root and publish a complete replacement Low ring');
   const switchedGeometries = distantRoot.children[0].children
     .map(child => child.geometry).filter(Boolean);
   assert.equal(currentGeometries.filter(geometry => switchedGeometries.includes(geometry)).length, 1,
@@ -4623,143 +4439,22 @@ test('canonical River keeps the Far owner staged while active ownership hides an
   presentation.dispose();
 });
 
-test('every visible Far water instance retains canonical identity and owner coverage', async () => {
-  const scene = new DistantTestGroup();
-  const presentation = await createLocalTerrainTestPresentation(scene);
-  const input = canonicalSyncInput({
-    centerChunkX: 0,
-    activeDataKeys: [],
-    renderedKeys: [],
-    chunk: canonicalChunk(0, 0, []),
-    quality: 'high',
-  });
-  assert.equal(await presentation.sync(input), true);
-  const generationRoot = scene.children[0].children[0];
-  const water = generationRoot.children.filter(child => child.material?.name === 'water'
-    || child.name?.includes('water'));
-  assert.ok(water.length > 0, 'the fixture must materialize Far water presentation');
-  assert.deepEqual(water.map(mesh => ({
-    name: mesh.name,
-    count: mesh.count,
-    canonicalStableIdCount: mesh.userData?.canonicalStableIds?.length ?? 0,
-    ownerKeyCount: mesh.userData?.ownerKeys?.length ?? 0,
-  })), water.map(mesh => ({
-    name: mesh.name,
-    count: mesh.count,
-    canonicalStableIdCount: mesh.count,
-    ownerKeyCount: mesh.count,
-  })), 'presentation-only water must still identify canonical water coverage and its owner');
-  const proxy = water.find(mesh => mesh.name === 'w8-distant-water-proxy-__road__-water');
-  assert.equal(proxy.userData.logicalBounds.length, proxy.count);
-  assert.equal(new Set(proxy.userData.canonicalStableIds).size, proxy.count,
-    'anchored Water cells must retain unique deterministic identities');
-  proxy.userData.logicalBounds.forEach(bounds => {
-    assert.ok(Number.isFinite(bounds.minimumX) && Number.isFinite(bounds.maximumX)
-      && Number.isFinite(bounds.minimumZ) && Number.isFinite(bounds.maximumZ));
-    assert.ok(bounds.minimumX < bounds.maximumX && bounds.minimumZ < bounds.maximumZ);
-  });
-  presentation.dispose();
+test('Far water has no moisture-grid proxy path outside canonical River records', async () => {
+  const source = await readFile(new URL(
+    '../src/infinite-world/render/w8-distant-presentation.js',
+    import.meta.url,
+  ), 'utf8');
+  assert.doesNotMatch(source, /water-proxy|createDistantWaterProxies|DISTANT_WATER_PROXY/);
+  assert.match(source, /createFarRiverPresentation/);
+  assert.match(source, /projection\.waterSurface/);
 });
 
-test('an old Far water instance cannot remain visible after its bounds enter the active ring', async () => {
-  const scene = new DistantTestGroup();
-  const presentation = await createLocalTerrainTestPresentation(scene);
-  const input = canonicalSyncInput({
-    centerChunkX: 0,
-    activeDataKeys: [],
-    renderedKeys: [],
-    chunk: canonicalChunk(0, 0, []),
-    quality: 'high',
-  });
-  input.renderOrigin.rebaseCount = 1;
-  assert.equal(await presentation.sync(input), true);
-  const generationRoot = scene.children[0].children[0];
-  const waterProxy = generationRoot.children.find(child => (
-    child.name === 'w8-distant-water-proxy-__road__-water'
-  ));
-  assert.ok(waterProxy?.count > 0, 'the fixture must materialize a distant Water proxy');
-  const firstProxy = structuredClone(waterProxy.matrices[0].value);
-  const unitsPerMeter = RENDER_CHUNK_SIZE / LEGACY_CHUNK_SIZE_METERS;
-  const proxyWorldX = firstProxy.position.x / unitsPerMeter;
-  const proxyWorldZ = firstProxy.position.z / unitsPerMeter;
-  const targetChunkX = Math.floor(proxyWorldX / LEGACY_CHUNK_SIZE_METERS);
-  const targetChunkZ = Math.floor(proxyWorldZ / LEGACY_CHUNK_SIZE_METERS);
-  const activeDataKeys = [];
-  const renderedKeys = [];
-  for (let chunkZ = targetChunkZ - 2; chunkZ <= targetChunkZ + 2; chunkZ += 1) {
-    for (let chunkX = targetChunkX - 2; chunkX <= targetChunkX + 2; chunkX += 1) {
-      const key = `${chunkX},${chunkZ}`;
-      activeDataKeys.push(key);
-      if (Math.abs(chunkX - targetChunkX) <= 1 && Math.abs(chunkZ - targetChunkZ) <= 1) {
-        renderedKeys.push(key);
-      }
-    }
-  }
-  assert.equal(presentation.commitRuntimeState({
-    activeDataKeys,
-    renderedKeys,
-    renderOrigin: {
-      renderOriginChunkX: targetChunkX,
-      renderOriginChunkZ: targetChunkZ,
-      rebaseCount: 2,
-    },
-    quality: 'high',
-    playerLogicalX: proxyWorldX,
-    playerLogicalZ: proxyWorldZ,
-  }), true);
-  const proxyRenderX = firstProxy.position.x + generationRoot.position.x;
-  const proxyRenderZ = firstProxy.position.z + generationRoot.position.z;
-  const playerRenderX = (proxyWorldX - targetChunkX * LEGACY_CHUNK_SIZE_METERS)
-    * unitsPerMeter;
-  const playerRenderZ = (proxyWorldZ - targetChunkZ * LEGACY_CHUNK_SIZE_METERS)
-    * unitsPerMeter;
-  assert.ok(Math.abs(proxyRenderX - playerRenderX) < 1e-9
-    && Math.abs(proxyRenderZ - playerRenderZ) < 1e-9,
-  'the old proxy must now overlap the Player in render coordinates');
-  const movedSnapshot = presentation.snapshot();
-  const handedOffProxy = waterProxy.matrices[0].value;
-  assert.equal(
-    handedOffProxy.scale.x === 0
-      && handedOffProxy.scale.y === 0
-      && handedOffProxy.scale.z === 0,
-    true,
-    `a presentation-only Far water proxy must be hidden when it enters active coverage: ${
-      JSON.stringify({
-        proxyWorldX,
-        proxyWorldZ,
-        targetChunkX,
-        targetChunkZ,
-        proxyRenderX,
-        proxyRenderZ,
-        playerRenderX,
-        playerRenderZ,
-        scale: handedOffProxy.scale,
-        meshName: waterProxy.name,
-        userData: waterProxy.userData,
-        far: {
-          committedEpoch: movedSnapshot.committedEpoch,
-          syncEpoch: movedSnapshot.syncEpoch,
-          buildOrigin: movedSnapshot.buildOrigin,
-          currentOrigin: movedSnapshot.currentOrigin,
-          rootAttached: movedSnapshot.rootAttached,
-        },
-      })}`,
-  );
-  assert.equal(presentation.commitRuntimeState({
-    activeDataKeys: [],
-    renderedKeys: [],
-    renderOrigin: {
-      renderOriginChunkX: 0,
-      renderOriginChunkZ: 0,
-      rebaseCount: 3,
-    },
-    quality: 'high',
-    playerLogicalX: 0,
-    playerLogicalZ: 0,
-  }), true);
-  assert.deepEqual(waterProxy.matrices[0].value, firstProxy,
-    'the same Far coverage must return without regeneration after active ownership leaves');
-  presentation.dispose();
+test('runtime ownership changes cannot create non-canonical Far water', async () => {
+  const source = await readFile(new URL(
+    '../src/infinite-world/render/w8-distant-presentation.js',
+    import.meta.url,
+  ), 'utf8');
+  assert.doesNotMatch(source, /distantWaterProxyPresentations|updateDistantWaterProxyVisibility/);
 });
 
 test('superseded distant sync cancels during owner acquisition and cannot commit an old epoch', async () => {
