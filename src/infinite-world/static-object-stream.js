@@ -64,9 +64,9 @@ function collectCircularOwners({
 }) {
   const result = new Set();
   const radius = Math.max(exactRadiusMeters, horizonRadiusMeters ?? exactRadiusMeters);
-  const minimumChunkX = Math.floor((centerX - radius) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkX = Math.ceil((centerX - radius) / LOGICAL_CHUNK_SIZE_METERS) - 1;
   const maximumChunkX = Math.floor((centerX + radius) / LOGICAL_CHUNK_SIZE_METERS);
-  const minimumChunkZ = Math.floor((centerZ - radius) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkZ = Math.ceil((centerZ - radius) / LOGICAL_CHUNK_SIZE_METERS) - 1;
   const maximumChunkZ = Math.floor((centerZ + radius) / LOGICAL_CHUNK_SIZE_METERS);
   for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
     for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
@@ -240,7 +240,13 @@ export function createCircularStaticStreamingPolicy({
       ? coverageFor(player, renderDistancePreset)
       : new Set(residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters));
     const exactOwnerKeys = residentCoverage === null
-      ? new Set()
+      ? collectCircularOwners({
+        centerX: player.x,
+        centerZ: player.z,
+        exactRadiusMeters: profile.exactDistanceMeters,
+        horizonRadiusMeters: null,
+        horizonOwnerPredicate,
+      })
       : new Set(residentOwnerKeysWithinRadius(
         residentCoverage,
         Math.min(
@@ -248,14 +254,16 @@ export function createCircularStaticStreamingPolicy({
           profile.exactDistanceMeters + LOGICAL_CHUNK_SIZE_METERS,
         ),
       ));
-    const prefetched = collectCorridorOwners({
-      start: player,
-      end: velocityCorridor.endpoint,
-      exactRadiusMeters: profile.exactDistanceMeters,
-      horizonRadiusMeters: profile.horizonDistanceMeters,
-      horizonOwnerPredicate,
-      exactOwnerKeys,
-    });
+    const prefetched = velocityCorridor.distanceMeters > 0
+      ? collectCorridorOwners({
+        start: player,
+        end: velocityCorridor.endpoint,
+        exactRadiusMeters: profile.exactDistanceMeters,
+        horizonRadiusMeters: profile.horizonDistanceMeters,
+        horizonOwnerPredicate,
+        exactOwnerKeys,
+      })
+      : new Set();
     for (const ownerKey of required) prefetched.delete(ownerKey);
     const retainedRadiusMeters = requiredRadiusMeters + retentionMarginMeters;
     const retained = residentCoverage !== null
@@ -317,13 +325,21 @@ export function createCircularStaticStreamingPolicy({
       ?? parseChunkKey(ownerKey);
     const profile = distanceProfileResolver(plan.renderDistancePreset);
     if (profile.horizonDistanceMeters === null) return exactResourceKind;
-    const exact = segmentIntersectsExpandedChunkAabb(
-      coordinate.chunkX,
-      coordinate.chunkZ,
-      plan.player,
-      policyPlan.velocityCorridor.endpoint,
-      profile.exactDistanceMeters,
-    );
+    const exact = policyPlan.velocityCorridor.distanceMeters > 0
+      ? segmentIntersectsExpandedChunkAabb(
+        coordinate.chunkX,
+        coordinate.chunkZ,
+        plan.player,
+        policyPlan.velocityCorridor.endpoint,
+        profile.exactDistanceMeters,
+      )
+      : staticChunkAabbIntersectsCircle(
+        coordinate.chunkX,
+        coordinate.chunkZ,
+        plan.player.x,
+        plan.player.z,
+        profile.exactDistanceMeters,
+      );
     return exact ? exactResourceKind : horizonResourceKind;
   };
   const maximumCoverage = renderDistancePreset => {
@@ -487,6 +503,9 @@ export function createStaticObjectStream({
   let latestRequestedOwnerKeys = new Set();
   let latestRequiredOwnerKeys = new Set();
   let latestAllOwnerKeys = new Set();
+  let pendingAdmissionOwnerKeys = Object.freeze([]);
+  let pendingAdmissionIndex = 0;
+  let pendingAdmissionCoverageGeneration = 0;
   let latestApplyDiff = Object.freeze({
     enteringOwnerCount: 0,
     leavingOwnerCount: 0,
@@ -539,6 +558,8 @@ export function createStaticObjectStream({
     readyPageQueueReuses: 0,
     sourceCoverageFastPaths: 0,
     enqueueCalls: 0,
+    admissionCursorReplacements: 0,
+    admissionCursorSkips: 0,
     supersededApplies: 0,
   };
 
@@ -599,7 +620,7 @@ export function createStaticObjectStream({
   const currentPublicationSequence = () => latestPublicationContext?.sequence ?? 0;
   const queueReadyPage = resource => {
     counts.readyPageQueueCalls += 1;
-    if (!resource || !latestAllOwnerKeys.has(resource.ownerKey)) return false;
+    if (!resource || !latestRequestedOwnerKeys.has(resource.ownerKey)) return false;
     if (latestResourceKindByOwner.get(resource.ownerKey) !== resource.resourceKind) {
       counts.staleResultDiscards += 1;
       return false;
@@ -679,7 +700,7 @@ export function createStaticObjectStream({
     staleTaskKeys.delete(task.key);
     if (state === 'ready') {
       const readyAtMs = clock();
-      const retainedByLatestCoverage = latestAllOwnerKeys.has(task.ownerKey)
+      const retainedByLatestCoverage = latestRequestedOwnerKeys.has(task.ownerKey)
         && latestResourceKindByOwner.get(task.ownerKey) === task.resourceKind;
       ready.set(task.key, Object.freeze({
         ownerKey: task.ownerKey,
@@ -704,8 +725,52 @@ export function createStaticObjectStream({
       task.reject(error);
     }
   };
+  const pendingAdmissionCount = () => (
+    pendingAdmissionCoverageGeneration === coverageGeneration
+      ? Math.max(0, pendingAdmissionOwnerKeys.length - pendingAdmissionIndex)
+      : 0
+  );
+  const fillAdmissionWindow = () => {
+    if (disposed || pendingAdmissionCoverageGeneration !== coverageGeneration) return 0;
+    let admitted = 0;
+    while (tasks.size < maximumConcurrentRequests
+      && pendingAdmissionIndex < pendingAdmissionOwnerKeys.length) {
+      const ownerKey = pendingAdmissionOwnerKeys[pendingAdmissionIndex++];
+      if (!latestRequestedOwnerKeys.has(ownerKey)) {
+        counts.admissionCursorSkips += 1;
+        continue;
+      }
+      const descriptor = latestOwnerDescriptorByKey.get(ownerKey);
+      const resourceKind = latestResourceKindByOwner.get(ownerKey);
+      if (!descriptor || typeof resourceKind !== 'string') {
+        counts.admissionCursorSkips += 1;
+        continue;
+      }
+      const key = taskKey(ownerKey, resourceKind);
+      if (tasks.has(key)) {
+        counts.admissionCursorSkips += 1;
+        continue;
+      }
+      enqueue({
+        ownerKey,
+        ownerX: descriptor.ownerX,
+        ownerZ: descriptor.ownerZ,
+        resourceKind,
+        required: latestRequiredOwnerKeys.has(ownerKey),
+        deadlineAtMs: latestRequiredOwnerKeys.has(ownerKey)
+          ? latestPolicyPlan.deadline.requiredAtMs
+          : latestPolicyPlan.deadline.prefetchedAtMs,
+        planId: latestPlan.planId,
+        publicationGroup: latestPolicyPlan.publicationGroup,
+        pumpNow: false,
+      });
+      admitted += Number(tasks.has(key));
+    }
+    return admitted;
+  };
   const pump = () => {
     if (disposed) return;
+    fillAdmissionWindow();
     while (activeCount < maximumConcurrentRequests && queue.length) {
       const task = queue.shift();
       if (task.state !== 'queued') continue;
@@ -813,6 +878,7 @@ export function createStaticObjectStream({
     }
     ownerTaskKeys.add(key);
     queue.push(task);
+    counts.queueInsertions += 1;
     createTicket(ownerKey, resourceKind);
     if (pumpNow) pump();
     return Object.freeze({
@@ -839,7 +905,7 @@ export function createStaticObjectStream({
         staleTaskKeys.delete(key);
         continue;
       }
-      const retainedWithCurrentKind = latestAllOwnerKeys.has(task.ownerKey)
+      const retainedWithCurrentKind = latestRequestedOwnerKeys.has(task.ownerKey)
         && latestResourceKindByOwner.get(task.ownerKey) === task.resourceKind;
       if (retainedWithCurrentKind) {
         task.staleSincePublicationSequence = null;
@@ -1218,12 +1284,18 @@ export function createStaticObjectStream({
     const required = new Set(policyPlan.requiredOwnerKeys);
     const retained = new Set(policyPlan.allOwnerKeys);
     const previousRequiredOwnerKeys = latestRequiredOwnerKeys;
+    const previousRequestedOwnerKeys = latestRequestedOwnerKeys;
     const previousResourceKindByOwner = latestResourceKindByOwner;
-    const previousAllOwnerKeys = latestAllOwnerKeys;
     const nextRequestedOwnerKeys = new Set(policyPlan.requestOwnerKeys);
+    const previousPendingAdmissionOwnerKeys = new Set(
+      pendingAdmissionCoverageGeneration === coverageGeneration
+        ? pendingAdmissionOwnerKeys.slice(pendingAdmissionIndex)
+        : [],
+    );
     const queueCandidateOwnerKeys = policyPlan.requestOwnerKeys.filter(ownerKey => (
       !latestRequestedOwnerKeys.has(ownerKey)
         || latestResourceKindByOwner.get(ownerKey) !== nextResourceKindByOwner.get(ownerKey)
+        || previousPendingAdmissionOwnerKeys.has(ownerKey)
     ));
     const compareRequestPriority = (left, right) => {
       const leftOwner = nextOwnerDescriptorByKey.get(left);
@@ -1238,24 +1310,6 @@ export function createStaticObjectStream({
         || leftOwner.chunkX - rightOwner.chunkX;
     };
     queueCandidateOwnerKeys.sort(compareRequestPriority);
-    const requested = queueCandidateOwnerKeys.map(ownerKey => ({
-      ownerKey,
-      ownerX: nextOwnerDescriptorByKey.get(ownerKey).ownerX,
-      ownerZ: nextOwnerDescriptorByKey.get(ownerKey).ownerZ,
-      resourceKind: nextResourceKindByOwner.get(ownerKey),
-      required: required.has(ownerKey),
-      deadlineAtMs: required.has(ownerKey)
-        ? policyPlan.deadline.requiredAtMs : policyPlan.deadline.prefetchedAtMs,
-      planId: plan.planId,
-      publicationGroup: policyPlan.publicationGroup,
-    }));
-    const newTaskKeys = new Set(requested.map(descriptor => (
-      taskKey(descriptor.ownerKey, descriptor.resourceKind)
-    )).filter(key => !tasks.has(key) && !ready.has(key)));
-    if (tasks.size + newTaskKeys.size > queueCapacity) {
-      counts.queueOverflows += 1;
-      throw new RangeError(`Static Object Stream queue capacity exceeded: ${queueCapacity}`);
-    }
     if (applyAttempt !== applyAttemptSequence) {
       counts.supersededApplies += 1;
       return false;
@@ -1265,8 +1319,7 @@ export function createStaticObjectStream({
       descriptors: retainedClassificationDescriptors,
     });
     // No stream plan state has changed above. Only commit the new coverage
-    // after classification, signature construction, ordering, cache retention,
-    // and capacity validation have all succeeded.
+    // after classification, signature construction, and ordering succeed.
     if (stagedPublicationContextChanged) {
       latestPublicationContext = stagedPublicationContext;
       counts.publicationContextUpdates += 1;
@@ -1290,6 +1343,24 @@ export function createStaticObjectStream({
     latestRequestedOwnerKeys = nextRequestedOwnerKeys;
     latestRequiredOwnerKeys = required;
     latestAllOwnerKeys = retained;
+    pendingAdmissionOwnerKeys = Object.freeze([...queueCandidateOwnerKeys]);
+    pendingAdmissionIndex = 0;
+    pendingAdmissionCoverageGeneration = coverageGeneration;
+    counts.admissionCursorReplacements += 1;
+    const supersededQueuedTasks = [...queue].filter(task => (
+      task.state === 'queued'
+        && (!nextRequestedOwnerKeys.has(task.ownerKey)
+          || nextResourceKindByOwner.get(task.ownerKey) !== task.resourceKind)
+    ));
+    for (const task of supersededQueuedTasks) {
+      if (tasks.get(task.key) !== task || task.state !== 'queued') continue;
+      const index = queue.indexOf(task);
+      if (index >= 0) queue.splice(index, 1);
+      task.cancellationRequested = true;
+      settleTask(task, 'cancelled');
+      counts.stalePlanCancels += 1;
+      counts.stableCoverageCancels += 1;
+    }
     counts.plans += 1;
     counts.coverageMerges += 1;
     counts.ownerSorts += Number(queueCandidateOwnerKeys.length > 1);
@@ -1300,26 +1371,26 @@ export function createStaticObjectStream({
     counts.leavingOwners += leavingOwnerCount;
     counts.unchangedOwners += unchangedOwnerCount;
     counts.sortTargetOwners += queueCandidateOwnerKeys.length;
-    counts.queueInsertions += newTaskKeys.size;
+    const queueInsertionsBeforeAdmission = counts.queueInsertions;
     latestApplyDiff = Object.freeze({
       enteringOwnerCount,
       leavingOwnerCount,
       unchangedOwnerCount,
       classifiedOwnerCount,
       sortTargetOwnerCount: queueCandidateOwnerKeys.length,
-      queueCandidateCount: requested.length,
-      queueInsertionCount: newTaskKeys.size,
+      queueCandidateCount: queueCandidateOwnerKeys.length,
+      queueInsertionCount: 0,
     });
     const affectedOwnerKeys = new Set(changedPolicyOwners);
-    for (const ownerKey of previousAllOwnerKeys) {
-      if (!retained.has(ownerKey)) affectedOwnerKeys.add(ownerKey);
+    for (const ownerKey of previousRequestedOwnerKeys) {
+      if (!nextRequestedOwnerKeys.has(ownerKey)) affectedOwnerKeys.add(ownerKey);
     }
     for (const ownerKey of affectedOwnerKeys) {
       const nextResourceKind = nextResourceKindByOwner.get(ownerKey);
       for (const key of taskKeysByOwner.get(ownerKey) ?? []) {
         const task = tasks.get(key);
         if (!task) continue;
-        const retainedWithCurrentKind = retained.has(ownerKey)
+        const retainedWithCurrentKind = nextRequestedOwnerKeys.has(ownerKey)
           && nextResourceKind === task.resourceKind;
         if (retainedWithCurrentKind) {
           task.staleSincePublicationSequence = null;
@@ -1332,7 +1403,8 @@ export function createStaticObjectStream({
       }
       const previousResourceKind = previousResourceKindByOwner.get(ownerKey);
       if (previousResourceKind !== undefined
-        && (!retained.has(ownerKey) || previousResourceKind !== nextResourceKind)) {
+        && (!nextRequestedOwnerKeys.has(ownerKey)
+          || previousResourceKind !== nextResourceKind)) {
         const previousKey = taskKey(ownerKey, previousResourceKind);
         tickets.delete(previousKey);
         if (readyPageQueue.delete(previousKey)) counts.staleResultDiscards += 1;
@@ -1355,22 +1427,12 @@ export function createStaticObjectStream({
         ? policyPlan.deadline.requiredAtMs : policyPlan.deadline.prefetchedAtMs;
       if (nextRequired) promoteQueuedTask(task);
     }
-    for (const descriptor of requested) enqueue({ ...descriptor, pumpNow: false });
-    const enteringRequiredTasks = requested.map(descriptor => tasks.get(taskKey(
-      descriptor.ownerKey,
-      descriptor.resourceKind,
-    ))).filter(task => task?.state === 'queued' && task.required && newTaskKeys.has(task.key));
-    if (enteringRequiredTasks.length > 0) {
-      const enteringRequiredKeys = new Set(enteringRequiredTasks.map(task => task.key));
-      for (let index = queue.length - 1; index >= 0; index -= 1) {
-        if (enteringRequiredKeys.has(queue[index].key)) queue.splice(index, 1);
-      }
-      const firstStablePrefetch = queue.findIndex(task => !task.required);
-      queue.splice(firstStablePrefetch < 0 ? queue.length : firstStablePrefetch,
-        0, ...enteringRequiredTasks);
-    }
     cancelMatureStaleTasks();
     pump();
+    latestApplyDiff = Object.freeze({
+      ...latestApplyDiff,
+      queueInsertionCount: counts.queueInsertions - queueInsertionsBeforeAdmission,
+    });
     return true;
   };
 
@@ -1393,6 +1455,10 @@ export function createStaticObjectStream({
       return existing.promise.then(value => value ?? fallback());
     }
     if (!latestPlan || !latestPolicyPlan) return fallback();
+    // Direct demand is already a currently-needed request. When the bounded
+    // plan window is full, let its caller's authoritative fallback join the
+    // shared generation service directly instead of growing a second queue.
+    if (tasks.size >= maximumConcurrentRequests) return fallback();
     const handle = enqueue({
       ownerKey,
       resourceKind,
@@ -1532,6 +1598,9 @@ export function createStaticObjectStream({
         .map(task => task.ownerKey)
         .sort()),
       backlog: queue.length + activeCount,
+      pendingAdmissionCount: pendingAdmissionCount(),
+      admissionWindowCount: tasks.size,
+      admissionWindowCapacity: maximumConcurrentRequests,
       queueCapacity,
       readyCacheSize: ready.size,
       readyCacheCapacity: readyCapacity,
@@ -1592,6 +1661,9 @@ export function createStaticObjectStream({
       prefetchedOwnerCount: prefetchedOwnerKeys.length,
       readyPrefetchedOwnerCount,
       backlog: queue.length + activeCount,
+      pendingAdmissionCount: pendingAdmissionCount(),
+      admissionWindowCount: tasks.size,
+      admissionWindowCapacity: maximumConcurrentRequests,
       queueDepth: queue.length,
       inFlightCount: activeCount,
       readyPageCount: readyPageQueue.size,
@@ -1622,6 +1694,9 @@ export function createStaticObjectStream({
     latestRequestedOwnerKeys = new Set();
     latestRequiredOwnerKeys = new Set();
     latestAllOwnerKeys = new Set();
+    pendingAdmissionOwnerKeys = Object.freeze([]);
+    pendingAdmissionIndex = 0;
+    pendingAdmissionCoverageGeneration = 0;
     latestApplyDiff = Object.freeze({
       enteringOwnerCount: 0,
       leavingOwnerCount: 0,
@@ -1666,6 +1741,8 @@ export function createStaticObjectStream({
     // itself must never hold application shutdown open on external work.
     void Promise.allSettled(pendingPromises);
     queue.length = 0;
+    pendingAdmissionOwnerKeys = Object.freeze([]);
+    pendingAdmissionIndex = 0;
     tasks.clear();
     taskKeysByOwner.clear();
     ready.clear();

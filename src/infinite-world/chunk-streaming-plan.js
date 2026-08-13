@@ -25,9 +25,10 @@ const currentVegetationVisibility = resolveW8VegetationVisibilityContract(
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
 );
 
-// Remote Settlement metadata remains a sparse presentation query in Phase A.
-// The dense Resident World is sized from every continuous 360-degree visual
-// surface: Terrain, fog, general objects, and canonical Natural.
+// Resource coverage is a cache/data-availability bound only. It must never be
+// interpreted as evidence that an owner has a visible GPU-backed drawable;
+// that is tracked by the separate Visual Continuity lifecycle.
+// Remote Settlement metadata remains a sparse Presentation Resource query.
 export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS = Math.max(
   currentRenderDistance.terrainRiverExtentMeters,
   currentRenderDistance.fogFarMeters,
@@ -84,6 +85,7 @@ function createNamedResidentView(name, radiusMeters, ownerCoordinates) {
   return Object.freeze({
     schemaVersion: 'resident-world-coverage-view-1',
     name,
+    contract: 'resource-resident-not-drawable',
     radiusMeters,
     ownerCoordinates: coordinates,
     ownerKeys: Object.freeze(coordinates.map(coordinate => coordinate.key)),
@@ -126,6 +128,7 @@ export function createResidentWorldCoverage({
   );
   return Object.freeze({
     schemaVersion: 'resident-world-coverage-1',
+    contract: 'resource-resident-not-drawable',
     centerChunkX,
     centerChunkZ,
     centerOwnerKey: createChunkKey(centerChunkX, centerChunkZ),

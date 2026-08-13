@@ -14,6 +14,8 @@ import {
   normalizeWorldGenerationRequestEnvelope,
 } from './world-generation-scheduler.js';
 
+const WORKER_SCHEDULER_CLOCK_SCHEMA = 'worker-scheduler-clock-1';
+
 function clock() {
   return globalThis.performance?.now?.() ?? Date.now();
 }
@@ -21,6 +23,27 @@ function clock() {
 function clockOrigin() {
   const value = globalThis.performance?.timeOrigin;
   return Number.isFinite(value) ? value : Date.now() - clock();
+}
+
+function rebaseSchedulerEnvelope(envelope, schedulerClock, receivedAtMs) {
+  if (schedulerClock?.schemaVersion !== WORKER_SCHEDULER_CLOCK_SCHEMA
+    || !Number.isFinite(schedulerClock.sentAtMs)
+    || !Number.isFinite(receivedAtMs)) return envelope;
+  const offsetMs = receivedAtMs - schedulerClock.sentAtMs;
+  const translatedTime = value => {
+    if (value === null) return null;
+    const translated = value + offsetMs;
+    // World-generation timestamps are non-negative by contract. An old
+    // request can predate a very young Worker clock; zero preserves its
+    // already-aged/already-missed status without comparing clock origins.
+    return Math.max(0, translated);
+  };
+  return normalizeWorldGenerationRequestEnvelope({
+    ...envelope,
+    createdAtMs: translatedTime(envelope.createdAtMs),
+    deadlineAtMs: translatedTime(envelope.deadlineAtMs),
+    firstVisibleDeadlineMs: translatedTime(envelope.firstVisibleDeadlineMs),
+  });
 }
 
 function pipelineTiming(
@@ -75,9 +98,10 @@ export function createChunkGeneratorWorkerCore({
   let isShutdown = false;
   let roadTimingRecorder = null;
   const forestHorizonCancelledBeforeEpoch = new Map();
+  const schedulerClock = schedulerOptions?.clock ?? clock;
   const scheduler = createWorldGenerationScheduler({
-    clock,
     ...(schedulerOptions ?? {}),
+    clock: schedulerClock,
   });
 
   const schedulerDefaults = request => {
@@ -87,7 +111,7 @@ export function createChunkGeneratorWorkerCore({
         operationKind: 'chunk',
         priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
         required: true,
-        createdAtMs: clock(),
+        createdAtMs: schedulerClock(),
         consumerId: 'chunk-data-service',
       };
     }
@@ -97,7 +121,7 @@ export function createChunkGeneratorWorkerCore({
         operationKind: 'forest-horizon',
         priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
         required: false,
-        createdAtMs: clock(),
+        createdAtMs: schedulerClock(),
         consumerId: request.consumerId,
         epoch: request.epoch,
         target: 'tree',
@@ -110,7 +134,7 @@ export function createChunkGeneratorWorkerCore({
         operationKind: 'presentation-owner',
         priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
         required: true,
-        createdAtMs: clock(),
+        createdAtMs: schedulerClock(),
         consumerId: 'presentation-owner-service',
         target: 'distant',
         stream: 'distant',
@@ -122,7 +146,7 @@ export function createChunkGeneratorWorkerCore({
         operationKind: 'settlement-query',
         priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
         required: true,
-        createdAtMs: clock(),
+        createdAtMs: schedulerClock(),
         consumerId: 'settlement-query',
         target: 'settlement',
         stream: 'distant',
@@ -134,7 +158,7 @@ export function createChunkGeneratorWorkerCore({
         operationKind: 'settlement-template',
         priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
         required: true,
-        createdAtMs: clock(),
+        createdAtMs: schedulerClock(),
         consumerId: 'settlement-template',
         target: 'building',
         stream: 'distant',
@@ -145,23 +169,30 @@ export function createChunkGeneratorWorkerCore({
       operationKind: 'diagnostics',
       priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
       required: false,
-      createdAtMs: clock(),
+      createdAtMs: schedulerClock(),
       consumerId: 'diagnostics',
     };
   };
 
-  const schedulerResponse = (execution, requestReceivedAtMs = null) => Object.freeze({
+  const schedulerResponse = (
+    execution,
+    requestReceivedAtMs = null,
+    schedulerReceivedAtMs = requestReceivedAtMs,
+    sourceScheduler = null,
+  ) => Object.freeze({
     schemaVersion: execution.envelope.schemaVersion,
     operationKind: execution.envelope.operationKind,
     priority: execution.envelope.priority,
     effectivePriority: execution.effectivePriority,
     required: execution.envelope.required,
-    deadlineAtMs: execution.envelope.deadlineAtMs,
+    // Keep the public response in the source protocol domain. Only the
+    // Worker's private scheduling envelope is translated.
+    deadlineAtMs: sourceScheduler?.deadlineAtMs ?? execution.envelope.deadlineAtMs,
     startedAtMs: execution.startedAtMs,
     queueTimeMs: execution.queueTimeMs,
     workerReceivedAtMs: requestReceivedAtMs,
-    workerQueueResidentMs: Number.isFinite(requestReceivedAtMs)
-      ? Math.max(0, execution.startedAtMs - requestReceivedAtMs) : null,
+    workerQueueResidentMs: Number.isFinite(schedulerReceivedAtMs)
+      ? Math.max(0, execution.startedAtMs - schedulerReceivedAtMs) : null,
     priorityAgingSteps: execution.priorityAgingSteps,
     deadlineMiss: execution.deadlineMiss,
     backlogAtStart: execution.backlogAtStart,
@@ -185,6 +216,7 @@ export function createChunkGeneratorWorkerCore({
     response,
     execution,
     requestReceivedAtMs,
+    schedulerReceivedAtMs,
     generationStartedAtMs,
     generationCompletedAtMs,
     stageRecorder,
@@ -224,11 +256,21 @@ export function createChunkGeneratorWorkerCore({
       stageTiming: stageRecorder?.snapshot() ?? null,
       roadTiming: roadTimingContext?.completedRun ?? null,
       roadTimingSummary: roadTimingContext?.recorder?.snapshot() ?? null,
-      scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
+      scheduler: execution ? schedulerResponse(
+        execution,
+        requestReceivedAtMs,
+        schedulerReceivedAtMs,
+        request.scheduler,
+      ) : null,
     });
   };
 
-  const processMessage = async (request, execution = null, requestReceivedAtMs = null) => {
+  const processMessage = async (
+    request,
+    execution = null,
+    requestReceivedAtMs = null,
+    schedulerReceivedAtMs = requestReceivedAtMs,
+  ) => {
     if (isShutdown) return;
     try {
       if (request?.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) {
@@ -272,6 +314,7 @@ export function createChunkGeneratorWorkerCore({
           request,
           execution,
           requestReceivedAtMs,
+          schedulerReceivedAtMs,
           generationStartedAtMs: startedAt,
           generationCompletedAtMs: completedAt,
           stageRecorder,
@@ -286,7 +329,12 @@ export function createChunkGeneratorWorkerCore({
           contentHash: chunkData.contentHash,
           chunkData,
           generationMs: Math.max(0, completedAt - startedAt),
-          scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
           },
         });
         return;
@@ -320,6 +368,7 @@ export function createChunkGeneratorWorkerCore({
           request,
           execution,
           requestReceivedAtMs,
+          schedulerReceivedAtMs,
           generationStartedAtMs: startedAt,
           generationCompletedAtMs: completedAt,
           stageRecorder,
@@ -334,7 +383,12 @@ export function createChunkGeneratorWorkerCore({
           contentHash: manifest.contentHash,
           manifest,
           generationMs: Math.max(0, completedAt - startedAt),
-          scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
           },
         });
         return;
@@ -354,6 +408,7 @@ export function createChunkGeneratorWorkerCore({
           request,
           execution,
           requestReceivedAtMs,
+          schedulerReceivedAtMs,
           generationStartedAtMs: startedAt,
           generationCompletedAtMs: completedAt,
           stageRecorder: null,
@@ -368,7 +423,12 @@ export function createChunkGeneratorWorkerCore({
             contentHash: presentationOwner.contentHash,
             presentationOwner,
             generationMs: Math.max(0, completedAt - startedAt),
-            scheduler: execution ? schedulerResponse(execution, requestReceivedAtMs) : null,
+            scheduler: execution ? schedulerResponse(
+              execution,
+              requestReceivedAtMs,
+              schedulerReceivedAtMs,
+              request.scheduler,
+            ) : null,
           },
         });
         return;
@@ -389,7 +449,12 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           settlements,
           operationMs: Math.max(0, completedAt - startedAt),
-          scheduler: execution ? schedulerResponse(execution) : null,
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
           ...pipelineTiming(request, startedAt, completedAt),
         });
         return;
@@ -411,7 +476,12 @@ export function createChunkGeneratorWorkerCore({
           serviceGeneration,
           template,
           operationMs: Math.max(0, completedAt - startedAt),
-          scheduler: execution ? schedulerResponse(execution) : null,
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
           ...pipelineTiming(request, startedAt, completedAt),
         });
         return;
@@ -429,7 +499,12 @@ export function createChunkGeneratorWorkerCore({
           generatorSnapshot,
           workerSchedulerSnapshot: scheduler.snapshot(),
           operationMs: Math.max(0, completedAt - startedAt),
-          scheduler: execution ? schedulerResponse(execution) : null,
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
           ...pipelineTiming(request, startedAt, completedAt),
         });
         return;
@@ -444,6 +519,7 @@ export function createChunkGeneratorWorkerCore({
   return Object.freeze({
     receive(request) {
       const requestReceivedAtMs = clock();
+      const schedulerReceivedAtMs = Number(schedulerClock());
       if (request?.type === CHUNK_GENERATOR_MESSAGE.CANCEL_GENERATION
         && request.protocolVersion === CHUNK_GENERATOR_PROTOCOL_VERSION
         && request.serviceGeneration === serviceGeneration) {
@@ -469,18 +545,28 @@ export function createChunkGeneratorWorkerCore({
         return Promise.resolve();
       }
       if (request?.type === CHUNK_GENERATOR_MESSAGE.INITIALIZE) {
-        return processMessage(request, null, requestReceivedAtMs);
+        return processMessage(request, null, requestReceivedAtMs, schedulerReceivedAtMs);
       }
       if (!request || request.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) {
-        return processMessage(request, null, requestReceivedAtMs);
+        return processMessage(request, null, requestReceivedAtMs, schedulerReceivedAtMs);
       }
-      const envelope = normalizeWorldGenerationRequestEnvelope(
+      const sourceEnvelope = normalizeWorldGenerationRequestEnvelope(
         request.scheduler,
         schedulerDefaults(request),
       );
+      const envelope = rebaseSchedulerEnvelope(
+        sourceEnvelope,
+        request.schedulerClock,
+        schedulerReceivedAtMs,
+      );
       const handle = scheduler.schedule({
         envelope,
-        execute: execution => processMessage(request, execution, requestReceivedAtMs),
+        execute: execution => processMessage(
+          request,
+          execution,
+          requestReceivedAtMs,
+          schedulerReceivedAtMs,
+        ),
       });
       return handle.promise.then(() => undefined);
     },

@@ -168,6 +168,8 @@ function createProductionNaturalBenchmarkRuntime() {
         afterStream.counts,
         'readyPageQueueCalls',
       ),
+      admissionWindowCount: afterStream.admissionWindowCount,
+      pendingAdmissionCount: afterStream.pendingAdmissionCount,
       ...afterStream.latestApplyDiff,
       normalizedOwnerCount: naturalPolicyPlans.reduce(
         (sum, policy) => sum + policy.allOwnerKeys.length,
@@ -561,8 +563,10 @@ test('production Natural coverage processes only the steady-state owner delta in
           });
           assert.equal(measured.classifiedOwnerCount, measured.enteringOwnerCount);
           assert.equal(measured.sortTargetOwnerCount, measured.queueCandidateCount);
-          assert.equal(measured.enqueueCalls, measured.queueCandidateCount);
-          assert.ok(measured.queueInsertionCount <= measured.queueCandidateCount);
+          assert.ok(measured.enqueueCalls <= 4);
+          assert.ok(measured.queueInsertionCount <= 4);
+          assert.ok(measured.admissionWindowCount <= 4);
+          assert.ok(measured.pendingAdmissionCount <= measured.queueCandidateCount);
           assert.ok(measured.parseCalls < 512, JSON.stringify({ stageId, sprint, path, measured }));
           assert.ok(measured.parseSameFrameDuplicates < 256);
           assert.equal(measured.duplicateQueuedTaskCount, 0);

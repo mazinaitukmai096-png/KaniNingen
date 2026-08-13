@@ -1795,6 +1795,13 @@ export class ChunkRuntimeManager {
     this.chunkDataService.cancelConsumer({ consumerId: plan.consumerId, epoch: plan.epoch });
     for (const [key, projected] of plan.projectedByKey) {
       plan.projectedByKey.delete(key);
+      // A rapid successor can make a formerly staged projection part of the
+      // live render set before this older plan reaches its cleanup turn. Once
+      // load has begun, ownership belongs to the render adapter/runtime and
+      // the plan must only release its reference; normal unload/shutdown owns
+      // disposal. Calling discardProjected here would attempt to destroy a
+      // drawable that is already attached.
+      if (projected?.lifecycle === 'loading' || projected?.lifecycle === 'loaded') continue;
       await this.renderAdapter.discardProjected?.(projected);
       if (this.terrainReadyDesiredRenderKeys.has(key) && !this.#isTerrainRenderReady(key)) {
         this.terrainReadyReadyKeys.delete(key);

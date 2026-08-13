@@ -6,6 +6,7 @@ import { resolveW8RockCanonicalObject } from '../src/infinite-world/rock-canonic
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
 import { hashWorldSeed } from '../src/infinite-world/legacy-core/g0/seed.js';
+import { createRenderFrameAcknowledger } from '../src/infinite-world/visual-continuity.js';
 
 class Triple {
   constructor() { this.set(0, 0, 0); }
@@ -18,7 +19,12 @@ class NodeObject {
     this.rotation = new Triple();
     this.scale = new Triple().set(1, 1, 1);
     this.userData = {};
-    this.matrix = {};
+    this.matrix = { elements: new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    ]) };
   }
   add(child) { this.children.push(child); child.parent = this; }
   remove(child) { this.children = this.children.filter(value => value !== child); child.parent = null; }
@@ -28,6 +34,12 @@ class NodeObject {
       position: { x: this.position.x, y: this.position.y, z: this.position.z },
       rotation: { x: this.rotation.x, y: this.rotation.y, z: this.rotation.z },
       scale: { x: this.scale.x, y: this.scale.y, z: this.scale.z },
+      elements: new Float32Array([
+        this.scale.x, 0, 0, 0,
+        0, this.scale.y, 0, 0,
+        0, 0, this.scale.z, 0,
+        this.position.x, this.position.y, this.position.z, 1,
+      ]),
     };
   }
 }
@@ -53,9 +65,13 @@ class Mesh extends NodeObject { constructor(geometry, material) { super(); this.
 class InstancedMesh extends Mesh {
   constructor(geometry, material, capacity) {
     super(geometry, material); this.capacity = capacity; this.count = capacity;
-    this.instanceMatrix = { needsUpdate: false }; this.matrices = [];
+    this.instanceMatrix = { needsUpdate: false, array: new Float32Array(capacity * 16) };
+    this.matrices = [];
   }
-  setMatrixAt(index, matrix) { this.matrices[index] = structuredClone(matrix); }
+  setMatrixAt(index, matrix) {
+    this.matrices[index] = structuredClone(matrix);
+    this.instanceMatrix.array.set(matrix.elements, index * 16);
+  }
 }
 class LineSegments extends Mesh {}
 class Object3D extends NodeObject {}
@@ -117,6 +133,23 @@ test('render adapter shares geometry/materials, releases chunk objects, and disp
   assert.equal(scene.children.includes(adapter.worldRoot), false);
   assert.ok(Object.values(adapter.geometries).every(geometry => geometry.disposed));
   assert.ok(Object.values(adapter.materials).every(material => material.disposed));
+  await adapter.shutdown();
+});
+
+test('a staged duplicate can be discarded while another projection for the owner is live', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'renderer-staged-duplicate' });
+  const data = await generator.generateChunk(0, 0);
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const live = await adapter.projectChunk(data);
+  const duplicate = await adapter.projectChunk(data);
+
+  await adapter.loadProjected(live);
+  assert.equal(await adapter.discardProjected(duplicate), true);
+  assert.equal(live.lifecycle, 'loaded');
+  assert.equal(duplicate.lifecycle, 'discarded');
+  assert.deepEqual(adapter.renderCoverageSnapshot().loadedKeys, ['0,0']);
+
+  await adapter.unloadChunk('0,0');
   await adapter.shutdown();
 });
 
@@ -381,7 +414,8 @@ test('Camera collision ignores LOS obstruction and only pushes a camera penetrat
 });
 
 test('Settlement projection preserves finite layer order and renders ribbon, entrance, and forecourt surfaces', async () => {
-  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const scene = new Scene();
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene });
   const roads = [
     {
       stableId: 'road-a', featureType: 'settlement-road', widthMeters: 2,
@@ -440,7 +474,9 @@ test('Settlement projection preserves finite layer order and renders ribbon, ent
   assert.equal(lotMesh.matrices[0].scale.x, 0.9 * adapter.unitsPerMeter);
   assert.equal(lotMesh.matrices[1].scale.x, 2.25 * adapter.unitsPerMeter);
   await adapter.loadProjected(projected);
-  adapter.markFirstDraw();
+  const frameAcknowledger = createRenderFrameAcknowledger({ clock: () => 1 });
+  const frameToken = frameAcknowledger.beginFrame({ frameSequence: 1 });
+  adapter.markFirstDraw(frameAcknowledger.completeFrame(frameToken, { scene }));
   const pathAudit = adapter.treePathAuditSnapshot();
   assert.equal(pathAudit.pathId, 'near-tree');
   assert.deepEqual(pathAudit.rootNames, ['w1a-render-root']);

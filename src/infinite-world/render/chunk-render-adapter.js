@@ -32,6 +32,10 @@ import {
   buildSettlementRoadRibbonMeshData,
   createRoadRibbonHeightSampler,
 } from './settlement-road-ribbon-geometry.js';
+import {
+  hasDrawableInCompletedFrame,
+  isCompletedRenderFrameReceipt,
+} from '../visual-continuity.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 
@@ -1450,24 +1454,29 @@ export class ChunkRenderAdapter {
     this.pendingFirstDrawByChunk.set(key, pending);
   }
 
-  markFirstDraw() {
+  markFirstDraw(receipt) {
+    if (!isCompletedRenderFrameReceipt(receipt)) return 0;
     if (this.treePathAudit.firstDrawAtMs === null && [...this.loaded.values()].some(projected => (
-      projected.group.children?.some(child => (
-        child.userData?.treePathId === 'near-tree'
-          && child.visible !== false && child.userData.treeStableIds?.length > 0
-      ))
+      hasDrawableInCompletedFrame({
+        root: projected.group,
+        receipt,
+        predicate: object => object.userData?.treePathId === 'near-tree'
+          && object.userData.treeStableIds?.length > 0,
+      })
     ))) {
-      this.treePathAudit.firstDrawAtMs = globalThis.performance?.now?.() ?? Date.now();
+      this.treePathAudit.firstDrawAtMs = receipt.completedAtMs;
     }
     if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
     let recorded = 0;
-    for (const pending of this.pendingFirstDrawByChunk.values()) {
+    for (const [key, pending] of this.pendingFirstDrawByChunk) {
+      const projected = this.loaded.get(key);
+      if (!projected || !hasDrawableInCompletedFrame({ root: projected.group, receipt })) continue;
       for (const details of pending) {
         this.telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
         recorded += 1;
       }
+      this.pendingFirstDrawByChunk.delete(key);
     }
-    this.pendingFirstDrawByChunk.clear();
     return recorded;
   }
 
@@ -1551,7 +1560,11 @@ export class ChunkRenderAdapter {
 
   async discardProjected(projected) {
     if (!projected?.group) return false;
-    if (this.loaded.has(projected.key) || ['loading', 'loaded'].includes(projected.lifecycle)) {
+    // A superseded plan may own a staged duplicate for an owner that another
+    // plan has already published. Reject only the exact live projection;
+    // blocking by owner key would leak the safely-discardable staged copy.
+    if (this.loaded.get(projected.key) === projected
+      || ['loading', 'loaded'].includes(projected.lifecycle)) {
       throw new Error(`cannot discard loaded chunk: ${projected.key}`);
     }
     if (projected.lifecycle === 'discarded' || projected.lifecycle === 'unloaded') return false;

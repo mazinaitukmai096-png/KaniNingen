@@ -13,6 +13,7 @@ import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import { MetricSeries } from './runtime-timing.js';
 
 const TRANSPORT_TIMING_SAMPLE_CAPACITY = 4096;
+const WORKER_SCHEDULER_CLOCK_SCHEMA = 'worker-scheduler-clock-1';
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -516,7 +517,18 @@ export function createWorkerChunkGeneratorTransport({
     });
     try {
       const postStartedAtMs = clock();
-      target.postMessage(request);
+      // Scheduler envelopes are authored in the caller's clock domain. A
+      // Worker owns a different performance.now() origin, so carry a boundary
+      // sample that lets the Worker translate the whole envelope by one
+      // offset before it performs deadline or aging comparisons.
+      const wireRequest = request.scheduler ? {
+        ...request,
+        schedulerClock: Object.freeze({
+          schemaVersion: WORKER_SCHEDULER_CLOCK_SCHEMA,
+          sentAtMs: sentAt,
+        }),
+      } : request;
+      target.postMessage(wireRequest);
       emitPipelineEvent('worker-message-sent', {
         ownerKey: Number.isSafeInteger(request.chunkX) && Number.isSafeInteger(request.chunkZ)
           ? `${request.chunkX},${request.chunkZ}` : null,

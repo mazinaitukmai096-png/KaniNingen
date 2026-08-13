@@ -20,6 +20,10 @@ import {
   WORLD_STREAMING_STREAM,
   WORLD_STREAMING_TARGET,
 } from '../world-streaming-telemetry.js';
+import {
+  hasDrawableInCompletedFrame,
+  isCompletedRenderFrameReceipt,
+} from '../visual-continuity.js';
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -1355,13 +1359,17 @@ export class GameplayRenderAdapter {
     }
   }
 
-  markFirstDraw() {
+  markFirstDraw(receipt) {
+    if (!isCompletedRenderFrameReceipt(receipt)) return 0;
     if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
-    for (const details of this.pendingFirstDrawByChunk.values()) {
+    let recorded = 0;
+    for (const [key, details] of this.pendingFirstDrawByChunk) {
+      const entry = this.loaded.get(key);
+      if (!entry || !hasDrawableInCompletedFrame({ root: entry.group, receipt })) continue;
       this.telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
+      this.pendingFirstDrawByChunk.delete(key);
+      recorded += 1;
     }
-    const recorded = this.pendingFirstDrawByChunk.size;
-    this.pendingFirstDrawByChunk.clear();
     return recorded;
   }
 

@@ -26,26 +26,55 @@ function envelope(requestId, {
   createdAtMs = 0,
   deadlineAtMs = null,
   operationKind = 'test',
+  priorityClass = null,
+  ownerKey = null,
+  resourceKind = null,
+  representationClass = null,
+  sequence = null,
+  subscriberIdentity = null,
 } = {}) {
   return createWorldGenerationRequestEnvelope({
     requestId,
     operationKind,
     priority,
+    priorityClass,
     required,
     createdAtMs,
     deadlineAtMs,
+    firstVisibleDeadlineMs: deadlineAtMs,
+    ownerKey,
+    resourceKind,
+    representationClass,
+    sequence,
+    subscriberIdentity,
     consumerId: 'phase-4-test',
     epoch: 1,
   });
 }
 
-test('unified request envelope is immutable and rejects invalid scheduler policy', () => {
-  const value = envelope(1, { priority: 2, deadlineAtMs: 100 });
+test('unified request envelope is immutable and carries global owner ordering identity', () => {
+  const value = envelope(1, {
+    priority: 2,
+    priorityClass: 1,
+    deadlineAtMs: 100,
+    ownerKey: '3,-4',
+    resourceKind: 'full',
+    representationClass: 'detail',
+    sequence: 9,
+    subscriberIdentity: 'runtime:7',
+  });
   assert.equal(value.schemaVersion, WORLD_GENERATION_REQUEST_SCHEMA);
   assert.equal(value.operationKind, 'test');
   assert.equal(value.priority, 2);
   assert.equal(value.required, true);
   assert.equal(value.deadlineAtMs, 100);
+  assert.equal(value.firstVisibleDeadlineMs, 100);
+  assert.equal(value.ownerKey, '3,-4');
+  assert.equal(value.resourceKind, 'full');
+  assert.equal(value.representationClass, 'detail');
+  assert.equal(value.priorityClass, 1);
+  assert.equal(value.sequence, 9);
+  assert.equal(value.subscriberIdentity, 'runtime:7');
   assert.equal(Object.isFrozen(value), true);
   assert.throws(() => envelope(2, { priority: 0 }), /priority/);
   assert.throws(() => envelope(3, { deadlineAtMs: -1 }), /deadlineAtMs/);
@@ -94,6 +123,48 @@ test('priority aging lets an older warm request run before a continuous new requ
   const snapshot = scheduler.snapshot();
   assert.ok(snapshot.counts.agedStarts >= 1);
   assert.ok(snapshot.counts.agingSteps >= 5);
+  await scheduler.shutdown();
+});
+
+test('global semantic classes prevent aged prefetch from crossing Terrain safety', async () => {
+  let now = 0;
+  const gate = deferred();
+  const order = [];
+  const scheduler = createWorldGenerationScheduler({ clock: () => now, agingIntervalMs: 10 });
+  const blocker = scheduler.schedule({
+    envelope: envelope(1, { priority: 1 }),
+    execute: () => gate.promise,
+  });
+  await drain();
+  const prefetch = scheduler.schedule({
+    envelope: envelope(2, {
+      priority: 5,
+      priorityClass: 5,
+      required: false,
+      createdAtMs: 0,
+      ownerKey: '9,9',
+      resourceKind: 'presentation',
+      representationClass: 'coarse',
+      sequence: 2,
+    }),
+    execute: async () => { order.push('prefetch'); },
+  });
+  now = 1_000;
+  const terrain = scheduler.schedule({
+    envelope: envelope(3, {
+      priority: 2,
+      priorityClass: 1,
+      createdAtMs: now,
+      ownerKey: '0,0',
+      resourceKind: 'full',
+      representationClass: 'detail',
+      sequence: 3,
+    }),
+    execute: async () => { order.push('terrain'); },
+  });
+  gate.resolve();
+  await Promise.all([blocker.promise, prefetch.promise, terrain.promise]);
+  assert.deepEqual(order, ['terrain', 'prefetch']);
   await scheduler.shutdown();
 });
 

@@ -82,6 +82,8 @@ test('velocity corridor creates a generic ahead ready-set without changing requi
   const movingPolicy = policyPlan(moving);
 
   assert.deepEqual(movingPolicy.requiredOwnerKeys, stationaryPolicy.requiredOwnerKeys);
+  assert.equal(stationaryPolicy.prefetchedOwnerKeys.length, 0,
+    'zero velocity must not turn a degenerate corridor into square prefetch coverage');
   assert.ok(movingPolicy.prefetchedOwnerKeys.length > stationaryPolicy.prefetchedOwnerKeys.length);
   assert.ok(movingPolicy.prefetchedOwnerKeys.some(key => Number(key.split(',')[0]) > 0));
   assert.ok(movingPolicy.retainedOwnerKeys.every(key => movingPolicy.allOwnerKeys.includes(key)));
@@ -144,6 +146,9 @@ test('incremental apply classifies and sorts only entering policy-owner identiti
     assert.equal(diff.enteringOwnerCount + diff.unchangedOwnerCount,
       member.allOwnerKeys.length);
     assert.equal(diff.sortTargetOwnerCount, diff.queueCandidateCount);
+    assert.ok(diff.queueInsertionCount <= 4,
+      `${scenario.name} materialized more than the request window`);
+    assert.ok(stream.snapshot().admissionWindowCount <= 4);
     assert.equal(new Set(actual.keys()).size, actual.size);
     reports.push({ name: scenario.name, ...diff });
     await new Promise(resolve => setImmediate(resolve));
@@ -557,7 +562,13 @@ test('late in-flight completion outside stable coverage is cached but not publis
 
   const returned = planner({ player: { x: 0, z: 0 }, stateRevision: 2 });
   stream.applyPlan({ plan: returned, policyPlan: policyPlan(returned) });
-  assert.equal(stream.snapshot().counts.readyHits > 0, true);
+  for (const ownerKey of stream.snapshot().inFlightOwnerKeys) {
+    pending.get(ownerKey)?.resolve(null);
+  }
+  await waitFor(
+    () => stream.snapshot().counts.readyHits > 0,
+    'the returned coverage cursor did not reuse the cached late completion',
+  );
   assert.equal(stream.drainReadyOwnerPages({ limit: 32 })
     .some(page => page.ownerKey === staleOwner), true);
   await stream.dispose();
@@ -682,7 +693,7 @@ test('one-sample stop and restart does not cancel reusable corridor work', async
   assert.equal(stream.snapshot().counts.stalePlanCancels, 0);
 });
 
-test('stable stopped coverage cancels stale corridor backlog without duplicate requeue', async t => {
+test('stable stopped coverage replaces the stale corridor cursor without duplicate work', async t => {
   const runtime = createPolicyRuntime({ horizon: false });
   const planner = createPlanner(runtime.policy);
   const pending = [];
@@ -726,9 +737,12 @@ test('stable stopped coverage cancels stale corridor backlog without duplicate r
 
   assert.equal(new Set(stoppedAgainSnapshot.queuedOwnerKeys).size,
     stoppedAgainSnapshot.queuedOwnerKeys.length);
-  assert.equal(stoppedAgainSnapshot.counts.cancelled > 0, true);
-  assert.equal(stoppedAgainSnapshot.counts.stalePlanCancels > 0, true);
-  assert.equal(stoppedAgainSnapshot.counts.stableCoverageCancels > 0, true);
+  assert.equal(stoppedAgainSnapshot.counts.cancelled, 0,
+    'never-materialized corridor work requires no cancellation');
+  assert.equal(stoppedAgainSnapshot.counts.admissionCursorReplacements, 2);
+  assert.ok(stoppedAgainSnapshot.admissionWindowCount <= 1);
+  assert.ok(stoppedAgainSnapshot.pendingAdmissionCount
+    <= policyPlan(stopped).requestOwnerKeys.length);
   assert.equal(staleQueuedOwnerKeys.length, 0);
   assert.equal(stoppedAgainSnapshot.planRevision, 3);
   assert.equal(stoppedAgainSnapshot.coverageGeneration, 2);
@@ -963,7 +977,7 @@ test('ready owner reuse does not allocate or enqueue the same publication page t
   await stream.dispose();
 });
 
-test('ready, queue, ticket, and Worker bounds are explicit and enforced', () => {
+test('ready, ticket, Worker, and lazy admission bounds are explicit and enforced', () => {
   const runtime = createPolicyRuntime({ horizon: false });
   const plan = createPlanner(runtime.policy)({ velocity: { x: 32, z: 0 } });
   const stream = createStaticObjectStream({
@@ -976,20 +990,59 @@ test('ready, queue, ticket, and Worker bounds are explicit and enforced', () => 
     requestOwner: () => new Promise(() => {}),
   });
 
-  assert.throws(
-    () => stream.applyPlan({ plan, policyPlan: policyPlan(plan) }),
-    /queue capacity exceeded/,
-  );
+  assert.equal(stream.applyPlan({ plan, policyPlan: policyPlan(plan) }), true);
   const snapshot = stream.snapshot();
   assert.equal(snapshot.workerCount, 1);
   assert.equal(snapshot.queueCapacity, 2);
   assert.equal(snapshot.readyCacheCapacity, 2);
   assert.equal(snapshot.ticketCapacity, 2);
-  assert.equal(snapshot.counts.queueOverflows, 1);
-  assert.equal(snapshot.backlog, 0);
-  assert.equal(snapshot.ticketCount, 0);
-  assert.equal(snapshot.coverageGeneration, 0,
-    'capacity failure must not publish a partial coverage generation');
+  assert.equal(snapshot.counts.queueOverflows, 0);
+  assert.equal(snapshot.backlog, 1);
+  assert.equal(snapshot.admissionWindowCount, 1);
+  assert.equal(snapshot.admissionWindowCapacity, 1);
+  assert.ok(snapshot.pendingAdmissionCount > 0);
+  assert.equal(snapshot.ticketCount, 1);
+  assert.equal(snapshot.coverageGeneration, 1);
+});
+
+test('a direction change reclaims superseded queued owners before capacity admission', async () => {
+  const runtime = createPolicyRuntime();
+  const makePlan = createPlanner(runtime.policy);
+  const east = makePlan({ player: { x: 0, z: 0 }, velocity: { x: 32, z: 0 } });
+  const west = makePlan({ player: { x: 0, z: 0 }, velocity: { x: -32, z: 0 } });
+  const capacity = Math.max(
+    policyPlan(east).requestOwnerKeys.length,
+    policyPlan(west).requestOwnerKeys.length,
+  ) + 1;
+  const pending = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 1,
+    queueCapacity: capacity,
+    requestOwner: request => {
+      let resolve;
+      const promise = new Promise(nextResolve => { resolve = nextResolve; });
+      pending.push({ request, resolve });
+      return { promise, cancel: () => { resolve(null); return true; } };
+    },
+  });
+
+  assert.equal(stream.applyPlan({ plan: east, policyPlan: policyPlan(east) }), true);
+  const before = stream.snapshot();
+  assert.equal(before.inFlightCount, 1);
+  assert.equal(before.queuedCount, 0);
+  assert.ok(before.pendingAdmissionCount > 0);
+  assert.equal(stream.applyPlan({ plan: west, policyPlan: policyPlan(west) }), true,
+    'the replacement corridor must replace the lazy cursor without a capacity spike');
+  const after = stream.snapshot();
+  assert.equal(after.counts.queueOverflows, 0);
+  assert.ok(after.admissionWindowCount <= 1);
+  assert.ok(after.backlog <= 1);
+  assert.ok(after.pendingAdmissionCount <= policyPlan(west).requestOwnerKeys.length);
+
+  for (const operation of pending) operation.resolve(null);
+  await stream.dispose();
 });
 
 test('the shared Static Object Stream contains no Tree-specific scheduling branch', async () => {

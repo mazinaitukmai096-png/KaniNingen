@@ -3,9 +3,9 @@ import test from 'node:test';
 import { ChunkDataService } from '../src/infinite-world/chunk-data-service.js';
 import { CHUNK_DATA_PRIORITY } from '../src/infinite-world/chunk-data-service-protocol.js';
 import {
-  createWorldGenerationRequestEnvelope,
-  createWorldGenerationScheduler,
-} from '../src/infinite-world/world-generation-scheduler.js';
+  createOwnerGenerationCoordinator,
+  defaultOwnerGenerationPriorityClass,
+} from '../src/infinite-world/owner-generation-coordinator.js';
 
 function chunk(chunkX, chunkZ, revision = 'a') {
   return Object.freeze({
@@ -52,13 +52,12 @@ function resolvePending(transport, chunkX, chunkZ = 0, revision = 'a') {
   pending.resolve(chunk(chunkX, chunkZ, revision));
 }
 
-async function terrainDependencyCompetitionFixture(requiredLookaheadCapacity) {
+async function terrainDependencyCompetitionFixture() {
   let now = 100;
   let releaseBlocker;
   const blockerGate = new Promise(resolve => { releaseBlocker = resolve; });
   const workerTimeline = [];
   const ownerTimeline = new Map();
-  let externalRequestId = 1_000;
   let timelineSequence = 0;
   const recordOwner = (ownerKey, event) => {
     let timeline = ownerTimeline.get(ownerKey);
@@ -68,49 +67,43 @@ async function terrainDependencyCompetitionFixture(requiredLookaheadCapacity) {
     }
     timeline[event] = ++timelineSequence;
   };
-  const workerScheduler = createWorldGenerationScheduler({
+  const coordinator = createOwnerGenerationCoordinator({
     clock: () => now,
+    maximumConcurrentRequests: 1,
     agingIntervalMs: 100_000,
   });
   const transport = {
     async generateChunk(request) {
       const ownerKey = `${request.chunkX},${request.chunkZ}`;
-      const handle = workerScheduler.schedule({
-        envelope: request.scheduler,
-        execute: async () => {
-          workerTimeline.push(`terrain:${ownerKey}`);
-          recordOwner(ownerKey, 'started');
-          recordOwner(ownerKey, 'completed');
-          return chunk(request.chunkX, request.chunkZ);
-        },
-      });
-      const result = await handle.promise;
-      // Model the Worker -> main-thread task boundary: the Worker selects its
-      // next queued operation before ChunkDataService can feed another owner.
-      return new Promise(resolve => setImmediate(() => resolve(result.value)));
+      workerTimeline.push(`terrain:${ownerKey}`);
+      recordOwner(ownerKey, 'started');
+      await Promise.resolve();
+      recordOwner(ownerKey, 'completed');
+      return chunk(request.chunkX, request.chunkZ);
     },
-    snapshot: () => workerScheduler.snapshot(),
-    async shutdown() { await workerScheduler.shutdown(); },
+    snapshot: () => Object.freeze({ kind: 'single-worker-test' }),
+    async shutdown() {},
   };
-  const blocker = workerScheduler.schedule({
-    envelope: createWorldGenerationRequestEnvelope({
-      requestId: ++externalRequestId,
-      operationKind: 'forest-horizon',
-      priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
-      required: true,
-      createdAtMs: now,
-      deadlineAtMs: 0,
-      consumerId: 'existing-worker-operation',
-    }),
-    execute: async () => { await blockerGate; },
+  const blocker = coordinator.schedule({
+    ownerKey: 'blocker',
+    resourceKind: 'control',
+    operationKind: 'test-blocker',
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    priorityClass: 1,
+    required: true,
+    createdAtMs: now,
+    firstVisibleDeadlineMs: 0,
+    representationClass: 'detail',
+    subscriberIdentity: 'existing-worker-operation',
+    execute: () => blockerGate,
   });
-  await new Promise(resolve => setImmediate(resolve));
+  await nextDispatch();
 
   const service = new ChunkDataService({
     transport,
     clock: () => now,
     agingIntervalMs: 100_000,
-    requiredLookaheadCapacity,
+    coordinator,
     onPipelineEvent(type, details) {
       if (type === 'chunk-request-queued') recordOwner(details.ownerKey, 'queued');
     },
@@ -128,16 +121,16 @@ async function terrainDependencyCompetitionFixture(requiredLookaheadCapacity) {
   await new Promise(resolve => setImmediate(resolve));
   const supplyBeforeRelease = service.snapshot();
 
-  const natural = Array.from({ length: 20 }, (_, index) => workerScheduler.schedule({
-    envelope: createWorldGenerationRequestEnvelope({
-      requestId: ++externalRequestId,
-      operationKind: 'forest-horizon',
-      priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
-      required: true,
-      createdAtMs: now,
-      deadlineAtMs: 0,
-      consumerId: 'static-object-stream:natural-static',
-    }),
+  const natural = Array.from({ length: 20 }, (_, index) => coordinator.schedule({
+    ownerKey: `natural:${index}`,
+    resourceKind: 'presentation',
+    operationKind: 'presentation-owner',
+    priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+    priorityClass: 2,
+    required: true,
+    createdAtMs: now,
+    representationClass: 'coarse',
+    subscriberIdentity: `static-object-stream:natural-static:${index}`,
     execute: async () => { workerTimeline.push(`natural:${index}`); },
   }));
   releaseBlocker();
@@ -157,6 +150,7 @@ async function terrainDependencyCompetitionFixture(requiredLookaheadCapacity) {
     ownerTimeline: Object.freeze([...ownerTimeline.values()].map(value => Object.freeze({ ...value }))),
   });
   await service.shutdown();
+  await coordinator.shutdown();
   return result;
 }
 
@@ -182,12 +176,242 @@ test('ChunkDataService dispatches priority 1 through 5 and preserves FIFO within
   assert.deepEqual(values.map(value => value.chunkX), [5, 4, 3, 1, 2, 0]);
 });
 
-test('ChunkDataService keeps exactly one required lookahead queued without publishing out of order', async () => {
+test('one global owner queue orders Full and Presentation by deadline and semantic class', async () => {
+  let now = 100;
+  let releaseBlocker;
+  const blockerGate = new Promise(resolve => { releaseBlocker = resolve; });
+  const coordinator = createOwnerGenerationCoordinator({
+    clock: () => now,
+    maximumConcurrentRequests: 1,
+  });
+  const calls = [];
+  const pending = [];
+  const transportFor = resourceKind => ({
+    generateChunk(request) {
+      calls.push({ resourceKind, request });
+      return new Promise(resolve => pending.push({ resourceKind, request, resolve }));
+    },
+    async shutdown() {},
+  });
+  const full = new ChunkDataService({
+    transport: transportFor('full'),
+    coordinator,
+    resourceKind: 'full',
+  });
+  const presentation = new ChunkDataService({
+    transport: transportFor('presentation'),
+    coordinator,
+    resourceKind: 'presentation',
+    representationClass: 'coarse',
+    operationKind: 'presentation-owner',
+  });
+  const blocker = coordinator.schedule({
+    ownerKey: 'blocker',
+    resourceKind: 'control',
+    operationKind: 'test-blocker',
+    priority: 1,
+    priorityClass: 1,
+    required: true,
+    representationClass: 'detail',
+    execute: () => blockerGate,
+  });
+  await nextDispatch();
+
+  const handles = [
+    presentation.requestChunk({ chunkX: 5, chunkZ: 0, priority: 5, required: false, consumerId: 'prefetch' }),
+    full.requestChunk({ chunkX: 4, chunkZ: 0, priority: 4, required: true, consumerId: 'detail' }),
+    full.requestChunk({ chunkX: 3, chunkZ: 0, priority: 3, required: true, consumerId: 'gameplay' }),
+    presentation.requestChunk({ chunkX: 2, chunkZ: 0, priority: 4, required: true, consumerId: 'coarse' }),
+    full.requestChunk({
+      chunkX: 1,
+      chunkZ: 0,
+      priority: 5,
+      required: false,
+      deadlineAtMs: now,
+      consumerId: 'visual-deadline',
+    }),
+  ];
+  assert.equal(coordinator.snapshot().queuedCount, 5);
+  releaseBlocker();
+  await blocker.promise;
+
+  const expected = [
+    ['full', 1],
+    ['presentation', 2],
+    ['full', 3],
+    ['full', 4],
+    ['presentation', 5],
+  ];
+  for (const [resourceKind, chunkX] of expected) {
+    await nextDispatch();
+    const call = calls.at(-1);
+    assert.deepEqual([call.resourceKind, call.request.chunkX], [resourceKind, chunkX]);
+    const operation = pending.shift();
+    operation.resolve(chunk(operation.request.chunkX, operation.request.chunkZ));
+  }
+  await Promise.all(handles.map(handle => handle.promise));
+  assert.deepEqual(calls.map(call => [call.resourceKind, call.request.chunkX]), expected);
+  assert.deepEqual(calls.map(call => call.request.scheduler.sequence), [6, 5, 4, 3, 2]);
+  assert.deepEqual(calls.map(call => call.request.scheduler.resourceKind), expected.map(([kind]) => kind));
+  assert.equal(coordinator.snapshot().queuedCount, 0);
+  await presentation.shutdown();
+  await coordinator.shutdown();
+  await full.shutdown();
+});
+
+test('deadline-bound required Full coverage remains in the Terrain safety class', () => {
+  assert.equal(defaultOwnerGenerationPriorityClass({
+    resourceKind: 'full',
+    priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+    required: true,
+    firstVisibleDeadlineMs: 1_000,
+  }), 1);
+  assert.equal(defaultOwnerGenerationPriorityClass({
+    resourceKind: 'full',
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    required: false,
+    firstVisibleDeadlineMs: 1_000,
+  }), 5);
+});
+
+test('global owner queue coalesces one composite resource key but keeps Full and Presentation distinct', async () => {
+  const coordinator = createOwnerGenerationCoordinator({ maximumConcurrentRequests: 3 });
+  const executions = [];
+  const schedule = (resourceKind, subscriberIdentity) => coordinator.schedule({
+    ownerKey: '7,-2',
+    resourceKind,
+    priority: resourceKind === 'presentation' ? 4 : 3,
+    priorityClass: resourceKind === 'presentation' ? 2 : 3,
+    required: true,
+    representationClass: resourceKind === 'presentation' ? 'coarse' : 'detail',
+    subscriberIdentity,
+    execute: async () => {
+      executions.push(resourceKind);
+      return `${resourceKind}:value`;
+    },
+  });
+  const fullA = schedule('full', 'full-a');
+  const fullB = schedule('full', 'full-b');
+  const presentation = schedule('presentation', 'presentation-a');
+  assert.equal(fullA.requestId, fullB.requestId);
+  assert.notEqual(fullA.requestId, presentation.requestId);
+  assert.equal(fullA.cancel('subscriber-left'), true,
+    'one coalesced subscriber may leave without cancelling the owner operation');
+  assert.equal(await fullA.promise, null);
+  assert.equal(await fullB.promise, 'full:value');
+  assert.equal(await presentation.promise, 'presentation:value');
+  assert.deepEqual(executions.sort(), ['full', 'presentation']);
+  const snapshot = coordinator.snapshot();
+  assert.equal(snapshot.counts.scheduled, 2);
+  assert.equal(snapshot.counts.deduplicated, 1);
+  await coordinator.shutdown();
+});
+
+test('cancelled in-flight composite keys cannot erase or absorb their successor generation', async () => {
+  const coordinator = createOwnerGenerationCoordinator({ maximumConcurrentRequests: 2 });
+  let resolveOld;
+  let resolveSuccessor;
+  const executions = [];
+  const schedule = (name, execute) => coordinator.schedule({
+    ownerKey: '4,9',
+    resourceKind: 'presentation',
+    priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+    priorityClass: 2,
+    required: true,
+    representationClass: 'coarse',
+    subscriberIdentity: name,
+    execute,
+  });
+
+  const old = schedule('old', async () => {
+    executions.push('old');
+    return new Promise(resolve => { resolveOld = resolve; });
+  });
+  await nextDispatch();
+  assert.equal(old.state, 'in-flight');
+  assert.equal(old.cancel('superseded'), true);
+
+  const successor = schedule('successor', async () => {
+    executions.push('successor');
+    return new Promise(resolve => { resolveSuccessor = resolve; });
+  });
+  await nextDispatch();
+  assert.notEqual(successor.requestId, old.requestId);
+  assert.deepEqual(executions, ['old', 'successor']);
+
+  resolveOld('obsolete');
+  await nextDispatch();
+  const joined = schedule('joined', async () => {
+    executions.push('incorrect-third-generation');
+    return 'incorrect';
+  });
+  assert.equal(joined.requestId, successor.requestId,
+    'the old terminal token must not delete the live successor composite mapping');
+  resolveSuccessor('current');
+
+  assert.equal(await old.promise, null);
+  assert.equal(await successor.promise, 'current');
+  assert.equal(await joined.promise, 'current');
+  assert.deepEqual(executions, ['old', 'successor']);
+  await coordinator.shutdown();
+});
+
+test('ChunkDataService starts a successor instead of subscribing to a cancelled in-flight tombstone', async () => {
+  const transport = deferredTransport();
+  const service = new ChunkDataService({ transport });
+  const old = service.requestChunk({
+    chunkX: 4, chunkZ: 9, consumerId: 'old', epoch: 1,
+  });
+  await nextDispatch();
+  assert.equal(old.cancel(), true);
+  assert.equal(await old.promise, null);
+
+  const successor = service.requestChunk({
+    chunkX: 4, chunkZ: 9, consumerId: 'successor', epoch: 1,
+  });
+  await nextDispatch();
+  assert.equal(transport.calls.length, 1,
+    'the successor waits behind the cancelled transport operation in the serial queue');
+
+  const oldPendingIndex = transport.pending.findIndex(({ request }) => (
+    request.requestId === transport.calls[0].requestId
+  ));
+  const [oldPending] = transport.pending.splice(oldPendingIndex, 1);
+  oldPending.resolve(chunk(4, 9, 'obsolete'));
+  await nextDispatch();
+  assert.equal(transport.calls.length, 2);
+  assert.notEqual(transport.calls[0].requestId, transport.calls[1].requestId);
+  assert.equal(service.snapshot().pendingCount, 1,
+    'the obsolete terminal must not delete the successor service entry');
+  assert.equal(service.snapshot().completedCacheSize, 0);
+
+  const joined = service.requestChunk({
+    chunkX: 4, chunkZ: 9, consumerId: 'joined', epoch: 1,
+  });
+  await nextDispatch();
+  assert.equal(transport.calls.length, 2,
+    'a third subscriber must coalesce with the live successor');
+  const successorPendingIndex = transport.pending.findIndex(({ request }) => (
+    request.requestId === transport.calls[1].requestId
+  ));
+  const [successorPending] = transport.pending.splice(successorPendingIndex, 1);
+  const current = chunk(4, 9, 'current');
+  successorPending.resolve(current);
+
+  assert.equal(await successor.promise, current);
+  assert.equal(await joined.promise, current);
+  await nextDispatch();
+  assert.equal(service.snapshot().completedCacheSize, 1);
+  await service.shutdown();
+});
+
+test('ChunkDataService publishes fast B/C completions without waiting for slow A', async () => {
   const transport = deferredTransport();
   const readyOrder = [];
+  const coordinator = createOwnerGenerationCoordinator({ maximumConcurrentRequests: 4 });
   const service = new ChunkDataService({
     transport,
-    requiredLookaheadCapacity: 1,
+    coordinator,
     onPipelineEvent(type, details) {
       if (type === 'chunk-owner-ready') readyOrder.push(details.chunkX);
     },
@@ -206,57 +430,45 @@ test('ChunkDataService keeps exactly one required lookahead queued without publi
   });
 
   await nextDispatch();
-  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1]);
-  assert.equal(service.snapshot().inFlightCount, 2);
-  assert.equal(service.snapshot().inFlightKey, '0,0');
-  assert.equal(service.snapshot().requiredLookaheadKey, '1,0');
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1, 2, 3]);
+  assert.equal(service.snapshot().inFlightCount, 4);
 
   let secondDelivered = false;
   void second.promise.then(() => { secondDelivered = true; });
   resolvePending(transport, 1);
+  resolvePending(transport, 2);
+  resolvePending(transport, 3);
   await nextDispatch();
-  assert.equal(secondDelivered, false, 'lookahead completion must not publish before the active owner');
-  assert.equal(service.snapshot().completedCacheSize, 0);
+  assert.equal(secondDelivered, true, 'B must publish independently while A remains slow');
+  assert.deepEqual(readyOrder, [1, 2, 3]);
+  assert.equal(service.snapshot().completedCacheSize, 3);
+  assert.equal(service.snapshot().inFlightKey, '0,0');
 
   resolvePending(transport, 0);
   assert.equal((await first.promise).chunkX, 0);
   assert.equal((await second.promise).chunkX, 1);
-  await nextDispatch();
-  assert.deepEqual(readyOrder, [0, 1]);
-  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1, 2]);
-  assert.equal(service.snapshot().inFlightCount, 1,
-    'non-required work must not occupy the required lookahead slot');
-
-  resolvePending(transport, 2);
   assert.equal((await third.promise).chunkX, 2);
-  await nextDispatch();
-  assert.deepEqual(transport.calls.map(value => value.chunkX), [0, 1, 2, 3]);
-  resolvePending(transport, 3);
   assert.equal((await warm.promise).chunkX, 3);
   await nextDispatch();
 
   const snapshot = service.snapshot();
-  assert.deepEqual(readyOrder, [0, 1, 2, 3]);
+  assert.deepEqual(readyOrder, [1, 2, 3, 0]);
   assert.equal(new Set(transport.calls.map(value => value.requestId)).size, 4);
   assert.equal(snapshot.pendingCount, 0);
   assert.equal(snapshot.inFlightCount, 0);
   assert.equal(snapshot.counts.pendingDedupeHits, 0);
   assert.equal(snapshot.counts.staleSubscriberResults, 0);
+  await coordinator.shutdown();
 });
 
-test('ChunkDataService exposes the complete 25-owner Terrain dependency batch to the shared Worker priority queue', async () => {
-  const serialLookahead = await terrainDependencyCompetitionFixture(1);
-  assert.equal(serialLookahead.supplyBeforeRelease.scheduler.workerCount, 1);
-  assert.equal(serialLookahead.supplyBeforeRelease.inFlightCount, 2);
-  assert.equal(serialLookahead.supplyBeforeRelease.queuedCount, 23);
-  assert.equal(serialLookahead.naturalBeforeThirdTerrain, 20);
-
-  const batchLookahead = await terrainDependencyCompetitionFixture(25);
+test('ChunkDataService registers the complete 25-owner Terrain batch in the sole owner queue before Worker selection', async () => {
+  const batchLookahead = await terrainDependencyCompetitionFixture();
   assert.equal(batchLookahead.supplyBeforeRelease.scheduler.workerCount, 1,
     'the fix must not increase Worker concurrency');
-  assert.equal(batchLookahead.supplyBeforeRelease.inFlightCount, 25);
-  assert.equal(batchLookahead.supplyBeforeRelease.requiredLookaheadCount, 24);
-  assert.equal(batchLookahead.supplyBeforeRelease.queuedCount, 0);
+  assert.equal(batchLookahead.supplyBeforeRelease.inFlightCount, 0);
+  assert.equal(batchLookahead.supplyBeforeRelease.queuedCount, 25);
+  assert.equal(batchLookahead.supplyBeforeRelease.coordinator.inFlightCount, 1,
+    'only the control blocker may have crossed the transport boundary');
   assert.equal(batchLookahead.naturalBeforeThirdTerrain, 0);
   assert.equal(batchLookahead.terrainBeforeFirstNatural, 25);
   assert.equal(batchLookahead.ownerTimeline.length, 25);
@@ -266,9 +478,10 @@ test('ChunkDataService exposes the complete 25-owner Terrain dependency batch to
   }
 });
 
-test('ChunkDataService cancels a required lookahead without duplicate, stale, or orphan state', async () => {
+test('ChunkDataService cancels an admitted owner without duplicate, stale, or orphan state', async () => {
   const transport = deferredTransport();
-  const service = new ChunkDataService({ transport, requiredLookaheadCapacity: 1 });
+  const coordinator = createOwnerGenerationCoordinator({ maximumConcurrentRequests: 3 });
+  const service = new ChunkDataService({ transport, coordinator });
   const first = service.requestChunk({
     chunkX: 10, chunkZ: 0, priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, consumerId: 'first',
   });
@@ -280,7 +493,7 @@ test('ChunkDataService cancels a required lookahead without duplicate, stale, or
   });
 
   await nextDispatch();
-  assert.deepEqual(transport.calls.map(value => value.chunkX), [10, 11]);
+  assert.deepEqual(transport.calls.map(value => value.chunkX), [10, 11, 12]);
   assert.equal(cancelled.cancel(), true);
   assert.deepEqual(transport.cancelCalls, [{
     requestId: 2,
@@ -291,8 +504,6 @@ test('ChunkDataService cancels a required lookahead without duplicate, stale, or
   assert.equal((await first.promise).chunkX, 10);
   assert.equal(await cancelled.promise, null);
 
-  await nextDispatch();
-  assert.deepEqual(transport.calls.map(value => value.chunkX), [10, 11, 12]);
   resolvePending(transport, 12);
   assert.equal((await third.promise).chunkX, 12);
   await nextDispatch();
@@ -304,6 +515,7 @@ test('ChunkDataService cancels a required lookahead without duplicate, stale, or
   assert.equal(snapshot.inFlightCount, 0);
   assert.equal(snapshot.counts.cancelledOperations, 1);
   assert.equal(snapshot.counts.staleSubscriberResults, 0);
+  await coordinator.shutdown();
 });
 
 test('ChunkDataService dedupes Runtime, Gameplay, and Distant consumers, promotes queued work, and returns one canonical object reference', async () => {

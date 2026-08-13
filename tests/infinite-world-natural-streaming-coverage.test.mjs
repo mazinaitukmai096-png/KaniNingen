@@ -287,8 +287,10 @@ test('480-frame deterministic workload keeps plan/application work below ten per
   assert.equal(streamSnapshot.counts.coverageMerges, staticApplyCalls);
   assert.equal(streamSnapshot.counts.coverageSignatures, staticApplyCalls);
   assert.ok(streamSnapshot.counts.ownerSorts <= staticApplyCalls);
-  assert.ok(streamSnapshot.counts.sortTargetOwners
-    <= streamSnapshot.counts.resourceKindClassifications);
+  assert.ok(streamSnapshot.admissionWindowCount <= 1);
+  assert.ok(streamSnapshot.backlog <= 1);
+  assert.ok(streamSnapshot.counts.queueInsertions <= 1,
+    'an unresolved request must keep later plan owners in the immutable cursor');
   const percentile = (values, ratio) => [...values].sort((a, b) => a - b)[
     Math.min(values.length - 1, Math.ceil(values.length * ratio) - 1)
   ];

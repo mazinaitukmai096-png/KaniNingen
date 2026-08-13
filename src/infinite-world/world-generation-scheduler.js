@@ -1,6 +1,19 @@
 export const WORLD_GENERATION_REQUEST_SCHEMA = 'world-generation-request-1';
 export const WORLD_GENERATION_SCHEDULER_SCHEMA = 'world-generation-scheduler-1';
 
+export const WORLD_GENERATION_PRIORITY_CLASS = Object.freeze({
+  DEADLINE_SAFETY: 1,
+  COARSE_EXISTENCE: 2,
+  GAMEPLAY_FULL: 3,
+  DETAIL: 4,
+  PREFETCH: 5,
+});
+
+export const WORLD_GENERATION_REPRESENTATION_CLASS = Object.freeze({
+  COARSE: 'coarse',
+  DETAIL: 'detail',
+});
+
 export const WORLD_GENERATION_STATE = Object.freeze({
   QUEUED: 'queued',
   IN_FLIGHT: 'in-flight',
@@ -58,9 +71,16 @@ export function createWorldGenerationRequestEnvelope({
   requestId,
   operationKind,
   priority,
+  priorityClass = null,
   required = false,
   createdAtMs = 0,
   deadlineAtMs = null,
+  firstVisibleDeadlineMs = deadlineAtMs,
+  ownerKey = null,
+  resourceKind = null,
+  representationClass = null,
+  sequence = null,
+  subscriberIdentity = null,
   consumerId = null,
   epoch = 0,
   correlationId = null,
@@ -74,9 +94,25 @@ export function createWorldGenerationRequestEnvelope({
   if (!Number.isSafeInteger(priority) || priority < 1 || priority > 5) {
     throw new RangeError('World generation priority must be an integer from 1 through 5');
   }
+  if (priorityClass !== null
+    && (!Number.isSafeInteger(priorityClass) || priorityClass < 1 || priorityClass > 5)) {
+    throw new RangeError('World generation priorityClass must be null or an integer from 1 through 5');
+  }
   if (typeof required !== 'boolean') throw new TypeError('World generation required must be boolean');
   const normalizedCreatedAtMs = finiteTime(createdAtMs, 'createdAtMs');
   const normalizedDeadlineAtMs = finiteTime(deadlineAtMs, 'deadlineAtMs', { nullable: true });
+  const normalizedFirstVisibleDeadlineMs = finiteTime(
+    firstVisibleDeadlineMs,
+    'firstVisibleDeadlineMs',
+    { nullable: true },
+  );
+  if (sequence !== null && (!Number.isSafeInteger(sequence) || sequence < 1)) {
+    throw new RangeError('World generation sequence must be null or a positive safe integer');
+  }
+  if (representationClass !== null
+    && !Object.values(WORLD_GENERATION_REPRESENTATION_CLASS).includes(representationClass)) {
+    throw new RangeError(`unknown World generation representationClass: ${representationClass}`);
+  }
   if (!Number.isSafeInteger(epoch) || epoch < 0) {
     throw new RangeError('World generation epoch must be a non-negative safe integer');
   }
@@ -85,9 +121,16 @@ export function createWorldGenerationRequestEnvelope({
     requestId,
     operationKind,
     priority,
+    priorityClass,
     required,
     createdAtMs: normalizedCreatedAtMs,
     deadlineAtMs: normalizedDeadlineAtMs,
+    firstVisibleDeadlineMs: normalizedFirstVisibleDeadlineMs,
+    ownerKey: optionalString(ownerKey, 'ownerKey'),
+    resourceKind: optionalString(resourceKind, 'resourceKind'),
+    representationClass,
+    sequence,
+    subscriberIdentity: optionalString(subscriberIdentity, 'subscriberIdentity'),
     consumerId: optionalString(consumerId, 'consumerId'),
     epoch,
     correlationId: optionalString(correlationId, 'correlationId'),
@@ -105,22 +148,33 @@ export function normalizeWorldGenerationRequestEnvelope(value, defaults = {}) {
 
 export function describeWorldGenerationPriority(envelope, nowMs, {
   agingIntervalMs = 250,
+  imminentWindowMs = 100,
 } = {}) {
   const normalized = normalizeWorldGenerationRequestEnvelope(envelope);
   const now = finiteTime(nowMs, 'nowMs');
   if (!Number.isFinite(agingIntervalMs) || agingIntervalMs <= 0) {
     throw new RangeError('agingIntervalMs must be positive');
   }
+  if (!Number.isFinite(imminentWindowMs) || imminentWindowMs < 0) {
+    throw new RangeError('imminentWindowMs must be non-negative');
+  }
   const queueTimeMs = Math.max(0, now - normalized.createdAtMs);
   const agingSteps = Math.floor(queueTimeMs / agingIntervalMs);
   const requiredBoost = normalized.required && normalized.priority > 3 ? 1 : 0;
   const effectivePriority = Math.max(1, normalized.priority - agingSteps - requiredBoost);
+  const visibleDeadline = normalized.firstVisibleDeadlineMs ?? normalized.deadlineAtMs;
+  const deadlineMiss = visibleDeadline !== null && now > visibleDeadline;
+  const deadlineImminent = visibleDeadline !== null
+    && visibleDeadline >= now
+    && visibleDeadline - now <= imminentWindowMs;
   return Object.freeze({
     queueTimeMs,
     agingSteps,
     requiredBoost,
     effectivePriority,
-    deadlineMiss: normalized.deadlineAtMs !== null && now > normalized.deadlineAtMs,
+    deadlineMiss,
+    deadlineImminent,
+    deadlineUrgent: deadlineMiss || deadlineImminent,
   });
 }
 
@@ -129,15 +183,35 @@ export function compareWorldGenerationRequests(left, right, nowMs, options = {})
   const rightEnvelope = right.envelope ?? right.scheduler ?? right;
   const leftRank = describeWorldGenerationPriority(leftEnvelope, nowMs, options);
   const rightRank = describeWorldGenerationPriority(rightEnvelope, nowMs, options);
-  if (leftRank.deadlineMiss !== rightRank.deadlineMiss) return leftRank.deadlineMiss ? -1 : 1;
-  if (leftRank.effectivePriority !== rightRank.effectivePriority) {
-    return leftRank.effectivePriority - rightRank.effectivePriority;
+  const usesGlobalContract = leftEnvelope.priorityClass != null
+    || rightEnvelope.priorityClass != null;
+  if (usesGlobalContract) {
+    if (leftRank.deadlineUrgent !== rightRank.deadlineUrgent) {
+      return leftRank.deadlineUrgent ? -1 : 1;
+    }
+    const leftClass = leftEnvelope.priorityClass ?? leftEnvelope.priority;
+    const rightClass = rightEnvelope.priorityClass ?? rightEnvelope.priority;
+    if (leftClass !== rightClass) return leftClass - rightClass;
+    // Priority aging remains useful inside one semantic class, but can no
+    // longer promote optional/prefetch work across Terrain or Gameplay safety.
+    if (leftRank.effectivePriority !== rightRank.effectivePriority) {
+      return leftRank.effectivePriority - rightRank.effectivePriority;
+    }
+  } else {
+    if (leftRank.deadlineMiss !== rightRank.deadlineMiss) return leftRank.deadlineMiss ? -1 : 1;
+    if (leftRank.effectivePriority !== rightRank.effectivePriority) {
+      return leftRank.effectivePriority - rightRank.effectivePriority;
+    }
   }
-  const leftDeadline = leftEnvelope.deadlineAtMs ?? Number.POSITIVE_INFINITY;
-  const rightDeadline = rightEnvelope.deadlineAtMs ?? Number.POSITIVE_INFINITY;
+  const leftDeadline = leftEnvelope.firstVisibleDeadlineMs
+    ?? leftEnvelope.deadlineAtMs
+    ?? Number.POSITIVE_INFINITY;
+  const rightDeadline = rightEnvelope.firstVisibleDeadlineMs
+    ?? rightEnvelope.deadlineAtMs
+    ?? Number.POSITIVE_INFINITY;
   if (leftDeadline !== rightDeadline) return leftDeadline - rightDeadline;
-  const leftSequence = left.sequence ?? 0;
-  const rightSequence = right.sequence ?? 0;
+  const leftSequence = left.sequence ?? leftEnvelope.sequence ?? 0;
+  const rightSequence = right.sequence ?? rightEnvelope.sequence ?? 0;
   return leftSequence - rightSequence;
 }
 

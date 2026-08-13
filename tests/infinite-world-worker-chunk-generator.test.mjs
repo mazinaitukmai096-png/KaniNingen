@@ -168,6 +168,68 @@ test('Worker core includes the full generator snapshot only in an explicit diagn
   assert.equal(shutdownCalls, 1);
 });
 
+test('Worker core rebases main scheduler times before Worker deadline and aging comparisons', async () => {
+  const responses = [];
+  const executionEnvelopes = [];
+  let workerNow = 10_000;
+  const generator = {
+    worldSeed: seed,
+    worldSeedHash: `sha256:${'7'.repeat(64)}`,
+    generatorVersion: { major: 800, minor: 0, patch: 0 },
+    experienceSpawn: { x: 0, z: 0 },
+    reviewSpawn: { x: 0, z: 0 },
+    distributor: { findSettlementsNear: async () => [] },
+    async generateChunk(chunkX, chunkZ, options = {}) {
+      executionEnvelopes.push(options.scheduler);
+      workerNow += 10;
+      return fixtureChunk(chunkX, chunkZ);
+    },
+  };
+  const core = createChunkGeneratorWorkerCore({
+    postMessage: response => responses.push(response),
+    generatorFactory: async () => generator,
+    schedulerOptions: { clock: () => workerNow },
+  });
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.INITIALIZE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    serviceGeneration: 17,
+    worldSeed: seed,
+  });
+  responses.length = 0;
+  await core.receive({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: 101,
+    serviceGeneration: 17,
+    chunkX: 1,
+    chunkZ: 2,
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId: 101,
+      operationKind: 'chunk',
+      priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required: false,
+      createdAtMs: 900,
+      deadlineAtMs: 1_050,
+      consumerId: 'clock-domain-test',
+    }),
+    schedulerClock: {
+      schemaVersion: 'worker-scheduler-clock-1',
+      sentAtMs: 1_000,
+    },
+  });
+
+  assert.equal(executionEnvelopes.length, 1);
+  assert.equal(executionEnvelopes[0].createdAtMs, 9_900);
+  assert.equal(executionEnvelopes[0].deadlineAtMs, 10_050);
+  assert.equal(executionEnvelopes[0].firstVisibleDeadlineMs, 10_050);
+  assert.equal(responses[0].scheduler.queueTimeMs, 100);
+  assert.equal(responses[0].scheduler.deadlineMiss, false);
+  assert.equal(responses[0].scheduler.deadlineAtMs, 1_050,
+    'the response keeps the caller protocol clock domain');
+  await core.shutdown();
+});
+
 test('Worker core emits one diagnostics-only generation profile trailer after the Chunk payload', async () => {
   const responses = [];
   const generator = {
@@ -463,6 +525,7 @@ test('Worker transport sends the unified deadline envelope and settles a generic
     worldSeed: seed,
     serviceGeneration: 11,
     workerFactory: () => fake,
+    clock: () => 40,
   });
   await transport.initialize();
   const pendingChunk = transport.generateChunk({
@@ -485,14 +548,25 @@ test('Worker transport sends the unified deadline envelope and settles a generic
     requestId: 77,
     operationKind: 'chunk',
     priority: CHUNK_DATA_PRIORITY.PLAYER_RENDER,
+    priorityClass: null,
     required: true,
     createdAtMs: 10,
     deadlineAtMs: 50,
+    firstVisibleDeadlineMs: 50,
+    ownerKey: null,
+    resourceKind: null,
+    representationClass: null,
+    sequence: null,
+    subscriberIdentity: null,
     consumerId: 'phase-4',
     epoch: 9,
     correlationId: null,
     target: null,
     stream: null,
+  });
+  assert.deepEqual(request.schedulerClock, {
+    schemaVersion: 'worker-scheduler-clock-1',
+    sentAtMs: 40,
   });
   assert.equal(transport.cancelGenerationRequest({
     requestId: 77,

@@ -908,16 +908,17 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       snapshot.treePathAudit.activationTimeline.firstRequiredOwnerRequestAtMs,
       null,
     );
-    assert.equal(snapshot.treePathAudit.activationTimeline.outerWarmCompletedAtMs, null);
     assert.equal(snapshot.treePathAudit.near.pathId, 'near-tree');
     assert.equal(snapshot.treePathAudit.near.active, true);
     assert.equal(snapshot.treePathAudit.near.instanceCount > 0, true);
     const initialStaticTreePath = snapshot.treePathAudit.distant.find(path => (
       path.pathId === 'distant-static-tree'
     ));
-    assert.equal(initialStaticTreePath.rootCount, 1);
-    assert.equal(initialStaticTreePath.planIds.length, 1);
-    assert.deepEqual(initialStaticTreePath.coverageGenerations, [1]);
+    assert.equal(initialStaticTreePath.rootCount, 0,
+      'boot defers the Natural visual root until a policy-owned page is ready');
+    assert.equal(initialStaticTreePath.planIds.length, 0,
+      'boot does not synchronously materialize the full Natural resource coverage');
+    assert.deepEqual(initialStaticTreePath.coverageGenerations, []);
     assert.equal(snapshot.treePathAudit.distant.some(path => (
       path.pathId === 'distant-legacy-tree' && path.instanceCount > 0
     )), false);
@@ -1045,14 +1046,12 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.presentation.distantTownProxyCount, 0);
     assert.equal(snapshot.presentation.distantTownProxyLimit, 0);
     assert.ok(snapshot.presentation.canonicalRecordCount > 0);
-    // Stage 3B deliberately removes the presentation-only 12m cluster gate.
-    // Keep this boot check tied to the canonical-set contract, rather than a
-    // historic post-filter count: all canonical records must be visible and
-    // their subtype totals must describe the same set.
-    assert.ok(snapshot.presentation.canonicalVegetationRecordCount > 0);
-    assert.ok(snapshot.presentation.canonicalTreeRecordCount > 0);
-    assert.ok(snapshot.presentation.canonicalShrubRecordCount > 0);
-    assert.ok(snapshot.presentation.canonicalGrassRecordCount > 0);
+    // Resource protection does not seed drawable Natural records. The actual
+    // Natural policy below is the first owner and publisher of this content.
+    assert.equal(snapshot.presentation.canonicalVegetationRecordCount, 0);
+    assert.equal(snapshot.presentation.canonicalTreeRecordCount, 0);
+    assert.equal(snapshot.presentation.canonicalShrubRecordCount, 0);
+    assert.equal(snapshot.presentation.canonicalGrassRecordCount, 0);
     assert.equal(
       snapshot.presentation.visibleCanonicalVegetationCount,
       snapshot.presentation.canonicalVegetationRecordCount,
@@ -1069,8 +1068,8 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       snapshot.presentation.visibleCanonicalGrassCount,
       snapshot.presentation.canonicalGrassRecordCount,
     );
-    assert.ok(snapshot.presentation.canonicalRockRecordCount > 0);
-    assert.ok(snapshot.presentation.visibleCanonicalRockCount > 0);
+    assert.equal(snapshot.presentation.canonicalRockRecordCount, 0);
+    assert.equal(snapshot.presentation.visibleCanonicalRockCount, 0);
     assert.equal(
       snapshot.presentation.canonicalTreeRecordCount
         + snapshot.presentation.canonicalShrubRecordCount
@@ -1194,23 +1193,28 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     environment.rafCallbacks[0](performance.now() + 100);
     assert.equal(outcome.sandbox.logicalPlayer.x, playerXBeforeInput);
     let warmed = outcome.sandbox.snapshot();
-    for (let attempt = 0; attempt < 500 && warmed.presentation.queryNaturalCandidateCount === 0;
+    let warmDiagnosticFrameCount = 0;
+    for (let attempt = 0; attempt < 500
+      && (warmed.presentation.staticTreePublishedOwnerCount === 0
+        || warmed.presentation.visibleCanonicalTreeCount === 0);
       attempt += 1) {
+      environment.rafCallbacks.at(-1)(performance.now() + 101 + attempt);
+      warmDiagnosticFrameCount += 1;
       await new Promise(resolve => setTimeout(resolve, 10));
       warmed = outcome.sandbox.snapshot();
     }
-    assert.ok(warmed.presentation.queryNaturalCandidateCount > 0, JSON.stringify({
-      farSyncPending: warmed.presentation.farSyncPending,
-      farSyncPendingCount: warmed.presentation.farSyncPendingCount,
-      syncEpoch: warmed.presentation.syncEpoch,
-      committedEpoch: warmed.presentation.committedEpoch,
-      staleEpochDiscardCount: warmed.presentation.staleEpochDiscardCount,
-      localTerrainCoverageCenter: warmed.presentation.localTerrainCoverageCenter,
-      localTerrainCommitCount: warmed.presentation.localTerrainCommitCount,
-      localTerrainRejectionCount: warmed.presentation.localTerrainRejectionCount,
+    assert.ok(warmed.presentation.staticTreePublishedOwnerCount > 0, JSON.stringify({
+      requestBacklog: warmed.staticObjectStreaming.backlog,
+      readyRequiredOwnerCount: warmed.staticObjectStreaming.readyRequiredOwnerCount,
+      requiredOwnerCount: warmed.staticObjectStreaming.requiredOwnerCount,
+      publishedOwnerCount: warmed.presentation.staticTreePublishedOwnerCount,
+      visibleCanonicalTreeCount: warmed.presentation.visibleCanonicalTreeCount,
     }));
-    assert.ok(warmed.presentation.queryNaturalOwnerChunkCount >= 83);
-    assert.ok(warmed.presentation.queryNaturalOwnerChunkCount <= 100);
+    assert.ok(warmed.presentation.visibleCanonicalTreeCount > 0);
+    assert.equal(warmed.presentation.queryNaturalOwnerChunkCount, 0,
+      'legacy Natural warm/query ownership must remain absent');
+    const browserFramesBeforeAcceptance =
+      warmed.diagnostics.browserFrameAttribution.frames.length;
     environment.rafCallbacks.at(-1)(performance.now() + 116);
     const browserAcceptanceDiagnosticFrameCount = 1;
     warmed = outcome.sandbox.snapshot();
@@ -1221,7 +1225,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     );
     assert.equal(
       warmed.diagnostics.browserFrameAttribution.frames.length,
-      browserAcceptanceDiagnosticFrameCount,
+      browserFramesBeforeAcceptance + browserAcceptanceDiagnosticFrameCount,
     );
     assert.ok(
       warmed.diagnostics.browserFrameAttribution.frames[0].stages['player-update'] >= 0,
@@ -1282,8 +1286,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     let firstDraw = warmed;
     let activationDiagnosticFrameCount = 0;
     for (let attempt = 0; attempt < 100
-      && (firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs === null
-        || firstDraw.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs === null);
+      && firstDraw.treePathAudit.activationTimeline.firstDistantTreeVisibleAtMs === null;
       attempt += 1) {
       environment.rafCallbacks.at(-1)(performance.now() + 120 + attempt);
       activationDiagnosticFrameCount += 1;
@@ -1299,7 +1302,6 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       firstDraw.treePathAudit.activationTimeline.firstPersistentTreePublishAtMs,
       null,
     );
-    assert.notEqual(firstDraw.treePathAudit.activationTimeline.firstPersistentTreeDrawAtMs, null);
     assert.ok(
       firstDraw.diagnostics.browserFrameAttribution.workerRequests.length > 0,
       'Browser attribution must correlate real scheduler request and response waits',
@@ -1315,13 +1317,6 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         && path.rootCount === 1
         && path.planIds.length > 0
     )), true);
-    assert.equal(
-      firstDraw.treePathAudit.activationTimeline.outerWarmCompletedAtMs === null
-        || firstDraw.treePathAudit.activationTimeline.firstPersistentTreePublishAtMs
-          < firstDraw.treePathAudit.activationTimeline.outerWarmCompletedAtMs,
-      true,
-      'persistent Tree must publish before the independent outer warm completes',
-    );
     t.diagnostic(`Static Tree activation timeline (first draw) ${JSON.stringify(
       firstDraw.treePathAudit.activationTimeline,
     )}`);
@@ -1346,22 +1341,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       lifecycle: firstDraw.presentationDiagnostics.lifecycleByObject.byTarget,
     })}`);
     let outerCompleted = firstDraw;
-    for (let attempt = 0; attempt < 1_000
-      && outerCompleted.treePathAudit.activationTimeline.outerWarmCompletedAtMs === null;
-      attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      outerCompleted = outcome.sandbox.snapshot();
-    }
     const activationTimeline = outerCompleted.treePathAudit.activationTimeline;
-    assert.notEqual(activationTimeline.outerWarmCompletedAtMs, null);
-    assert.equal(
-      activationTimeline.staticStreamActivatedAtMs < activationTimeline.outerWarmCompletedAtMs,
-      true,
-    );
-    assert.equal(
-      activationTimeline.firstPersistentTreePublishAtMs < activationTimeline.outerWarmCompletedAtMs,
-      true,
-    );
     assert.equal(
       activationTimeline.staticStreamActivatedAtMs
         - activationTimeline.firstShadowPlanGeneratedAtMs < 50,
@@ -1372,13 +1352,6 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         - activationTimeline.staticStreamActivatedAtMs < 50,
       true,
     );
-    for (let attempt = 0; attempt < 1_000
-      && outerCompleted.staticObjectStreaming.backlog > 0;
-      attempt += 1) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-      outerCompleted = outcome.sandbox.snapshot();
-    }
-    assert.equal(outerCompleted.staticObjectStreaming.backlog, 0);
     assert.equal(outerCompleted.staticObjectStreaming.counts.failed, 0);
     assert.equal(outerCompleted.presentation.staticTreeDuplicatePageQueueCount, 0);
     assert.equal(
@@ -1389,34 +1362,13 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       outerCompleted.staticObjectStreaming.queuedCount
         + outerCompleted.staticObjectStreaming.inFlightCount,
     );
-    assert.equal(
-      outerCompleted.staticObjectStreaming.counts.pendingReuse
-        + outerCompleted.staticObjectStreaming.counts.readyHits > 0,
-      true,
-      'Distant warm must reuse Static Stream owners instead of generating duplicates',
-    );
-    t.diagnostic(`Static Tree activation timeline (outer complete) ${JSON.stringify(
+    t.diagnostic(`Static Tree activation timeline (policy-owned) ${JSON.stringify(
       activationTimeline,
     )}`);
-    t.diagnostic(`Static Tree outer warm ${JSON.stringify({
-      ownerCount: outerCompleted.presentation.queryNaturalOwnerChunkCount,
-      innerOwnerCount: outerCompleted.presentation.queryInnerNaturalOwnerChunkCount,
-      ultraOwnerCount: outerCompleted.presentation.queryUltraOwnerChunkCount,
-      ultraOnlyOwnerCount: outerCompleted.presentation.queryUltraOnlyOwnerChunkCount,
-      forestHorizonOwnerCount: outerCompleted.presentation.queryForestHorizonOwnerChunkCount,
-      forestHorizonOnlyOwnerCount:
-        outerCompleted.presentation.queryForestHorizonOnlyOwnerChunkCount,
-      farCacheHits: outerCompleted.presentation.queryFarOwnerChunkCacheHits,
-      farCacheMisses: outerCompleted.presentation.queryFarOwnerChunkCacheMisses,
-      ultraCacheHits: outerCompleted.presentation.queryUltraOwnerChunkCacheHits,
-      ultraCacheMisses: outerCompleted.presentation.queryUltraOwnerChunkCacheMisses,
-      forestHorizonCacheHits: outerCompleted.presentation.queryForestHorizonOwnerChunkCacheHits,
-      forestHorizonCacheMisses:
-        outerCompleted.presentation.queryForestHorizonOwnerChunkCacheMisses,
-      innerWarmMs: outerCompleted.presentation.innerWarmDurationMs,
-      ultraWarmMs: outerCompleted.presentation.ultraWarmDurationMs,
-      forestHorizonWarmMs: outerCompleted.presentation.forestHorizonWarmDurationMs,
-      preparationMs: outerCompleted.presentation.queryPreparationDurationMs,
+    t.diagnostic(`Static Tree policy-owned work ${JSON.stringify({
+      requiredOwnerCount: outerCompleted.staticObjectStreaming.requiredOwnerCount,
+      readyRequiredOwnerCount: outerCompleted.staticObjectStreaming.readyRequiredOwnerCount,
+      backlog: outerCompleted.staticObjectStreaming.backlog,
       pendingReuse: outerCompleted.staticObjectStreaming.counts.pendingReuse,
       readyHits: outerCompleted.staticObjectStreaming.counts.readyHits,
     })}`);
@@ -1438,7 +1390,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       environment.rafInitializationStates,
       Array.from({
         length: 2 + activationDiagnosticFrameCount + inputDiagnosticFrameCount
-          + browserAcceptanceDiagnosticFrameCount,
+          + browserAcceptanceDiagnosticFrameCount + warmDiagnosticFrameCount,
       }, () => true),
     );
     const expectedCancelledFrameId = environment.rafInitializationStates.length;
@@ -1463,7 +1415,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
 test('GP-SAVE-03 pagehide directly captures dirty state and coordinates queue conflicts',
   verifyGpSave03Pagehide);
 
-test('persistent Tree publication A/B flag preserves Near and Distant warm while withholding pages',
+test('persistent Tree publication A/B flag preserves Near and queues Distant pages without publishing',
   async () => {
     const environment = installBrowserEquivalentEnvironment();
     let sandbox = null;
@@ -1484,29 +1436,27 @@ test('persistent Tree publication A/B flag preserves Near and Distant warm while
       assert.equal(snapshot.presentation.staticTreePublishedOwnerCount, 0);
 
       for (let attempt = 0; attempt < 500
-        && (snapshot.presentation.queryNaturalCandidateCount === 0
-          || snapshot.staticObjectStreaming.readyPageQueueCount === 0);
+        && snapshot.staticObjectStreaming.readyPageQueueCount === 0;
         attempt += 1) {
         environment.rafCallbacks.at(-1)(performance.now() + 100 + attempt);
         await new Promise(resolve => setTimeout(resolve, 10));
         snapshot = sandbox.snapshot();
       }
 
-      assert.ok(snapshot.presentation.queryNaturalCandidateCount > 0);
-      assert.ok(snapshot.presentation.visibleCanonicalTreeCount > 0);
+      assert.equal(snapshot.presentation.queryNaturalCandidateCount, 0,
+        'the A/B fixture must not restore legacy Natural enumeration');
+      assert.equal(snapshot.presentation.queryNaturalOwnerChunkCount, 0,
+        'the A/B fixture must not restore legacy Natural owner queries');
+      assert.equal(snapshot.presentation.visibleCanonicalTreeCount, 0,
+        'Distant Natural remains unpublished while the A/B flag is disabled');
       assert.ok(snapshot.staticObjectStreaming.readyPageQueueCount > 0);
-      assert.ok(snapshot.presentation.staticTreePublishedOwnerCount > 0,
-        'Distant warm must retain its active-coverage seed display');
-      assert.equal(
-        snapshot.presentation.staticTreePublishedOwnerCount,
-        snapshot.runtime.activeDataCount,
-        'only the retained active-coverage seed may publish while A/B is disabled',
-      );
+      assert.equal(snapshot.presentation.staticTreePublishedOwnerCount, 0,
+        'policy pages must remain queued while persistent publication is disabled');
       assert.equal(snapshot.presentation.staticTreeDuplicatePageQueueCount, 0);
       assert.equal(snapshot.staticObjectStreaming.counts.failed, 0);
       assert.equal(snapshot.treePathAudit.distant.some(path => (
         path.active && path.instanceCount > 0
-      )), true);
+      )), false);
       assert.equal(snapshot.treePathAudit.distant.some(path => (
         path.pathId === 'distant-legacy-tree' && path.instanceCount > 0
       )), false);
@@ -1537,11 +1487,16 @@ test('MAX Player movement continues while destination Terrain presentation is pe
         runtimeFactory(options) {
           runtime = new ChunkRuntimeManager(options);
           const getChunkData = runtime.getChunkData.bind(runtime);
+          const isTerrainCoveragePublished = runtime.isTerrainCoveragePublished.bind(runtime);
           const prepareTransition = runtime.prepareTransition.bind(runtime);
           const transitionToChunk = runtime.transitionToChunk.bind(runtime);
           runtime.getChunkData = (chunkX, chunkZ) => (
             holdDestination && `${chunkX},${chunkZ}` === blockedOwnerKey
               ? null : getChunkData(chunkX, chunkZ)
+          );
+          runtime.isTerrainCoveragePublished = (chunkX, chunkZ) => (
+            holdDestination && `${chunkX},${chunkZ}` === blockedOwnerKey
+              ? false : isTerrainCoveragePublished(chunkX, chunkZ)
           );
           runtime.prepareTransition = (chunkX, chunkZ) => {
             if (holdDestination) prepareRequests.push(`${chunkX},${chunkZ}`);
@@ -1843,15 +1798,15 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
 test('Render Distance presets keep fixed gameplay coverage and resync Distant roots live', async t => {
   const expected = {
     short: {
-      natural: 84, terrain: 192, general: 112.5,
+      terrain: 192, general: 112.5,
       settlementMetadata: 352, settlementRender: 112.5, atmosphere: 'disabled',
     },
     standard: {
-      natural: 112, terrain: 256, general: 150,
+      terrain: 256, general: 150,
       settlementMetadata: 656.25, settlementRender: 150, atmosphere: 'disabled',
     },
     current: {
-      natural: 140, terrain: 352, general: 187.5,
+      terrain: 352, general: 187.5,
       settlementMetadata: 875, settlementRender: 875, atmosphere: 'manual-fog-blend',
     },
   };
@@ -1879,7 +1834,10 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       assert.equal(snapshot.runtime.renderedCount, 9);
       assert.equal(snapshot.runtime.cacheCapacity, RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY);
       assert.equal(snapshot.presentation.renderDistancePreset, preset);
-      assert.equal(snapshot.presentation.naturalVisibilityMeters, values.natural);
+      assert.equal(snapshot.presentation.staticNaturalRenderDistancePreset, preset,
+        'the policy-owned Natural root must use the selected Render Distance preset');
+      assert.equal(snapshot.presentation.naturalVisibilityMeters, 0,
+        'the retired Far-generation Natural path must remain absent');
       assert.equal(snapshot.presentation.clipmapExtentMeters, values.terrain);
       assert.equal(snapshot.presentation.visibilityMeters, values.general);
       assert.equal(snapshot.presentation.settlementMetadataQueryDistanceMeters,
@@ -2439,8 +2397,8 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
   assert.match(boot, /diagnosticMeasure\(\s*'diagnostics-hud-summary',[\s\S]*diagnostics\.hudSnapshot\(/,
     'HUD reads only the bounded diagnostics summary');
-  assert.equal((boot.match(/diagnostics\.snapshot\(/g) ?? []).length, 1,
-    'the full diagnostics snapshot is reserved for the explicit sandbox snapshot API');
+  assert.equal((boot.match(/diagnostics\.snapshot\(/g) ?? []).length, 2,
+    'full diagnostics snapshots are limited to the explicit API and opt-in lag capture');
   assert.equal((boot.match(/scenePresentation\.rebase\([^)]*renderOrigin\);\s*\n\s*commitDistantRuntimeState\([^)]*\);\s*\n\s*await gameplayRenderAdapter\.rebase\([^)]*renderOrigin\);[\s\S]*?const gameplaySync[\s\S]*?synchronizeLocalTerrain/g) ?? []).length, 1,
     'explicit runtime relocation starts atomic Gameplay staging before Local/Far compose');
   assert.match(boot, /const gameplayRebase = gameplayRenderAdapter\.rebase\(nextState\.renderOrigin\);\s*\n\s*schedulePostCommitWork\(nextState\);[\s\S]{0,600}?\n\s*await gameplayRebase;/,
@@ -2456,6 +2414,14 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);
   assert.match(boot, /new ChunkDataService\(/);
+  assert.match(boot, /ownerGenerationCoordinator = createOwnerGenerationCoordinator\(/,
+    'Full and Presentation must enter one main-side owner generation queue');
+  assert.equal((boot.match(/coordinator:\s*ownerGenerationCoordinator/g) ?? []).length, 2,
+    'both resource services must share the same global coordinator');
+  assert.doesNotMatch(boot, /presentationResidentRequests|requestKind:\s*'resident'/,
+    'boot must not enqueue all 1,757 Presentation resources as required work');
+  assert.doesNotMatch(boot, /prefetchCoverage\.presentationView|centerChunkX:\s*corridorEndpoint\.chunkX/,
+    'Terrain velocity prediction must not create a second 368 m Presentation coverage request');
   assert.match(boot, /createInlineChunkGeneratorTransport/);
   assert.doesNotMatch(runtime, /this\.generator\.generateChunk/);
   assert.doesNotMatch(boot, /runtime\.getChunkData\([^)]*\)\s*\?\?\s*generator\.generateChunk/);
