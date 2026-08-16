@@ -254,8 +254,14 @@ test('W8 wraps byte-identical W5 output and publishes sorted deterministic overl
     'terrain', 'roads', 'intersections', 'lots', 'buildings', 'water',
     'landmarks', 'street-details', 'natural', 'ambient-details',
   ]);
-  assert.equal(parity.presentationLayers.natural.vegetation.every(candidate =>
-    parity.sourceChunkData.vegetationCandidates.includes(candidate)), true);
+  const sourceVegetationById = new Map(parity.sourceChunkData.vegetationCandidates
+    .map(candidate => [candidate.candidateId, candidate]));
+  assert.equal(parity.presentationLayers.natural.vegetation.every(candidate => {
+    const sourceCandidate = sourceVegetationById.get(candidate.candidateId);
+    return sourceCandidate
+      && sourceCandidate.worldPosition.x === candidate.worldPosition.x
+      && sourceCandidate.worldPosition.z === candidate.worldPosition.z;
+  }), true, 'Natural selection preserves formal identity/XZ while canonical Y follows finalGround');
   assert.equal((await hashW8ParityChunkContent(parity)), parity.contentHash);
   assert.deepEqual(validateW8ParityChunkData(parity), { valid: true, errors: [] });
   const cacheSnapshot = w8.snapshot();
@@ -491,8 +497,13 @@ test('Phase 1 creates deterministic meadow and grove diagnostics from the legacy
   const selectedIds = new Set(selectedCandidates.map(candidate => candidate.candidateId));
   const rawById = new Map(rawEntries.map(entry => [entry.candidate.candidateId, entry.candidate]));
   for (const candidate of selectedCandidates) {
-    assert.equal(rawById.has(candidate.candidateId), true);
-    assert.equal(rawById.get(candidate.candidateId), candidate);
+    const raw = rawById.get(candidate.candidateId);
+    assert.ok(raw);
+    assert.equal(raw.worldPosition.x, candidate.worldPosition.x);
+    assert.equal(raw.worldPosition.z, candidate.worldPosition.z);
+    assert.equal(raw.subtype, candidate.subtype);
+    assert.equal(raw.variationSeed, candidate.variationSeed);
+    assert.equal(raw.orientationSeed, candidate.orientationSeed);
   }
 
   const bounds = Object.freeze({

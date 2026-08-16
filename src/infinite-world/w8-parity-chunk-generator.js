@@ -54,6 +54,7 @@ import {
   createW8SettlementParityOverlay,
 } from './w8-settlement-parity-overlay.js';
 import {
+  W8_CANONICAL_NATURAL_GROUND_REVISION,
   createSettlementSurfacePolicy,
   resolveCanonicalSettlementGroundSurface,
   sampleW8SurfaceHeightMeters,
@@ -1158,7 +1159,7 @@ export async function createW8ParityChunkGenerator({
   const majorRoadSourceHashCache = createPendingSafeLruCache({
     capacity: cacheCapacities.majorRoadSourceHash,
   });
-  const canonicalSourceRevision = `${base.worldSeedHash}:${W8_PARITY_GENERATOR_VERSION.major}`;
+  const canonicalSourceRevision = `${base.worldSeedHash}:${W8_PARITY_GENERATOR_VERSION.major}:${W8_CANONICAL_NATURAL_GROUND_REVISION}`;
   const canonicalOwnerCache = createCanonicalOwnerCache({
     capacity: cacheCapacities.canonicalOwner,
     identityOf: context => Object.freeze({
@@ -2304,6 +2305,14 @@ export async function createW8ParityChunkGenerator({
       ...record,
       worldPosition: groundPosition(record.worldPosition),
     });
+    const regroundNaturalCandidate = candidate => {
+      const worldPosition = groundPosition(candidate.worldPosition);
+      if (candidate.worldPosition.y === worldPosition.y) return candidate;
+      return Object.freeze({
+        ...candidate,
+        worldPosition,
+      });
+    };
     const groundedSettlementFeatures = settlementFeatures.map(record => Object.freeze({
       ...record,
       worldPosition: settlementGroundPosition(record.worldPosition),
@@ -2329,6 +2338,7 @@ export async function createW8ParityChunkGenerator({
       riverProjection,
       groundPosition,
       reground,
+      regroundNaturalCandidate,
       groundedOverlayFeatures: Object.freeze(
         groundedSettlementFeatures.filter(feature => feature.parityOverlay),
       ),
@@ -2364,6 +2374,7 @@ export async function createW8ParityChunkGenerator({
       riverProjection,
       groundPosition,
       reground,
+      regroundNaturalCandidate,
       settlementReferences,
     } = context;
     const [naturalWater, ambientDetailsRaw, distributedLandmarks, streetDetailsRaw] =
@@ -2399,12 +2410,19 @@ export async function createW8ParityChunkGenerator({
     ].sort((left, right) => left.stableId.localeCompare(right.stableId));
     const settlementLandmarks = distributedLandmarks
       .map(reground).sort((left, right) => left.stableId.localeCompare(right.stableId));
-    const natural = createNaturalPresentationLayer(
+    const selectedNatural = createNaturalPresentationLayer(
       parityGameplayChunk,
       { waterSurfaces, settlementLandmarks },
       experienceSpawn,
       naturalPresentationPolicy,
     );
+    const natural = Object.freeze({
+      ...selectedNatural,
+      vegetation: Object.freeze(
+        selectedNatural.vegetation.map(regroundNaturalCandidate),
+      ),
+      rocks: Object.freeze(selectedNatural.rocks.map(regroundNaturalCandidate)),
+    });
     if (!includeFullPresentation) {
       return Object.freeze({
         waterSurfaces: Object.freeze(waterSurfaces),
@@ -2503,6 +2521,7 @@ export async function createW8ParityChunkGenerator({
               finiteExperienceConnected: true,
               distributedSettlementSurfacePolicyConnected: true,
               canonicalRiverCorridorConnected: true,
+              canonicalNaturalGroundRevision: W8_CANONICAL_NATURAL_GROUND_REVISION,
             }),
           };
         };

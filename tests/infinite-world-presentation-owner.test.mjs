@@ -163,6 +163,60 @@ test('shared Natural semantic kernel preserves Full Stable ID, owner, position, 
   }
 });
 
+test('Settlement Tree Y is canonical finalGround in Full, PresentationOwner, and Tree-cell paths', async t => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
+  try {
+    const chunkX = 35;
+    const chunkZ = 24;
+    const full = await generator.generateChunk(chunkX, chunkZ);
+    const presentation = await generator.generatePresentationOwner(chunkX, chunkZ);
+    const treeCell = await generator.generateCanonicalTreeCell(8, 6);
+    const fullTrees = full.presentationLayers.natural.vegetation
+      .filter(candidate => candidate.subtype !== 'shrub');
+    const sourceById = new Map(full.vegetationCandidates.map(candidate => (
+      [candidate.candidateId, candidate]
+    )));
+    const presentationById = new Map(presentation.resource.natural
+      .filter(record => record.objectType === 'tree')
+      .map(record => [record.stableId, record]));
+    const cellById = new Map(treeCell.trees.map(record => [record.stableId, record]));
+    let maximumFormerFloatMeters = 0;
+
+    assert.ok(fullTrees.length > 0, 'the deterministic Settlement fixture must contain a Tree');
+    for (const tree of fullTrees) {
+      const source = sourceById.get(tree.candidateId);
+      const compact = presentationById.get(tree.candidateId);
+      const cellTree = cellById.get(tree.candidateId);
+      assert.ok(source, `missing formal source Tree ${tree.candidateId}`);
+      assert.ok(compact, `missing PresentationOwner Tree ${tree.candidateId}`);
+      assert.ok(cellTree, `missing canonical Tree-cell Tree ${tree.candidateId}`);
+      const ground = resolveCanonicalGroundSurface({
+        chunkData: full,
+        worldX: tree.worldPosition.x,
+        worldZ: tree.worldPosition.z,
+      });
+      maximumFormerFloatMeters = Math.max(
+        maximumFormerFloatMeters,
+        Math.abs(source.worldPosition.y - ground.heightMeters),
+      );
+      assert.equal(tree.worldPosition.y, ground.heightMeters,
+        'Full/Near Tree must use canonical finalGround Y');
+      assert.equal(compact.position[1], ground.heightMeters,
+        'PresentationOwner Tree must use canonical finalGround Y');
+      assert.equal(cellTree.position[1], ground.heightMeters,
+        'persistent Tree-cell Tree must use canonical finalGround Y');
+    }
+    assert.ok(maximumFormerFloatMeters > 0.5,
+      'the fixture must expose the former Natural-base-Y floating regression');
+    t.diagnostic(JSON.stringify({
+      groundedTreeCount: fullTrees.length,
+      maximumFormerFloatMeters: q6(maximumFormerFloatMeters),
+    }));
+  } finally {
+    await generator.shutdown();
+  }
+});
+
 test('pre-resolved sparse Settlement exclusions preserve exact Natural identity without Full generation in the owner path', async () => {
   const full = await createW8ParityChunkGenerator({ worldSeed: seed });
   try {

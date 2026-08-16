@@ -12,6 +12,8 @@ export const W8_SURFACE_POLICY_IDS = Object.freeze({
 });
 export const W8_SHARED_CANONICAL_GROUND_REVISION =
   'shared-canonical-ground-kernel-1';
+export const W8_CANONICAL_NATURAL_GROUND_REVISION =
+  'canonical-natural-final-ground-1';
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;

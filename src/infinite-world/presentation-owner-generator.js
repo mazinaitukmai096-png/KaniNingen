@@ -20,6 +20,7 @@ import {
 import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
 import { createCanonicalRiverProjection } from './canonical-river-realization.js';
 import {
+  W8_CANONICAL_NATURAL_GROUND_REVISION,
   W8_SHARED_CANONICAL_GROUND_REVISION,
   createSharedCanonicalGroundKernel,
   createSettlementSurfacePolicy,
@@ -27,7 +28,7 @@ import {
 
 export const PRESENTATION_OWNER_SCHEMA = 'w8-presentation-owner-1';
 export const PRESENTATION_OWNER_SHARED_CORE_REVISION =
-  `${W8_SHARED_CANONICAL_GROUND_REVISION}:formal-natural-candidate-kernel-1`;
+  `${W8_SHARED_CANONICAL_GROUND_REVISION}:${W8_CANONICAL_NATURAL_GROUND_REVISION}:formal-natural-candidate-kernel-1`;
 export const W8_CANONICAL_TREE_CELL_SCHEMA = 'w8-canonical-tree-cell-1';
 export const W8_CANONICAL_TREE_PREPARER_REVISION =
   `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1`;
@@ -709,15 +710,32 @@ export async function createPresentationOwnerGenerator({
         introDistanceMeters: context.introDistanceMeters ?? 11,
       });
       const rocks = candidates.rockCandidates.filter(candidateVisible);
-      // Full W8 preserves the formal Natural candidate base Y and applies the
-      // shared final-ground kernel to Terrain/structures separately. Both
-      // consumers resolve Tree records through compactNatural; the Tree-only
-      // batch does not also allocate the unrelated PresentationOwner payload.
+      const regroundNaturalCandidate = candidate => {
+        const heightMeters = ground.finalGround(
+          candidate.worldPosition.x,
+          candidate.worldPosition.z,
+        ).heightMeters;
+        if (candidate.worldPosition.y === heightMeters) return candidate;
+        return Object.freeze({
+          ...candidate,
+          worldPosition: Object.freeze({
+            ...candidate.worldPosition,
+            y: heightMeters,
+          }),
+        });
+      };
+      const groundedVegetation = Object.freeze(vegetation.map(regroundNaturalCandidate));
+      const groundedRocks = Object.freeze(rocks.map(regroundNaturalCandidate));
+      // Natural Stable IDs and X/Z admission remain unchanged, but canonical Y
+      // is the same post-grading/post-river finalGround used by visible Terrain.
+      // Near, Distant, and the Tree-only batch therefore share one immutable
+      // ground anchor without per-frame Terrain resampling.
       const resource = materializePresentationOwner ? createPresentationOwnerResource({
         worldSeedHash,
         chunkX,
         chunkZ,
-        naturalCandidates: [...vegetation, ...rocks].map(resolveW8CanonicalWorldObject),
+        naturalCandidates: [...groundedVegetation, ...groundedRocks]
+          .map(resolveW8CanonicalWorldObject),
         structures: preliminaryStructures,
         settlementRegionRefs,
         riverCorridorRefs: context.riverCorridorRefs
@@ -728,7 +746,7 @@ export async function createPresentationOwnerGenerator({
       }) : null;
       const trees = Object.freeze((resource
         ? resource.natural.filter(record => record.objectType === 'tree')
-        : vegetation.filter(candidate => candidate.subtype !== 'shrub')
+        : groundedVegetation.filter(candidate => candidate.subtype !== 'shrub')
           .map(candidate => compactNatural(resolveW8CanonicalWorldObject(candidate)))
           .sort((left, right) => left.stableId.localeCompare(right.stableId))));
       const completedAt = globalThis.performance?.now?.() ?? Date.now();
