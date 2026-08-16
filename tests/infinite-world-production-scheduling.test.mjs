@@ -41,14 +41,18 @@ function assertStopped(before, after, message) {
   assert.ok(magnitude(displacement(before, after)) <= POSITION_EPSILON_METERS, message);
 }
 
-const naturalDensityAttributes = harness => harness.gpuMirrorSnapshot({
-  attributeName: 'w8NaturalDensityRank',
-}).filter(attribute => (
-  attribute.attributeName === 'w8NaturalDensityRank'
+const NATURAL_LOD_GPU_ATTRIBUTE_NAMES = new Set([
+  'w8NaturalAnchorXZ',
+  'w8NaturalInitialReveal',
+]);
+
+const naturalLodAttributes = harness => harness.gpuMirrorSnapshot().filter(attribute => (
+  NATURAL_LOD_GPU_ATTRIBUTE_NAMES.has(attribute.attributeName)
+    && attribute.path.includes('w8-persistent-static-natural-pages')
 ));
 
-const naturalDensityMirrorsReady = harness => {
-  const attributes = naturalDensityAttributes(harness);
+const naturalLodMirrorsReady = harness => {
+  const attributes = naturalLodAttributes(harness);
   return attributes.length > 0 && attributes.every(attribute => (
     attribute.gpuArray !== null
       && attribute.gpuVersion === attribute.cpuVersion
@@ -57,19 +61,22 @@ const naturalDensityMirrorsReady = harness => {
   ));
 };
 
-function assertNaturalDensityGpuMirrors(harness, phase) {
-  const densityAttributes = naturalDensityAttributes(harness);
-  assert.ok(densityAttributes.length > 0,
-    `${phase}: rendered Natural density attributes must exist`);
-  for (const attribute of densityAttributes) {
+function assertNaturalLodGpuMirrors(harness, phase) {
+  const attributes = naturalLodAttributes(harness);
+  assert.ok(attributes.length > 0,
+    `${phase}: persistent Natural LOD attributes must exist`);
+  assert.deepEqual(new Set(attributes.map(attribute => attribute.attributeName)),
+    NATURAL_LOD_GPU_ATTRIBUTE_NAMES,
+    `${phase}: persistent Natural must expose anchor and reveal attributes`);
+  for (const attribute of attributes) {
     assert.notEqual(attribute.gpuArray, null,
-      `${phase}: ${attribute.path} density must have a renderer-side mirror`);
+      `${phase}: ${attribute.path} ${attribute.attributeName} must have a renderer-side mirror`);
     assert.equal(attribute.gpuVersion, attribute.cpuVersion,
-      `${phase}: ${attribute.path} density versions must match`);
+      `${phase}: ${attribute.path} ${attribute.attributeName} versions must match`);
     assert.deepEqual(attribute.gpuArray, attribute.cpuArray,
-      `${phase}: ${attribute.path} density CPU/GPU values must match`);
+      `${phase}: ${attribute.path} ${attribute.attributeName} CPU/GPU values must match`);
   }
-  return densityAttributes;
+  return attributes;
 }
 
 const gpuMirrorMismatchCount = attributes => attributes.filter(attribute => (
@@ -90,13 +97,10 @@ function assertVisualContinuityReceiptState(snapshot, phase) {
     `${phase}: policy-owned Presentation pages must reach CoarseDrawable`);
   assert.ok(continuity.detailDrawableCount > 0,
     `${phase}: Full owners must reach DetailDrawable after the coarse contract is complete`);
-  const nearOwners = continuity.owners.filter(owner => (
-    owner.nearRepresentationAvailableAt !== null
-  ));
-  assert.ok(nearOwners.length > 0,
-    `${phase}: the normal Near renderer must update the shared owner lifecycle`);
-  assert.ok(nearOwners.some(owner => owner.canonicalStableIds.length > 0),
-    `${phase}: Near availability must retain canonical Natural Stable IDs`);
+  assert.equal(snapshot.treePathAudit?.near?.pathId, 'near-tree',
+    `${phase}: the normal Near Tree route must remain registered`);
+  assert.ok(snapshot.treePathAudit.near.publicationSources.includes('runtime-chunk-load'),
+    `${phase}: the Near Tree route must remain owned by runtime Chunk publication`);
   assert.ok((continuity.renderFrames?.completedFrameCount ?? 0) > 0,
     `${phase}: drawable lifecycle must contain a completed renderer receipt`);
   assert.equal(continuity.actualDrawableLatencyMs?.includesMissingOwners, true,
@@ -232,8 +236,11 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       'natural-grass',
       'natural-rock',
     ]));
-    assert.ok(booted.treePathAudit.near.instanceCount > 0,
-      'Natural must be present through the normal near renderer path');
+    // Road Graph v3 / Lot v2 can legitimately clear every Tree from the
+    // initial Near footprint. Verify route ownership instead of fixture content.
+    assert.equal(booted.treePathAudit.near.pathId, 'near-tree');
+    assert.deepEqual(booted.treePathAudit.near.rootNames, ['w1a-render-root']);
+    assert.deepEqual(booted.treePathAudit.near.publicationSources, ['runtime-chunk-load']);
     assert.equal(booted.presentation.visibleCanonicalTreeCount, 0,
       'Full Chunk boot data must not seed the policy-owned persistent Natural presentation');
     assert.equal(booted.presentation.staticTreePublishedOwnerCount, 0,
@@ -267,7 +274,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     // Ready-page builds can complete in a host-task turn following a render.
     // Keep advancing the real loop until the policy-published mesh itself has
     // crossed the renderer/GPU boundary.
-    for (let frame = 0; frame < 30 && !naturalDensityMirrorsReady(harness); frame += 1) {
+    for (let frame = 0; frame < 30 && !naturalLodMirrorsReady(harness); frame += 1) {
       await harness.advanceFrame({ hostDelayMs: 2 });
     }
     warmed = harness.snapshot();
@@ -280,7 +287,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       'the shared Worker must generate PresentationOwner resources');
     assert.ok(warmed.presentation.visibleCanonicalTreeCount > 0,
       'canonical Natural records must arrive through policy-owned Presentation pages');
-    const warmedDensityAttributes = assertNaturalDensityGpuMirrors(harness, 'warm');
+    const warmedNaturalLodAttributes = assertNaturalLodGpuMirrors(harness, 'warm');
     diagnose(JSON.stringify({
       continuityCounts: {
         expected: warmed.visualContinuity?.expectedOwnerCount,
@@ -340,9 +347,9 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       coarseSafetyFilled.presentation.staticTreeCoarsePrewarmPublishedOwnerCount,
       coarseSafetyFilled.staticObjectStreaming.coarsePrewarmOwnerCount,
     );
-    assertNaturalDensityGpuMirrors(harness, 'coarse-safety-receipt');
+    assertNaturalLodGpuMirrors(harness, 'coarse-safety-receipt');
     harness.resetReleaseGateObservation();
-    diagnose(`static Natural warmed (${warmedDensityAttributes.length} density attributes)`);
+    diagnose(`static Natural warmed (${warmedNaturalLodAttributes.length} LOD attributes)`);
 
     async function runInputFrame(name, codes, frameCount = 6) {
       harness.releaseAll();
@@ -375,9 +382,9 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     const reversal = await runInputFrame('180-degree reversal', ['KeyS', 'ShiftLeft']);
     assertNear(dot(straight.direction, reversal.direction), -1, 1e-10,
       'S sprint must reverse the original W sprint');
-    const reversalDensityAttributes = assertNaturalDensityGpuMirrors(harness, 'reversal');
-    assert.ok(reversalDensityAttributes.length >= warmedDensityAttributes.length,
-      'reversal must not lose rendered Natural density attribute mirrors');
+    const reversalNaturalLodAttributes = assertNaturalLodGpuMirrors(harness, 'reversal');
+    assert.ok(reversalNaturalLodAttributes.length >= warmedNaturalLodAttributes.length,
+      'reversal must not lose rendered Natural LOD attribute mirrors');
     assertVisualContinuityReceiptState(harness.snapshot(), 'reversal');
     for (const [index, codes] of [
       ['KeyW', 'ShiftLeft'],
@@ -742,11 +749,11 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       assert.equal(annulus.before.measuredImplementation, false,
         `${annulus.label}: Before must not claim a measured old implementation run`);
       assert.ok(annulus.after.drawableCount <= annulus.before.canonicalCount,
-        `${annulus.label}: density-selected Tree count cannot exceed canonical input`);
+        `${annulus.label}: submitted Tree count cannot exceed canonical input`);
       assert.ok(annulus.after.instanceCount <= annulus.before.instanceCount,
-        `${annulus.label}: density-selected instances cannot exceed canonical input`);
+        `${annulus.label}: submitted instances cannot exceed canonical input`);
       assert.ok(annulus.after.triangleCount <= annulus.before.triangleCount,
-        `${annulus.label}: density-selected triangles cannot exceed canonical input`);
+        `${annulus.label}: submitted triangles cannot exceed canonical input`);
     }
 
     t.diagnostic(JSON.stringify({
@@ -759,7 +766,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       staticPublishedOwners: settled.presentation.staticTreePublishedOwnerCount,
       buildingPublications: settled.buildingSettlementStreaming.counts.published,
       rendererDrawCalls: settled.renderInfo.drawCalls,
-      densityAttributeCount: reversalDensityAttributes.length,
+      naturalLodAttributeCount: reversalNaturalLodAttributes.length,
       cameraYawTriggeredGeneration,
       releaseProof,
       releaseGate,

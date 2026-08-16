@@ -269,7 +269,9 @@ class Geometry {
   dispose() { this.disposed = true; }
 }
 class PlaneGeometry extends Geometry {}
+class BoxGeometry extends Geometry {}
 class ConeGeometry extends Geometry {}
+class SphereGeometry extends Geometry {}
 class DodecahedronGeometry extends Geometry {}
 class BufferGeometry extends Geometry {}
 class CylinderGeometry extends Geometry {}
@@ -334,7 +336,9 @@ const FakeThree = {
   Group,
   Scene,
   PlaneGeometry,
+  BoxGeometry,
   ConeGeometry,
+  SphereGeometry,
   DodecahedronGeometry,
   BufferGeometry,
   CylinderGeometry,
@@ -910,9 +914,11 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       snapshot.treePathAudit.activationTimeline.firstRequiredOwnerRequestAtMs,
       null,
     );
+    // The production Settlement spawn can be Tree-free. The Near contract is
+    // route ownership; a deterministic non-empty publication is covered below.
     assert.equal(snapshot.treePathAudit.near.pathId, 'near-tree');
-    assert.equal(snapshot.treePathAudit.near.active, true);
-    assert.equal(snapshot.treePathAudit.near.instanceCount > 0, true);
+    assert.deepEqual(snapshot.treePathAudit.near.rootNames, ['w1a-render-root']);
+    assert.deepEqual(snapshot.treePathAudit.near.publicationSources, ['runtime-chunk-load']);
     const initialStaticTreePath = snapshot.treePathAudit.distant.find(path => (
       path.pathId === 'distant-static-tree'
     ));
@@ -1422,7 +1428,9 @@ test('persistent Tree publication A/B flag preserves Near and queues Distant pag
     const environment = installBrowserEquivalentEnvironment();
     let sandbox = null;
     try {
-      globalThis.location.search = '?disablePersistentTreePublication=1';
+      // Pin a deterministic non-empty Near fixture; this test isolates the
+      // Distant publication flag from production Settlement spawn clearance.
+      globalThis.location.search = '?disablePersistentTreePublication=1&settlementRoadGraph=legacy-migrated-v1';
       sandbox = await bootInfiniteWorldSandbox({
         globalObject: globalThis,
         THREE: FakeThree,

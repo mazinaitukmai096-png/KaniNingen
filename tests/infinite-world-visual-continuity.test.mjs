@@ -942,7 +942,7 @@ test('Terrain receipt rejects invalid GPU position, zero color, and invalid topo
   }
 });
 
-test('forest proof evaluates GPU density rank, anchor distance, exit, and reveal opacity per slot', () => {
+test('forest proof evaluates GPU anchor distance, entry, exit, and reveal opacity per slot', () => {
   let now = 0;
   const gpuMirror = createGpuAttributeMirror();
   const frames = createRenderFrameAcknowledger({ clock: () => now, gpuMirror });
@@ -953,10 +953,8 @@ test('forest proof evaluates GPU density rank, anchor distance, exit, and reveal
   const forest = createDrawable().mesh;
   forest.count = 1;
   forest.instanceMatrix = createAttribute(identityMatrices(1), 16);
-  const density = createAttribute([0.9]);
   const anchor = createAttribute([0, 0], 2);
   const reveal = createAttribute([1]);
-  forest.geometry.attributes.w8NaturalDensityRank = density;
   forest.geometry.attributes.w8NaturalAnchorXZ = anchor;
   forest.geometry.attributes.w8NaturalInitialReveal = reveal;
   forest.userData = {
@@ -968,19 +966,11 @@ test('forest proof evaluates GPU density rank, anchor distance, exit, and reveal
   const uniforms = {
     w8NaturalPlayerLocalXZ: { value: { x: 0, y: 0 } },
     w8NaturalUnitsPerMeter: { value: 1 },
-    w8NaturalEnterStart: { value: -1 },
-    w8NaturalEnterEnd: { value: 0 },
+    w8NaturalEnterStart: { value: 10 },
+    w8NaturalEnterEnd: { value: 20 },
     w8NaturalExitStart: { value: 40 },
     w8NaturalExitEnd: { value: 50 },
     w8NaturalReveal: { value: 0 },
-    w8NaturalDensityNearTransitionStart: { value: 10 },
-    w8NaturalDensityNearTransitionEnd: { value: 20 },
-    w8NaturalDensityFarTransitionStart: { value: 30 },
-    w8NaturalDensityFarTransitionEnd: { value: 40 },
-    w8NaturalDensityNear: { value: 0.5 },
-    w8NaturalDensityMid: { value: 0.3 },
-    w8NaturalDensityFar: { value: 0.1 },
-    w8NaturalDensityFade: { value: 0.05 },
   };
   forest.material.userData = {
     naturalLodMode: 'far',
@@ -1012,15 +1002,13 @@ test('forest proof evaluates GPU density rank, anchor distance, exit, and reveal
 
   draw(1);
   assert.deepEqual(registry.get('shader-owner').drawnForestStableIds, [],
-    'rank-hidden Tree must not be mistaken for a coarse draw');
-  density.array[0] = 0.01;
-  upload(density);
+    'a Tree before the shader entry must not be mistaken for a coarse draw');
   anchor.array[0] = 100;
   upload(anchor);
   draw(2);
   assert.deepEqual(registry.get('shader-owner').drawnForestStableIds, [],
-    'a density-selected Tree beyond the shader exit is still not drawable');
-  anchor.array[0] = 0;
+    'a Tree beyond the shader exit is still not drawable');
+  anchor.array[0] = 30;
   upload(anchor);
   reveal.array[0] = 0;
   upload(reveal);
@@ -1059,7 +1047,6 @@ test('prewarmed Forest receipt cache re-evaluates player uniforms without a full
   const forest = createDrawable().mesh;
   forest.count = 1;
   forest.instanceMatrix = createAttribute(identityMatrices(1), 16);
-  forest.geometry.attributes.w8NaturalDensityRank = createAttribute([0.01]);
   forest.geometry.attributes.w8NaturalAnchorXZ = createAttribute([100, 0], 2);
   forest.geometry.attributes.w8NaturalInitialReveal = createAttribute([1]);
   forest.userData = {
@@ -1076,14 +1063,6 @@ test('prewarmed Forest receipt cache re-evaluates player uniforms without a full
     w8NaturalExitStart: { value: 40 },
     w8NaturalExitEnd: { value: 50 },
     w8NaturalReveal: { value: 1 },
-    w8NaturalDensityNearTransitionStart: { value: 10 },
-    w8NaturalDensityNearTransitionEnd: { value: 20 },
-    w8NaturalDensityFarTransitionStart: { value: 30 },
-    w8NaturalDensityFarTransitionEnd: { value: 40 },
-    w8NaturalDensityNear: { value: 0.5 },
-    w8NaturalDensityMid: { value: 0.3 },
-    w8NaturalDensityFar: { value: 0.1 },
-    w8NaturalDensityFade: { value: 0.05 },
   };
   forest.material.userData = {
     naturalLodMode: 'far',

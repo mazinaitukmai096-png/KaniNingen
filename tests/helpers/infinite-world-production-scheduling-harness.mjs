@@ -742,9 +742,8 @@ const isDrawableGpuMatrix = values => values !== null && values.length >= 16
   && Math.hypot(values[8], values[9], values[10]) > Number.EPSILON;
 
 const materialValues = material => Array.isArray(material) ? material : [material];
-const naturalUniforms = mesh => materialValues(mesh?.material)
-  .map(material => material?.userData?.naturalLodUniforms)
-  .find(Boolean) ?? null;
+const naturalMaterial = mesh => materialValues(mesh?.material)
+  .find(material => material?.userData?.naturalLodUniforms) ?? null;
 const uniformValue = (uniforms, name) => Number(uniforms?.[name]?.value);
 const effectiveMaterialOpacity = material => {
   const materials = materialValues(material).filter(Boolean);
@@ -758,33 +757,22 @@ const clampedSmoothstep = (minimum, maximum, value) => {
   const progress = Math.max(0, Math.min(1, (value - minimum) / (maximum - minimum)));
   return progress * progress * (3 - 2 * progress);
 };
-const mixed = (left, right, progress) => left * (1 - progress) + right * progress;
 
 function evaluateCoarseTreeSlot(mesh, slot, gpuAttributes) {
-  const uniforms = naturalUniforms(mesh);
-  const density = gpuAttributes.get(mesh?.geometry?.attributes?.w8NaturalDensityRank);
+  const material = naturalMaterial(mesh);
+  const uniforms = material?.userData?.naturalLodUniforms ?? null;
   const anchor = gpuAttributes.get(mesh?.geometry?.attributes?.w8NaturalAnchorXZ);
   const reveal = gpuAttributes.get(mesh?.geometry?.attributes?.w8NaturalInitialReveal);
   const matrix = gpuAttributes.get(mesh?.instanceMatrix);
-  if (!uniforms || !density || !anchor || !reveal || !matrix) return null;
-  const densityRank = Number(density[slot]);
+  if (!material || !uniforms || !anchor || !reveal || !matrix) return null;
   const anchorX = Number(anchor[slot * 2]);
   const anchorZ = Number(anchor[slot * 2 + 1]);
   const player = uniforms.w8NaturalPlayerLocalXZ?.value;
   const unitsPerMeter = uniformValue(uniforms, 'w8NaturalUnitsPerMeter');
   const playerX = Number(player?.x);
   const playerZ = Number(player?.y ?? player?.z);
-  if (![densityRank, anchorX, anchorZ, unitsPerMeter, playerX, playerZ]
-    .every(Number.isFinite) || unitsPerMeter <= 0) return null;
-  const distanceMeters = Math.hypot(anchorX - playerX, anchorZ - playerZ) / unitsPerMeter;
-  const nearStart = uniformValue(uniforms, 'w8NaturalDensityNearTransitionStart');
-  const nearEnd = uniformValue(uniforms, 'w8NaturalDensityNearTransitionEnd');
-  const farStart = uniformValue(uniforms, 'w8NaturalDensityFarTransitionStart');
-  const farEnd = uniformValue(uniforms, 'w8NaturalDensityFarTransitionEnd');
-  const nearDensity = uniformValue(uniforms, 'w8NaturalDensityNear');
-  const midDensity = uniformValue(uniforms, 'w8NaturalDensityMid');
-  const farDensity = uniformValue(uniforms, 'w8NaturalDensityFar');
-  const densityFade = uniformValue(uniforms, 'w8NaturalDensityFade');
+  const enterStart = uniformValue(uniforms, 'w8NaturalEnterStart');
+  const enterEnd = uniformValue(uniforms, 'w8NaturalEnterEnd');
   const exitStart = uniformValue(uniforms, 'w8NaturalExitStart');
   const exitEnd = uniformValue(uniforms, 'w8NaturalExitEnd');
   const initialReveal = Number(reveal[slot]);
@@ -792,30 +780,21 @@ function evaluateCoarseTreeSlot(mesh, slot, gpuAttributes) {
     Math.max(0, Math.min(1, initialReveal)),
     uniformValue(uniforms, 'w8NaturalReveal'),
   );
-  if ([nearStart, nearEnd, farStart, farEnd, nearDensity, midDensity, farDensity,
-    densityFade, exitStart, exitEnd, initialReveal, streamReveal]
-    .some(value => !Number.isFinite(value))) return null;
-  let threshold = nearDensity;
-  if (distanceMeters > nearStart) {
-    if (distanceMeters < nearEnd) {
-      threshold = mixed(nearDensity, midDensity,
-        clampedSmoothstep(nearStart, nearEnd, distanceMeters));
-    } else if (distanceMeters <= farStart) threshold = midDensity;
-    else if (distanceMeters < farEnd) {
-      threshold = mixed(midDensity, farDensity,
-        clampedSmoothstep(farStart, farEnd, distanceMeters));
-    } else threshold = farDensity;
-  }
-  const densityOpacity = clampedSmoothstep(0, densityFade, threshold - densityRank);
+  if ([anchorX, anchorZ, unitsPerMeter, playerX, playerZ, enterStart, enterEnd,
+    exitStart, exitEnd, initialReveal, streamReveal]
+    .some(value => !Number.isFinite(value)) || unitsPerMeter <= 0) return null;
+  const distanceMeters = Math.hypot(anchorX - playerX, anchorZ - playerZ) / unitsPerMeter;
+  const mode = material.userData.naturalLodMode;
+  const coarseMidTree = material.userData.canonicalCoarseTree === true && mode === 'forest';
+  const entryOpacity = mode === 'full' || coarseMidTree
+    ? 1 : clampedSmoothstep(enterStart, enterEnd, distanceMeters);
   const exitOpacity = 1 - clampedSmoothstep(exitStart, exitEnd, distanceMeters);
   const handoffOpacity = initialReveal >= -0.5 ? 1 : 0;
   const matrixElements = gpuMatrixElementsAt(matrix, slot);
   const matrixValue = matrixPosition({ array: matrix }, slot);
   return Object.freeze({
     distanceMeters,
-    densityRank,
-    threshold,
-    opacity: Math.max(0, streamReveal) * handoffOpacity * densityOpacity * exitOpacity,
+    opacity: entryOpacity * exitOpacity * Math.max(0, streamReveal) * handoffOpacity,
     matrixPosition: matrixValue,
     drawableMatrix: isDrawableGpuMatrix(matrixElements),
   });

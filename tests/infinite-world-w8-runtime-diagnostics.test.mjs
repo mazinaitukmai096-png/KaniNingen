@@ -6369,69 +6369,68 @@ test('persistent Static Natural pages publish only coarse Tree while detail avai
   assert.equal(afterExactMotion.naturalVisibilityQueueLength, 0);
   assert.equal(snapshot.staticTreeMaximumAdmissionsPerFrame <= 1, true);
   assert.equal(snapshot.staticTreeAdmissionLimitViolationCount, 0);
-  const naturalDensityAttributes = [];
+  const naturalRevealAttributes = [];
   const pendingNodes = [...scene.children];
   while (pendingNodes.length > 0) {
     const node = pendingNodes.shift();
     pendingNodes.push(...(node.children ?? []));
-    const attribute = node.geometry?.attributes?.w8NaturalDensityRank;
-    if (attribute) naturalDensityAttributes.push(attribute);
+    const attribute = node.geometry?.attributes?.w8NaturalInitialReveal;
+    if (attribute) naturalRevealAttributes.push(attribute);
   }
-  if (naturalDensityAttributes.length === 0) {
-    t.diagnostic('fixture visual assets do not materialize a density attribute for every Natural kind');
-  }
-  for (const attribute of naturalDensityAttributes) {
+  assert.ok(naturalRevealAttributes.length > 0,
+    'fixture must materialize current Natural LOD reveal attributes');
+  for (const attribute of naturalRevealAttributes) {
     attribute.clearUpdateRanges();
     attribute.needsUpdate = false;
   }
-  const densityStableId = audit.find(object => (
+  const treeStableId = audit.find(object => (
     object.naturalLod.kind === 'tree'
   )).identity.stableId;
-  const densityMesh = (() => {
+  const treeMesh = (() => {
     const nodes = [...scene.children];
     while (nodes.length > 0) {
       const node = nodes.shift();
       nodes.push(...(node.children ?? []));
       if (node.userData?.canonicalCoarseTreeSubmission === true
-        && node.userData?.canonicalStableIds?.includes(densityStableId)) return node;
+        && node.userData?.canonicalStableIds?.includes(treeStableId)) return node;
     }
     return null;
   })();
-  assert.ok(densityMesh, 'fixture must expose the target coarse Tree mesh');
-  const densityAttribute = densityMesh.geometry.attributes.w8NaturalDensityRank;
-  const densitySlot = densityMesh.userData.canonicalStableIds.indexOf(densityStableId);
-  assert.ok(densitySlot >= 0 && densitySlot < densityMesh.count);
-  const pendingDensitySlot = densitySlot + 1;
-  assert.ok(pendingDensitySlot < densityAttribute.array.length,
+  assert.ok(treeMesh, 'fixture must expose the target coarse Tree mesh');
+  const revealAttribute = treeMesh.geometry.attributes.w8NaturalInitialReveal;
+  const treeSlot = treeMesh.userData.canonicalStableIds.indexOf(treeStableId);
+  assert.ok(treeSlot >= 0 && treeSlot < treeMesh.count);
+  const pendingRevealSlot = treeSlot + 1;
+  assert.ok(pendingRevealSlot < revealAttribute.array.length,
     'fixture must expose one inactive capacity slot for range-union coverage');
-  densityAttribute.addUpdateRange(pendingDensitySlot, 1);
-  destroyed.add(densityStableId);
+  revealAttribute.addUpdateRange(pendingRevealSlot, 1);
+  destroyed.add(treeStableId);
   presentation.advanceStaticNaturalFrame({
     coverageGeneration: 1,
     planRevision: 1,
     planId: 'static-natural-all-kinds',
-    destructionRevision: densityStableId,
+    destructionRevision: treeStableId,
     playerLogicalX: input.playerLogicalX,
     playerLogicalZ: input.playerLogicalZ,
     activeDataKeys: input.activeDataKeys,
     renderedKeys: input.renderedKeys,
   });
-  const densityTreeIsDrawable = () => densityMesh.userData.canonicalStableIds
-    .slice(0, densityMesh.count).some((stableId, slot) => (
-      stableId === densityStableId
-        && (densityMesh.userData.canonicalOpacities?.[slot] ?? 0) > 0
+  const treeIsDrawable = () => treeMesh.userData.canonicalStableIds
+    .slice(0, treeMesh.count).some((stableId, slot) => (
+      stableId === treeStableId
+        && (treeMesh.userData.canonicalOpacities?.[slot] ?? 0) > 0
     ));
-  for (let frame = 0; frame < 32 && densityTreeIsDrawable(); frame += 1) {
+  for (let frame = 0; frame < 32 && treeIsDrawable(); frame += 1) {
     presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
   }
-  assert.equal(densityTreeIsDrawable(), false,
+  assert.equal(treeIsDrawable(), false,
     'destruction must remove the target Tree from the submitted coarse prefix');
-  assert.equal(densityAttribute.needsUpdate, true);
-  for (const slot of [densitySlot, pendingDensitySlot]) {
-    assert.equal(densityAttribute.updateRanges.some(range => (
+  assert.equal(revealAttribute.needsUpdate, true);
+  for (const slot of [treeSlot, pendingRevealSlot]) {
+    assert.equal(revealAttribute.updateRanges.some(range => (
       range.start <= slot && range.start + range.count >= slot + 1
-    )), true, 'Static Natural density upload ranges must union dirty and pending slots');
+    )), true, 'Static Natural reveal upload ranges must union dirty and pending slots');
   }
   destroyed.clear();
   presentation.advanceStaticNaturalFrame({
@@ -6450,7 +6449,7 @@ test('persistent Static Natural pages publish only coarse Tree while detail avai
   });
   presentation.update(input.playerLogicalX, input.playerLogicalZ, input.renderOrigin);
   const restored = presentation.canonicalAuditSnapshot();
-  assert.notEqual(restored.find(object => object.identity.stableId === densityStableId).visibleLod,
+  assert.notEqual(restored.find(object => object.identity.stableId === treeStableId).visibleLod,
     'destroyed');
   assert.equal(presentation.snapshot().staticTreeOwnerReuseCount > 0, true);
   assert.equal(presentation.snapshot().staticTreeDuplicatePageQueueCount, 0);

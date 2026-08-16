@@ -357,9 +357,9 @@ function attributeSlotComponent(attribute, slot, component, receipt) {
   return values && index >= 0 && index < values.length ? Number(values[index]) : Number.NaN;
 }
 
-function materialUniforms(material) {
+function naturalLodMaterials(material) {
   const materials = Array.isArray(material) ? material : [material];
-  return materials.map(value => value?.userData?.naturalLodUniforms).filter(Boolean);
+  return materials.filter(value => value?.userData?.naturalLodUniforms);
 }
 
 function uniformNumber(uniforms, name) {
@@ -373,83 +373,42 @@ function smoothstep(edge0, edge1, value) {
   return progress * progress * (3 - 2 * progress);
 }
 
-function mix(left, right, progress) {
-  return left * (1 - progress) + right * progress;
-}
-
 function forestShaderOpacity(mesh, slot, receipt) {
-  const densityRankAttribute = mesh?.geometry?.attributes?.w8NaturalDensityRank;
+  const materials = naturalLodMaterials(mesh?.material);
+  if (materials.length === 0) return 1;
+
   const anchorAttribute = mesh?.geometry?.attributes?.w8NaturalAnchorXZ;
   const revealAttribute = mesh?.geometry?.attributes?.w8NaturalInitialReveal;
-  const shaderUniforms = materialUniforms(mesh?.material).filter(uniforms => (
-    uniforms.w8NaturalDensityNear && uniforms.w8NaturalDensityMid
-      && uniforms.w8NaturalDensityFar
-  ));
-  if (!densityRankAttribute && shaderUniforms.length === 0) return 1;
-  if (!densityRankAttribute || !anchorAttribute || !revealAttribute
-    || shaderUniforms.length === 0) return 0;
-  const densityRank = attributeSlotComponent(densityRankAttribute, slot, 0, receipt);
+  if (!anchorAttribute || !revealAttribute) return 0;
   const anchorX = attributeSlotComponent(anchorAttribute, slot, 0, receipt);
   const anchorZ = attributeSlotComponent(anchorAttribute, slot, 1, receipt);
   const initialReveal = attributeSlotComponent(revealAttribute, slot, 0, receipt);
-  if (![densityRank, anchorX, anchorZ, initialReveal].every(Number.isFinite)) return 0;
+  if (![anchorX, anchorZ, initialReveal].every(Number.isFinite)) return 0;
 
   let maximumOpacity = 0;
-  for (const uniforms of shaderUniforms) {
+  for (const material of materials) {
+    const uniforms = material.userData.naturalLodUniforms;
     const player = uniforms.w8NaturalPlayerLocalXZ?.value;
     const playerX = Number(player?.x);
     const playerZ = Number(player?.y ?? player?.z);
     const unitsPerMeter = uniformNumber(uniforms, 'w8NaturalUnitsPerMeter');
-    if (![playerX, playerZ, unitsPerMeter].every(Number.isFinite)
-      || unitsPerMeter <= 0) continue;
-    const distanceMeters = Math.hypot(anchorX - playerX, anchorZ - playerZ) / unitsPerMeter;
     const enterStart = uniformNumber(uniforms, 'w8NaturalEnterStart');
     const enterEnd = uniformNumber(uniforms, 'w8NaturalEnterEnd');
     const exitStart = uniformNumber(uniforms, 'w8NaturalExitStart');
     const exitEnd = uniformNumber(uniforms, 'w8NaturalExitEnd');
     const reveal = uniformNumber(uniforms, 'w8NaturalReveal');
-    const nearStart = uniformNumber(uniforms, 'w8NaturalDensityNearTransitionStart');
-    const nearEnd = uniformNumber(uniforms, 'w8NaturalDensityNearTransitionEnd');
-    const farStart = uniformNumber(uniforms, 'w8NaturalDensityFarTransitionStart');
-    const farEnd = uniformNumber(uniforms, 'w8NaturalDensityFarTransitionEnd');
-    const nearDensity = uniformNumber(uniforms, 'w8NaturalDensityNear');
-    const midDensity = uniformNumber(uniforms, 'w8NaturalDensityMid');
-    const farDensity = uniformNumber(uniforms, 'w8NaturalDensityFar');
-    const densityFade = uniformNumber(uniforms, 'w8NaturalDensityFade');
-    if (![enterStart, enterEnd, exitStart, exitEnd, reveal,
-      nearStart, nearEnd, farStart, farEnd, nearDensity, midDensity,
-      farDensity, densityFade].every(Number.isFinite)) continue;
+    if (![playerX, playerZ, unitsPerMeter, enterStart, enterEnd,
+      exitStart, exitEnd, reveal].every(Number.isFinite) || unitsPerMeter <= 0) continue;
 
-    const coarseTree = (Array.isArray(mesh.material) ? mesh.material : [mesh.material])
-      .some(material => material?.userData?.canonicalCoarseTree === true
-        && material?.userData?.naturalLodUniforms === uniforms);
-    const entryOpacity = coarseTree ? 1 : smoothstep(enterStart, enterEnd, distanceMeters);
+    const distanceMeters = Math.hypot(anchorX - playerX, anchorZ - playerZ) / unitsPerMeter;
+    const mode = material.userData.naturalLodMode;
+    const coarseMidTree = material.userData.canonicalCoarseTree === true && mode === 'forest';
+    const entryOpacity = mode === 'full' || coarseMidTree
+      ? 1 : smoothstep(enterStart, enterEnd, distanceMeters);
     const exitOpacity = 1 - smoothstep(exitStart, exitEnd, distanceMeters);
     const streamReveal = Math.max(Math.max(0, Math.min(1, initialReveal)), reveal);
     const handoffOpacity = initialReveal >= -0.5 ? 1 : 0;
-    let densityThreshold = nearDensity;
-    if (distanceMeters > nearStart) {
-      if (distanceMeters < nearEnd) {
-        densityThreshold = mix(
-          nearDensity,
-          midDensity,
-          smoothstep(nearStart, nearEnd, distanceMeters),
-        );
-      } else if (distanceMeters <= farStart) {
-        densityThreshold = midDensity;
-      } else if (distanceMeters < farEnd) {
-        densityThreshold = mix(
-          midDensity,
-          farDensity,
-          smoothstep(farStart, farEnd, distanceMeters),
-        );
-      } else {
-        densityThreshold = farDensity;
-      }
-    }
-    const densityOpacity = smoothstep(0, densityFade, densityThreshold - densityRank);
-    const shaderOpacity = entryOpacity * exitOpacity * streamReveal
-      * handoffOpacity * densityOpacity;
+    const shaderOpacity = entryOpacity * exitOpacity * streamReveal * handoffOpacity;
     if (Number.isFinite(shaderOpacity)) maximumOpacity = Math.max(maximumOpacity, shaderOpacity);
   }
   return maximumOpacity;
