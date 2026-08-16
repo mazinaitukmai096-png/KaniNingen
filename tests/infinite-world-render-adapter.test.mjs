@@ -3,10 +3,16 @@ import assert from 'node:assert/strict';
 
 import { ChunkRenderAdapter } from '../src/infinite-world/render/chunk-render-adapter.js';
 import { resolveW8RockCanonicalObject } from '../src/infinite-world/rock-canonical-object.js';
+import { resolveW8CanonicalWorldObject } from '../src/infinite-world/world-object-canonical-contract.js';
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
+import { sampleW8SurfaceHeightMeters } from '../src/infinite-world/w8-surface-policy.js';
 import { hashWorldSeed } from '../src/infinite-world/legacy-core/g0/seed.js';
-import { createRenderFrameAcknowledger } from '../src/infinite-world/visual-continuity.js';
+import {
+  createGpuAttributeMirror,
+  createRenderFrameAcknowledger,
+  createVisualContinuityRegistry,
+} from '../src/infinite-world/visual-continuity.js';
 
 class Triple {
   constructor() { this.set(0, 0, 0); }
@@ -474,9 +480,16 @@ test('Settlement projection preserves finite layer order and renders ribbon, ent
   assert.equal(lotMesh.matrices[0].scale.x, 0.9 * adapter.unitsPerMeter);
   assert.equal(lotMesh.matrices[1].scale.x, 2.25 * adapter.unitsPerMeter);
   await adapter.loadProjected(projected);
+  assert.deepEqual(adapter.drawableStableIdsSnapshot(), [],
+    'Near publication is not renderer proof before a completed receipt');
+  assert.equal(adapter.markFirstDraw({ rendererFrameCompleted: true }), 0,
+    'a forgeable manual first-draw object must not update receipt-backed identity');
+  assert.deepEqual(adapter.drawableStableIdsSnapshot(), []);
   const frameAcknowledger = createRenderFrameAcknowledger({ clock: () => 1 });
   const frameToken = frameAcknowledger.beginFrame({ frameSequence: 1 });
   adapter.markFirstDraw(frameAcknowledger.completeFrame(frameToken, { scene }));
+  assert.equal(adapter.drawableStableIdsSnapshot().includes('tree-after-town'), true,
+    'completed scene receipt publishes the actually drawn Near Stable ID');
   const pathAudit = adapter.treePathAuditSnapshot();
   assert.equal(pathAudit.pathId, 'near-tree');
   assert.deepEqual(pathAudit.rootNames, ['w1a-render-root']);
@@ -486,6 +499,11 @@ test('Settlement projection preserves finite layer order and renders ribbon, ent
   assert.equal(pathAudit.instanceCount > 0, true);
   assert.equal(pathAudit.firstDrawAtMs !== null, true);
   assert.deepEqual(pathAudit.publicationSources, ['runtime-chunk-load']);
+  adapter.setFeatureDestroyed('tree-after-town', true);
+  const destroyedFrame = frameAcknowledger.beginFrame({ frameSequence: 2 });
+  adapter.markFirstDraw(frameAcknowledger.completeFrame(destroyedFrame, { scene }));
+  assert.equal(adapter.drawableStableIdsSnapshot().includes('tree-after-town'), false,
+    'a zero-scale destroyed slot is not retained as a drawable Near presenter');
   await adapter.unloadChunk('0,0');
   assert.equal(adapter.treePathAuditSnapshot().disposeCount, 1);
   await adapter.shutdown();
@@ -576,6 +594,147 @@ test('Settlement presentation hold releases Terrain and collision while retainin
   assert.equal(adapter.presentationHoldSnapshot().length, 0);
 });
 
+test('generic replacement barrier releases presentation-only coarse hold only after returning Near detail actually draws', async () => {
+  let now = 1;
+  const scene = new Scene();
+  const visualRegistry = createVisualContinuityRegistry({ clock: () => now });
+  const adapter = new ChunkRenderAdapter({
+    THREE: FakeThree,
+    scene,
+    visualRegistry,
+    // No diagnostic or telemetry switch is supplied: this is the normal path.
+  });
+  const road = {
+    stableId: 'road-replacement-projection',
+    sourceStableId: 'road-replacement-source',
+    featureType: 'settlement-road', widthMeters: 2,
+    start: { x: 2, z: 8 }, end: { x: 8, z: 8 }, worldPosition: { x: 5, y: 0, z: 8 },
+  };
+  const secondRoad = {
+    stableId: 'road-replacement-projection-2',
+    sourceStableId: 'road-replacement-source-2',
+    featureType: 'settlement-road', widthMeters: 2,
+    start: { x: 8, z: 8 }, end: { x: 14, z: 8 }, worldPosition: { x: 11, y: 0, z: 8 },
+  };
+  const building = {
+    stableId: 'building-replacement-projection',
+    featureType: 'settlement-building', buildingType: 'house',
+    worldPosition: { x: 11, y: 0, z: 8 }, rotationY: 0,
+    widthMeters: 6.5, heightMeters: 4.5, depthMeters: 5.25,
+  };
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'settlement-replacement-chunk', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0], heightUnitMeters: 0.001,
+      materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementLandmarks: [], streetDetails: [], settlementFeatures: [road, secondRoad, building],
+  };
+
+  visualRegistry.expect({ ownerKey: '0,0', expectedAt: now });
+  visualRegistry.resolveCoarseRequirements({
+    ownerKey: '0,0',
+    structureStableIds: [road.stableId, secondRoad.stableId, building.stableId],
+    forestStableIds: [],
+    at: now,
+  });
+  const initial = await adapter.projectChunk(chunk);
+  const oldRoadGeometry = initial.group.children
+    .find(child => child.name === 'infinite-settlement-roads').geometry;
+  await adapter.loadProjected(initial);
+  const frames = createRenderFrameAcknowledger({
+    clock: () => now,
+    gpuMirror: createGpuAttributeMirror(),
+  });
+  let token = frames.beginFrame({ frameSequence: 1 });
+  let receipt = frames.completeFrame(token, { scene });
+  adapter.markFirstDraw(receipt);
+  const terrain = initial.group.children.find(child => /terrain/.test(child.name));
+  assert.equal(visualRegistry.acknowledgeCoarseComponent({
+    ownerKey: '0,0', component: 'terrain', receipt, drawable: { mesh: terrain },
+  }), true, 'the test Terrain has actual receipt evidence');
+  visualRegistry.acknowledgeScene({ receipt, scene });
+  assert.deepEqual(visualRegistry.get('0,0').drawnStructureStableIds,
+    [building.stableId, road.stableId, secondRoad.stableId].sort(),
+    'merged ribbon receipt credits every declared Road ID while Building stays per-instance');
+  assert.deepEqual(adapter.drawableStableIdsSnapshot(),
+    [building.stableId, road.stableId, secondRoad.stableId].sort(),
+    'receipt-backed Near identity includes merged Road IDs on the normal path');
+
+  await adapter.unloadChunk('0,0', { deferSettlementPresentation: true });
+  const returning = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(returning);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'loading new Near detail must not publish-dispose the coarse hold');
+  assert.equal(oldRoadGeometry.disposed, false);
+  assert.equal(adapter.markFirstDraw({ rendererFrameCompleted: true }), 0);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'a forgeable receipt cannot release the retained drawable');
+
+  const hidden = new Object3D();
+  hidden.scale.set(0, 0, 0);
+  hidden.updateMatrix();
+  const hiddenBuildingParts = [];
+  for (const mesh of returning.group.children) {
+    const slot = mesh.userData?.featureStableIds?.indexOf(building.stableId) ?? -1;
+    if (slot < 0) continue;
+    hiddenBuildingParts.push({ mesh, slot, matrix: structuredClone(mesh.matrices[slot]) });
+    mesh.setMatrixAt(slot, hidden.matrix);
+  }
+  assert.ok(hiddenBuildingParts.length > 0);
+  now = 2;
+  token = frames.beginFrame({ frameSequence: 2 });
+  receipt = frames.completeFrame(token, { scene });
+  adapter.markFirstDraw(receipt);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'one drawn Road cannot release the hold while matching Building detail is zero-scale');
+  assert.equal(oldRoadGeometry.disposed, false);
+
+  for (const part of hiddenBuildingParts) part.mesh.setMatrixAt(part.slot, part.matrix);
+  const returningRoad = returning.group.children
+    .find(child => child.name === 'infinite-settlement-roads');
+  const completeRoadStableIds = returningRoad.userData.sourceRoadStableIds;
+  returningRoad.userData.sourceRoadStableIds = Object.freeze([road.stableId]);
+  now = 3;
+  token = frames.beginFrame({ frameSequence: 3 });
+  receipt = frames.completeFrame(token, { scene });
+  adapter.markFirstDraw(receipt);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'a partial merged ribbon cannot stand in for its missing declared Road ID');
+  assert.equal(oldRoadGeometry.disposed, false);
+
+  returningRoad.userData.sourceRoadStableIds = completeRoadStableIds;
+  returningRoad.visible = false;
+  now = 4;
+  token = frames.beginFrame({ frameSequence: 4 });
+  receipt = frames.completeFrame(token, { scene });
+  adapter.markFirstDraw(receipt);
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'an absent merged ribbon produces no renderer evidence and keeps OLD coarse');
+  assert.equal(oldRoadGeometry.disposed, false);
+  returningRoad.visible = true;
+
+  await adapter.unloadChunk('0,0', { deferSettlementPresentation: true });
+  assert.equal(adapter.presentationHoldSnapshot().length, 1,
+    'rapid reversal before receipt keeps the proven OLD coarse hold');
+  assert.equal(oldRoadGeometry.disposed, false);
+  const retry = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(retry);
+
+  now = 5;
+  token = frames.beginFrame({ frameSequence: 5 });
+  receipt = frames.completeFrame(token, { scene });
+  adapter.markFirstDraw(receipt);
+  assert.deepEqual(adapter.drawableStableIdsSnapshot(),
+    [building.stableId, road.stableId, secondRoad.stableId].sort());
+  assert.equal(adapter.presentationHoldSnapshot().length, 0,
+    'all matching Near Structure Stable IDs on a completed receipt release coarse');
+  assert.equal(oldRoadGeometry.disposed, true);
+  await adapter.shutdown();
+});
+
 test('canonical MAJOR projection seams do not become artificial road junctions', async () => {
   const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
   const segment = (stableId, sourceSegmentStableId, startX, endX) => ({
@@ -612,5 +771,59 @@ test('canonical MAJOR projection seams do not become artificial road junctions',
   assert.equal(projected.group.children.some(child => (
     child.name === 'infinite-settlement-junctions'
   )), false);
+  await adapter.shutdown();
+});
+
+test('Near W8 canonical vegetation anchors every part at canonical position Y without Terrain resampling', async () => {
+  const candidate = Object.freeze({
+    candidateId: 'detail-v1:tree:canonical-y-anchor',
+    candidateType: 'vegetation',
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.625,
+    orientationSeed: 0.375,
+    worldPosition: Object.freeze({ x: 8, y: 1.23456789, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.625 }),
+  });
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'canonical-tree-y-anchor', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [9000, 9000, 9000, 9000],
+      heightUnitMeters: 0.001, materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [candidate], rockCandidates: [], waterSurfaces: [], ambientDetails: [],
+    settlementFeatures: [], settlementLandmarks: [], streetDetails: [],
+  };
+  const canonical = resolveW8CanonicalWorldObject(candidate);
+  const sampledTerrainY = sampleW8SurfaceHeightMeters(
+    chunk,
+    canonical.position.x,
+    canonical.position.z,
+  );
+  assert.notEqual(sampledTerrainY, canonical.position.y,
+    'the fixture must distinguish canonical identity Y from sampled Terrain Y');
+
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const projected = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(projected);
+  const entry = adapter.featureInstances.get(canonical.stableId);
+  assert.ok(entry, 'canonical Tree must be registered on the Near path');
+
+  const expectedCanonicalPartY = canonical.presentation.parts.map(part => (
+    canonical.position.y * adapter.unitsPerMeter
+      + part.position[1] * canonical.visualBounds.height * adapter.unitsPerMeter
+  )).sort((left, right) => left - right);
+  const terrainResampledPartY = canonical.presentation.parts.map(part => (
+    sampledTerrainY * adapter.unitsPerMeter
+      + part.position[1] * canonical.visualBounds.height * adapter.unitsPerMeter
+  )).sort((left, right) => left - right);
+  const actualPartY = entry.parts.map(part => part.originalMatrix.position.y)
+    .sort((left, right) => left - right);
+
+  assert.deepEqual(actualPartY, expectedCanonicalPartY,
+    'each Near Tree part must preserve the exact canonical.position.y anchor');
+  assert.notDeepEqual(actualPartY, terrainResampledPartY,
+    'Near Tree placement must not substitute the sampled Terrain height');
   await adapter.shutdown();
 });

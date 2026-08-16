@@ -1175,6 +1175,8 @@ export async function createW8ParityChunkGenerator({
     fullChunkCompleted: 0,
     presentationOwnerRequests: 0,
     presentationOwnerCompleted: 0,
+    canonicalTreeCellRequests: 0,
+    canonicalTreeCellCompleted: 0,
     forestHorizonManifestRequests: 0,
     forestHorizonManifestCompleted: 0,
   };
@@ -1769,6 +1771,41 @@ export async function createW8ParityChunkGenerator({
       return graph;
     });
   };
+  const projectMajorRoadFeaturesToOwner = ({
+    chunkX,
+    chunkZ,
+    roads,
+    surfaceBackedChunk,
+    roadTimingContext = null,
+    sampleGroundHeightOverride = null,
+  }) => {
+    const roadTimingRun = roadTimingContext?.run ?? null;
+    const projectionStartedAt = nowMs();
+    const sampleGroundHeight = (worldX, worldZ) => {
+      const sampleStartedAt = roadTimingRun ? nowMs() : null;
+      const sample = sampleGroundHeightOverride === null
+        ? sampleW8SurfaceHeightMeters(surfaceBackedChunk, worldX, worldZ)
+        : sampleGroundHeightOverride(worldX, worldZ);
+      roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.TERRAIN_SAMPLES);
+      recordRoadFunction(roadTimingRun, 'road-terrain-height-sample', sampleStartedAt);
+      return sample;
+    };
+    const features = measureRoadSpanSync(
+      roadTimingRun,
+      ROAD_GENERATION_SPAN.SURFACE_METADATA,
+      () => projectCanonicalMajorRoadsToChunk({
+        roads,
+        chunkX,
+        chunkZ,
+        sampleGroundHeight,
+      }),
+    );
+    roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.SORT_DEDUPE_ITEMS, features.length);
+    recordRoadFunction(roadTimingRun, 'road-surface-metadata', projectionStartedAt);
+    majorRoadDiagnostics.chunkProjectionCount += 1;
+    majorRoadDiagnostics.chunkProjectionMs += nowMs() - projectionStartedAt;
+    return features;
+  };
   const createMajorRoadFeatures = async (
     chunkX,
     chunkZ,
@@ -1813,30 +1850,14 @@ export async function createW8ParityChunkGenerator({
       recordRoadFunction(roadTimingRun, 'road-graph-segment-filter', graphSegmentsStartedAt);
       const roads = await getMajorRoads(edges, graph, roadTimingContext);
       majorRoadDiagnostics.chunkRoadResolutionMs += nowMs() - resolutionStartedAt;
-      const projectionStartedAt = nowMs();
-      const sampleGroundHeight = (worldX, worldZ) => {
-        const sampleStartedAt = roadTimingRun ? nowMs() : null;
-        const sample = sampleGroundHeightOverride === null
-          ? sampleW8SurfaceHeightMeters(surfaceBackedChunk, worldX, worldZ)
-          : sampleGroundHeightOverride(worldX, worldZ);
-        roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.TERRAIN_SAMPLES);
-        recordRoadFunction(roadTimingRun, 'road-terrain-height-sample', sampleStartedAt);
-        return sample;
-      };
-      const features = measureRoadSpanSync(
-        roadTimingRun,
-        ROAD_GENERATION_SPAN.SURFACE_METADATA,
-        () => projectCanonicalMajorRoadsToChunk({
-          roads,
-          chunkX,
-          chunkZ,
-          sampleGroundHeight,
-        }),
-      );
-      roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.SORT_DEDUPE_ITEMS, features.length);
-      recordRoadFunction(roadTimingRun, 'road-surface-metadata', projectionStartedAt);
-      majorRoadDiagnostics.chunkProjectionCount += 1;
-      majorRoadDiagnostics.chunkProjectionMs += nowMs() - projectionStartedAt;
+      const features = projectMajorRoadFeaturesToOwner({
+        chunkX,
+        chunkZ,
+        roads,
+        surfaceBackedChunk,
+        roadTimingContext,
+        sampleGroundHeightOverride,
+      });
       completeRoadTiming('completed');
       return features;
     } catch (error) {
@@ -1940,102 +1961,211 @@ export async function createW8ParityChunkGenerator({
       W8_SPAWN_SAFETY_CONTRACT.preparedDataRadiusChunks,
     );
   }
-  let presentationOwnerGeneratorPromise = null;
-  const getPresentationOwnerGenerator = () => {
-    presentationOwnerGeneratorPromise ??= createPresentationOwnerGenerator({
-      worldSeed: base.worldSeed,
-      experienceSpawn,
-      resolvePresentationContext: async ({ chunkX, chunkZ }) => {
-        const centerX = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-        const centerZ = (chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-        const candidates = await base.distributor.findSettlementsNear(
-          centerX,
-          centerZ,
-          Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS / 2,
-        );
-        const influenceByType = { CITY: 204, TOWN: 95, RURAL: 88 };
-        const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
-        const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
-        const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
-        const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
-        const intersecting = candidates.filter(candidate => {
-          const closestX = Math.max(minimumX, Math.min(maximumX, candidate.center.x));
-          const closestZ = Math.max(minimumZ, Math.min(maximumZ, candidate.center.z));
-          return Math.hypot(
-            closestX - candidate.center.x,
-            closestZ - candidate.center.z,
-          ) <= influenceByType[candidate.settlementType];
-        });
-        const overlays = await Promise.all(intersecting.map(getSettlementOverlay));
-        const settlementTemplates = overlays.map(overlay => {
-          const presentation = composeW8SettlementPresentationTemplate(overlay);
-          const buildings = [...overlay.sourceBuildings, ...overlay.buildings];
-          return Object.freeze({
-            ...presentation,
-            roads: Object.freeze(presentation.roads.filter(road => (
-              !buildings.some(building => roadIntersectsSettlementBuilding(road, building))
-            ))),
-          });
-        });
-        return Object.freeze({
-          settlementTemplates: Object.freeze(settlementTemplates),
-          naturalExclusionTemplates: Object.freeze(
-            overlays.map(overlay => overlay.sourceTemplate),
-          ),
-          includeCanonicalRiver: true,
-          resolvePresentationAuxiliary: async ({
+  const presentationInfluenceByType = Object.freeze({ CITY: 204, TOWN: 95, RURAL: 88 });
+  const settlementIntersectsPresentationOwner = (candidate, { chunkX, chunkZ }) => {
+    const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+    const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+    const closestX = Math.max(minimumX, Math.min(maximumX, candidate.center.x));
+    const closestZ = Math.max(minimumZ, Math.min(maximumZ, candidate.center.z));
+    return Math.hypot(
+      closestX - candidate.center.x,
+      closestZ - candidate.center.z,
+    ) <= presentationInfluenceByType[candidate.settlementType];
+  };
+  const createPresentationContextForOwner = (
+    { chunkX, chunkZ },
+    overlayEntries,
+    sharedMajorRoadsPromise = null,
+  ) => {
+    const overlays = overlayEntries.map(entry => entry.overlay);
+    const settlementTemplates = overlayEntries.map(entry => entry.presentationTemplate);
+    return Object.freeze({
+      settlementTemplates: Object.freeze(settlementTemplates),
+      naturalExclusionTemplates: Object.freeze(
+        overlays.map(overlay => overlay.sourceTemplate),
+      ),
+      includeCanonicalRiver: true,
+      resolvePresentationAuxiliary: async ({
+        settlementReferences,
+        structures,
+        ground,
+        naturalOnly = false,
+      }) => {
+        const [landmarks, street] = await Promise.all([
+          createSettlementLandmarks({
+            chunkX,
+            chunkZ,
             settlementReferences,
-            structures,
-            ground,
-          }) => Object.freeze({
-            landmarks: Object.freeze(await createSettlementLandmarks({
-              chunkX,
-              chunkZ,
-              settlementReferences,
-            }, seed, base.worldSeedHash, {
-              sampleHeightMeters: (worldX, worldZ) => (
-                ground.finalGround(worldX, worldZ).heightMeters
-              ),
-            })),
-            street: Object.freeze(await createStreetDetails({
-              chunkX,
-              chunkZ,
-              settlementFeatures: structures,
-            }, base.worldSeedHash, {
-              sampleHeightMeters: (worldX, worldZ) => (
-                ground.finalGround(worldX, worldZ).heightMeters
-              ),
-            })),
+          }, seed, base.worldSeedHash, {
+            sampleHeightMeters: (worldX, worldZ) => (
+              ground.finalGround(worldX, worldZ).heightMeters
+            ),
           }),
-          isNaturalCandidateAllowed: ({ candidate, structures, water, landmarks }) => (
-            !conflictsWithPresentation(
-              candidate.worldPosition,
-              candidate.metadata?.candidateRadiusMeters
-                ?? (candidate.candidateType === 'rock' ? 0.45 : 0.625),
-              { settlementFeatures: structures },
-              {
-                waterSurfaces: water,
-                settlementLandmarks: landmarks,
-                experienceSpawn,
-              },
-            )
-          ),
-          resolveMajorRoadFeatures: ({ ground }) => createMajorRoadFeatures(
+          naturalOnly ? [] : createStreetDetails({
+            chunkX,
+            chunkZ,
+            settlementFeatures: structures,
+          }, base.worldSeedHash, {
+            sampleHeightMeters: (worldX, worldZ) => (
+              ground.finalGround(worldX, worldZ).heightMeters
+            ),
+          }),
+        ]);
+        return Object.freeze({
+          landmarks: Object.freeze(landmarks),
+          street: Object.freeze(street),
+        });
+      },
+      isNaturalCandidateAllowed: ({ candidate, structures, water, landmarks }) => (
+        !conflictsWithPresentation(
+          candidate.worldPosition,
+          candidate.metadata?.candidateRadiusMeters
+            ?? (candidate.candidateType === 'rock' ? 0.45 : 0.625),
+          { settlementFeatures: structures },
+          {
+            waterSurfaces: water,
+            settlementLandmarks: landmarks,
+            experienceSpawn,
+          },
+        )
+      ),
+      resolveMajorRoadFeatures: async ({ ground }) => {
+        const sampleGroundHeightOverride = (worldX, worldZ) => (
+          ground.settlementGround(worldX, worldZ).heightMeters
+        );
+        if (!sharedMajorRoadsPromise) {
+          return createMajorRoadFeatures(
             chunkX,
             chunkZ,
             null,
             null,
-            {
-              sampleGroundHeight: (worldX, worldZ) => (
-                ground.settlementGround(worldX, worldZ).heightMeters
-              ),
-            },
-          ),
+            { sampleGroundHeight: sampleGroundHeightOverride },
+          );
+        }
+        const shared = await sharedMajorRoadsPromise;
+        const edges = graphEdgesPotentiallyIntersectChunk({
+          graph: shared.graph,
+          chunkX,
+          chunkZ,
+        });
+        const roads = edges.map(edge => {
+          const road = shared.roadByEdgeStableId.get(edge.stableId);
+          if (!road) throw new Error(`missing canonical Major Road ${edge.stableId}`);
+          return road;
+        });
+        return projectMajorRoadFeaturesToOwner({
+          chunkX,
+          chunkZ,
+          roads,
+          surfaceBackedChunk: null,
+          sampleGroundHeightOverride,
         });
       },
     });
-    return presentationOwnerGeneratorPromise;
   };
+  const majorRoadGraphRegionKeyForOwner = ({ chunkX, chunkZ }) => {
+    const regionSize = W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters;
+    return `${Math.floor(((chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS) / regionSize)},${
+      Math.floor(((chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS) / regionSize)}`;
+  };
+  const prepareSharedMajorRoadsForOwners = async owners => {
+    const startedAt = nowMs();
+    const graph = await getMajorRoadGraph(owners[0].chunkX, owners[0].chunkZ);
+    const requiredEdgeIds = new Set(owners.flatMap(owner => (
+      graphEdgesPotentiallyIntersectChunk({
+        graph,
+        chunkX: owner.chunkX,
+        chunkZ: owner.chunkZ,
+      }).map(edge => edge.stableId)
+    )));
+    const edges = graph.edges.filter(edge => requiredEdgeIds.has(edge.stableId));
+    const roads = await getMajorRoads(edges, graph);
+    majorRoadDiagnostics.chunkRoadResolutionMs += nowMs() - startedAt;
+    return Object.freeze({
+      graph,
+      roadByEdgeStableId: new Map(edges.map((edge, index) => (
+        [edge.stableId, roads[index]]
+      ))),
+    });
+  };
+  const resolvePresentationContextsForOwners = async owners => {
+    if (!Array.isArray(owners) || owners.length === 0) {
+      throw new TypeError('Presentation owner context batch is required');
+    }
+    const minimumX = Math.min(...owners.map(owner => (
+      owner.chunkX * LOGICAL_CHUNK_SIZE_METERS
+    )));
+    const minimumZ = Math.min(...owners.map(owner => (
+      owner.chunkZ * LOGICAL_CHUNK_SIZE_METERS
+    )));
+    const maximumX = Math.max(...owners.map(owner => (
+      (owner.chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS
+    )));
+    const maximumZ = Math.max(...owners.map(owner => (
+      (owner.chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS
+    )));
+    const centerX = (minimumX + maximumX) / 2;
+    const centerZ = (minimumZ + maximumZ) / 2;
+    const graphRegionKeys = new Set(owners.map(majorRoadGraphRegionKeyForOwner));
+    const sharedMajorRoadsPromise = owners.length > 1 && graphRegionKeys.size === 1
+      ? prepareSharedMajorRoadsForOwners(owners) : null;
+    // Context lookup may independently fail before owner projections attach
+    // their awaits. Keep the original rejecting Promise for those owners while
+    // marking its early rejection as observed.
+    sharedMajorRoadsPromise?.catch(() => {});
+    const candidates = await base.distributor.findSettlementsNear(
+      centerX,
+      centerZ,
+      Math.hypot(maximumX - minimumX, maximumZ - minimumZ) / 2,
+    );
+    const candidatesByOwner = owners.map(owner => candidates.filter(candidate => (
+      settlementIntersectsPresentationOwner(candidate, owner)
+    )));
+    const requiredIds = new Set(candidatesByOwner.flatMap(ownerCandidates => (
+      ownerCandidates.map(candidate => candidate.settlementId)
+    )));
+    const requiredCandidates = candidates.filter(candidate => requiredIds.has(candidate.settlementId));
+    const overlayEntries = await Promise.all(requiredCandidates.map(async candidate => {
+      const overlay = await getSettlementOverlay(candidate);
+      const presentation = composeW8SettlementPresentationTemplate(overlay);
+      const buildings = [...overlay.sourceBuildings, ...overlay.buildings];
+      return Object.freeze({
+        settlementId: candidate.settlementId,
+        overlay,
+        presentationTemplate: Object.freeze({
+          ...presentation,
+          roads: Object.freeze(presentation.roads.filter(road => (
+            !buildings.some(building => roadIntersectsSettlementBuilding(road, building))
+          ))),
+        }),
+      });
+    }));
+    const entryBySettlementId = new Map(overlayEntries.map(entry => (
+      [entry.settlementId, entry]
+    )));
+    return Object.freeze(owners.map((owner, index) => createPresentationContextForOwner(
+      owner,
+      candidatesByOwner[index].map(candidate => entryBySettlementId.get(candidate.settlementId)),
+      sharedMajorRoadsPromise,
+    )));
+  };
+  const presentationOwnerGeneratorPromise = createPresentationOwnerGenerator({
+    worldSeed: base.worldSeed,
+    experienceSpawn,
+    resolvePresentationContext: async owner => (
+      (await resolvePresentationContextsForOwners([owner]))[0]
+    ),
+    resolvePresentationContexts: ({ owners }) => (
+      resolvePresentationContextsForOwners(owners)
+    ),
+  });
+  // Canonical Natural kernels are an always-used W8 service dependency. Make
+  // Worker initialization own this one-time setup instead of charging the
+  // first visible Tree cell.
+  await presentationOwnerGeneratorPromise;
+  const getPresentationOwnerGenerator = () => presentationOwnerGeneratorPromise;
 
   const buildW8CanonicalChunkContext = async (
     chunkX,
@@ -2518,6 +2648,14 @@ export async function createW8ParityChunkGenerator({
       });
       resourceGenerationCounts.presentationOwnerCompleted += 1;
       return result;
+    },
+    async generateCanonicalTreeCell(macroX, macroZ) {
+      assertGeneratorActive();
+      resourceGenerationCounts.canonicalTreeCellRequests += 1;
+      const generated = await (await getPresentationOwnerGenerator())
+        .generateCanonicalTreeCell(macroX, macroZ);
+      resourceGenerationCounts.canonicalTreeCellCompleted += 1;
+      return generated;
     },
     async resolveCanonicalMajorRoadNetwork({
       centerWorldX,

@@ -5,7 +5,10 @@ import test from 'node:test';
 import {
   createCircularStaticStreamingPolicy,
   createStaticObjectStream,
+  staticMovingPointChunkAabbEntrySeconds,
 } from '../src/infinite-world/static-object-stream.js';
+import { createResidentWorldCoverage } from '../src/infinite-world/chunk-streaming-plan.js';
+import { LOGICAL_CHUNK_SIZE_METERS, parseChunkKey } from '../src/infinite-world/chunk-coordinates.js';
 import { createWorldStreamingCoordinator } from '../src/infinite-world/world-streaming-coordinator.js';
 import { createWorldStreamingPolicyRegistry } from '../src/infinite-world/world-streaming-policy-registry.js';
 import {
@@ -55,6 +58,7 @@ function createPlanner(policy) {
     renderDistancePreset: 'current',
     stateRevision: input.stateRevision ?? 0,
     originGeneration: input.originGeneration ?? 0,
+    residentCoverage: input.residentCoverage ?? null,
   });
 }
 
@@ -99,6 +103,433 @@ test('a high-speed turn replaces the prefetched corridor while retaining current
   assert.notDeepEqual(east.prefetchedOwnerKeys, north.prefetchedOwnerKeys);
   assert.ok(east.prefetchedOwnerKeys.some(key => Number(key.split(',')[0]) > 1));
   assert.ok(north.prefetchedOwnerKeys.some(key => Number(key.split(',')[1]) < -1));
+});
+
+test('resource prewarm margin stays outside the true visual Expected boot cohort', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const residentCoverage = createResidentWorldCoverage({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+  });
+  const plan = planner({
+    player: { x: 0, z: 0 },
+    velocity: { x: 0, z: 0 },
+    residentCoverage,
+  });
+  const member = policyPlan(plan);
+  const source = member.sourceSnapshot;
+  assert.equal(source.requiredRadiusMeters, residentCoverage.presentationView.radiusMeters,
+    'resource coverage preserves the shared 368 m Presentation resident window');
+  assert.equal(source.visualRadiusMeters, 16);
+  assert.deepEqual(source.visualExpected, source.visualRequired,
+    'stationary visual Expected must not invent a corridor');
+  assert.ok(source.coarsePrewarm.length > 0,
+    'one owner-width coarse safety shell must exist outside visual Expected');
+  assert.equal(source.coarsePrewarm.every(ownerKey => (
+    !source.visualExpected.includes(ownerKey) && member.requiredOwnerKeys.includes(ownerKey)
+  )), true, 'coarse safety must remain Resource-only scheduling metadata');
+  assert.ok(member.requiredOwnerKeys.length > source.visualRequired.length);
+  assert.equal(source.visualRequired.every(ownerKey => (
+    member.requestOwnerKeys.includes(ownerKey)
+  )), true);
+
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  t.after(() => stream.dispose());
+  stream.applyPlan({ plan, policyPlan: member });
+  const control = stream.snapshot();
+  assert.equal(control.requiredOwnerCount, member.requiredOwnerKeys.length);
+  assert.equal(control.visualRequiredOwnerCount, source.visualRequired.length);
+  assert.equal(control.visualExpectedOwnerCount, source.visualExpected.length);
+  assert.equal(control.coarsePrewarmOwnerCount, source.coarsePrewarm.length);
+  assert.equal(control.bootCohortOwnerCount, source.visualRequired.length);
+  const outerMarginOwner = member.requiredOwnerKeys.find(ownerKey => (
+    !source.visualExpected.includes(ownerKey)
+  ));
+  assert.ok(outerMarginOwner, 'fixture requires a resource-only margin owner');
+  const [outerTiming] = stream.ownerTimingSnapshot([outerMarginOwner]);
+  assert.equal(outerTiming.cohort, 'steady');
+  assert.equal(outerTiming.required, false);
+  assert.equal(outerTiming.firstPossibleVisibleAt, null);
+  assert.equal(outerTiming.deadlineAtMs, null,
+    'stationary resource-only margin must not receive an artificial now deadline');
+});
+
+test('coarse safety shell fills before the outer visual ring on the existing cursor', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const residentCoverage = createResidentWorldCoverage({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+  });
+  const plan = planner({
+    player: { x: 0, z: 0 },
+    velocity: { x: 0, z: 0 },
+    residentCoverage,
+  });
+  const member = policyPlan(plan);
+  const source = member.sourceSnapshot;
+  const requests = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 2048,
+    requestOwner: request => {
+      requests.push(request);
+      return Promise.resolve(Object.freeze({ ownerKey: request.ownerKey }));
+    },
+  });
+  t.after(() => stream.dispose());
+  stream.applyPlan({ plan, policyPlan: member });
+  await waitFor(() => stream.snapshot().backlog === 0,
+    'coarse fill ordering fixture did not settle');
+
+  const ownerDistanceSquared = ownerKey => {
+    const { chunkX, chunkZ } = parseChunkKey(ownerKey);
+    const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+    const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+    const closestX = Math.max(minimumX, Math.min(maximumX, plan.player.x));
+    const closestZ = Math.max(minimumZ, Math.min(maximumZ, plan.player.z));
+    return (closestX - plan.player.x) ** 2 + (closestZ - plan.player.z) ** 2;
+  };
+  const innerDistanceSquared = source.coarseFillInnerRadiusMeters ** 2;
+  const category = ownerKey => {
+    if (source.isVisualExpected(ownerKey)
+      && ownerDistanceSquared(ownerKey) <= innerDistanceSquared) return 'inner';
+    if (source.isCoarsePrewarm(ownerKey)) return 'safety';
+    if (source.isVisualExpected(ownerKey)) return 'outer-visual';
+    return 'resource';
+  };
+  const categories = requests.map(request => category(request.ownerKey));
+  const lastInner = categories.lastIndexOf('inner');
+  const firstSafety = categories.indexOf('safety');
+  const lastSafety = categories.lastIndexOf('safety');
+  const firstOuterVisual = categories.indexOf('outer-visual');
+  assert.ok(lastInner >= 0 && firstSafety > lastInner,
+    'local/inner visual world must fill before the safety shell');
+  assert.ok(lastSafety >= firstSafety && firstOuterVisual > lastSafety,
+    'the full safety shell must precede the outer visual ring');
+  assert.equal(requests.slice(firstSafety, lastSafety + 1).every(request => (
+    request.required && request.priority === 3 && request.deadlineAtMs === null
+  )), true, 'safety shell must use coarse-existence scheduling without fake deadlines');
+  const readyPages = stream.drainReadyOwnerPages({ limit: 2048 });
+  const pageCategories = readyPages.map(page => category(page.ownerKey));
+  assert.ok(pageCategories.indexOf('safety') > pageCategories.lastIndexOf('inner'));
+  assert.ok(pageCategories.indexOf('outer-visual') > pageCategories.lastIndexOf('safety'),
+    'the one ready-page bridge must preserve inner/safety/outer coarse ordering');
+  assert.equal(readyPages.every(page => page.coarseFillBand === ({
+    inner: 1,
+    safety: 2,
+    'outer-visual': 3,
+    resource: 4,
+  })[category(page.ownerKey)]), true);
+  assert.ok(stream.snapshot().admissionWindowCount <= 2048);
+});
+
+test('cached Resource margin page is re-admitted when its owner enters Visual Expected', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const residentCoverage = createResidentWorldCoverage({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+  });
+  const initial = planner({
+    player: { x: 0, z: 0 },
+    residentCoverage,
+  });
+  const initialPolicy = policyPlan(initial);
+  const marginOwner = initialPolicy.requiredOwnerKeys.find(ownerKey => (
+    !initialPolicy.sourceSnapshot.visualExpected.includes(ownerKey)
+  ));
+  assert.ok(marginOwner, 'fixture requires one Resource-only owner');
+  let requestCount = 0;
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 2048,
+    requestOwner: request => {
+      requestCount += 1;
+      return Promise.resolve(Object.freeze({ ownerKey: request.ownerKey }));
+    },
+  });
+  t.after(() => stream.dispose());
+  stream.applyPlan({ plan: initial, policyPlan: initialPolicy });
+  await waitFor(() => stream.snapshot().backlog === 0, 'initial Resource pages did not settle');
+  assert.equal(stream.drainReadyOwnerPages({ limit: 2048 })
+    .some(page => page.ownerKey === marginOwner), true,
+  'the lazy Resource window may warm coarse pages without making them Visual Expected');
+  const cachedResource = stream.readyOwnerResource(marginOwner);
+  assert.ok(cachedResource,
+    'requirement metadata can read the already-consumed immutable ready cache entry');
+  assert.equal(stream.drainReadyOwnerPages({ limit: 2048 }).length, 0);
+  const requestsBeforeVisualEntry = requestCount;
+
+  const [chunkX, chunkZ] = marginOwner.split(',').map(Number);
+  const moved = planner({
+    player: { x: (chunkX + 0.5) * 16, z: (chunkZ + 0.5) * 16 },
+    stateRevision: 1,
+    residentCoverage,
+  });
+  const movedPolicy = policyPlan(moved);
+  assert.equal(movedPolicy.sourceSnapshot.visualExpected.includes(marginOwner), true);
+  stream.applyPlan({ plan: moved, policyPlan: movedPolicy });
+  const reAdmitted = stream.drainReadyOwnerPages({ limit: 2048 });
+  const replayed = reAdmitted.find(page => page.ownerKey === marginOwner);
+  assert.ok(replayed,
+    'Visual entry must replay the cached page through the one existing publication bridge');
+  assert.equal(replayed.schedulerRequired, true);
+  assert.equal(Number.isFinite(replayed.deadlineAtMs), true);
+  assert.equal(replayed.deadlineAtMs,
+    stream.ownerTimingSnapshot([marginOwner])[0].deadlineAtMs);
+  assert.equal(requestCount, requestsBeforeVisualEntry,
+    'cached visual entry must not regenerate the resource');
+  assert.equal(stream.readyOwnerResource(marginOwner), cachedResource,
+    'metadata lookup must not consume, clone, or requeue the cached resource');
+  assert.equal(stream.drainReadyOwnerPages({ limit: 2048 }).length, 0);
+  stream.applyPlan({ plan: moved, policyPlan: movedPolicy });
+  assert.equal(stream.drainReadyOwnerPages({ limit: 2048 }).length, 0,
+    'the unchanged visual set must not duplicate the replay');
+});
+
+test('diagonal visual ETA enters the rounded Chunk radius, not the expanded square corner', () => {
+  const entrySeconds = staticMovingPointChunkAabbEntrySeconds({
+    chunkX: 0,
+    chunkZ: 0,
+    player: { x: -20, z: -20 },
+    velocity: { x: 1, z: 1 },
+    radiusMeters: 10,
+  });
+  assert.ok(Math.abs(entrySeconds - (20 - 10 / Math.sqrt(2))) < 1e-9);
+  assert.ok(entrySeconds > 10,
+    'independently expanding both AABB axes would report the false square-corner ETA');
+});
+
+test('diagonal square-corner resource prefetch does not create a false visual Expected owner', () => {
+  const runtime = createCircularStaticStreamingPolicy({
+    kind: POLICY_KIND,
+    publicationGroup: 'test-static-publication',
+    maximumRequiredDistanceMeters: 16,
+    velocityPrefetch: Object.freeze({
+      enabled: true,
+      leadSeconds: 2,
+      maximumDistanceMeters: 64,
+      sampleIntervalSeconds: 0.5,
+    }),
+    distanceProfileResolver: () => Object.freeze({
+      exactDistanceMeters: 16,
+      horizonDistanceMeters: null,
+    }),
+  });
+  const plan = createPlanner(runtime.policy)({
+    player: { x: -32, z: -32 },
+    velocity: { x: 8, z: 8 },
+  });
+  const member = policyPlan(plan);
+  assert.ok(member.prefetchedOwnerKeys.includes('0,0'),
+    'resource prefetch may conservatively include the expanded square corner');
+  assert.equal(member.sourceSnapshot.visualExpected.includes('0,0'), false,
+    'visual Expected must use Euclidean distance to the owner AABB');
+  assert.equal(member.sourceSnapshot.visualExpected.every(ownerKey => (
+    member.requestOwnerKeys.includes(ownerKey)
+  )), true, 'every exact visual Expected owner must already belong to resource demand');
+});
+
+test('coverage cache never reuses an older sub-Chunk visual circle alignment', () => {
+  const runtime = createCircularStaticStreamingPolicy({
+    kind: POLICY_KIND,
+    publicationGroup: 'test-static-publication',
+    maximumRequiredDistanceMeters: 300,
+    velocityPrefetch: Object.freeze({
+      enabled: true,
+      leadSeconds: 4,
+      maximumDistanceMeters: 192,
+      sampleIntervalSeconds: 0.25,
+    }),
+    distanceProfileResolver: () => Object.freeze({
+      exactDistanceMeters: 300,
+      horizonDistanceMeters: null,
+    }),
+  });
+  const planner = createPlanner(runtime.policy);
+  const first = policyPlan(planner({
+    player: { x: 549.75, z: 430.4525 },
+    velocity: { x: 0, z: -47.85 },
+    stateRevision: 1,
+  }));
+  const shifted = policyPlan(planner({
+    player: { x: 557.918506, z: 427.068994 },
+    velocity: { x: 0, z: -47.85 },
+    stateRevision: 2,
+  }));
+  assert.equal(first.sourceSnapshot.visualExpected.includes('15,11'), true,
+    'the earlier north corridor reaches the lateral owner');
+  assert.equal(shifted.sourceSnapshot.visualExpected.includes('15,11'), false,
+    'same start/end owner keys cannot reuse a stale lateral circle after regeneration');
+});
+
+test('boot owners use staged fill while entering velocity owners expose AABB ETA and queue age', async t => {
+  const runtime = createPolicyRuntime();
+  const planner = createPlanner(runtime.policy);
+  let now = 10_000;
+  const pending = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 1,
+    clock: () => now,
+    requestOwner: request => new Promise(resolve => pending.push({ request, resolve })),
+  });
+  t.after(() => stream.dispose());
+  const boot = planner({ player: { x: 0, z: 0 }, velocity: { x: 0, z: 0 } });
+  stream.applyPlan({ plan: boot, policyPlan: policyPlan(boot) });
+  const bootTiming = stream.ownerTimingSnapshot(policyPlan(boot).requiredOwnerKeys);
+  assert.equal(bootTiming.length, policyPlan(boot).requiredOwnerKeys.length);
+  assert.equal(bootTiming.every(value => value.cohort === 'boot'
+    && value.deadlineAtMs === null), true);
+
+  const moving = planner({ player: { x: 0, z: 0 }, velocity: { x: 32, z: 0 } });
+  stream.applyPlan({ plan: moving, policyPlan: policyPlan(moving) });
+  const entering = policyPlan(moving).prefetchedOwnerKeys.find(ownerKey => {
+    if (policyPlan(boot).requestOwnerKeys.includes(ownerKey)) return false;
+    const [candidate] = stream.ownerTimingSnapshot([ownerKey]);
+    return candidate?.firstPossibleVisibleAt > moving.generatedAtMs;
+  });
+  assert.ok(entering);
+  const [timing] = stream.ownerTimingSnapshot([entering]);
+  assert.equal(timing.cohort, 'steady');
+  assert.ok(timing.firstPossibleVisibleAt > moving.generatedAtMs);
+  assert.equal(timing.deadlineAtMs, timing.firstPossibleVisibleAt);
+
+  now += 250;
+  const aged = stream.snapshot();
+  assert.ok(aged.oldestPendingTaskAgeMs >= 250);
+  assert.ok(aged.oldestAdmissionCursorAgeMs >= 250);
+  assert.ok(aged.maximumPendingTaskAgeMs >= aged.oldestPendingTaskAgeMs);
+  assert.ok(aged.maximumAdmissionCursorAgeMs >= aged.oldestAdmissionCursorAgeMs);
+  for (const handle of pending) handle.resolve(null);
+});
+
+test('a boot identity that leaves visual Expected receives exact steady ETA on re-entry', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 1,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  t.after(() => stream.dispose());
+
+  const boot = planner({ player: { x: 8, z: 8 }, velocity: { x: 0, z: 0 } });
+  stream.applyPlan({ plan: boot, policyPlan: policyPlan(boot) });
+  const ownerKey = '0,0';
+  assert.ok(policyPlan(boot).sourceSnapshot.visualRequired.includes(ownerKey));
+  assert.equal(stream.ownerTimingSnapshot([ownerKey])[0]?.cohort, 'boot');
+
+  const left = planner({ player: { x: 80, z: 8 }, velocity: { x: 0, z: 0 } });
+  stream.applyPlan({ plan: left, policyPlan: policyPlan(left) });
+  assert.equal(policyPlan(left).sourceSnapshot.visualExpected.includes(ownerKey), false);
+  assert.equal(stream.ownerTimingSnapshot([ownerKey]).length, 0,
+    'leaving resource demand prunes the old boot timing');
+
+  const reentering = planner({
+    player: { x: 64, z: 8 },
+    velocity: { x: -16, z: 0 },
+  });
+  stream.applyPlan({ plan: reentering, policyPlan: policyPlan(reentering) });
+  assert.equal(policyPlan(reentering).sourceSnapshot.visualRequired.includes(ownerKey), false);
+  assert.equal(policyPlan(reentering).sourceSnapshot.visualExpected.includes(ownerKey), true);
+  const [timing] = stream.ownerTimingSnapshot([ownerKey]);
+  assert.equal(timing.cohort, 'steady');
+  assert.ok(timing.firstPossibleVisibleAt > reentering.generatedAtMs);
+  assert.equal(timing.deadlineAtMs, timing.firstPossibleVisibleAt);
+  assert.equal(timing.required, false);
+});
+
+test('finite-deadline entering owner bypasses a huge boot cursor through the existing queue', async () => {
+  const runtime = createPolicyRuntime();
+  const planner = createPlanner(runtime.policy);
+  let now = 20_000;
+  let cancelCount = 0;
+  const requests = [];
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 4,
+    clock: () => now,
+    requestOwner: request => {
+      let resolve;
+      let settled = false;
+      const promise = new Promise(nextResolve => { resolve = nextResolve; });
+      const operation = {
+        request,
+        complete: value => {
+          if (settled) return false;
+          settled = true;
+          resolve(value);
+          return true;
+        },
+      };
+      requests.push(operation);
+      return {
+        promise,
+        cancel: () => {
+          if (settled) return false;
+          cancelCount += 1;
+          return operation.complete(null);
+        },
+      };
+    },
+  });
+
+  const boot = planner({ player: { x: 0, z: 0 }, velocity: { x: 0, z: 0 } });
+  const bootMember = policyPlan(boot);
+  assert.ok(bootMember.requestOwnerKeys.length > 4, 'test requires a staged boot cursor');
+  stream.applyPlan({ plan: boot, policyPlan: bootMember });
+  assert.equal(requests.length, 4);
+  assert.equal(requests.every(({ request }) => request.coverageRequired
+    && request.required
+    && request.priority === 3
+    && request.deadlineAtMs === null), true,
+  'boot visual Expected owners must be staged coarse-existence work without fake deadlines');
+  assert.ok(stream.snapshot().pendingAdmissionCount > 0);
+
+  now += 10;
+  const moving = planner({ player: { x: 0, z: 0 }, velocity: { x: 32, z: 0 } });
+  const movingMember = policyPlan(moving);
+  stream.applyPlan({ plan: moving, policyPlan: movingMember });
+  const bootOwnerKeys = new Set(bootMember.requestOwnerKeys);
+  const finiteEnteringTimings = stream.ownerTimingSnapshot(movingMember.requestOwnerKeys)
+    .filter(timing => !bootOwnerKeys.has(timing.ownerKey)
+      && Number.isFinite(timing.deadlineAtMs));
+  assert.ok(finiteEnteringTimings.length > 0);
+  assert.equal(requests.length, 4,
+    'an active boot request must not be cancelled to make physical room');
+  assert.equal(cancelCount, 0);
+
+  requests[0].complete(Object.freeze({ ownerKey: requests[0].request.ownerKey }));
+  await waitFor(() => requests.length === 5,
+    'entering owner did not take the next bounded admission slot');
+  const next = requests[4].request;
+  assert.equal(bootOwnerKeys.has(next.ownerKey), false,
+    'the next slot was consumed by the remaining boot cursor');
+  assert.equal(next.required, true,
+    'finite ETA must enter the coordinator coarse-existence class');
+  assert.equal(next.coverageRequired, false,
+    'scheduler promotion must not mutate the Expected required denominator');
+  assert.equal(next.priority, 3);
+  assert.ok(Number.isFinite(next.deadlineAtMs));
+  assert.equal(cancelCount, 0);
+  assert.ok(stream.snapshot().pendingAdmissionCount > 0,
+    'boot staged fill must continue after deadline-bearing admission');
+
+  await stream.dispose();
 });
 
 test('incremental apply classifies and sorts only entering policy-owner identities', async t => {

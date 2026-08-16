@@ -26,10 +26,13 @@ test('canonical Far Tree policy carries the atmospheric handoff to each preset F
 
     assert.equal(tree.farEntry, tree.atmosphericFade);
     assert.equal(tree.farEntry.maximum <= tree.visibilityMeters, true);
+    const outerFadeWidth = q6(Math.max(4, 8 * renderDistance.fogFarMeters / 300));
     assert.deepEqual(tree.farFade, {
-      minimum: q6(Math.max(tree.farEntry.maximum, renderDistance.fogFarMeters * 0.92)),
-      maximum: q6(renderDistance.fogFarMeters + 4),
+      minimum: q6(renderDistance.fogFarMeters - outerFadeWidth / 2),
+      maximum: q6(renderDistance.fogFarMeters + outerFadeWidth / 2),
     });
+    assert.equal(tree.farFade, tree.farDensity.outerFade,
+      'the canonical Tree density and geometry share one outer Fog fade');
     assert.equal(tree.farFade.minimum >= tree.farEntry.maximum, true);
     assert.equal(tree.farFade.minimum < tree.farFade.maximum, true);
     assert.equal(tree.farVisibilityMeters, renderDistance.fogFarMeters);

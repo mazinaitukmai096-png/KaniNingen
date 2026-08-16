@@ -274,6 +274,7 @@ class DodecahedronGeometry extends Geometry {}
 class BufferGeometry extends Geometry {}
 class CylinderGeometry extends Geometry {}
 class Float32BufferAttribute { constructor(values, size) { this.values = values; this.size = size; } }
+class Uint32BufferAttribute { constructor(values, size) { this.values = values; this.size = size; } }
 class InstancedBufferAttribute extends Float32BufferAttribute {}
 class Material {
   constructor(options = {}) { this.options = options; Object.assign(this, options); }
@@ -338,6 +339,7 @@ const FakeThree = {
   BufferGeometry,
   CylinderGeometry,
   Float32BufferAttribute,
+  Uint32BufferAttribute,
   InstancedBufferAttribute,
   MeshLambertMaterial,
   LineBasicMaterial,
@@ -2414,12 +2416,20 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.equal(existsSync(resolve(repoRoot, 'src/infinite-world/sandbox-main.js')), true);
   assert.doesNotMatch(entry, /await\s+(?:bootPromise|waitForSandboxDom)|waitForSandboxDom/);
   assert.match(boot, /new ChunkDataService\(/);
+  assert.match(boot, /createRendererGpuAttributeMirror\(\)/,
+    'normal startup must shadow renderer-confirmed GPU upload ranges');
+  assert.match(boot, /beginFrame\(\{[\s\S]{0,120}?frameSequence:[\s\S]{0,120}?scene,/,
+    'normal rendering captures dirty attribute ranges before renderer.render clears them');
+  assert.doesNotMatch(boot, /gpu\?\.array\s*\?\?|gpu\?\.data\?\.array/,
+    'normal drawable proof cannot depend on private WebGLAttributes buffer contents');
   assert.match(boot, /ownerGenerationCoordinator = createOwnerGenerationCoordinator\(/,
     'Full and Presentation must enter one main-side owner generation queue');
   assert.equal((boot.match(/coordinator:\s*ownerGenerationCoordinator/g) ?? []).length, 2,
     'both resource services must share the same global coordinator');
   assert.doesNotMatch(boot, /presentationResidentRequests|requestKind:\s*'resident'/,
     'boot must not enqueue all 1,757 Presentation resources as required work');
+  assert.doesNotMatch(boot, /invalidateNaturalStreamingCoverage\(`start-run:/,
+    'starting play must retain renderer-proven coarse pages warmed by the title loop');
   assert.doesNotMatch(boot, /prefetchCoverage\.presentationView|centerChunkX:\s*corridorEndpoint\.chunkX/,
     'Terrain velocity prediction must not create a second 368 m Presentation coverage request');
   assert.match(boot, /createInlineChunkGeneratorTransport/);

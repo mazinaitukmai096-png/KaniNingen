@@ -7,6 +7,9 @@ import {
   PRODUCTION_FRAME_MS,
   PRODUCTION_FRAME_SECONDS,
   bootProductionSchedulingHarness,
+  productionHarnessGpuUploadContractSnapshot,
+  productionHarnessResidentSafetyMetrics,
+  productionHarnessTraverseVisitCount,
 } from './helpers/infinite-world-production-scheduling-harness.mjs';
 
 const MAX_SPRINT_METERS_PER_SECOND = 47.85;
@@ -38,7 +41,9 @@ function assertStopped(before, after, message) {
   assert.ok(magnitude(displacement(before, after)) <= POSITION_EPSILON_METERS, message);
 }
 
-const naturalDensityAttributes = harness => harness.gpuMirrorSnapshot().filter(attribute => (
+const naturalDensityAttributes = harness => harness.gpuMirrorSnapshot({
+  attributeName: 'w8NaturalDensityRank',
+}).filter(attribute => (
   attribute.attributeName === 'w8NaturalDensityRank'
 ));
 
@@ -67,6 +72,13 @@ function assertNaturalDensityGpuMirrors(harness, phase) {
   return densityAttributes;
 }
 
+const gpuMirrorMismatchCount = attributes => attributes.filter(attribute => (
+  attribute.gpuArray === null
+    || attribute.gpuVersion !== attribute.cpuVersion
+    || attribute.gpuArray.length !== attribute.cpuArray.length
+    || attribute.gpuArray.some((value, index) => !Object.is(value, attribute.cpuArray[index]))
+)).length;
+
 
 function assertVisualContinuityReceiptState(snapshot, phase) {
   const continuity = snapshot.visualContinuity ?? null;
@@ -77,7 +89,7 @@ function assertVisualContinuityReceiptState(snapshot, phase) {
   assert.ok(continuity.coarseDrawableCount > 0,
     `${phase}: policy-owned Presentation pages must reach CoarseDrawable`);
   assert.ok(continuity.detailDrawableCount > 0,
-    `${phase}: Full owners must reach DetailDrawable independently of coarse availability`);
+    `${phase}: Full owners must reach DetailDrawable after the coarse contract is complete`);
   const nearOwners = continuity.owners.filter(owner => (
     owner.nearRepresentationAvailableAt !== null
   ));
@@ -100,6 +112,57 @@ function assertMaxSprint(step, name) {
 const ownerOf = position => Object.freeze({
   chunkX: Math.floor(position.x / LOGICAL_CHUNK_SIZE_METERS),
   chunkZ: Math.floor(position.z / LOGICAL_CHUNK_SIZE_METERS),
+});
+
+test('production harness scene traversal visits each child once', () => {
+  assert.equal(productionHarnessTraverseVisitCount(), 1);
+});
+
+test('production harness GPU mirrors follow Three r160 object-update eligibility', () => {
+  assert.deepEqual(productionHarnessGpuUploadContractSnapshot(), {
+    zeroCountGeometryUploaded: true,
+    zeroCountInstanceMatrixUploaded: true,
+    materialHiddenGeometryUploaded: true,
+    materialHiddenIndexUploaded: false,
+    hierarchyHiddenGeometryUploaded: false,
+    visibleIndexUploaded: true,
+    auditIncludesZeroCount: true,
+    auditIncludesMaterialHiddenGeometry: true,
+    auditIncludesMaterialHiddenIndex: false,
+    auditIncludesHierarchyHidden: false,
+    auditedMismatchCount: 0,
+  });
+});
+
+test('production release gate excludes obsolete non-resident prefetch cancellation', () => {
+  const metrics = productionHarnessResidentSafetyMetrics({
+    chunkDataService: {
+      counts: {
+        cancelledOperations: 3,
+        protectedOwnerEvictions: 0,
+      },
+    },
+    runtime: {
+      terrainReady: {
+        residentWorld: {
+          requiredCancellationByPrefetch: 0,
+          coverageMiss: 0,
+        },
+        chunkDataSubscriberDiagnostics: {
+          chunkDataDuplicateRequests: 0,
+          chunkDataSameOwnerRerequestCount: 1,
+        },
+      },
+    },
+  });
+  assert.deepEqual(metrics, {
+    residentRequiredCancellationCount: 0,
+    protectedOwnerEvictionCount: 0,
+    concurrentDuplicateRerequestCount: 0,
+    coverageMissCount: 0,
+    allCancellationCount: 3,
+    historicalSameOwnerRerequestCount: 1,
+  });
 });
 
 test('full production boot scheduling stays continuous through MAX sprint direction changes', {
@@ -150,8 +213,19 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.ok(booted.staticObjectStreaming.backlog <= 4,
       'the full Natural coverage must remain an immutable cursor, not materialized tasks');
     assert.equal(booted.visualContinuity.expectedOwnerCount,
-      booted.staticObjectStreaming.requiredOwnerCount,
-      'lazy admission must preserve the full immutable Expected denominator');
+      booted.staticObjectStreaming.visualExpectedOwnerCount,
+      'lazy admission must preserve the true visual Expected denominator');
+    assert.equal(booted.visualContinuity.expectedOwnerCount,
+      booted.staticObjectStreaming.bootCohortOwnerCount,
+      'stationary boot must stage the true visual-current cohort');
+    assert.ok(booted.visualContinuity.expectedOwnerCount
+      < booted.staticObjectStreaming.requiredOwnerCount,
+    'the 16 m resource prewarm margin must stay outside visual Expected');
+    assert.ok(booted.staticObjectStreaming.coarsePrewarmOwnerCount > 0);
+    assert.ok(booted.staticObjectStreaming.visualExpectedOwnerCount
+      + booted.staticObjectStreaming.coarsePrewarmOwnerCount
+      < booted.staticObjectStreaming.requiredOwnerCount,
+    'the coarse safety shell must not promote the complete 368 m Resource window');
     assert.deepEqual(new Set(booted.staticObjectStreaming.policyKinds), new Set([
       'natural-tree',
       'natural-bush',
@@ -178,7 +252,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
 
     const initialPosition = logicalPosition(booted);
     await harness.advanceFrame({ hostDelayMs: 2 });
-    assertStopped(initialPosition, logicalPosition(harness.snapshot()),
+    assertStopped(initialPosition, harness.logicalPlayerPosition(),
       'initial no-input frame must not move Player');
 
     let warmed = await harness.advanceUntil(snapshot => (
@@ -207,17 +281,82 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.ok(warmed.presentation.visibleCanonicalTreeCount > 0,
       'canonical Natural records must arrive through policy-owned Presentation pages');
     const warmedDensityAttributes = assertNaturalDensityGpuMirrors(harness, 'warm');
+    diagnose(JSON.stringify({
+      continuityCounts: {
+        expected: warmed.visualContinuity?.expectedOwnerCount,
+        coarse: warmed.visualContinuity?.coarseDrawableCount,
+        detail: warmed.visualContinuity?.detailDrawableCount,
+      },
+      resolvedCoarseRequirements:
+        warmed.visualContinuity?.coarseComponentMetrics?.requirementsResolvedOwnerCount,
+      missingForest:
+        warmed.visualContinuity?.coarseComponentMetrics?.forest?.missingCount,
+    }));
     assertVisualContinuityReceiptState(warmed, 'warm');
+
+    const bootFilled = await harness.waitForBootCohortCoarse({
+      maximumFrames: 6_000,
+      hostDelayMs: 2,
+      checkIntervalFrames: 30,
+    });
+    assert.equal(harness.bootCohort.expectedOwnerCount,
+      booted.visualContinuity.expectedOwnerCount,
+      'the immutable boot cohort must equal the boot Expected denominator');
+    assert.equal(bootFilled.visualContinuity.coarseDrawableCount,
+      harness.bootCohort.expectedOwnerCount,
+      'the explicit test observation must wait for every boot Expected owner to become CoarseDrawable');
+    assert.equal(
+      bootFilled.visualContinuity.coarseComponentMetrics.requirementsUnresolvedOwnerCount,
+      0,
+      'full boot fill must resolve every owner coarse requirement summary',
+    );
+    for (const component of ['terrain', 'structure', 'forest']) {
+      const metrics = bootFilled.visualContinuity.coarseComponentMetrics[component];
+      assert.equal(metrics.missingCount, 0,
+        `${component}: immutable boot cohort must have zero missing coarse components`);
+      assert.equal(metrics.deadlineMissCount, 0,
+        `${component}: immutable boot cohort must have zero coarse component deadline misses`);
+      assert.equal(
+        bootFilled.visualContinuity.currentReceiptCoarseComponentMetrics[component].missingCount,
+        0,
+        `${component}: immutable boot cohort must be present in the latest completed receipt`,
+      );
+    }
+    const coarseSafetyFilled = await harness.advanceUntil(snapshot => (
+      snapshot.staticObjectStreaming.coarsePrewarmOwnerCount > 0
+        && snapshot.presentation.staticTreeCoarsePrewarmResidentOwnerCount
+          === snapshot.staticObjectStreaming.coarsePrewarmOwnerCount
+        && snapshot.presentation.staticTreeCoarsePrewarmPublishedOwnerCount
+          === snapshot.staticObjectStreaming.coarsePrewarmOwnerCount
+    ), {
+      maximumFrames: 300,
+      hostDelayMs: 2,
+      checkIntervalFrames: 30,
+      message: 'the 300-322.63 m coarse safety shell did not reach the existing publisher',
+    });
+    await harness.advanceFrame({ hostDelayMs: 2 });
+    warmed = harness.snapshot();
+    assert.equal(
+      coarseSafetyFilled.presentation.staticTreeCoarsePrewarmPublishedOwnerCount,
+      coarseSafetyFilled.staticObjectStreaming.coarsePrewarmOwnerCount,
+    );
+    assertNaturalDensityGpuMirrors(harness, 'coarse-safety-receipt');
+    harness.resetReleaseGateObservation();
     diagnose(`static Natural warmed (${warmedDensityAttributes.length} density attributes)`);
 
-    async function runInputFrame(name, codes) {
+    async function runInputFrame(name, codes, frameCount = 6) {
       harness.releaseAll();
       harness.press(...codes);
-      const before = logicalPosition(harness.snapshot());
-      await harness.advanceFrame({ hostDelayMs: 2 });
-      const after = logicalPosition(harness.snapshot());
+      const before = harness.logicalPlayerPosition();
+      let previous = before;
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        await harness.advanceFrame({ hostDelayMs: 2 });
+        const current = harness.logicalPlayerPosition();
+        assertMaxSprint(displacement(previous, current), `${name} frame ${frame + 1}`);
+        previous = current;
+      }
+      const after = harness.logicalPlayerPosition();
       const step = displacement(before, after);
-      assertMaxSprint(step, name);
       return Object.freeze({ before, after, step, direction: normalized(step) });
     }
 
@@ -240,25 +379,149 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.ok(reversalDensityAttributes.length >= warmedDensityAttributes.length,
       'reversal must not lose rendered Natural density attribute mirrors');
     assertVisualContinuityReceiptState(harness.snapshot(), 'reversal');
+    for (const [index, codes] of [
+      ['KeyW', 'ShiftLeft'],
+      ['KeyD', 'ShiftLeft'],
+      ['KeyS', 'ShiftLeft'],
+      ['KeyA', 'ShiftLeft'],
+      ['KeyW', 'KeyD', 'ShiftLeft'],
+      ['KeyS', 'KeyA', 'ShiftLeft'],
+    ].entries()) {
+      await runInputFrame(`rapid direction ${index + 1}`, codes, 2);
+    }
     diagnose('initial/straight/diagonal/90/reversal input scenarios completed');
 
     harness.releaseAll();
-    const stoppedBefore = logicalPosition(harness.snapshot());
+    const stoppedBefore = harness.logicalPlayerPosition();
     await harness.advanceFrame({ hostDelayMs: 2 });
-    assertStopped(stoppedBefore, logicalPosition(harness.snapshot()),
+    assertStopped(stoppedBefore, harness.logicalPlayerPosition(),
       'stop frame must preserve Player position');
 
+    const yawBaseline = await harness.waitForStrictCoarseFill({
+      maximumFrames: 600,
+      hostDelayMs: 2,
+      checkIntervalFrames: 30,
+      requireVisualRequiredEqualsExpected: true,
+      message: 'no-input yaw control could not reach a complete visual Expected baseline',
+    });
+    const preYawDeadlineMisses = yawBaseline.visualContinuity.owners
+      .filter(owner => owner.state !== 'Retiring' && owner.deadlineMiss)
+      .map(owner => ({
+        ownerKey: owner.ownerKey,
+        expectedAt: owner.expectedAt,
+        firstPossibleVisibleAt: owner.firstPossibleVisibleAt,
+        deadlineAtMs: owner.deadlineAtMs,
+        coarseDrawableAt: owner.coarseDrawableAt,
+        deadlineMissMs: owner.deadlineMissMs,
+        terrainDrawableAt: owner.terrainDrawableAt,
+        structureCoarseDrawableAt: owner.structureCoarseDrawableAt,
+        forestCoarseDrawableAt: owner.forestCoarseDrawableAt,
+        requiredForestStableIds: owner.requiredForestStableIds,
+        drawnForestStableIds: owner.drawnForestStableIds,
+      }));
+    assert.equal(yawBaseline.visualContinuity.deadlineMissCount, 0,
+      `pre-yaw steady visual baseline must retain zero coarse deadline misses: ${JSON.stringify(
+        preYawDeadlineMisses,
+      )}`);
+    for (const component of ['terrain', 'structure', 'forest']) {
+      assert.equal(
+        yawBaseline.visualContinuity.coarseComponentMetrics[component].deadlineMissCount,
+        0,
+        `${component}: pre-yaw steady baseline must retain zero deadline misses`,
+      );
+    }
+
+    const cameraControlBefore = harness.snapshot();
+    await harness.advanceFrames(2, { hostDelayMs: 2 });
     const cameraOnlyBefore = harness.snapshot();
+    const cameraControlDeltas = {
+      ownerRequests: (cameraOnlyBefore.ownerGeneration.counts?.requested ?? 0)
+        - (cameraControlBefore.ownerGeneration.counts?.requested ?? 0),
+      presentationRequests: (cameraOnlyBefore.presentationOwnerData.counts?.requests ?? 0)
+        - (cameraControlBefore.presentationOwnerData.counts?.requests ?? 0),
+      canonicalCompose: (cameraOnlyBefore.presentation.canonicalComposeCount ?? 0)
+        - (cameraControlBefore.presentation.canonicalComposeCount ?? 0),
+    };
+    const cameraOnlyGenerationBefore = {
+      staticPlans: cameraOnlyBefore.staticObjectStreaming.counts.plans,
+      transitionGeneration: cameraOnlyBefore.runtime.transitionContract.generation,
+      terrainCommits: cameraOnlyBefore.presentation.localTerrainCommitCount,
+      ownerRequests: cameraOnlyBefore.ownerGeneration.counts?.requested ?? 0,
+      presentationRequests: cameraOnlyBefore.presentationOwnerData.counts?.requests ?? 0,
+      canonicalCompose: cameraOnlyBefore.presentation.canonicalComposeCount ?? 0,
+      staticCoverageGeneration: cameraOnlyBefore.staticObjectStreaming.coverageGeneration,
+      staticPlanRevision: cameraOnlyBefore.staticObjectStreaming.planRevision,
+      staticLatestPlanId: cameraOnlyBefore.staticObjectStreaming.latestPlanId,
+      staticNaturalCoverageApplyCount:
+        cameraOnlyBefore.presentation.staticNaturalCoverageApplyCount,
+    };
     harness.mouseMove({ movementX: 120, movementY: 0 });
+    await harness.advanceFrame({ hostDelayMs: 2 });
+    const sampleYawAfter = harness.snapshot();
+    const yawPerMouseUnit = Math.abs(
+      sampleYawAfter.experience.camera.yaw - cameraOnlyBefore.experience.camera.yaw
+    ) / 120;
+    harness.mouseMove({ movementX: (Math.PI * 2) / yawPerMouseUnit - 120, movementY: 0 });
     await harness.advanceFrame({ hostDelayMs: 2 });
     const cameraOnlyAfter = harness.snapshot();
     assertStopped(logicalPosition(cameraOnlyBefore), logicalPosition(cameraOnlyAfter),
       'camera-only yaw must not move Player');
-    assert.notEqual(cameraOnlyAfter.experience.camera.yaw, cameraOnlyBefore.experience.camera.yaw,
-      'the camera-only scenario must pass through the production mouse input handler');
+    const cameraYawChange = cameraOnlyAfter.experience.camera.yaw
+      - cameraOnlyBefore.experience.camera.yaw;
+    assertNear(Math.abs(cameraYawChange), Math.PI * 2, 1e-10,
+      'the camera-only scenario must execute a true 2π yaw through production mouse input');
     assert.equal(cameraOnlyAfter.staticObjectStreaming.counts.plans,
       cameraOnlyBefore.staticObjectStreaming.counts.plans,
       'camera-only yaw must not trigger a velocity-prefetch coverage request');
+    const cameraYawTriggeredGeneration = (
+      cameraOnlyAfter.staticObjectStreaming.counts.plans
+        - cameraOnlyGenerationBefore.staticPlans
+    ) + (
+      cameraOnlyAfter.runtime.transitionContract.generation
+        - cameraOnlyGenerationBefore.transitionGeneration
+    ) + (
+      cameraOnlyAfter.presentation.localTerrainCommitCount
+        - cameraOnlyGenerationBefore.terrainCommits
+    );
+    assert.equal(cameraYawTriggeredGeneration, 0,
+      'camera-only yaw triggered generation must remain exactly zero');
+    const cameraYawOwnerRequestDelta = (cameraOnlyAfter.ownerGeneration.counts?.requested ?? 0)
+      - cameraOnlyGenerationBefore.ownerRequests;
+    const cameraYawPresentationRequestDelta =
+      (cameraOnlyAfter.presentationOwnerData.counts?.requests ?? 0)
+      - cameraOnlyGenerationBefore.presentationRequests
+      ;
+    const cameraYawComposeDelta = (cameraOnlyAfter.presentation.canonicalComposeCount ?? 0)
+      - cameraOnlyGenerationBefore.canonicalCompose;
+    const cameraYawRawDeltas = {
+      ownerRequests: cameraYawOwnerRequestDelta,
+      presentationRequests: cameraYawPresentationRequestDelta,
+      canonicalCompose: cameraYawComposeDelta,
+    };
+    assert.equal(cameraOnlyAfter.staticObjectStreaming.coverageGeneration,
+      cameraOnlyGenerationBefore.staticCoverageGeneration,
+      'camera yaw must not create a new static coverage generation');
+    assert.equal(cameraOnlyAfter.staticObjectStreaming.planRevision,
+      cameraOnlyGenerationBefore.staticPlanRevision,
+      'camera yaw must not revise the static plan');
+    assert.equal(cameraOnlyAfter.staticObjectStreaming.latestPlanId,
+      cameraOnlyGenerationBefore.staticLatestPlanId,
+      'camera yaw must not replace the static world plan');
+    assert.equal(cameraOnlyAfter.presentation.staticNaturalCoverageApplyCount,
+      cameraOnlyGenerationBefore.staticNaturalCoverageApplyCount,
+      'camera yaw must not apply a new Natural coverage plan');
+    diagnose(JSON.stringify({
+      camera360Yaw: {
+        yawChangeRadians: cameraYawChange,
+        staticPlanDelta: cameraOnlyAfter.staticObjectStreaming.counts.plans
+          - cameraOnlyBefore.staticObjectStreaming.counts.plans,
+        rawOwnerRequestDelta: cameraYawOwnerRequestDelta,
+        rawPresentationRequestDelta: cameraYawPresentationRequestDelta,
+        rawComposeDelta: cameraYawComposeDelta,
+        noInputControlDeltas: cameraControlDeltas,
+        rawDeltasIncludeBackgroundStagedFill: true,
+      },
+    }));
 
     const restart = await runInputFrame('restart after camera yaw', ['KeyW', 'ShiftLeft']);
     const yaw = cameraOnlyAfter.experience.camera.yaw;
@@ -271,19 +534,19 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       chunkX: booted.runtime.centerChunkX,
       chunkZ: booted.runtime.centerChunkZ,
     });
-    let crossedOwner = ownerOf(logicalPosition(harness.snapshot()));
+    let crossedOwner = ownerOf(harness.logicalPlayerPosition());
     for (let frame = 0; frame < 48
       && crossedOwner.chunkX === centerAtBoot.chunkX
       && crossedOwner.chunkZ === centerAtBoot.chunkZ; frame += 1) {
       await harness.advanceFrame({ hostDelayMs: 2 });
-      crossedOwner = ownerOf(logicalPosition(harness.snapshot()));
+      crossedOwner = ownerOf(harness.logicalPlayerPosition());
     }
     harness.releaseAll();
     assert.notDeepEqual(crossedOwner, centerAtBoot,
       'actual MAX sprint must cross a logical Chunk boundary without position injection');
     diagnose(`MAX sprint crossed into ${crossedOwner.chunkX},${crossedOwner.chunkZ}`);
 
-    const settled = await harness.advanceUntil(snapshot => (
+    let settled = await harness.advanceUntil(snapshot => (
       snapshot.runtime.centerChunkX === crossedOwner.chunkX
       && snapshot.runtime.centerChunkZ === crossedOwner.chunkZ
       && snapshot.runtime.streaming.transitionPending === false
@@ -293,6 +556,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     ), {
       maximumFrames: 240,
       hostDelayMs: 3,
+      checkIntervalFrames: 12,
       message: 'real Worker/CDS/Terrain transition did not settle at the Player owner',
     });
 
@@ -314,6 +578,13 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.ok(settled.staticObjectStreaming.backlog <= 4);
     assert.equal(settled.chunkDataService.transport.fallbackOccurred, false);
     diagnose('movement-driven Worker/CDS/Terrain transition settled');
+
+    settled = await harness.waitForStrictCoarseFill({
+      maximumFrames: 1_200,
+      hostDelayMs: 2,
+      checkIntervalFrames: 30,
+      message: 'movement-driven Expected cohort did not finish strict aggregate coarse fill',
+    });
 
     const schedulerSnapshot = harness.scheduler.snapshot();
     for (let index = 1; index < schedulerSnapshot.frameTimestamps.length; index += 1) {
@@ -339,6 +610,145 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       );
     }
 
+    const releaseGate = harness.releaseGateMetrics();
+    const gpuAttributes = harness.gpuMirrorSnapshot();
+    const releaseProof = Object.freeze({
+      gpuAttributeCount: gpuAttributes.length,
+      gpuMismatchCount: gpuMirrorMismatchCount(gpuAttributes),
+      scanErrorCount: settled.visualContinuity.lastReceiptPresentation.scanErrorCount,
+      presentationResidentCancellation:
+        settled.presentationOwnerData.counts.cancelledOperations,
+      fullResidentCancellation:
+        releaseGate.residentSafety.residentRequiredCancellationCount,
+      fullAllCancellationDiagnostic:
+        releaseGate.residentSafety.allCancellationCount,
+      presentationResidentEviction:
+        settled.presentationOwnerData.counts.protectedOwnerEvictions,
+      fullResidentEviction:
+        releaseGate.residentSafety.protectedOwnerEvictionCount,
+      sameOwnerDuplicateRerequest:
+        releaseGate.residentSafety.concurrentDuplicateRerequestCount,
+      sameOwnerHistoricalRerequestDiagnostic:
+        releaseGate.residentSafety.historicalSameOwnerRerequestCount,
+      fullResidentCoverageMiss:
+        releaseGate.residentSafety.coverageMissCount,
+      terrainHole: settled.presentation.visibleTerrainHoleFrame,
+      collisionMiss: settled.terrainCoverageDiagnostics.collisionCoverageMiss,
+      movementBlock: settled.terrainCoverageDiagnostics.movementBlockedByTerrain,
+    });
+    assert.equal(releaseProof.gpuMismatchCount, 0,
+      `renderer-eligible GPU mirrors must match exactly: ${JSON.stringify(releaseProof)}`);
+    assert.equal(releaseProof.scanErrorCount, 0,
+      'the completed Visual Continuity receipt scan must have zero errors');
+    assert.equal(releaseProof.presentationResidentCancellation, 0,
+      'Presentation resident generation must not be cancelled');
+    assert.equal(releaseProof.fullResidentCancellation, 0,
+      'Full resident generation must not be cancelled');
+    assert.equal(releaseProof.presentationResidentEviction, 0,
+      'Presentation resident owners must not be evicted');
+    assert.equal(releaseProof.fullResidentEviction, 0,
+      'Full resident owners must not be evicted');
+    assert.equal(releaseProof.sameOwnerDuplicateRerequest, 0,
+      'Full resident owners must not be requested twice during the same transition');
+    assert.equal(releaseProof.fullResidentCoverageMiss, 0,
+      'Full resident coverage must not miss a required owner');
+    assert.equal(releaseProof.terrainHole, 0,
+      'completed production frames must not expose a visible Terrain hole');
+    assert.equal(releaseProof.collisionMiss, 0,
+      'movement must not miss collision Terrain coverage');
+    assert.equal(releaseProof.movementBlock, 0,
+      'Terrain readiness must not block movement');
+    assert.equal(releaseGate.schemaVersion,
+      'infinite-world-production-release-gate-metrics-1');
+    assert.deepEqual(releaseGate.lifecycle, {
+      ...releaseGate.lifecycle,
+      expected: settled.visualContinuity.expectedOwnerCount,
+      coarse: settled.visualContinuity.coarseDrawableCount,
+      detail: settled.visualContinuity.detailDrawableCount,
+      coarseMiss: settled.visualContinuity.deadlineMissCount,
+      oldestCoarseMissingMs: settled.visualContinuity.oldestMissingAgeMs,
+    }, 'release gate lifecycle counts must be the strict receipt-backed registry values');
+    assert.equal(releaseGate.lifecycle.coarseMiss, 0,
+      `finite MAX sprint scenario must have zero coarse drawable deadline misses: ${JSON.stringify(
+        releaseGate,
+      )}`);
+    assert.deepEqual(releaseGate.coarseComponents,
+      settled.visualContinuity.coarseComponentMetrics,
+      'release gate component metrics must be the production registry snapshot');
+    assert.deepEqual(releaseGate.currentCoarseComponents,
+      settled.visualContinuity.currentReceiptCoarseComponentMetrics,
+      'release gate must expose the latest completed-receipt component coverage');
+    assert.equal(releaseGate.coarseComponents.terrain.missingCount, 0,
+      'Terrain coarse coverage must be receipt-backed for every Expected owner');
+    assert.equal(releaseGate.coarseComponents.requirementsUnresolvedOwnerCount, 0,
+      'release gate must have zero unresolved coarse requirement summaries');
+    for (const component of ['terrain', 'structure', 'forest']) {
+      assert.equal(releaseGate.coarseComponents[component].missingCount, 0,
+        `${component}: release gate must have zero missing coarse components`);
+      assert.equal(releaseGate.coarseComponents[component].deadlineMissCount, 0,
+        `${component}: release gate must have zero coarse component deadline misses`);
+      assert.equal(releaseGate.currentCoarseComponents[component].missingCount, 0,
+        `${component}: release gate must have zero current-receipt component holes`);
+    }
+    assert.deepEqual(releaseGate.coarseContinuity, {
+      terrainDisappearanceFrames: 0,
+      structureDisappearanceFrames: 0,
+      forestDisappearanceFrames: 0,
+    }, 'receipt-proven coarse components must not disappear during movement scenarios');
+    assert.ok(releaseGate.lifecycle.detailMissingCount >= 0,
+      'detailMissingCount is an explicitly labelled population, not a deadline-miss metric');
+    assert.equal(Object.hasOwn(releaseGate.lifecycle, 'detailMiss'), false,
+      'missing DetailDrawable owners must not be mislabeled as deadline misses');
+    assert.ok(releaseGate.queues.generationAgeMs >= 0);
+    assert.equal(releaseGate.queues.naturalWorkQueueAgeMeasurable, true);
+    assert.ok(releaseGate.queues.naturalWorkQueueAgeMs >= 0);
+    assert.ok(releaseGate.queues.naturalAdmissionCursorAgeMs >= 0);
+    assert.ok(releaseGate.gpuUploadLatencyMs.count > 0,
+      'actual renderer receipts must produce GPU upload latency samples');
+    assert.ok(releaseGate.treePresenters.frameCount > 0,
+      'steady MAX scenarios must record completed-receipt Tree presenter frames');
+    assert.equal(releaseGate.treePresenters.zeroPresenterFrames, 0,
+      `a previously presented required Tree must never have a zero-presenter frame: ${
+        JSON.stringify(releaseGate.treePresenters.latest)}`);
+    assert.equal(releaseGate.treePresenters.duplicatePresenterFrames, 0,
+      `a canonical Tree must not have a duplicate presenter frame: ${
+        JSON.stringify(releaseGate.treePresenters.latest)}`);
+    assert.ok(releaseGate.treePresenters.duplicatePresenterFrames
+      <= releaseGate.treePresenters.frameCount,
+    'brief OLD-coarse/NEW-Near overlap receipts are allowed and remain measured');
+    assert.equal(releaseGate.treePresenters.latest.duplicatePresenterCount, 0,
+      `Near/coarse overlap must be gone after the settled release gate: ${
+        JSON.stringify(releaseGate.treePresenters.latest)}`);
+    assert.equal(releaseGate.treePresenters.duplicateCoarsePresenterFrames, 0,
+      `one canonical coarse Tree identity must not appear in multiple coarse meshes: ${
+        JSON.stringify(releaseGate.treePresenters.latest)}`);
+    assert.equal(
+      releaseGate.currentCoarseComponents.forest.drawableCount,
+      releaseGate.currentCoarseComponents.forest.requiredCount,
+      'the completed receipt must draw every required Forest Stable ID',
+    );
+    for (const [label, value] of Object.entries(releaseGate.bootFillMs)) {
+      assert.ok(Number.isFinite(value) && value >= 0,
+        `immutable boot cohort ${label} fill timing must be measured`);
+    }
+    assert.equal(releaseGate.densityAnnuli.length, 3);
+    assert.deepEqual(releaseGate.densityAnnuli.map(value => value.label), [
+      '0-100', '100-200', '200-300',
+    ]);
+    for (const annulus of releaseGate.densityAnnuli) {
+      assert.equal(annulus.before.basis,
+        'analytical-all-canonical-legacy-density-baseline',
+      `${annulus.label}: Before must be labelled as an analytical legacy baseline`);
+      assert.equal(annulus.before.measuredImplementation, false,
+        `${annulus.label}: Before must not claim a measured old implementation run`);
+      assert.ok(annulus.after.drawableCount <= annulus.before.canonicalCount,
+        `${annulus.label}: density-selected Tree count cannot exceed canonical input`);
+      assert.ok(annulus.after.instanceCount <= annulus.before.instanceCount,
+        `${annulus.label}: density-selected instances cannot exceed canonical input`);
+      assert.ok(annulus.after.triangleCount <= annulus.before.triangleCount,
+        `${annulus.label}: density-selected triangles cannot exceed canonical input`);
+    }
+
     t.diagnostic(JSON.stringify({
       virtualFrames: schedulerSnapshot.frameCount,
       player: settled.spatial.playerLogical,
@@ -350,6 +760,9 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       buildingPublications: settled.buildingSettlementStreaming.counts.published,
       rendererDrawCalls: settled.renderInfo.drawCalls,
       densityAttributeCount: reversalDensityAttributes.length,
+      cameraYawTriggeredGeneration,
+      releaseProof,
+      releaseGate,
     }));
   } finally {
     await harness.shutdown();

@@ -25,6 +25,7 @@ import {
   validateRoadGraphV3,
 } from '../src/infinite-world/road-graph-v3.js';
 import { createRoadGraphV3SettlementTemplate } from '../src/infinite-world/road-graph-v3-settlement-adapter.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from '../src/infinite-world/settlement-lot-v2.js';
 import {
   SETTLEMENT_SEMANTIC_STABLE_ID_SCHEMA,
   createSettlementSemanticStableId,
@@ -32,7 +33,11 @@ import {
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { createMigratedSettlementTemplate } from '../src/infinite-world/single-rural-settlement.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
-import { parseSettlementRoadGraphGeneratorId } from '../src/infinite-world/sandbox-boot.js';
+import {
+  INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION,
+  parseSettlementRoadGraphGeneratorId,
+  resolveInfiniteWorldProductionGameplayConfiguration,
+} from '../src/infinite-world/sandbox-boot.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const baselineHead = '7f92b63373ba395ef71deac790f8ced264ebfc4b';
@@ -308,7 +313,7 @@ test('semantic Stable IDs, gateway order, repetition, reverse order, and paralle
   }
 });
 
-test('explicit v3 flag works while v1, v2, legacy, and production default remain unchanged', async () => {
+test('explicit v3 flag works while v1, v2, legacy, and lower-level generator default remain unchanged', async () => {
   assert.equal(parseSettlementRoadGraphGeneratorId('road-graph-v3'), ROAD_GRAPH_V3_GENERATOR_ID);
   assert.equal(parseSettlementRoadGraphGeneratorId('road-graph-v2'), ROAD_GRAPH_V2_GENERATOR_ID);
   assert.equal(parseSettlementRoadGraphGeneratorId('road-graph-v1'), ROAD_GRAPH_V1_GENERATOR_ID);
@@ -350,6 +355,42 @@ test('explicit v3 flag works while v1, v2, legacy, and production default remain
   assert.ok(presentation.sourceBuildingCount > 0);
   assert.ok(presentation.buildings.length > 0);
   await w8.shutdown();
+});
+
+test('normal URL selects the latest gameplay while explicit legacy and diagnostics stay isolated', () => {
+  assert.deepEqual(INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION, {
+    settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
+    settlementLotMode: SETTLEMENT_LOT_V2_GENERATOR_ID,
+  });
+  assert.deepEqual(resolveInfiniteWorldProductionGameplayConfiguration(''), {
+    settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
+    settlementLotMode: SETTLEMENT_LOT_V2_GENERATOR_ID,
+  });
+  assert.deepEqual(resolveInfiniteWorldProductionGameplayConfiguration(
+    '?settlementRoadGraph=road-graph-v2',
+  ), {
+    settlementRoadGraphGeneratorId: ROAD_GRAPH_V2_GENERATOR_ID,
+    settlementLotMode: null,
+  });
+  assert.deepEqual(resolveInfiniteWorldProductionGameplayConfiguration(
+    '?settlementRoadGraph=legacy-migrated-v1',
+  ), {
+    settlementRoadGraphGeneratorId: null,
+    settlementLotMode: null,
+  });
+  assert.deepEqual(resolveInfiniteWorldProductionGameplayConfiguration(
+    '?settlementLotMode=lot-v1',
+  ), {
+    settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
+    settlementLotMode: 'lot-v1',
+  });
+  const diagnosticConfiguration = resolveInfiniteWorldProductionGameplayConfiguration(
+    '?diagnostics=1&terrainLagSpikeDiagnostics=1&terrainLagSpikeDiagnostics=1',
+  );
+  assert.deepEqual(
+    diagnosticConfiguration,
+    INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION,
+  );
 });
 
 test('forbidden generators and production algorithms remain byte-identical to the baseline HEAD', () => {

@@ -1,14 +1,22 @@
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
+import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { hashWorldSeed, normalizeWorldSeed } from './legacy-core/g0/seed.js';
-import { createChunkKey } from './chunk-coordinates.js';
+import { sha256Hex } from './legacy-core/g0/sha256.js';
+import { createChunkKey, LOGICAL_CHUNK_SIZE_METERS } from './chunk-coordinates.js';
 import {
   projectMigratedSettlementTemplate,
   settlementTemplateConflictsWithCandidate,
 } from './distributed-settlement-chunk-generator.js';
 import { createFormalNaturalCandidateKernel } from './formal-natural-chunk-generator.js';
 import { createSharedCanonicalNaturalKernel } from './natural-chunk-generator.js';
-import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
-import { resolveW8CanonicalFarTreeDensityRank } from './vegetation-lod-policy.js';
+import {
+  W8_NATURAL_PRESENTATION_PHASE_1,
+  createW8NaturalPresentationPhase1Policy,
+} from './w8-natural-presentation-policy.js';
+import {
+  W8_CANONICAL_TREE_DENSITY_THRESHOLDS,
+  resolveW8CanonicalFarTreeDensityRank,
+} from './vegetation-lod-policy.js';
 import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
 import { createCanonicalRiverProjection } from './canonical-river-realization.js';
 import {
@@ -20,6 +28,12 @@ import {
 export const PRESENTATION_OWNER_SCHEMA = 'w8-presentation-owner-1';
 export const PRESENTATION_OWNER_SHARED_CORE_REVISION =
   `${W8_SHARED_CANONICAL_GROUND_REVISION}:formal-natural-candidate-kernel-1`;
+export const W8_CANONICAL_TREE_CELL_SCHEMA = 'w8-canonical-tree-cell-1';
+export const W8_CANONICAL_TREE_PREPARER_REVISION =
+  `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1`;
+export const W8_CANONICAL_TREE_MACRO_SIZE_METERS = 64;
+export const W8_CANONICAL_TREE_OWNERS_PER_AXIS =
+  W8_CANONICAL_TREE_MACRO_SIZE_METERS / LOGICAL_CHUNK_SIZE_METERS;
 const PRESENTATION_CANONICAL_GENERATOR_MAJOR = 8;
 
 const q6 = value => {
@@ -310,6 +324,10 @@ export function expandPresentationNaturalRecord(record) {
   const matrixScale = record.objectType === 'rock' ? 0.5 : 1;
   return Object.freeze({
     ...resolved,
+    // Preserve the compact resource's deterministic selection input through
+    // expansion. Renderers may independently recompute the same Stable-ID
+    // hash for validation, but must not need a second identity source.
+    densityRank: record.densityRank,
     position,
     worldPosition: position,
     rotation: Object.freeze({ y: record.rotationY }),
@@ -414,6 +432,102 @@ export function presentationOwnerResourceOf(value) {
   return null;
 }
 
+function recordInsidePresentationOwnerDomain(resource, record) {
+  // The canonical owner cell is the only observer-independent spatial
+  // criterion available to an immutable summary. Runtime owner admission is
+  // based on that cell intersecting the 0-300 m domain, so the presenter must
+  // keep every admitted anchor drawable through the cell's far corner.
+  const owner = resource?.identity?.owner;
+  if (!Number.isSafeInteger(owner?.x) || !Number.isSafeInteger(owner?.z)
+    || record?.owner !== owner.key) return false;
+  const worldX = Number(record?.position?.[0]);
+  const worldZ = Number(record?.position?.[2]);
+  if (!Number.isFinite(worldX) || !Number.isFinite(worldZ)) return false;
+  const minimumX = owner.x * LOGICAL_CHUNK_SIZE_METERS;
+  const minimumZ = owner.z * LOGICAL_CHUNK_SIZE_METERS;
+  return worldX >= minimumX && worldX < minimumX + LOGICAL_CHUNK_SIZE_METERS
+    && worldZ >= minimumZ && worldZ < minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+}
+
+/**
+ * Derives the coarse world-existence contract from the existing compact
+ * PresentationOwner.  This is an immutable summary/index only: it creates no
+ * request, queue, visual identity, or handoff state.
+ */
+export function derivePresentationOwnerCoarseSummary(value, {
+  // Kept for call-site compatibility. Coarse requirements intentionally do
+  // not depend on the observer: an immutable owner resource must resolve to
+  // the same contract before, during, and after a player crossing.
+  playerX: _playerX = null,
+  playerZ: _playerZ = null,
+  maximumDistanceMeters: _maximumDistanceMeters = Number.POSITIVE_INFINITY,
+} = {}) {
+  const resource = presentationOwnerResourceOf(value);
+  if (!resource) throw new TypeError('PresentationOwner resource is required');
+  const structureStableIds = [...new Set((resource.structures ?? [])
+    // Require authored Building silhouettes and only roads explicitly marked
+    // as canonical major layout. Ordinary split road segments remain useful
+    // coarse detail without turning one continuous road into an artificial
+    // all-segments barrier.
+    .filter(record => recordInsidePresentationOwnerDomain(resource, record)
+      && (record?.objectType === 'building'
+        || (record?.objectType === 'road' && record.canonicalMajorRoad === true)))
+    .map(record => record.stableId)
+    .filter(stableId => typeof stableId === 'string' && stableId))]
+    .sort((left, right) => left.localeCompare(right));
+  const trees = (resource.natural ?? [])
+    .filter(record => recordInsidePresentationOwnerDomain(resource, record)
+      && record?.objectType === 'tree'
+      && typeof record.stableId === 'string' && record.stableId)
+    .map(record => Object.freeze({
+      stableId: record.stableId,
+      densityRank: Number.isFinite(record.densityRank)
+        ? record.densityRank : resolveW8CanonicalFarTreeDensityRank(record.stableId),
+    }))
+    .sort((left, right) => left.densityRank - right.densityRank
+      || left.stableId.localeCompare(right.stableId));
+  const selectedForest = trees.filter(tree => (
+    tree.densityRank < W8_CANONICAL_TREE_DENSITY_THRESHOLDS.far
+  ));
+  return Object.freeze({
+    schemaVersion: 'presentation-owner-coarse-summary-1',
+    ownerKey: resource.identity.owner.key,
+    terrainRequired: true,
+    structureStableIds: Object.freeze(structureStableIds),
+    selectedForestStableIds: Object.freeze(selectedForest.map(tree => tree.stableId)),
+    canonicalTreeCount: trees.length,
+  });
+}
+
+function assertCanonicalTreeMacroCoordinate(value, name) {
+  if (!Number.isSafeInteger(value)
+    || !Number.isSafeInteger(value * W8_CANONICAL_TREE_OWNERS_PER_AXIS)) {
+    throw new RangeError(`${name} must be a safe Macro coordinate`);
+  }
+}
+
+function canonicalTreeCellBounds(macroX, macroZ) {
+  const minimumX = macroX * W8_CANONICAL_TREE_MACRO_SIZE_METERS;
+  const minimumZ = macroZ * W8_CANONICAL_TREE_MACRO_SIZE_METERS;
+  const maximumExclusiveX = minimumX + W8_CANONICAL_TREE_MACRO_SIZE_METERS;
+  const maximumExclusiveZ = minimumZ + W8_CANONICAL_TREE_MACRO_SIZE_METERS;
+  if (![minimumX, minimumZ, maximumExclusiveX, maximumExclusiveZ]
+    .every(Number.isSafeInteger)) {
+    throw new RangeError('canonical Tree cell bounds exceed safe coordinates');
+  }
+  return Object.freeze({
+    minimumX,
+    minimumZ,
+    maximumExclusiveX,
+    maximumExclusiveZ,
+    sizeMeters: W8_CANONICAL_TREE_MACRO_SIZE_METERS,
+  });
+}
+
+async function hashCanonicalTreeCellContent(content) {
+  return `sha256:${await sha256Hex(canonicalizeJson(content))}`;
+}
+
 /**
  * Purpose-built Stage 1 generator. It evaluates only Natural lattice samples
  * reached by semantic candidates and consumes compact settlement/structure
@@ -423,6 +537,7 @@ export async function createPresentationOwnerGenerator({
   worldSeed = 'KaniNingen Infinite Natural World',
   experienceSpawn = null,
   resolvePresentationContext = null,
+  resolvePresentationContexts = null,
 } = {}) {
   const normalizedWorldSeed = normalizeWorldSeed(worldSeed);
   const { worldSeedHash } = await hashWorldSeed(normalizedWorldSeed);
@@ -431,32 +546,74 @@ export async function createPresentationOwnerGenerator({
     createFormalNaturalCandidateKernel({ worldSeedHash }),
     createW8NaturalPresentationPhase1Policy({ worldSeedHash }),
   ]);
-  return Object.freeze({
-    schemaVersion: 'w8-presentation-owner-generator-1',
-    worldSeed: normalizedWorldSeed,
-    worldSeedHash,
-    async generateOwner(chunkX, chunkZ) {
-      if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
-        throw new TypeError('Presentation owner coordinates are required');
-      }
-      const startedAt = globalThis.performance?.now?.() ?? Date.now();
-      const context = resolvePresentationContext
-        ? await resolvePresentationContext({
+  const prepareOwner = async (chunkX, chunkZ, {
+    includeRocks = true,
+    materializePresentationOwner = true,
+    resolvedContext = undefined,
+    resolvedContextPromise = null,
+  } = {}) => {
+    if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
+      throw new TypeError('Presentation owner coordinates are required');
+    }
+    if (typeof includeRocks !== 'boolean') {
+      throw new TypeError('includeRocks must be boolean');
+    }
+    if (typeof materializePresentationOwner !== 'boolean') {
+      throw new TypeError('materializePresentationOwner must be boolean');
+    }
+    if (resolvedContextPromise !== null
+      && typeof resolvedContextPromise?.then !== 'function') {
+      throw new TypeError('resolvedContextPromise must be Promise-like');
+    }
+    const startedAt = globalThis.performance?.now?.() ?? Date.now();
+    let contextReadyAt = startedAt;
+    const pendingContext = Promise.resolve(resolvedContextPromise ?? (
+      resolvedContext === undefined && resolvePresentationContext
+        ? resolvePresentationContext({
           chunkX,
           chunkZ,
           ownerKey: createChunkKey(chunkX, chunkZ),
-        }) ?? {} : {};
-      const contextReadyAt = globalThis.performance?.now?.() ?? Date.now();
-      const ownerSampler = naturalKernel.createOwnerSampler(chunkX, chunkZ);
-      const candidates = await candidateKernel.generate({
+        }) : resolvedContext
+    )).then(value => {
+      contextReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      return value ?? {};
+    });
+    const ownerSampler = naturalKernel.createOwnerSampler(chunkX, chunkZ);
+    const sampleTerrainAt = (_chunk, point, candidateKind) => ownerSampler.sampleTerrain(
+      point,
+      { includeMaterials: candidateKind === 'rock' },
+    );
+    const sampleBiomeWeightsAt = (_chunk, point) => ownerSampler.sampleBiomeWeights(point);
+    let candidatesReadyAt = startedAt;
+    const pendingCandidates = (async () => {
+      const vegetationGeneration = await candidateKernel.generateVegetation({
         chunk: { chunkX, chunkZ, worldSeedHash },
-        sampleTerrainAt: (_chunk, point, candidateKind) => ownerSampler.sampleTerrain(
-          point,
-          { includeMaterials: candidateKind === 'rock' },
-        ),
-        sampleBiomeWeightsAt: (_chunk, point) => ownerSampler.sampleBiomeWeights(point),
+        sampleTerrainAt,
+        sampleBiomeWeightsAt,
       });
-      const candidatesReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      const rockGeneration = includeRocks
+        ? await candidateKernel.generateRocks({
+          chunk: { chunkX, chunkZ, worldSeedHash },
+          vegetationCandidates: vegetationGeneration.vegetationCandidates,
+          sampleTerrainAt,
+          sampleBiomeWeightsAt,
+        })
+        : Object.freeze({
+          rockCandidates: Object.freeze([]),
+          timings: Object.freeze({ rockMs: 0 }),
+        });
+      candidatesReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      return Object.freeze({
+        vegetationCandidates: vegetationGeneration.vegetationCandidates,
+        rockCandidates: rockGeneration.rockCandidates,
+        timings: Object.freeze({
+          vegetationMs: vegetationGeneration.timings.vegetationMs,
+          rockMs: rockGeneration.timings.rockMs,
+        }),
+      });
+    })();
+      const [context, candidates] = await Promise.all([pendingContext, pendingCandidates]);
+      const preparationReadyAt = globalThis.performance?.now?.() ?? Date.now();
       const excluded = new Set(context.excludedNaturalStableIds ?? []);
       const exclusionTemplates = context.naturalExclusionTemplates
         ?? context.settlementTemplates ?? [];
@@ -521,13 +678,14 @@ export async function createPresentationOwnerGenerator({
       });
       const auxiliary = typeof context.resolvePresentationAuxiliary === 'function'
         ? await context.resolvePresentationAuxiliary({
-          chunkX,
-          chunkZ,
-          ground,
-          settlementReferences: settlementRegionRefs,
-          structures: preliminaryStructures,
-          riverProjection,
-        }) ?? {} : {};
+            chunkX,
+            chunkZ,
+            ground,
+            settlementReferences: settlementRegionRefs,
+            structures: preliminaryStructures,
+            riverProjection,
+            naturalOnly: !materializePresentationOwner,
+          }) ?? {} : {};
       const water = [
         ...(context.water ?? []),
         ...(auxiliary.water ?? []),
@@ -551,13 +709,14 @@ export async function createPresentationOwnerGenerator({
         introDistanceMeters: context.introDistanceMeters ?? 11,
       });
       const rocks = candidates.rockCandidates.filter(candidateVisible);
-      const resource = createPresentationOwnerResource({
+      // Full W8 preserves the formal Natural candidate base Y and applies the
+      // shared final-ground kernel to Terrain/structures separately. Both
+      // consumers resolve Tree records through compactNatural; the Tree-only
+      // batch does not also allocate the unrelated PresentationOwner payload.
+      const resource = materializePresentationOwner ? createPresentationOwnerResource({
         worldSeedHash,
         chunkX,
         chunkZ,
-        // Full W8 preserves the formal Natural candidate base Y and applies
-        // the shared final-ground kernel to Terrain/structures separately.
-        // Presentation must retain that same canonical object identity.
         naturalCandidates: [...vegetation, ...rocks].map(resolveW8CanonicalWorldObject),
         structures: preliminaryStructures,
         settlementRegionRefs,
@@ -566,15 +725,21 @@ export async function createPresentationOwnerGenerator({
         water,
         landmarks,
         street: [...(context.street ?? []), ...(auxiliary.street ?? [])],
-      });
+      }) : null;
+      const trees = Object.freeze((resource
+        ? resource.natural.filter(record => record.objectType === 'tree')
+        : vegetation.filter(candidate => candidate.subtype !== 'shrub')
+          .map(candidate => compactNatural(resolveW8CanonicalWorldObject(candidate)))
+          .sort((left, right) => left.stableId.localeCompare(right.stableId))));
       const completedAt = globalThis.performance?.now?.() ?? Date.now();
       return Object.freeze({
         schemaVersion: 'w8-presentation-owner-data-1',
-        chunkId: resource.identity.chunkId,
+        chunkId: resource?.identity.chunkId ?? null,
         contentHash: `presentation:${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${chunkX},${chunkZ}`,
         chunkX,
         chunkZ,
         resource,
+        trees,
         ground,
         canonicalSurfacePolicy,
         riverProjection,
@@ -588,14 +753,149 @@ export async function createPresentationOwnerGenerator({
           latticeSampleCount: ownerSampler.snapshot().latticeSampleCount,
           sourceVegetationCandidateCount: candidates.vegetationCandidates.length,
           sourceRockCandidateCount: candidates.rockCandidates.length,
+          selectedVegetationCandidateCount: vegetation.length,
+          selectedTreeCount: vegetation.filter(candidate => candidate.subtype !== 'shrub').length,
+          selectedShrubCount: vegetation.filter(candidate => candidate.subtype === 'shrub').length,
+          excludedVegetationCandidateCount:
+            candidates.vegetationCandidates.length - vegetation.length,
+          rockGenerationSkipped: !includeRocks,
           vegetationCandidateCpuMs: candidates.timings.vegetationMs,
           rockCandidateCpuMs: candidates.timings.rockMs,
           contextCpuMs: q6(contextReadyAt - startedAt),
-          candidateCpuMs: q6(candidatesReadyAt - contextReadyAt),
-          projectionCpuMs: q6(completedAt - candidatesReadyAt),
+          candidateCpuMs: q6(candidatesReadyAt - startedAt),
+          projectionCpuMs: q6(completedAt - preparationReadyAt),
           totalCpuMs: q6(completedAt - startedAt),
         }),
       });
+  };
+
+  const generateCanonicalTreeCell = async (macroX, macroZ) => {
+    assertCanonicalTreeMacroCoordinate(macroX, 'macroX');
+    assertCanonicalTreeMacroCoordinate(macroZ, 'macroZ');
+    const key = `${macroX},${macroZ}`;
+    const bounds = canonicalTreeCellBounds(macroX, macroZ);
+    const ownerCoordinates = [];
+    for (let ownerOffsetZ = 0;
+      ownerOffsetZ < W8_CANONICAL_TREE_OWNERS_PER_AXIS;
+      ownerOffsetZ += 1) {
+      for (let ownerOffsetX = 0;
+        ownerOffsetX < W8_CANONICAL_TREE_OWNERS_PER_AXIS;
+        ownerOffsetX += 1) {
+        ownerCoordinates.push(Object.freeze({
+          chunkX: macroX * W8_CANONICAL_TREE_OWNERS_PER_AXIS + ownerOffsetX,
+          chunkZ: macroZ * W8_CANONICAL_TREE_OWNERS_PER_AXIS + ownerOffsetZ,
+        }));
+      }
+    }
+    const resolvedContextsPromise = typeof resolvePresentationContexts === 'function'
+      ? Promise.resolve(resolvePresentationContexts(Object.freeze({
+          macroX,
+          macroZ,
+          bounds,
+          owners: Object.freeze(ownerCoordinates),
+        }))).then(resolvedContexts => {
+          if (!Array.isArray(resolvedContexts)
+            || resolvedContexts.length !== ownerCoordinates.length) {
+            throw new Error('canonical Tree context batch must match all 16 owners');
+          }
+          return resolvedContexts;
+        }) : null;
+    const preparedOwners = await Promise.all(ownerCoordinates.map(({ chunkX, chunkZ }, index) => (
+      prepareOwner(chunkX, chunkZ, {
+        includeRocks: false,
+        materializePresentationOwner: false,
+        resolvedContextPromise: resolvedContextsPromise?.then(contexts => contexts[index]) ?? null,
+      })
+    )));
+    const ownerKeys = Object.freeze(ownerCoordinates.map(({ chunkX, chunkZ }) => (
+      createChunkKey(chunkX, chunkZ)
+    )));
+    const trees = [];
+    const ownerBoundaries = [];
+    for (let ownerIndex = 0; ownerIndex < preparedOwners.length; ownerIndex += 1) {
+      const prepared = preparedOwners[ownerIndex];
+      const { chunkX, chunkZ } = ownerCoordinates[ownerIndex];
+      const ownerKey = ownerKeys[ownerIndex];
+      const ownerTrees = prepared.trees;
+      if (ownerTrees.some(record => record.owner !== ownerKey)) {
+        throw new Error(`canonical Tree escaped owner ${ownerKey}`);
+      }
+      ownerBoundaries.push(Object.freeze({
+        ownerKey,
+        chunkX,
+        chunkZ,
+        minimumX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
+        minimumZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+        maximumExclusiveX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
+        maximumExclusiveZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
+        treeOffset: trees.length,
+        treeCount: ownerTrees.length,
+      }));
+      trees.push(...ownerTrees);
+    }
+    const stableIds = new Set(trees.map(tree => tree.stableId));
+    if (stableIds.size !== trees.length) {
+      throw new Error(`duplicate canonical Tree Stable ID in ${key}`);
+    }
+    const frozenTrees = Object.freeze(trees);
+    const frozenOwnerBoundaries = Object.freeze(ownerBoundaries);
+    const identity = Object.freeze({
+      schemaVersion: 'w8-canonical-tree-cell-identity-1',
+      worldSeedHash,
+      sourceRevision: W8_CANONICAL_TREE_PREPARER_REVISION,
+      key,
+      macroX,
+      macroZ,
+    });
+    const content = Object.freeze({
+      schemaVersion: W8_CANONICAL_TREE_CELL_SCHEMA,
+      identity,
+      key,
+      macroX,
+      macroZ,
+      bounds,
+      ownerKeys,
+      ownerBoundaries: frozenOwnerBoundaries,
+      trees: frozenTrees,
+    });
+    const contentHash = await hashCanonicalTreeCellContent(content);
+    return Object.freeze({
+      ...content,
+      contentHash,
+      diagnostics: Object.freeze({
+        ownerCount: preparedOwners.length,
+        treeCount: trees.length,
+        sourceVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.sourceVegetationCandidateCount
+        ), 0),
+        selectedVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.selectedVegetationCandidateCount
+        ), 0),
+        selectedShrubCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.selectedShrubCount
+        ), 0),
+        excludedVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.excludedVegetationCandidateCount
+        ), 0),
+        latticeSampleCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.latticeSampleCount
+        ), 0),
+        rockCandidateCount: 0,
+        rockGenerationSkippedOwnerCount: preparedOwners.filter(prepared => (
+          prepared.diagnostics.rockGenerationSkipped
+        )).length,
+      }),
+    });
+  };
+
+  return Object.freeze({
+    schemaVersion: 'w8-presentation-owner-generator-1',
+    worldSeed: normalizedWorldSeed,
+    worldSeedHash,
+    prepareCanonicalNaturalOwner: prepareOwner,
+    generateOwner(chunkX, chunkZ) {
+      return prepareOwner(chunkX, chunkZ, { includeRocks: true });
     },
+    generateCanonicalTreeCell,
   });
 }

@@ -1,11 +1,18 @@
 import { ChunkRuntimeManager } from './chunk-runtime-manager.js';
 import { ChunkDataService } from './chunk-data-service.js';
-import { CHUNK_DATA_PRIORITY } from './chunk-data-service-protocol.js';
+import {
+  CHUNK_DATA_PRIORITY,
+  createCanonicalTreeCellRequestKey,
+} from './chunk-data-service-protocol.js';
 import { createOwnerGenerationCoordinator } from './owner-generation-coordinator.js';
-import { WORLD_GENERATION_REPRESENTATION_CLASS } from './world-generation-scheduler.js';
+import {
+  WORLD_GENERATION_PRIORITY_CLASS,
+  WORLD_GENERATION_REPRESENTATION_CLASS,
+} from './world-generation-scheduler.js';
 import {
   VISUAL_PIPELINE_STAGE,
   createRenderFrameAcknowledger,
+  createRendererGpuAttributeMirror,
   createVisualContinuityRegistry,
 } from './visual-continuity.js';
 import { createInlineChunkGeneratorTransport } from './inline-chunk-generator-transport.js';
@@ -111,6 +118,11 @@ import {
   createBuildingSettlementStream,
 } from './building-settlement-stream.js';
 import { createWebGLRenderDiagnostics } from './webgl-render-diagnostics.js';
+import {
+  PRESENTATION_OWNER_SCHEMA,
+  PRESENTATION_OWNER_SHARED_CORE_REVISION,
+  derivePresentationOwnerCoarseSummary,
+} from './presentation-owner-generator.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
 const HUD_DIAGNOSTIC_STAGE_NAMES = Object.freeze([
@@ -371,6 +383,275 @@ export function parseSettlementLotMode(value) {
   if (value === SETTLEMENT_LOT_V1_GENERATOR_ID) return SETTLEMENT_LOT_V1_GENERATOR_ID;
   if (value === SETTLEMENT_LOT_V2_GENERATOR_ID) return SETTLEMENT_LOT_V2_GENERATOR_ID;
   throw new RangeError(`unsupported experimental Settlement Lot mode: ${value}`);
+}
+
+export const INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION = Object.freeze({
+  settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
+  settlementLotMode: SETTLEMENT_LOT_V2_GENERATOR_ID,
+});
+
+export function resolveInfiniteWorldProductionGameplayConfiguration(
+  search = '',
+  URLSearchParamsConstructor = globalThis.URLSearchParams,
+) {
+  if (typeof URLSearchParamsConstructor !== 'function') {
+    throw new TypeError('URLSearchParams is required');
+  }
+  const query = new URLSearchParamsConstructor(search);
+  const roadGraphExplicit = query.has('settlementRoadGraph');
+  const settlementRoadGraphGeneratorId = roadGraphExplicit
+    ? parseSettlementRoadGraphGeneratorId(query.get('settlementRoadGraph'))
+    : INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION.settlementRoadGraphGeneratorId;
+  const settlementLotMode = query.has('settlementLotMode')
+    ? parseSettlementLotMode(query.get('settlementLotMode'))
+    : roadGraphExplicit && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V3_GENERATOR_ID
+      ? null
+      : INFINITE_WORLD_PRODUCTION_GAMEPLAY_CONFIGURATION.settlementLotMode;
+  if (settlementLotMode !== null
+    && settlementRoadGraphGeneratorId !== ROAD_GRAPH_V3_GENERATOR_ID) {
+    throw new RangeError(
+      `${settlementLotMode} requires settlementRoadGraph=road-graph-v3`,
+    );
+  }
+  return Object.freeze({ settlementRoadGraphGeneratorId, settlementLotMode });
+}
+
+function directCanonicalTreeOwnerView(batch, boundary, worldSeedHash) {
+  const {
+    ownerKey,
+    chunkX,
+    chunkZ,
+    treeOffset,
+    treeCount,
+  } = boundary ?? {};
+  if (typeof ownerKey !== 'string' || !ownerKey
+    || !Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)
+    || ownerKey !== `${chunkX},${chunkZ}`
+    || !Number.isSafeInteger(treeOffset) || treeOffset < 0
+    || !Number.isSafeInteger(treeCount) || treeCount < 0
+    || treeOffset + treeCount > batch.trees.length) {
+    throw new Error(`invalid canonical Tree owner boundary: ${ownerKey ?? 'unknown'}`);
+  }
+  const trees = batch.trees.slice(treeOffset, treeOffset + treeCount);
+  if (trees.some(record => record?.objectType !== 'tree'
+    || record.owner !== ownerKey || typeof record.stableId !== 'string')) {
+    throw new Error(`canonical Tree owner view escaped ${ownerKey}`);
+  }
+  const resource = Object.freeze({
+    schemaVersion: PRESENTATION_OWNER_SCHEMA,
+    identity: Object.freeze({
+      owner: Object.freeze({ x: chunkX, z: chunkZ, key: ownerKey }),
+      chunkId: `direct-canonical-tree:${worldSeedHash}:${ownerKey}`,
+      sharedCoreRevision: PRESENTATION_OWNER_SHARED_CORE_REVISION,
+    }),
+    surface: Object.freeze({
+      settlementRegionRefs: Object.freeze([]),
+      riverCorridorRefs: Object.freeze([]),
+    }),
+    natural: Object.freeze(trees),
+    structures: Object.freeze([]),
+    water: Object.freeze([]),
+    landmarks: Object.freeze([]),
+    street: Object.freeze([]),
+  });
+  return Object.freeze({
+    schemaVersion: 'w8-direct-canonical-tree-owner-view-1',
+    chunkId: resource.identity.chunkId,
+    contentHash: `${batch.contentHash}:owner:${ownerKey}`,
+    chunkX,
+    chunkZ,
+    resource,
+    directCanonicalTreeCellKey: batch.key,
+    diagnostics: Object.freeze({
+      presentationOwnerGenerated: false,
+      canonicalTreeCount: trees.length,
+    }),
+  });
+}
+
+/**
+ * Passive fan-out of an already-generated 64 m Tree batch into immutable
+ * 16 m metadata views. It owns no admission, scheduling, or publication; the
+ * existing Macro controller and Static Object Stream remain those owners.
+ */
+export function createCanonicalTreeOwnerViewBroker({
+  worldSeedHash,
+  readyCapacity = PRESENTATION_OWNER_CACHE_CAPACITY,
+} = {}) {
+  if (typeof worldSeedHash !== 'string' || !worldSeedHash) {
+    throw new TypeError('canonical Tree owner-view broker requires worldSeedHash');
+  }
+  if (!Number.isSafeInteger(readyCapacity) || readyCapacity < 1) {
+    throw new RangeError('canonical Tree owner-view broker readyCapacity must be positive');
+  }
+  const ready = new Map();
+  const pending = new Map();
+  let disposed = false;
+  let publishedBatchCount = 0;
+  let publishedOwnerCount = 0;
+  let cacheHitCount = 0;
+  let cancelledSubscriberCount = 0;
+
+  const touchReady = (ownerKey, value = ready.get(ownerKey)) => {
+    if (!value) return null;
+    ready.delete(ownerKey);
+    ready.set(ownerKey, value);
+    return value;
+  };
+  const requestOwner = ({ ownerKey } = {}) => {
+    if (typeof ownerKey !== 'string' || !ownerKey) {
+      throw new TypeError('canonical Tree owner-view request requires ownerKey');
+    }
+    if (disposed) return Object.freeze({ promise: Promise.resolve(null), cancel: () => false });
+    const cached = touchReady(ownerKey);
+    if (cached) {
+      cacheHitCount += 1;
+      return Object.freeze({ promise: Promise.resolve(cached), cancel: () => false });
+    }
+    let resolve;
+    const promise = new Promise(nextResolve => { resolve = nextResolve; });
+    const subscriber = { resolve, cancelled: false };
+    if (!pending.has(ownerKey)) pending.set(ownerKey, new Set());
+    pending.get(ownerKey).add(subscriber);
+    return Object.freeze({
+      promise,
+      cancel: () => {
+        if (subscriber.cancelled) return false;
+        const subscribers = pending.get(ownerKey);
+        if (!subscribers?.delete(subscriber)) return false;
+        if (subscribers.size === 0) pending.delete(ownerKey);
+        subscriber.cancelled = true;
+        cancelledSubscriberCount += 1;
+        resolve(null);
+        return true;
+      },
+    });
+  };
+  const publishBatch = batch => {
+    if (disposed) return 0;
+    if (batch?.schemaVersion !== 'w8-canonical-tree-cell-1'
+      || typeof batch.key !== 'string' || typeof batch.contentHash !== 'string'
+      || !Array.isArray(batch.trees)
+      || !Array.isArray(batch.ownerKeys) || !Array.isArray(batch.ownerBoundaries)
+      || batch.ownerKeys.length !== batch.ownerBoundaries.length
+      || batch.identity?.worldSeedHash !== worldSeedHash) {
+      throw new Error(`invalid canonical Tree owner-view batch: ${batch?.key ?? 'unknown'}`);
+    }
+    const uniqueOwnerKeys = new Set(batch.ownerKeys);
+    const uniqueBoundaryOwnerKeys = new Set(
+      batch.ownerBoundaries.map(boundary => boundary?.ownerKey),
+    );
+    if (uniqueOwnerKeys.size !== batch.ownerKeys.length
+      || uniqueBoundaryOwnerKeys.size !== batch.ownerBoundaries.length
+      || batch.ownerBoundaries.some(boundary => !uniqueOwnerKeys.has(boundary?.ownerKey))) {
+      throw new Error(`canonical Tree owner-view batch has invalid ownership: ${batch.key}`);
+    }
+    for (const boundary of batch.ownerBoundaries) {
+      const view = directCanonicalTreeOwnerView(batch, boundary, worldSeedHash);
+      touchReady(boundary.ownerKey, view);
+      while (ready.size > readyCapacity) ready.delete(ready.keys().next().value);
+      const subscribers = pending.get(boundary.ownerKey);
+      if (subscribers) {
+        pending.delete(boundary.ownerKey);
+        for (const subscriber of subscribers) {
+          if (!subscriber.cancelled) subscriber.resolve(view);
+        }
+      }
+      publishedOwnerCount += 1;
+    }
+    publishedBatchCount += 1;
+    return batch.ownerBoundaries.length;
+  };
+  const dispose = () => {
+    if (disposed) return false;
+    disposed = true;
+    for (const subscribers of pending.values()) {
+      for (const subscriber of subscribers) {
+        if (!subscriber.cancelled) subscriber.resolve(null);
+      }
+    }
+    pending.clear();
+    ready.clear();
+    return true;
+  };
+  const snapshot = () => Object.freeze({
+    schemaVersion: 'w8-direct-canonical-tree-owner-view-broker-1',
+    disposed,
+    readyCapacity,
+    readyOwnerCount: ready.size,
+    pendingOwnerCount: pending.size,
+    pendingSubscriberCount: [...pending.values()]
+      .reduce((sum, subscribers) => sum + subscribers.size, 0),
+    publishedBatchCount,
+    publishedOwnerCount,
+    cacheHitCount,
+    cancelledSubscriberCount,
+  });
+  return Object.freeze({ requestOwner, publishBatch, snapshot, dispose });
+}
+
+export function requestCanonicalTreeCellThroughOwnerCoordinator({
+  macroX,
+  macroZ,
+  coordinator,
+  transport,
+  ownerViewBroker = null,
+  clock = () => globalThis.performance?.now?.() ?? Date.now(),
+  priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+  required = true,
+  consumerId = 'macro-coarse-world',
+  epoch = 0,
+  telemetryCorrelationId = null,
+  telemetryTarget = WORLD_STREAMING_TARGET.TREE,
+  telemetryStream = WORLD_STREAMING_STREAM.DISTANT,
+} = {}) {
+  const ownerKey = createCanonicalTreeCellRequestKey(macroX, macroZ);
+  if (typeof coordinator?.schedule !== 'function'
+    || typeof transport?.generateCanonicalTreeCell !== 'function') {
+    throw new TypeError('canonical Tree-cell generation requires coordinator and transport');
+  }
+  if (ownerViewBroker !== null && typeof ownerViewBroker?.publishBatch !== 'function') {
+    throw new TypeError('canonical Tree owner-view broker must expose publishBatch');
+  }
+  const createdAtMs = clock();
+  const handle = coordinator.schedule({
+    ownerKey,
+    resourceKind: 'canonical-tree-cell',
+    operationKind: 'canonical-tree-cell',
+    priority,
+    priorityClass: WORLD_GENERATION_PRIORITY_CLASS.COARSE_EXISTENCE,
+    required,
+    createdAtMs,
+    firstVisibleDeadlineMs: null,
+    representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.COARSE,
+    subscriberIdentity: `${consumerId}:${ownerKey}`,
+    consumerId,
+    epoch,
+    correlationId: telemetryCorrelationId,
+    target: telemetryTarget,
+    stream: telemetryStream,
+    execute: execution => {
+      if (execution.cancelled) return null;
+      return transport.generateCanonicalTreeCell({
+        macroX,
+        macroZ,
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs: null,
+        consumerId,
+        epoch,
+        telemetryCorrelationId,
+        telemetryTarget,
+        telemetryStream,
+        scheduler: execution.envelope,
+      });
+    },
+  });
+  return handle.promise.then(batch => {
+    if (batch !== null) ownerViewBroker?.publishBatch(batch);
+    return batch;
+  });
 }
 
 export function gatePlayerMovementByTerrainCoverage({
@@ -1015,6 +1296,10 @@ export async function bootInfiniteWorldSandbox({
   THREE = globalObject.THREE,
   viewport = globalObject.document?.querySelector?.('#viewport'),
   hud = globalObject.document?.querySelector?.('#hud'),
+  productionGameplayConfiguration = resolveInfiniteWorldProductionGameplayConfiguration(
+    globalObject.location?.search ?? '',
+    globalObject.URLSearchParams,
+  ),
   requestedSeed = new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('seed')
     ?? 'KaniNingen Infinite Natural World',
   measurementViewport = parseMeasurementViewport(
@@ -1053,16 +1338,9 @@ export async function bootInfiniteWorldSandbox({
   ).get('settlementStreaming') === 'legacy'
     ? BUILDING_SETTLEMENT_STREAM_MODE.LEGACY
     : BUILDING_SETTLEMENT_STREAM_MODE.SHARED,
-  settlementRoadGraphGeneratorId = parseSettlementRoadGraphGeneratorId(
-    new globalObject.URLSearchParams(
-      globalObject.location?.search ?? '',
-    ).get('settlementRoadGraph'),
-  ),
-  settlementLotMode = parseSettlementLotMode(
-    new globalObject.URLSearchParams(
-      globalObject.location?.search ?? '',
-    ).get('settlementLotMode'),
-  ),
+  settlementRoadGraphGeneratorId =
+    productionGameplayConfiguration.settlementRoadGraphGeneratorId,
+  settlementLotMode = productionGameplayConfiguration.settlementLotMode,
   streamingTelemetryCapacity = 8192,
   state = createSandboxBootState(),
   generatorFactory = createW8ParityChunkGenerator,
@@ -1086,6 +1364,7 @@ export async function bootInfiniteWorldSandbox({
   if (typeof requestAnimationFrameFn !== 'function') {
     throw recordSandboxBootFailure({ state, hud, error: new Error('requestAnimationFrame is unavailable'), clock });
   }
+  const directCanonicalTreeSupplyActive = diagnosticProfile.distant;
   if (globalObject.document?.documentElement?.dataset) {
     globalObject.document.documentElement.dataset.infiniteWorldBuild =
       SANDBOX_RUNTIME_BUILD_IDENTITY.sourceRevision;
@@ -1093,6 +1372,7 @@ export async function bootInfiniteWorldSandbox({
       `settlement:${settlementStreamingMode}`,
       'incrementalStaticTreePages:true',
       `persistentStaticNatural:${!disablePersistentTreePublication}`,
+      `canonicalTreeDirect:${directCanonicalTreeSupplyActive}`,
       `diagnostics:${diagnosticsEnabled}`,
       `terrainLagSpikeDiagnostics:${terrainLagSpikeDiagnosticsEnabled}`,
     ].join(',');
@@ -1129,6 +1409,7 @@ export async function bootInfiniteWorldSandbox({
   let streamingTelemetry = null;
   let worldStreamingCoordinator = null;
   let naturalStaticStream = null;
+  let canonicalTreeOwnerViewBroker = null;
   let streamingOwnerMetadataCache = null;
   let buildingSettlementStream = null;
   let settlementStreamingFrameSequence = 0;
@@ -1138,6 +1419,7 @@ export async function bootInfiniteWorldSandbox({
   let naturalStaticStreamActivated = false;
   let naturalStaticStreamSuspended = false;
   let latestNaturalCoverageState = null;
+  let lastVisualDestructionRevision = null;
   let canonicalWorldSeedHash = null;
   let availableSaveSnapshot = null;
   let experienceSpawn = null;
@@ -1194,6 +1476,97 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingCoordinator?.invalidateCoverage?.(reason);
     return naturalStaticStream?.invalidate?.(reason) ?? 0;
   };
+  const destroyedFeatureStableIds = () => [...(worldState?.featureDamage?.entries?.() ?? [])]
+    .filter(([, value]) => value?.destroyed === true)
+    .map(([stableId]) => stableId)
+    .sort((left, right) => left.localeCompare(right));
+  const resetVisualContinuityForRestoredFeatures = () => {
+    if (!worldState || !visualContinuity) return false;
+    const destroyed = new Set(destroyedFeatureStableIds());
+    const staleExclusion = visualContinuity.snapshot().owners.some(owner => (
+      (owner.destroyedStableIdsExcludedFromCoarse ?? []).some(stableId => (
+        !destroyed.has(stableId)
+      ))
+    ));
+    if (!staleExclusion) return false;
+    // A New/Restart/Load state replacement may restore a previously
+    // destroyed feature. The old requirement exclusion is monotonic within
+    // one visual lifecycle, so rebuild that lifecycle from the authoritative
+    // gameplay state. This uses the existing registry and Static stream only.
+    visualContinuity.clear();
+    lastVisualDestructionRevision = null;
+    invalidateNaturalStreamingCoverage('restored-feature-requirements');
+    return true;
+  };
+  const synchronizeDestroyedVisualRequirements = () => {
+    if (!worldState || !visualContinuity) return 0;
+    const destroyedStableIds = destroyedFeatureStableIds();
+    const revision = destroyedStableIds.join('\n');
+    if (revision === lastVisualDestructionRevision) return 0;
+    lastVisualDestructionRevision = revision;
+    if (destroyedStableIds.length === 0) return 0;
+    const destroyed = new Set(destroyedStableIds);
+    let updatedOwnerCount = 0;
+    for (const owner of visualContinuity.snapshot().owners) {
+      const declaredDestroyedStableIds = [
+        ...(owner.requiredStructureStableIds ?? []),
+        ...(owner.requiredForestStableIds ?? []),
+      ].filter(stableId => destroyed.has(stableId));
+      if (declaredDestroyedStableIds.length === 0) continue;
+      visualContinuity.excludeDestroyedStableIds({
+        ownerKey: owner.ownerKey,
+        stableIds: declaredDestroyedStableIds,
+        at: clock(),
+      });
+      updatedOwnerCount += 1;
+    }
+    return updatedOwnerCount;
+  };
+  const resolveNaturalVisualCoarseRequirements = ({
+    ownerKey,
+    value,
+    playerX,
+    playerZ,
+  }) => {
+    const visualOwner = visualContinuity?.get?.(ownerKey) ?? null;
+    if (!visualOwner || visualOwner.state === 'Retiring'
+      || visualOwner.coarseRequirementsResolvedAt !== null || !value) return false;
+    const coarseSummary = derivePresentationOwnerCoarseSummary(value, {
+      playerX,
+      playerZ,
+      maximumDistanceMeters: 300,
+    });
+    const destroyedDeclaredStableIds = [
+      ...coarseSummary.structureStableIds,
+      ...coarseSummary.selectedForestStableIds,
+    ].filter(stableId => worldState.isFeatureDestroyed(stableId));
+    const at = clock();
+    if (value.schemaVersion === 'w8-direct-canonical-tree-owner-view-1') {
+      visualContinuity.recordPipelineStage({
+        ownerKey,
+        stage: VISUAL_PIPELINE_STAGE.RESOURCE_READY,
+        at,
+      });
+      visualContinuity.markRepresentationAvailable({
+        ownerKey,
+        representation: 'coarse',
+        at,
+      });
+    }
+    if (destroyedDeclaredStableIds.length > 0) {
+      visualContinuity.excludeDestroyedStableIds({
+        ownerKey,
+        stableIds: destroyedDeclaredStableIds,
+        at,
+      });
+    }
+    visualContinuity.resolveCoarseRequirements({
+      ownerKey,
+      summary: coarseSummary,
+      at,
+    });
+    return true;
+  };
 
   const startStage = stage => {
     state.stage = stage;
@@ -1235,16 +1608,7 @@ export async function bootInfiniteWorldSandbox({
       ? (stage, operation) => diagnostics.measure(stage, operation)
       : (_stage, operation) => operation();
     visualContinuity = createVisualContinuityRegistry({ clock });
-    const rendererGpuAttributeState = Object.freeze({
-      uploadFrame: () => null,
-      matches: attribute => {
-        const gpu = renderer?.attributes?.get?.(attribute) ?? null;
-        if (!gpu) return false;
-        return !Number.isSafeInteger(attribute?.version)
-          || !Number.isSafeInteger(gpu.version)
-          || gpu.version === attribute.version;
-      },
-    });
+    const rendererGpuAttributeState = createRendererGpuAttributeMirror();
     renderFrameAcknowledger = createRenderFrameAcknowledger({
       clock,
       gpuMirror: rendererGpuAttributeState,
@@ -1529,6 +1893,8 @@ export async function bootInfiniteWorldSandbox({
           workerTransport.cancelGenerationRequest(options),
         generatePresentationOwner: request =>
           workerTransport.generatePresentationOwner(request),
+        generateCanonicalTreeCell: request =>
+          workerTransport.generateCanonicalTreeCell(request),
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
         resolveSettlementPresentationTemplate: (...args) =>
           workerTransport.resolveSettlementPresentationTemplate(...args),
@@ -1611,6 +1977,9 @@ export async function bootInfiniteWorldSandbox({
       snapshot: () => chunkGeneratorTransport.snapshot().generatorSnapshot,
     });
     canonicalWorldSeedHash = generator.worldSeedHash;
+    canonicalTreeOwnerViewBroker = createCanonicalTreeOwnerViewBroker({
+      worldSeedHash: generator.worldSeedHash,
+    });
     experienceSpawn = generator.experienceSpawn ?? generator.reviewSpawn;
     await runStage('Save State', async () => {
       worldState = worldStateFactory({
@@ -1724,6 +2093,10 @@ export async function bootInfiniteWorldSandbox({
         isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
         visualAssets,
         telemetry: streamingTelemetry,
+        // Lifecycle infrastructure is present on the normal URL as well as
+        // diagnostics runs. It gates presentation-only coarse hold disposal
+        // on a completed renderer receipt from returning Near detail.
+        visualRegistry: visualContinuity,
       });
       const chunkIndex = chunkIndexFactory({ capacity: 65_536 });
       const logicalPlayer = worldState.player;
@@ -1890,6 +2263,12 @@ export async function bootInfiniteWorldSandbox({
         if (resourceKind !== 'presentation') {
           throw new Error(`Static Natural requires PresentationOwner resources: ${resourceKind}`);
         }
+        if (directCanonicalTreeSupplyActive) {
+          // The Static stream observes the 16 m ownership slices of the same
+          // real Tree batch. It does not start 16 PresentationOwner requests;
+          // the 64 m Macro controller remains the sole request producer.
+          return observeReady(canonicalTreeOwnerViewBroker.requestOwner({ ownerKey }));
+        }
         const existing = presentationOwnerService.getCompletedChunk(chunkX, chunkZ);
         if (existing) return observeReady(Object.freeze({
           promise: Promise.resolve(existing), cancel: () => false,
@@ -1908,10 +2287,33 @@ export async function bootInfiniteWorldSandbox({
       },
     });
     recordStaticTreeActivationTime('staticStreamCreatedAtMs');
+    const canonicalTreeGenerationCoordinator = ownerGenerationCoordinator;
     distantPresentation = await createW8DistantPresentation({
       THREE,
       scene,
       worldSeedHash: generator.worldSeedHash,
+      generateCanonicalTreeCell: directCanonicalTreeSupplyActive
+        ? ({ macroX, macroZ }) => {
+          const macroKey = createCanonicalTreeCellRequestKey(macroX, macroZ);
+          return traceGenerationBoundary({
+            target: WORLD_STREAMING_TARGET.TREE,
+            resourceKey: `canonical-tree-cell:${macroKey}`,
+            ownerKey: macroKey,
+            metadata: { macroX, macroZ, ownerCount: 16 },
+          }, telemetryOptions => requestCanonicalTreeCellThroughOwnerCoordinator({
+            macroX,
+            macroZ,
+            coordinator: canonicalTreeGenerationCoordinator,
+            transport: chunkGeneratorTransport,
+            ownerViewBroker: canonicalTreeOwnerViewBroker,
+            clock,
+            telemetryCorrelationId: telemetryOptions?.telemetryCorrelationId ?? null,
+            telemetryTarget: telemetryOptions?.telemetryTarget ?? WORLD_STREAMING_TARGET.TREE,
+            telemetryStream:
+              telemetryOptions?.telemetryStream ?? WORLD_STREAMING_STREAM.DISTANT,
+          }));
+        }
+        : null,
       visualAssets,
       // Persistent buckets survive render-distance publication. Size them for
       // every registered preset so an atomic Short -> Current switch can keep
@@ -1981,7 +2383,7 @@ export async function bootInfiniteWorldSandbox({
           telemetryCorrelationId: correlationId,
         }).promise;
         };
-        if (naturalStaticStreamSuspended) return fallback();
+        if (naturalStaticStreamSuspended || directCanonicalTreeSupplyActive) return fallback();
         return naturalStaticStream.requestOrReuse({
           ownerKey,
           resourceKind: 'presentation',
@@ -2003,6 +2405,11 @@ export async function bootInfiniteWorldSandbox({
       incrementalStaticTreePages: true,
       isFeatureDestroyed: stableId => worldState.isFeatureDestroyed(stableId),
       getNearVisibleStableIds: () =>
+        renderAdapter.drawableStableIdsSnapshot?.() ?? [],
+      // Publication is consulted only to reject a stale previous-frame draw
+      // receipt after Near has already detached an identity. Arrival remains
+      // gated by the renderer-backed drawable snapshot above.
+      getNearPublishedStableIds: () =>
         renderAdapter.visibleStableIdsSnapshot?.() ?? [],
       getNearVisibleSettlementIds: () => renderAdapter.visibleSettlementIdsSnapshot?.() ?? [],
       getNearPresentationHolds: () => renderAdapter.presentationHoldSnapshot?.() ?? [],
@@ -2016,6 +2423,7 @@ export async function bootInfiniteWorldSandbox({
       recordDiagnosticWork: (route, values) => diagnostics.recordWork(route, values),
       recordDiagnosticEvent: (type, details) => diagnostics.recordEvent(type, details),
       getDiagnosticFrameSequence: () => diagnostics.currentFrameSequence(),
+      enableMacroCoarseWorld: directCanonicalTreeSupplyActive,
     });
     recordStaticTreeActivationTime('distantPresentationCreatedAtMs');
     const recordDistantTreeVisibility = () => {
@@ -2428,6 +2836,8 @@ export async function bootInfiniteWorldSandbox({
     let lastHudAt = 0;
     let lastVisualPlayerX = logicalPlayer.x;
     let lastVisualPlayerZ = logicalPlayer.z;
+    let latestDistantVelocityX = 0;
+    let latestDistantVelocityZ = 0;
     let diagnosticFrameStarted = false;
     let saveTimer = null;
     let saveIdleCallback = null;
@@ -3045,6 +3455,7 @@ export async function bootInfiniteWorldSandbox({
           saveStatus = 'missing';
           return false;
         }
+        resetVisualContinuityForRestoredFeatures();
         gameplay.clearTransientCombat?.();
         await synchronizeRuntimeToLogicalPlayer({ refreshGameplay: true });
         experienceShell?.resetPlayerVerticalMovement({
@@ -3257,7 +3668,10 @@ export async function bootInfiniteWorldSandbox({
       onStartRun: async (startMode, { skipConfirmation = false } = {}) => {
         playerRelocationInProgress = true;
         naturalStaticStreamSuspended = true;
-        invalidateNaturalStreamingCoverage(`start-run:${startMode}`);
+        // Preserve renderer-proven coarse pages warmed by the title loop. New
+        // starts use the same spawn and Continue already invalidates when its
+        // saved logical position is loaded; the next policy diff handles any
+        // relocation without discarding useful PresentationOwner work here.
         const phaseBefore = experienceShell?.getRunPhase?.() ?? 'menu';
         const gameplayTimeBeforeMs = worldState.gameplayTimeMs;
         const playerBefore = Object.freeze({ ...logicalPlayer });
@@ -3284,6 +3698,7 @@ export async function bootInfiniteWorldSandbox({
               renderOrigin: runtime.snapshot().renderOrigin,
               scaleStageId: W6_INITIAL_SCALE_STAGE_ID,
             });
+            resetVisualContinuityForRestoredFeatures();
             worldState.updatePlayer({ facingY: experienceSpawn.facingY });
             synchronized = await synchronizeRuntimeToLogicalPlayer();
             state.saveLoaded = false;
@@ -3363,6 +3778,7 @@ export async function bootInfiniteWorldSandbox({
             renderOrigin: runtime.snapshot().renderOrigin,
             scaleStageId: W6_INITIAL_SCALE_STAGE_ID,
           });
+          resetVisualContinuityForRestoredFeatures();
           worldState.updatePlayer({ facingY: experienceSpawn.facingY });
           await synchronizeRuntimeToLogicalPlayer();
           runStarted = true;
@@ -3899,7 +4315,7 @@ export async function bootInfiniteWorldSandbox({
       recordStaticTreeActivationTime('firstShadowPlanGeneratedAtMs');
       if (coverageResolution.regenerated || latestNaturalCoverageState === null) {
         const previouslyExpectedNaturalOwners = new Set(
-          latestNaturalCoverageState?.requiredOwnerKeys ?? [],
+          latestNaturalCoverageState?.expectedOwnerKeys ?? [],
         );
         const naturalOwnerPlan = diagnosticMeasure('natural-policy-plan', () => {
           const policyPlans = worldStreamingPlan.policyPlans.filter(
@@ -3910,37 +4326,26 @@ export async function bootInfiniteWorldSandbox({
             requiredOwnerKeys: Object.freeze([
               ...new Set(policyPlans.flatMap(policy => policy.requiredOwnerKeys)),
             ]),
+            visualRequiredOwnerKeys: Object.freeze([
+              ...new Set(policyPlans.flatMap(policy => (
+                policy.sourceSnapshot?.visualRequired ?? policy.requiredOwnerKeys
+              ))),
+            ]),
+            expectedOwnerKeys: Object.freeze([
+              ...new Set(policyPlans.flatMap(policy => (
+                policy.sourceSnapshot?.visualExpected ?? policy.requestOwnerKeys
+              ))),
+            ]),
             retainedOwnerKeys: Object.freeze([
               ...new Set(policyPlans.flatMap(policy => policy.allOwnerKeys)),
             ]),
           });
         });
         const requestedNaturalRequiredOwnerKeys = naturalOwnerPlan.requiredOwnerKeys;
+        const requestedNaturalVisualRequiredOwnerKeys =
+          naturalOwnerPlan.visualRequiredOwnerKeys;
+        const requestedNaturalExpectedOwnerKeys = naturalOwnerPlan.expectedOwnerKeys;
         const requestedNaturalRetainedOwnerKeys = naturalOwnerPlan.retainedOwnerKeys;
-        const visualExpectedAt = clock();
-        const firstVisibleDeadlineMs = Math.min(
-          ...naturalOwnerPlan.policyPlans.map(policy => (
-            Number.isFinite(policy.deadline?.requiredAtMs)
-              ? policy.deadline.requiredAtMs : Number.POSITIVE_INFINITY
-          )),
-        );
-        for (const ownerKey of requestedNaturalRequiredOwnerKeys) {
-          visualContinuity.expect({
-            ownerKey,
-            expectedAt: visualExpectedAt,
-            firstPossibleVisibleAt: visualExpectedAt,
-            deadlineAtMs: Number.isFinite(firstVisibleDeadlineMs)
-              ? firstVisibleDeadlineMs : null,
-            resourceKind: 'presentation',
-            required: true,
-            subscriberIdentity: `visual-natural:${worldStreamingPlan.planId}`,
-          });
-          previouslyExpectedNaturalOwners.delete(ownerKey);
-        }
-        for (const ownerKey of previouslyExpectedNaturalOwners) {
-          visualContinuity.retire({ ownerKey, at: visualExpectedAt });
-        }
-        visualContinuity.pruneRetired({ maximumRecords: 4096 });
         if (pendingRenderDistancePublication) {
           pendingRenderDistancePublication.requiredNaturalOwnerKeys =
             requestedNaturalRequiredOwnerKeys;
@@ -3960,16 +4365,21 @@ export async function bootInfiniteWorldSandbox({
           plan: worldStreamingPlan,
           policyPlans: naturalOwnerPlan.policyPlans,
           requiredOwnerKeys: requestedNaturalRequiredOwnerKeys,
+          visualRequiredOwnerKeys: requestedNaturalVisualRequiredOwnerKeys,
+          expectedOwnerKeys: requestedNaturalExpectedOwnerKeys,
           retainedOwnerKeys: requestedNaturalRetainedOwnerKeys,
           presentedRetainedOwnerKeys: presentedNaturalRetainedOwnerKeys,
           streamApplied: false,
           resourceKindEntries: Object.freeze([]),
           policyResourceCoverage: Object.freeze([]),
+          previouslyExpectedOwnerKeys: Object.freeze([...previouslyExpectedNaturalOwners]),
         });
         if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
           calls: 1,
           policies: naturalOwnerPlan.policyPlans.length,
           requiredOwners: requestedNaturalRequiredOwnerKeys.length,
+          visualRequiredOwners: requestedNaturalVisualRequiredOwnerKeys.length,
+          visualExpectedOwners: requestedNaturalExpectedOwnerKeys.length,
           retainedOwners: requestedNaturalRetainedOwnerKeys.length,
         });
       } else if (diagnostics.enabled) diagnostics.recordWork('natural-policy-plan', {
@@ -3991,6 +4401,51 @@ export async function bootInfiniteWorldSandbox({
             publicationContext,
             ownerMetadataRevision: worldStreamingPlan.planId,
           }));
+          const visualExpectedAt = clock();
+          for (const timing of naturalStaticStream.ownerTimingSnapshot(
+            latestNaturalCoverageState.expectedOwnerKeys,
+          )) {
+            if (!Number.isFinite(timing.firstPossibleVisibleAt)) {
+              throw new Error(`Static Natural visual timing is unresolved: ${JSON.stringify({
+                ownerKey: timing.ownerKey,
+                cohort: timing.cohort,
+                expectedAt: timing.expectedAt,
+                firstPossibleVisibleAt: timing.firstPossibleVisibleAt,
+                deadlineAtMs: timing.deadlineAtMs,
+                required: timing.required,
+                visualExpected: timing.visualExpected,
+              })}`);
+            }
+            const expectedVisualOwner = visualContinuity.expect({
+              ownerKey: timing.ownerKey,
+              expectedAt: timing.expectedAt,
+              firstPossibleVisibleAt: timing.firstPossibleVisibleAt,
+              deadlineAtMs: timing.deadlineAtMs,
+              resourceKind: 'presentation',
+              required: timing.required,
+              subscriberIdentity: `visual-natural:${worldStreamingPlan.planId}`,
+            });
+            // The same immutable page may already be renderer-resident because
+            // it was prepared in the coarse safety shell. Resolve its contract
+            // now instead of waiting for that cached page to take another turn
+            // through the bounded publisher bridge; the next renderer receipt
+            // can then prove CoarseDrawable before firstPossibleVisibleAt.
+            if (expectedVisualOwner.coarseRequirementsResolvedAt === null) {
+              const readyResource = naturalStaticStream.readyOwnerResource?.(timing.ownerKey);
+              if (!readyResource) continue;
+              resolveNaturalVisualCoarseRequirements({
+                ownerKey: timing.ownerKey,
+                value: readyResource.value,
+                playerX: logicalPlayer.x,
+                playerZ: logicalPlayer.z,
+              });
+            }
+          }
+          for (const ownerKey of latestNaturalCoverageState.previouslyExpectedOwnerKeys) {
+            if (latestNaturalCoverageState.expectedOwnerKeys.includes(ownerKey)) continue;
+            visualContinuity.retire({ ownerKey, at: visualExpectedAt });
+          }
+          visualContinuity.pruneRetired({ maximumRecords: 4096 });
           recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
         } else naturalStaticStream.updatePublicationContext(publicationContext);
         const streamControl = naturalStaticStream.diagnostics();
@@ -4041,7 +4496,22 @@ export async function bootInfiniteWorldSandbox({
             readyPages,
           };
           for (const page of readyPages) {
-            if (!visualContinuity.get(page.ownerKey)) continue;
+            // Resolve world-existence requirements from the same immutable
+            // PresentationOwner page that is already admitted to the single
+            // Natural work queue.  This is metadata derivation, not another
+            // scheduling or handoff path.
+            resolveNaturalVisualCoarseRequirements({
+              ownerKey: page.ownerKey,
+              value: page.value,
+              playerX: logicalPlayer.x,
+              playerZ: logicalPlayer.z,
+            });
+            const visualOwner = visualContinuity.get(page.ownerKey);
+            // A resource-margin page may complete after its former visual
+            // Expected membership has already retired during a fast turn. It
+            // remains useful to the resource cache, but must not reopen or
+            // resolve the retired visual lifecycle.
+            if (!visualOwner || visualOwner.state === 'Retiring') continue;
             try {
               visualContinuity.recordPipelineStage({
                 ownerKey: page.ownerKey,
@@ -4067,6 +4537,8 @@ export async function bootInfiniteWorldSandbox({
           }
         }
       }
+      latestDistantVelocityX = movement.velocityX;
+      latestDistantVelocityZ = movement.velocityZ;
       return owner;
     }
 
@@ -4460,6 +4932,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         }
         const visualFrameToken = renderFrameAcknowledger.beginFrame({
           frameSequence: ++completedRenderFrameSequence,
+          scene,
         });
         let completedRenderReceipt = null;
         try {
@@ -4491,9 +4964,26 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         gameplayRenderAdapter.markFirstDraw?.(completedRenderReceipt);
         let actualDrawableCount = 0;
         try {
+          const committedTerrainState = runtime.getCommittedChunkState();
+          const actualTerrainCoverage = distantPresentation
+            .terrainPresentationCoverageForOwner?.(
+              committedTerrainState.centerChunkX,
+              committedTerrainState.centerChunkZ,
+            ) ?? null;
           actualDrawableCount = visualContinuity.acknowledgeScene({
             receipt: completedRenderReceipt,
             scene,
+            terrainCoverage: {
+              ownerKeys: latestNaturalCoverageState?.expectedOwnerKeys ?? [],
+              lowAnnulus: actualTerrainCoverage ? {
+                centerWorldX: (actualTerrainCoverage.centerChunkX + 0.5)
+                  * LOGICAL_CHUNK_SIZE_METERS,
+                centerWorldZ: (actualTerrainCoverage.centerChunkZ + 0.5)
+                  * LOGICAL_CHUNK_SIZE_METERS,
+                innerBoundaryMeters: actualTerrainCoverage.nearOuterCoverageHalfExtentMeters,
+                outerBoundaryMeters: actualTerrainCoverage.clipmapExtentMeters,
+              } : null,
+            },
           });
         } catch {
           // Lifecycle observation cannot invalidate an otherwise valid frame.
@@ -4621,6 +5111,12 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
               experienceShell.isPaused(),
             ),
           }));
+        // Destruction changes the immutable coarse requirement domain; it is
+        // not a substitute for a renderer receipt. Synchronize it before W8
+        // hides the destroyed slot so an Expected owner cannot be stranded.
+        diagnostics.measure('visual-destruction-sync', () => (
+          synchronizeDestroyedVisualRequirements()
+        ));
         // Gameplay owns feature damage. Refresh every canonical distant tier
         // after simulation so a Tree destroyed this frame cannot survive for
         // one extra rendered frame as a Forest/Horizon silhouette.
@@ -4628,6 +5124,10 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           logicalPlayer.x,
           logicalPlayer.z,
           frameRenderOrigin,
+          {
+            velocityX: latestDistantVelocityX,
+            velocityZ: latestDistantVelocityZ,
+          },
         ));
         diagnostics.measure('render-distance-publication', () => (
           tryCommitRenderDistancePublication()
@@ -4702,6 +5202,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       await runtime.shutdown();
       distantPresentation.dispose();
       await naturalStaticStream.dispose();
+      canonicalTreeOwnerViewBroker.dispose();
       await buildingSettlementStream.dispose();
       await presentationOwnerService.shutdown();
       await ownerGenerationCoordinator.shutdown({ reason: 'sandbox-shutdown' });
@@ -4719,6 +5220,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       renderProfile,
       logicalPlayer,
       bootState: state,
+      visualContinuityProgress: () => Object.freeze({
+        ...visualContinuity.progressSnapshot(),
+        visualRequiredOwnerCount:
+          latestNaturalCoverageState?.visualRequiredOwnerKeys?.length ?? 0,
+        visualExpectedOwnerCount:
+          latestNaturalCoverageState?.expectedOwnerKeys?.length ?? 0,
+      }),
       snapshot: () => {
         const runtimeSnapshot = runtime.snapshot();
         const renderOrigin = runtimeSnapshot.renderOrigin;
@@ -4726,7 +5234,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         const presentationSnapshot = distantPresentation.snapshot();
         const distantPresenterAudit = distantPresentation.presenterAuditSnapshot?.() ?? null;
         const nearVisibleStableIds = new Set(
-          renderAdapter.visibleStableIdsSnapshot?.() ?? [],
+          renderAdapter.drawableStableIdsSnapshot?.() ?? [],
         );
         const distantVisibleStableIds = new Set([
           ...(distantPresenterAudit?.legacyDistantVisibleStableIds ?? []),
@@ -4888,6 +5396,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           buildingSettlementShadow: buildingSettlementShadowComparison,
           buildingSettlementStreaming: buildingSettlementStream.snapshot(),
           staticObjectStreaming: naturalStaticStream.snapshot(),
+          canonicalTreeOwnerViews: canonicalTreeOwnerViewBroker.snapshot(),
           presentationOwnerData: presentationOwnerService.snapshot(),
           visualContinuity: Object.freeze({
             ...visualContinuity.snapshot(),
@@ -4903,6 +5412,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           sceneObjectCount: countSceneObjects(scene),
           renderInfo: Object.freeze({
             drawCalls: renderer.info?.render?.calls ?? null,
+            instances: renderer.info?.render?.instances ?? null,
             triangles: renderer.info?.render?.triangles ?? null,
             geometries: renderer.info?.memory?.geometries ?? null,
             textures: renderer.info?.memory?.textures ?? null,
@@ -4924,6 +5434,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       else if (renderAdapter && !runtime) await renderAdapter.shutdown();
       distantPresentation?.dispose?.();
       await naturalStaticStream?.dispose?.();
+      canonicalTreeOwnerViewBroker?.dispose?.();
       await buildingSettlementStream?.dispose?.();
       await presentationOwnerService?.shutdown?.();
       await ownerGenerationCoordinator?.shutdown?.({ reason: 'sandbox-boot-failure' });

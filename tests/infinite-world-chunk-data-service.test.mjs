@@ -236,10 +236,10 @@ test('one global owner queue orders Full and Presentation by deadline and semant
   await blocker.promise;
 
   const expected = [
-    ['full', 1],
     ['presentation', 2],
     ['full', 3],
     ['full', 4],
+    ['full', 1],
     ['presentation', 5],
   ];
   for (const [resourceKind, chunkX] of expected) {
@@ -251,7 +251,7 @@ test('one global owner queue orders Full and Presentation by deadline and semant
   }
   await Promise.all(handles.map(handle => handle.promise));
   assert.deepEqual(calls.map(call => [call.resourceKind, call.request.chunkX]), expected);
-  assert.deepEqual(calls.map(call => call.request.scheduler.sequence), [6, 5, 4, 3, 2]);
+  assert.deepEqual(calls.map(call => call.request.scheduler.sequence), [5, 4, 3, 6, 2]);
   assert.deepEqual(calls.map(call => call.request.scheduler.resourceKind), expected.map(([kind]) => kind));
   assert.equal(coordinator.snapshot().queuedCount, 0);
   await presentation.shutdown();

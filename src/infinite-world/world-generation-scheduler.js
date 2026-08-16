@@ -186,14 +186,15 @@ export function compareWorldGenerationRequests(left, right, nowMs, options = {})
   const usesGlobalContract = leftEnvelope.priorityClass != null
     || rightEnvelope.priorityClass != null;
   if (usesGlobalContract) {
-    if (leftRank.deadlineUrgent !== rightRank.deadlineUrgent) {
-      return leftRank.deadlineUrgent ? -1 : 1;
-    }
     const leftClass = leftEnvelope.priorityClass ?? leftEnvelope.priority;
     const rightClass = rightEnvelope.priorityClass ?? rightEnvelope.priority;
     if (leftClass !== rightClass) return leftClass - rightClass;
-    // Priority aging remains useful inside one semantic class, but can no
-    // longer promote optional/prefetch work across Terrain or Gameplay safety.
+    // Deadline urgency and aging refine order only inside a semantic class.
+    // Otherwise an overdue optional prefetch could invert the global contract
+    // and jump ahead of fresh safety, coarse-existence, or gameplay work.
+    if (leftRank.deadlineUrgent !== rightRank.deadlineUrgent) {
+      return leftRank.deadlineUrgent ? -1 : 1;
+    }
     if (leftRank.effectivePriority !== rightRank.effectivePriority) {
       return leftRank.effectivePriority - rightRank.effectivePriority;
     }

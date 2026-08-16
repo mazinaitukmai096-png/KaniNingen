@@ -3,6 +3,7 @@ import {
   CHUNK_DATA_PRIORITY,
   CHUNK_GENERATOR_MESSAGE,
   CHUNK_GENERATOR_PROTOCOL_VERSION,
+  createCanonicalTreeCellRequestKey,
   createChunkDataRequestKey,
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
@@ -87,6 +88,13 @@ function errorResponse(error, request) {
   };
 }
 
+function generationRequestKey(request) {
+  if (request?.type === CHUNK_GENERATOR_MESSAGE.GENERATE_CANONICAL_TREE_CELL) {
+    return createCanonicalTreeCellRequestKey(request.macroX, request.macroZ);
+  }
+  return createChunkDataRequestKey(request.chunkX, request.chunkZ);
+}
+
 export function createChunkGeneratorWorkerCore({
   postMessage,
   generatorFactory = createW8ParityChunkGenerator,
@@ -137,6 +145,21 @@ export function createChunkGeneratorWorkerCore({
         createdAtMs: schedulerClock(),
         consumerId: 'presentation-owner-service',
         target: 'distant',
+        stream: 'distant',
+      };
+    }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_CANONICAL_TREE_CELL) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'canonical-tree-cell',
+        priority: CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+        required: true,
+        createdAtMs: schedulerClock(),
+        ownerKey: createCanonicalTreeCellRequestKey(request.macroX, request.macroZ),
+        resourceKind: 'canonical-tree-cell',
+        representationClass: 'coarse',
+        consumerId: 'macro-coarse-world',
+        target: 'tree',
         stream: 'distant',
       };
     }
@@ -243,7 +266,7 @@ export function createChunkGeneratorWorkerCore({
       protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
       requestId: request.requestId,
       serviceGeneration,
-      chunkKey: createChunkDataRequestKey(request.chunkX, request.chunkZ),
+      chunkKey: generationRequestKey(request),
       operationKind: request.scheduler?.operationKind ?? null,
       workerTimeOriginMs: clockOrigin(),
       requestReceivedAtMs,
@@ -422,6 +445,49 @@ export function createChunkGeneratorWorkerCore({
             chunkId: presentationOwner.chunkId,
             contentHash: presentationOwner.contentHash,
             presentationOwner,
+            generationMs: Math.max(0, completedAt - startedAt),
+            scheduler: execution ? schedulerResponse(
+              execution,
+              requestReceivedAtMs,
+              schedulerReceivedAtMs,
+              request.scheduler,
+            ) : null,
+          },
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE_CANONICAL_TREE_CELL) {
+        if (typeof generator.generateCanonicalTreeCell !== 'function') {
+          throw new Error('Chunk generator does not expose canonical Tree-cell generation');
+        }
+        const startedAt = clock();
+        const treeCell = await generator.generateCanonicalTreeCell(
+          request.macroX,
+          request.macroZ,
+          {
+            scheduler: execution?.envelope ?? null,
+            checkpoint: execution?.checkpoint ?? null,
+          },
+        );
+        execution?.checkpoint();
+        const completedAt = clock();
+        postGenerationResponse({
+          request,
+          execution,
+          requestReceivedAtMs,
+          schedulerReceivedAtMs,
+          generationStartedAtMs: startedAt,
+          generationCompletedAtMs: completedAt,
+          stageRecorder: null,
+          roadTimingContext: null,
+          response: {
+            type: CHUNK_GENERATOR_MESSAGE.GENERATED_CANONICAL_TREE_CELL,
+            protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+            requestId: request.requestId,
+            serviceGeneration,
+            macroKey: treeCell.key,
+            contentHash: treeCell.contentHash,
+            canonicalTreeCell: treeCell,
             generationMs: Math.max(0, completedAt - startedAt),
             scheduler: execution ? schedulerResponse(
               execution,

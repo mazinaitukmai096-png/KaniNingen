@@ -2,6 +2,7 @@ import {
   CHUNK_DATA_PRIORITY,
   CHUNK_GENERATOR_MESSAGE,
   CHUNK_GENERATOR_PROTOCOL_VERSION,
+  createCanonicalTreeCellGeneratorRequest,
   createChunkGeneratorCancelRequest,
   createChunkGeneratorInitializeRequest,
   createChunkGeneratorRequest,
@@ -105,6 +106,8 @@ export function createWorkerChunkGeneratorTransport({
   const forestHorizonReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const presentationOwnerGenerationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const presentationOwnerReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const canonicalTreeCellGenerationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const canonicalTreeCellReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementTemplateTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
@@ -115,6 +118,7 @@ export function createWorkerChunkGeneratorTransport({
     generated: 0,
     forestHorizonGenerated: 0,
     presentationOwnersGenerated: 0,
+    canonicalTreeCellsGenerated: 0,
     settlementQueries: 0,
     settlementTemplateQueries: 0,
     diagnosticQueries: 0,
@@ -250,17 +254,20 @@ export function createWorkerChunkGeneratorTransport({
       counts.lateResponses += 1;
       emitPipelineEvent('worker-late-response', {
         requestId: message.requestId,
-        ownerKey: message.chunkKey ?? null,
+        ownerKey: message.macroKey ?? message.chunkKey ?? null,
         responseType: message.type,
         receivedAtMs,
       });
       return;
     }
     const operationKind = operation.request.scheduler?.operationKind ?? null;
-    const ownerKey = message.chunkKey
+    const ownerKey = message.macroKey ?? message.chunkKey ?? operation.request.scheduler?.ownerKey
       ?? (Number.isSafeInteger(operation.request.chunkX)
         && Number.isSafeInteger(operation.request.chunkZ)
-        ? `${operation.request.chunkX},${operation.request.chunkZ}` : null);
+        ? `${operation.request.chunkX},${operation.request.chunkZ}`
+        : Number.isSafeInteger(operation.request.macroX)
+          && Number.isSafeInteger(operation.request.macroZ)
+          ? `${operation.request.macroX},${operation.request.macroZ}` : null);
     const executionMs = Math.max(0, Number(
       message.generationMs ?? message.operationMs ?? 0,
     ) || 0);
@@ -385,6 +392,15 @@ export function createWorkerChunkGeneratorTransport({
       presentationOwnerReceiveTimes.record(Math.max(0, receivedMs - generationMs));
       counts.presentationOwnersGenerated += 1;
       resolveOperation(message.presentationOwner);
+      return;
+    }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.GENERATED_CANONICAL_TREE_CELL) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const generationMs = Math.max(0, Number(message.generationMs) || 0);
+      canonicalTreeCellGenerationTimes.record(generationMs);
+      canonicalTreeCellReceiveTimes.record(Math.max(0, receivedMs - generationMs));
+      counts.canonicalTreeCellsGenerated += 1;
+      resolveOperation(message.canonicalTreeCell);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.SETTLEMENTS) {
@@ -530,8 +546,11 @@ export function createWorkerChunkGeneratorTransport({
       } : request;
       target.postMessage(wireRequest);
       emitPipelineEvent('worker-message-sent', {
-        ownerKey: Number.isSafeInteger(request.chunkX) && Number.isSafeInteger(request.chunkZ)
-          ? `${request.chunkX},${request.chunkZ}` : null,
+        ownerKey: request.scheduler?.ownerKey
+          ?? (Number.isSafeInteger(request.chunkX) && Number.isSafeInteger(request.chunkZ)
+            ? `${request.chunkX},${request.chunkZ}`
+            : Number.isSafeInteger(request.macroX) && Number.isSafeInteger(request.macroZ)
+              ? `${request.macroX},${request.macroZ}` : null),
         requestId: request.requestId,
         correlationId: request.scheduler?.correlationId ?? null,
         operationKind: request.scheduler?.operationKind ?? null,
@@ -677,6 +696,61 @@ export function createWorkerChunkGeneratorTransport({
         serviceGeneration,
         chunkX,
         chunkZ,
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs,
+        consumerId,
+        epoch,
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        scheduler,
+        pipelineDiagnostics: onPipelineEvent !== null,
+      }));
+    },
+    async generateCanonicalTreeCell({
+      macroX,
+      macroZ,
+      priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required = true,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      consumerId = 'macro-coarse-world',
+      epoch = 0,
+      telemetryCorrelationId = null,
+      telemetryTarget = 'tree',
+      telemetryStream = 'distant',
+      scheduler = null,
+    } = {}) {
+      await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
+      if (fallbackTransport) {
+        if (typeof fallbackTransport.generateCanonicalTreeCell !== 'function') {
+          throw new Error('fallback transport does not expose canonical Tree-cell generation');
+        }
+        return fallbackTransport.generateCanonicalTreeCell({
+          macroX,
+          macroZ,
+          priority,
+          required,
+          createdAtMs,
+          deadlineAtMs,
+          consumerId,
+          epoch,
+          telemetryCorrelationId,
+          telemetryTarget,
+          telemetryStream,
+          scheduler,
+        });
+      }
+      const requestId = ++controlRequestId;
+      return requestWorker(createCanonicalTreeCellGeneratorRequest({
+        requestId,
+        serviceGeneration,
+        macroX,
+        macroZ,
         priority,
         required,
         createdAtMs,
@@ -866,6 +940,8 @@ export function createWorkerChunkGeneratorTransport({
       const forestHorizonReceiveTiming = forestHorizonReceiveTimes.snapshot();
       const presentationOwnerGenerationTiming = presentationOwnerGenerationTimes.snapshot();
       const presentationOwnerReceiveTiming = presentationOwnerReceiveTimes.snapshot();
+      const canonicalTreeCellGenerationTiming = canonicalTreeCellGenerationTimes.snapshot();
+      const canonicalTreeCellReceiveTiming = canonicalTreeCellReceiveTimes.snapshot();
       const settlementQueryTiming = settlementQueryTimes.snapshot();
       const settlementQueryReceiveTiming = settlementQueryReceiveTimes.snapshot();
       const settlementTemplateTiming = settlementTemplateTimes.snapshot();
@@ -890,6 +966,9 @@ export function createWorkerChunkGeneratorTransport({
         presentationOwnerGenerationMsP50: presentationOwnerGenerationTiming.p50,
         presentationOwnerGenerationMsMaximum: presentationOwnerGenerationTiming.max,
         presentationOwnerReceiveMsMaximum: presentationOwnerReceiveTiming.max,
+        canonicalTreeCellGenerationMsP50: canonicalTreeCellGenerationTiming.p50,
+        canonicalTreeCellGenerationMsMaximum: canonicalTreeCellGenerationTiming.max,
+        canonicalTreeCellReceiveMsMaximum: canonicalTreeCellReceiveTiming.max,
         settlementQueryMsP50: settlementQueryTiming.p50,
         settlementQueryMsMaximum: settlementQueryTiming.max,
         settlementQueryReceiveMsMaximum: settlementQueryReceiveTiming.max,
@@ -924,6 +1003,8 @@ export function createWorkerChunkGeneratorTransport({
         forestHorizonReceiveTimes,
         presentationOwnerGenerationTimes,
         presentationOwnerReceiveTimes,
+        canonicalTreeCellGenerationTimes,
+        canonicalTreeCellReceiveTimes,
         settlementQueryTimes,
         settlementQueryReceiveTimes,
         settlementTemplateTimes,

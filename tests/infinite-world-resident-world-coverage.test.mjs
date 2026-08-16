@@ -472,9 +472,18 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   const stationaryRequired = requiredUnion(stationary);
   const straightEntering = difference(requiredUnion(shiftedStraight), stationaryRequired);
   const diagonalEntering = difference(requiredUnion(shiftedDiagonal), stationaryRequired);
-  assert.equal(stationaryRequired.length, 1305);
-  assert.equal(straightEntering.length, 41);
-  assert.equal(diagonalEntering.length, 57);
+  assert.equal(stationaryRequired.length, PRESENTATION_RESIDENT_OWNER_COUNT,
+    'resource coverage keeps the full shared 368 m Presentation resident window');
+  assert.equal(straightEntering.length, difference(
+    createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 0 })
+      .presentationView.ownerKeys,
+    coverage.presentationView.ownerKeys,
+  ).length);
+  assert.equal(diagonalEntering.length, difference(
+    createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 1 })
+      .presentationView.ownerKeys,
+    coverage.presentationView.ownerKeys,
+  ).length);
   assert.ok(allOwnerUnion(maxSprintNatural).length <= PRESENTATION_OWNER_CACHE_CAPACITY);
   assert.ok(stationary.policyPlans.every(policy => policy.requiredOwnerKeys.every(
     ownerKey => coverage.residentNaturalOwnerKeys.includes(ownerKey),

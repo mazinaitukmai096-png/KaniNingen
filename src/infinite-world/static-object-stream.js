@@ -22,6 +22,14 @@ export const STATIC_OBJECT_STREAM_VELOCITY_PREFETCH = Object.freeze({
   sampleIntervalSeconds: 0.25,
 });
 
+// Keep one owner-cell diagonal of renderer-ready coarse world immediately
+// outside the true visual circle. Natural coverage invalidates at owner
+// boundaries, so this is the exact conservative supply needed while the player
+// moves between any two points in the same 16 m cell. It is scheduling metadata
+// on the existing Resource cursor, not another coverage lifecycle or queue.
+const STATIC_COARSE_SAFETY_MARGIN_METERS = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS;
+const STATIC_COARSE_FILL_INNER_RATIO = 2 / 3;
+
 function maximumCorridorOwnerCount(radiusMeters, corridorLengthMeters) {
   if (!Number.isFinite(radiusMeters) || radiusMeters < 0
     || !Number.isFinite(corridorLengthMeters) || corridorLengthMeters < 0) {
@@ -116,6 +124,152 @@ function segmentIntersectsExpandedChunkAabb(
   return minimumT <= maximumT;
 }
 
+function rayAabbEntrySeconds({
+  playerX,
+  playerZ,
+  velocityX,
+  velocityZ,
+  minimumX,
+  minimumZ,
+  maximumX,
+  maximumZ,
+}) {
+  let minimumT = 0;
+  let maximumT = Number.POSITIVE_INFINITY;
+  for (const [position, direction, minimum, maximum] of [
+    [playerX, velocityX, minimumX, maximumX],
+    [playerZ, velocityZ, minimumZ, maximumZ],
+  ]) {
+    if (direction === 0) {
+      if (position < minimum || position > maximum) return null;
+      continue;
+    }
+    const first = (minimum - position) / direction;
+    const second = (maximum - position) / direction;
+    minimumT = Math.max(minimumT, Math.min(first, second));
+    maximumT = Math.min(maximumT, Math.max(first, second));
+    if (minimumT > maximumT) return null;
+  }
+  return maximumT < 0 ? null : Math.max(0, minimumT);
+}
+
+function rayCircleEntrySeconds({
+  playerX,
+  playerZ,
+  velocityX,
+  velocityZ,
+  centerX,
+  centerZ,
+  radiusMeters,
+}) {
+  const offsetX = playerX - centerX;
+  const offsetZ = playerZ - centerZ;
+  const radiusSquared = radiusMeters * radiusMeters;
+  if (offsetX * offsetX + offsetZ * offsetZ <= radiusSquared) return 0;
+  const speedSquared = velocityX * velocityX + velocityZ * velocityZ;
+  if (!(speedSquared > 0)) return null;
+  const projection = offsetX * velocityX + offsetZ * velocityZ;
+  const discriminant = projection * projection
+    - speedSquared * (offsetX * offsetX + offsetZ * offsetZ - radiusSquared);
+  if (discriminant < 0) return null;
+  const entry = (-projection - Math.sqrt(Math.max(0, discriminant))) / speedSquared;
+  return entry < 0 ? null : entry;
+}
+
+/**
+ * First time a moving point enters the exact Euclidean radius of a Chunk AABB.
+ * The rounded rectangle is the union of its two edge strips and four corner
+ * circles.  In particular, this never treats the square corner of an
+ * independently-expanded AABB as drawable visual coverage.
+ */
+export function staticMovingPointChunkAabbEntrySeconds({
+  chunkX,
+  chunkZ,
+  player,
+  velocity,
+  radiusMeters,
+} = {}) {
+  if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
+    throw new TypeError('Chunk coordinates must be safe integers');
+  }
+  const playerX = Number(player?.x);
+  const playerZ = Number(player?.z);
+  const velocityX = Number(velocity?.x);
+  const velocityZ = Number(velocity?.z);
+  if (![playerX, playerZ, velocityX, velocityZ, radiusMeters].every(Number.isFinite)
+    || radiusMeters < 0) {
+    throw new RangeError('moving-point Chunk entry requires finite coordinates and radius');
+  }
+  const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+  const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+  const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+  const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+  if (staticChunkAabbIntersectsCircle(
+    chunkX,
+    chunkZ,
+    playerX,
+    playerZ,
+    radiusMeters,
+  )) return 0;
+  const candidates = [
+    rayAabbEntrySeconds({
+      playerX,
+      playerZ,
+      velocityX,
+      velocityZ,
+      minimumX: minimumX - radiusMeters,
+      minimumZ,
+      maximumX: maximumX + radiusMeters,
+      maximumZ,
+    }),
+    rayAabbEntrySeconds({
+      playerX,
+      playerZ,
+      velocityX,
+      velocityZ,
+      minimumX,
+      minimumZ: minimumZ - radiusMeters,
+      maximumX,
+      maximumZ: maximumZ + radiusMeters,
+    }),
+  ];
+  for (const [centerX, centerZ] of [
+    [minimumX, minimumZ],
+    [minimumX, maximumZ],
+    [maximumX, minimumZ],
+    [maximumX, maximumZ],
+  ]) {
+    candidates.push(rayCircleEntrySeconds({
+      playerX,
+      playerZ,
+      velocityX,
+      velocityZ,
+      centerX,
+      centerZ,
+      radiusMeters,
+    }));
+  }
+  const finiteCandidates = candidates.filter(Number.isFinite);
+  return finiteCandidates.length === 0 ? null : Math.min(...finiteCandidates);
+}
+
+function segmentIntersectsRoundedChunkAabb(
+  chunkX,
+  chunkZ,
+  start,
+  end,
+  radiusMeters,
+) {
+  const entrySeconds = staticMovingPointChunkAabbEntrySeconds({
+    chunkX,
+    chunkZ,
+    player: start,
+    velocity: { x: end.x - start.x, z: end.z - start.z },
+    radiusMeters,
+  });
+  return entrySeconds !== null && entrySeconds <= 1;
+}
+
 function collectCorridorOwners({
   start,
   end,
@@ -126,9 +280,13 @@ function collectCorridorOwners({
 }) {
   const result = new Set();
   const radius = Math.max(exactRadiusMeters, horizonRadiusMeters ?? exactRadiusMeters);
-  const minimumChunkX = Math.floor((Math.min(start.x, end.x) - radius) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkX = Math.ceil(
+    (Math.min(start.x, end.x) - radius) / LOGICAL_CHUNK_SIZE_METERS,
+  ) - 1;
   const maximumChunkX = Math.floor((Math.max(start.x, end.x) + radius) / LOGICAL_CHUNK_SIZE_METERS);
-  const minimumChunkZ = Math.floor((Math.min(start.z, end.z) - radius) / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkZ = Math.ceil(
+    (Math.min(start.z, end.z) - radius) / LOGICAL_CHUNK_SIZE_METERS,
+  ) - 1;
   const maximumChunkZ = Math.floor((Math.max(start.z, end.z) + radius) / LOGICAL_CHUNK_SIZE_METERS);
   for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
     for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
@@ -139,6 +297,52 @@ function collectCorridorOwners({
         && horizonOwnerPredicate({ chunkX, chunkZ })
         && segmentIntersectsExpandedChunkAabb(
           chunkX, chunkZ, start, end, horizonRadiusMeters,
+        );
+      if (exact || horizon) {
+        const ownerKey = createChunkKey(chunkX, chunkZ);
+        result.add(ownerKey);
+        if (exact) exactOwnerKeys?.add(ownerKey);
+      }
+    }
+  }
+  return result;
+}
+
+function collectVisualCorridorOwners({
+  start,
+  end,
+  exactRadiusMeters,
+  horizonRadiusMeters,
+  horizonOwnerPredicate,
+  exactOwnerKeys = null,
+}) {
+  const result = new Set();
+  const radius = Math.max(exactRadiusMeters, horizonRadiusMeters ?? exactRadiusMeters);
+  const minimumChunkX = Math.ceil((Math.min(start.x, end.x) - radius)
+    / LOGICAL_CHUNK_SIZE_METERS) - 1;
+  const maximumChunkX = Math.floor((Math.max(start.x, end.x) + radius)
+    / LOGICAL_CHUNK_SIZE_METERS);
+  const minimumChunkZ = Math.ceil((Math.min(start.z, end.z) - radius)
+    / LOGICAL_CHUNK_SIZE_METERS) - 1;
+  const maximumChunkZ = Math.floor((Math.max(start.z, end.z) + radius)
+    / LOGICAL_CHUNK_SIZE_METERS);
+  for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
+    for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
+      const exact = segmentIntersectsRoundedChunkAabb(
+        chunkX,
+        chunkZ,
+        start,
+        end,
+        exactRadiusMeters,
+      );
+      const horizon = !exact && horizonRadiusMeters !== null
+        && horizonOwnerPredicate({ chunkX, chunkZ })
+        && segmentIntersectsRoundedChunkAabb(
+          chunkX,
+          chunkZ,
+          start,
+          end,
+          horizonRadiusMeters,
         );
       if (exact || horizon) {
         const ownerKey = createChunkKey(chunkX, chunkZ);
@@ -217,8 +421,17 @@ export function createCircularStaticStreamingPolicy({
       velocityCorridor.endpoint.x,
       velocityCorridor.endpoint.z,
     );
+    // The coordinator decides when coverage is regenerated (owner/corridor
+    // boundary, not camera or micro-movement). Once it does regenerate, the
+    // cache must not substitute a circle computed from an older sub-Chunk
+    // alignment that happened to share the same start/end owner keys. Such a
+    // stale circle can mark a lateral owner Expected even though the current
+    // velocity ray can never enter its exact visual radius.
     const coverageKey = `${renderDistancePreset}:${residentCoverage?.signature
-      ?? playerOwner.key}:${endpointOwner.key}`;
+      ?? playerOwner.key}:${endpointOwner.key}:`
+      + `${Number(player.x).toFixed(6)},${Number(player.z).toFixed(6)}:`
+      + `${Number(velocityCorridor.endpoint.x).toFixed(6)},`
+      + `${Number(velocityCorridor.endpoint.z).toFixed(6)}`;
     const cached = coverageCache.get(coverageKey);
     if (cached) {
       coverageCache.delete(coverageKey);
@@ -231,14 +444,21 @@ export function createCircularStaticStreamingPolicy({
       profile.horizonDistanceMeters ?? profile.exactDistanceMeters,
     );
     const requiredRadiusMeters = residentCoverage === null
-      ? presentationRadiusMeters
-      : Math.min(
-        residentCoverage.radiusMeters,
-        presentationRadiusMeters + LOGICAL_CHUNK_SIZE_METERS,
-      );
+      ? presentationRadiusMeters : residentCoverage.radiusMeters;
     const required = residentCoverage === null
       ? coverageFor(player, renderDistancePreset)
       : new Set(residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters));
+    // Resource residency deliberately carries one Chunk of prewarm margin,
+    // while visual existence is the true presentation circle around the
+    // player. Keep both immutable domains on the same source snapshot.
+    const visualRequired = coverageFor(player, renderDistancePreset);
+    const visualExactOwnerKeys = collectCircularOwners({
+      centerX: player.x,
+      centerZ: player.z,
+      exactRadiusMeters: profile.exactDistanceMeters,
+      horizonRadiusMeters: null,
+      horizonOwnerPredicate,
+    });
     const exactOwnerKeys = residentCoverage === null
       ? collectCircularOwners({
         centerX: player.x,
@@ -265,13 +485,52 @@ export function createCircularStaticStreamingPolicy({
       })
       : new Set();
     for (const ownerKey of required) prefetched.delete(ownerKey);
+    const visualCorridor = velocityCorridor.distanceMeters > 0
+      ? collectVisualCorridorOwners({
+        start: player,
+        end: velocityCorridor.endpoint,
+        exactRadiusMeters: profile.exactDistanceMeters,
+        horizonRadiusMeters: profile.horizonDistanceMeters,
+        horizonOwnerPredicate,
+        exactOwnerKeys: visualExactOwnerKeys,
+      })
+      : new Set();
+    const visualPrefetched = new Set(visualCorridor);
+    for (const ownerKey of visualRequired) visualPrefetched.delete(ownerKey);
     const retainedRadiusMeters = requiredRadiusMeters + retentionMarginMeters;
     const retained = residentCoverage !== null
-      && retainedRadiusMeters <= residentCoverage.radiusMeters
-      ? new Set(residentOwnerKeysWithinRadius(residentCoverage, retainedRadiusMeters))
+      ? new Set(residentCoverage.presentationView?.ownerKeys
+        ?? residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters))
       : coverageFor(player, renderDistancePreset, retentionMarginMeters);
     const requiredOwnerKeys = freezeCollectedOwnerKeys(required, ownerMetadataCache);
     const prefetchedOwnerKeys = freezeCollectedOwnerKeys(prefetched, ownerMetadataCache);
+    const visualRequiredOwnerKeys = freezeCollectedOwnerKeys(
+      visualRequired,
+      ownerMetadataCache,
+    );
+    const visualPrefetchedOwnerKeys = freezeCollectedOwnerKeys(
+      visualPrefetched,
+      ownerMetadataCache,
+    );
+    const visualExpectedOwnerKeys = unionNormalizedOwnerKeys(
+      ownerMetadataCache,
+      visualRequiredOwnerKeys,
+      visualPrefetchedOwnerKeys,
+    );
+    const visualExpectedOwnerSet = new Set(visualExpectedOwnerKeys);
+    const coarsePrewarm = coverageFor(
+      player,
+      renderDistancePreset,
+      STATIC_COARSE_SAFETY_MARGIN_METERS,
+    );
+    for (const ownerKey of visualExpectedOwnerSet) coarsePrewarm.delete(ownerKey);
+    for (const ownerKey of [...coarsePrewarm]) {
+      if (!required.has(ownerKey)) coarsePrewarm.delete(ownerKey);
+    }
+    const coarsePrewarmOwnerKeys = freezeCollectedOwnerKeys(
+      coarsePrewarm,
+      ownerMetadataCache,
+    );
     const retainedOwnerKeys = unionNormalizedOwnerKeys(
       ownerMetadataCache,
       freezeCollectedOwnerKeys(retained, ownerMetadataCache),
@@ -281,9 +540,17 @@ export function createCircularStaticStreamingPolicy({
     const canonicalOnly = profile.horizonDistanceMeters === null;
     const resolved = {
       sourceHash: coverageKey,
+      requiredRadiusMeters,
+      visualRadiusMeters: presentationRadiusMeters,
       required: requiredOwnerKeys,
       prefetched: prefetchedOwnerKeys,
       retained: retainedOwnerKeys,
+      visualRequired: visualRequiredOwnerKeys,
+      visualPrefetched: visualPrefetchedOwnerKeys,
+      visualExpected: visualExpectedOwnerKeys,
+      coarsePrewarm: coarsePrewarmOwnerKeys,
+      coarseFillInnerRadiusMeters:
+        presentationRadiusMeters * STATIC_COARSE_FILL_INNER_RATIO,
       resourceKindEntries: Object.freeze(retainedOwnerKeys.map(ownerKey => Object.freeze([
         ownerKey,
         canonicalOnly || exactOwnerKeys.has(ownerKey) ? exactResourceKind : horizonResourceKind,
@@ -292,6 +559,24 @@ export function createCircularStaticStreamingPolicy({
     Object.defineProperty(resolved, 'resourceKindFor', {
       value: ownerKey => (canonicalOnly || exactOwnerKeys.has(ownerKey)
         ? exactResourceKind : horizonResourceKind),
+      enumerable: false,
+    });
+    Object.defineProperty(resolved, 'isVisualRequired', {
+      value: ownerKey => visualRequired.has(ownerKey),
+      enumerable: false,
+    });
+    Object.defineProperty(resolved, 'isVisualExpected', {
+      value: ownerKey => visualRequired.has(ownerKey) || visualPrefetched.has(ownerKey),
+      enumerable: false,
+    });
+    Object.defineProperty(resolved, 'isCoarsePrewarm', {
+      value: ownerKey => coarsePrewarm.has(ownerKey),
+      enumerable: false,
+    });
+    Object.defineProperty(resolved, 'visualRadiusFor', {
+      value: ownerKey => (visualExactOwnerKeys.has(ownerKey)
+        ? profile.exactDistanceMeters
+        : profile.horizonDistanceMeters),
       enumerable: false,
     });
     Object.freeze(resolved);
@@ -304,7 +589,12 @@ export function createCircularStaticStreamingPolicy({
     kind,
     stream: WORLD_STREAMING_POLICY_STREAM.STATIC,
     distanceBands: Object.freeze({
-      required: Object.freeze({ radiusChunks: requiredRadiusChunks, deadlineSeconds: 0 }),
+      // The initial stationary 360-degree domain is a staged boot cohort, not
+      // a steady-state deadline proof. StaticObjectStream derives exact
+      // per-owner deadlines for velocity-corridor admission from owner AABB
+      // entry time instead of assigning this entire domain one artificial
+      // grace period.
+      required: Object.freeze({ radiusChunks: requiredRadiusChunks, deadlineSeconds: null }),
       prefetched: Object.freeze({ radiusChunks: requiredRadiusChunks, deadlineSeconds: 4.5 }),
       retained: Object.freeze({ radiusChunks: retainedRadiusChunks, deadlineSeconds: null }),
     }),
@@ -412,7 +702,24 @@ function mergePolicyPlanCoverage(
     .filter(ownerKey => !requiredOwnerSet.has(ownerKey));
   const retainedOwnerKeys = union('retainedOwnerKeys');
   const requestOwnerKeys = mergeOrdered([requiredOwnerKeys, prefetchedOwnerKeys]);
-  return Object.freeze({
+  const visualRequiredOwnerKeys = mergeOrdered(ordered.map(member => (
+    member.sourceSnapshot?.visualRequired ?? member.requiredOwnerKeys
+  )));
+  const visualExpectedOwnerKeys = mergeOrdered(ordered.map(member => (
+    member.sourceSnapshot?.visualExpected
+      ?? member.requestOwnerKeys
+      ?? mergeOrdered([member.requiredOwnerKeys, member.prefetchedOwnerKeys])
+  )));
+  const visualRequiredOwnerSet = new Set(visualRequiredOwnerKeys);
+  const visualExpectedOwnerSet = new Set(visualExpectedOwnerKeys);
+  const coarsePrewarmOwnerKeys = mergeOrdered(ordered.map(member => (
+    member.sourceSnapshot?.coarsePrewarm ?? Object.freeze([])
+  ))).filter(ownerKey => !visualExpectedOwnerSet.has(ownerKey));
+  const coarsePrewarmOwnerSet = new Set(coarsePrewarmOwnerKeys);
+  const coarseFillInnerRadiusMeters = Math.max(0, ...ordered.map(member => (
+    member.sourceSnapshot?.coarseFillInnerRadiusMeters ?? 0
+  )));
+  const merged = {
     kind: policyKind,
     policyKinds,
     memberPolicyPlans: Object.freeze(ordered),
@@ -427,12 +734,29 @@ function mergePolicyPlanCoverage(
     retainedOwnerKeys,
     requestOwnerKeys,
     allOwnerKeys: mergeOrdered([requestOwnerKeys, retainedOwnerKeys]),
+    visualRequiredOwnerKeys,
+    visualExpectedOwnerKeys,
+    coarsePrewarmOwnerKeys: Object.freeze(coarsePrewarmOwnerKeys),
+    coarseFillInnerRadiusMeters,
     deadline: Object.freeze({
       requiredAtMs: finiteDeadline('requiredAtMs'),
       prefetchedAtMs: finiteDeadline('prefetchedAtMs'),
     }),
     velocityCorridor: ordered[0].velocityCorridor,
+  };
+  Object.defineProperty(merged, 'isVisualRequired', {
+    value: ownerKey => visualRequiredOwnerSet.has(ownerKey),
+    enumerable: false,
   });
+  Object.defineProperty(merged, 'isVisualExpected', {
+    value: ownerKey => visualExpectedOwnerSet.has(ownerKey),
+    enumerable: false,
+  });
+  Object.defineProperty(merged, 'isCoarsePrewarm', {
+    value: ownerKey => coarsePrewarmOwnerSet.has(ownerKey),
+    enumerable: false,
+  });
+  return Object.freeze(merged);
 }
 
 export function createStaticObjectStream({
@@ -506,6 +830,12 @@ export function createStaticObjectStream({
   let pendingAdmissionOwnerKeys = Object.freeze([]);
   let pendingAdmissionIndex = 0;
   let pendingAdmissionCoverageGeneration = 0;
+  const pendingAdmissionSinceByOwner = new Map();
+  const ownerTimingByOwner = new Map();
+  let bootCohortOwnerKeys = null;
+  let bootCohortStartedAtMs = null;
+  let maximumPendingTaskAgeMs = 0;
+  let maximumAdmissionCursorAgeMs = 0;
   let latestApplyDiff = Object.freeze({
     enteringOwnerCount: 0,
     leavingOwnerCount: 0,
@@ -564,6 +894,175 @@ export function createStaticObjectStream({
   };
 
   const taskKey = (ownerKey, resourceKind) => `${resourceKind}\n${ownerKey}`;
+  const ownerEntrySeconds = (owner, player, velocity, radiusMeters) => {
+    if (!(radiusMeters >= 0)) return null;
+    return staticMovingPointChunkAabbEntrySeconds({
+      chunkX: owner.chunkX,
+      chunkZ: owner.chunkZ,
+      player,
+      velocity,
+      radiusMeters,
+    });
+  };
+  const ownerDistanceSquared = (owner, player) => {
+    const minimumX = owner.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+    const minimumZ = owner.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+    const maximumX = minimumX + LOGICAL_CHUNK_SIZE_METERS;
+    const maximumZ = minimumZ + LOGICAL_CHUNK_SIZE_METERS;
+    const closestX = Math.max(minimumX, Math.min(maximumX, player.x));
+    const closestZ = Math.max(minimumZ, Math.min(maximumZ, player.z));
+    return (closestX - player.x) ** 2 + (closestZ - player.z) ** 2;
+  };
+  const coarseFillBandFor = ({
+    deadlineAtMs,
+    visualExpected,
+    coarsePrewarm,
+    owner,
+    plan,
+    policyPlan,
+  }) => {
+    if (Number.isFinite(deadlineAtMs)) return 0;
+    if (visualExpected === true && ownerDistanceSquared(owner, plan.player)
+      <= policyPlan.coarseFillInnerRadiusMeters ** 2) return 1;
+    if (coarsePrewarm === true) return 2;
+    if (visualExpected === true) return 3;
+    return 4;
+  };
+  const derivedOwnerTiming = (
+    ownerKey,
+    owner,
+    plan,
+    policyPlan,
+    _coverageRequired,
+    bootKeys = bootCohortOwnerKeys,
+  ) => {
+    const previous = ownerTimingByOwner.get(ownerKey);
+    const visualRequired = policyPlan.isVisualRequired?.(ownerKey)
+      ?? policyPlan.requiredOwnerKeys.includes(ownerKey);
+    const visualExpected = policyPlan.isVisualExpected?.(ownerKey)
+      ?? policyPlan.requestOwnerKeys.includes(ownerKey);
+    const coarsePrewarm = policyPlan.isCoarsePrewarm?.(ownerKey) ?? false;
+    // bootCohortOwnerKeys remains the immutable metrics identity, but boot
+    // exemption lasts only while that identity is continuously Visual
+    // Expected. Leaving the visual domain converts it to steady timing, so a
+    // later corridor re-entry receives its real deadline.
+    const initialBootApply = bootCohortOwnerKeys === null;
+    if (bootKeys?.has(ownerKey) && visualExpected
+      && (initialBootApply || previous?.cohort === 'boot')) {
+      return previous ?? Object.freeze({
+        ownerKey,
+        cohort: 'boot',
+        expectedAt: plan.generatedAtMs,
+        firstPossibleVisibleAt: plan.generatedAtMs,
+        deadlineAtMs: null,
+        required: true,
+        visualExpected: true,
+        coarsePrewarm: false,
+        coarseFillBand: coarseFillBandFor({
+          deadlineAtMs: null,
+          visualExpected: true,
+          coarsePrewarm: false,
+          owner,
+          plan,
+          policyPlan,
+        }),
+      });
+    }
+    let firstPossibleVisibleAt = Number.POSITIVE_INFINITY;
+    for (const member of visualExpected ? policyPlan.memberPolicyPlans : []) {
+      const sourceSnapshot = member.sourceSnapshot;
+      const memberVisualExpected = sourceSnapshot?.isVisualExpected?.(ownerKey)
+        ?? (sourceSnapshot?.visualExpected
+          ?? member.requestOwnerKeys
+          ?? member.requiredOwnerKeys).includes(ownerKey);
+      if (!memberVisualExpected) continue;
+      const radiusMeters = sourceSnapshot?.visualRadiusFor?.(ownerKey)
+        ?? sourceSnapshot?.visualRadiusMeters
+        ?? sourceSnapshot?.requiredRadiusMeters;
+      const entrySeconds = ownerEntrySeconds(
+        owner,
+        plan.player,
+        plan.velocity,
+        radiusMeters,
+      );
+      if (entrySeconds !== null) {
+        firstPossibleVisibleAt = Math.min(
+          firstPossibleVisibleAt,
+          plan.generatedAtMs + entrySeconds * 1_000,
+        );
+      }
+    }
+    if (!Number.isFinite(firstPossibleVisibleAt)) {
+      if (visualExpected && !visualRequired) {
+        const evidence = policyPlan.memberPolicyPlans.map(member => {
+          const sourceSnapshot = member.sourceSnapshot;
+          const memberVisualExpected = sourceSnapshot?.isVisualExpected?.(ownerKey)
+            ?? (sourceSnapshot?.visualExpected
+              ?? member.requestOwnerKeys
+              ?? member.requiredOwnerKeys).includes(ownerKey);
+          const radiusMeters = sourceSnapshot?.visualRadiusFor?.(ownerKey)
+            ?? sourceSnapshot?.visualRadiusMeters
+            ?? sourceSnapshot?.requiredRadiusMeters;
+          return Object.freeze({
+            kind: member.kind,
+            memberVisualExpected,
+            radiusMeters,
+            entrySeconds: memberVisualExpected ? ownerEntrySeconds(
+              owner,
+              plan.player,
+              plan.velocity,
+              radiusMeters,
+            ) : null,
+          });
+        });
+        throw new Error(`visual Expected owner has no exact entry: ${JSON.stringify({
+          ownerKey,
+          owner,
+          player: plan.player,
+          velocity: plan.velocity,
+          evidence,
+        })}`);
+      }
+      firstPossibleVisibleAt = visualRequired ? plan.generatedAtMs : null;
+    }
+    if (previous && previous.cohort !== 'boot' && visualRequired) {
+      firstPossibleVisibleAt = Number.isFinite(previous.firstPossibleVisibleAt)
+        ? Math.min(previous.firstPossibleVisibleAt, firstPossibleVisibleAt ?? Number.POSITIVE_INFINITY)
+        : firstPossibleVisibleAt;
+    }
+    return Object.freeze({
+      ownerKey,
+      cohort: 'steady',
+      expectedAt: plan.generatedAtMs,
+      firstPossibleVisibleAt,
+      deadlineAtMs: firstPossibleVisibleAt,
+      required: visualRequired,
+      visualExpected,
+      coarsePrewarm,
+      coarseFillBand: coarseFillBandFor({
+        deadlineAtMs: firstPossibleVisibleAt,
+        visualExpected,
+        coarsePrewarm,
+        owner,
+        plan,
+        policyPlan,
+      }),
+    });
+  };
+  const ownerDeadlineAtMs = (ownerKey, required) => {
+    const timing = ownerTimingByOwner.get(ownerKey);
+    return timing?.required === required ? timing.deadlineAtMs : timing?.deadlineAtMs ?? null;
+  };
+  // Coverage membership remains the immutable Expected denominator. Visual
+  // Expected work always belongs to the coordinator's coarse-existence class;
+  // only real entry ETA supplies a deadline. Resource-only margin work remains
+  // staged prefetch, so boot does not invent simultaneous deadlines for the
+  // complete resident Resource window.
+  const schedulerRequiredFor = (deadlineAtMs, timing = null) => (
+    Number.isFinite(deadlineAtMs)
+      || timing?.visualExpected === true
+      || timing?.coarsePrewarm === true
+  );
   const classify = (
     ownerKey,
     plan = latestPlan,
@@ -626,11 +1125,17 @@ export function createStaticObjectStream({
       return false;
     }
     const required = latestRequiredOwnerKeys.has(resource.ownerKey);
-    const deadlineAtMs = required
-      ? latestPolicyPlan.deadline.requiredAtMs : latestPolicyPlan.deadline.prefetchedAtMs;
+    const deadlineAtMs = ownerDeadlineAtMs(resource.ownerKey, required);
+    const schedulerRequired = schedulerRequiredFor(
+      deadlineAtMs,
+      ownerTimingByOwner.get(resource.ownerKey),
+    );
+    const coarseFillBand = ownerTimingByOwner.get(resource.ownerKey)?.coarseFillBand ?? 4;
     const key = taskKey(resource.ownerKey, resource.resourceKind);
     const queued = readyPageQueue.get(key);
     if (queued?.value === resource.value && queued.required === required
+      && queued.schedulerRequired === schedulerRequired
+      && queued.coarseFillBand === coarseFillBand
       && queued.deadlineAtMs === deadlineAtMs) {
       counts.readyPageQueueReuses += 1;
       return false;
@@ -638,6 +1143,8 @@ export function createStaticObjectStream({
     readyPageQueue.set(key, Object.freeze({
       ...resource,
       required,
+      schedulerRequired,
+      coarseFillBand,
       deadlineAtMs,
     }));
     counts.readyPageQueueInsertions += 1;
@@ -736,6 +1243,7 @@ export function createStaticObjectStream({
     while (tasks.size < maximumConcurrentRequests
       && pendingAdmissionIndex < pendingAdmissionOwnerKeys.length) {
       const ownerKey = pendingAdmissionOwnerKeys[pendingAdmissionIndex++];
+      pendingAdmissionSinceByOwner.delete(ownerKey);
       if (!latestRequestedOwnerKeys.has(ownerKey)) {
         counts.admissionCursorSkips += 1;
         continue;
@@ -751,15 +1259,19 @@ export function createStaticObjectStream({
         counts.admissionCursorSkips += 1;
         continue;
       }
+      const required = latestRequiredOwnerKeys.has(ownerKey);
+      const deadlineAtMs = ownerDeadlineAtMs(ownerKey, required);
       enqueue({
         ownerKey,
         ownerX: descriptor.ownerX,
         ownerZ: descriptor.ownerZ,
         resourceKind,
-        required: latestRequiredOwnerKeys.has(ownerKey),
-        deadlineAtMs: latestRequiredOwnerKeys.has(ownerKey)
-          ? latestPolicyPlan.deadline.requiredAtMs
-          : latestPolicyPlan.deadline.prefetchedAtMs,
+        required,
+        schedulerRequired: schedulerRequiredFor(
+          deadlineAtMs,
+          ownerTimingByOwner.get(ownerKey),
+        ),
+        deadlineAtMs,
         planId: latestPlan.planId,
         publicationGroup: latestPolicyPlan.publicationGroup,
         pumpNow: false,
@@ -784,8 +1296,9 @@ export function createStaticObjectStream({
           ownerX: task.ownerX,
           ownerZ: task.ownerZ,
           resourceKind: task.resourceKind,
-          priority: task.required ? requiredPriority : prefetchedPriority,
-          required: task.required,
+          priority: task.schedulerRequired ? requiredPriority : prefetchedPriority,
+          required: task.schedulerRequired,
+          coverageRequired: task.required,
           deadlineAtMs: task.deadlineAtMs,
           epoch: task.epoch,
           planId: task.planId,
@@ -813,6 +1326,10 @@ export function createStaticObjectStream({
     resourceKind,
     required,
     deadlineAtMs,
+    schedulerRequired = schedulerRequiredFor(
+      deadlineAtMs,
+      ownerTimingByOwner.get(ownerKey),
+    ),
     planId,
     publicationGroup,
     pumpNow = true,
@@ -829,9 +1346,15 @@ export function createStaticObjectStream({
     const existing = tasks.get(key);
     if (existing) {
       counts.pendingReuse += 1;
-      if (required && !existing.required) {
-        existing.required = true;
-        existing.deadlineAtMs = deadlineAtMs;
+      const requirementPromoted = required && !existing.required;
+      const schedulingPromoted = schedulerRequired && !existing.schedulerRequired;
+      if (requirementPromoted || schedulingPromoted) {
+        existing.required ||= required;
+        existing.schedulerRequired ||= schedulerRequired;
+        if (deadlineAtMs !== null
+          && (existing.deadlineAtMs === null || deadlineAtMs < existing.deadlineAtMs)) {
+          existing.deadlineAtMs = deadlineAtMs;
+        }
         promoteQueuedTask(existing);
         pump();
       }
@@ -854,10 +1377,12 @@ export function createStaticObjectStream({
       ownerZ,
       resourceKind,
       required,
+      schedulerRequired,
       deadlineAtMs,
       planId,
       publicationGroup,
       epoch,
+      createdAtMs: clock(),
       state: 'queued',
       promise,
       resolve,
@@ -1222,6 +1747,20 @@ export function createStaticObjectStream({
       return entry;
     }));
     const nextResourceKindByOwner = new Map(nextResourceKindEntries);
+    const visuallyEnteringOwnerKeys = new Set(
+      (policyPlan.visualExpectedOwnerKeys ?? []).filter(ownerKey => (
+        ownerTimingByOwner.get(ownerKey)?.visualExpected !== true
+      )),
+    );
+    const coarsePrewarmEnteringOwnerKeys = new Set(
+      (policyPlan.coarsePrewarmOwnerKeys ?? []).filter(ownerKey => (
+        ownerTimingByOwner.get(ownerKey)?.coarsePrewarm !== true
+      )),
+    );
+    const priorityEnteringOwnerKeys = new Set([
+      ...visuallyEnteringOwnerKeys,
+      ...coarsePrewarmEnteringOwnerKeys,
+    ]);
     const nextSignature = ownerMetadataRevision === null
       ? coverageSignature(plan, policyPlan, nextResourceKindEntries, ownerMetadataCache)
       : `immutable-coverage:${ownerMetadataRevision}`;
@@ -1238,7 +1777,7 @@ export function createStaticObjectStream({
       }
       return committed;
     };
-    if (nextSignature === latestCoverageSignature) {
+    if (nextSignature === latestCoverageSignature && priorityEnteringOwnerKeys.size === 0) {
       if (applyAttempt !== applyAttemptSequence) {
         counts.supersededApplies += 1;
         return false;
@@ -1254,6 +1793,7 @@ export function createStaticObjectStream({
       }
       publicationContextPendingForPlan = false;
       latestPlan = plan;
+      latestPolicyPlan = policyPlan;
       latestPolicyDescriptorMaps = commitPolicyDescriptorMaps();
       latestPolicyResourceEntryMaps = resourceEntryMapsByPolicy;
       latestResourceKindEntryByOwner = nextResourceKindEntryByOwner;
@@ -1277,13 +1817,45 @@ export function createStaticObjectStream({
         queueCandidateCount: 0,
         queueInsertionCount: 0,
       });
+      for (const ownerKey of policyPlan.requestOwnerKeys) {
+        const required = policyPlan.requiredOwnerKeys.includes(ownerKey);
+        ownerTimingByOwner.set(ownerKey, derivedOwnerTiming(
+          ownerKey,
+          nextOwnerDescriptorByKey.get(ownerKey),
+          plan,
+          policyPlan,
+          required,
+        ));
+        const task = tasks.get(taskKey(ownerKey, nextResourceKindByOwner.get(ownerKey)));
+        if (task) {
+          task.required = required;
+          task.deadlineAtMs = ownerDeadlineAtMs(ownerKey, required);
+          task.schedulerRequired = schedulerRequiredFor(
+            task.deadlineAtMs,
+            ownerTimingByOwner.get(ownerKey),
+          );
+          if (task.schedulerRequired) promoteQueuedTask(task);
+        }
+      }
       cancelMatureStaleTasks();
       pump();
       return false;
     }
     const required = new Set(policyPlan.requiredOwnerKeys);
     const retained = new Set(policyPlan.allOwnerKeys);
-    const previousRequiredOwnerKeys = latestRequiredOwnerKeys;
+    const stagedBootCohortOwnerKeys = bootCohortOwnerKeys
+      ?? new Set(policyPlan.visualRequiredOwnerKeys);
+    const stagedOwnerTimingByOwner = new Map(ownerTimingByOwner);
+    for (const ownerKey of policyPlan.requestOwnerKeys) {
+      stagedOwnerTimingByOwner.set(ownerKey, derivedOwnerTiming(
+        ownerKey,
+        nextOwnerDescriptorByKey.get(ownerKey),
+        plan,
+        policyPlan,
+        required.has(ownerKey),
+        stagedBootCohortOwnerKeys,
+      ));
+    }
     const previousRequestedOwnerKeys = latestRequestedOwnerKeys;
     const previousResourceKindByOwner = latestResourceKindByOwner;
     const nextRequestedOwnerKeys = new Set(policyPlan.requestOwnerKeys);
@@ -1296,16 +1868,25 @@ export function createStaticObjectStream({
       !latestRequestedOwnerKeys.has(ownerKey)
         || latestResourceKindByOwner.get(ownerKey) !== nextResourceKindByOwner.get(ownerKey)
         || previousPendingAdmissionOwnerKeys.has(ownerKey)
+        || (priorityEnteringOwnerKeys.has(ownerKey)
+          && !ready.has(taskKey(ownerKey, nextResourceKindByOwner.get(ownerKey)))
+          && !tasks.has(taskKey(ownerKey, nextResourceKindByOwner.get(ownerKey))))
     ));
     const compareRequestPriority = (left, right) => {
       const leftOwner = nextOwnerDescriptorByKey.get(left);
       const rightOwner = nextOwnerDescriptorByKey.get(right);
-      const leftX = (leftOwner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.x;
-      const leftZ = (leftOwner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.z;
-      const rightX = (rightOwner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.x;
-      const rightZ = (rightOwner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS - plan.player.z;
-      return Number(required.has(right)) - Number(required.has(left))
-        || leftX * leftX + leftZ * leftZ - (rightX * rightX + rightZ * rightZ)
+      const leftTiming = stagedOwnerTimingByOwner.get(left);
+      const rightTiming = stagedOwnerTimingByOwner.get(right);
+      const leftSchedulerRequired = schedulerRequiredFor(leftTiming?.deadlineAtMs, leftTiming);
+      const rightSchedulerRequired = schedulerRequiredFor(rightTiming?.deadlineAtMs, rightTiming);
+      const leftDistanceSquared = ownerDistanceSquared(leftOwner, plan.player);
+      const rightDistanceSquared = ownerDistanceSquared(rightOwner, plan.player);
+      return Number(rightSchedulerRequired) - Number(leftSchedulerRequired)
+        || (leftTiming?.deadlineAtMs ?? Number.POSITIVE_INFINITY)
+          - (rightTiming?.deadlineAtMs ?? Number.POSITIVE_INFINITY)
+        || (leftTiming?.coarseFillBand ?? 4) - (rightTiming?.coarseFillBand ?? 4)
+        || Number(required.has(right)) - Number(required.has(left))
+        || leftDistanceSquared - rightDistanceSquared
         || leftOwner.chunkZ - rightOwner.chunkZ
         || leftOwner.chunkX - rightOwner.chunkX;
     };
@@ -1343,9 +1924,35 @@ export function createStaticObjectStream({
     latestRequestedOwnerKeys = nextRequestedOwnerKeys;
     latestRequiredOwnerKeys = required;
     latestAllOwnerKeys = retained;
+    if (bootCohortOwnerKeys === null) {
+      bootCohortOwnerKeys = stagedBootCohortOwnerKeys;
+      bootCohortStartedAtMs = plan.generatedAtMs;
+    }
+    ownerTimingByOwner.clear();
+    for (const [ownerKey, timing] of stagedOwnerTimingByOwner) {
+      if (nextRequestedOwnerKeys.has(ownerKey)) ownerTimingByOwner.set(ownerKey, timing);
+    }
+    // A resident Resource-margin page may have been consumed by the existing
+    // coarse publisher before that owner entered the 300 m Visual domain. Put
+    // its immutable cached page back on the same ready-page bridge so the new
+    // Expected record can derive requirements; no generation or second queue
+    // is introduced.
+    for (const ownerKey of priorityEnteringOwnerKeys) {
+      const resourceKind = nextResourceKindByOwner.get(ownerKey);
+      queueReadyPage(ready.get(taskKey(ownerKey, resourceKind)));
+    }
     pendingAdmissionOwnerKeys = Object.freeze([...queueCandidateOwnerKeys]);
     pendingAdmissionIndex = 0;
     pendingAdmissionCoverageGeneration = coverageGeneration;
+    for (const ownerKey of queueCandidateOwnerKeys) {
+      pendingAdmissionSinceByOwner.set(
+        ownerKey,
+        pendingAdmissionSinceByOwner.get(ownerKey) ?? plan.generatedAtMs,
+      );
+    }
+    for (const ownerKey of [...pendingAdmissionSinceByOwner.keys()]) {
+      if (!nextRequestedOwnerKeys.has(ownerKey)) pendingAdmissionSinceByOwner.delete(ownerKey);
+    }
     counts.admissionCursorReplacements += 1;
     const supersededQueuedTasks = [...queue].filter(task => (
       task.state === 'queued'
@@ -1410,22 +2017,19 @@ export function createStaticObjectStream({
         if (readyPageQueue.delete(previousKey)) counts.staleResultDiscards += 1;
       }
     }
-    const requirementChangedOwnerKeys = new Set();
-    for (const ownerKey of required) {
-      if (!previousRequiredOwnerKeys.has(ownerKey)) requirementChangedOwnerKeys.add(ownerKey);
-    }
-    for (const ownerKey of previousRequiredOwnerKeys) {
-      if (!required.has(ownerKey)) requirementChangedOwnerKeys.add(ownerKey);
-    }
-    for (const ownerKey of requirementChangedOwnerKeys) {
-      const nextRequired = required.has(ownerKey);
-      const nextResourceKind = nextResourceKindByOwner.get(ownerKey);
-      const task = tasks.get(taskKey(ownerKey, nextResourceKind));
-      if (!task) continue;
-      task.required = nextRequired;
-      task.deadlineAtMs = nextRequired
-        ? policyPlan.deadline.requiredAtMs : policyPlan.deadline.prefetchedAtMs;
-      if (nextRequired) promoteQueuedTask(task);
+    // The physical window is at most maximumConcurrentRequests, so refresh
+    // scheduling metadata in-place without scanning or materializing the full
+    // staged boot cursor.
+    for (const task of tasks.values()) {
+      if (!nextRequestedOwnerKeys.has(task.ownerKey)
+        || nextResourceKindByOwner.get(task.ownerKey) !== task.resourceKind) continue;
+      task.required = required.has(task.ownerKey);
+      task.deadlineAtMs = ownerDeadlineAtMs(task.ownerKey, task.required);
+      task.schedulerRequired = schedulerRequiredFor(
+        task.deadlineAtMs,
+        ownerTimingByOwner.get(task.ownerKey),
+      );
+      if (task.schedulerRequired) promoteQueuedTask(task);
     }
     cancelMatureStaleTasks();
     pump();
@@ -1463,7 +2067,8 @@ export function createStaticObjectStream({
       ownerKey,
       resourceKind,
       required: true,
-      deadlineAtMs: latestPolicyPlan.deadline.requiredAtMs,
+      deadlineAtMs: ownerDeadlineAtMs(ownerKey, true),
+      schedulerRequired: true,
       planId: latestPlan.planId,
       publicationGroup: latestPolicyPlan.publicationGroup,
       pumpNow: false,
@@ -1514,9 +2119,11 @@ export function createStaticObjectStream({
     }
     const pages = [];
     const prioritized = [...readyPageQueue.entries()].sort((left, right) => (
-      Number(right[1].required) - Number(left[1].required)
+      Number(right[1].schedulerRequired) - Number(left[1].schedulerRequired)
         || (left[1].deadlineAtMs ?? Number.POSITIVE_INFINITY)
           - (right[1].deadlineAtMs ?? Number.POSITIVE_INFINITY)
+        || (left[1].coarseFillBand ?? 4) - (right[1].coarseFillBand ?? 4)
+        || Number(right[1].required) - Number(left[1].required)
         || left[1].readyAtMs - right[1].readyAtMs
         || left[1].ownerKey.localeCompare(right[1].ownerKey)
     ));
@@ -1534,6 +2141,8 @@ export function createStaticObjectStream({
         readyAtMs: resource.readyAtMs,
         sourcePlanId: resource.sourcePlanId,
         required: resource.required,
+        schedulerRequired: resource.schedulerRequired,
+        coarseFillBand: resource.coarseFillBand,
         deadlineAtMs: resource.deadlineAtMs,
         coverageGeneration,
         planRevision,
@@ -1544,6 +2153,23 @@ export function createStaticObjectStream({
   };
 
   const snapshot = () => {
+    const snapshotAtMs = clock();
+    const taskAges = [...tasks.values()].map(task => Math.max(
+      0,
+      snapshotAtMs - task.createdAtMs,
+    ));
+    const cursorAges = pendingAdmissionCoverageGeneration === coverageGeneration
+      ? pendingAdmissionOwnerKeys.slice(pendingAdmissionIndex).map(ownerKey => Math.max(
+        0,
+        snapshotAtMs - (pendingAdmissionSinceByOwner.get(ownerKey) ?? snapshotAtMs),
+      )) : [];
+    const oldestPendingTaskAgeMs = taskAges.length ? Math.max(...taskAges) : 0;
+    const oldestAdmissionCursorAgeMs = cursorAges.length ? Math.max(...cursorAges) : 0;
+    maximumPendingTaskAgeMs = Math.max(maximumPendingTaskAgeMs, oldestPendingTaskAgeMs);
+    maximumAdmissionCursorAgeMs = Math.max(
+      maximumAdmissionCursorAgeMs,
+      oldestAdmissionCursorAgeMs,
+    );
     const required = new Set(latestPolicyPlan?.requiredOwnerKeys ?? []);
     const prefetched = new Set(latestPolicyPlan?.prefetchedOwnerKeys ?? []);
     const ownerReady = ownerKey => ready.has(taskKey(
@@ -1558,6 +2184,13 @@ export function createStaticObjectStream({
       .map(member => Object.freeze({
         kind: member.kind,
         requiredOwnerCount: member.requiredOwnerKeys.length,
+        visualRequiredOwnerCount:
+          (member.sourceSnapshot?.visualRequired ?? member.requiredOwnerKeys).length,
+        visualExpectedOwnerCount:
+          (member.sourceSnapshot?.visualExpected
+            ?? member.requestOwnerKeys
+            ?? member.requiredOwnerKeys).length,
+        coarsePrewarmOwnerCount: member.sourceSnapshot?.coarsePrewarm?.length ?? 0,
         prefetchedOwnerCount: member.prefetchedOwnerKeys.length,
         retainedOwnerCount: member.retainedOwnerKeys.length,
         readyRequiredOwnerCount: member.requiredOwnerKeys.filter(ownerReady).length,
@@ -1576,6 +2209,9 @@ export function createStaticObjectStream({
       publicationContext: latestPublicationContext,
       publicationGroup: latestPolicyPlan?.publicationGroup ?? null,
       requiredOwnerCount: required.size,
+      visualRequiredOwnerCount: latestPolicyPlan?.visualRequiredOwnerKeys.length ?? 0,
+      visualExpectedOwnerCount: latestPolicyPlan?.visualExpectedOwnerKeys.length ?? 0,
+      coarsePrewarmOwnerCount: latestPolicyPlan?.coarsePrewarmOwnerKeys.length ?? 0,
       prefetchedOwnerCount: prefetched.size,
       retainedOwnerCount: latestPolicyPlan?.retainedOwnerKeys.length ?? 0,
       readyOwnerCount: readyOwnerKeys.size,
@@ -1599,6 +2235,14 @@ export function createStaticObjectStream({
         .sort()),
       backlog: queue.length + activeCount,
       pendingAdmissionCount: pendingAdmissionCount(),
+      oldestPendingTaskAgeMs,
+      maximumPendingTaskAgeMs,
+      oldestAdmissionCursorAgeMs,
+      maximumAdmissionCursorAgeMs,
+      bootCohortStartedAtMs,
+      bootCohortOwnerCount: bootCohortOwnerKeys?.size ?? 0,
+      bootCohortReadyOwnerCount: bootCohortOwnerKeys
+        ? [...bootCohortOwnerKeys].filter(ownerReady).length : 0,
       admissionWindowCount: tasks.size,
       admissionWindowCapacity: maximumConcurrentRequests,
       queueCapacity,
@@ -1641,6 +2285,13 @@ export function createStaticObjectStream({
       .map(member => Object.freeze({
         kind: member.kind,
         requiredOwnerCount: member.requiredOwnerKeys.length,
+        visualRequiredOwnerCount:
+          (member.sourceSnapshot?.visualRequired ?? member.requiredOwnerKeys).length,
+        visualExpectedOwnerCount:
+          (member.sourceSnapshot?.visualExpected
+            ?? member.requestOwnerKeys
+            ?? member.requiredOwnerKeys).length,
+        coarsePrewarmOwnerCount: member.sourceSnapshot?.coarsePrewarm?.length ?? 0,
         readyRequiredOwnerCount: member.requiredOwnerKeys.filter(isReady).length,
         prefetchedOwnerCount: member.prefetchedOwnerKeys.length,
         readyPrefetchedOwnerCount: member.prefetchedOwnerKeys.filter(isReady).length,
@@ -1656,6 +2307,9 @@ export function createStaticObjectStream({
       publicationSequence: currentPublicationSequence(),
       policyCoverage,
       requiredOwnerCount: requiredOwnerKeys.length,
+      visualRequiredOwnerCount: latestPolicyPlan?.visualRequiredOwnerKeys.length ?? 0,
+      visualExpectedOwnerCount: latestPolicyPlan?.visualExpectedOwnerKeys.length ?? 0,
+      coarsePrewarmOwnerCount: latestPolicyPlan?.coarsePrewarmOwnerKeys.length ?? 0,
       readyRequiredOwnerCount,
       missingRequiredOwnerCount: requiredOwnerKeys.length - readyRequiredOwnerCount,
       prefetchedOwnerCount: prefetchedOwnerKeys.length,
@@ -1697,6 +2351,10 @@ export function createStaticObjectStream({
     pendingAdmissionOwnerKeys = Object.freeze([]);
     pendingAdmissionIndex = 0;
     pendingAdmissionCoverageGeneration = 0;
+    pendingAdmissionSinceByOwner.clear();
+    ownerTimingByOwner.clear();
+    bootCohortOwnerKeys = null;
+    bootCohortStartedAtMs = null;
     latestApplyDiff = Object.freeze({
       enteringOwnerCount: 0,
       leavingOwnerCount: 0,
@@ -1755,9 +2413,20 @@ export function createStaticObjectStream({
     requestOrReuse,
     publishOwners,
     drainReadyOwnerPages,
+    // Requirement derivation may read an immutable page that the same bridge
+    // already consumed while it was only Resource-prewarmed. This is a cache
+    // view, not another admission/publication path; renderer work continues to
+    // flow exclusively through drainReadyOwnerPages.
+    readyOwnerResource: ownerKey => {
+      const resourceKind = latestResourceKindByOwner.get(ownerKey);
+      return resourceKind ? ready.get(taskKey(ownerKey, resourceKind)) ?? null : null;
+    },
     resourceKindEntries: () => latestResourceKindEntries,
     policyResourceKindEntries: () => latestPolicyResourceKindEntries,
     ownerMetadataDiagnostics: () => ownerMetadataCache?.snapshot() ?? null,
+    ownerTimingSnapshot: ownerKeys => Object.freeze((ownerKeys ?? []).map(ownerKey => (
+      ownerTimingByOwner.get(ownerKey)
+    )).filter(Boolean)),
     invalidate,
     diagnostics,
     snapshot,

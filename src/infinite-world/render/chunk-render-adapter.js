@@ -33,7 +33,9 @@ import {
   createRoadRibbonHeightSampler,
 } from './settlement-road-ribbon-geometry.js';
 import {
+  createDrawableReplacementBarrier,
   hasDrawableInCompletedFrame,
+  isDrawableInCompletedFrame,
   isCompletedRenderFrameReceipt,
 } from '../visual-continuity.js';
 
@@ -52,6 +54,7 @@ export class ChunkRenderAdapter {
     isFeatureDestroyed = () => false,
     visualAssets = null,
     telemetry = null,
+    visualRegistry = null,
   } = {}) {
     if (!scene || typeof scene.add !== 'function' || typeof scene.remove !== 'function') {
       throw new TypeError('a Three.js scene is required');
@@ -72,11 +75,33 @@ export class ChunkRenderAdapter {
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
     this.telemetry = telemetry?.enabled === true ? telemetry : null;
+    this.visualRegistry = visualRegistry;
+    this.settlementReplacementBarrier = visualRegistry
+      ? createDrawableReplacementBarrier({
+        visualRegistry,
+        // A Settlement presentation hold is the presentation-only coarse
+        // drawable retained after Near gameplay/collision ownership leaves.
+        // Disposal means releasing that hold only after the returning Near
+        // detail has crossed an actual completed renderer receipt.
+        disposeDrawable: held => this.releaseSettlementPresentationHolds({
+          ownerKeys: [held.key],
+          descriptors: held.descriptors,
+          reason: 'near-detail-drawn',
+        }),
+      })
+      : null;
     this.pendingFirstDrawByChunk = new Map();
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
     this.visibleStableIdsRevision = 0;
     this.visibleStableIdsCache = null;
+    // Publication is not proof that a Near object reached the renderer.  This
+    // receipt-backed set is rebuilt after every completed frame and is the
+    // only Near identity source that a coarse replacement may consume.
+    this.drawableStableIds = new Set();
+    this.drawableStableIdsCache = Object.freeze([]);
+    this.drawableStableIdsFrameSequence = 0;
+    this.validatedRoadGeometry = new WeakMap();
     this.occlusionMeshes = [];
     this.cameraCollisionBounds = [];
     this.occludedFeatureIds = new Set();
@@ -147,6 +172,250 @@ export class ChunkRenderAdapter {
   #invalidateVisibleStableIds() {
     this.visibleStableIdsRevision += 1;
     this.visibleStableIdsCache = null;
+  }
+
+  #instanceMatrixAt(mesh, slot) {
+    const values = mesh?.instanceMatrix?.array ?? mesh?.instanceMatrix?.values ?? null;
+    const offset = slot * 16;
+    if ((!ArrayBuffer.isView(values) && !Array.isArray(values))
+      || !Number.isSafeInteger(slot) || slot < 0 || values.length < offset + 16) return null;
+    return values.subarray?.(offset, offset + 16) ?? values.slice(offset, offset + 16);
+  }
+
+  #drawableInstancePartEvidence(part, receipt) {
+    const candidates = [part.mesh, part.fadeMesh].filter(Boolean);
+    for (const mesh of candidates) {
+      if (!Number.isSafeInteger(part.index) || part.index < 0
+        || !(mesh.count > part.index)) continue;
+      const matrix = this.#instanceMatrixAt(mesh, part.index);
+      if (!matrix) continue;
+      // A zero-scale matrix is the existing hidden-slot sentinel.  Finite
+      // numbers alone are insufficient to call that slot drawable.
+      const scaleX = Math.hypot(matrix[0], matrix[1], matrix[2]);
+      const scaleY = Math.hypot(matrix[4], matrix[5], matrix[6]);
+      const scaleZ = Math.hypot(matrix[8], matrix[9], matrix[10]);
+      if (!(scaleX > 1e-8 && scaleY > 1e-8 && scaleZ > 1e-8)) continue;
+      if (isDrawableInCompletedFrame({ mesh, receipt, matrix })) {
+        return Object.freeze({ mesh, matrix });
+      }
+    }
+    return null;
+  }
+
+  #drawableInstancePart(part, receipt) {
+    return this.#drawableInstancePartEvidence(part, receipt) !== null;
+  }
+
+  #rendererAttributeValues(attribute, receipt) {
+    const gpuValues = receipt?.gpuMirror?.read?.(attribute) ?? null;
+    if (gpuValues) return gpuValues;
+    if (ArrayBuffer.isView(attribute) || Array.isArray(attribute)) return attribute;
+    const values = attribute?.array ?? attribute?.values ?? attribute ?? null;
+    return ArrayBuffer.isView(values) || Array.isArray(values) ? values : null;
+  }
+
+  #drawableMergedRoadEvidence(mesh, receipt) {
+    const stableIds = mesh?.userData?.sourceRoadStableIds;
+    if (!Array.isArray(stableIds) || stableIds.length === 0
+      || stableIds.some(stableId => typeof stableId !== 'string' || !stableId)) return null;
+    const matrix = mesh.matrixWorld ?? mesh.matrix;
+    if (!isDrawableInCompletedFrame({ mesh, receipt, matrix })) return null;
+    const attributes = Object.values(mesh.geometry?.attributes ?? {});
+    const uploadAttributes = [...attributes, mesh.geometry?.index].filter(Boolean);
+    const versions = uploadAttributes.map(attribute => (
+      Number.isSafeInteger(attribute?.version) ? attribute.version : 0
+    ));
+    const cached = this.validatedRoadGeometry.get(mesh.geometry);
+    const cacheCurrent = cached
+      && cached.attributes.length === uploadAttributes.length
+      && cached.attributes.every((attribute, index) => (
+        attribute === uploadAttributes[index] && cached.versions[index] === versions[index]
+      ));
+    if (cacheCurrent) return cached.valid ? Object.freeze({
+      mesh,
+      matrix,
+      stableIds: Object.freeze([...new Set(stableIds)]),
+    }) : null;
+    const positionAttribute = mesh.geometry?.getAttribute?.('position')
+      ?? mesh.geometry?.attributes?.position ?? null;
+    const positions = this.#rendererAttributeValues(positionAttribute, receipt);
+    const indices = this.#rendererAttributeValues(mesh.geometry?.index, receipt);
+    for (const attribute of attributes) {
+      const values = this.#rendererAttributeValues(attribute, receipt);
+      if (!values || values.length === 0 || Array.from(values).some(value => !Number.isFinite(value))) {
+        this.validatedRoadGeometry.set(mesh.geometry, { attributes: uploadAttributes, versions, valid: false });
+        return null;
+      }
+    }
+    if (!positions || positions.length < 9 || positions.length % 3 !== 0
+      || !indices || indices.length < 3 || indices.length % 3 !== 0) {
+      this.validatedRoadGeometry.set(mesh.geometry, { attributes: uploadAttributes, versions, valid: false });
+      return null;
+    }
+    const vertexCount = positions.length / 3;
+    let nonDegenerate = false;
+    for (let offset = 0; offset < indices.length; offset += 3) {
+      const a = Number(indices[offset]);
+      const b = Number(indices[offset + 1]);
+      const c = Number(indices[offset + 2]);
+      if (![a, b, c].every(index => Number.isSafeInteger(index)
+        && index >= 0 && index < vertexCount)) {
+        this.validatedRoadGeometry.set(mesh.geometry, { attributes: uploadAttributes, versions, valid: false });
+        return null;
+      }
+      const ax = Number(positions[a * 3]);
+      const ay = Number(positions[a * 3 + 1]);
+      const az = Number(positions[a * 3 + 2]);
+      const abx = Number(positions[b * 3]) - ax;
+      const aby = Number(positions[b * 3 + 1]) - ay;
+      const abz = Number(positions[b * 3 + 2]) - az;
+      const acx = Number(positions[c * 3]) - ax;
+      const acy = Number(positions[c * 3 + 1]) - ay;
+      const acz = Number(positions[c * 3 + 2]) - az;
+      if (![ax, ay, az, abx, aby, abz, acx, acy, acz].every(Number.isFinite)) {
+        this.validatedRoadGeometry.set(mesh.geometry, { attributes: uploadAttributes, versions, valid: false });
+        return null;
+      }
+      const crossX = aby * acz - abz * acy;
+      const crossY = abz * acx - abx * acz;
+      const crossZ = abx * acy - aby * acx;
+      if (crossX * crossX + crossY * crossY + crossZ * crossZ > Number.EPSILON) {
+        nonDegenerate = true;
+      }
+    }
+    this.validatedRoadGeometry.set(mesh.geometry, {
+      attributes: uploadAttributes,
+      versions,
+      valid: nonDegenerate,
+    });
+    return nonDegenerate ? Object.freeze({
+      mesh,
+      matrix,
+      stableIds: Object.freeze([...new Set(stableIds)]),
+    }) : null;
+  }
+
+  #mergedRoadEvidenceForDescriptor(projected, descriptor, receipt) {
+    const roadComponent = projected?.settlementPresentation?.components
+      ?.find(component => component.kind === 'road') ?? null;
+    for (const mesh of roadComponent?.meshes ?? []) {
+      const evidence = this.#drawableMergedRoadEvidence(mesh, receipt);
+      if (evidence?.stableIds.includes(descriptor.projectionIdentity)) return evidence;
+    }
+    return null;
+  }
+
+  #recordDrawableMergedRoads(presentation, receipt, drawable) {
+    const declared = new Set((presentation?.descriptors ?? [])
+      .filter(descriptor => descriptor.kind === 'road')
+      .map(descriptor => descriptor.projectionIdentity));
+    const roadComponent = presentation?.components
+      ?.find(component => component.kind === 'road') ?? null;
+    for (const mesh of roadComponent?.meshes ?? []) {
+      const evidence = this.#drawableMergedRoadEvidence(mesh, receipt);
+      if (!evidence) continue;
+      const stableIds = evidence.stableIds.filter(stableId => (
+        declared.has(stableId) && !this.isFeatureDestroyed(stableId)
+      ));
+      for (const stableId of stableIds) drawable.add(stableId);
+      if (stableIds.length > 0) {
+        this.visualRegistry?.acknowledgeCoarseComponent?.({
+          ownerKey: presentation.ownerKey,
+          component: 'structure',
+          stableIds,
+          receipt,
+          drawable: evidence,
+        });
+      }
+    }
+  }
+
+  #acknowledgeSettlementReplacements(receipt) {
+    if (!this.settlementReplacementBarrier) return 0;
+    let released = 0;
+    for (const projected of this.loaded.values()) {
+      const held = projected.settlementReplacementHold ?? null;
+      if (!held) continue;
+      const evidence = [];
+      let allDrawn = true;
+      for (const descriptor of held.descriptors) {
+        if (this.isFeatureDestroyed(descriptor.projectionIdentity)) continue;
+        const actual = descriptor.kind === 'road'
+          ? this.#mergedRoadEvidenceForDescriptor(projected, descriptor, receipt)
+          : this.featureInstances.get(descriptor.projectionIdentity)?.parts
+            ?.map(part => this.#drawableInstancePartEvidence(part, receipt))
+            .find(Boolean) ?? null;
+        if (!actual) {
+          allDrawn = false;
+          break;
+        }
+        evidence.push(actual);
+      }
+      if (!allDrawn) continue;
+      // A fully destroyed held component no longer needs visual replacement;
+      // release it explicitly instead of manufacturing renderer evidence for
+      // an invisible slot.
+      if (evidence.length === 0) {
+        this.settlementReplacementBarrier.release(projected.key);
+        projected.settlementReplacementHold = null;
+        released += 1;
+        continue;
+      }
+      const visualOwner = this.visualRegistry?.get?.(projected.key) ?? null;
+      if (!visualOwner || visualOwner.retiringAt !== null) {
+        // The lifecycle denominator may retire while a returning Near owner
+        // is waiting. The completed receipt above still proves NEW before OLD
+        // is released, without leaving an unacknowledgeable retained entry.
+        this.settlementReplacementBarrier.release(projected.key);
+        projected.settlementReplacementHold = null;
+        released += 1;
+        continue;
+      }
+      const acknowledged = this.settlementReplacementBarrier.acknowledgeReplacement({
+        ownerKey: projected.key,
+        level: 'detail',
+        receipt,
+        drawable: evidence[0],
+      });
+      if (!acknowledged) continue;
+      projected.settlementReplacementHold = null;
+      released += 1;
+    }
+    return released;
+  }
+
+  #recordDrawableStableIds(receipt) {
+    const drawable = new Set();
+    for (const [stableId, entry] of this.featureInstances) {
+      if (entry.destroyed === true || this.isFeatureDestroyed(stableId)) continue;
+      if (entry.parts.some(part => this.#drawableInstancePart(part, receipt))) {
+        drawable.add(stableId);
+      }
+    }
+    for (const held of this.settlementPresentationHolds.values()) {
+      for (const [stableId, entry] of held.featureEntries) {
+        if (entry?.destroyed === true || this.isFeatureDestroyed(stableId)) continue;
+        if (entry?.parts?.some(part => this.#drawableInstancePart(part, receipt))) {
+          drawable.add(stableId);
+        }
+      }
+      this.#recordDrawableMergedRoads({
+        ownerKey: held.key,
+        descriptors: held.descriptors,
+        components: [...held.components.values()],
+      }, receipt, drawable);
+    }
+    for (const projected of this.loaded.values()) {
+      this.#recordDrawableMergedRoads({
+        ...projected.settlementPresentation,
+        ownerKey: projected.key,
+      }, receipt, drawable);
+    }
+    this.drawableStableIds = drawable;
+    this.drawableStableIdsCache = Object.freeze([...drawable]
+      .sort((left, right) => left.localeCompare(right)));
+    this.drawableStableIdsFrameSequence = receipt.frameSequence;
+    return drawable;
   }
 
   #registry() {
@@ -501,6 +770,17 @@ export class ChunkRenderAdapter {
   #holdSettlementPresentation(projected) {
     const presentation = projected.settlementPresentation;
     if (!presentation?.meshes?.length || !presentation.descriptors?.length) return false;
+    // Rapid reversal: this returning Near projection has not yet crossed the
+    // renderer receipt which would release the previously retained coarse
+    // hold. Do not replace that proven OLD drawable with an unproven NEW one;
+    // let unloadChunk discard the returning projection normally while OLD
+    // remains available for the next handoff attempt.
+    if (projected.settlementReplacementHold
+      && this.settlementPresentationHolds.get(projected.key)
+        === projected.settlementReplacementHold) {
+      projected.settlementReplacementHold = null;
+      return false;
+    }
     this.releaseSettlementPresentationHolds({
       ownerKeys: [projected.key],
       reason: 'replaced-hold',
@@ -900,11 +1180,11 @@ export class ChunkRenderAdapter {
           - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS
         : candidate.logicalLocalZ;
       const groundY = formal
-        ? sampleW8SurfaceHeightMeters(
+        ? (canonical?.position.y ?? sampleW8SurfaceHeightMeters(
           chunkData,
-          canonical?.position.x ?? candidate.worldPosition.x,
-          canonical?.position.z ?? candidate.worldPosition.z,
-        ) * this.unitsPerMeter : 0;
+          candidate.worldPosition.x,
+          candidate.worldPosition.z,
+        )) * this.unitsPerMeter : 0;
       const visual = canonical ? null : resolveW8NaturalCandidateVisual(candidate);
       const dimensions = canonical?.visualBounds ?? {
         width: visual.widthMeters, height: visual.heightMeters, depth: visual.depthMeters,
@@ -1353,10 +1633,15 @@ export class ChunkRenderAdapter {
     if (projected.lifecycle !== 'staged') {
       throw new Error(`render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`);
     }
-    this.releaseSettlementPresentationHolds({
-      ownerKeys: [projected.key],
-      reason: 'owner-returned-near',
-    });
+    const replacementOwner = this.visualRegistry?.get?.(projected.key) ?? null;
+    const replacementHold = replacementOwner && replacementOwner.retiringAt === null
+      ? this.settlementPresentationHolds.get(projected.key) ?? null : null;
+    if (!replacementHold || !this.settlementReplacementBarrier) {
+      this.releaseSettlementPresentationHolds({
+        ownerKeys: [projected.key],
+        reason: 'owner-returned-near',
+      });
+    }
     if (this.loaded.has(projected.key)) throw new Error(`render chunk already loaded: ${projected.key}`);
     const provisional = this.provisionalTerrain.get(projected.key) ?? null;
     const projectedTerrain = (projected.group.children ?? []).find(child => (
@@ -1397,6 +1682,13 @@ export class ChunkRenderAdapter {
       }
       this.#recordPublishedChunk(projected.key);
       this.#invalidateVisibleStableIds();
+      if (replacementHold && this.settlementReplacementBarrier) {
+        projected.settlementReplacementHold = replacementHold;
+        this.settlementReplacementBarrier.retain({
+          ownerKey: projected.key,
+          drawable: replacementHold,
+        });
+      }
     } catch (error) {
       this.worldRoot.remove(projected.group);
       this.loaded.delete(projected.key);
@@ -1456,6 +1748,8 @@ export class ChunkRenderAdapter {
 
   markFirstDraw(receipt) {
     if (!isCompletedRenderFrameReceipt(receipt)) return 0;
+    this.#recordDrawableStableIds(receipt);
+    this.#acknowledgeSettlementReplacements(receipt);
     if (this.treePathAudit.firstDrawAtMs === null && [...this.loaded.values()].some(projected => (
       hasDrawableInCompletedFrame({
         root: projected.group,
@@ -1679,6 +1973,10 @@ export class ChunkRenderAdapter {
     this.visibleStableIdsCache = Object.freeze([...visible]
       .sort((left, right) => left.localeCompare(right)));
     return this.visibleStableIdsCache;
+  }
+
+  drawableStableIdsSnapshot() {
+    return this.drawableStableIdsCache;
   }
 
   visibleSettlementStableIdsSnapshot() {

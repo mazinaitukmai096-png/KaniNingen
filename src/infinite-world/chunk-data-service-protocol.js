@@ -20,6 +20,8 @@ export const CHUNK_GENERATOR_MESSAGE = Object.freeze({
   GENERATED: 'chunk-generator:generated',
   GENERATE_PRESENTATION_OWNER: 'chunk-generator:generate-presentation-owner',
   GENERATED_PRESENTATION_OWNER: 'chunk-generator:generated-presentation-owner',
+  GENERATE_CANONICAL_TREE_CELL: 'chunk-generator:generate-canonical-tree-cell',
+  GENERATED_CANONICAL_TREE_CELL: 'chunk-generator:generated-canonical-tree-cell',
   PIPELINE_TIMING: 'chunk-generator:pipeline-timing',
   GENERATE_FOREST_HORIZON: 'chunk-generator:generate-forest-horizon',
   GENERATED_FOREST_HORIZON: 'chunk-generator:generated-forest-horizon',
@@ -50,6 +52,16 @@ export function createChunkDataRequestKey(chunkX, chunkZ) {
     throw new TypeError('ChunkData request coordinates must be safe integers');
   }
   return `${chunkX},${chunkZ}`;
+}
+
+export function createCanonicalTreeCellRequestKey(macroX, macroZ) {
+  createChunkDataRequestKey(macroX, macroZ);
+  if (![macroX * 4, macroZ * 4, macroX * 4 + 3, macroZ * 4 + 3,
+    macroX * 64, macroZ * 64, macroX * 64 + 64, macroZ * 64 + 64]
+    .every(Number.isSafeInteger)) {
+    throw new RangeError('canonical Tree Macro coordinates exceed safe owner coordinates');
+  }
+  return `${macroX},${macroZ}`;
 }
 
 export function createChunkGeneratorInitializeRequest({
@@ -300,6 +312,66 @@ export function createPresentationOwnerGeneratorRequest({
         ...scheduler,
         requestId,
         operationKind: 'presentation-owner',
+      },
+    }),
+  });
+}
+
+export function createCanonicalTreeCellGeneratorRequest({
+  requestId,
+  serviceGeneration,
+  macroX,
+  macroZ,
+  priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+  required = true,
+  createdAtMs = 0,
+  deadlineAtMs = null,
+  consumerId = 'macro-coarse-world',
+  epoch = 0,
+  correlationId = null,
+  target = 'tree',
+  stream = 'distant',
+  scheduler = null,
+  pipelineDiagnostics = false,
+} = {}) {
+  if (!Number.isSafeInteger(requestId) || requestId < 1) {
+    throw new RangeError('requestId must be positive');
+  }
+  createCanonicalTreeCellRequestKey(macroX, macroZ);
+  assertChunkDataPriority(priority);
+  if (!Number.isSafeInteger(serviceGeneration) || serviceGeneration < 1) {
+    throw new RangeError('serviceGeneration must be positive');
+  }
+  return Object.freeze({
+    type: CHUNK_GENERATOR_MESSAGE.GENERATE_CANONICAL_TREE_CELL,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId,
+    serviceGeneration,
+    macroX,
+    macroZ,
+    ...(pipelineDiagnostics === true ? { pipelineDiagnostics: true } : {}),
+    scheduler: createChunkGeneratorSchedulerEnvelope({
+      requestId,
+      operationKind: 'canonical-tree-cell',
+      priority,
+      required,
+      createdAtMs,
+      deadlineAtMs,
+      ownerKey: `${macroX},${macroZ}`,
+      resourceKind: 'canonical-tree-cell',
+      representationClass: 'coarse',
+      consumerId,
+      epoch,
+      correlationId,
+      target,
+      stream,
+      scheduler: scheduler === null ? null : {
+        ...scheduler,
+        requestId,
+        operationKind: 'canonical-tree-cell',
+        ownerKey: `${macroX},${macroZ}`,
+        resourceKind: 'canonical-tree-cell',
+        representationClass: 'coarse',
       },
     }),
   });

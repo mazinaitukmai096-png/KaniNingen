@@ -64,9 +64,13 @@ function foldInteger(value) {
   return mix32((value >>> 0) ^ mix32(Math.trunc(value / 0x100000000) >>> 0));
 }
 
-function cellUnit(seed, x, z, salt) {
-  return mix32(seed ^ Math.imul(foldInteger(x), 0x1f123bb5)
-    ^ Math.imul(foldInteger(z), 0x5f356495) ^ Math.imul(salt, 0x9e3779b9)) / 0xffffffff;
+function cellRandomBase(seed, x, z) {
+  return seed ^ Math.imul(foldInteger(x), 0x1f123bb5)
+    ^ Math.imul(foldInteger(z), 0x5f356495);
+}
+
+function cellUnitFromBase(base, salt) {
+  return mix32(base ^ Math.imul(salt, 0x9e3779b9)) / 0xffffffff;
 }
 
 function seed32(seed64) {
@@ -117,8 +121,7 @@ function sampleBiomeWeights(chunk, point) {
   }));
 }
 
-function chooseVegetationSubtype(weights, terrain, subtypeRoll) {
-  const byId = Object.fromEntries(weights.map(item => [item.biomeId, item.weight]));
+function chooseVegetationSubtype(byId, terrain, subtypeRoll) {
   if ((byId.wetland ?? 0) > 0.34 && terrain.moisture > 0.6) return 'wetland-tree';
   if ((byId['rocky-highland'] ?? 0) > 0.38 || terrain.moisture < 0.32) return 'conifer-tree';
   if ((byId['mixed-woodland'] ?? 0) > 0.3 || subtypeRoll < 0.68) return 'broadleaf-tree';
@@ -135,17 +138,19 @@ async function createVegetationCandidates(
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
   const startX = chunk.chunkX * cellsPerChunk;
   const startZ = chunk.chunkZ * cellsPerChunk;
+  const owner = Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ });
   const candidateTasks = [];
   for (let localZ = 0; localZ < cellsPerChunk; localZ += 1) {
     for (let localX = 0; localX < cellsPerChunk; localX += 1) {
       const cellX = startX + localX; const cellZ = startZ + localZ;
+      const randomBase = cellRandomBase(placementSeed, cellX, cellZ);
       const point = {
-        x: q6((cellX + 0.5) * size + (cellUnit(placementSeed, cellX, cellZ, 1) - 0.5) * size * 0.54),
-        z: q6((cellZ + 0.5) * size + (cellUnit(placementSeed, cellX, cellZ, 2) - 0.5) * size * 0.54),
+        x: q6((cellX + 0.5) * size + (cellUnitFromBase(randomBase, 1) - 0.5) * size * 0.54),
+        z: q6((cellZ + 0.5) * size + (cellUnitFromBase(randomBase, 2) - 0.5) * size * 0.54),
       };
-      const owner = determineDetailCandidateOwner(point);
-      if (owner.x !== chunk.chunkX || owner.z !== chunk.chunkZ) continue;
-      const admissionRoll = cellUnit(placementSeed, cellX, cellZ, 3);
+      // Jitter is strictly inside its 2 m semantic cell, so the owning 16 m
+      // cell is already the validated candidate input owner.
+      const admissionRoll = cellUnitFromBase(randomBase, 3);
       // eligibility is clamped to one, so a roll outside the absolute maximum
       // acceptance range can be rejected before any Terrain/Biome sampling.
       if (admissionRoll >= 0.58) continue;
@@ -164,9 +169,9 @@ async function createVegetationCandidates(
       const eligibility = q6(clamp(habitatUpperBound * slopeFit * rockPenalty));
       if (admissionRoll >= eligibility * 0.58) continue;
       const subtype = chooseVegetationSubtype(
-        sourceBiomeWeights,
+        weights,
         terrain,
-        cellUnit(placementSeed, cellX, cellZ, 4),
+        cellUnitFromBase(randomBase, 4),
       );
       const identityTask = createDetailCandidateId({
         worldSeedHash: chunk.worldSeedHash,
@@ -175,8 +180,8 @@ async function createVegetationCandidates(
         quantizedWorldCell: { x: cellX, z: cellZ },
         semanticKey: `${subtype}:slot-0`,
       });
-      const orientationSeed = q6(cellUnit(placementSeed, cellX, cellZ, 5));
-      const variationSeed = q6(cellUnit(placementSeed, cellX, cellZ, 6));
+      const orientationSeed = q6(cellUnitFromBase(randomBase, 5));
+      const variationSeed = q6(cellUnitFromBase(randomBase, 6));
       const radius = W3_FORMAL_DETAILS.vegetationRadiusMeters[subtype];
       candidateTasks.push(identityTask.then(identity => Object.freeze({
         schemaVersion: 'detail-candidate-1',
@@ -222,21 +227,21 @@ async function createRockCandidates(
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
   const startX = chunk.chunkX * cellsPerChunk;
   const startZ = chunk.chunkZ * cellsPerChunk;
+  const owner = Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ });
   const profile = Object.freeze({ ...baseProfile, fieldCache: new Map() });
   const fieldRandom = createDeterministicRandom(profile.fieldSeed);
   const candidateTasks = [];
   for (let localZ = 0; localZ < cellsPerChunk; localZ += 1) {
     for (let localX = 0; localX < cellsPerChunk; localX += 1) {
       const proposalX = startX + localX; const proposalZ = startZ + localZ;
+      const randomBase = cellRandomBase(placementSeed, proposalX, proposalZ);
       const point = {
-        x: q6((proposalX + 0.5) * size + (cellUnit(placementSeed, proposalX, proposalZ, 21) - 0.5) * size * 0.54),
-        z: q6((proposalZ + 0.5) * size + (cellUnit(placementSeed, proposalX, proposalZ, 22) - 0.5) * size * 0.54),
+        x: q6((proposalX + 0.5) * size + (cellUnitFromBase(randomBase, 21) - 0.5) * size * 0.54),
+        z: q6((proposalZ + 0.5) * size + (cellUnitFromBase(randomBase, 22) - 0.5) * size * 0.54),
       };
-      const owner = determineDetailCandidateOwner(point);
-      if (owner.x !== chunk.chunkX || owner.z !== chunk.chunkZ) continue;
       // The proposal roll is semantic and independent of Terrain. Evaluate it
       // before sparse/dense sampling so rejected rock cells pay no height cost.
-      if (cellUnit(placementSeed, proposalX, proposalZ, 23) >= 0.36) continue;
+      if (cellUnitFromBase(randomBase, 23) >= 0.36) continue;
       const quantizedWorldCell = {
         x: Math.floor(point.x / G6_D_ROCK.cellSizeMeters),
         z: Math.floor(point.z / G6_D_ROCK.cellSizeMeters),
@@ -370,43 +375,85 @@ export async function createFormalNaturalCandidateKernel({
     }),
   ]);
   const placementSeed = seed32(placementSeed64);
+  const candidateInputFor = chunk => {
+    if (!Number.isSafeInteger(chunk?.chunkX) || !Number.isSafeInteger(chunk?.chunkZ)) {
+      throw new TypeError('candidate owner is required');
+    }
+    return chunk.worldSeedHash === worldSeedHash
+      ? chunk : { ...chunk, worldSeedHash };
+  };
+  const generateVegetation = async ({
+    chunk,
+    sampleTerrainAt = sampleTerrain,
+    sampleBiomeWeightsAt = sampleBiomeWeights,
+  } = {}) => {
+    const candidateInput = candidateInputFor(chunk);
+    const startedAt = globalThis.performance?.now?.() ?? Date.now();
+    const vegetationCandidates = await createVegetationCandidates(
+      candidateInput,
+      placementSeed,
+      sampleTerrainAt,
+      sampleBiomeWeightsAt,
+    );
+    const completedAt = globalThis.performance?.now?.() ?? Date.now();
+    return Object.freeze({
+      vegetationCandidates: Object.freeze(vegetationCandidates),
+      timings: Object.freeze({ vegetationMs: q6(completedAt - startedAt) }),
+    });
+  };
+  const generateRocks = async ({
+    chunk,
+    vegetationCandidates,
+    sampleTerrainAt = sampleTerrain,
+    sampleBiomeWeightsAt = sampleBiomeWeights,
+  } = {}) => {
+    const candidateInput = candidateInputFor(chunk);
+    if (!Array.isArray(vegetationCandidates)) {
+      throw new TypeError('canonical vegetation candidates are required for Rock conflicts');
+    }
+    const startedAt = globalThis.performance?.now?.() ?? Date.now();
+    const rockCandidates = await createRockCandidates(
+      candidateInput,
+      macroEvaluator,
+      rockProfile,
+      placementSeed,
+      vegetationCandidates,
+      sampleTerrainAt,
+      sampleBiomeWeightsAt,
+    );
+    const completedAt = globalThis.performance?.now?.() ?? Date.now();
+    return Object.freeze({
+      rockCandidates: Object.freeze(rockCandidates),
+      timings: Object.freeze({ rockMs: q6(completedAt - startedAt) }),
+    });
+  };
   return Object.freeze({
     schemaVersion: 'shared-formal-natural-candidate-kernel-1',
     worldSeedHash,
+    generateVegetation,
+    generateRocks,
     async generate({
       chunk,
       sampleTerrainAt = sampleTerrain,
       sampleBiomeWeightsAt = sampleBiomeWeights,
     } = {}) {
-      if (!Number.isSafeInteger(chunk?.chunkX) || !Number.isSafeInteger(chunk?.chunkZ)) {
-        throw new TypeError('candidate owner is required');
-      }
-      const candidateInput = chunk.worldSeedHash === worldSeedHash
-        ? chunk : { ...chunk, worldSeedHash };
-      const vegetationStartedAt = globalThis.performance?.now?.() ?? Date.now();
-      const vegetationCandidates = await createVegetationCandidates(
-        candidateInput,
-        placementSeed,
+      const vegetation = await generateVegetation({
+        chunk,
         sampleTerrainAt,
         sampleBiomeWeightsAt,
-      );
-      const vegetationReadyAt = globalThis.performance?.now?.() ?? Date.now();
-      const rockCandidates = await createRockCandidates(
-        candidateInput,
-        macroEvaluator,
-        rockProfile,
-        placementSeed,
-        vegetationCandidates,
+      });
+      const rocks = await generateRocks({
+        chunk,
+        vegetationCandidates: vegetation.vegetationCandidates,
         sampleTerrainAt,
         sampleBiomeWeightsAt,
-      );
-      const rockReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      });
       return Object.freeze({
-        vegetationCandidates: Object.freeze(vegetationCandidates),
-        rockCandidates: Object.freeze(rockCandidates),
+        vegetationCandidates: vegetation.vegetationCandidates,
+        rockCandidates: rocks.rockCandidates,
         timings: Object.freeze({
-          vegetationMs: q6(vegetationReadyAt - vegetationStartedAt),
-          rockMs: q6(rockReadyAt - vegetationReadyAt),
+          vegetationMs: vegetation.timings.vegetationMs,
+          rockMs: rocks.timings.rockMs,
         }),
       });
     },

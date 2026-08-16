@@ -2,12 +2,20 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS,
+  W8_CANONICAL_TREE_DENSITY_SCHEMA,
+  W8_CANONICAL_TREE_DENSITY_THRESHOLDS,
+  W8_CANONICAL_TREE_DENSITY_TIERS,
   W8_VEGETATION_LOD_KINDS,
   W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA,
   evaluateW8VegetationLodBlend,
+  isW8CanonicalTreeDensitySelected,
   resolveW8CanonicalFarTreeDensityOpacity,
   resolveW8CanonicalFarTreeDensityRank,
   resolveW8CanonicalFarTreeDensityThreshold,
+  resolveW8CanonicalTreeDensityOpacity,
+  resolveW8CanonicalTreeDensityThreshold,
+  resolveW8CanonicalTreeDensityTier,
   resolveW8VegetationLodBlend,
   resolveW8VegetationLodPolicy,
   resolveW8VegetationVisibilityContract,
@@ -15,33 +23,62 @@ import {
 
 const q6 = value => Math.round(value * 1e6) / 1e6;
 
-test('canonical Far Tree density is Stable-ID keyed, nested, and monotonic on approach', () => {
+test('canonical Tree presentation keeps one Stable-ID population at every distance', () => {
   const policy = resolveW8VegetationLodPolicy(W8_VEGETATION_LOD_KINDS.TREE, 'current');
   assert.deepEqual(policy.farDensity, {
-    schemaVersion: 'w8-canonical-far-tree-density-1',
-    innerDistanceMeters: 140,
-    outerDistanceMeters: 300,
-    innerDensity: 0.48,
-    outerDensity: 0.24,
+    schemaVersion: W8_CANONICAL_TREE_DENSITY_SCHEMA,
+    nearMaximumDistanceMeters: 100,
+    midMaximumDistanceMeters: 200,
+    farMaximumDistanceMeters: 300,
+    transitionWidthMeters: 8,
+    nearToMid: { minimum: 100, maximum: 108 },
+    midToFar: { minimum: 192, maximum: 200 },
+    nearDensity: 1,
+    midDensity: 1,
+    farDensity: 1,
     rankFadeWidth: 0.012,
+    innerDistanceMeters: 100,
+    outerDistanceMeters: 300,
+    innerDensity: 1,
+    outerDensity: 1,
+    outerFade: { minimum: 296, maximum: 304 },
   });
-  assert.equal(resolveW8CanonicalFarTreeDensityThreshold(policy, 300), 0.24);
-  assert.equal(resolveW8CanonicalFarTreeDensityThreshold(policy, 220), 0.36);
-  assert.equal(resolveW8CanonicalFarTreeDensityThreshold(policy, 140), 0.48);
+  assert.deepEqual(W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS, {
+    nearMaximum: 100, midMaximum: 200, farMaximum: 300,
+    transitionWidth: 8, outerFadeWidth: 8,
+  });
+  assert.deepEqual(W8_CANONICAL_TREE_DENSITY_THRESHOLDS, {
+    near: 1, mid: 1, far: 1,
+  });
+  const expectedThresholds = new Map([
+    [0, 1], [100, 1], [104, 1], [108, 1],
+    [150, 1], [192, 1], [196, 1], [200, 1], [300, 1],
+  ]);
+  for (const [distance, expected] of expectedThresholds) {
+    assert.equal(resolveW8CanonicalTreeDensityThreshold(policy, distance), expected);
+    assert.equal(resolveW8CanonicalFarTreeDensityThreshold(policy, distance), expected);
+  }
+  assert.equal(resolveW8CanonicalTreeDensityTier(policy, 100),
+    W8_CANONICAL_TREE_DENSITY_TIERS.NEAR);
+  assert.equal(resolveW8CanonicalTreeDensityTier(policy, 100.001),
+    W8_CANONICAL_TREE_DENSITY_TIERS.MID);
+  assert.equal(resolveW8CanonicalTreeDensityTier(policy, 200),
+    W8_CANONICAL_TREE_DENSITY_TIERS.FAR);
   const stableIds = Array.from({ length: 105 }, (_, index) => (
     `detail-v1:vegetation:canonical-far-density:${index}`
   ));
   const selectedAt = distance => new Set(stableIds.filter(stableId => (
-    resolveW8CanonicalFarTreeDensityRank(stableId)
-      < resolveW8CanonicalFarTreeDensityThreshold(policy, distance)
+    isW8CanonicalTreeDensitySelected({ policy, distanceMeters: distance, stableId })
   )));
   const outer = selectedAt(300);
-  const middle = selectedAt(220);
-  const inner = selectedAt(140);
+  const middle = selectedAt(150);
+  const inner = selectedAt(100);
   const subset = (left, right) => [...left].every(stableId => right.has(stableId));
   assert.equal(subset(outer, middle), true);
   assert.equal(subset(middle, inner), true);
-  assert.equal(inner.size < stableIds.length, true);
+  assert.deepEqual(outer, middle);
+  assert.deepEqual(middle, inner);
+  assert.equal(inner.size, stableIds.length);
   const ranks = Object.fromEntries(stableIds.map(stableId => [
     stableId, resolveW8CanonicalFarTreeDensityRank(stableId),
   ]));
@@ -52,12 +89,15 @@ test('canonical Far Tree density is Stable-ID keyed, nested, and monotonic on ap
   for (const stableId of stableIds) {
     let previous = 0;
     let becameVisible = false;
-    for (let distance = 300; distance >= 140; distance -= 1) {
-      const opacity = resolveW8CanonicalFarTreeDensityOpacity({
+    for (let distance = 300; distance >= 0; distance -= 1) {
+      const opacity = resolveW8CanonicalTreeDensityOpacity({
         policy,
         distanceMeters: distance,
         stableId,
       });
+      assert.equal(opacity, resolveW8CanonicalFarTreeDensityOpacity({
+        policy, distanceMeters: distance, stableId,
+      }));
       assert.ok(opacity + 1e-6 >= previous,
         `${stableId} became less visible while approaching at ${distance}m`);
       previous = opacity;
@@ -78,6 +118,9 @@ test('canonical Far Tree density is Stable-ID keyed, nested, and monotonic on ap
       if (becameVisible) assert.ok(totalOpacity > 0, `${stableId} disappeared at ${distance}m`);
     }
   }
+  assert.equal(stableIds.every(stableId => resolveW8CanonicalTreeDensityOpacity({
+    policy, distanceMeters: 100, stableId,
+  }) === 1), true, 'the complete Near identity set must be fully opaque');
 });
 
 test('Natural visibility contract preserves the formal Object-specific preset distances', () => {
@@ -126,9 +169,10 @@ test('Vegetation LOD policy is shared, ordered, and safe across Near-owner hando
     }
   }
   const tree = resolveW8VegetationLodPolicy('tree', 'current');
-  assert.deepEqual(tree.fullToForest, { minimum: 54, maximum: 58 });
-  assert.deepEqual(tree.forestToAtmospheric, { minimum: 76, maximum: 84 });
-  assert.deepEqual(tree.atmosphericFade, { minimum: 124, maximum: 140 });
+  assert.deepEqual(tree.fullToForest, { minimum: 100, maximum: 108 });
+  assert.deepEqual(tree.forestToAtmospheric, { minimum: 192, maximum: 196 });
+  assert.deepEqual(tree.atmosphericFade, { minimum: 196, maximum: 200 });
+  assert.deepEqual(tree.farFade, { minimum: 296, maximum: 304 });
 });
 
 test('Tree cross-fades conserve opacity through canonical Far and into Fog', () => {
@@ -136,26 +180,21 @@ test('Tree cross-fades conserve opacity through canonical Far and into Fog', () 
     kind: 'tree', distanceMeters, renderDistancePreset: 'current',
   });
   assert.deepEqual(
-    [at(56).full, at(56).forest, at(56).atmospheric, at(56).totalOpacity],
+    [at(104).full, at(104).forest, at(104).atmospheric, at(104).totalOpacity],
     [0.5, 0.5, 0, 1],
   );
   assert.deepEqual(
-    [at(80).full, at(80).forest, at(80).atmospheric, at(80).totalOpacity],
+    [at(194).full, at(194).forest, at(194).atmospheric, at(194).totalOpacity],
     [0, 0.5, 0.5, 1],
   );
-  assert.equal(at(124).totalOpacity, 1);
+  assert.equal(at(196).totalOpacity, 1);
   assert.deepEqual(
-    [at(132).atmospheric, at(132).far, at(132).totalOpacity],
+    [at(198).atmospheric, at(198).far, at(198).totalOpacity],
     [0.5, 0.5, 1],
   );
-  assert.deepEqual(
-    [at(138).atmospheric, at(138).far, at(138).totalOpacity],
-    [0.042969, 0.957031, 1],
-  );
-  assert.deepEqual([at(140).atmospheric, at(140).far], [0, 1]);
-  assert.equal(at(276).totalOpacity, 1);
-  assert.equal(at(290).totalOpacity, 0.5);
-  assert.equal(at(300).totalOpacity, 0.055394);
+  assert.deepEqual([at(200).atmospheric, at(200).far], [0, 1]);
+  assert.equal(at(296).totalOpacity, 1);
+  assert.equal(at(300).totalOpacity, 0.5);
   assert.equal(at(300).visible, true);
   assert.equal(at(304).totalOpacity, 0);
   assert.equal(at(304).visible, false);

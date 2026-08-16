@@ -6,6 +6,7 @@ import {
   PRESENTATION_OWNER_SCHEMA,
   createPresentationOwnerGenerator,
   createPresentationOwnerResource,
+  derivePresentationOwnerCoarseSummary,
   expandPresentationAuxiliaryRecord,
   expandPresentationNaturalRecord,
   expandPresentationStructureRecord,
@@ -43,6 +44,61 @@ test('PresentationOwner schema is compact and excludes Full-only payload', async
   assert.equal(diagnostics.largeContentHashGenerated, false);
   assert.ok(diagnostics.latticeSampleCount < 33 * 33);
   assert.ok(resource.natural.every(record => ['tree', 'shrub', 'rock'].includes(record.objectType)));
+  const summary = derivePresentationOwnerCoarseSummary(resource);
+  assert.equal(summary.ownerKey, resource.identity.owner.key);
+  assert.equal(summary.terrainRequired, true);
+  assert.deepEqual(summary.structureStableIds, []);
+  const compactTrees = resource.natural.filter(record => record.objectType === 'tree');
+  assert.equal(summary.canonicalTreeCount, compactTrees.length);
+  assert.equal('forestCoverageFloorStableId' in summary, false);
+  assert.ok(summary.selectedForestStableIds.every(stableId => (
+    compactTrees.some(record => record.stableId === stableId)
+  )), 'coarse forest IDs must be canonical PresentationOwner Tree identities');
+});
+
+test('coarse summary admits only canonical anchors inside its immutable owner domain', () => {
+  const base = createPresentationOwnerResource({
+    worldSeedHash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    chunkX: 10,
+    chunkZ: 20,
+  });
+  const resource = Object.freeze({
+    ...base,
+    natural: Object.freeze([
+      Object.freeze({
+        stableId: 'tree:inside', owner: '10,20', position: Object.freeze([168, 0, 328]),
+        objectType: 'tree', densityRank: 0,
+      }),
+      Object.freeze({
+        stableId: 'tree:outside-anchor', owner: '10,20', position: Object.freeze([176, 0, 328]),
+        objectType: 'tree', densityRank: 0,
+      }),
+      Object.freeze({
+        stableId: 'tree:cross-owner', owner: '11,20', position: Object.freeze([168, 0, 328]),
+        objectType: 'tree', densityRank: 0,
+      }),
+    ]),
+    structures: Object.freeze([
+      Object.freeze({
+        stableId: 'building:inside', owner: '10,20', position: Object.freeze([168, 0, 328]),
+        objectType: 'building',
+      }),
+      Object.freeze({
+        stableId: 'building:outside-anchor', owner: '10,20',
+        position: Object.freeze([168, 0, 336]), objectType: 'building',
+      }),
+    ]),
+  });
+  const summary = derivePresentationOwnerCoarseSummary(resource, {
+    playerX: -1_000_000,
+    playerZ: 1_000_000,
+    maximumDistanceMeters: 1,
+  });
+  assert.equal(summary.ownerKey, '10,20');
+  assert.deepEqual(summary.structureStableIds, ['building:inside']);
+  assert.deepEqual(summary.selectedForestStableIds, ['tree:inside']);
+  assert.equal('forestCoverageFloorStableId' in summary, false);
+  assert.equal(summary.canonicalTreeCount, 1);
 });
 
 test('PresentationOwner generation is independent of owner enumeration and async completion order', async () => {
@@ -269,6 +325,23 @@ test('Presentation structure summary preserves Building and Road projection iden
         assert.equal(compact.dimensions[0], source.widthMeters);
       }
     }
+    const summary = derivePresentationOwnerCoarseSummary(resource);
+    const requiredStructureIds = resource.structures.filter(record => (
+      record.objectType === 'building'
+        || (record.objectType === 'road' && record.canonicalMajorRoad === true)
+    )).map(record => record.stableId).sort();
+    assert.deepEqual(summary.structureStableIds, requiredStructureIds,
+      'coarse contract must require Buildings and canonical major Road layout only');
+    assert.ok(summary.structureStableIds.every(stableId => compactById.has(stableId)));
+    assert.deepEqual(
+      derivePresentationOwnerCoarseSummary(resource, {
+        playerX: -1_000_000,
+        playerZ: 1_000_000,
+        maximumDistanceMeters: 1,
+      }),
+      summary,
+      'immutable owner requirements must not freeze an observer-distance snapshot',
+    );
     t.diagnostic(JSON.stringify({
       buildingCount: chunk.settlementFeatures.filter(value => value.featureType === 'settlement-building').length,
       roadCount: chunk.settlementFeatures.filter(value => value.featureType === 'settlement-road').length,

@@ -1,5 +1,6 @@
 import { deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
 import { W8_RENDER_DISTANCE_PRESETS } from './render-distance-policy.js';
+import { resolveW8CanonicalFarTreeDensityRank } from './vegetation-lod-policy.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 const smoothstep = value => {
@@ -14,6 +15,11 @@ export const W8_NATURAL_PRESENTATION_PHASE_1 = Object.freeze({
   spawnFeatherMeters: 18,
   spawnHardClearanceMeters: 12,
 });
+
+// This is world-generation membership, not a distance-dependent presentation
+// threshold.  The same Stable-ID rank is applied by every canonical Natural
+// producer so Far, Mid, and Near see one immutable Tree population.
+export const W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD = 0.5;
 
 export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze({
   short: W8_RENDER_DISTANCE_PRESETS.short.naturalVisibilityMeters,
@@ -175,6 +181,9 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
     });
     const acceptance = baseAcceptance * settlementFactor * spawnFactor;
     const rank = hashText(rankSeed, candidate.candidateId ?? candidate.stableId ?? '') / 0xffffffff;
+    const densityRank = resolveW8CanonicalFarTreeDensityRank(
+      candidate.candidateId ?? candidate.stableId ?? '',
+    );
     return Object.freeze({
       macroField,
       groveField,
@@ -184,7 +193,9 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
       spawnFactor,
       acceptance,
       rank,
-      accepted: rank < acceptance,
+      densityRank,
+      accepted: rank < acceptance
+        && densityRank < W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD,
     });
   };
 

@@ -1,5 +1,6 @@
 import {
   CHUNK_DATA_PRIORITY,
+  createCanonicalTreeCellRequestKey,
   createChunkGeneratorSchedulerEnvelope,
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
@@ -25,6 +26,7 @@ export function createInlineChunkGeneratorTransport({
   let generatedCount = 0;
   let forestHorizonGeneratedCount = 0;
   let presentationOwnerGeneratedCount = 0;
+  let canonicalTreeCellGeneratedCount = 0;
   let initialized = false;
   let diagnosticRequestCount = 0;
   let lastGeneratorSnapshot = null;
@@ -188,6 +190,57 @@ export function createInlineChunkGeneratorTransport({
         });
       } });
     },
+    async generateCanonicalTreeCell({
+      macroX,
+      macroZ,
+      priority = CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+      required = true,
+      createdAtMs = clock(),
+      deadlineAtMs = null,
+      consumerId = 'macro-coarse-world',
+      epoch = 0,
+      telemetryCorrelationId = null,
+      telemetryTarget = 'tree',
+      telemetryStream = 'distant',
+      scheduler: suppliedScheduler = null,
+    } = {}) {
+      if (typeof generator.generateCanonicalTreeCell !== 'function') {
+        throw new Error('generator does not expose canonical Tree-cell generation');
+      }
+      const key = createCanonicalTreeCellRequestKey(macroX, macroZ);
+      const requestId = ++controlRequestId;
+      const envelope = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'canonical-tree-cell',
+        priority,
+        required,
+        createdAtMs,
+        deadlineAtMs,
+        ownerKey: key,
+        resourceKind: 'canonical-tree-cell',
+        representationClass: 'coarse',
+        consumerId,
+        epoch,
+        correlationId: telemetryCorrelationId,
+        target: telemetryTarget,
+        stream: telemetryStream,
+        scheduler: suppliedScheduler === null ? null : {
+          ...suppliedScheduler,
+          requestId,
+          operationKind: 'canonical-tree-cell',
+          ownerKey: key,
+          resourceKind: 'canonical-tree-cell',
+          representationClass: 'coarse',
+        },
+      });
+      return runOperation({ envelope, operation: execution => {
+        canonicalTreeCellGeneratedCount += 1;
+        return generator.generateCanonicalTreeCell(macroX, macroZ, {
+          scheduler: envelope,
+          checkpoint: execution.checkpoint,
+        });
+      } });
+    },
     cancelForestHorizonRequests({
       consumerId = 'distant-owner-query',
       epoch = null,
@@ -271,7 +324,7 @@ export function createInlineChunkGeneratorTransport({
     snapshot() {
       return Object.freeze({
         kind: 'inline', generatedCount, forestHorizonGeneratedCount,
-        presentationOwnerGeneratedCount,
+        presentationOwnerGeneratedCount, canonicalTreeCellGeneratedCount,
         diagnosticRequestCount, initialized, isShutdown,
         scheduler: scheduler.snapshot(),
         generatorSnapshot: lastGeneratorSnapshot,

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  WORLD_GENERATION_PRIORITY_CLASS,
   WORLD_GENERATION_REQUEST_SCHEMA,
   WORLD_GENERATION_SCHEDULER_SCHEMA,
   WORLD_GENERATION_STATE,
@@ -165,6 +166,102 @@ test('global semantic classes prevent aged prefetch from crossing Terrain safety
   gate.resolve();
   await Promise.all([blocker.promise, prefetch.promise, terrain.promise]);
   assert.deepEqual(order, ['terrain', 'prefetch']);
+  await scheduler.shutdown();
+});
+
+test('overdue optional prefetch cannot cross fresh safety, coarse, or gameplay semantic work', async () => {
+  let now = 0;
+  const gate = deferred();
+  const order = [];
+  const scheduler = createWorldGenerationScheduler({ clock: () => now });
+  const blocker = scheduler.schedule({
+    envelope: envelope(1, { priority: 1 }),
+    execute: () => gate.promise,
+  });
+  await drain();
+  const prefetch = scheduler.schedule({
+    envelope: envelope(2, {
+      priority: 5,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.PREFETCH,
+      required: false,
+      deadlineAtMs: 10,
+    }),
+    execute: async () => { order.push('overdue-prefetch'); },
+  });
+  now = 20;
+  const gameplay = scheduler.schedule({
+    envelope: envelope(3, {
+      priority: 3,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.GAMEPLAY_FULL,
+      createdAtMs: now,
+    }),
+    execute: async () => { order.push('gameplay'); },
+  });
+  const coarse = scheduler.schedule({
+    envelope: envelope(4, {
+      priority: 2,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.COARSE_EXISTENCE,
+      createdAtMs: now,
+    }),
+    execute: async () => { order.push('coarse'); },
+  });
+  const safety = scheduler.schedule({
+    envelope: envelope(5, {
+      priority: 1,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.DEADLINE_SAFETY,
+      createdAtMs: now,
+    }),
+    execute: async () => { order.push('safety'); },
+  });
+  gate.resolve();
+  await Promise.all([
+    blocker.promise,
+    prefetch.promise,
+    gameplay.promise,
+    coarse.promise,
+    safety.promise,
+  ]);
+  assert.deepEqual(order, ['safety', 'coarse', 'gameplay', 'overdue-prefetch']);
+  await scheduler.shutdown();
+});
+
+test('deadline urgency still orders work inside the same semantic class', async () => {
+  let now = 0;
+  const gate = deferred();
+  const order = [];
+  const scheduler = createWorldGenerationScheduler({ clock: () => now });
+  const blocker = scheduler.schedule({
+    envelope: envelope(1, { priority: 1 }),
+    execute: () => gate.promise,
+  });
+  await drain();
+  const normal = scheduler.schedule({
+    envelope: envelope(2, {
+      priority: 2,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.COARSE_EXISTENCE,
+    }),
+    execute: async () => { order.push('normal'); },
+  });
+  const imminent = scheduler.schedule({
+    envelope: envelope(3, {
+      priority: 2,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.COARSE_EXISTENCE,
+      deadlineAtMs: 25,
+    }),
+    execute: async () => { order.push('imminent'); },
+  });
+  const missed = scheduler.schedule({
+    envelope: envelope(4, {
+      priority: 2,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.COARSE_EXISTENCE,
+      deadlineAtMs: 10,
+    }),
+    execute: async () => { order.push('missed'); },
+  });
+  now = 20;
+  gate.resolve();
+  await Promise.all([blocker.promise, normal.promise, imminent.promise, missed.promise]);
+  assert.deepEqual(order, ['missed', 'imminent', 'normal']);
   await scheduler.shutdown();
 });
 

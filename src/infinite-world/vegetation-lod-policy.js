@@ -22,11 +22,27 @@ export const W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA =
 export const W8_FOREST_SILHOUETTE_COLOR_HEX = 0x28512f;
 export const W8_ATMOSPHERIC_VEGETATION_COLOR_HEX = 0x49674f;
 
+export const W8_CANONICAL_TREE_DENSITY_SCHEMA = 'w8-canonical-tree-density-2';
+export const W8_CANONICAL_TREE_DENSITY_TIERS = Object.freeze({
+  NEAR: 'near',
+  MID: 'mid',
+  FAR: 'far',
+});
+export const W8_CANONICAL_TREE_DENSITY_THRESHOLDS = Object.freeze({
+  [W8_CANONICAL_TREE_DENSITY_TIERS.NEAR]: 1,
+  [W8_CANONICAL_TREE_DENSITY_TIERS.MID]: 1,
+  [W8_CANONICAL_TREE_DENSITY_TIERS.FAR]: 1,
+});
+export const W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS = Object.freeze({
+  nearMaximum: 100,
+  midMaximum: 200,
+  farMaximum: 300,
+  transitionWidth: 8,
+  outerFadeWidth: 8,
+});
+
 const CURRENT_NATURAL_VISIBILITY_METERS = 140;
 const NEAR_OWNER_HANDOFF_SAFE_METERS = 48;
-const CANONICAL_FAR_FADE_START_RATIO = 0.92;
-const CANONICAL_FAR_TREE_OUTER_DENSITY = 0.24;
-const CANONICAL_FAR_TREE_INNER_DENSITY = 0.48;
 const CANONICAL_FAR_TREE_DENSITY_FADE = 0.012;
 const q6 = value => Math.round(value * 1e6) / 1e6;
 const clamp = value => Math.max(0, Math.min(1, value));
@@ -49,28 +65,67 @@ const noFar = Object.freeze({
   farVisibilityMeters: null,
 });
 
+const scaledTreeDensityPolicy = renderDistance => {
+  const reference = W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS;
+  const scale = renderDistance.fogFarMeters / reference.farMaximum;
+  const nearMaximum = q6(reference.nearMaximum * scale);
+  const midMaximum = q6(reference.midMaximum * scale);
+  const farMaximum = renderDistance.fogFarMeters;
+  const transitionWidth = q6(Math.max(4, reference.transitionWidth * scale));
+  const outerFadeWidth = q6(Math.max(4, reference.outerFadeWidth * scale));
+  const nearToMid = Object.freeze({
+    // The canonical Near set remains complete through the nominal 100 m
+    // boundary. Moving outward may remove ranked silhouettes; approaching can
+    // therefore only add them.
+    minimum: nearMaximum,
+    maximum: q6(nearMaximum + transitionWidth),
+  });
+  const midToFar = Object.freeze({
+    minimum: q6(midMaximum - transitionWidth),
+    maximum: midMaximum,
+  });
+  const farFade = Object.freeze({
+    // Keep the exact Fog boundary drawable and finish the fade just outside it.
+    minimum: q6(farMaximum - outerFadeWidth / 2),
+    maximum: q6(farMaximum + outerFadeWidth / 2),
+  });
+  return Object.freeze({
+    schemaVersion: W8_CANONICAL_TREE_DENSITY_SCHEMA,
+    nearMaximumDistanceMeters: nearMaximum,
+    midMaximumDistanceMeters: midMaximum,
+    farMaximumDistanceMeters: farMaximum,
+    transitionWidthMeters: transitionWidth,
+    nearToMid,
+    midToFar,
+    nearDensity: W8_CANONICAL_TREE_DENSITY_THRESHOLDS.near,
+    midDensity: W8_CANONICAL_TREE_DENSITY_THRESHOLDS.mid,
+    farDensity: W8_CANONICAL_TREE_DENSITY_THRESHOLDS.far,
+    rankFadeWidth: CANONICAL_FAR_TREE_DENSITY_FADE,
+    // Compatibility names used by the existing instanced geometry admission.
+    // innerDensity=1 means every canonical identity can reappear on approach.
+    innerDistanceMeters: nearMaximum,
+    outerDistanceMeters: farMaximum,
+    innerDensity: W8_CANONICAL_TREE_DENSITY_THRESHOLDS.near,
+    outerDensity: W8_CANONICAL_TREE_DENSITY_THRESHOLDS.far,
+    outerFade: farFade,
+  });
+};
+
 const profileFor = (kind, renderDistance) => {
   const { naturalVisibilityMeters } = renderDistance;
   const scale = naturalVisibilityMeters / CURRENT_NATURAL_VISIBILITY_METERS;
   if (kind === W8_VEGETATION_LOD_KINDS.TREE) {
-    const fullToForest = handoffSafeBand(54, 58, scale);
-    const forestStart = Math.max(fullToForest.maximum + 8, 76 * scale);
+    const farDensity = scaledTreeDensityPolicy(renderDistance);
+    const fullToForest = farDensity.nearToMid;
+    // The renderer retains its existing atmospheric bridge, but the two 4 m
+    // halves form one simple 8 m Mid-to-Far representation handoff.
     const forestToAtmospheric = Object.freeze({
-      minimum: q6(forestStart),
-      maximum: q6(forestStart + Math.max(6, 8 * scale)),
+      minimum: farDensity.midToFar.minimum,
+      maximum: q6((farDensity.midToFar.minimum + farDensity.midToFar.maximum) / 2),
     });
     const atmosphericFade = Object.freeze({
-      minimum: q6(Math.max(forestToAtmospheric.maximum + 8, 124 * scale)),
-      maximum: naturalVisibilityMeters,
-    });
-    const farFade = Object.freeze({
-      minimum: q6(Math.max(
-        atmosphericFade.maximum,
-        renderDistance.fogFarMeters * CANONICAL_FAR_FADE_START_RATIO,
-      )),
-      // Keep the 300m boundary drawable; visibility itself remains capped at
-      // fogFar, while the fade curve would reach zero just outside that cap.
-      maximum: q6(renderDistance.fogFarMeters + 4),
+      minimum: forestToAtmospheric.maximum,
+      maximum: farDensity.midToFar.maximum,
     });
     return Object.freeze({
       kind,
@@ -83,16 +138,9 @@ const profileFor = (kind, renderDistance) => {
       forestScale: 1,
       atmosphericScale: 1,
       farEntry: atmosphericFade,
-      farFade,
+      farFade: farDensity.outerFade,
       farVisibilityMeters: renderDistance.fogFarMeters,
-      farDensity: Object.freeze({
-        schemaVersion: 'w8-canonical-far-tree-density-1',
-        innerDistanceMeters: atmosphericFade.maximum,
-        outerDistanceMeters: renderDistance.fogFarMeters,
-        innerDensity: CANONICAL_FAR_TREE_INNER_DENSITY,
-        outerDensity: CANONICAL_FAR_TREE_OUTER_DENSITY,
-        rankFadeWidth: CANONICAL_FAR_TREE_DENSITY_FADE,
-      }),
+      farDensity,
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
@@ -192,22 +240,47 @@ export function resolveW8CanonicalFarTreeDensityRank(stableId) {
   return (hash >>> 0) / 0x1_0000_0000;
 }
 
-export function resolveW8CanonicalFarTreeDensityThreshold(policy, distanceMeters) {
+export function resolveW8CanonicalTreeDensityTier(policy, distanceMeters) {
+  const density = policy?.farDensity;
+  if (!density) return W8_CANONICAL_TREE_DENSITY_TIERS.NEAR;
+  const distance = Number.isFinite(distanceMeters)
+    ? Math.max(0, distanceMeters) : density.farMaximumDistanceMeters;
+  if (distance <= density.nearMaximumDistanceMeters) {
+    return W8_CANONICAL_TREE_DENSITY_TIERS.NEAR;
+  }
+  if (distance < density.midMaximumDistanceMeters) {
+    return W8_CANONICAL_TREE_DENSITY_TIERS.MID;
+  }
+  return W8_CANONICAL_TREE_DENSITY_TIERS.FAR;
+}
+
+export function resolveW8CanonicalTreeDensityThreshold(policy, distanceMeters) {
   const density = policy?.farDensity;
   if (!density) return 1;
   const distance = Number.isFinite(distanceMeters)
-    ? distanceMeters : density.outerDistanceMeters;
-  const span = density.outerDistanceMeters - density.innerDistanceMeters;
-  const progress = span > 0
-    ? clamp((density.outerDistanceMeters - distance) / span)
-    : Number(distance <= density.innerDistanceMeters);
-  return q6(
-    density.outerDensity
-      + (density.innerDensity - density.outerDensity) * progress,
-  );
+    ? Math.max(0, distanceMeters) : density.farMaximumDistanceMeters;
+  const interpolate = (band, inner, outer) => {
+    const width = band.maximum - band.minimum;
+    if (!(width > 0)) return distance <= band.minimum ? inner : outer;
+    const progress = smoothstep((distance - band.minimum) / width);
+    return inner + (outer - inner) * progress;
+  };
+  if (distance <= density.nearToMid.minimum) return density.nearDensity;
+  if (distance < density.nearToMid.maximum) {
+    return q6(interpolate(density.nearToMid, density.nearDensity, density.midDensity));
+  }
+  if (distance <= density.midToFar.minimum) return density.midDensity;
+  if (distance < density.midToFar.maximum) {
+    return q6(interpolate(density.midToFar, density.midDensity, density.farDensity));
+  }
+  return density.farDensity;
 }
 
-export function resolveW8CanonicalFarTreeDensityOpacity({
+export function resolveW8CanonicalFarTreeDensityThreshold(policy, distanceMeters) {
+  return resolveW8CanonicalTreeDensityThreshold(policy, distanceMeters);
+}
+
+export function resolveW8CanonicalTreeDensityOpacity({
   policy,
   distanceMeters,
   stableId,
@@ -217,8 +290,25 @@ export function resolveW8CanonicalFarTreeDensityOpacity({
   if (!density) return 1;
   const rank = Number.isFinite(densityRank)
     ? densityRank : resolveW8CanonicalFarTreeDensityRank(stableId);
-  const threshold = resolveW8CanonicalFarTreeDensityThreshold(policy, distanceMeters);
+  const threshold = resolveW8CanonicalTreeDensityThreshold(policy, distanceMeters);
+  // Rank is in [0, 1), so the complete Near threshold is truly fully opaque.
+  if (threshold >= 1) return 1;
   return q6(smoothstep((threshold - rank) / density.rankFadeWidth));
+}
+
+export function resolveW8CanonicalFarTreeDensityOpacity(options = {}) {
+  return resolveW8CanonicalTreeDensityOpacity(options);
+}
+
+export function isW8CanonicalTreeDensitySelected({
+  policy,
+  distanceMeters,
+  stableId,
+  densityRank = null,
+} = {}) {
+  const rank = Number.isFinite(densityRank)
+    ? densityRank : resolveW8CanonicalFarTreeDensityRank(stableId);
+  return rank < resolveW8CanonicalTreeDensityThreshold(policy, distanceMeters);
 }
 
 export function resolveW8VegetationVisibilityContract(
