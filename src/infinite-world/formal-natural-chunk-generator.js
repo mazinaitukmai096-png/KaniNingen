@@ -1,4 +1,8 @@
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
+import {
+  canonicalizeJsonWithContext,
+  createCanonicalJsonSerializationContext,
+} from './canonical-json-serialization-context.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
 import {
   createDeterministicRandom,
@@ -296,14 +300,20 @@ async function createRockCandidates(
   return output.sort(compareFormalDetailCandidates).slice(0, W3_FORMAL_DETAILS.maximumRocksPerChunk);
 }
 
-export async function hashW3ChunkContent(content, { stageRecorder = null } = {}) {
+export async function hashW3ChunkContent(content, {
+  stageRecorder = null,
+  canonicalJsonContext = null,
+} = {}) {
+  const serializeContent = () => canonicalJsonContext
+    ? canonicalizeJsonWithContext(content, canonicalJsonContext)
+    : canonicalizeJson(content);
   const serialized = stageRecorder
     ? measureChunkGenerationStageSync(
       stageRecorder,
       CHUNK_GENERATION_STAGE.SERIALIZE,
-      () => canonicalizeJson(content),
+      serializeContent,
     )
-    : canonicalizeJson(content);
+    : serializeContent();
   const digest = stageRecorder
     ? await measureChunkGenerationStage(
       stageRecorder,
@@ -470,10 +480,20 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
     worldSeedHash: naturalGenerator.worldSeedHash,
     seed64: naturalGenerator.seed64,
     generatorVersion: W3_GENERATOR_VERSION,
-    async generateChunk(chunkX, chunkZ, { stageRecorder = null } = {}) {
+    async generateChunk(chunkX, chunkZ, {
+      stageRecorder = null,
+      canonicalJsonContext = null,
+    } = {}) {
+      const serializationContext = canonicalJsonContext
+        ?? createCanonicalJsonSerializationContext();
       const natural = stageRecorder
-        ? await naturalGenerator.generateChunk(chunkX, chunkZ, { stageRecorder })
-        : await naturalGenerator.generateChunk(chunkX, chunkZ);
+        ? await naturalGenerator.generateChunk(chunkX, chunkZ, {
+          stageRecorder,
+          canonicalJsonContext: serializationContext,
+        })
+        : await naturalGenerator.generateChunk(chunkX, chunkZ, {
+          canonicalJsonContext: serializationContext,
+        });
       const naturalToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.NATURAL);
       const { vegetationCandidates, rockCandidates } = await candidateKernel.generate({
         chunk: natural,
@@ -510,8 +530,13 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
         },
       };
       const contentHash = stageRecorder
-        ? await hashW3ChunkContent(content, { stageRecorder })
-        : await hashW3ChunkContent(content);
+        ? await hashW3ChunkContent(content, {
+          stageRecorder,
+          canonicalJsonContext: serializationContext,
+        })
+        : await hashW3ChunkContent(content, {
+          canonicalJsonContext: serializationContext,
+        });
       const chunkData = { ...content, contentHash };
       const validation = validateW3FormalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W3 ChunkData: ${validation.errors.join('; ')}`);

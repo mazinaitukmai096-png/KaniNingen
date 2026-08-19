@@ -68,6 +68,11 @@ const preset = ({
   fogFarMeters: q6(
     terrainRiverExtentMeters * 300 / CURRENT_TERRAIN_RIVER_EXTENT_METERS,
   ),
+  // Roads and other world-defining silhouettes must exist through the useful
+  // visible range. Detail objects keep the shorter general-object distance.
+  majorSilhouetteVisibilityMeters: q6(
+    terrainRiverExtentMeters * 300 / CURRENT_TERRAIN_RIVER_EXTENT_METERS,
+  ),
   treeLod: treeLodFor(naturalVisibilityMeters),
   settlementLod: settlementLodFor(generalObjectVisibilityMeters),
 });

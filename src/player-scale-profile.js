@@ -1,14 +1,7 @@
 import {
-  CAM_INITIAL_DIST,
-  CAM_INITIAL_PITCH,
-  CAM_MAX_DIST,
-  CAM_MAX_PITCH,
-  CAM_MIN_DIST,
-  CAM_MIN_PITCH,
   PLAYER_GRAVITY,
   PLAYER_JUMP_VELOCITY,
   PLAYER_RADIUS,
-  PLAYER_SPEED,
 } from './constants.js';
 
 export const PLAYER_SCALE_STAGE_IDS = Object.freeze({
@@ -20,10 +13,13 @@ export const PLAYER_SCALE_STAGE_IDS = Object.freeze({
 export const NEW_GAME_PLAYER_SCALE_STAGE_ID = PLAYER_SCALE_STAGE_IDS.TINY;
 
 const TINY_REFERENCE_VISUAL_SCALE = 0.08;
-const TINY_VISUAL_SCALE = 0.05;
+const TINY_VISUAL_SCALE = 0.04;
 const TINY_LINEAR_SCALE = TINY_VISUAL_SCALE / TINY_REFERENCE_VISUAL_SCALE;
 const scaleTinyLinearValue = value => value * TINY_LINEAR_SCALE;
 const finiteMetersPerSecondToFrameSpeed = value => value * 40 / 60;
+const finiteFrameSpeedToMetersPerSecond = value => value / 40 * 60;
+const MAX_SPRINT_METERS_PER_SECOND = 30;
+const MAX_SPRINT_MULTIPLIER = 1.45;
 
 const PLAYER_LEG_HALF_WIDTH_UNITS = 7.5;
 const PLAYER_LEG_HALF_HEIGHT_UNITS = 22.5;
@@ -73,6 +69,10 @@ function createProfile({
   const collisionRadius = PLAYER_RADIUS * visualScale;
   const collisionHeight = PLAYER_MODEL_VERTICAL_BOUNDS_UNITS.height * visualScale;
   const footOffset = -PLAYER_MODEL_VERTICAL_BOUNDS_UNITS.minimum * visualScale;
+  const cameraWheelZoomScale = Math.max(
+    Number.EPSILON,
+    (cameraMaxDistance - cameraMinDistance) / 1000,
+  );
   const playerHitBounds = Object.freeze({
     shape: 'vertical-ellipsoid',
     radius: collisionRadius,
@@ -116,6 +116,7 @@ function createProfile({
     cameraTargetHeight,
     cameraYawRestriction: 'FULL',
     cameraRotationSensitivity: 1,
+    cameraWheelZoomScale,
     cameraGroundClearance,
     allowedTargetClass,
   });
@@ -126,10 +127,10 @@ export const PLAYER_SCALE_PROFILES = Object.freeze({
     id: PLAYER_SCALE_STAGE_IDS.TINY,
     label: 'Tiny',
     visualScale: TINY_VISUAL_SCALE,
-    movementSpeed: finiteMetersPerSecondToFrameSpeed(4),
-    sprintMultiplier: 1.35,
-    jumpVelocity: PLAYER_JUMP_VELOCITY * 0.09,
-    gravity: PLAYER_GRAVITY / 7,
+    movementSpeed: finiteMetersPerSecondToFrameSpeed(3.5),
+    sprintMultiplier: 1.3,
+    jumpVelocity: PLAYER_JUMP_VELOCITY * 0.075,
+    gravity: PLAYER_GRAVITY / 8,
     attackOffsetX: scaleTinyLinearValue(8),
     attackOffsetZ: scaleTinyLinearValue(10),
     singleAttackRadius: scaleTinyLinearValue(18),
@@ -156,9 +157,46 @@ export const PLAYER_SCALE_PROFILES = Object.freeze({
   [PLAYER_SCALE_STAGE_IDS.MID]: createProfile({
     id: PLAYER_SCALE_STAGE_IDS.MID,
     label: 'Mid',
+    visualScale: 0.2,
+    movementSpeed: finiteMetersPerSecondToFrameSpeed(12),
+    sprintMultiplier: 1.4,
+    jumpVelocity: PLAYER_JUMP_VELOCITY * 0.375,
+    gravity: PLAYER_GRAVITY * 0.5,
+    attackOffsetX: 36,
+    attackOffsetZ: 38,
+    singleAttackRadius: 74,
+    doubleAttackRadius: 80,
+    landingRadius: 102,
+    landingPushRadius: 205,
+    landingShake: 16,
+    playerShakeMultiplier: 0.2,
+    cameraShakeCap: 43,
+    windArcRadius: 40,
+    windArcParticleScale: 0.35,
+    cameraDistance: 130,
+    cameraMinDistance: 85,
+    cameraMaxDistance: 300,
+    cameraHeight: 55,
+    cameraNear: 2,
+    cameraPitch: 0.55,
+    cameraMinPitch: 0.07,
+    cameraMaxPitch: 1.46,
+    cameraTargetHeight: 30,
+    cameraGroundClearance: 5,
+    allowedTargetClass: 'MID_SANDBOX',
+  }),
+  [PLAYER_SCALE_STAGE_IDS.MAX]: createProfile({
+    id: PLAYER_SCALE_STAGE_IDS.MAX,
+    label: 'Max',
+    // The former MID profile is now the production maximum.  This caps the
+    // player at the largest scale supported by the current world streaming
+    // contract.  Sprint is capped at 30m/s to leave completion headroom for
+    // future world density instead of running at the edge of generation.
     visualScale: 0.45,
-    movementSpeed: PLAYER_SPEED * 0.75,
-    sprintMultiplier: 1.45,
+    movementSpeed: finiteMetersPerSecondToFrameSpeed(
+      MAX_SPRINT_METERS_PER_SECOND / MAX_SPRINT_MULTIPLIER,
+    ),
+    sprintMultiplier: MAX_SPRINT_MULTIPLIER,
     jumpVelocity: PLAYER_JUMP_VELOCITY * 0.8,
     gravity: PLAYER_GRAVITY,
     attackOffsetX: 80,
@@ -182,40 +220,13 @@ export const PLAYER_SCALE_PROFILES = Object.freeze({
     cameraMaxPitch: 1.42,
     cameraTargetHeight: 65,
     cameraGroundClearance: 10,
-    allowedTargetClass: 'MID_SANDBOX',
-  }),
-  [PLAYER_SCALE_STAGE_IDS.MAX]: createProfile({
-    id: PLAYER_SCALE_STAGE_IDS.MAX,
-    label: 'Max',
-    visualScale: 1,
-    movementSpeed: PLAYER_SPEED,
-    sprintMultiplier: 1.45,
-    jumpVelocity: PLAYER_JUMP_VELOCITY,
-    gravity: PLAYER_GRAVITY,
-    attackOffsetX: 180,
-    attackOffsetZ: 180,
-    singleAttackRadius: 350,
-    doubleAttackRadius: 380,
-    landingRadius: 500,
-    landingPushRadius: 1000,
-    landingShake: 80,
-    playerShakeMultiplier: 1,
-    cameraShakeCap: Infinity,
-    windArcRadius: 180,
-    windArcParticleScale: 1,
-    cameraDistance: CAM_INITIAL_DIST,
-    cameraMinDistance: CAM_MIN_DIST,
-    cameraMaxDistance: CAM_MAX_DIST,
-    cameraHeight: 200,
-    cameraNear: 10,
-    cameraPitch: CAM_INITIAL_PITCH,
-    cameraMinPitch: CAM_MIN_PITCH,
-    cameraMaxPitch: CAM_MAX_PITCH,
-    cameraTargetHeight: 120,
-    cameraGroundClearance: 12,
     allowedTargetClass: 'ALL',
   }),
 });
+
+export const PLAYER_MAX_SPRINT_METERS_PER_SECOND = finiteFrameSpeedToMetersPerSecond(
+  PLAYER_SCALE_PROFILES[PLAYER_SCALE_STAGE_IDS.MAX].movementSpeed,
+) * PLAYER_SCALE_PROFILES[PLAYER_SCALE_STAGE_IDS.MAX].sprintMultiplier;
 
 export function resolvePlayerScaleProfile(stageId) {
   const profile = PLAYER_SCALE_PROFILES[stageId];

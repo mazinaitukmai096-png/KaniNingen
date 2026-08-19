@@ -791,6 +791,70 @@ function clipSegment(start, end, bounds) {
   };
 }
 
+/**
+ * Enumerates the canonical 16 m owners that contain a clipped MAJOR Road
+ * projected Road record whose clipped midpoint is inside the requested
+ * circle. Ownership and distance use the same midpoint rule as
+ * projectCanonicalMajorRoadsToChunk(), including exact grid boundaries.
+ */
+export function enumerateCanonicalMajorRoadOwnerCoordinates({
+  roads,
+  centerWorldX,
+  centerWorldZ,
+  radiusMeters,
+} = {}) {
+  if (!Array.isArray(roads)
+    || ![centerWorldX, centerWorldZ, radiusMeters].every(Number.isFinite)
+    || radiusMeters < 0) {
+    throw new TypeError('roads and a valid canonical MAJOR Road owner query are required');
+  }
+  const owners = new Map();
+  for (const road of roads) {
+    if (!Array.isArray(road?.segments)) {
+      throw new TypeError('canonical MAJOR Road records require segments');
+    }
+    for (const segment of road.segments) {
+      if (![segment?.start?.x, segment?.start?.z, segment?.end?.x, segment?.end?.z]
+        .every(Number.isFinite)) {
+        throw new TypeError('canonical MAJOR Road segments require finite endpoints');
+      }
+      const startOwner = decomposeLogicalWorldPosition(segment.start.x, segment.start.z);
+      const endOwner = decomposeLogicalWorldPosition(segment.end.x, segment.end.z);
+      const minimumChunkX = Math.min(startOwner.chunkX, endOwner.chunkX) - 1;
+      const maximumChunkX = Math.max(startOwner.chunkX, endOwner.chunkX) + 1;
+      const minimumChunkZ = Math.min(startOwner.chunkZ, endOwner.chunkZ) - 1;
+      const maximumChunkZ = Math.max(startOwner.chunkZ, endOwner.chunkZ) + 1;
+      for (let chunkZ = minimumChunkZ; chunkZ <= maximumChunkZ; chunkZ += 1) {
+        for (let chunkX = minimumChunkX; chunkX <= maximumChunkX; chunkX += 1) {
+          const bounds = {
+            minX: chunkX * LOGICAL_CHUNK_SIZE_METERS,
+            minZ: chunkZ * LOGICAL_CHUNK_SIZE_METERS,
+            maxX: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS,
+            maxZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
+          };
+          const clipped = clipSegment(segment.start, segment.end, bounds);
+          if (!clipped) continue;
+          const midpoint = {
+            x: q6((clipped.start.x + clipped.end.x) / 2),
+            z: q6((clipped.start.z + clipped.end.z) / 2),
+          };
+          const midpointOwner = decomposeLogicalWorldPosition(midpoint.x, midpoint.z);
+          if (midpointOwner.chunkX !== chunkX || midpointOwner.chunkZ !== chunkZ) continue;
+          if (Math.hypot(
+            midpoint.x - centerWorldX,
+            midpoint.z - centerWorldZ,
+          ) > radiusMeters) continue;
+          const key = `${chunkX},${chunkZ}`;
+          if (!owners.has(key)) owners.set(key, Object.freeze({ key, chunkX, chunkZ }));
+        }
+      }
+    }
+  }
+  return Object.freeze([...owners.values()].sort((left, right) => (
+    left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
+  )));
+}
+
 export function projectCanonicalMajorRoadsToChunk({
   roads,
   chunkX,

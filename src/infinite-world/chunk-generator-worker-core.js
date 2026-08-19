@@ -187,6 +187,18 @@ export function createChunkGeneratorWorkerCore({
         stream: 'distant',
       };
     }
+    if (request.type === CHUNK_GENERATOR_MESSAGE.RESOLVE_CANONICAL_MAJOR_ROAD_OWNERS) {
+      return {
+        requestId: request.requestId,
+        operationKind: 'canonical-major-road-owner-query',
+        priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: true,
+        createdAtMs: schedulerClock(),
+        consumerId: 'canonical-major-road-owner-query',
+        target: 'road',
+        stream: 'distant',
+      };
+    }
     return {
       requestId: request.requestId,
       operationKind: 'diagnostics',
@@ -541,6 +553,35 @@ export function createChunkGeneratorWorkerCore({
           requestId: request.requestId,
           serviceGeneration,
           template,
+          operationMs: Math.max(0, completedAt - startedAt),
+          scheduler: execution ? schedulerResponse(
+            execution,
+            requestReceivedAtMs,
+            schedulerReceivedAtMs,
+            request.scheduler,
+          ) : null,
+          ...pipelineTiming(request, startedAt, completedAt),
+        });
+        return;
+      }
+      if (request.type === CHUNK_GENERATOR_MESSAGE.RESOLVE_CANONICAL_MAJOR_ROAD_OWNERS) {
+        if (typeof generator.resolveCanonicalMajorRoadOwnerCoverage !== 'function') {
+          throw new Error('Chunk generator does not expose canonical MAJOR Road owner coverage');
+        }
+        const startedAt = clock();
+        const coverage = await generator.resolveCanonicalMajorRoadOwnerCoverage({
+          centerWorldX: request.centerWorldX,
+          centerWorldZ: request.centerWorldZ,
+          radiusMeters: request.radiusMeters,
+        });
+        execution?.checkpoint();
+        const completedAt = clock();
+        postMessage({
+          type: CHUNK_GENERATOR_MESSAGE.CANONICAL_MAJOR_ROAD_OWNERS,
+          protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+          requestId: request.requestId,
+          serviceGeneration,
+          coverage,
           operationMs: Math.max(0, completedAt - startedAt),
           scheduler: execution ? schedulerResponse(
             execution,

@@ -27,6 +27,7 @@ export function createInlineChunkGeneratorTransport({
   let forestHorizonGeneratedCount = 0;
   let presentationOwnerGeneratedCount = 0;
   let canonicalTreeCellGeneratedCount = 0;
+  let canonicalMajorRoadOwnerQueryCount = 0;
   let initialized = false;
   let diagnosticRequestCount = 0;
   let lastGeneratorSnapshot = null;
@@ -303,6 +304,40 @@ export function createInlineChunkGeneratorTransport({
         return generator.resolveSettlementPresentationTemplate({ candidate });
       } });
     },
+    resolveCanonicalMajorRoadOwnerCoverage({
+      centerWorldX,
+      centerWorldZ,
+      radiusMeters,
+      ...options
+    } = {}) {
+      const requestId = ++controlRequestId;
+      const envelope = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'canonical-major-road-owner-query',
+        priority: options.priority ?? CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: options.required ?? true,
+        createdAtMs: options.createdAtMs ?? clock(),
+        deadlineAtMs: options.deadlineAtMs ?? null,
+        consumerId: options.consumerId ?? 'canonical-major-road-owner-query',
+        correlationId: options.telemetryCorrelationId ?? null,
+        target: options.telemetryTarget ?? 'road',
+        stream: options.telemetryStream ?? 'distant',
+        scheduler: options.scheduler ?? null,
+      });
+      return runOperation({ envelope, operation: async execution => {
+        if (typeof generator.resolveCanonicalMajorRoadOwnerCoverage !== 'function') {
+          throw new Error('Chunk generator does not expose canonical MAJOR Road owner coverage');
+        }
+        canonicalMajorRoadOwnerQueryCount += 1;
+        const coverage = await generator.resolveCanonicalMajorRoadOwnerCoverage({
+          centerWorldX,
+          centerWorldZ,
+          radiusMeters,
+        });
+        execution.checkpoint();
+        return coverage;
+      } });
+    },
     requestDiagnostics(options = {}) {
       const requestId = ++controlRequestId;
       const envelope = createChunkGeneratorSchedulerEnvelope({
@@ -325,6 +360,7 @@ export function createInlineChunkGeneratorTransport({
       return Object.freeze({
         kind: 'inline', generatedCount, forestHorizonGeneratedCount,
         presentationOwnerGeneratedCount, canonicalTreeCellGeneratedCount,
+        canonicalMajorRoadOwnerQueryCount,
         diagnosticRequestCount, initialized, isShutdown,
         scheduler: scheduler.snapshot(),
         generatorSnapshot: lastGeneratorSnapshot,

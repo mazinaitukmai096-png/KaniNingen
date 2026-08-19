@@ -16,10 +16,11 @@ export const W8_NATURAL_PRESENTATION_PHASE_1 = Object.freeze({
   spawnHardClearanceMeters: 12,
 });
 
-// This is world-generation membership, not a distance-dependent presentation
-// threshold.  The same Stable-ID rank is applied by every canonical Natural
-// producer so Far, Mid, and Near see one immutable Tree population.
-export const W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD = 1;
+// This is observer-independent world-generation membership, not a
+// distance-dependent presentation threshold. Every canonical Natural producer
+// applies the same Stable-ID rank, so the selected half remains immutable across
+// Near, Mid, and Far while avoiding submission of the former full Tree set.
+export const W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD = 0.5;
 
 export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze({
   short: W8_RENDER_DISTANCE_PRESETS.short.naturalVisibilityMeters,

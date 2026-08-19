@@ -518,9 +518,12 @@ export function createInfiniteExperienceShell({
     onWheel(event) {
       if (state.runPhase !== 'playing' || state.paused) return;
       const profile = state.lastScaleProfile ?? initialScaleProfile;
+      const wheelZoomScale = Number.isFinite(profile.stage.cameraWheelZoomScale)
+        ? profile.stage.cameraWheelZoomScale
+        : CAM_WHEEL_ZOOM_SCALE;
       state.camera.distanceMeters = clamp(
         state.camera.distanceMeters
-          + finiteWorldUnitsToMeters(Number(event.deltaY ?? 0) * CAM_WHEEL_ZOOM_SCALE),
+          + finiteWorldUnitsToMeters(Number(event.deltaY ?? 0) * wheelZoomScale),
         finiteWorldUnitsToMeters(profile.stage.cameraMinDistance),
         finiteWorldUnitsToMeters(profile.stage.cameraMaxDistance),
       );

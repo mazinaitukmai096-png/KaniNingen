@@ -28,12 +28,22 @@ test('Render Distance exposes the three exact presets from one immutable policy 
       natural: policy.naturalVisibilityMeters,
       terrainRiver: policy.terrainRiverExtentMeters,
       generalObject: policy.generalObjectVisibilityMeters,
+      majorSilhouette: policy.majorSilhouetteVisibilityMeters,
       settlementHorizon: policy.settlementHorizonMeters,
     }],
   )), {
-    short: { natural: 84, terrainRiver: 192, generalObject: 112.5, settlementHorizon: 352 },
-    standard: { natural: 112, terrainRiver: 256, generalObject: 150, settlementHorizon: 656.25 },
-    current: { natural: 140, terrainRiver: 352, generalObject: 187.5, settlementHorizon: 875 },
+    short: {
+      natural: 84, terrainRiver: 192, generalObject: 112.5,
+      majorSilhouette: 163.636364, settlementHorizon: 352,
+    },
+    standard: {
+      natural: 112, terrainRiver: 256, generalObject: 150,
+      majorSilhouette: 218.181818, settlementHorizon: 656.25,
+    },
+    current: {
+      natural: 140, terrainRiver: 352, generalObject: 187.5,
+      majorSilhouette: 300, settlementHorizon: 875,
+    },
   });
   assert.equal(Object.isFrozen(W8_RENDER_DISTANCE_PRESETS), true);
   assert.equal(resolveW8RenderDistancePolicy('invalid'), W8_RENDER_DISTANCE_PRESETS.current);

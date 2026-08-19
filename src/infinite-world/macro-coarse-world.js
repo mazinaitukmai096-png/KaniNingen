@@ -1,3 +1,5 @@
+import { PLAYER_MAX_SPRINT_METERS_PER_SECOND } from '../player-scale-profile.js';
+
 export const MACRO_CELL_SIZE_METERS = 64;
 export const MACRO_OWNER_SIZE_METERS = 16;
 export const MACRO_OWNERS_PER_AXIS = MACRO_CELL_SIZE_METERS / MACRO_OWNER_SIZE_METERS;
@@ -6,7 +8,7 @@ export const MACRO_VISIBLE_RADIUS_METERS = 352;
 export const MACRO_MAX_NEW_CELLS_PER_FRAME = 1;
 export const MACRO_DEFAULT_MAX_IN_FLIGHT = 2;
 export const MACRO_MAX_RETAINED_CELLS = 174;
-export const MACRO_MAX_SPRINT_METERS_PER_SECOND = 47.85;
+export const MACRO_MAX_SPRINT_METERS_PER_SECOND = PLAYER_MAX_SPRINT_METERS_PER_SECOND;
 
 const EPSILON = 1e-9;
 const INITIAL_FILL_RADII_METERS = Object.freeze([100, 200, 300, 352]);
@@ -297,8 +299,6 @@ export function createMacroCoarseWorldController({
   let center = null;
   let desiredCoverage = Object.freeze([]);
   let desiredByKey = new Map();
-  let previousDesiredKeys = new Set();
-  let enteringKeys = new Set();
   const presented = new Map();
   const pending = new Map();
   const completionQueue = [];
@@ -335,11 +335,8 @@ export function createMacroCoarseWorldController({
     const nextCenter = logicalWorldToMacroCell(playerX, playerZ);
     if (center?.key === nextCenter.key) return false;
     const nextCoverage = createMacroResidentCoverage(nextCenter);
-    const diff = diffMacroCoverage(desiredCoverage, nextCoverage);
-    previousDesiredKeys = new Set(desiredByKey.keys());
     desiredCoverage = nextCoverage;
     desiredByKey = coverageMap(nextCoverage);
-    enteringKeys = new Set(diff.entering.map(cell => cell.key));
     center = nextCenter;
     coverageRevision += 1;
     if (initialCenterKey === null) {
@@ -469,20 +466,35 @@ export function createMacroCoarseWorldController({
       !presented.has(cell.key) && !pending.has(cell.key) && !completedKeys.has(cell.key)
     ))
       .map(cell => {
-        const visible = visibleCell(cell, playerX, playerZ);
-        const prior = previousDesiredKeys.has(cell.key);
-        const entering = enteringKeys.has(cell.key);
-        const priority = visible && prior ? 0
-          : visible && entering ? 1
-            : visible ? 0 : 2;
+        const distanceMeters = pointToMacroCellAabbDistance(
+          playerX,
+          playerZ,
+          cell.macroX,
+          cell.macroZ,
+        );
+        const visible = distanceMeters <= MACRO_VISIBLE_RADIUS_METERS + EPSILON;
         const ahead = directionX * (cell.bounds.centerX - playerX)
           + directionZ * (cell.bounds.centerZ - playerZ);
-        return { cell, priority, ahead };
+        const moving = speed > EPSILON;
+        const nearCore = visible
+          && distanceMeters <= INITIAL_FILL_RADII_METERS[0] + EPSILON;
+        const forward = moving && ahead > 0;
+        // The old queue completed the entire radial visible set before using
+        // velocity at all.  Starting a sprint before initial fill therefore
+        // left the forward edge behind old side/rear work for several seconds.
+        // Keep the safety-critical 100 m core radial and deterministic, then
+        // prioritize already-visible cells in the movement hemisphere.  The
+        // Resident margin remains last and is only directionally prefetched.
+        const priority = nearCore ? 0
+          : visible && forward ? 1
+            : visible ? 2
+              : forward ? 3 : 4;
+        return { cell, priority, ahead, distanceMeters };
       })
       .sort((left, right) => (
         left.priority - right.priority
-          || (left.priority >= 2 ? right.ahead - left.ahead : 0)
-          || left.cell.distanceMeters - right.cell.distanceMeters
+          || left.distanceMeters - right.distanceMeters
+          || (left.priority === 3 ? right.ahead - left.ahead : 0)
           || left.cell.macroZ - right.cell.macroZ
           || left.cell.macroX - right.cell.macroX
       ));

@@ -7,6 +7,7 @@ import { resolveW8CanonicalWorldObject } from '../src/infinite-world/world-objec
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 import { createCanonicalRiverProjection } from '../src/infinite-world/canonical-river-realization.js';
 import { sampleW8SurfaceHeightMeters } from '../src/infinite-world/w8-surface-policy.js';
+import { resolveW8LowPolyTreePresentationParts } from '../src/infinite-world/vegetation-lod-policy.js';
 import { hashWorldSeed } from '../src/infinite-world/legacy-core/g0/seed.js';
 import {
   createGpuAttributeMirror,
@@ -470,6 +471,10 @@ test('Settlement projection preserves finite layer order and renders ribbon, ent
   assert.ok(lotIndex > roadIndex);
   assert.ok(buildingIndex > lotIndex);
   assert.ok(vegetationIndex > buildingIndex);
+  assert.equal(names.some(name => /production-vegetation-dodeca-treeLeaves/.test(name)), true,
+    'Near broadleaf uses the same angular dodeca crown as Distant presentation');
+  assert.equal(names.some(name => /production-vegetation-sphere-treeLeaves/.test(name)), false,
+    'Near projection does not restore the smooth multi-sphere crown');
   const roadMesh = projected.group.children[roadIndex];
   assert.equal(roadMesh.userData.roadRibbon.roadRecordCount, 2);
   assert.equal(roadMesh.userData.roadRibbon.degenerateTriangleCount, 0);
@@ -810,11 +815,16 @@ test('Near W8 canonical vegetation anchors every part at canonical position Y wi
   const entry = adapter.featureInstances.get(canonical.stableId);
   assert.ok(entry, 'canonical Tree must be registered on the Near path');
 
-  const expectedCanonicalPartY = canonical.presentation.parts.map(part => (
+  const lowPolyParts = resolveW8LowPolyTreePresentationParts({
+    subtype: candidate.subtype,
+    parts: canonical.presentation.parts,
+    supportsDodeca: true,
+  });
+  const expectedCanonicalPartY = lowPolyParts.map(part => (
     canonical.position.y * adapter.unitsPerMeter
       + part.position[1] * canonical.visualBounds.height * adapter.unitsPerMeter
   )).sort((left, right) => left - right);
-  const terrainResampledPartY = canonical.presentation.parts.map(part => (
+  const terrainResampledPartY = lowPolyParts.map(part => (
     sampledTerrainY * adapter.unitsPerMeter
       + part.position[1] * canonical.visualBounds.height * adapter.unitsPerMeter
   )).sort((left, right) => left - right);
@@ -825,5 +835,10 @@ test('Near W8 canonical vegetation anchors every part at canonical position Y wi
     'each Near Tree part must preserve the exact canonical.position.y anchor');
   assert.notDeepEqual(actualPartY, terrainResampledPartY,
     'Near Tree placement must not substitute the sampled Terrain height');
+  assert.equal(entry.parts.length, 2, 'Near broadleaf retains one trunk and one low-poly crown');
+  assert.equal(entry.parts.some(part => part.mesh.geometry === adapter.visualAssets.geometries.dodeca), true,
+    'Near broadleaf crown uses the angular DodecahedronGeometry');
+  assert.equal(entry.parts.some(part => part.mesh.geometry === adapter.visualAssets.geometries.sphere), false,
+    'Near broadleaf does not allocate a smooth SphereGeometry crown');
   await adapter.shutdown();
 });

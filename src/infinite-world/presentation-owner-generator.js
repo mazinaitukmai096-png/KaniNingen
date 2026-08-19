@@ -539,6 +539,7 @@ export async function createPresentationOwnerGenerator({
   experienceSpawn = null,
   resolvePresentationContext = null,
   resolvePresentationContexts = null,
+  resolveCanonicalNaturalCandidates = null,
 } = {}) {
   const normalizedWorldSeed = normalizeWorldSeed(worldSeed);
   const { worldSeedHash } = await hashWorldSeed(normalizedWorldSeed);
@@ -547,11 +548,16 @@ export async function createPresentationOwnerGenerator({
     createFormalNaturalCandidateKernel({ worldSeedHash }),
     createW8NaturalPresentationPhase1Policy({ worldSeedHash }),
   ]);
+  if (resolveCanonicalNaturalCandidates !== null
+    && typeof resolveCanonicalNaturalCandidates !== 'function') {
+    throw new TypeError('resolveCanonicalNaturalCandidates must be a function');
+  }
   const prepareOwner = async (chunkX, chunkZ, {
     includeRocks = true,
     materializePresentationOwner = true,
     resolvedContext = undefined,
     resolvedContextPromise = null,
+    resolvedCandidates = undefined,
   } = {}) => {
     if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
       throw new TypeError('Presentation owner coordinates are required');
@@ -579,6 +585,19 @@ export async function createPresentationOwnerGenerator({
       contextReadyAt = globalThis.performance?.now?.() ?? Date.now();
       return value ?? {};
     });
+    // Reuse only the immutable formal candidates. Settlement/Road/River
+    // projection, exclusions, final-ground anchoring, and Stable-ID selection
+    // still execute through this purpose-built PresentationOwner path.
+    const reusableCandidates = resolvedCandidates ?? resolveCanonicalNaturalCandidates?.({
+      chunkX,
+      chunkZ,
+      ownerKey: createChunkKey(chunkX, chunkZ),
+    }) ?? null;
+    if (reusableCandidates !== null
+      && (!Array.isArray(reusableCandidates.vegetationCandidates)
+        || !Array.isArray(reusableCandidates.rockCandidates))) {
+      throw new TypeError('resolved canonical Natural candidates are invalid');
+    }
     const ownerSampler = naturalKernel.createOwnerSampler(chunkX, chunkZ);
     const sampleTerrainAt = (_chunk, point, candidateKind) => ownerSampler.sampleTerrain(
       point,
@@ -586,7 +605,7 @@ export async function createPresentationOwnerGenerator({
     );
     const sampleBiomeWeightsAt = (_chunk, point) => ownerSampler.sampleBiomeWeights(point);
     let candidatesReadyAt = startedAt;
-    const pendingCandidates = (async () => {
+    const pendingCandidates = reusableCandidates === null ? (async () => {
       const vegetationGeneration = await candidateKernel.generateVegetation({
         chunk: { chunkX, chunkZ, worldSeedHash },
         sampleTerrainAt,
@@ -611,180 +630,191 @@ export async function createPresentationOwnerGenerator({
           vegetationMs: vegetationGeneration.timings.vegetationMs,
           rockMs: rockGeneration.timings.rockMs,
         }),
+        reused: false,
       });
-    })();
-      const [context, candidates] = await Promise.all([pendingContext, pendingCandidates]);
-      const preparationReadyAt = globalThis.performance?.now?.() ?? Date.now();
-      const excluded = new Set(context.excludedNaturalStableIds ?? []);
-      const exclusionTemplates = context.naturalExclusionTemplates
-        ?? context.settlementTemplates ?? [];
-      const candidateAllowed = candidate => !excluded.has(candidate.candidateId)
-        && !exclusionTemplates.some(template => (
-          settlementTemplateConflictsWithCandidate(candidate, template)
-        ));
-      const firstProjection = (context.settlementTemplates ?? []).map(template => (
-        projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
-          sampleTerrainHeightAt: ownerSampler.sampleNaturalHeightMeters,
-        })
+    })() : Promise.resolve().then(() => {
+      candidatesReadyAt = globalThis.performance?.now?.() ?? Date.now();
+      return Object.freeze({
+        vegetationCandidates: reusableCandidates.vegetationCandidates,
+        rockCandidates: includeRocks
+          ? reusableCandidates.rockCandidates : Object.freeze([]),
+        timings: Object.freeze({ vegetationMs: 0, rockMs: 0 }),
+        reused: true,
+      });
+    });
+    const [context, candidates] = await Promise.all([pendingContext, pendingCandidates]);
+    const preparationReadyAt = globalThis.performance?.now?.() ?? Date.now();
+    const excluded = new Set(context.excludedNaturalStableIds ?? []);
+    const exclusionTemplates = context.naturalExclusionTemplates
+      ?? context.settlementTemplates ?? [];
+    const candidateAllowed = candidate => !excluded.has(candidate.candidateId)
+      && !exclusionTemplates.some(template => (
+        settlementTemplateConflictsWithCandidate(candidate, template)
       ));
-      const settlementRegionRefs = context.settlementRegionRefs
-        ?? context.settlementReferences
-        ?? firstProjection.flatMap(value => value.references);
-      const preliminarySurfacePolicy = context.canonicalSurfacePolicy
-        ?? createSettlementSurfacePolicy(settlementRegionRefs);
-      const preliminaryGround = createSharedCanonicalGroundKernel({
-        canonicalSurfacePolicy: preliminarySurfacePolicy,
-        sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
-      });
-      const projectedSettlements = (context.settlementTemplates ?? []).map(template => (
-        projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
-          sampleTerrainHeightAt: (worldX, worldZ) => (
-            preliminaryGround.settlementGround(worldX, worldZ).heightMeters
-          ),
-        })
-      ));
-      const settlementStructures = projectedSettlements.flatMap(value => value.features);
-      const majorRoadStructures = typeof context.resolveMajorRoadFeatures === 'function'
-        ? await context.resolveMajorRoadFeatures({
-          chunkX,
-          chunkZ,
-          ground: preliminaryGround,
-          settlementReferences: settlementRegionRefs,
-          settlementStructures,
-        }) ?? [] : [];
-      const preliminaryStructures = [
-        ...settlementStructures,
-        ...majorRoadStructures,
-        ...(context.structures ?? []),
-      ].sort((left, right) => left.stableId.localeCompare(right.stableId));
-      const riverProjection = context.includeCanonicalRiver === true
-        ? await createCanonicalRiverProjection({
-          worldSeedHash,
-          chunkX,
-          chunkZ,
-          settlementReferences: settlementRegionRefs,
-          roads: preliminaryStructures,
-          sampleSurfaceHeight: (worldX, worldZ) => (
-            preliminaryGround.finalGround(worldX, worldZ).heightMeters
-          ),
-        }) : null;
-      const canonicalSurfacePolicy = context.canonicalSurfacePolicy
-        ?? createSettlementSurfacePolicy(
-          settlementRegionRefs,
-          riverProjection?.surfaceCorridor ? [riverProjection.surfaceCorridor] : [],
-        );
-      const ground = createSharedCanonicalGroundKernel({
-        canonicalSurfacePolicy,
-        sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
-      });
-      const auxiliary = typeof context.resolvePresentationAuxiliary === 'function'
-        ? await context.resolvePresentationAuxiliary({
-            chunkX,
-            chunkZ,
-            ground,
-            settlementReferences: settlementRegionRefs,
-            structures: preliminaryStructures,
-            riverProjection,
-            naturalOnly: !materializePresentationOwner,
-          }) ?? {} : {};
-      const water = [
-        ...(context.water ?? []),
-        ...(auxiliary.water ?? []),
-        ...(riverProjection?.waterSurface ? [riverProjection.waterSurface] : []),
-      ];
-      const landmarks = [...(context.landmarks ?? []), ...(auxiliary.landmarks ?? [])];
-      const candidateVisible = candidate => candidateAllowed(candidate)
-        && (typeof context.isNaturalCandidateAllowed !== 'function'
-          || context.isNaturalCandidateAllowed({
-            candidate,
-            structures: preliminaryStructures,
-            water,
-            landmarks,
-            riverProjection,
-            canonicalSurfacePolicy,
-          }) !== false);
-      const vegetation = naturalPolicy.selectVegetation({
-        candidates: candidates.vegetationCandidates.filter(candidateVisible),
+    const firstProjection = (context.settlementTemplates ?? []).map(template => (
+      projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
+        sampleTerrainHeightAt: ownerSampler.sampleNaturalHeightMeters,
+      })
+    ));
+    const settlementRegionRefs = context.settlementRegionRefs
+      ?? context.settlementReferences
+      ?? firstProjection.flatMap(value => value.references);
+    const preliminarySurfacePolicy = context.canonicalSurfacePolicy
+      ?? createSettlementSurfacePolicy(settlementRegionRefs);
+    const preliminaryGround = createSharedCanonicalGroundKernel({
+      canonicalSurfacePolicy: preliminarySurfacePolicy,
+      sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
+    });
+    const projectedSettlements = (context.settlementTemplates ?? []).map(template => (
+      projectMigratedSettlementTemplate(template, { chunkX, chunkZ }, {
+        sampleTerrainHeightAt: (worldX, worldZ) => (
+          preliminaryGround.settlementGround(worldX, worldZ).heightMeters
+        ),
+      })
+    ));
+    const settlementStructures = projectedSettlements.flatMap(value => value.features);
+    const majorRoadStructures = typeof context.resolveMajorRoadFeatures === 'function'
+      ? await context.resolveMajorRoadFeatures({
+        chunkX,
+        chunkZ,
+        ground: preliminaryGround,
         settlementReferences: settlementRegionRefs,
-        experienceSpawn,
-        introDistanceMeters: context.introDistanceMeters ?? 11,
-      });
-      const rocks = candidates.rockCandidates.filter(candidateVisible);
-      const regroundNaturalCandidate = candidate => {
-        const heightMeters = ground.finalGround(
-          candidate.worldPosition.x,
-          candidate.worldPosition.z,
-        ).heightMeters;
-        if (candidate.worldPosition.y === heightMeters) return candidate;
-        return Object.freeze({
-          ...candidate,
-          worldPosition: Object.freeze({
-            ...candidate.worldPosition,
-            y: heightMeters,
-          }),
-        });
-      };
-      const groundedVegetation = Object.freeze(vegetation.map(regroundNaturalCandidate));
-      const groundedRocks = Object.freeze(rocks.map(regroundNaturalCandidate));
-      // Natural Stable IDs and X/Z admission remain unchanged, but canonical Y
-      // is the same post-grading/post-river finalGround used by visible Terrain.
-      // Near, Distant, and the Tree-only batch therefore share one immutable
-      // ground anchor without per-frame Terrain resampling.
-      const resource = materializePresentationOwner ? createPresentationOwnerResource({
+        settlementStructures,
+      }) ?? [] : [];
+    const preliminaryStructures = [
+      ...settlementStructures,
+      ...majorRoadStructures,
+      ...(context.structures ?? []),
+    ].sort((left, right) => left.stableId.localeCompare(right.stableId));
+    const riverProjection = context.includeCanonicalRiver === true
+      ? await createCanonicalRiverProjection({
         worldSeedHash,
         chunkX,
         chunkZ,
-        naturalCandidates: [...groundedVegetation, ...groundedRocks]
-          .map(resolveW8CanonicalWorldObject),
-        structures: preliminaryStructures,
-        settlementRegionRefs,
-        riverCorridorRefs: context.riverCorridorRefs
-          ?? canonicalSurfacePolicy?.riverCorridors ?? [],
-        water,
-        landmarks,
-        street: [...(context.street ?? []), ...(auxiliary.street ?? [])],
+        settlementReferences: settlementRegionRefs,
+        roads: preliminaryStructures,
+        sampleSurfaceHeight: (worldX, worldZ) => (
+          preliminaryGround.finalGround(worldX, worldZ).heightMeters
+        ),
       }) : null;
-      const trees = Object.freeze((resource
-        ? resource.natural.filter(record => record.objectType === 'tree')
-        : groundedVegetation.filter(candidate => candidate.subtype !== 'shrub')
-          .map(candidate => compactNatural(resolveW8CanonicalWorldObject(candidate)))
-          .sort((left, right) => left.stableId.localeCompare(right.stableId))));
-      const completedAt = globalThis.performance?.now?.() ?? Date.now();
+    const canonicalSurfacePolicy = context.canonicalSurfacePolicy
+      ?? createSettlementSurfacePolicy(
+        settlementRegionRefs,
+        riverProjection?.surfaceCorridor ? [riverProjection.surfaceCorridor] : [],
+      );
+    const ground = createSharedCanonicalGroundKernel({
+      canonicalSurfacePolicy,
+      sampleNaturalHeightMeters: ownerSampler.sampleNaturalHeightMeters,
+    });
+    const auxiliary = typeof context.resolvePresentationAuxiliary === 'function'
+      ? await context.resolvePresentationAuxiliary({
+          chunkX,
+          chunkZ,
+          ground,
+          settlementReferences: settlementRegionRefs,
+          structures: preliminaryStructures,
+          riverProjection,
+          naturalOnly: !materializePresentationOwner,
+        }) ?? {} : {};
+    const water = [
+      ...(context.water ?? []),
+      ...(auxiliary.water ?? []),
+      ...(riverProjection?.waterSurface ? [riverProjection.waterSurface] : []),
+    ];
+    const landmarks = [...(context.landmarks ?? []), ...(auxiliary.landmarks ?? [])];
+    const candidateVisible = candidate => candidateAllowed(candidate)
+      && (typeof context.isNaturalCandidateAllowed !== 'function'
+        || context.isNaturalCandidateAllowed({
+          candidate,
+          structures: preliminaryStructures,
+          water,
+          landmarks,
+          riverProjection,
+          canonicalSurfacePolicy,
+        }) !== false);
+    const vegetation = naturalPolicy.selectVegetation({
+      candidates: candidates.vegetationCandidates.filter(candidateVisible),
+      settlementReferences: settlementRegionRefs,
+      experienceSpawn,
+      introDistanceMeters: context.introDistanceMeters ?? 11,
+    });
+    const rocks = candidates.rockCandidates.filter(candidateVisible);
+    const regroundNaturalCandidate = candidate => {
+      const heightMeters = ground.finalGround(
+        candidate.worldPosition.x,
+        candidate.worldPosition.z,
+      ).heightMeters;
+      if (candidate.worldPosition.y === heightMeters) return candidate;
       return Object.freeze({
-        schemaVersion: 'w8-presentation-owner-data-1',
-        chunkId: resource?.identity.chunkId ?? null,
-        contentHash: `presentation:${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${chunkX},${chunkZ}`,
-        chunkX,
-        chunkZ,
-        resource,
-        trees,
-        ground,
-        canonicalSurfacePolicy,
-        riverProjection,
-        diagnostics: Object.freeze({
-          denseTerrainMaterialized: false,
-          fullNaturalExpanded: false,
-          grassGenerated: false,
-          gameplayGenerated: false,
-          fullSettlementGenerated: false,
-          largeContentHashGenerated: false,
-          latticeSampleCount: ownerSampler.snapshot().latticeSampleCount,
-          sourceVegetationCandidateCount: candidates.vegetationCandidates.length,
-          sourceRockCandidateCount: candidates.rockCandidates.length,
-          selectedVegetationCandidateCount: vegetation.length,
-          selectedTreeCount: vegetation.filter(candidate => candidate.subtype !== 'shrub').length,
-          selectedShrubCount: vegetation.filter(candidate => candidate.subtype === 'shrub').length,
-          excludedVegetationCandidateCount:
-            candidates.vegetationCandidates.length - vegetation.length,
-          rockGenerationSkipped: !includeRocks,
-          vegetationCandidateCpuMs: candidates.timings.vegetationMs,
-          rockCandidateCpuMs: candidates.timings.rockMs,
-          contextCpuMs: q6(contextReadyAt - startedAt),
-          candidateCpuMs: q6(candidatesReadyAt - startedAt),
-          projectionCpuMs: q6(completedAt - preparationReadyAt),
-          totalCpuMs: q6(completedAt - startedAt),
+        ...candidate,
+        worldPosition: Object.freeze({
+          ...candidate.worldPosition,
+          y: heightMeters,
         }),
       });
+    };
+    const groundedVegetation = Object.freeze(vegetation.map(regroundNaturalCandidate));
+    const groundedRocks = Object.freeze(rocks.map(regroundNaturalCandidate));
+    // Natural Stable IDs and X/Z admission remain unchanged, but canonical Y
+    // is the same post-grading/post-river finalGround used by visible Terrain.
+    // Near, Distant, and the Tree-only batch therefore share one immutable
+    // ground anchor without per-frame Terrain resampling.
+    const resource = materializePresentationOwner ? createPresentationOwnerResource({
+      worldSeedHash,
+      chunkX,
+      chunkZ,
+      naturalCandidates: [...groundedVegetation, ...groundedRocks]
+        .map(resolveW8CanonicalWorldObject),
+      structures: preliminaryStructures,
+      settlementRegionRefs,
+      riverCorridorRefs: context.riverCorridorRefs
+        ?? canonicalSurfacePolicy?.riverCorridors ?? [],
+      water,
+      landmarks,
+      street: [...(context.street ?? []), ...(auxiliary.street ?? [])],
+    }) : null;
+    const trees = Object.freeze((resource
+      ? resource.natural.filter(record => record.objectType === 'tree')
+      : groundedVegetation.filter(candidate => candidate.subtype !== 'shrub')
+        .map(candidate => compactNatural(resolveW8CanonicalWorldObject(candidate)))
+        .sort((left, right) => left.stableId.localeCompare(right.stableId))));
+    const completedAt = globalThis.performance?.now?.() ?? Date.now();
+    return Object.freeze({
+      schemaVersion: 'w8-presentation-owner-data-1',
+      chunkId: resource?.identity.chunkId ?? null,
+      contentHash: `presentation:${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${chunkX},${chunkZ}`,
+      chunkX,
+      chunkZ,
+      resource,
+      trees,
+      ground,
+      canonicalSurfacePolicy,
+      riverProjection,
+      diagnostics: Object.freeze({
+        denseTerrainMaterialized: false,
+        fullNaturalExpanded: false,
+        grassGenerated: false,
+        gameplayGenerated: false,
+        fullSettlementGenerated: false,
+        largeContentHashGenerated: false,
+        latticeSampleCount: ownerSampler.snapshot().latticeSampleCount,
+        sourceVegetationCandidateCount: candidates.vegetationCandidates.length,
+        sourceRockCandidateCount: candidates.rockCandidates.length,
+        selectedVegetationCandidateCount: vegetation.length,
+        selectedTreeCount: vegetation.filter(candidate => candidate.subtype !== 'shrub').length,
+        selectedShrubCount: vegetation.filter(candidate => candidate.subtype === 'shrub').length,
+        excludedVegetationCandidateCount:
+          candidates.vegetationCandidates.length - vegetation.length,
+        rockGenerationSkipped: !includeRocks,
+        canonicalCandidatesReused: candidates.reused === true,
+        vegetationCandidateCpuMs: candidates.timings.vegetationMs,
+        rockCandidateCpuMs: candidates.timings.rockMs,
+        contextCpuMs: q6(contextReadyAt - startedAt),
+        candidateCpuMs: q6(candidatesReadyAt - startedAt),
+        projectionCpuMs: q6(completedAt - preparationReadyAt),
+        totalCpuMs: q6(completedAt - startedAt),
+      }),
+    });
   };
 
   const generateCanonicalTreeCell = async (macroX, macroZ) => {

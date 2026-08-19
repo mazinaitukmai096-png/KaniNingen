@@ -6,6 +6,7 @@ import { createDistributedSettlementChunkGenerator } from '../src/infinite-world
 import { createW6ChunkGameplay } from '../src/infinite-world/gameplay-runtime.js';
 import { createW8ForestHorizonManifest } from '../src/infinite-world/forest-horizon-manifest.js';
 import {
+  W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD,
   W8_NATURAL_PRESENTATION_PHASE_1,
   createW8NaturalPresentationPhase1Policy,
   evaluateW8SettlementDensityFactor,
@@ -236,6 +237,35 @@ test('Phase 1 natural presentation policy is world-fixed, smooth, and preserves 
   const selected = policy.selectVegetation({ candidates: [shrub, tree] });
   assert.equal(selected.includes(shrub), true);
   assert.equal(selected.filter(candidate => candidate.subtype === 'shrub').length, 1);
+});
+
+test('Phase 1 applies one immutable 50 percent Tree world sample', async () => {
+  assert.equal(W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD, 0.5);
+  const policy = await createW8NaturalPresentationPhase1Policy({
+    worldSeedHash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  });
+  const evaluations = Array.from({ length: 512 }, (_, index) => policy.evaluateTree({
+    candidate: candidateAt({
+      id: `phase-1:world-density:${index}`,
+      x: 100,
+      z: 100,
+    }),
+  }));
+  const habitatAccepted = evaluations.filter(evaluation => (
+    evaluation.rank < evaluation.acceptance
+  ));
+  const worldAccepted = evaluations.filter(evaluation => evaluation.accepted);
+
+  assert.ok(worldAccepted.length > 0);
+  assert.ok(worldAccepted.length < habitatAccepted.length,
+    'world sampling must reduce the Phase 1 habitat-accepted Tree set');
+  assert.ok(habitatAccepted.some(evaluation => (
+    evaluation.densityRank >= W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD
+  )), 'the fixture must include Trees rejected only by immutable world sampling');
+  assert.equal(evaluations.every(evaluation => evaluation.accepted === (
+    evaluation.rank < evaluation.acceptance
+      && evaluation.densityRank < W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD
+  )), true);
 });
 
 test('W8 wraps byte-identical W5 output and publishes sorted deterministic overlays', async () => {

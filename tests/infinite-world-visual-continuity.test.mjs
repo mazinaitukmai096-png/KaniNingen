@@ -227,6 +227,28 @@ test('visibility, opacity, matrix, and GPU state are all required for Drawable',
   assert.equal(isDrawableInCompletedFrame({ mesh: drawable.mesh, receipt }), true);
 });
 
+test('GPU mirrors use updateRanges without touching deprecated updateRange', () => {
+  const attribute = createAttribute([1, 2], 1);
+  const gpuMirror = createGpuAttributeMirror();
+
+  assert.equal(gpuMirror.uploadAttribute(attribute), true);
+  assert.deepEqual(Array.from(gpuMirror.read(attribute)), [1, 2]);
+
+  Object.defineProperty(attribute, 'updateRange', {
+    configurable: true,
+    get() {
+      throw new Error('deprecated updateRange getter must not be read');
+    },
+  });
+  attribute.array[1] = 20;
+  attribute.clearUpdateRanges();
+  attribute.needsUpdate = true;
+
+  assert.equal(gpuMirror.uploadAttribute(attribute), true);
+  assert.deepEqual(Array.from(gpuMirror.read(attribute)), [1, 20],
+    'an empty updateRanges list means the whole attribute is uploaded');
+});
+
 test('renderer GPU shadow commits only ranges accepted by a completed renderer upload', () => {
   let now = 0;
   const attribute = createAttribute([1, 2], 1);

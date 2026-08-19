@@ -69,6 +69,7 @@ import {
   createCanonicalMajorRoadCacheKey,
   createCanonicalMajorRoadNetwork,
   createCanonicalMajorRoadObstacles,
+  enumerateCanonicalMajorRoadOwnerCoordinates,
   graphEdgesPotentiallyIntersectChunk,
   projectCanonicalMajorRoadsToChunk,
 } from './canonical-major-road-network.js';
@@ -2091,6 +2092,116 @@ export async function createW8ParityChunkGenerator({
       ))),
     });
   };
+  const resolveCanonicalMajorRoadOwnerCoverage = async ({
+    centerWorldX,
+    centerWorldZ,
+    radiusMeters,
+  } = {}) => {
+    if (![centerWorldX, centerWorldZ, radiusMeters].every(Number.isFinite)
+      || radiusMeters < 0) throw new TypeError('valid MAJOR Road owner query is required');
+    const regionSize = W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters;
+    const chunksPerRegion = regionSize / LOGICAL_CHUNK_SIZE_METERS;
+    if (!Number.isSafeInteger(chunksPerRegion) || chunksPerRegion <= 0) {
+      throw new Error('MAJOR Road owner coverage requires integral macro regions');
+    }
+    const minimumChunkX = Math.floor(
+      (centerWorldX - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS,
+    ) - 1;
+    const maximumChunkX = Math.floor(
+      (centerWorldX + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS,
+    ) + 1;
+    const minimumChunkZ = Math.floor(
+      (centerWorldZ - radiusMeters) / LOGICAL_CHUNK_SIZE_METERS,
+    ) - 1;
+    const maximumChunkZ = Math.floor(
+      (centerWorldZ + radiusMeters) / LOGICAL_CHUNK_SIZE_METERS,
+    ) + 1;
+    const minimumRegionX = Math.floor(minimumChunkX / chunksPerRegion);
+    const maximumRegionX = Math.floor(maximumChunkX / chunksPerRegion);
+    const minimumRegionZ = Math.floor(minimumChunkZ / chunksPerRegion);
+    const maximumRegionZ = Math.floor(maximumChunkZ / chunksPerRegion);
+    const regions = [];
+    for (let regionZ = minimumRegionZ; regionZ <= maximumRegionZ; regionZ += 1) {
+      for (let regionX = minimumRegionX; regionX <= maximumRegionX; regionX += 1) {
+        regions.push({ regionX, regionZ });
+      }
+    }
+    const resolvedRegions = [];
+    for (const region of regions) {
+      const graph = await getMajorRoadGraph(
+        region.regionX * chunksPerRegion,
+        region.regionZ * chunksPerRegion,
+      );
+      const requiredEdgeIds = new Set();
+      const regionMinimumChunkX = Math.max(
+        minimumChunkX,
+        region.regionX * chunksPerRegion,
+      );
+      const regionMaximumChunkX = Math.min(
+        maximumChunkX,
+        (region.regionX + 1) * chunksPerRegion - 1,
+      );
+      const regionMinimumChunkZ = Math.max(
+        minimumChunkZ,
+        region.regionZ * chunksPerRegion,
+      );
+      const regionMaximumChunkZ = Math.min(
+        maximumChunkZ,
+        (region.regionZ + 1) * chunksPerRegion - 1,
+      );
+      for (let chunkZ = regionMinimumChunkZ; chunkZ <= regionMaximumChunkZ; chunkZ += 1) {
+        for (let chunkX = regionMinimumChunkX; chunkX <= regionMaximumChunkX; chunkX += 1) {
+          const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+          const maximumX = (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS;
+          const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+          const maximumZ = (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS;
+          const nearestX = Math.max(minimumX, Math.min(maximumX, centerWorldX));
+          const nearestZ = Math.max(minimumZ, Math.min(maximumZ, centerWorldZ));
+          if (Math.hypot(nearestX - centerWorldX, nearestZ - centerWorldZ)
+            > radiusMeters) continue;
+          for (const edge of graphEdgesPotentiallyIntersectChunk({ graph, chunkX, chunkZ })) {
+            requiredEdgeIds.add(edge.stableId);
+          }
+        }
+      }
+      const edges = graph.edges.filter(edge => requiredEdgeIds.has(edge.stableId));
+      const roads = await getMajorRoads(edges, graph);
+      const ownerCoordinates = enumerateCanonicalMajorRoadOwnerCoordinates({
+        roads,
+        centerWorldX,
+        centerWorldZ,
+        radiusMeters,
+      }).filter(coordinate => (
+        Math.floor(coordinate.chunkX / chunksPerRegion) === region.regionX
+          && Math.floor(coordinate.chunkZ / chunksPerRegion) === region.regionZ
+      ));
+      resolvedRegions.push({ graph, edges, roads, ownerCoordinates });
+    }
+    const graphEdgeIds = new Set();
+    const roadIds = new Set();
+    const owners = new Map();
+    for (const resolved of resolvedRegions) {
+      for (const edge of resolved.edges) graphEdgeIds.add(edge.stableId);
+      for (const road of resolved.roads) roadIds.add(road.stableId);
+      for (const coordinate of resolved.ownerCoordinates) {
+        owners.set(coordinate.key, coordinate);
+      }
+    }
+    const ownerCoordinates = Object.freeze([...owners.values()].sort((left, right) => (
+      left.chunkZ - right.chunkZ || left.chunkX - right.chunkX
+    )));
+    return Object.freeze({
+      schemaVersion: 'w8-canonical-major-road-owner-coverage-1',
+      centerWorldX,
+      centerWorldZ,
+      radiusMeters,
+      regionCount: regions.length,
+      graphEdgeCount: graphEdgeIds.size,
+      roadCount: roadIds.size,
+      ownerCount: ownerCoordinates.length,
+      ownerCoordinates,
+    });
+  };
   const resolvePresentationContextsForOwners = async owners => {
     if (!Array.isArray(owners) || owners.length === 0) {
       throw new TypeError('Presentation owner context batch is required');
@@ -2155,6 +2266,21 @@ export async function createW8ParityChunkGenerator({
   const presentationOwnerGeneratorPromise = createPresentationOwnerGenerator({
     worldSeed: base.worldSeed,
     experienceSpawn,
+    resolveCanonicalNaturalCandidates: ({ ownerKey }) => {
+      // Full generation already owns an immutable candidate source. Reuse it
+      // opportunistically without starting Full generation from the sparse path.
+      const cachedContext = canonicalOwnerCache.peek({
+        ownerKey,
+        sourceRevision: canonicalSourceRevision,
+      });
+      if (!cachedContext) return null;
+      return Object.freeze({
+        vegetationCandidates:
+          cachedContext.parityGameplayChunk.vegetationCandidates ?? Object.freeze([]),
+        rockCandidates:
+          cachedContext.parityGameplayChunk.rockCandidates ?? Object.freeze([]),
+      });
+    },
     resolvePresentationContext: async owner => (
       (await resolvePresentationContextsForOwners([owner]))[0]
     ),
@@ -2675,6 +2801,10 @@ export async function createW8ParityChunkGenerator({
         .generateCanonicalTreeCell(macroX, macroZ);
       resourceGenerationCounts.canonicalTreeCellCompleted += 1;
       return generated;
+    },
+    async resolveCanonicalMajorRoadOwnerCoverage(query = {}) {
+      assertGeneratorActive();
+      return resolveCanonicalMajorRoadOwnerCoverage(query);
     },
     async resolveCanonicalMajorRoadNetwork({
       centerWorldX,

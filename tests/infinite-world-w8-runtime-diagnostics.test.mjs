@@ -23,6 +23,7 @@ import {
   resolveW8CanonicalCandidateSet,
   resolveW8NaturalCandidateVisual,
   resolveW8PersistentNaturalBucketCapacity,
+  resolveW8RoadVisibilityDiagnostic,
   sampleW8DistantTerrainAt,
   w8TerrainColorFromWeights,
 } from '../src/infinite-world/render/w8-distant-presentation.js';
@@ -320,6 +321,32 @@ function createDistantTestVisualAssets() {
       record.buildingType === 'house' ? [CANONICAL_HOUSE_PART] : null,
   };
 }
+
+test('Road visibility diagnostic has explicit off, contrast, and wide modes', () => {
+  assert.deepEqual(resolveW8RoadVisibilityDiagnostic(), {
+    schemaVersion: 'w8-road-visibility-diagnostic-1',
+    mode: 'off',
+    enabled: false,
+    colorHex: 0xff00ff,
+    disableFog: false,
+    unlit: false,
+    widthMultiplier: 1,
+  });
+  assert.deepEqual(resolveW8RoadVisibilityDiagnostic('contrast'), {
+    schemaVersion: 'w8-road-visibility-diagnostic-1',
+    mode: 'contrast',
+    enabled: true,
+    colorHex: 0xff00ff,
+    disableFog: true,
+    unlit: true,
+    widthMultiplier: 1,
+  });
+  assert.equal(resolveW8RoadVisibilityDiagnostic('wide').widthMultiplier, 4);
+  assert.throws(
+    () => resolveW8RoadVisibilityDiagnostic('unknown'),
+    /off, contrast, or wide/,
+  );
+});
 
 const SILHOUETTE_TREE_TRUNK_PART = Object.freeze({
   geometry: 'box', material: 'treeTrunk', position: Object.freeze([0, 0.2, 0]),
@@ -3853,6 +3880,152 @@ test('canonical MAJOR Road remains eligible across the Far handoff without a rep
   presentation.dispose();
 });
 
+test('Settlement Road stays drawable through the major-silhouette range without loading distant Buildings', async () => {
+  const settlementId = 'settlement-v1:road-silhouette';
+  const road = Object.freeze({
+    stableId: `${settlementId}:road:0`,
+    sourceStableId: `${settlementId}:road-source:0`,
+    sourceSegmentStableId: `${settlementId}:road-source:0:segment:0`,
+    featureType: 'settlement-road',
+    canonicalMajorRoad: false,
+    settlementId,
+    settlementIds: Object.freeze([settlementId]),
+    roadKind: 'LOCAL',
+    widthMeters: 1.75,
+    start: Object.freeze({ x: 248, y: 0, z: 8 }),
+    end: Object.freeze({ x: 256, y: 0, z: 8 }),
+    worldPosition: Object.freeze({ x: 252, y: 0, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 15, z: 0 }),
+  });
+  const chunk = canonicalChunk(15, 0, [road]);
+  const candidate = Object.freeze({
+    settlementId,
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: Object.freeze({ x: 252, z: 8 }),
+    radiusMeters: 0,
+  });
+  const template = Object.freeze({
+    settlementId,
+    settlementType: candidate.settlementType,
+    townType: candidate.townType,
+    center: candidate.center,
+    buildings: Object.freeze([]),
+    roads: Object.freeze([Object.freeze({ start: road.start, end: road.end })]),
+  });
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene: new DistantTestGroup(),
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createDistantTestVisualAssets(),
+    findSettlementsNear: async () => [candidate],
+    resolveTemplate: async () => template,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 15 && chunkZ === 0 ? chunk : canonicalChunk(chunkX, chunkZ, [])
+    ),
+  });
+  assert.equal(await presentation.sync({
+    activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+    renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+    centerChunkX: 0, centerChunkZ: 0, quality: 'high',
+    playerLogicalX: 8, playerLogicalZ: 8,
+  }), true);
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.visibilityMeters, 187.5);
+  assert.equal(snapshot.roadVisibilityMeters, 300);
+  assert.ok(snapshot.queryRoadOwnerChunkCount >= 1);
+  assert.equal(snapshot.queryBuildingOwnerChunkCount, 0);
+  assert.equal(snapshot.canonicalRoadRecordCount, 1);
+  let audit = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === road.stableId
+  ));
+  assert.equal(audit.visibleLod, 'far');
+  assert.ok(audit.composedInstanceCount > 0);
+
+  presentation.update(-60, 8, { renderOriginChunkX: 0, renderOriginChunkZ: 0 });
+  audit = presentation.canonicalAuditSnapshot().find(value => (
+    value.identity.stableId === road.stableId
+  ));
+  assert.equal(audit.visibleLod, 'hidden');
+  presentation.dispose();
+});
+
+test('Road visibility diagnostic separates contrast from screen-width amplification', async () => {
+  const settlementId = 'settlement-v1:road-diagnostic';
+  const road = Object.freeze({
+    stableId: `${settlementId}:road:0`,
+    sourceStableId: `${settlementId}:road-source:0`,
+    sourceSegmentStableId: `${settlementId}:road-source:0:segment:0`,
+    featureType: 'settlement-road',
+    canonicalMajorRoad: false,
+    settlementId,
+    settlementIds: Object.freeze([settlementId]),
+    roadKind: 'LOCAL',
+    widthMeters: 1.75,
+    start: Object.freeze({ x: 248, y: 0, z: 8 }),
+    end: Object.freeze({ x: 256, y: 0, z: 8 }),
+    worldPosition: Object.freeze({ x: 252, y: 0, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 15, z: 0 }),
+  });
+  const chunk = canonicalChunk(15, 0, [road]);
+  const candidate = Object.freeze({
+    settlementId,
+    settlementType: 'RURAL',
+    townType: 'suburb',
+    center: Object.freeze({ x: 252, z: 8 }),
+    radiusMeters: 0,
+  });
+  const template = Object.freeze({
+    settlementId,
+    settlementType: candidate.settlementType,
+    townType: candidate.townType,
+    center: candidate.center,
+    buildings: Object.freeze([]),
+    roads: Object.freeze([Object.freeze({ start: road.start, end: road.end })]),
+  });
+  const run = async mode => {
+    const presentation = await createW8DistantPresentation({
+      THREE: DISTANT_TEST_THREE,
+      scene: new DistantTestGroup(),
+      worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+      visualAssets: createDistantTestVisualAssets(),
+      findSettlementsNear: async () => [candidate],
+      resolveTemplate: async () => template,
+      getCanonicalChunkData: async (chunkX, chunkZ) => (
+        chunkX === 15 && chunkZ === 0 ? chunk : canonicalChunk(chunkX, chunkZ, [])
+      ),
+      roadVisibilityDiagnosticMode: mode,
+    });
+    assert.equal(await presentation.sync({
+      activeDataKeys: [], renderedKeys: [], getChunkData: () => null,
+      renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+      centerChunkX: 0, centerChunkZ: 0, quality: 'high',
+      playerLogicalX: 8, playerLogicalZ: 8,
+    }), true);
+    const snapshot = presentation.roadVisibilityDiagnosticSnapshot();
+    presentation.dispose();
+    return snapshot;
+  };
+
+  const contrast = await run('contrast');
+  assert.equal(contrast.mode, 'contrast');
+  assert.equal(contrast.enabled, true);
+  assert.equal(contrast.drawableRoadRecordCount, 1);
+  assert.equal(contrast.drawableBeyondGeneralVisibilityCount, 1);
+  assert.equal(contrast.maximumDrawableDistanceMeters, 244);
+  assert.equal(contrast.material.colorHex, 0xff00ff);
+  assert.equal(contrast.material.fog, false);
+  assert.equal(contrast.material.polygonOffset, true);
+  assert.equal(contrast.geometry.minimumSourceWidthMeters, 1.75);
+  assert.equal(contrast.geometry.minimumRenderedWidthMeters, 1.75);
+
+  const wide = await run('wide');
+  assert.equal(wide.mode, 'wide');
+  assert.equal(wide.widthMultiplier, 4);
+  assert.equal(wide.geometry.minimumRenderedWidthMeters, 7);
+  assert.equal(wide.geometry.maximumRenderedWidthMeters, 7);
+});
+
 test('canonical River keeps the Far owner staged while active ownership hides and restores it atomically', async () => {
   const scene = new DistantTestGroup();
   const chunk = canonicalChunk(0, 0, []);
@@ -6504,8 +6677,8 @@ test('PresentationOwner page publishes canonical Building and Road through the S
     centerChunkX: 3, activeDataKeys: ['5,0'], renderedKeys: [], chunk,
   });
   assert.equal(await presentation.sync(syncInput), true);
-  const coarsePlayerX = 80 - 300 / Math.SQRT2;
-  const coarsePlayerZ = -300 / Math.SQRT2;
+  const coarsePlayerX = road.worldPosition.x - 300 / Math.SQRT2;
+  const coarsePlayerZ = road.worldPosition.z - 300 / Math.SQRT2;
   assert.equal(presentation.applyStaticNaturalPlan({
     coverageGeneration: 1,
     planRevision: 1,
@@ -6577,7 +6750,7 @@ test('PresentationOwner page publishes canonical Building and Road through the S
   visualRegistry.acknowledgeScene({ receipt, scene });
   assert.deepEqual(visualRegistry.get('5,0').drawnForestStableIds, [
     boundaryTree.candidateId,
-  ], 'the exact 300 m owner-intersection far corner remains positive on a completed receipt');
+  ], 'the owner-intersection far corner remains positive on a completed receipt');
   for (let frame = 0; frame < 8; frame += 1) {
     presentation.update(coarsePlayerX, coarsePlayerZ, renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
@@ -6774,7 +6947,7 @@ test('Static coarse pages include only owners covered by Tree policy', async t =
   assert.equal(new Set(audit.map(object => object.identity.stableId)).size, audit.length);
 });
 
-test('Near handoff suppresses only the matching natural Stable ID across every tier', async t => {
+test('Near handoff suppresses only the matching natural Stable ID in the all-distance coarse slot', async t => {
   const candidate = (candidateId, x) => Object.freeze({
     candidateId,
     subtype: 'broadleaf-tree',
@@ -6909,8 +7082,8 @@ test('Near handoff suppresses only the matching natural Stable ID across every t
     audit[trees[0].candidateId].naturalLod.atmosphericInstanceCount,
     audit[trees[0].candidateId].naturalLod.farInstanceCount,
   ], [0, 0, 0, 0], 'Near handoff hides the submitted coarse Tree slot');
-  assert.equal(audit[trees[0].candidateId].instanceCount, 2,
-    'Near handoff retains both LOD slots on one canonical resident Tree identity');
+  assert.equal(audit[trees[0].candidateId].instanceCount, 1,
+    'Near handoff retains one hidden low-poly slot on the canonical resident Tree identity');
   assert.equal(distantOpacitiesFor(trees[0].candidateId).every(opacity => opacity === 0), true);
   assert.equal(audit[trees[1].candidateId].visibleLod, 'mid');
   assert.deepEqual([
@@ -6918,7 +7091,7 @@ test('Near handoff suppresses only the matching natural Stable ID across every t
     audit[trees[1].candidateId].naturalLod.forestInstanceCount,
     audit[trees[1].candidateId].naturalLod.atmosphericInstanceCount,
     audit[trees[1].candidateId].naturalLod.farInstanceCount,
-  ], [0, 1, 0, 1]);
+  ], [0, 1, 0, 0]);
   assert.equal(distantOpacitiesFor(trees[1].candidateId).some(opacity => opacity > 0), true);
   assert.equal(presentation.snapshot().duplicateVisibleStableIdCount, 0);
 
@@ -6941,11 +7114,11 @@ test('Near handoff suppresses only the matching natural Stable ID across every t
     audit[trees[0].candidateId].naturalLod.forestInstanceCount,
     audit[trees[0].candidateId].naturalLod.atmosphericInstanceCount,
     audit[trees[0].candidateId].naturalLod.farInstanceCount,
-  ], [0, 1, 0, 1]);
+  ], [0, 1, 0, 0]);
   assert.equal(distantOpacitiesFor(trees[0].candidateId).some(opacity => opacity > 0), true);
   assert.equal(distantOpacitiesFor(trees[0].candidateId)
-    .filter(opacity => opacity > 0).length, 2,
-  'Near disappearance restores the two GPU LOD tiers of one logical presenter');
+    .filter(opacity => opacity > 0).length, 1,
+  'Near disappearance restores the single all-distance GPU presenter');
   assert.equal(audit[trees[0].candidateId].ownerKey, '5,0');
   presentation.dispose();
 });
@@ -7022,8 +7195,8 @@ test('persistent coarse replacement keeps one attached root and one Tree present
       opacity: mesh.userData?.canonicalOpacities?.[slot] ?? 0,
     }))
   )).filter(value => value.stableId === tree.candidateId && value.opacity > 0);
-  assert.equal(presenters.length, 2,
-    'one canonical Tree object owns one Mid slot and one Far slot');
+  assert.equal(presenters.length, 1,
+    'one canonical Tree object owns one all-distance low-poly slot');
   assert.equal(new Set(presenters.map(value => value.stableId)).size, 1);
 });
 
@@ -7278,7 +7451,7 @@ test('Vegetation density 2x, 5x, and 10x keeps Material, Mesh, Geometry, and Dra
   t.diagnostic(JSON.stringify(rows));
 });
 
-test('coarse Tree submits one immutable world-admitted set at every observer distance', async t => {
+test('coarse Tree submits one all-distance low-poly slot at every observer distance', async t => {
   const trees = Object.freeze(Array.from({ length: 5 }, (_, index) => Object.freeze({
     candidateId: `detail-v1:vegetation:submitted-density:${index}`,
     subtype: 'broadleaf-tree',
@@ -7344,14 +7517,13 @@ test('coarse Tree submits one immutable world-admitted set at every observer dis
   ));
   const mesh = root.children.find(child => (
     child.userData?.canonicalCoarseTreeSubmission === true
-      && child.userData?.treePathMode === 'far'
-  ));
-  const midMesh = root.children.find(child => (
-    child.userData?.canonicalCoarseTreeSubmission === true
       && child.userData?.treePathMode === 'forest'
   ));
   assert.ok(mesh);
-  assert.ok(midMesh);
+  assert.equal(root.children.some(child => (
+    child.userData?.canonicalCoarseTreeSubmission === true
+      && child.userData?.treePathMode === 'far'
+  )), false, 'the former foliage-only Far duplicate is not allocated');
   const residentAudit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
     [value.identity.stableId, value]
   )));
@@ -7368,11 +7540,12 @@ test('coarse Tree submits one immutable world-admitted set at every observer dis
   const farSnapshot = presentation.snapshot();
   const trianglesPerTree = mesh.geometry.userData.canonicalFarTreeTriangleCount;
   assert.equal(mesh.count, trees.length);
-  assert.equal(midMesh.count, trees.length);
   assert.equal(farSnapshot.canonicalFarTreeInstanceCapacity, trees.length,
     'the world-level admitted Stable-ID set is the renderer capacity');
   assert.equal(farSnapshot.canonicalFarTreeVisibleInstanceCount, trees.length);
   assert.equal(farSnapshot.canonicalFarTreeTriangleCount, trianglesPerTree * trees.length);
+  assert.equal(farSnapshot.staticTreeInstanceSlotCount, trees.length,
+    'one immutable low-poly slot replaces the former Forest plus Far pair');
   assert.deepEqual(
     mesh.userData.canonicalObjects.slice(0, mesh.count).map(record => record.stableId).sort(),
     trees.map(tree => tree.candidateId).sort(),
@@ -7441,7 +7614,7 @@ test('coarse Tree submits one immutable world-admitted set at every observer dis
   }
 });
 
-test('direct 64m canonical Tree batch exclusively publishes one identity through Mid Far and Near', async t => {
+test('direct 64m canonical Tree batch publishes one low-poly identity through Distant and Near', async t => {
   const generator = await createW8ParityChunkGenerator({
     worldSeed: 'KaniNingen Infinite Natural World',
   });
@@ -7542,11 +7715,11 @@ test('direct 64m canonical Tree batch exclusively publishes one identity through
   assert.deepEqual(audit[target.stableId].identity.worldPosition, {
     x: target.position[0], y: target.position[1], z: target.position[2],
   });
-  assert.equal(audit[target.stableId].instanceCount, 2);
+  assert.equal(audit[target.stableId].instanceCount, 1);
   assert.deepEqual([
     audit[target.stableId].naturalLod.forestInstanceCount,
     audit[target.stableId].naturalLod.farInstanceCount,
-  ], [1, 1]);
+  ], [1, 0]);
   const persistentRoot = scene.children.find(child => (
     child.name === 'w8-persistent-static-natural-pages'
   ));
@@ -7555,8 +7728,8 @@ test('direct 64m canonical Tree batch exclusively publishes one identity through
   ));
   assert.ok(tierMeshes.some(mesh => mesh.userData.treePathMode === 'forest'
     && mesh.geometry.userData.canonicalFarTreePartCount === 2));
-  assert.ok(tierMeshes.some(mesh => mesh.userData.treePathMode === 'far'
-    && mesh.geometry.userData.canonicalFarTreePartCount === 1));
+  assert.equal(tierMeshes.some(mesh => mesh.userData.treePathMode === 'far'), false,
+    'Distant Tree retains no second foliage-only representation');
 
   const rebuildsBeforeRace = snapshot.staticTreeOwnerRebuildCount;
   assert.equal(apply(2, [{ ...presentationPage, readyAtMs: performance.now() }]), true);
@@ -7592,7 +7765,7 @@ test('direct 64m canonical Tree batch exclusively publishes one identity through
   assert.deepEqual([
     audit[target.stableId].naturalLod.forestInstanceCount,
     audit[target.stableId].naturalLod.farInstanceCount,
-  ], [1, 1], 'Near departure restores the same canonical identity in both LOD tiers');
+  ], [1, 0], 'Near departure restores the same single low-poly canonical identity');
 
   destroyed.add(target.stableId);
   presentation.advanceStaticNaturalFrame({

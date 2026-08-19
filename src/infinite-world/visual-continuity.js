@@ -72,9 +72,7 @@ function attributeArray(attribute) {
 function attributeUpdateRanges(attribute, length) {
   const ranges = Array.isArray(attribute?.updateRanges) && attribute.updateRanges.length > 0
     ? attribute.updateRanges
-    : Number.isFinite(attribute?.updateRange?.count) && attribute.updateRange.count >= 0
-      ? [attribute.updateRange]
-      : null;
+    : null;
   if (!ranges) return Object.freeze([{ offset: 0, count: length }]);
   return Object.freeze(ranges.map(range => {
     const offset = Math.max(0, Math.min(length, Math.trunc(range.start ?? range.offset ?? 0)));

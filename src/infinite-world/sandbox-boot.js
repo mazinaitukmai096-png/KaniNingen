@@ -67,7 +67,10 @@ import {
 } from './world-state-store.js';
 import { createInfiniteExperienceShell } from './experience-shell.js';
 import { createW8AudioDirector } from './w8-audio.js';
-import { createW8DistantPresentation } from './render/w8-distant-presentation.js';
+import {
+  createW8DistantPresentation,
+  resolveW8RoadVisibilityDiagnostic,
+} from './render/w8-distant-presentation.js';
 import {
   createW8RuntimeDiagnostics,
   parseW8DiagnosticProfile,
@@ -1333,6 +1336,14 @@ export async function bootInfiniteWorldSandbox({
   disablePersistentTreePublication = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('disablePersistentTreePublication') === '1',
+  roadVisibilityDiagnosticMode = resolveW8RoadVisibilityDiagnostic(
+    new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('roadVisibilityDiagnostic'),
+  ).mode,
+  roadLifecycleDiagnosticEnabled = new globalObject.URLSearchParams(
+    globalObject.location?.search ?? '',
+  ).get('roadLifecycleDiagnostic') === '1',
   settlementStreamingMode = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('settlementStreaming') === 'legacy'
@@ -1375,6 +1386,8 @@ export async function bootInfiniteWorldSandbox({
       `canonicalTreeDirect:${directCanonicalTreeSupplyActive}`,
       `diagnostics:${diagnosticsEnabled}`,
       `terrainLagSpikeDiagnostics:${terrainLagSpikeDiagnosticsEnabled}`,
+      `roadVisibilityDiagnostic:${roadVisibilityDiagnosticMode}`,
+      `roadLifecycleDiagnostic:${roadLifecycleDiagnosticEnabled}`,
     ].join(',');
   }
 
@@ -1898,6 +1911,8 @@ export async function bootInfiniteWorldSandbox({
         findSettlementsNear: (...args) => workerTransport.findSettlementsNear(...args),
         resolveSettlementPresentationTemplate: (...args) =>
           workerTransport.resolveSettlementPresentationTemplate(...args),
+        resolveCanonicalMajorRoadOwnerCoverage: (...args) =>
+          workerTransport.resolveCanonicalMajorRoadOwnerCoverage(...args),
         requestDiagnostics: () => workerTransport.requestDiagnostics(),
         snapshot: () => workerTransport.snapshot(),
         shutdown: () => workerTransport.shutdown(),
@@ -2084,6 +2099,65 @@ export async function bootInfiniteWorldSandbox({
     const camera = rendererContext.nextCamera;
     renderer = rendererContext.nextRenderer;
     const playerMarker = rendererContext.playerMarker;
+    let rendererProgramWarmupTimer = null;
+    const rendererProgramWarmup = {
+      schemaVersion: 'renderer-program-warmup-1',
+      status: measurementMode ? 'disabled' : 'pending',
+      scheduledAtMs: null,
+      startedAtMs: null,
+      completedAtMs: null,
+      durationMs: 0,
+      method: null,
+      error: null,
+    };
+    const finishRendererProgramWarmup = (status, error = null) => {
+      rendererProgramWarmup.status = status;
+      rendererProgramWarmup.completedAtMs = clock();
+      rendererProgramWarmup.durationMs = rendererProgramWarmup.startedAtMs === null
+        ? 0 : Math.max(0, rendererProgramWarmup.completedAtMs
+          - rendererProgramWarmup.startedAtMs);
+      rendererProgramWarmup.error = error ? Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+      }) : null;
+    };
+    const scheduleRendererProgramWarmup = () => {
+      if (rendererProgramWarmup.status !== 'pending'
+        || staticTreeActivationTimeline.firstPersistentTreePublishAtMs === null
+        || experienceShell?.getMode?.() !== 'menu') return false;
+      const compileAsync = typeof renderer.compileAsync === 'function';
+      const compile = compileAsync ? renderer.compileAsync : renderer.compile;
+      if (typeof compile !== 'function') {
+        rendererProgramWarmup.status = 'unsupported';
+        return false;
+      }
+      rendererProgramWarmup.status = 'scheduled';
+      rendererProgramWarmup.scheduledAtMs = clock();
+      rendererProgramWarmup.method = compileAsync ? 'compileAsync' : 'compile';
+      rendererProgramWarmupTimer = setTimeoutFn(() => {
+        rendererProgramWarmupTimer = null;
+        if (!running || experienceShell?.getMode?.() !== 'menu') {
+          rendererProgramWarmup.status = 'pending';
+          return;
+        }
+        rendererProgramWarmup.status = 'running';
+        rendererProgramWarmup.startedAtMs = clock();
+        try {
+          const result = compile.call(renderer, scene, camera);
+          if (result && typeof result.then === 'function') {
+            result.then(
+              () => finishRendererProgramWarmup('complete'),
+              error => finishRendererProgramWarmup('failed', error),
+            );
+          } else {
+            finishRendererProgramWarmup('complete');
+          }
+        } catch (error) {
+          finishRendererProgramWarmup('failed', error);
+        }
+      }, 0);
+      return true;
+    };
 
     const runtimeContext = await runStage('Chunk Runtime', () => {
       renderAdapter = renderAdapterFactory({
@@ -2335,6 +2409,8 @@ export async function bootInfiniteWorldSandbox({
       ),
       findSettlementsNear: generator.distributor.findSettlementsNear,
       resolveTemplate: request => generator.resolveSettlementPresentationTemplate(request),
+      resolveCanonicalMajorRoadOwnerCoverage: request =>
+        chunkGeneratorTransport.resolveCanonicalMajorRoadOwnerCoverage(request),
       getCanonicalChunkData: async (chunkX, chunkZ, request = {}) => {
         const ownerKey = `${chunkX},${chunkZ}`;
         const fallback = async () => {
@@ -2424,6 +2500,8 @@ export async function bootInfiniteWorldSandbox({
       recordDiagnosticEvent: (type, details) => diagnostics.recordEvent(type, details),
       getDiagnosticFrameSequence: () => diagnostics.currentFrameSequence(),
       enableMacroCoarseWorld: directCanonicalTreeSupplyActive,
+      roadVisibilityDiagnosticMode,
+      roadLifecycleDiagnosticEnabled,
     });
     recordStaticTreeActivationTime('distantPresentationCreatedAtMs');
     const recordDistantTreeVisibility = () => {
@@ -4167,10 +4245,24 @@ export async function bootInfiniteWorldSandbox({
           + scaleProfile.cameraTargetHeightMeters) * UNITS_PER_METER,
         z: presentedRenderLocal.z,
       };
+      // Building collision must use the logical Player anchor rather than the
+      // animated locomotion offset.  Otherwise the running bounce can move the
+      // focus across a wall/roof boundary for one frame and toggle collision,
+      // producing the remaining indoor camera snap.
+      const stableCameraCollisionTarget = {
+        x: renderLocal.x,
+        y: (playerRootY + scaleProfile.cameraTargetHeightMeters) * UNITS_PER_METER,
+        z: renderLocal.z,
+      };
+      const cameraCollisionClearanceMeters = Math.max(
+        0.05,
+        Math.min(0.35, scaleProfile.collision.radiusMeters * 0.5),
+      );
       const buildingCollision = renderAdapter.resolveCameraCollision?.({
         camera,
-        target: cameraTarget,
-        clearanceMeters: 0.6,
+        target: stableCameraCollisionTarget,
+        clearanceMeters: cameraCollisionClearanceMeters,
+        targetInteriorMarginMeters: scaleProfile.collision.radiusMeters,
       }) ?? lastCameraCollision;
       const bossCollision = gameplayRenderAdapter.resolveBossCameraCollision?.({
         camera,
@@ -4992,6 +5084,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           && actualDrawableCount > 0) {
           recordStaticTreeActivationTime('firstPersistentTreeDrawAtMs');
         }
+        if (titleActive) scheduleRendererProgramWarmup();
         recordOriginTransformDiagnosticFrame();
       });
     }
@@ -5190,6 +5283,10 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         clearTimeoutFn(transitionRetryTimer);
         transitionRetryTimer = null;
       }
+      if (rendererProgramWarmupTimer !== null) {
+        clearTimeoutFn(rendererProgramWarmupTimer);
+        rendererProgramWarmupTimer = null;
+      }
       cancelScheduledSave();
       removeWindowListener('resize', resize);
       removeWindowListener('pagehide', handlePageHide);
@@ -5227,6 +5324,9 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         visualExpectedOwnerCount:
           latestNaturalCoverageState?.expectedOwnerKeys?.length ?? 0,
       }),
+      roadLifecycleDiagnosticSnapshot: options => (
+        distantPresentation.roadLifecycleDiagnosticSnapshot?.(options) ?? null
+      ),
       snapshot: () => {
         const runtimeSnapshot = runtime.snapshot();
         const renderOrigin = runtimeSnapshot.renderOrigin;
@@ -5419,6 +5519,14 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             canvasWidth: renderer.domElement?.width ?? null,
             canvasHeight: renderer.domElement?.height ?? null,
           }),
+          rendererProgramWarmup: Object.freeze({ ...rendererProgramWarmup }),
+          roadVisibilityDiagnostic:
+            distantPresentation.roadVisibilityDiagnosticSnapshot?.() ?? null,
+          roadLifecycleDiagnostic:
+            distantPresentation.roadLifecycleDiagnosticSnapshot?.({
+              includeRecords: false,
+              includeHistory: false,
+            }) ?? null,
         };
       },
       setMeasurementViewport,

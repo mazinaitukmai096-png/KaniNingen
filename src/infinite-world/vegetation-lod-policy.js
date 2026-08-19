@@ -41,6 +41,55 @@ export const W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS = Object.freeze({
   outerFadeWidth: 8,
 });
 
+/**
+ * Resolves the single low-poly Tree silhouette shared by Near and Distant
+ * presentation. Broadleaf and wetland crowns keep the authored primary crown
+ * transform/material but replace the smooth SphereGeometry with the existing
+ * detail-0 DodecahedronGeometry. Conifers retain their authored ConeGeometry.
+ *
+ * The helper is intentionally descriptor-only: canonical identity, dimensions,
+ * and world transforms remain unchanged, and isolated test assets can fall back
+ * to their authored geometry when a low-poly resource is unavailable.
+ */
+export function resolveW8LowPolyTreePresentationParts({
+  subtype = null,
+  parts = [],
+  supportsDodeca = true,
+  supportsCone = true,
+  includeTrunk = true,
+} = {}) {
+  if (!Array.isArray(parts)) {
+    throw new TypeError('low-poly Tree presentation parts must be an array');
+  }
+  if (parts.length === 0) return Object.freeze([]);
+
+  const trunk = parts.find(part => part?.material === 'treeTrunk')
+    ?? parts.find(part => /trunk/i.test(part?.materialRole ?? ''))
+    ?? null;
+  const conifer = subtype === 'conifer-tree'
+    || (subtype === null
+      && parts.some(part => part?.geometry === 'cone')
+      && !parts.some(part => part?.geometry === 'sphere'));
+  const authoredFoliageGeometry = conifer ? 'cone' : 'sphere';
+  const foliage = parts.find(part => part?.geometry === authoredFoliageGeometry)
+    ?? parts.find(part => part !== trunk && part?.material !== 'treeTrunk')
+    ?? parts.find(part => part !== trunk)
+    ?? parts[0]
+    ?? null;
+  if (!foliage) return Object.freeze([]);
+
+  const lowPolyGeometry = conifer
+    ? (supportsCone ? 'cone' : foliage.geometry)
+    : (supportsDodeca ? 'dodeca' : foliage.geometry);
+  const lowPolyFoliage = lowPolyGeometry === foliage.geometry
+    ? foliage
+    : Object.freeze({ ...foliage, geometry: lowPolyGeometry });
+  const resolved = includeTrunk && trunk && trunk !== foliage
+    ? [trunk, lowPolyFoliage]
+    : [lowPolyFoliage];
+  return Object.freeze(resolved);
+}
+
 const CURRENT_NATURAL_VISIBILITY_METERS = 140;
 const NEAR_OWNER_HANDOFF_SAFE_METERS = 48;
 const CANONICAL_FAR_TREE_DENSITY_FADE = 0.012;

@@ -38,8 +38,67 @@ import {
   isDrawableInCompletedFrame,
   isCompletedRenderFrameReceipt,
 } from '../visual-continuity.js';
+import { resolveW8LowPolyTreePresentationParts } from '../vegetation-lod-policy.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const CAMERA_COLLISION_EPSILON = 1e-7;
+
+function cameraBoundLocalPoint(point, centerX, centerZ, rotationY) {
+  const dx = point.x - centerX;
+  const dz = point.z - centerZ;
+  const cosine = Math.cos(rotationY);
+  const sine = Math.sin(rotationY);
+  return Object.freeze({
+    x: cosine * dx - sine * dz,
+    y: point.y,
+    z: sine * dx + cosine * dz,
+  });
+}
+
+function cameraBoundWorldPoint(point, centerX, centerZ, rotationY) {
+  const cosine = Math.cos(rotationY);
+  const sine = Math.sin(rotationY);
+  return Object.freeze({
+    x: centerX + cosine * point.x + sine * point.z,
+    y: point.y,
+    z: centerZ - sine * point.x + cosine * point.z,
+  });
+}
+
+function pointInsideCameraBox(point, {
+  halfWidth, halfDepth, minimumY, maximumY,
+}, margin = 0) {
+  return Math.abs(point.x) <= halfWidth + margin
+    && Math.abs(point.z) <= halfDepth + margin
+    && point.y >= minimumY - margin
+    && point.y <= maximumY + margin;
+}
+
+function segmentCameraBoxEntry(start, end, {
+  halfWidth, halfDepth, minimumY, maximumY,
+}, margin = 0) {
+  let entry = 0;
+  let exit = 1;
+  const axes = [
+    [start.x, end.x - start.x, -halfWidth - margin, halfWidth + margin],
+    [start.y, end.y - start.y, minimumY - margin, maximumY + margin],
+    [start.z, end.z - start.z, -halfDepth - margin, halfDepth + margin],
+  ];
+  for (const [origin, delta, minimum, maximum] of axes) {
+    if (Math.abs(delta) <= CAMERA_COLLISION_EPSILON) {
+      if (origin < minimum || origin > maximum) return null;
+      continue;
+    }
+    let near = (minimum - origin) / delta;
+    let far = (maximum - origin) / delta;
+    if (near > far) [near, far] = [far, near];
+    entry = Math.max(entry, near);
+    exit = Math.min(exit, far);
+    if (entry > exit + CAMERA_COLLISION_EPSILON) return null;
+  }
+  return entry >= -CAMERA_COLLISION_EPSILON && entry <= 1 + CAMERA_COLLISION_EPSILON
+    ? Math.max(0, Math.min(1, entry)) : null;
+}
 
 function requireConstructor(THREE, name) {
   if (typeof THREE?.[name] !== 'function') throw new TypeError(`THREE.${name} is required`);
@@ -557,7 +616,9 @@ export class ChunkRenderAdapter {
     return this.setFeatureDestroyed(stableId, this.isFeatureDestroyed(stableId));
   }
 
-  resolveCameraCollision({ camera, target, clearanceMeters = 0.6 } = {}) {
+  resolveCameraCollision({
+    camera, target, clearanceMeters = 0.6, targetInteriorMarginMeters = clearanceMeters,
+  } = {}) {
     if (!camera?.position || !target || !this.cameraCollisionBounds.length) {
       return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
     }
@@ -570,6 +631,8 @@ export class ChunkRenderAdapter {
       return Object.freeze({ collided: false, stableId: null, desiredDistance: 0, resolvedDistance: 0 });
     }
     const clearanceRender = Math.max(0, clearanceMeters) * this.unitsPerMeter;
+    const targetInteriorMarginRender = Math.max(0, targetInteriorMarginMeters)
+      * this.unitsPerMeter;
     let collidedStableId = null;
     let collisionCount = 0;
     for (let pass = 0; pass < 4; pass += 1) {
@@ -580,31 +643,73 @@ export class ChunkRenderAdapter {
           - this.renderOriginChunkX * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter;
         const centerZ = (bound.worldZ
           - this.renderOriginChunkZ * LOGICAL_CHUNK_SIZE_METERS) * this.unitsPerMeter;
-        const dx = camera.position.x - centerX;
-        const dz = camera.position.z - centerZ;
-        const cosine = Math.cos(bound.rotationY);
-        const sine = Math.sin(bound.rotationY);
-        const localX = cosine * dx - sine * dz;
-        const localZ = sine * dx + cosine * dz;
         const topY = bound.groundY + bound.height;
-        if (Math.abs(localX) >= bound.halfWidth || Math.abs(localZ) >= bound.halfDepth
-          || camera.position.y <= bound.groundY || camera.position.y >= topY) continue;
+        const box = {
+          halfWidth: bound.halfWidth,
+          halfDepth: bound.halfDepth,
+          minimumY: bound.groundY,
+          maximumY: topY,
+        };
+        const localCamera = cameraBoundLocalPoint(
+          camera.position, centerX, centerZ, bound.rotationY,
+        );
+        if (!pointInsideCameraBox(localCamera, box)) continue;
 
-        const sideX = bound.halfWidth - Math.abs(localX);
-        const sideZ = bound.halfDepth - Math.abs(localZ);
-        const top = topY - camera.position.y;
-        if (top <= sideX && top <= sideZ) {
-          camera.position.y = topY + clearanceRender;
+        const localTarget = cameraBoundLocalPoint(
+          target, centerX, centerZ, bound.rotationY,
+        );
+        // When the Player focus is inside (or immediately beside) the same
+        // building, pushing the camera to a different wall on every yaw
+        // change makes the actual view direction diverge from the stored
+        // camera yaw.  Let the camera remain on its intended orbit instead;
+        // clipping is less disruptive than a moving pivot in this case.
+        if (pointInsideCameraBox(localTarget, box, targetInteriorMarginRender)) continue;
+
+        const entry = segmentCameraBoxEntry(
+          localTarget,
+          localCamera,
+          box,
+          clearanceRender,
+        );
+        if (entry !== null) {
+          const resolvedT = Math.max(0, entry - CAMERA_COLLISION_EPSILON);
+          const localResolved = {
+            x: localTarget.x + (localCamera.x - localTarget.x) * resolvedT,
+            y: localTarget.y + (localCamera.y - localTarget.y) * resolvedT,
+            z: localTarget.z + (localCamera.z - localTarget.z) * resolvedT,
+          };
+          const worldResolved = cameraBoundWorldPoint(
+            localResolved, centerX, centerZ, bound.rotationY,
+          );
+          camera.position.x = worldResolved.x;
+          camera.position.y = worldResolved.y;
+          camera.position.z = worldResolved.z;
         } else {
-          let pushedLocalX = localX;
-          let pushedLocalZ = localZ;
-          if (sideX <= sideZ) {
-            pushedLocalX = (localX < 0 ? -1 : 1) * (bound.halfWidth + clearanceRender);
+          // Degenerate fallback: preserve the previous point-depenetration
+          // behaviour if numerical precision prevents a segment entry.
+          const sideX = bound.halfWidth - Math.abs(localCamera.x);
+          const sideZ = bound.halfDepth - Math.abs(localCamera.z);
+          const top = topY - localCamera.y;
+          if (top <= sideX && top <= sideZ) {
+            camera.position.y = topY + clearanceRender;
           } else {
-            pushedLocalZ = (localZ < 0 ? -1 : 1) * (bound.halfDepth + clearanceRender);
+            let pushedLocalX = localCamera.x;
+            let pushedLocalZ = localCamera.z;
+            if (sideX <= sideZ) {
+              pushedLocalX = (localCamera.x < 0 ? -1 : 1)
+                * (bound.halfWidth + clearanceRender);
+            } else {
+              pushedLocalZ = (localCamera.z < 0 ? -1 : 1)
+                * (bound.halfDepth + clearanceRender);
+            }
+            const pushed = cameraBoundWorldPoint({
+              x: pushedLocalX,
+              y: camera.position.y,
+              z: pushedLocalZ,
+            }, centerX, centerZ, bound.rotationY);
+            camera.position.x = pushed.x;
+            camera.position.z = pushed.z;
           }
-          camera.position.x = centerX + cosine * pushedLocalX + sine * pushedLocalZ;
-          camera.position.z = centerZ - sine * pushedLocalX + cosine * pushedLocalZ;
         }
         collidedStableId ??= bound.stableId;
         collisionCount += 1;
@@ -1189,10 +1294,18 @@ export class ChunkRenderAdapter {
       const dimensions = canonical?.visualBounds ?? {
         width: visual.widthMeters, height: visual.heightMeters, depth: visual.depthMeters,
       };
-      const descriptors = canonical?.presentation.parts
+      const authoredDescriptors = canonical?.presentation.parts
         ?? this.visualAssets.featureParts[visual.visualKind]
         ?? this.visualAssets.featureParts.broadleafTree;
       const treePathId = candidate.subtype === 'shrub' ? null : 'near-tree';
+      const descriptors = treePathId === 'near-tree'
+        ? resolveW8LowPolyTreePresentationParts({
+          subtype: candidate.subtype ?? canonical?.subtype ?? null,
+          parts: authoredDescriptors,
+          supportsDodeca: Boolean(this.visualAssets.geometries?.dodeca),
+          supportsCone: Boolean(this.visualAssets.geometries?.cone),
+        })
+        : authoredDescriptors;
       for (const descriptor of descriptors) {
         vegetationParts.push({
           stableId: canonical?.stableId ?? candidate.candidateId ?? candidate.stableId,

@@ -16,12 +16,64 @@ import {
   resolveW8CanonicalTreeDensityOpacity,
   resolveW8CanonicalTreeDensityThreshold,
   resolveW8CanonicalTreeDensityTier,
+  resolveW8LowPolyTreePresentationParts,
   resolveW8VegetationLodBlend,
   resolveW8VegetationLodPolicy,
   resolveW8VegetationVisibilityContract,
 } from '../src/infinite-world/vegetation-lod-policy.js';
 
 const q6 = value => Math.round(value * 1e6) / 1e6;
+
+test('Near and Distant Tree paths resolve the same single low-poly crown', () => {
+  const trunk = Object.freeze({
+    geometry: 'box', material: 'treeTrunk', materialRole: 'trunk',
+    position: Object.freeze([0, 0.2, 0]),
+    scale: Object.freeze([0.2, 0.4, 0.2]),
+    rotation: Object.freeze([0, 0, 0]),
+  });
+  const primary = Object.freeze({
+    geometry: 'sphere', material: 'treeLeavesMeadow',
+    position: Object.freeze([0, 0.55, 0]),
+    scale: Object.freeze([0.69, 0.45, 0.69]),
+    rotation: Object.freeze([0, 0, 0]),
+  });
+  const secondary = Object.freeze({
+    geometry: 'sphere', material: 'treeLeavesMeadow',
+    position: Object.freeze([0.27, 0.66, -0.27]),
+    scale: Object.freeze([0.44, 0.24, 0.44]),
+    rotation: Object.freeze([0, 0, 0]),
+  });
+  const broadleaf = resolveW8LowPolyTreePresentationParts({
+    subtype: 'broadleaf-tree',
+    parts: [trunk, primary, secondary],
+    supportsDodeca: true,
+  });
+  assert.equal(Object.isFrozen(broadleaf), true);
+  assert.equal(broadleaf.length, 2, 'the secondary smooth crown is not duplicated');
+  assert.equal(broadleaf[0], trunk, 'the authored trunk is retained');
+  assert.deepEqual(broadleaf[1], { ...primary, geometry: 'dodeca' });
+  assert.equal(primary.geometry, 'sphere', 'canonical authored descriptors remain immutable');
+
+  const cone = Object.freeze({ ...primary, geometry: 'cone', material: 'treeLeaves' });
+  const conifer = resolveW8LowPolyTreePresentationParts({
+    subtype: 'conifer-tree', parts: [trunk, cone], supportsCone: true,
+  });
+  assert.deepEqual(conifer, [trunk, cone]);
+  const inferredConifer = resolveW8LowPolyTreePresentationParts({
+    parts: [trunk, cone], supportsCone: true,
+  });
+  assert.deepEqual(inferredConifer, [trunk, cone],
+    'legacy generic Tree descriptors keep their authored cone silhouette');
+
+  const isolated = resolveW8LowPolyTreePresentationParts({
+    subtype: 'broadleaf-tree',
+    parts: [Object.freeze({ ...primary, geometry: 'box' })],
+    supportsDodeca: false,
+  });
+  assert.equal(isolated.length, 1);
+  assert.equal(isolated[0].geometry, 'box', 'isolated assets fall back to authored geometry');
+  assert.throws(() => resolveW8LowPolyTreePresentationParts({ parts: null }), /must be an array/);
+});
 
 test('canonical Tree presentation keeps one Stable-ID population at every distance', () => {
   const policy = resolveW8VegetationLodPolicy(W8_VEGETATION_LOD_KINDS.TREE, 'current');

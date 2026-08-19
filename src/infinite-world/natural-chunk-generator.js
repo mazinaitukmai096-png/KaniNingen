@@ -1,4 +1,5 @@
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
+import { canonicalizeJsonWithContext } from './canonical-json-serialization-context.js';
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
 import { parseGeneratorVersion } from './legacy-core/g0/generator-version.js';
 import { hashWorldSeed, normalizeWorldSeed } from './legacy-core/g0/seed.js';
@@ -157,6 +158,10 @@ export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEval
     const originX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
     const originZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
     const coreCache = new Map();
+    // Sparse vegetation consumers need biome memberships, but not the material
+    // weights required by Rock/Full generation. Resolve those two layers lazily
+    // so Tree-only cells do not materialize 25 unused material samples per owner.
+    const biomeCache = new Map();
     const fullCache = new Map();
     const macroCache = new Map();
     const macroAt = (worldX, worldZ) => {
@@ -207,17 +212,27 @@ export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEval
       }
       return sample;
     };
-    const fullAt = (x, z) => {
+    const biomeAt = (x, z) => {
       const { key } = latticeCoordinates(x, z);
-      let sample = fullCache.get(key);
-      if (!sample) {
+      let biome = biomeCache.get(key);
+      if (!biome) {
         const core = coreAt(x, z);
-        const biome = biomeEvaluator.evaluateWithMoisture(
+        biome = biomeEvaluator.evaluateWithMoisture(
           core.position,
           core.macro,
           core.slope,
           core.climateMoisture,
         );
+        biomeCache.set(key, biome);
+      }
+      return biome;
+    };
+    const fullAt = (x, z) => {
+      const { key } = latticeCoordinates(x, z);
+      let sample = fullCache.get(key);
+      if (!sample) {
+        const core = coreAt(x, z);
+        const biome = biomeAt(x, z);
         sample = Object.freeze({
           ...core,
           biome,
@@ -258,11 +273,7 @@ export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEval
       return (northwest * (1 - tx) + northeast * tx) * (1 - tz)
         + (southwest * (1 - tx) + southeast * tx) * tz;
     };
-    const biomeSamples = Array.from({ length: 25 }, (_, index) => {
-      const x = (index % 5) * 8;
-      const z = Math.floor(index / 5) * 8;
-      return fullAt(x, z).biome;
-    });
+    const biomeSampleAt = (x, z) => biomeAt(x * 8, z * 8);
     const sampleBiomeWeights = point => {
       const localX = point.x - originX;
       const localZ = point.z - originZ;
@@ -271,7 +282,7 @@ export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEval
       const x0 = Math.floor(fx); const z0 = Math.floor(fz);
       const x1 = Math.min(x0 + 1, 4); const z1 = Math.min(z0 + 1, 4);
       const tx = fx - x0; const tz = fz - z0;
-      const weight = (x, z, biomeId) => biomeSamples[z * 5 + x].memberships
+      const weight = (x, z, biomeId) => biomeSampleAt(x, z).memberships
         .find(item => item.biomeId === biomeId)?.weight ?? 0;
       return NATURAL_BIOME_ORDER.map(biomeId => ({
         biomeId,
@@ -323,7 +334,7 @@ export function createCanonicalNaturalSamplingKernel({ macroEvaluator, biomeEval
       snapshot() {
         return Object.freeze({
           latticeSampleCount: coreCache.size,
-          fullBiomeSampleCount: fullCache.size,
+          fullBiomeSampleCount: biomeCache.size,
           macroSampleCount: macroCache.size,
         });
       },
@@ -440,14 +451,20 @@ function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator
   };
 }
 
-export async function hashW2ChunkContent(content, { stageRecorder = null } = {}) {
+export async function hashW2ChunkContent(content, {
+  stageRecorder = null,
+  canonicalJsonContext = null,
+} = {}) {
+  const serializeContent = () => canonicalJsonContext
+    ? canonicalizeJsonWithContext(content, canonicalJsonContext)
+    : canonicalizeJson(content);
   const serialized = stageRecorder
     ? measureChunkGenerationStageSync(
       stageRecorder,
       CHUNK_GENERATION_STAGE.SERIALIZE,
-      () => canonicalizeJson(content),
+      serializeContent,
     )
-    : canonicalizeJson(content);
+    : serializeContent();
   const digest = stageRecorder
     ? await measureChunkGenerationStage(
       stageRecorder,
@@ -510,7 +527,10 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
     worldSeedHash,
     seed64,
     generatorVersion: W2_GENERATOR_VERSION,
-    async generateChunk(chunkXInput, chunkZInput, { stageRecorder = null } = {}) {
+    async generateChunk(chunkXInput, chunkZInput, {
+      stageRecorder = null,
+      canonicalJsonContext = null,
+    } = {}) {
       const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'chunkX');
       const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'chunkZ');
       const chunkId = createChunkId({
@@ -556,8 +576,8 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
         },
       };
       const contentHash = stageRecorder
-        ? await hashW2ChunkContent(content, { stageRecorder })
-        : await hashW2ChunkContent(content);
+        ? await hashW2ChunkContent(content, { stageRecorder, canonicalJsonContext })
+        : await hashW2ChunkContent(content, { canonicalJsonContext });
       const chunkData = { ...content, contentHash };
       const validation = validateW2NaturalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W2 ChunkData: ${validation.errors.join('; ')}`);

@@ -323,11 +323,17 @@ class WebGLRenderer {
   static instances = [];
   constructor() {
     this.renderCount = 0;
+    this.compileCount = 0;
     this.domElement = { removed: false, remove() { this.removed = true; } };
     WebGLRenderer.instances.push(this);
   }
   setPixelRatio() {}
   setSize() {}
+  compile(scene, camera) {
+    this.compileCount += 1;
+    this.compiledScene = scene;
+    this.compiledCamera = camera;
+  }
   render() { this.renderCount += 1; }
   dispose() { this.disposed = true; }
 }
@@ -1325,6 +1331,10 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
         && path.rootCount === 1
         && path.planIds.length > 0
     )), true);
+    const programWarmup = outcome.sandbox.snapshot().rendererProgramWarmup;
+    assert.equal(programWarmup.status, 'pending',
+      'renderer compilation must not interrupt an already-playing diagnostic run');
+    assert.equal(WebGLRenderer.instances[0].compileCount, 0);
     t.diagnostic(`Static Tree activation timeline (first draw) ${JSON.stringify(
       firstDraw.treePathAudit.activationTimeline,
     )}`);
@@ -1420,6 +1430,71 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
   }
 });
 
+
+test('title precompiles renderer programs after the first persistent Tree publication', async () => {
+  WebGLRenderer.instances.length = 0;
+  Scene.instances.length = 0;
+  PerspectiveCamera.instances.length = 0;
+  const environment = installBrowserEquivalentEnvironment();
+  installExperienceControls();
+  globalThis.location.search = '';
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+    });
+    let snapshot = sandbox.snapshot();
+    for (let attempt = 0; attempt < 20
+      && snapshot.rendererProgramWarmup.status !== 'complete'; attempt += 1) {
+      environment.rafCallbacks.at(-1)(performance.now() + 100 + attempt);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      snapshot = sandbox.snapshot();
+    }
+    assert.notEqual(snapshot.treePathAudit.activationTimeline.firstPersistentTreePublishAtMs, null);
+    assert.equal(snapshot.rendererProgramWarmup.status, 'complete');
+    assert.equal(snapshot.rendererProgramWarmup.method, 'compile');
+    assert.equal(snapshot.rendererProgramWarmup.error, null);
+    assert.equal(WebGLRenderer.instances[0].compileCount, 1);
+    assert.equal(WebGLRenderer.instances[0].compiledScene, Scene.instances[0]);
+    assert.equal(WebGLRenderer.instances[0].compiledCamera, PerspectiveCamera.instances[0]);
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
+
+test('Road visibility diagnostic URL reaches the active Distant presenter snapshot', async () => {
+  WebGLRenderer.instances.length = 0;
+  Scene.instances.length = 0;
+  PerspectiveCamera.instances.length = 0;
+  const environment = installBrowserEquivalentEnvironment();
+  installExperienceControls();
+  globalThis.location.search = '?roadVisibilityDiagnostic=wide';
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+    });
+    const diagnostic = sandbox.snapshot().roadVisibilityDiagnostic;
+    assert.equal(diagnostic.mode, 'wide');
+    assert.equal(diagnostic.enabled, true);
+    assert.equal(diagnostic.colorHex, 0xff00ff);
+    assert.equal(diagnostic.disableFog, true);
+    assert.equal(diagnostic.widthMultiplier, 4);
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
+
 test('GP-SAVE-03 pagehide directly captures dirty state and coordinates queue conflicts',
   verifyGpSave03Pagehide);
 
@@ -1428,15 +1503,16 @@ test('persistent Tree publication A/B flag preserves Near and queues Distant pag
     const environment = installBrowserEquivalentEnvironment();
     let sandbox = null;
     try {
-      // Pin a deterministic non-empty Near fixture; this test isolates the
-      // Distant publication flag from production Settlement spawn clearance.
+      // Pin a deterministic non-empty Near fixture after immutable 50 percent
+      // Tree world sampling; this isolates the Distant publication flag from
+      // production Settlement spawn clearance.
       globalThis.location.search = '?disablePersistentTreePublication=1&settlementRoadGraph=legacy-migrated-v1';
       sandbox = await bootInfiniteWorldSandbox({
         globalObject: globalThis,
         THREE: FakeThree,
         viewport: environment.viewport,
         hud: environment.hud,
-        requestedSeed: 'KaniNingen Infinite Natural World',
+        requestedSeed: 'KaniNingen Infinite Natural World A',
       });
       let snapshot = sandbox.snapshot();
       assert.equal(snapshot.boot.status, 'ready');

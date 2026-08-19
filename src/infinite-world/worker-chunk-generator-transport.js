@@ -112,6 +112,8 @@ export function createWorkerChunkGeneratorTransport({
   const settlementQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementTemplateTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const settlementTemplateReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const canonicalMajorRoadOwnerQueryTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const canonicalMajorRoadOwnerQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const diagnosticTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const diagnosticReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const counts = {
@@ -121,6 +123,7 @@ export function createWorkerChunkGeneratorTransport({
     canonicalTreeCellsGenerated: 0,
     settlementQueries: 0,
     settlementTemplateQueries: 0,
+    canonicalMajorRoadOwnerQueries: 0,
     diagnosticQueries: 0,
     staleGenerationResponses: 0,
     lateResponses: 0,
@@ -419,6 +422,15 @@ export function createWorkerChunkGeneratorTransport({
       settlementTemplateReceiveTimes.record(Math.max(0, receivedMs - operationMs));
       counts.settlementTemplateQueries += 1;
       resolveOperation(message.template);
+      return;
+    }
+    if (message.type === CHUNK_GENERATOR_MESSAGE.CANONICAL_MAJOR_ROAD_OWNERS) {
+      const receivedMs = Math.max(0, clock() - operation.sentAt);
+      const operationMs = Math.max(0, Number(message.operationMs) || 0);
+      canonicalMajorRoadOwnerQueryTimes.record(operationMs);
+      canonicalMajorRoadOwnerQueryReceiveTimes.record(Math.max(0, receivedMs - operationMs));
+      counts.canonicalMajorRoadOwnerQueries += 1;
+      resolveOperation(message.coverage);
       return;
     }
     if (message.type === CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS) {
@@ -901,6 +913,52 @@ export function createWorkerChunkGeneratorTransport({
         ...(onPipelineEvent ? { pipelineDiagnostics: true } : {}),
       });
     },
+    async resolveCanonicalMajorRoadOwnerCoverage({
+      centerWorldX,
+      centerWorldZ,
+      radiusMeters,
+      ...options
+    } = {}) {
+      await initialize();
+      if (isShutdown) throw shutdownError();
+      if (runtimeFailure && !fallbackTransport) throw runtimeFailure;
+      if (fallbackTransport) {
+        if (typeof fallbackTransport.resolveCanonicalMajorRoadOwnerCoverage !== 'function') {
+          throw new Error('fallback transport does not expose canonical MAJOR Road owner coverage');
+        }
+        return fallbackTransport.resolveCanonicalMajorRoadOwnerCoverage({
+          centerWorldX,
+          centerWorldZ,
+          radiusMeters,
+          ...options,
+        });
+      }
+      const requestId = ++controlRequestId;
+      const scheduler = createChunkGeneratorSchedulerEnvelope({
+        requestId,
+        operationKind: 'canonical-major-road-owner-query',
+        priority: options.priority ?? CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+        required: options.required ?? true,
+        createdAtMs: options.createdAtMs ?? clock(),
+        deadlineAtMs: options.deadlineAtMs ?? null,
+        consumerId: options.consumerId ?? 'canonical-major-road-owner-query',
+        correlationId: options.telemetryCorrelationId ?? null,
+        target: options.telemetryTarget ?? 'road',
+        stream: options.telemetryStream ?? 'distant',
+        scheduler: options.scheduler ?? null,
+      });
+      return requestWorker({
+        type: CHUNK_GENERATOR_MESSAGE.RESOLVE_CANONICAL_MAJOR_ROAD_OWNERS,
+        protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+        requestId,
+        serviceGeneration,
+        centerWorldX,
+        centerWorldZ,
+        radiusMeters,
+        scheduler,
+        ...(onPipelineEvent ? { pipelineDiagnostics: true } : {}),
+      });
+    },
     async requestDiagnostics(options = {}) {
       await initialize();
       if (isShutdown) throw shutdownError();
@@ -946,6 +1004,9 @@ export function createWorkerChunkGeneratorTransport({
       const settlementQueryReceiveTiming = settlementQueryReceiveTimes.snapshot();
       const settlementTemplateTiming = settlementTemplateTimes.snapshot();
       const settlementTemplateReceiveTiming = settlementTemplateReceiveTimes.snapshot();
+      const canonicalMajorRoadOwnerQueryTiming = canonicalMajorRoadOwnerQueryTimes.snapshot();
+      const canonicalMajorRoadOwnerQueryReceiveTiming =
+        canonicalMajorRoadOwnerQueryReceiveTimes.snapshot();
       const diagnosticTiming = diagnosticTimes.snapshot();
       const diagnosticReceiveTiming = diagnosticReceiveTimes.snapshot();
       return Object.freeze({
@@ -975,6 +1036,10 @@ export function createWorkerChunkGeneratorTransport({
         settlementTemplateMsP50: settlementTemplateTiming.p50,
         settlementTemplateMsMaximum: settlementTemplateTiming.max,
         settlementTemplateReceiveMsMaximum: settlementTemplateReceiveTiming.max,
+        canonicalMajorRoadOwnerQueryMsP50: canonicalMajorRoadOwnerQueryTiming.p50,
+        canonicalMajorRoadOwnerQueryMsMaximum: canonicalMajorRoadOwnerQueryTiming.max,
+        canonicalMajorRoadOwnerQueryReceiveMsMaximum:
+          canonicalMajorRoadOwnerQueryReceiveTiming.max,
         diagnosticMsP50: diagnosticTiming.p50,
         diagnosticMsMaximum: diagnosticTiming.max,
         diagnosticReceiveMsMaximum: diagnosticReceiveTiming.max,
@@ -1009,6 +1074,8 @@ export function createWorkerChunkGeneratorTransport({
         settlementQueryReceiveTimes,
         settlementTemplateTimes,
         settlementTemplateReceiveTimes,
+        canonicalMajorRoadOwnerQueryTimes,
+        canonicalMajorRoadOwnerQueryReceiveTimes,
         diagnosticTimes,
         diagnosticReceiveTimes,
       ]) series.reset();
