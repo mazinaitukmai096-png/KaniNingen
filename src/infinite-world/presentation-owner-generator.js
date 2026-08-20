@@ -29,13 +29,19 @@ import {
 export const PRESENTATION_OWNER_SCHEMA = 'w8-presentation-owner-1';
 export const PRESENTATION_OWNER_SHARED_CORE_REVISION =
   `${W8_SHARED_CANONICAL_GROUND_REVISION}:${W8_CANONICAL_NATURAL_GROUND_REVISION}:formal-natural-candidate-kernel-1`;
-export const W8_CANONICAL_TREE_CELL_SCHEMA = 'w8-canonical-tree-cell-1';
+export const W8_CANONICAL_TREE_CELL_SCHEMA = 'w8-canonical-tree-cell-5';
+export const W8_CANONICAL_NATURAL_PRESENCE_SCHEMA = 'w8-canonical-natural-presence-4';
 export const W8_CANONICAL_TREE_PREPARER_REVISION =
-  `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1`;
+  `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1:decorative-bush-only-1:canonical-rock-presence-4`;
 export const W8_CANONICAL_TREE_MACRO_SIZE_METERS = 64;
 export const W8_CANONICAL_TREE_OWNERS_PER_AXIS =
   W8_CANONICAL_TREE_MACRO_SIZE_METERS / LOGICAL_CHUNK_SIZE_METERS;
 const PRESENTATION_CANONICAL_GENERATOR_MAJOR = 8;
+const W8_CANONICAL_NATURAL_PRESENCE_MAX_ROCKS_PER_OWNER = 4;
+// Far Rock presentation is a deterministic subset of the exact canonical Rock
+// proposal lattice. It is sparse by design so the existing Tree Macro path does
+// not regain the Rock-generation cost that previously hurt Streaming.
+const W8_CANONICAL_NATURAL_PRESENCE_ROCK_PROPOSAL_SAMPLE_RATE = 1 / 16;
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
@@ -64,8 +70,8 @@ function ownerSummary(owner, includeKey = false) {
 
 function compactNatural(source) {
   const canonical = resolveW8CanonicalWorldObject(source);
-  if (!['tree', 'shrub', 'rock'].includes(canonical.objectType)) {
-    throw new TypeError('Presentation Natural supports Tree, Bush/Shrub, and Rock only');
+  if (!['tree', 'shrub', 'rock', 'grass'].includes(canonical.objectType)) {
+    throw new TypeError('Presentation Natural supports Tree, Bush/Shrub, Grass, and Rock only');
   }
   const position = frozenPosition(canonical.position);
   return Object.freeze({
@@ -298,25 +304,35 @@ const expandPosition = value => Object.freeze({
 
 /** Expands only the canonical fields required by the existing renderer. */
 export function expandPresentationNaturalRecord(record) {
-  if (!record || !['tree', 'shrub', 'rock'].includes(record.objectType)) {
+  if (!record || !['tree', 'shrub', 'rock', 'grass'].includes(record.objectType)) {
     throw new TypeError('compact Presentation Natural record is required');
   }
   const position = expandPosition(record.position);
   const owner = parseCompactOwner(record.owner);
-  const resolved = resolveW8CanonicalWorldObject(Object.freeze({
-    candidateId: record.stableId,
-    candidateType: record.objectType === 'rock' ? 'rock' : 'vegetation',
-    subtype: record.subtype,
-    variationSeed: record.variationSeed,
-    orientationSeed: record.rotationY / (Math.PI * 2),
-    worldPosition: position,
-    owningChunkCoordinate: owner,
-    metadata: Object.freeze({
-      candidateRadiusMeters: record.objectType === 'rock'
-        ? record.dimensions[0] / 2 : record.objectType === 'shrub' ? 0.2 : 0.625,
-      boundsType: 'horizontal-circle',
-    }),
-  }));
+  const source = record.objectType === 'grass'
+    ? Object.freeze({
+      stableId: record.stableId,
+      detailType: 'grass',
+      worldPosition: position,
+      owningChunkCoordinate: owner,
+      rotationY: record.rotationY,
+      variation: 1,
+    })
+    : Object.freeze({
+      candidateId: record.stableId,
+      candidateType: record.objectType === 'rock' ? 'rock' : 'vegetation',
+      subtype: record.subtype,
+      variationSeed: record.variationSeed,
+      orientationSeed: record.rotationY / (Math.PI * 2),
+      worldPosition: position,
+      owningChunkCoordinate: owner,
+      metadata: Object.freeze({
+        candidateRadiusMeters: record.objectType === 'rock'
+          ? record.dimensions[0] / 2 : record.objectType === 'shrub' ? 0.2 : 0.625,
+        boundsType: 'horizontal-circle',
+      }),
+    });
+  const resolved = resolveW8CanonicalWorldObject(source);
   const visualBounds = Object.freeze({
     width: record.dimensions[0],
     height: record.dimensions[1],
@@ -329,6 +345,7 @@ export function expandPresentationNaturalRecord(record) {
     // expansion. Renderers may independently recompute the same Stable-ID
     // hash for validation, but must not need a second identity source.
     densityRank: record.densityRank,
+    coarsePresenceKind: record.coarsePresenceKind ?? null,
     position,
     worldPosition: position,
     rotation: Object.freeze({ y: record.rotationY }),
@@ -554,10 +571,13 @@ export async function createPresentationOwnerGenerator({
   }
   const prepareOwner = async (chunkX, chunkZ, {
     includeRocks = true,
+    includeCoarsePresence = false,
     materializePresentationOwner = true,
     resolvedContext = undefined,
     resolvedContextPromise = null,
     resolvedCandidates = undefined,
+    rockProposalSampleRate = 1,
+    sharedRockFieldCache = null,
   } = {}) => {
     if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
       throw new TypeError('Presentation owner coordinates are required');
@@ -565,8 +585,17 @@ export async function createPresentationOwnerGenerator({
     if (typeof includeRocks !== 'boolean') {
       throw new TypeError('includeRocks must be boolean');
     }
+    if (typeof includeCoarsePresence !== 'boolean') {
+      throw new TypeError('includeCoarsePresence must be boolean');
+    }
     if (typeof materializePresentationOwner !== 'boolean') {
       throw new TypeError('materializePresentationOwner must be boolean');
+    }
+    if (!Number.isFinite(rockProposalSampleRate) || rockProposalSampleRate <= 0 || rockProposalSampleRate > 1) {
+      throw new RangeError('rockProposalSampleRate must be in (0, 1]');
+    }
+    if (sharedRockFieldCache !== null && !(sharedRockFieldCache instanceof Map)) {
+      throw new TypeError('sharedRockFieldCache must be a Map');
     }
     if (resolvedContextPromise !== null
       && typeof resolvedContextPromise?.then !== 'function') {
@@ -617,6 +646,8 @@ export async function createPresentationOwnerGenerator({
           vegetationCandidates: vegetationGeneration.vegetationCandidates,
           sampleTerrainAt,
           sampleBiomeWeightsAt,
+          proposalSampleRate: rockProposalSampleRate,
+          sharedFieldCache: sharedRockFieldCache,
         })
         : Object.freeze({
           rockCandidates: Object.freeze([]),
@@ -734,7 +765,7 @@ export async function createPresentationOwnerGenerator({
         }) !== false);
     const vegetation = naturalPolicy.selectVegetation({
       candidates: candidates.vegetationCandidates.filter(candidateVisible),
-      settlementReferences: settlementRegionRefs,
+      settlementReferences: context.settlementDensityReferences ?? settlementRegionRefs,
       experienceSpawn,
       introDistanceMeters: context.introDistanceMeters ?? 11,
     });
@@ -755,6 +786,27 @@ export async function createPresentationOwnerGenerator({
     };
     const groundedVegetation = Object.freeze(vegetation.map(regroundNaturalCandidate));
     const groundedRocks = Object.freeze(rocks.map(regroundNaturalCandidate));
+    const coarsePresence = includeCoarsePresence ? (() => {
+      // Macro Natural presence may only reuse real canonical Rock objects.
+      // Bush is a Near-only ambient decoration and must never enter the Macro
+      // Natural stream. Far-only synthetic Grass/Rock identities are forbidden.
+      const rocks = groundedRocks
+        .map(candidate => Object.freeze({
+          ...compactNatural(resolveW8CanonicalWorldObject(candidate)),
+          coarsePresenceKind: 'canonical-rock',
+        }))
+        .sort((left, right) => left.densityRank - right.densityRank
+          || left.stableId.localeCompare(right.stableId))
+        .slice(0, W8_CANONICAL_NATURAL_PRESENCE_MAX_ROCKS_PER_OWNER);
+      if (rocks.some(record => record.objectType !== 'rock'
+        || record.coarsePresenceKind !== 'canonical-rock')) {
+        throw new Error(`non-canonical Natural escaped Macro presence for ${chunkX},${chunkZ}`);
+      }
+      return Object.freeze({
+        schemaVersion: W8_CANONICAL_NATURAL_PRESENCE_SCHEMA,
+        rocks: Object.freeze(rocks),
+      });
+    })() : null;
     // Natural Stable IDs and X/Z admission remain unchanged, but canonical Y
     // is the same post-grading/post-river finalGround used by visible Terrain.
     // Near, Distant, and the Tree-only batch therefore share one immutable
@@ -787,6 +839,7 @@ export async function createPresentationOwnerGenerator({
       chunkZ,
       resource,
       trees,
+      coarsePresence,
       ground,
       canonicalSurfacePolicy,
       riverProjection,
@@ -806,6 +859,9 @@ export async function createPresentationOwnerGenerator({
         excludedVegetationCandidateCount:
           candidates.vegetationCandidates.length - vegetation.length,
         rockGenerationSkipped: !includeRocks,
+        coarseNaturalPresenceGenerated: includeCoarsePresence,
+        coarseShrubCount: 0,
+        coarseRockCount: coarsePresence?.rocks.length ?? 0,
         canonicalCandidatesReused: candidates.reused === true,
         vegetationCandidateCpuMs: candidates.timings.vegetationMs,
         rockCandidateCpuMs: candidates.timings.rockMs,
@@ -848,9 +904,13 @@ export async function createPresentationOwnerGenerator({
           }
           return resolvedContexts;
         }) : null;
+    const sharedRockFieldCache = new Map();
     const preparedOwners = await Promise.all(ownerCoordinates.map(({ chunkX, chunkZ }, index) => (
       prepareOwner(chunkX, chunkZ, {
-        includeRocks: false,
+        includeRocks: true,
+        rockProposalSampleRate: W8_CANONICAL_NATURAL_PRESENCE_ROCK_PROPOSAL_SAMPLE_RATE,
+        sharedRockFieldCache,
+        includeCoarsePresence: true,
         materializePresentationOwner: false,
         resolvedContextPromise: resolvedContextsPromise?.then(contexts => contexts[index]) ?? null,
       })
@@ -859,14 +919,23 @@ export async function createPresentationOwnerGenerator({
       createChunkKey(chunkX, chunkZ)
     )));
     const trees = [];
+    const rocks = [];
     const ownerBoundaries = [];
     for (let ownerIndex = 0; ownerIndex < preparedOwners.length; ownerIndex += 1) {
       const prepared = preparedOwners[ownerIndex];
       const { chunkX, chunkZ } = ownerCoordinates[ownerIndex];
       const ownerKey = ownerKeys[ownerIndex];
       const ownerTrees = prepared.trees;
-      if (ownerTrees.some(record => record.owner !== ownerKey)) {
-        throw new Error(`canonical Tree escaped owner ${ownerKey}`);
+      const ownerPresence = prepared.coarsePresence;
+      if (ownerPresence?.schemaVersion !== W8_CANONICAL_NATURAL_PRESENCE_SCHEMA) {
+        throw new Error(`canonical Natural presence missing for owner ${ownerKey}`);
+      }
+      const ownerRocks = ownerPresence.rocks;
+      if ([...ownerTrees, ...ownerRocks]
+        .some(record => record.owner !== ownerKey)
+        || ownerRocks.some(record => record.objectType !== 'rock'
+          || record.coarsePresenceKind !== 'canonical-rock')) {
+        throw new Error(`canonical Natural presence escaped owner ${ownerKey}`);
       }
       ownerBoundaries.push(Object.freeze({
         ownerKey,
@@ -878,14 +947,22 @@ export async function createPresentationOwnerGenerator({
         maximumExclusiveZ: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS,
         treeOffset: trees.length,
         treeCount: ownerTrees.length,
+        rockOffset: rocks.length,
+        rockCount: ownerRocks.length,
       }));
       trees.push(...ownerTrees);
+      rocks.push(...ownerRocks);
     }
-    const stableIds = new Set(trees.map(tree => tree.stableId));
-    if (stableIds.size !== trees.length) {
-      throw new Error(`duplicate canonical Tree Stable ID in ${key}`);
+    const allNatural = [...trees, ...rocks];
+    const stableIds = new Set(allNatural.map(record => record.stableId));
+    if (stableIds.size !== allNatural.length) {
+      throw new Error(`duplicate canonical Natural presence Stable ID in ${key}`);
     }
     const frozenTrees = Object.freeze(trees);
+    const frozenNaturalPresence = Object.freeze({
+      schemaVersion: W8_CANONICAL_NATURAL_PRESENCE_SCHEMA,
+      rocks: Object.freeze(rocks),
+    });
     const frozenOwnerBoundaries = Object.freeze(ownerBoundaries);
     const identity = Object.freeze({
       schemaVersion: 'w8-canonical-tree-cell-identity-1',
@@ -905,6 +982,7 @@ export async function createPresentationOwnerGenerator({
       ownerKeys,
       ownerBoundaries: frozenOwnerBoundaries,
       trees: frozenTrees,
+      naturalPresence: frozenNaturalPresence,
     });
     const contentHash = await hashCanonicalTreeCellContent(content);
     return Object.freeze({
@@ -913,6 +991,8 @@ export async function createPresentationOwnerGenerator({
       diagnostics: Object.freeze({
         ownerCount: preparedOwners.length,
         treeCount: trees.length,
+        coarseShrubCount: 0,
+        coarseRockCount: rocks.length,
         sourceVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
           sum + prepared.diagnostics.sourceVegetationCandidateCount
         ), 0),
@@ -928,7 +1008,9 @@ export async function createPresentationOwnerGenerator({
         latticeSampleCount: preparedOwners.reduce((sum, prepared) => (
           sum + prepared.diagnostics.latticeSampleCount
         ), 0),
-        rockCandidateCount: 0,
+        rockCandidateCount: preparedOwners.reduce((sum, prepared) => (
+          sum + prepared.diagnostics.sourceRockCandidateCount
+        ), 0),
         rockGenerationSkippedOwnerCount: preparedOwners.filter(prepared => (
           prepared.diagnostics.rockGenerationSkipped
         )).length,

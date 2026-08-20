@@ -41,6 +41,8 @@ import {
 import { resolveW8LowPolyTreePresentationParts } from '../vegetation-lod-policy.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
+// projectChunk remains fully staged while yielding; this only bounds one main-thread task.
+const CHUNK_PROJECTION_COOPERATIVE_SLICE_MS = 4;
 const CAMERA_COLLISION_EPSILON = 1e-7;
 
 function cameraBoundLocalPoint(point, centerX, centerZ, rotationY) {
@@ -931,7 +933,10 @@ export class ChunkRenderAdapter {
     return true;
   }
 
-  #createNaturalTerrainGeometry(chunkData) {
+  async #createNaturalTerrainGeometry(chunkData, cooperativeCheckpoint = null) {
+    if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+      throw new TypeError('cooperative Terrain checkpoint must be a function when provided');
+    }
     const BufferGeometry = requireConstructor(this.THREE, 'BufferGeometry');
     const Float32BufferAttribute = requireConstructor(this.THREE, 'Float32BufferAttribute');
     const terrain = chunkData.terrain;
@@ -957,6 +962,9 @@ export class ChunkRenderAdapter {
           naturalColor, surface, worldX, worldZ,
         }));
       }
+      if (cooperativeCheckpoint && ((z + 1) % 4 === 0 || z === depth - 1)) {
+        await cooperativeCheckpoint();
+      }
     }
     for (let z = 0; z < depth - 1; z += 1) {
       for (let x = 0; x < width - 1; x += 1) {
@@ -966,6 +974,9 @@ export class ChunkRenderAdapter {
         const southeast = southwest + 1;
         indices.push(northwest, southwest, northeast, northeast, southwest, southeast);
       }
+      if (cooperativeCheckpoint && ((z + 1) % 8 === 0 || z === depth - 2)) {
+        await cooperativeCheckpoint();
+      }
     }
     for (let offset = 0; offset < colors.length; offset += 3) {
       if (![colors[offset], colors[offset + 1], colors[offset + 2]].every(Number.isFinite)
@@ -973,6 +984,7 @@ export class ChunkRenderAdapter {
         throw new Error(`invalid canonical Terrain color at High vertex ${offset / 3}`);
       }
     }
+    if (cooperativeCheckpoint) await cooperativeCheckpoint();
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new Float32BufferAttribute(positions, 3));
     geometry.setAttribute('color', new Float32BufferAttribute(colors, 3));
@@ -1036,7 +1048,7 @@ export class ChunkRenderAdapter {
     };
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
     const terrainGeometry = naturalTerrain
-      ? this.#createNaturalTerrainGeometry(chunkData)
+      ? await this.#createNaturalTerrainGeometry(chunkData)
       : this.geometries.terrain;
     const terrain = new Mesh(
       terrainGeometry,
@@ -1191,9 +1203,19 @@ export class ChunkRenderAdapter {
     return meshes;
   }
 
-  async projectChunk(chunkData, origin = null, { deferredRegistration = false } = {}) {
+  async projectChunk(chunkData, origin = null, {
+    deferredRegistration = false,
+    yieldToHost = null,
+    cooperativeSliceMs = CHUNK_PROJECTION_COOPERATIVE_SLICE_MS,
+  } = {}) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
+    if (yieldToHost !== null && typeof yieldToHost !== 'function') {
+      throw new TypeError('yieldToHost must be a function when provided');
+    }
+    if (!Number.isFinite(cooperativeSliceMs) || cooperativeSliceMs < 0) {
+      throw new RangeError('cooperativeSliceMs must be a non-negative finite number');
+    }
     if (deferredRegistration && this.projectionStaging !== null) {
       throw new Error('Chunk projection is already in progress');
     }
@@ -1203,6 +1225,17 @@ export class ChunkRenderAdapter {
     }
     const key = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
     if (deferredRegistration) this.projectionStaging = this.#createProjectionRegistry();
+    const cooperativeYieldEnabled = deferredRegistration && yieldToHost !== null;
+    const projectionClock = () => globalThis.performance?.now?.() ?? Date.now();
+    let projectionSliceStartedAtMs = projectionClock();
+    const yieldProjectionIfNeeded = async () => {
+      if (!cooperativeYieldEnabled) return false;
+      const now = projectionClock();
+      if (now - projectionSliceStartedAtMs < cooperativeSliceMs) return false;
+      await yieldToHost();
+      projectionSliceStartedAtMs = projectionClock();
+      return true;
+    };
     try {
     const layers = chunkData.presentationLayers;
     const usesW8CanonicalObjects = (chunkData.generatorVersion?.major ?? 0) >= 800;
@@ -1225,7 +1258,10 @@ export class ChunkRenderAdapter {
 
     const naturalTerrain = chunkData.terrain.resolution.x > 2 || chunkData.terrain.resolution.z > 2;
     const terrainGeometry = naturalTerrain
-      ? this.#createNaturalTerrainGeometry(chunkData)
+      ? await this.#createNaturalTerrainGeometry(
+        chunkData,
+        cooperativeYieldEnabled ? yieldProjectionIfNeeded : null,
+      )
       : this.geometries.terrain;
     const terrain = new Mesh(
       terrainGeometry,
@@ -1244,6 +1280,7 @@ export class ChunkRenderAdapter {
       terrain.position.set(this.renderChunkSize / 2, 0, this.renderChunkSize / 2);
     }
     group.add(terrain);
+    await yieldProjectionIfNeeded();
 
     const transform = new Object3D();
     const createPartMatrix = ({ localX, localZ, groundY, rotationY, width, height, depth, part }) => {
@@ -1382,6 +1419,7 @@ export class ChunkRenderAdapter {
       items: rockParts,
       attach: false,
     }));
+    await yieldProjectionIfNeeded();
 
     if (settlementFeatures.length) {
       const resources = this.#ensureSettlementResources();
@@ -1411,6 +1449,7 @@ export class ChunkRenderAdapter {
           }));
         }
       }
+      await yieldProjectionIfNeeded();
 
       const residentialLotSurfaces = [];
       const civicLotSurfaces = [];
@@ -1458,6 +1497,7 @@ export class ChunkRenderAdapter {
         lotMesh.instanceMatrix.needsUpdate = true;
         layerMeshes.lots.push(lotMesh);
       }
+      await yieldProjectionIfNeeded();
 
       const buildingParts = [];
       buildings.forEach(building => {
@@ -1547,6 +1587,7 @@ export class ChunkRenderAdapter {
         attach: false,
       }));
     }
+    await yieldProjectionIfNeeded();
 
     if (waterSurfaces.length) {
       const resources = this.#ensureSettlementResources();
@@ -1615,6 +1656,7 @@ export class ChunkRenderAdapter {
       createWaterMesh(wetlandInstances, 'w8-continuous-wetland-water');
       createWaterMesh(riverInstances, 'w8-canonical-river-water');
     }
+    await yieldProjectionIfNeeded();
 
     const formalDetailParts = [];
     const ambientDetailParts = [];
@@ -1683,6 +1725,7 @@ export class ChunkRenderAdapter {
       castShadow: false,
       attach: false,
     }));
+    await yieldProjectionIfNeeded();
 
     for (const layer of [
       layerMeshes.roads,

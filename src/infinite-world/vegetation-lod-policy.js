@@ -1,5 +1,7 @@
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  W8_PRESENTATION_DISTANCE_KINDS,
+  resolveW8PresentationDistanceProfile,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
 export const W8_VEGETATION_LOD_KINDS = Object.freeze({
@@ -108,6 +110,28 @@ const handoffSafeBand = (minimum, maximum, scale) => {
   });
 };
 
+const coarsePresenceBands = (detailVisibilityMeters, visibilityMeters, {
+  entryWidthMeters = 12,
+  fadeWidthMeters = 30,
+} = {}) => {
+  const halfEntry = entryWidthMeters / 2;
+  const entry = Object.freeze({
+    minimum: q6(Math.max(NEAR_OWNER_HANDOFF_SAFE_METERS,
+      detailVisibilityMeters - halfEntry)),
+    maximum: q6(Math.min(visibilityMeters - fadeWidthMeters - 4,
+      detailVisibilityMeters + halfEntry)),
+  });
+  const fade = Object.freeze({
+    minimum: q6(Math.max(entry.maximum + 16, visibilityMeters - fadeWidthMeters)),
+    maximum: q6(visibilityMeters),
+  });
+  return Object.freeze({
+    entry,
+    fade,
+    fogStartMeters: q6(Math.max(entry.maximum + 20, visibilityMeters * 0.72)),
+  });
+};
+
 const noFar = Object.freeze({
   farEntry: null,
   farFade: null,
@@ -116,10 +140,10 @@ const noFar = Object.freeze({
 
 const scaledTreeDensityPolicy = renderDistance => {
   const reference = W8_CANONICAL_TREE_DENSITY_REFERENCE_METERS;
-  const scale = renderDistance.fogFarMeters / reference.farMaximum;
+  const scale = renderDistance.worldPresentationDistanceMeters / reference.farMaximum;
   const nearMaximum = q6(reference.nearMaximum * scale);
   const midMaximum = q6(reference.midMaximum * scale);
-  const farMaximum = renderDistance.fogFarMeters;
+  const farMaximum = renderDistance.worldPresentationDistanceMeters;
   const transitionWidth = q6(Math.max(4, reference.transitionWidth * scale));
   const outerFadeWidth = q6(Math.max(4, reference.outerFadeWidth * scale));
   const nearToMid = Object.freeze({
@@ -161,7 +185,15 @@ const scaledTreeDensityPolicy = renderDistance => {
 };
 
 const profileFor = (kind, renderDistance) => {
-  const { naturalVisibilityMeters } = renderDistance;
+  const naturalDistance = resolveW8PresentationDistanceProfile(
+    W8_PRESENTATION_DISTANCE_KINDS.NATURAL,
+    renderDistance.id,
+  );
+  const treeDistance = resolveW8PresentationDistanceProfile(
+    W8_PRESENTATION_DISTANCE_KINDS.TREE,
+    renderDistance.id,
+  );
+  const naturalVisibilityMeters = naturalDistance.visibilityMeters;
   const scale = naturalVisibilityMeters / CURRENT_NATURAL_VISIBILITY_METERS;
   if (kind === W8_VEGETATION_LOD_KINDS.TREE) {
     const farDensity = scaledTreeDensityPolicy(renderDistance);
@@ -181,53 +213,67 @@ const profileFor = (kind, renderDistance) => {
       fullToForest,
       forestToAtmospheric,
       atmosphericFade,
-      visibilityMeters: renderDistance.fogFarMeters,
+      visibilityMeters: treeDistance.visibilityMeters,
       // Every canonical Tree tier keeps the same physical silhouette. Distance
       // changes geometry complexity and fog, never object scale.
       forestScale: 1,
       atmosphericScale: 1,
       farEntry: atmosphericFade,
       farFade: farDensity.outerFade,
-      farVisibilityMeters: renderDistance.fogFarMeters,
+      farVisibilityMeters: treeDistance.visibilityMeters,
       farDensity,
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
+    // Bush is finite-style ambient decoration, not World-presence geometry.
+    // It fades within Natural Detail distance and never opens a Macro/Far lane.
+    const detailVisibilityMeters = naturalVisibilityMeters;
+    const visibilityMeters = detailVisibilityMeters;
     const fullToForest = handoffSafeBand(44, 56, scale);
     const forestStart = Math.max(fullToForest.maximum + 8, 76 * scale);
     const forestToAtmospheric = Object.freeze({
       minimum: q6(forestStart),
       maximum: q6(forestStart + Math.max(6, 12 * scale)),
     });
+    const fadeStart = Math.max(
+      forestToAtmospheric.maximum,
+      visibilityMeters - Math.max(12, 24 * scale),
+    );
     return Object.freeze({
       kind,
       fullToForest,
       forestToAtmospheric,
       atmosphericFade: Object.freeze({
-        minimum: q6(Math.max(forestToAtmospheric.maximum + 4, 116 * scale)),
-        maximum: naturalVisibilityMeters,
+        minimum: q6(fadeStart),
+        maximum: q6(visibilityMeters),
       }),
-      visibilityMeters: naturalVisibilityMeters,
-      forestScale: 1.12,
-      atmosphericScale: 1.18,
+      detailVisibilityMeters,
+      visibilityMeters,
+      forestScale: 1,
+      atmosphericScale: 1,
       ...noFar,
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.GRASS) {
-    const visibilityMeters = q6(Math.min(
+    const detailVisibilityMeters = q6(Math.min(
       naturalVisibilityMeters,
       Math.max(64, 84 * scale),
     ));
+    const visibilityMeters = renderDistance.worldPresentationDistanceMeters;
     const fullToForest = Object.freeze({ minimum: 48, maximum: 52 });
     const forestToAtmospheric = Object.freeze({ minimum: 56, maximum: 60 });
+    const coarsePresence = coarsePresenceBands(detailVisibilityMeters, visibilityMeters, {
+      entryWidthMeters: 12,
+    });
     return Object.freeze({
       kind,
       fullToForest,
       forestToAtmospheric,
-      atmosphericFade: Object.freeze({
-        minimum: q6(Math.max(forestToAtmospheric.maximum, 68 * scale)),
-        maximum: visibilityMeters,
-      }),
+      atmosphericFade: coarsePresence.fade,
+      coarsePresenceEntry: coarsePresence.entry,
+      coarsePresenceFade: coarsePresence.fade,
+      coarsePresenceFogStartMeters: coarsePresence.fogStartMeters,
+      detailVisibilityMeters,
       visibilityMeters,
       forestScale: 1.2,
       atmosphericScale: 1.3,
@@ -235,16 +281,22 @@ const profileFor = (kind, renderDistance) => {
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.ROCK) {
+    const detailVisibilityMeters = naturalVisibilityMeters;
+    const visibilityMeters = renderDistance.worldPresentationDistanceMeters;
     const fullToForest = handoffSafeBand(76, 92, scale);
+    const coarsePresence = coarsePresenceBands(detailVisibilityMeters, visibilityMeters, {
+      entryWidthMeters: 16,
+    });
     return Object.freeze({
       kind,
       fullToForest,
       forestToAtmospheric: null,
-      atmosphericFade: Object.freeze({
-        minimum: q6(Math.max(fullToForest.maximum + 8, 124 * scale)),
-        maximum: naturalVisibilityMeters,
-      }),
-      visibilityMeters: naturalVisibilityMeters,
+      atmosphericFade: coarsePresence.fade,
+      coarsePresenceEntry: coarsePresence.entry,
+      coarsePresenceFade: coarsePresence.fade,
+      coarsePresenceFogStartMeters: coarsePresence.fogStartMeters,
+      detailVisibilityMeters,
+      visibilityMeters,
       forestScale: 1,
       atmosphericScale: 1,
       ...noFar,
@@ -370,10 +422,24 @@ export function resolveW8VegetationVisibilityContract(
   const byKind = Object.freeze(Object.fromEntries(
     Object.values(W8_VEGETATION_LOD_KINDS).map(kind => {
       const policy = resolveW8VegetationLodPolicy(kind, renderDistance.id);
+      const presentationKind = kind === W8_VEGETATION_LOD_KINDS.TREE
+        ? W8_PRESENTATION_DISTANCE_KINDS.TREE
+        : W8_PRESENTATION_DISTANCE_KINDS.NATURAL;
+      const distanceProfile = resolveW8PresentationDistanceProfile(
+        presentationKind,
+        renderDistance.id,
+      );
+      const exactDistanceMeters = kind === W8_VEGETATION_LOD_KINDS.TREE
+        ? policy.visibilityMeters
+        : (policy.detailVisibilityMeters ?? distanceProfile.visibilityMeters);
       return [kind, Object.freeze({
         kind,
-        exactDistanceMeters: policy.visibilityMeters,
-        horizonDistanceMeters: null,
+        presentationKind,
+        presentationLane: distanceProfile.lane,
+        exactDistanceMeters,
+        envelopeDistanceMeters: policy.visibilityMeters,
+        horizonDistanceMeters: kind === W8_VEGETATION_LOD_KINDS.TREE
+          ? null : policy.visibilityMeters,
       })];
     }),
   ));

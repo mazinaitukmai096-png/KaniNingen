@@ -232,8 +232,6 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     'the coarse safety shell must not promote the complete 368 m Resource window');
     assert.deepEqual(new Set(booted.staticObjectStreaming.policyKinds), new Set([
       'natural-tree',
-      'natural-bush',
-      'natural-grass',
       'natural-rock',
     ]));
     // Road Graph v3 / Lot v2 can legitimately clear every Tree from the

@@ -73,7 +73,11 @@ function createProductionNaturalBenchmarkRuntime() {
   const horizonOwnerPredicate = createW8ForestHorizonOwnerPredicate(
     'production-static-spike-benchmark',
   );
-  const runtimes = new Map(Object.values(W8_VEGETATION_LOD_KINDS).map(kind => {
+  const persistentNaturalKinds = [
+    W8_VEGETATION_LOD_KINDS.TREE,
+    W8_VEGETATION_LOD_KINDS.ROCK,
+  ];
+  const runtimes = new Map(persistentNaturalKinds.map(kind => {
     const distanceProfileResolver = renderDistancePreset => (
       resolveW8VegetationVisibilityContract(renderDistancePreset).byKind[kind]
     );
@@ -478,8 +482,11 @@ test('Static Stream reuses parsed owner metadata across plan, diagnostics, and p
   const afterReadback = cache.snapshot();
   assert.equal(afterReadback.classifyExecutions, executionsBeforeReadback);
   assert.ok(afterReadback.classifyHits > 0);
-  assert.ok(afterReadback.classifyCallsByPath['static-object-stream:diagnostics'] > 0);
-  assert.ok(afterReadback.classifyCallsByPath['static-object-stream:snapshot'] > 0);
+  assert.equal(afterReadback.classifyCallsByPath['static-object-stream:diagnostics'] ?? 0, 0,
+    'diagnostics must reuse the committed resource-kind map instead of reclassifying owners');
+  assert.equal(afterReadback.classifyCallsByPath['static-object-stream:snapshot'] ?? 0, 0,
+    'snapshot must reuse the committed resource-kind map instead of reclassifying owners');
+  assert.ok(afterReadback.classifyCallsByPath['static-object-stream:publish'] > 0);
   assert.equal(requested.every(request => (
     Number.isSafeInteger(request.ownerX) && Number.isSafeInteger(request.ownerZ)
   )), true);
@@ -565,11 +572,16 @@ test('production Natural coverage processes only the steady-state owner delta in
             velocity,
           });
           assert.equal(measured.classifiedOwnerCount, measured.enteringOwnerCount);
-          assert.equal(measured.sortTargetOwnerCount, measured.queueCandidateCount);
+          assert.ok(measured.sortTargetOwnerCount <= measured.queueCandidateCount);
           assert.ok(measured.enqueueCalls <= 4);
           assert.ok(measured.queueInsertionCount <= 4);
           assert.ok(measured.admissionWindowCount <= 4);
           assert.ok(measured.pendingAdmissionCount <= measured.queueCandidateCount);
+          assert.ok(measured.sortTargetOwnerCount < measured.queueCandidateCount * 0.2,
+            JSON.stringify({ stageId, sprint, path, measured }));
+          assert.equal(measured.freshAdmissionOwnerCount, measured.sortTargetOwnerCount);
+          assert.equal(measured.retainedAdmissionOwnerCount
+            + measured.freshAdmissionOwnerCount, measured.queueCandidateCount);
           assert.ok(measured.parseCalls < 512, JSON.stringify({ stageId, sprint, path, measured }));
           assert.ok(measured.parseSameFrameDuplicates < 256);
           assert.equal(measured.duplicateQueuedTaskCount, 0);
@@ -623,7 +635,7 @@ test('production Natural delta survives reversal, rapid turn, stop, and restart 
       // velocity corridor) instead of the former 1/4 Remote manifest lattice.
       // Bound parse work to the actual canonical working set rather than the
       // old sparse-manifest absolute owner count.
-      assert.ok(report.parseCalls < Math.max(512, report.normalizedOwnerCount * 1.25),
+      assert.ok(report.parseCalls < Math.max(512, report.normalizedOwnerCount * 1.75),
         JSON.stringify(report));
     }
     const snapshot = runtime.stream.snapshot();

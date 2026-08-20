@@ -1126,6 +1126,88 @@ test('prewarmed Forest receipt cache re-evaluates player uniforms without a full
     beforeApproach.canonicalCoarseTreeSlotScanEarlyOutCount + 1);
 });
 
+test('unrelated owner requirement churn reuses immutable canonical Tree slots', () => {
+  let now = 0;
+  const gpuMirror = createGpuAttributeMirror();
+  const frames = createRenderFrameAcknowledger({ clock: () => now, gpuMirror });
+  const registry = createVisualContinuityRegistry({ clock: () => now });
+  const terrain = createDrawable().mesh;
+  markTerrain(terrain, 'high');
+  terrain.userData.visibleOwnerKeys = ['cache-owner-a', 'cache-owner-b'];
+  const forest = createDrawable().mesh;
+  forest.count = 2;
+  forest.instanceMatrix = createAttribute(identityMatrices(2), 16);
+  forest.geometry.attributes.w8NaturalAnchorXZ = createAttribute([0, 0, 10, 0], 2);
+  forest.geometry.attributes.w8NaturalInitialReveal = createAttribute([1, 1]);
+  forest.userData = {
+    canonicalObjects: [
+      { stableId: 'tree:cache-a', owner: 'cache-owner-a', objectType: 'tree' },
+      { stableId: 'tree:cache-b', owner: 'cache-owner-b', objectType: 'tree' },
+    ],
+    canonicalOpacities: [1, 1],
+    canonicalCoarseTreeSubmission: true,
+    canonicalVisualRevision: 1,
+  };
+  forest.material.userData = {
+    naturalLodMode: 'forest',
+    naturalLodKind: 'tree',
+    canonicalCoarseTree: true,
+    naturalLodUniforms: {
+      w8NaturalPlayerLocalXZ: { value: { x: 0, y: 0 } },
+      w8NaturalUnitsPerMeter: { value: 1 },
+      w8NaturalEnterStart: { value: -1 },
+      w8NaturalEnterEnd: { value: 0 },
+      w8NaturalExitStart: { value: 100 },
+      w8NaturalExitEnd: { value: 120 },
+      w8NaturalReveal: { value: 1 },
+    },
+  };
+  const scene = { children: [terrain, forest] };
+  terrain.parent = scene;
+  forest.parent = scene;
+
+  registry.expect({ ownerKey: 'cache-owner-a', expectedAt: 0 });
+  registry.resolveCoarseRequirements({
+    ownerKey: 'cache-owner-a',
+    structureStableIds: [],
+    forestStableIds: ['tree:cache-a'],
+  });
+  const draw = (frameSequence, ownerKeys) => {
+    const token = frames.beginFrame({ frameSequence });
+    now = frameSequence;
+    const receipt = frames.completeFrame(token, { scene });
+    registry.acknowledgeScene({
+      receipt,
+      scene,
+      terrainCoverage: { ownerKeys },
+    });
+  };
+
+  draw(1, ['cache-owner-a']);
+  const afterInitialProof = registry.snapshot().receiptScanMetrics;
+  assert.equal(registry.get('cache-owner-a').coarseDrawableAt, 1);
+
+  registry.expect({ ownerKey: 'cache-owner-b', expectedAt: 1 });
+  registry.resolveCoarseRequirements({
+    ownerKey: 'cache-owner-b',
+    structureStableIds: [],
+    forestStableIds: ['tree:cache-b'],
+  });
+  draw(2, ['cache-owner-a', 'cache-owner-b']);
+  const afterRequirementChurn = registry.snapshot().receiptScanMetrics;
+  assert.equal(registry.get('cache-owner-b').coarseDrawableAt, 2,
+    'a newly expected owner is resolved from the cached immutable Tree slot');
+  assert.equal(
+    afterRequirementChurn.canonicalCoarseTreeSlotScanCount,
+    afterInitialProof.canonicalCoarseTreeSlotScanCount,
+    'owner requirement churn must not rescan the immutable canonical Tree mesh',
+  );
+  assert.equal(
+    afterRequirementChurn.canonicalCoarseTreeSlotScanEarlyOutCount,
+    afterInitialProof.canonicalCoarseTreeSlotScanEarlyOutCount + 1,
+  );
+});
+
 test('Structure handoff opacity must be renderer-uploaded before it proves coarse existence', () => {
   let now = 0;
   const gpuMirror = createGpuAttributeMirror();

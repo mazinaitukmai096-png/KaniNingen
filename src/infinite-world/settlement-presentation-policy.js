@@ -42,7 +42,7 @@ const minimumFormalSettlementSeparationMeters = Math.min(
 );
 const maximumLocalSettlementCenterDistanceMeters = (
   resolveW8RenderDistancePolicy(W8_RENDER_DISTANCE_PRESET_IDS.CURRENT)
-    .generalObjectVisibilityMeters
+    .generalDetailDistanceMeters
   + W5_SETTLEMENT_DISTRIBUTION.maximumInfluenceRadiusMeters
 );
 const formalSettlementPackingRadiusMeters = minimumFormalSettlementSeparationMeters / 2;
@@ -74,13 +74,13 @@ const buildPresentationPolicy = (quality, renderDistancePreset) => {
   const partsPerBuilding = qualityPartCount(quality);
   const remoteEnabled = distance.id === W8_RENDER_DISTANCE_PRESET_IDS.CURRENT;
   const remoteEndMeters = remoteEnabled
-    ? distance.settlementHorizonMeters
-    : distance.generalObjectVisibilityMeters;
+    ? distance.settlementMetadataDistanceMeters
+    : distance.generalDetailDistanceMeters;
   return Object.freeze({
     quality: ['high', 'medium', 'low'].includes(quality) ? quality : 'high',
     renderDistancePreset: distance.id,
     metadata: Object.freeze({
-      queryDistanceMeters: distance.settlementHorizonMeters,
+      queryDistanceMeters: distance.settlementMetadataDistanceMeters,
     }),
     local: Object.freeze({
       fullDistanceMeters: distance.settlementLod.fullDistanceMeters,
@@ -89,13 +89,13 @@ const buildPresentationPolicy = (quality, renderDistancePreset) => {
       handoffEndMeters: distance.settlementLod.handoffEndMeters,
       handoffWidthMeters: distance.settlementLod.handoffWidthMeters,
       fadeStartMeters: distance.settlementLod.fadeStartMeters,
-      hiddenDistanceMeters: distance.generalObjectVisibilityMeters,
+      hiddenDistanceMeters: distance.generalDetailDistanceMeters,
       settlementLimit: W8_LOCAL_SETTLEMENT_SELECTION_LIMIT,
     }),
     remote: Object.freeze({
       enabled: remoteEnabled,
-      horizonStartMeters: distance.generalObjectVisibilityMeters,
-      fadeStartMeters: distance.generalObjectVisibilityMeters,
+      horizonStartMeters: distance.generalDetailDistanceMeters,
+      fadeStartMeters: distance.generalDetailDistanceMeters,
       fadeEndMeters: remoteEndMeters,
       hiddenDistanceMeters: remoteEndMeters,
       fog: false,
@@ -103,7 +103,7 @@ const buildPresentationPolicy = (quality, renderDistancePreset) => {
         mode: remoteEnabled ? 'manual-fog-blend' : 'disabled',
         silhouetteColorHex: W8_SETTLEMENT_SILHOUETTE_COLOR_HEX,
         fogColorHex: W8_RENDER_FOG_COLOR_HEX,
-        fogIntegrationEndMeters: distance.fogFarMeters,
+        fogIntegrationEndMeters: distance.worldPresentationDistanceMeters,
         fogEdgeBlend: REMOTE_SETTLEMENT_FOG_EDGE_BLEND,
         fogEdgeOpacity: REMOTE_SETTLEMENT_FOG_EDGE_OPACITY,
         maximumFogBlend: REMOTE_SETTLEMENT_MAXIMUM_FOG_BLEND,

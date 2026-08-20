@@ -728,6 +728,8 @@ test('unchanged merged coverage still commits the latest policy-owner diff basel
     classifiedOwnerCount: 2,
     sortTargetOwnerCount: 0,
     queueCandidateCount: 0,
+    retainedAdmissionOwnerCount: 0,
+    freshAdmissionOwnerCount: 0,
     queueInsertionCount: 0,
   });
   assert.equal(stream.applyPlan({ plan: repeated, policyPlans: repeated.policyPlans }), false);
@@ -738,6 +740,8 @@ test('unchanged merged coverage still commits the latest policy-owner diff basel
     classifiedOwnerCount: 0,
     sortTargetOwnerCount: 0,
     queueCandidateCount: 0,
+    retainedAdmissionOwnerCount: 0,
+    freshAdmissionOwnerCount: 0,
     queueInsertionCount: 0,
   });
 });

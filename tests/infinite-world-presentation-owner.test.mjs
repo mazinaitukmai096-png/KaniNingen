@@ -166,8 +166,8 @@ test('shared Natural semantic kernel preserves Full Stable ID, owner, position, 
 test('Settlement Tree Y is canonical finalGround in Full, PresentationOwner, and Tree-cell paths', async t => {
   const generator = await createW8ParityChunkGenerator({ worldSeed: seed });
   try {
-    const chunkX = 35;
-    const chunkZ = 24;
+    const chunkX = 32;
+    const chunkZ = 26;
     const full = await generator.generateChunk(chunkX, chunkZ);
     const presentation = await generator.generatePresentationOwner(chunkX, chunkZ);
     const treeCell = await generator.generateCanonicalTreeCell(8, 6);

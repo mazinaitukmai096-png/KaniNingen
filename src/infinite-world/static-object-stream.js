@@ -831,6 +831,12 @@ export function createStaticObjectStream({
   let pendingAdmissionIndex = 0;
   let pendingAdmissionCoverageGeneration = 0;
   const pendingAdmissionSinceByOwner = new Map();
+  // Coverage changes can arrive every 16 m while the bounded admission window
+  // still has a large retained backlog. Keep the unadmitted cursor across
+  // generations and only priority-sort identities whose scheduling class
+  // actually changed. Re-sorting the entire retained cursor was an O(N log N)
+  // main-thread spike on every owner-boundary crossing.
+  let pendingAdmissionOwnerSet = new Set();
   const ownerTimingByOwner = new Map();
   let bootCohortOwnerKeys = null;
   let bootCohortStartedAtMs = null;
@@ -843,6 +849,8 @@ export function createStaticObjectStream({
     classifiedOwnerCount: 0,
     sortTargetOwnerCount: 0,
     queueCandidateCount: 0,
+    retainedAdmissionOwnerCount: 0,
+    freshAdmissionOwnerCount: 0,
     queueInsertionCount: 0,
   });
   let applyAttemptSequence = 0;
@@ -890,6 +898,8 @@ export function createStaticObjectStream({
     enqueueCalls: 0,
     admissionCursorReplacements: 0,
     admissionCursorSkips: 0,
+    admissionCursorRetainedOwners: 0,
+    admissionCursorFreshOwners: 0,
     supersededApplies: 0,
   };
 
@@ -1243,6 +1253,7 @@ export function createStaticObjectStream({
     while (tasks.size < maximumConcurrentRequests
       && pendingAdmissionIndex < pendingAdmissionOwnerKeys.length) {
       const ownerKey = pendingAdmissionOwnerKeys[pendingAdmissionIndex++];
+      pendingAdmissionOwnerSet.delete(ownerKey);
       pendingAdmissionSinceByOwner.delete(ownerKey);
       if (!latestRequestedOwnerKeys.has(ownerKey)) {
         counts.admissionCursorSkips += 1;
@@ -1552,6 +1563,8 @@ export function createStaticObjectStream({
         classifiedOwnerCount: 0,
         sortTargetOwnerCount: 0,
         queueCandidateCount: 0,
+        retainedAdmissionOwnerCount: 0,
+        freshAdmissionOwnerCount: 0,
         queueInsertionCount: 0,
       });
       cancelMatureStaleTasks();
@@ -1815,6 +1828,8 @@ export function createStaticObjectStream({
         classifiedOwnerCount,
         sortTargetOwnerCount: 0,
         queueCandidateCount: 0,
+        retainedAdmissionOwnerCount: 0,
+        freshAdmissionOwnerCount: 0,
         queueInsertionCount: 0,
       });
       for (const ownerKey of policyPlan.requestOwnerKeys) {
@@ -1857,21 +1872,45 @@ export function createStaticObjectStream({
       ));
     }
     const previousRequestedOwnerKeys = latestRequestedOwnerKeys;
+    const previousRequiredOwnerKeys = latestRequiredOwnerKeys;
     const previousResourceKindByOwner = latestResourceKindByOwner;
     const nextRequestedOwnerKeys = new Set(policyPlan.requestOwnerKeys);
-    const previousPendingAdmissionOwnerKeys = new Set(
-      pendingAdmissionCoverageGeneration === coverageGeneration
-        ? pendingAdmissionOwnerKeys.slice(pendingAdmissionIndex)
-        : [],
+    const previousPendingAdmissionOwnerKeys = pendingAdmissionCoverageGeneration === coverageGeneration
+      ? pendingAdmissionOwnerKeys.slice(pendingAdmissionIndex)
+      : [];
+    const requiredEnteringOwnerKeys = new Set(
+      policyPlan.requiredOwnerKeys.filter(ownerKey => !previousRequiredOwnerKeys.has(ownerKey)),
     );
-    const queueCandidateOwnerKeys = policyPlan.requestOwnerKeys.filter(ownerKey => (
-      !latestRequestedOwnerKeys.has(ownerKey)
-        || latestResourceKindByOwner.get(ownerKey) !== nextResourceKindByOwner.get(ownerKey)
-        || previousPendingAdmissionOwnerKeys.has(ownerKey)
+    const retainedPendingOwnerKeys = [];
+    const retainedPendingOwnerSet = new Set();
+    for (const ownerKey of previousPendingAdmissionOwnerKeys) {
+      const nextResourceKind = nextResourceKindByOwner.get(ownerKey);
+      const key = typeof nextResourceKind === 'string'
+        ? taskKey(ownerKey, nextResourceKind) : null;
+      const schedulingClassChanged = priorityEnteringOwnerKeys.has(ownerKey)
+        || requiredEnteringOwnerKeys.has(ownerKey);
+      if (!nextRequestedOwnerKeys.has(ownerKey)
+        || previousResourceKindByOwner.get(ownerKey) !== nextResourceKind
+        || schedulingClassChanged
+        || (key !== null && (ready.has(key) || tasks.has(key)))) continue;
+      retainedPendingOwnerKeys.push(ownerKey);
+      retainedPendingOwnerSet.add(ownerKey);
+    }
+    const freshQueueCandidateOwnerKeys = policyPlan.requestOwnerKeys.filter(ownerKey => {
+      if (retainedPendingOwnerSet.has(ownerKey)) return false;
+      const nextResourceKind = nextResourceKindByOwner.get(ownerKey);
+      const key = taskKey(ownerKey, nextResourceKind);
+      const wasPending = pendingAdmissionOwnerSet.has(ownerKey);
+      return !latestRequestedOwnerKeys.has(ownerKey)
+        || latestResourceKindByOwner.get(ownerKey) !== nextResourceKind
+        || (requiredEnteringOwnerKeys.has(ownerKey)
+          && !ready.has(key)
+          && !tasks.has(key))
+        || (wasPending && !ready.has(key) && !tasks.has(key))
         || (priorityEnteringOwnerKeys.has(ownerKey)
-          && !ready.has(taskKey(ownerKey, nextResourceKindByOwner.get(ownerKey)))
-          && !tasks.has(taskKey(ownerKey, nextResourceKindByOwner.get(ownerKey))))
-    ));
+          && !ready.has(key)
+          && !tasks.has(key));
+    });
     const compareRequestPriority = (left, right) => {
       const leftOwner = nextOwnerDescriptorByKey.get(left);
       const rightOwner = nextOwnerDescriptorByKey.get(right);
@@ -1890,7 +1929,15 @@ export function createStaticObjectStream({
         || leftOwner.chunkZ - rightOwner.chunkZ
         || leftOwner.chunkX - rightOwner.chunkX;
     };
-    queueCandidateOwnerKeys.sort(compareRequestPriority);
+    // Existing unadmitted work keeps its prior deterministic order. Only new
+    // or scheduling-class-changed identities are re-ranked for this coverage
+    // generation. Put that fresh frontier first so movement never leaves newly
+    // visible/required owners behind a large stale prefetch cursor.
+    freshQueueCandidateOwnerKeys.sort(compareRequestPriority);
+    const queueCandidateOwnerKeys = Object.freeze([
+      ...freshQueueCandidateOwnerKeys,
+      ...retainedPendingOwnerKeys,
+    ]);
     if (applyAttempt !== applyAttemptSequence) {
       counts.supersededApplies += 1;
       return false;
@@ -1941,10 +1988,11 @@ export function createStaticObjectStream({
       const resourceKind = nextResourceKindByOwner.get(ownerKey);
       queueReadyPage(ready.get(taskKey(ownerKey, resourceKind)));
     }
-    pendingAdmissionOwnerKeys = Object.freeze([...queueCandidateOwnerKeys]);
+    pendingAdmissionOwnerKeys = queueCandidateOwnerKeys;
     pendingAdmissionIndex = 0;
     pendingAdmissionCoverageGeneration = coverageGeneration;
-    for (const ownerKey of queueCandidateOwnerKeys) {
+    pendingAdmissionOwnerSet = new Set(queueCandidateOwnerKeys);
+    for (const ownerKey of freshQueueCandidateOwnerKeys) {
       pendingAdmissionSinceByOwner.set(
         ownerKey,
         pendingAdmissionSinceByOwner.get(ownerKey) ?? plan.generatedAtMs,
@@ -1970,22 +2018,26 @@ export function createStaticObjectStream({
     }
     counts.plans += 1;
     counts.coverageMerges += 1;
-    counts.ownerSorts += Number(queueCandidateOwnerKeys.length > 1);
+    counts.ownerSorts += Number(freshQueueCandidateOwnerKeys.length > 1);
     counts.resourceKindClassifications += classifiedOwnerCount;
     counts.coverageOwnerEntryAllocations += coverageOwnerEntryAllocationCount;
     if (ownerMetadataRevision === null) counts.coverageSignatures += 1;
     counts.enteringOwners += enteringOwnerCount;
     counts.leavingOwners += leavingOwnerCount;
     counts.unchangedOwners += unchangedOwnerCount;
-    counts.sortTargetOwners += queueCandidateOwnerKeys.length;
+    counts.sortTargetOwners += freshQueueCandidateOwnerKeys.length;
+    counts.admissionCursorRetainedOwners += retainedPendingOwnerKeys.length;
+    counts.admissionCursorFreshOwners += freshQueueCandidateOwnerKeys.length;
     const queueInsertionsBeforeAdmission = counts.queueInsertions;
     latestApplyDiff = Object.freeze({
       enteringOwnerCount,
       leavingOwnerCount,
       unchangedOwnerCount,
       classifiedOwnerCount,
-      sortTargetOwnerCount: queueCandidateOwnerKeys.length,
+      sortTargetOwnerCount: freshQueueCandidateOwnerKeys.length,
       queueCandidateCount: queueCandidateOwnerKeys.length,
+      retainedAdmissionOwnerCount: retainedPendingOwnerKeys.length,
+      freshAdmissionOwnerCount: freshQueueCandidateOwnerKeys.length,
       queueInsertionCount: 0,
     });
     const affectedOwnerKeys = new Set(changedPolicyOwners);
@@ -2172,10 +2224,10 @@ export function createStaticObjectStream({
     );
     const required = new Set(latestPolicyPlan?.requiredOwnerKeys ?? []);
     const prefetched = new Set(latestPolicyPlan?.prefetchedOwnerKeys ?? []);
-    const ownerReady = ownerKey => ready.has(taskKey(
-      ownerKey,
-       classify(ownerKey, latestPlan, latestPolicyPlan, 'static-object-stream:snapshot'),
-    ));
+    const ownerReady = ownerKey => {
+      const resourceKind = latestResourceKindByOwner.get(ownerKey);
+      return typeof resourceKind === 'string' && ready.has(taskKey(ownerKey, resourceKind));
+    };
     const readyOwnerKeys = new Set([
       ...required,
       ...prefetched,
@@ -2269,10 +2321,10 @@ export function createStaticObjectStream({
   const diagnostics = () => {
     const requiredOwnerKeys = latestPolicyPlan?.requiredOwnerKeys ?? [];
     const prefetchedOwnerKeys = latestPolicyPlan?.prefetchedOwnerKeys ?? [];
-    const isReady = ownerKey => ready.has(taskKey(
-      ownerKey,
-      classify(ownerKey, latestPlan, latestPolicyPlan, 'static-object-stream:diagnostics'),
-    ));
+    const isReady = ownerKey => {
+      const resourceKind = latestResourceKindByOwner.get(ownerKey);
+      return typeof resourceKind === 'string' && ready.has(taskKey(ownerKey, resourceKind));
+    };
     let readyRequiredOwnerCount = 0;
     let readyPrefetchedOwnerCount = 0;
     if (latestPlan) {
@@ -2351,6 +2403,7 @@ export function createStaticObjectStream({
     pendingAdmissionOwnerKeys = Object.freeze([]);
     pendingAdmissionIndex = 0;
     pendingAdmissionCoverageGeneration = 0;
+    pendingAdmissionOwnerSet = new Set();
     pendingAdmissionSinceByOwner.clear();
     ownerTimingByOwner.clear();
     bootCohortOwnerKeys = null;
@@ -2362,6 +2415,8 @@ export function createStaticObjectStream({
       classifiedOwnerCount: 0,
       sortTargetOwnerCount: 0,
       queueCandidateCount: 0,
+      retainedAdmissionOwnerCount: 0,
+      freshAdmissionOwnerCount: 0,
       queueInsertionCount: 0,
     });
     ownerMetadataCache?.invalidateClassifications();
@@ -2401,6 +2456,9 @@ export function createStaticObjectStream({
     queue.length = 0;
     pendingAdmissionOwnerKeys = Object.freeze([]);
     pendingAdmissionIndex = 0;
+    pendingAdmissionCoverageGeneration = 0;
+    pendingAdmissionOwnerSet = new Set();
+    pendingAdmissionSinceByOwner.clear();
     tasks.clear();
     taskKeysByOwner.clear();
     ready.clear();

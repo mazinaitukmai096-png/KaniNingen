@@ -175,25 +175,67 @@ test('canonical Tree presentation keeps one Stable-ID population at every distan
   }) === 1), true, 'the complete Near identity set must be fully opaque');
 });
 
-test('Natural visibility contract preserves the formal Object-specific preset distances', () => {
+test('Natural visibility contract separates detail reach from shared World presence', () => {
   const expected = {
-    short: { tree: 163.636364, bush: 84, grass: 64, rock: 84 },
-    standard: { tree: 218.181818, bush: 112, grass: 67.2, rock: 112 },
-    current: { tree: 300, bush: 140, grass: 84, rock: 140 },
+    short: {
+      world: 163.636364,
+      detail: { tree: 163.636364, bush: 84, grass: 64, rock: 84 },
+    },
+    standard: {
+      world: 218.181818,
+      detail: { tree: 218.181818, bush: 112, grass: 67.2, rock: 112 },
+    },
+    current: {
+      world: 300,
+      detail: { tree: 300, bush: 140, grass: 84, rock: 140 },
+    },
   };
-  for (const [preset, visibilityByKind] of Object.entries(expected)) {
+  for (const [preset, values] of Object.entries(expected)) {
     const contract = resolveW8VegetationVisibilityContract(preset);
     assert.equal(contract.schemaVersion, W8_VEGETATION_VISIBILITY_CONTRACT_SCHEMA);
     assert.equal(contract.renderDistancePreset, preset);
     assert.equal(resolveW8VegetationVisibilityContract(preset), contract);
-    for (const [kind, exactDistanceMeters] of Object.entries(visibilityByKind)) {
+    for (const [kind, exactDistanceMeters] of Object.entries(values.detail)) {
+      const policy = resolveW8VegetationLodPolicy(kind, preset);
       assert.equal(contract.byKind[kind].exactDistanceMeters, exactDistanceMeters);
-      assert.equal(
-        contract.byKind[kind].exactDistanceMeters,
-        resolveW8VegetationLodPolicy(kind, preset).visibilityMeters,
-      );
-      assert.equal(contract.byKind[kind].horizonDistanceMeters, null);
+      if (kind === W8_VEGETATION_LOD_KINDS.TREE) {
+        assert.equal(contract.byKind[kind].envelopeDistanceMeters, values.world);
+        assert.equal(policy.visibilityMeters, values.world);
+        assert.equal(contract.byKind[kind].horizonDistanceMeters, null);
+      } else if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
+        assert.equal(policy.detailVisibilityMeters, exactDistanceMeters);
+        assert.equal(policy.visibilityMeters, exactDistanceMeters);
+        assert.equal(contract.byKind[kind].envelopeDistanceMeters, exactDistanceMeters);
+        assert.equal(contract.byKind[kind].horizonDistanceMeters, exactDistanceMeters);
+        assert.equal(policy.coarsePresenceEntry, undefined);
+        assert.equal(policy.coarsePresenceFade, undefined);
+        assert.equal(policy.coarsePresenceFogStartMeters, undefined);
+      } else {
+        assert.equal(contract.byKind[kind].envelopeDistanceMeters, values.world);
+        assert.equal(policy.visibilityMeters, values.world);
+        assert.equal(policy.detailVisibilityMeters, exactDistanceMeters);
+        assert.equal(contract.byKind[kind].horizonDistanceMeters, values.world);
+        assert.ok(policy.coarsePresenceEntry.minimum < policy.coarsePresenceEntry.maximum);
+        assert.ok(policy.coarsePresenceEntry.minimum < exactDistanceMeters);
+        assert.ok(policy.coarsePresenceEntry.maximum > exactDistanceMeters);
+        assert.ok(policy.coarsePresenceFade.minimum > policy.coarsePresenceEntry.maximum);
+        assert.equal(policy.coarsePresenceFade.maximum, values.world);
+        assert.ok(policy.coarsePresenceFogStartMeters > policy.coarsePresenceEntry.maximum);
+        assert.ok(policy.coarsePresenceFogStartMeters < values.world);
+      }
     }
+  }
+
+  assert.deepEqual(resolveW8VegetationLodPolicy('bush', 'current').atmosphericFade,
+    { minimum: 116, maximum: 140 });
+  assert.deepEqual(resolveW8VegetationLodPolicy('grass', 'current').coarsePresenceEntry,
+    { minimum: 78, maximum: 90 });
+  assert.deepEqual(resolveW8VegetationLodPolicy('rock', 'current').coarsePresenceEntry,
+    { minimum: 132, maximum: 148 });
+  for (const kind of ['grass', 'rock']) {
+    const policy = resolveW8VegetationLodPolicy(kind, 'current');
+    assert.deepEqual(policy.coarsePresenceFade, { minimum: 270, maximum: 300 });
+    assert.equal(policy.coarsePresenceFogStartMeters, 216);
   }
 });
 

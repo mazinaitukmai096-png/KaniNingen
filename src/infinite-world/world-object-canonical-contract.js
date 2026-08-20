@@ -6,7 +6,9 @@ import {
 import {
   W8_CURRENT_SETTLEMENT_LOD_METERS,
   W8_CURRENT_TREE_LOD_METERS,
-  W8_RENDER_DISTANCE_PRESETS,
+  W8_PRESENTATION_DISTANCE_KINDS,
+  W8_RENDER_DISTANCE_PRESET_IDS,
+  resolveW8PresentationDistanceProfile,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
 import {
@@ -26,11 +28,15 @@ export const W8_RESERVED_WORLD_DETAIL_TYPES = Object.freeze([
   'bench', 'trashBin', 'planter', 'vendingMachine', 'parkedCar', 'fence',
 ]);
 
-export const W8_CANONICAL_VISIBILITY_METERS = Object.freeze({
-  short: W8_RENDER_DISTANCE_PRESETS.short.generalObjectVisibilityMeters,
-  standard: W8_RENDER_DISTANCE_PRESETS.standard.generalObjectVisibilityMeters,
-  current: W8_RENDER_DISTANCE_PRESETS.current.generalObjectVisibilityMeters,
-});
+export const W8_CANONICAL_VISIBILITY_METERS = Object.freeze(Object.fromEntries(
+  Object.values(W8_RENDER_DISTANCE_PRESET_IDS).map(renderDistancePreset => [
+    renderDistancePreset,
+    resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.BUILDING,
+      renderDistancePreset,
+    ).visibilityMeters,
+  ]),
+));
 
 export const W8_HIGH_TREE_LOD_METERS = W8_CURRENT_TREE_LOD_METERS;
 
@@ -73,12 +79,12 @@ export const W8_TREE_CANONICAL_LOD_POLICY = Object.freeze({
 });
 
 export const W8_SHRUB_CANONICAL_LOD_POLICY = Object.freeze({
-  schemaVersion: 'w8-shrub-lod-policy-1',
+  schemaVersion: 'w8-shrub-decoration-lod-policy-2',
   visibilityClass: 'natural',
   near: nearTier,
-  outer: activeTier,
-  far: queriedTier,
-  presentationTiers: Object.freeze(['full', 'forest', 'atmospheric']),
+  outer: null,
+  far: null,
+  presentationTiers: Object.freeze(['full']),
   proxy: false,
 });
 
@@ -352,7 +358,7 @@ function resolveNatural(source) {
   const objectType = shrub ? 'shrub' : 'tree';
   const visualBounds = dimensions(visual.widthMeters, visual.heightMeters, visual.depthMeters);
   const radiusMeters = source.metadata?.candidateRadiusMeters ?? (shrub ? 0.2 : 0.625);
-  const collision = Object.freeze({
+  const collision = shrub ? noCollision(visualBounds.height) : Object.freeze({
     shape: 'horizontal-circle', radiusMeters, halfExtents: null,
     heightMeters: visualBounds.height, blocksPlayer: false,
   });
@@ -367,8 +373,8 @@ function resolveNatural(source) {
     visualBounds,
     matrixDimensionsMeters: visualBounds,
     collision,
-    interaction: interactionFromContract('tree', radiusMeters),
-    destructible: true,
+    interaction: shrub ? noInteraction : interactionFromContract('tree', radiusMeters),
+    destructible: !shrub,
     lodPolicy,
     presentation: presentation(visual.visualKind, W8_PARITY_FEATURE_PARTS[visual.visualKind], lodPolicy.presentationTiers),
     extension: {
@@ -598,9 +604,17 @@ export function resolveW8CanonicalWorldObject(source) {
 
 export function resolveW8ObjectVisibilityMeters(record, renderDistancePreset = 'current') {
   const policy = resolveW8RenderDistancePolicy(renderDistancePreset);
-  if (record?.lodPolicy?.visibilityClass === 'natural') return policy.naturalVisibilityMeters;
+  if (record?.lodPolicy?.visibilityClass === 'natural') {
+    return resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.NATURAL,
+      policy.id,
+    ).visibilityMeters;
+  }
   if (record?.lodPolicy?.visibilityClass === 'general-object') {
-    return policy.generalObjectVisibilityMeters;
+    return resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.BUILDING,
+      policy.id,
+    ).visibilityMeters;
   }
   if (record?.lodPolicy?.visibilityClass === 'near-only') return 0;
   const direct = record?.lodPolicy?.visibilityMeters?.[policy.id];

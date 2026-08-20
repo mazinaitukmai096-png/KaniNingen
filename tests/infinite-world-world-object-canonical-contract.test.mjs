@@ -122,7 +122,7 @@ test('Rock, Tree, Building, and Cow share one immutable canonical World Object s
   assert.deepEqual(canonicalCow.lodPolicy.presentationTiers, ['full', 'horizon']);
 });
 
-test('formal Shrub, ambient Grass/Shrub, Haystack, Street Lamp, and Road Sign share identity', () => {
+test('formal and ambient Shrub are pure Near-only decoration while other World Details retain identity', () => {
   const shrub = resolveW8CanonicalWorldObject(Object.freeze({
     ...tree,
     candidateId: 'detail-v1:vegetation:canonical-shrub',
@@ -170,16 +170,24 @@ test('formal Shrub, ambient Grass/Shrub, Haystack, Street Lamp, and Road Sign sh
   const ambientShrub = assertBaseContract(ambientShrubSource, 'shrub');
 
   assert.equal(shrub.objectType, 'shrub');
+  assert.equal(shrub.collision.shape, 'none');
   assert.equal(shrub.collision.blocksPlayer, false);
-  assert.equal(shrub.interaction.targetType, 'tree');
-  assert.equal(shrub.destruction.destructible, true);
-  assert.deepEqual(shrub.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
+  assert.equal(shrub.interaction.enabled, false);
+  assert.equal(shrub.interaction.targetType, null);
+  assert.equal(shrub.destruction.destructible, false);
+  assert.equal(shrub.lodPolicy.visibilityClass, 'natural');
+  assert.equal(shrub.lodPolicy.outer, null);
+  assert.equal(shrub.lodPolicy.far, null);
+  assert.deepEqual(shrub.lodPolicy.presentationTiers, ['full']);
   assert.equal(grass.stableId, grassSource.stableId);
   assert.deepEqual(grass.owner, owner);
   assert.equal(grass.destruction.destructible, false);
   assert.deepEqual(grass.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
+  assert.equal(ambientShrub.collision.shape, 'none');
+  assert.equal(ambientShrub.interaction.enabled, false);
   assert.equal(ambientShrub.destruction.destructible, false);
-  assert.deepEqual(ambientShrub.lodPolicy.presentationTiers, ['full', 'forest', 'atmospheric']);
+  assert.equal(ambientShrub.lodPolicy.visibilityClass, 'natural');
+  assert.deepEqual(ambientShrub.lodPolicy.presentationTiers, ['full']);
   assert.equal(haystack.objectType, 'haystack');
   assert.equal(haystack.collision.blocksPlayer, false);
   assert.equal(haystack.interaction.targetType, 'haystack');

@@ -40,7 +40,10 @@ import {
   FINITE_WORLD_UNITS_PER_METER,
   MIGRATED_SETTLEMENT_PROFILES,
 } from './single-rural-settlement.js';
-import { createW8NaturalPresentationPhase1Policy } from './w8-natural-presentation-policy.js';
+import {
+  W8_NATURAL_PRESENTATION_PHASE_1,
+  createW8NaturalPresentationPhase1Policy,
+} from './w8-natural-presentation-policy.js';
 import { createHashedW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import { createCanonicalOwnerCache } from './canonical-owner-cache.js';
 import { createPresentationManifestCache } from './presentation-manifest-cache.js';
@@ -653,6 +656,7 @@ function createNaturalPresentationLayer(
   { waterSurfaces, settlementLandmarks },
   experienceSpawn,
   naturalPresentationPolicy,
+  settlementDensityReferences = chunk.settlementReferences,
 ) {
   const compatibleVegetation = (chunk.vegetationCandidates ?? []).filter(candidate => !conflictsWithPresentation(
     candidate.worldPosition,
@@ -662,7 +666,7 @@ function createNaturalPresentationLayer(
   ));
   const vegetation = naturalPresentationPolicy.selectVegetation({
     candidates: compatibleVegetation,
-    settlementReferences: chunk.settlementReferences,
+    settlementReferences: settlementDensityReferences,
     experienceSpawn,
     introDistanceMeters: W8_SPAWN_SAFETY_CONTRACT.introDistanceMeters,
   });
@@ -786,7 +790,8 @@ async function createAmbientDetails(chunk, seed, worldSeedHash) {
         worldPosition: Object.freeze({ x, y: q6(terrain.height), z }),
         rotationY: q6(unit(seed, cellX, cellZ, 5) * Math.PI * 2),
         variation: q6(0.72 + unit(seed, cellX, cellZ, 6) * 0.56),
-        destructible: true,
+        // Ambient Grass/Flower/Bush are visual decoration only.
+        destructible: false,
         owningChunkCoordinate: Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ }),
       }));
     }
@@ -1160,7 +1165,7 @@ export async function createW8ParityChunkGenerator({
   const majorRoadSourceHashCache = createPendingSafeLruCache({
     capacity: cacheCapacities.majorRoadSourceHash,
   });
-  const canonicalSourceRevision = `${base.worldSeedHash}:${W8_PARITY_GENERATOR_VERSION.major}:${W8_CANONICAL_NATURAL_GROUND_REVISION}`;
+  const canonicalSourceRevision = `${base.worldSeedHash}:${W8_PARITY_GENERATOR_VERSION.major}:${W8_CANONICAL_NATURAL_GROUND_REVISION}:${naturalPresentationPolicy.schemaVersion}`;
   const canonicalOwnerCache = createCanonicalOwnerCache({
     capacity: cacheCapacities.canonicalOwner,
     identityOf: context => Object.freeze({
@@ -1964,6 +1969,33 @@ export async function createW8ParityChunkGenerator({
     );
   }
   const presentationInfluenceByType = Object.freeze({ CITY: 204, TOWN: 95, RURAL: 88 });
+  const naturalSettlementRecoveryScale =
+    W8_NATURAL_PRESENTATION_PHASE_1.settlementDensity.fullRecoveryRadiusScale;
+  const maximumSettlementRadiusMeters = Math.max(...Object.values(
+    MIGRATED_SETTLEMENT_PROFILES,
+  ).map(profile => profile.radius / FINITE_WORLD_UNITS_PER_METER));
+  if (maximumSettlementRadiusMeters * naturalSettlementRecoveryScale
+    > W5_SETTLEMENT_DISTRIBUTION.maximumInfluenceRadiusMeters + 1e-9) {
+    throw new RangeError(
+      'Natural Settlement Tree-density recovery exceeds Settlement distributor query coverage',
+    );
+  }
+  const settlementInfluencesNaturalOwner = (candidate, { chunkX, chunkZ }) => {
+    const radius = candidate?.radiusMeters;
+    if (!Number.isFinite(radius) || radius <= 0) return false;
+    const ownerCenterX = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const ownerCenterZ = (chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const ownerHalfDiagonal = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS / 2;
+    return Math.hypot(
+      ownerCenterX - candidate.center.x,
+      ownerCenterZ - candidate.center.z,
+    ) <= radius * naturalSettlementRecoveryScale + ownerHalfDiagonal;
+  };
+  const compactNaturalSettlementReference = candidate => Object.freeze({
+    stableId: candidate.settlementId,
+    center: candidate.center,
+    radiusMeters: candidate.radiusMeters,
+  });
   const settlementIntersectsPresentationOwner = (candidate, { chunkX, chunkZ }) => {
     const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
     const minimumZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
@@ -1980,11 +2012,15 @@ export async function createW8ParityChunkGenerator({
     { chunkX, chunkZ },
     overlayEntries,
     sharedMajorRoadsPromise = null,
+    naturalDensityCandidates = [],
   ) => {
     const overlays = overlayEntries.map(entry => entry.overlay);
     const settlementTemplates = overlayEntries.map(entry => entry.presentationTemplate);
     return Object.freeze({
       settlementTemplates: Object.freeze(settlementTemplates),
+      settlementDensityReferences: Object.freeze(
+        naturalDensityCandidates.map(compactNaturalSettlementReference),
+      ),
       naturalExclusionTemplates: Object.freeze(
         overlays.map(overlay => overlay.sourceTemplate),
       ),
@@ -2235,6 +2271,9 @@ export async function createW8ParityChunkGenerator({
     const candidatesByOwner = owners.map(owner => candidates.filter(candidate => (
       settlementIntersectsPresentationOwner(candidate, owner)
     )));
+    const naturalDensityCandidatesByOwner = owners.map(owner => candidates.filter(candidate => (
+      settlementInfluencesNaturalOwner(candidate, owner)
+    )));
     const requiredIds = new Set(candidatesByOwner.flatMap(ownerCandidates => (
       ownerCandidates.map(candidate => candidate.settlementId)
     )));
@@ -2261,6 +2300,7 @@ export async function createW8ParityChunkGenerator({
       owner,
       candidatesByOwner[index].map(candidate => entryBySettlementId.get(candidate.settlementId)),
       sharedMajorRoadsPromise,
+      naturalDensityCandidatesByOwner[index],
     )));
   };
   const presentationOwnerGeneratorPromise = createPresentationOwnerGenerator({
@@ -2305,8 +2345,21 @@ export async function createW8ParityChunkGenerator({
       ? await getSourceChunk(chunkX, chunkZ, stageRecorder)
       : await getSourceChunk(chunkX, chunkZ);
     const settlementToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.SETTLEMENT);
-    const overlayTemplates = await Promise.all(
-      (sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay),
+    const ownerCenterX = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const ownerCenterZ = (chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const ownerHalfDiagonal = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS / 2;
+    const [overlayTemplates, naturalDensityCandidates] = await Promise.all([
+      Promise.all((sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay)),
+      base.distributor.findSettlementsNear(
+        ownerCenterX,
+        ownerCenterZ,
+        ownerHalfDiagonal,
+      ).then(candidates => candidates.filter(candidate => (
+        settlementInfluencesNaturalOwner(candidate, { chunkX, chunkZ })
+      ))),
+    ]);
+    const naturalDensityReferences = Object.freeze(
+      naturalDensityCandidates.map(compactNaturalSettlementReference),
     );
     const settlementOverlayFeatures = overlayTemplates.filter(Boolean)
       .flatMap(template => template.buildings)
@@ -2460,6 +2513,7 @@ export async function createW8ParityChunkGenerator({
       chunkId,
       sourceChunkData,
       settlementReferences: Object.freeze(settlementReferences),
+      naturalDensityReferences,
       canonicalSurfacePolicy,
       riverProjection,
       groundPosition,
@@ -2502,6 +2556,7 @@ export async function createW8ParityChunkGenerator({
       reground,
       regroundNaturalCandidate,
       settlementReferences,
+      naturalDensityReferences,
     } = context;
     const [naturalWater, ambientDetailsRaw, distributedLandmarks, streetDetailsRaw] =
       await Promise.all([
@@ -2541,6 +2596,7 @@ export async function createW8ParityChunkGenerator({
       { waterSurfaces, settlementLandmarks },
       experienceSpawn,
       naturalPresentationPolicy,
+      naturalDensityReferences,
     );
     const natural = Object.freeze({
       ...selectedNatural,

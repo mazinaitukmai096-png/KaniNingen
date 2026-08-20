@@ -842,3 +842,40 @@ test('Near W8 canonical vegetation anchors every part at canonical position Y wi
     'Near broadleaf does not allocate a smooth SphereGeometry crown');
   await adapter.shutdown();
 });
+
+test('ambient Bush remains a Near-only decorative renderable with no gameplay-style state', async () => {
+  const bush = Object.freeze({
+    stableId: 'wf1:ambient-detail:near-decoration-bush',
+    detailType: 'shrub',
+    worldPosition: Object.freeze({ x: 8, y: 0.75, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+    rotationY: 0.4,
+    variation: 1.1,
+    destructible: false,
+  });
+  const chunk = {
+    chunkX: 0, chunkZ: 0, chunkId: 'near-decoration-bush', contentHash: 'sha256:test',
+    generatorVersion: { major: 800 },
+    terrain: {
+      resolution: { x: 2, z: 2 }, heights: [0, 0, 0, 0],
+      heightUnitMeters: 0.001, materialWeights: new Array(20).fill(0),
+    },
+    vegetationCandidates: [], rockCandidates: [], waterSurfaces: [], ambientDetails: [bush],
+    settlementFeatures: [], settlementLandmarks: [], streetDetails: [],
+  };
+  const canonical = resolveW8CanonicalWorldObject(bush);
+  assert.equal(canonical.objectType, 'shrub');
+  assert.equal(canonical.collision.shape, 'none');
+  assert.equal(canonical.interaction.enabled, false);
+  assert.equal(canonical.destruction.destructible, false);
+  assert.equal(canonical.lodPolicy.outer, null);
+  assert.equal(canonical.lodPolicy.far, null);
+
+  const adapter = new ChunkRenderAdapter({ THREE: FakeThree, scene: new Scene() });
+  const projected = await adapter.projectChunk(chunk);
+  await adapter.loadProjected(projected);
+  const entry = adapter.featureInstances.get(bush.stableId);
+  assert.ok(entry, 'ambient Bush must remain visible on the Near chunk path');
+  assert.ok(entry.parts.length > 0);
+  await adapter.shutdown();
+});

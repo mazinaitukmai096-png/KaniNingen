@@ -1,5 +1,9 @@
 import { deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
-import { W8_RENDER_DISTANCE_PRESETS } from './render-distance-policy.js';
+import {
+  W8_PRESENTATION_DISTANCE_KINDS,
+  W8_RENDER_DISTANCE_PRESET_IDS,
+  resolveW8PresentationDistanceProfile,
+} from './render-distance-policy.js';
 import { resolveW8CanonicalFarTreeDensityRank } from './vegetation-lod-policy.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
@@ -9,11 +13,31 @@ const smoothstep = value => {
 };
 
 export const W8_NATURAL_PRESENTATION_PHASE_1 = Object.freeze({
-  schemaVersion: 'w8-natural-presentation-phase-1',
+  // Keep the original field seed so this revision changes density deliberately
+  // without randomly relocating every grove/open-land feature in the world.
+  schemaVersion: 'w8-natural-presentation-phase-3',
+  fieldSeedVersion: 'w8-natural-presentation-phase-1',
   macroFieldSpacingMeters: 96,
   groveFieldSpacingMeters: 32,
   spawnFeatherMeters: 18,
   spawnHardClearanceMeters: 12,
+  settlementDensity: Object.freeze({
+    coreMaximumRadiusScale: 0.70,
+    innerFeatherMaximumRadiusScale: 1.00,
+    outerFeatherStartRadiusScale: 1.35,
+    fullRecoveryRadiusScale: 1.80,
+    coreFactor: 0.12,
+    innerFactor: 0.24,
+    outerFactor: 0.55,
+  }),
+  treeHabitat: Object.freeze({
+    macroFieldWeight: 0.25,
+    groveFieldWeight: 0.35,
+    minimumAcceptance: 0.18,
+    maximumAcceptance: 0.88,
+    contrastStart: 0.14,
+    contrastWidth: 0.30,
+  }),
 });
 
 // This is observer-independent world-generation membership, not a
@@ -22,11 +46,15 @@ export const W8_NATURAL_PRESENTATION_PHASE_1 = Object.freeze({
 // Near, Mid, and Far while avoiding submission of the former full Tree set.
 export const W8_CANONICAL_TREE_WORLD_DENSITY_THRESHOLD = 0.5;
 
-export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze({
-  short: W8_RENDER_DISTANCE_PRESETS.short.naturalVisibilityMeters,
-  standard: W8_RENDER_DISTANCE_PRESETS.standard.naturalVisibilityMeters,
-  current: W8_RENDER_DISTANCE_PRESETS.current.naturalVisibilityMeters,
-});
+export const W8_NATURAL_CANONICAL_VISIBILITY_METERS = Object.freeze(Object.fromEntries(
+  Object.values(W8_RENDER_DISTANCE_PRESET_IDS).map(renderDistancePreset => [
+    renderDistancePreset,
+    resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.NATURAL,
+      renderDistancePreset,
+    ).visibilityMeters,
+  ]),
+));
 
 function mix32(value) {
   let result = value >>> 0;
@@ -92,16 +120,34 @@ function distanceToSegment(point, start, end) {
 }
 
 export function evaluateW8SettlementDensityFactor(settlementReferences, point) {
+  const density = W8_NATURAL_PRESENTATION_PHASE_1.settlementDensity;
   let factor = 1;
   for (const reference of settlementReferences ?? []) {
     const radius = reference?.radiusMeters;
     if (!Number.isFinite(radius) || radius <= 0) continue;
     const q = Math.hypot(point.x - reference.center.x, point.z - reference.center.z) / radius;
     let candidateFactor = 1;
-    if (q <= 0.65) candidateFactor = 0.18;
-    else if (q < 0.8) candidateFactor = 0.18 + (0.28 - 0.18) * smoothstep((q - 0.65) / 0.15);
-    else if (q < 1) candidateFactor = 0.28 + (0.72 - 0.28) * smoothstep((q - 0.8) / 0.2);
-    else if (q < 1.25) candidateFactor = 0.72 + (1 - 0.72) * smoothstep((q - 1) / 0.25);
+    if (q <= density.coreMaximumRadiusScale) {
+      candidateFactor = density.coreFactor;
+    } else if (q < density.innerFeatherMaximumRadiusScale) {
+      candidateFactor = density.coreFactor
+        + (density.innerFactor - density.coreFactor) * smoothstep(
+          (q - density.coreMaximumRadiusScale)
+            / (density.innerFeatherMaximumRadiusScale - density.coreMaximumRadiusScale),
+        );
+    } else if (q < density.outerFeatherStartRadiusScale) {
+      candidateFactor = density.innerFactor
+        + (density.outerFactor - density.innerFactor) * smoothstep(
+          (q - density.innerFeatherMaximumRadiusScale)
+            / (density.outerFeatherStartRadiusScale - density.innerFeatherMaximumRadiusScale),
+        );
+    } else if (q < density.fullRecoveryRadiusScale) {
+      candidateFactor = density.outerFactor
+        + (1 - density.outerFactor) * smoothstep(
+          (q - density.outerFeatherStartRadiusScale)
+            / (density.fullRecoveryRadiusScale - density.outerFeatherStartRadiusScale),
+        );
+    }
     factor = Math.min(factor, candidateFactor);
   }
   return factor;
@@ -127,7 +173,7 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
   const seed64 = await deriveLocalSeed64({
     worldSeedHash,
     namespace: 'w8-natural-presentation-phase-1',
-    semanticKey: W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion,
+    semanticKey: W8_NATURAL_PRESENTATION_PHASE_1.fieldSeedVersion,
   });
   const macroSeed = seed32(seed64, 0x51ed270b);
   const groveSeed = seed32(seed64, 0x68bc21eb);
@@ -156,6 +202,7 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
     const slope = clamp((candidate.metadata?.slope ?? 0) / 0.18, 0, 1);
     const moisture = clamp(candidate.metadata?.moisture ?? 0, 0, 1);
     const rockiness = clamp(candidate.metadata?.rockiness ?? 0, 0, 1);
+    const habitat = W8_NATURAL_PRESENTATION_PHASE_1.treeHabitat;
     const habitatScore = clamp(
       biomeWeight(candidate, 'mixed-woodland') * 0.5
         + biomeWeight(candidate, 'wetland') * 0.2
@@ -164,16 +211,19 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
         + moisture * 0.15
         - slope * 0.25
         - rockiness * 0.2
-        + (macroField - 0.5) * 0.25
-        + (groveField - 0.5) * 0.35,
+        + (macroField - 0.5) * habitat.macroFieldWeight
+        + (groveField - 0.5) * habitat.groveFieldWeight,
       0,
       1,
     );
-    // Phase 1 works only from the legacy-visible Tree subset.  Preserve enough
-    // baseline acceptance for meadow candidates, then let the two continuous
-    // fields create the grove/open-land contrast instead of emptying a whole
-    // Settlement neighborhood.
-    const baseAcceptance = 0.44 + 0.36 * smoothstep((habitatScore - 0.12) / 0.36);
+    // The former 0.44 floor made almost every 64 m cell moderately wooded.
+    // Keep dense habitat capable of supporting a forest, but lower the floor
+    // and steepen the continuous response so the same world-fixed fields can
+    // produce broad, genuinely open land without distance-based Tree popping.
+    const baseAcceptance = habitat.minimumAcceptance
+      + (habitat.maximumAcceptance - habitat.minimumAcceptance) * smoothstep(
+        (habitatScore - habitat.contrastStart) / habitat.contrastWidth,
+      );
     const settlementFactor = evaluateW8SettlementDensityFactor(settlementReferences, point);
     const spawnFactor = evaluateW8SpawnDensityFactor({
       candidate,
@@ -204,14 +254,17 @@ export async function createW8NaturalPresentationPhase1Policy({ worldSeedHash })
     schemaVersion: W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion,
     evaluateTree,
     selectVegetation({ candidates, settlementReferences, experienceSpawn, introDistanceMeters }) {
+      // Formal shrub proposals are generation-only reservations. The actual
+      // Bush world decoration is the ambient-detail path, matching the finite
+      // game: non-colliding, non-destructible, and Near-only.
       return Object.freeze((candidates ?? []).filter(candidate => (
-        candidate?.subtype === 'shrub'
-          || evaluateTree({
-            candidate,
-            settlementReferences,
-            experienceSpawn,
-            introDistanceMeters,
-          }).accepted
+        candidate?.subtype !== 'shrub'
+        && evaluateTree({
+          candidate,
+          settlementReferences,
+          experienceSpawn,
+          introDistanceMeters,
+        }).accepted
       )));
     },
   });

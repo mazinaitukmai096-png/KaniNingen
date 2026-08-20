@@ -226,19 +226,25 @@ async function createRockCandidates(
   vegetationCandidates,
   sampleTerrainAt = sampleTerrain,
   sampleBiomeWeightsAt = sampleBiomeWeights,
+  proposalSampleRate = 1,
+  sharedFieldCache = null,
 ) {
   const size = W3_FORMAL_DETAILS.rockProposalCellSizeMeters;
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
   const startX = chunk.chunkX * cellsPerChunk;
   const startZ = chunk.chunkZ * cellsPerChunk;
   const owner = Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ });
-  const profile = Object.freeze({ ...baseProfile, fieldCache: new Map() });
+  const profile = Object.freeze({ ...baseProfile, fieldCache: sharedFieldCache ?? new Map() });
   const fieldRandom = createDeterministicRandom(profile.fieldSeed);
   const candidateTasks = [];
   for (let localZ = 0; localZ < cellsPerChunk; localZ += 1) {
     for (let localX = 0; localX < cellsPerChunk; localX += 1) {
       const proposalX = startX + localX; const proposalZ = startZ + localZ;
       const randomBase = cellRandomBase(placementSeed, proposalX, proposalZ);
+      // Sparse Far presentation evaluates only a deterministic subset of the
+      // canonical proposal lattice. Every admitted result is still produced by
+      // the exact Near Rock generator and therefore remains a real Rock.
+      if (proposalSampleRate < 1 && cellUnitFromBase(randomBase, 24) >= proposalSampleRate) continue;
       const point = {
         x: q6((proposalX + 0.5) * size + (cellUnitFromBase(randomBase, 21) - 0.5) * size * 0.54),
         z: q6((proposalZ + 0.5) * size + (cellUnitFromBase(randomBase, 22) - 0.5) * size * 0.54),
@@ -255,8 +261,8 @@ async function createRockCandidates(
         // Final G6-D occupancy can never exceed occupancyScale because both
         // eligibility and subtype occupancy are <= 1. This exact upper-bound
         // precheck avoids Terrain/field work for the other 81.3% of proposals.
-        if (await fieldRandom.float01(`occupancy:${occupancyKey}`)
-          >= G6_D_ROCK.proposal.occupancyScale) return null;
+        const occupancyRoll = await fieldRandom.float01(`occupancy:${occupancyKey}`);
+        if (occupancyRoll >= G6_D_ROCK.proposal.occupancyScale) return null;
         const terrain = sampleTerrainAt(chunk, point, 'rock');
         if (terrain.rockiness + terrain.rockMaterial + terrain.slope * 2 < 0.16) return null;
         const macro = macroEvaluator.evaluate(point.x, point.z);
@@ -268,8 +274,7 @@ async function createRockCandidates(
           + macroEvaluator.evaluate(point.x, point.z - step).offsetMm
           - 4 * macro.offsetMm
         ) * 0.001 / 4);
-        const sourceBiomeWeights = sampleBiomeWeightsAt(chunk, point);
-        return createRockCandidateG6D({
+        const candidate = await createRockCandidateG6D({
           profile,
           worldSeedHash: chunk.worldSeedHash,
           quantizedWorldCell,
@@ -286,9 +291,15 @@ async function createRockCandidates(
           },
           river: { distance: Infinity, width: 0 },
           vegetationCandidates,
-          sourceBiomeWeights,
           sourceFeatureIds: [],
+          occupancyRoll,
         });
+        if (!candidate) return null;
+        // Biome weights are output provenance only; defer them until the Rock
+        // has actually passed canonical occupancy so rejected proposals do not
+        // pay for interpolation.
+        candidate.sourceBiomeWeights = sampleBiomeWeightsAt(chunk, point);
+        return candidate;
       })().then(candidate => {
         if (!candidate) return null;
         candidate.owningChunkCoordinate = owner;
@@ -416,10 +427,18 @@ export async function createFormalNaturalCandidateKernel({
     vegetationCandidates,
     sampleTerrainAt = sampleTerrain,
     sampleBiomeWeightsAt = sampleBiomeWeights,
+    proposalSampleRate = 1,
+    sharedFieldCache = null,
   } = {}) => {
     const candidateInput = candidateInputFor(chunk);
     if (!Array.isArray(vegetationCandidates)) {
       throw new TypeError('canonical vegetation candidates are required for Rock conflicts');
+    }
+    if (!Number.isFinite(proposalSampleRate) || proposalSampleRate <= 0 || proposalSampleRate > 1) {
+      throw new RangeError('proposalSampleRate must be in (0, 1]');
+    }
+    if (sharedFieldCache !== null && !(sharedFieldCache instanceof Map)) {
+      throw new TypeError('sharedFieldCache must be a Map');
     }
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
     const rockCandidates = await createRockCandidates(
@@ -430,6 +449,8 @@ export async function createFormalNaturalCandidateKernel({
       vegetationCandidates,
       sampleTerrainAt,
       sampleBiomeWeightsAt,
+      proposalSampleRate,
+      sharedFieldCache,
     );
     const completedAt = globalThis.performance?.now?.() ?? Date.now();
     return Object.freeze({

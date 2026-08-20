@@ -8,7 +8,6 @@ import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
-import { resolveW8VegetationVisibilityContract } from './vegetation-lod-policy.js';
 
 const EPSILON = 1e-9;
 
@@ -21,21 +20,12 @@ export const RUNTIME_TERRAIN_READY_MAXIMUM_DISTANCE_METERS = 192;
 const currentRenderDistance = resolveW8RenderDistancePolicy(
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
 );
-const currentVegetationVisibility = resolveW8VegetationVisibilityContract(
-  W8_DEFAULT_RENDER_DISTANCE_PRESET,
-);
-
 // Resource coverage is a cache/data-availability bound only. It must never be
 // interpreted as evidence that an owner has a visible GPU-backed drawable;
 // that is tracked by the separate Visual Continuity lifecycle.
 // Remote Settlement metadata remains a sparse Presentation Resource query.
-export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS = Math.max(
-  currentRenderDistance.terrainRiverExtentMeters,
-  currentRenderDistance.fogFarMeters,
-  currentRenderDistance.generalObjectVisibilityMeters,
-  ...Object.values(currentVegetationVisibility.byKind)
-    .map(profile => profile.exactDistanceMeters),
-);
+export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS =
+  currentRenderDistance.distanceContract.residentCoverageDistanceMeters;
 export const RESIDENT_WORLD_REQUIRED_RADIUS_METERS =
   RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS + LOGICAL_CHUNK_SIZE_METERS;
 export const PRESENTATION_RESIDENT_RADIUS_METERS =

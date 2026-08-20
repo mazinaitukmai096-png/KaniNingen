@@ -459,6 +459,7 @@ export async function createW6ChunkGameplay({ chunkData, worldSeedHash, generato
   for (const candidate of vegetationCandidates) {
     if (usesW8Presentation && !isW8NaturalCandidateVisible(candidate)) continue;
     const canonical = usesW8Presentation ? resolveW8CanonicalWorldObject(candidate) : null;
+    if (canonical && canonical.interaction.enabled !== true) continue;
     const radius = canonical
       ? canonical.interaction.radiusMeters * 40
       : (candidate.metadata?.candidateRadiusMeters ?? 0.625) * 40;

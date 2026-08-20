@@ -80,6 +80,7 @@ import {
   createRenderFrameAcknowledger,
   createVisualContinuityRegistry,
 } from '../src/infinite-world/visual-continuity.js';
+import { createCanonicalTreeOwnerViewBroker } from '../src/infinite-world/sandbox-boot.js';
 
 const LEGACY_CHUNK_SIZE_METERS = 16;
 const LEGACY_FIVE_BY_FIVE_HALF_EXTENT_METERS = LEGACY_CHUNK_SIZE_METERS * 2.5;
@@ -806,6 +807,55 @@ test('deadline-aware Terrain scheduler bounds frame slices, prioritizes urgent w
   assert.equal(scheduler.resetDiagnostics(), true);
   assert.equal(scheduler.snapshot().terrainSliceCount, 0);
   assert.equal(scheduler.snapshot().terrainGenerationCount, 0);
+});
+
+test('deadline-aware Terrain scheduler adapts same-frame allowance to generation lag without hard throttling', async () => {
+  let now = 0;
+  const continuationTasks = [];
+  const scheduler = createDeadlineAwareTerrainPresentationScheduler({
+    clock: () => now,
+    setTimeoutFn: () => ({ type: 'timeout' }),
+    clearTimeoutFn: () => {},
+    postTaskFn: () => Promise.resolve(),
+    scheduleTaskFn: callback => continuationTasks.push(callback),
+    AbortControllerCtor: null,
+    normalSlicesPerFrame: 8,
+    urgentSlicesPerFrame: 10,
+  });
+  const generation = scheduler.beginGeneration({ isUrgent: () => false });
+
+  const first = scheduler.waitForContinuation();
+  let frame = scheduler.pumpFrame();
+  assert.equal(frame.allowance, 4,
+    'caught-up normal Terrain starts at half the proven maximum allowance');
+  assert.equal(frame.maximumAllowance, 8);
+  assert.equal(frame.pressureLevel, 'normal');
+  assert.equal((await first).source, 'frame');
+
+  now = 160;
+  const moderate = scheduler.waitForContinuation();
+  frame = scheduler.pumpFrame();
+  assert.equal(frame.allowance, 6,
+    'aging Terrain work raises allowance before traversal falls materially behind');
+  assert.equal(frame.pressureLevel, 'moderate');
+  assert.equal((await moderate).source, 'frame');
+
+  now = 340;
+  const severe = scheduler.waitForContinuation();
+  frame = scheduler.pumpFrame();
+  assert.equal(frame.allowance, 8,
+    'severely lagged Terrain regains the original maximum throughput');
+  assert.equal(frame.pressureLevel, 'severe');
+  assert.equal((await severe).source, 'frame');
+
+  scheduler.completeGeneration(generation, { cpuMs: 3.2, wallMs: now });
+  const snapshot = scheduler.snapshot();
+  assert.equal(snapshot.schemaVersion, 'terrain-presentation-deadline-scheduler-3');
+  assert.equal(snapshot.normalResumeDeadlineMs, 16);
+  assert.equal(snapshot.urgentResumeDeadlineMs, 6);
+  assert.equal(snapshot.frameAllowance, 8);
+  assert.equal(snapshot.framePressureLevel, 'severe');
+  assert.equal(snapshot.frameResumeCount, 3);
 });
 
 test('deadline-aware Terrain scheduler enforces normal fairness, deadline fallback, and shutdown', async () => {
@@ -6397,7 +6447,7 @@ test('clipmap topology and terrain sampling remain Float32-identical to the pre-
   );
 });
 
-test('persistent Static Natural pages publish only coarse Tree while detail availability stays separate', async t => {
+test('persistent Static Natural pages keep Bush out of coarse presence while detail availability stays separate', async t => {
   const vegetation = Object.freeze([
     Object.freeze({
       candidateId: 'detail-v1:vegetation:static-page-tree',
@@ -6406,7 +6456,7 @@ test('persistent Static Natural pages publish only coarse Tree while detail avai
       owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
       metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
     }),
-    ...Array.from({ length: 64 }, (_, index) => Object.freeze({
+    ...Array.from({ length: 4 }, (_, index) => Object.freeze({
       candidateId: `detail-v1:vegetation:static-page-bush:${index}`,
       subtype: 'shrub', variationSeed: 0.5, orientationSeed: 0.75,
       worldPosition: Object.freeze({ x: 89 + (index % 4), y: 0.4, z: 4 + (index % 8) }),
@@ -6414,25 +6464,24 @@ test('persistent Static Natural pages publish only coarse Tree while detail avai
       metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
     })),
   ]);
-  const rocks = Object.freeze(Array.from({ length: 64 }, (_, index) => Object.freeze({
-    candidateId: `detail-v1:rock:static-page:${index}`, candidateType: 'rock',
-    subtype: 'medium-rock', sizeClass: 'medium', variationSeed: 0.5,
-    orientationSeed: 0.25,
-    worldPosition: Object.freeze({ x: 90 + (index % 4), y: 0.4, z: 4 + (index % 8) }),
-    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
-    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
-  })));
-  const grass = Object.freeze(Array.from({ length: 48 }, (_, index) => Object.freeze({
-    stableId: `wf1:ambient-detail:static-page-grass:${index}`, detailType: 'grass',
-    worldPosition: Object.freeze({ x: 91 + (index % 4), y: 0.4, z: 4 + (index % 8) }), rotationY: 0,
-    variation: 1, owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
-  })));
+  const rocks = Object.freeze([]);
+  const ambientDetails = Object.freeze([
+    Object.freeze({
+      stableId: 'wf1:ambient-detail:static-page-bush',
+      detailType: 'shrub',
+      variation: 1,
+      rotationY: 0.25,
+      destructible: false,
+      worldPosition: Object.freeze({ x: 90, y: 0.4, z: 7 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    }),
+  ]);
   const chunk = canonicalChunk(5, 0, []);
   chunk.vegetationCandidates = vegetation;
   chunk.rockCandidates = rocks;
-  chunk.ambientDetails = grass;
+  chunk.ambientDetails = ambientDetails;
   chunk.presentationLayers.natural = { vegetation, rocks };
-  chunk.presentationLayers.ambientDetails = grass;
+  chunk.presentationLayers.ambientDetails = ambientDetails;
   const destroyed = new Set();
   const scene = new DistantTestGroup();
   const presentation = await createW8DistantPresentation({
@@ -6492,7 +6541,7 @@ test('persistent Static Natural pages publish only coarse Tree while detail avai
   const stableIds = audit.map(object => object.identity.stableId).sort();
   assert.deepEqual(new Set(audit.map(object => object.naturalLod.kind)),
     new Set(['tree']),
-  'Bush, Grass, and Rock never enter the coarse publication or receipt path');
+  'Macro coarse publication must not carry Bush decoration');
   assert.equal(new Set(audit.map(object => object.identity.stableId)).size, audit.length);
   assert.equal(snapshot.staticTreePromotionPendingOwnerCount, 0);
   assert.equal(snapshot.staticTreePromotionRequestCount, 0);
@@ -7208,26 +7257,10 @@ test('coarse Tree destruction hides its stable slot and survives Save Continue',
     owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
     metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
   });
-  const rock = Object.freeze({
-    candidateId: 'detail-v1:rock:destroy-continue',
-    candidateType: 'rock', subtype: 'medium-rock', sizeClass: 'medium',
-    variationSeed: 0.5, orientationSeed: 0.25,
-    worldPosition: Object.freeze({ x: 90, y: 0.4, z: 8 }),
-    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
-    metadata: Object.freeze({ candidateRadiusMeters: 0.22 }),
-  });
-  const bush = Object.freeze({
-    candidateId: 'detail-v1:vegetation:shrub:destroy-continue',
-    candidateType: 'vegetation',
-    subtype: 'shrub', variationSeed: 0.5, orientationSeed: 0.75,
-    worldPosition: Object.freeze({ x: 89, y: 0.4, z: 8 }),
-    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
-    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
-  });
   const chunk = canonicalChunk(5, 0, []);
-  chunk.vegetationCandidates = [tree, bush];
-  chunk.rockCandidates = [rock];
-  chunk.presentationLayers.natural = { vegetation: [tree, bush], rocks: [rock] };
+  chunk.vegetationCandidates = [tree];
+  chunk.rockCandidates = [];
+  chunk.presentationLayers.natural = { vegetation: [tree], rocks: [] };
   let activeState = new InfiniteWorldState({
     worldSeed: 'vegetation-continue',
     worldSeedHash: CANONICAL_WORLD_SEED_HASH,
@@ -7314,13 +7347,18 @@ test('coarse Tree destruction hides its stable slot and survives Save Continue',
   assert.equal(coarseTreeDrawable(), false,
     'destroyed Tree identity remains resident but cannot remain in the draw prefix');
   assert.equal(coarseAudit.length, 1,
-    'Bush and Rock remain Full/Near detail and have no persistent coarse slots');
+    'destroying one Tree keeps its canonical identity resident for Save/Continue');
+  assert.deepEqual(
+    new Set(coarseAudit.map(object => object.naturalLod.kind)),
+    new Set(['tree']),
+  );
   for (const object of coarseAudit) {
     assert.ok(object.instanceCount > 0,
       'destruction hides but does not rebuild the Presentation-owned Stable ID slots');
     assert.equal(object.ownerKey, '5,0');
   }
-  assert.equal(presentation.snapshot().naturalLodVisibleInstanceCount, 0);
+  assert.equal(presentation.snapshot().naturalLodVisibleInstanceCount, 0,
+    'destroyed Tree has no remaining visible Natural instance');
 
   const serialized = await encodeInfiniteWorldSave(activeState.createSaveSnapshot());
   const decoded = await decodeInfiniteWorldSave(serialized, {
@@ -7344,7 +7382,6 @@ test('coarse Tree destruction hides its stable slot and survives Save Continue',
     assert.equal(activeState.isFeatureDestroyed(tree.candidateId), true);
     assert.equal(coarseTreeDrawable(), false,
       'Save Continue and distance changes must not resubmit the destroyed Tree');
-    assert.equal(presentation.snapshot().naturalLodVisibleInstanceCount, 0);
   }
   presentation.dispose();
 });
@@ -7614,18 +7651,43 @@ test('coarse Tree submits one all-distance low-poly slot at every observer dista
   }
 });
 
-test('direct 64m canonical Tree batch publishes one low-poly identity through Distant and Near', async t => {
+test('direct 64m canonical Natural batch keeps Tree exclusive while publishing canonical Rock only', async t => {
   const generator = await createW8ParityChunkGenerator({
     worldSeed: 'KaniNingen Infinite Natural World',
   });
-  const batch = await generator.generateCanonicalTreeCell(0, 0);
+  const batch = await generator.generateCanonicalTreeCell(1, 0);
   assert.ok(batch.trees.length > 0, 'real canonical batch fixture must contain Trees');
-  const target = batch.trees[0];
-  const ownerKey = batch.ownerKeys[0];
-  const [ownerX, ownerZ] = ownerKey.split(',').map(Number);
-  const presentationOwner = await generator.generatePresentationOwner(ownerX, ownerZ);
+  const targetBoundary = batch.ownerBoundaries.find(boundary => boundary.treeCount > 0);
+  assert.ok(targetBoundary, 'real canonical batch fixture must contain Tree');
+  const target = batch.trees[targetBoundary.treeOffset];
+  const ownerKey = targetBoundary.ownerKey;
+  const ownerBroker = createCanonicalTreeOwnerViewBroker({
+    worldSeedHash: generator.worldSeedHash,
+    readyCapacity: 32,
+  });
+  assert.equal(ownerBroker.publishBatch(batch), 16);
+  const naturalOwnerView = await ownerBroker.requestOwner({ ownerKey }).promise;
+  const rockBoundary = batch.ownerBoundaries.find(boundary => boundary.rockCount > 0);
+  assert.ok(rockBoundary, 'real canonical batch fixture must contain one sparse canonical Rock');
+  const rockOwnerView = await ownerBroker.requestOwner({ ownerKey: rockBoundary.ownerKey }).promise;
+  const ownerNonTreeStableIds = [...new Set([
+    ...naturalOwnerView.resource.natural,
+    ...rockOwnerView.resource.natural,
+  ].filter(record => record.objectType !== 'tree').map(record => record.stableId))].sort();
+  assert.ok(ownerNonTreeStableIds.length > 0,
+    'the same Macro batch must supply bounded canonical Rock presence to its owner views');
+  assert.equal([...naturalOwnerView.resource.natural, ...rockOwnerView.resource.natural]
+    .some(record => ['grass', 'shrub'].includes(record.objectType)), false,
+  'Macro owner views must not publish Grass or Bush; Bush is Near-only decoration');
+  const rockTarget = rockOwnerView.resource.natural.find(record => record.objectType === 'rock');
+  assert.ok(rockTarget, 'fixture must expose one real canonical Rock');
+  assert.equal(rockTarget.coarsePresenceKind, 'canonical-rock');
+  assert.ok(rockTarget.stableId.startsWith('detail-v1:rock:'),
+    'Far Rock must retain the normal canonical Rock identity');
   let nearReceiptIds = [];
   let nearPublishedIds = [];
+  const playerLogicalX = 88;
+  const playerLogicalZ = 8;
   const destroyed = new Set();
   let targetRequestCount = 0;
   let nonTargetRequestCount = 0;
@@ -7648,7 +7710,7 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
     incrementalStaticTreePages: true,
     enableMacroCoarseWorld: true,
     generateCanonicalTreeCell: async ({ macroX, macroZ }) => {
-      if (macroX === 0 && macroZ === 0) {
+      if (macroX === 1 && macroZ === 0) {
         targetRequestCount += 1;
         return batch;
       }
@@ -7658,6 +7720,7 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
   });
   t.after(async () => {
     presentation.dispose();
+    ownerBroker.dispose();
     await generator.shutdown();
   });
   const renderOrigin = Object.freeze({
@@ -7674,8 +7737,8 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
     quality,
     renderDistancePreset: 'current',
     renderOrigin,
-    playerLogicalX: 8,
-    playerLogicalZ: 8,
+    playerLogicalX,
+    playerLogicalZ,
     activeDataKeys: batch.ownerKeys,
     renderedKeys: [],
     retainedOwnerKeys: batch.ownerKeys,
@@ -7686,14 +7749,21 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
   const presentationPage = {
     ownerKey,
     resourceKind: 'presentation',
-    value: presentationOwner.resource,
+    value: naturalOwnerView,
     readyAtMs: performance.now(),
     required: true,
   };
-  assert.equal(apply(1, [presentationPage]), true,
-    'PresentationOwner may complete first without becoming Tree authority');
+  const rockPresentationPage = {
+    ownerKey: rockBoundary.ownerKey,
+    resourceKind: 'presentation',
+    value: rockOwnerView,
+    readyAtMs: performance.now(),
+    required: true,
+  };
+  assert.equal(apply(1, [presentationPage, rockPresentationPage]), true,
+    'Macro owner views may publish canonical Rock presence without becoming Tree authority');
   for (let frame = 0; frame < 240; frame += 1) {
-    presentation.update(8, 8, renderOrigin);
+    presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
     const snapshot = presentation.snapshot();
     if (snapshot.macroCoarseWorld.canonicalTreeResidentCellCount === 1
@@ -7711,7 +7781,25 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
   let audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
     [value.identity.stableId, value]
   )));
-  assert.equal(Object.keys(audit).length, batch.trees.length);
+  assert.equal(Object.keys(audit).length, batch.trees.length + ownerNonTreeStableIds.length);
+  for (const stableId of ownerNonTreeStableIds) {
+    assert.ok(audit[stableId], 'owner-view canonical Rock presence must reach the renderer');
+    assert.equal(audit[stableId].naturalLod.kind, 'rock');
+  }
+  assert.equal(presentation.canonicalAuditSnapshot().some(value => (
+    value.naturalLod?.kind === 'bush'
+  )), false, 'Distant/Macro presentation must never publish Bush');
+  assert.deepEqual(audit[rockTarget.stableId].identity.worldPosition, {
+    x: rockTarget.position[0], y: rockTarget.position[1], z: rockTarget.position[2],
+  });
+  assert.ok(audit[rockTarget.stableId].instanceCount > 0);
+  assert.ok(audit[rockTarget.stableId].naturalLod.totalOpacity > 0,
+    'canonical Rock has no visibility hole in its Far band');
+  assert.equal(
+    presentation.canonicalAuditSnapshot().filter(value => value.identity.stableId === target.stableId).length,
+    1,
+    'Tree stays single-owned by the direct Macro page even when its owner view also contains Tree metadata',
+  );
   assert.deepEqual(audit[target.stableId].identity.worldPosition, {
     x: target.position[0], y: target.position[1], z: target.position[2],
   });
@@ -7731,12 +7819,28 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
   assert.equal(tierMeshes.some(mesh => mesh.userData.treePathMode === 'far'), false,
     'Distant Tree retains no second foliage-only representation');
 
+  const coarseNaturalMaterials = persistentRoot.children
+    .flatMap(mesh => Array.isArray(mesh.material) ? mesh.material : [mesh.material])
+    .filter(material => material?.userData?.canonicalCoarseNaturalPresence === true);
+  const coarseRockMaterial = coarseNaturalMaterials.find(material => (
+    material.userData?.naturalLodKind === 'rock'
+  ));
+  assert.ok(coarseRockMaterial, 'canonical coarse Rock material must exist');
+  assert.equal(coarseRockMaterial.userData.canonicalCoarseNaturalInnerContinuity, true,
+    'canonical coarse Rock must hold its identity inward until Near draw receipt');
+  assert.equal(coarseRockMaterial.userData.naturalLodUniforms.w8NaturalEnterStart.value, -1,
+    'canonical coarse Rock cannot fade out on approach before Near is drawable');
+  assert.equal(coarseRockMaterial.userData.naturalLodUniforms.w8NaturalEnterEnd.value, 0);
+  assert.equal(coarseNaturalMaterials.some(material => (
+    material.userData?.naturalLodKind === 'bush'
+  )), false, 'Bush has no coarse/Distant material');
+
   const rebuildsBeforeRace = snapshot.staticTreeOwnerRebuildCount;
   assert.equal(apply(2, [{ ...presentationPage, readyAtMs: performance.now() }]), true);
   presentation.update(8, 8, renderOrigin);
   snapshot = presentation.snapshot();
   assert.equal(snapshot.staticTreeOwnerRebuildCount, rebuildsBeforeRace,
-    'later PresentationOwner completion cannot rebuild the direct Tree authority');
+    'replayed owner presence cannot rebuild the direct Tree authority');
   assert.equal(presentation.presenterAuditSnapshot().duplicatePresenterCount, 0);
 
   nearPublishedIds = [target.stableId];
@@ -7767,19 +7871,51 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
     audit[target.stableId].naturalLod.farInstanceCount,
   ], [1, 0], 'Near departure restores the same single low-poly canonical identity');
 
+  nearPublishedIds = [rockTarget.stableId];
+  presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
+  audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
+    [value.identity.stableId, value]
+  )));
+  assert.notEqual(audit[rockTarget.stableId].visibleLod, 'near',
+    'Near publication without a completed receipt cannot blank canonical Rock');
+  assert.ok(audit[rockTarget.stableId].naturalLod.totalOpacity > 0);
+
+  nearReceiptIds = [rockTarget.stableId];
+  presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
+  audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
+    [value.identity.stableId, value]
+  )));
+  assert.equal(audit[rockTarget.stableId].visibleLod, 'near');
+  assert.deepEqual(audit[rockTarget.stableId].identity.worldPosition, {
+    x: rockTarget.position[0], y: rockTarget.position[1], z: rockTarget.position[2],
+  });
+
+  nearPublishedIds = [];
+  nearReceiptIds = [];
+  presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
+  audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
+    [value.identity.stableId, value]
+  )));
+  assert.notEqual(audit[rockTarget.stableId].visibleLod, 'near');
+  assert.ok(audit[rockTarget.stableId].naturalLod.totalOpacity > 0,
+    'Near departure restores the same canonical Rock identity');
+  assert.equal(presentation.canonicalAuditSnapshot().filter(value => (
+    value.identity.stableId === rockTarget.stableId
+  )).length, 1, 'Far/Near/Far handoff never duplicates the canonical Rock identity');
+
   destroyed.add(target.stableId);
   presentation.advanceStaticNaturalFrame({
     coverageGeneration: 2,
     planRevision: 2,
     planId: 'direct-tree:2',
     destructionRevision: target.stableId,
-    playerLogicalX: 8,
-    playerLogicalZ: 8,
+    playerLogicalX,
+    playerLogicalZ,
     activeDataKeys: batch.ownerKeys,
     renderedKeys: [],
   });
   for (let frame = 0; frame < 32; frame += 1) {
-    presentation.update(8, 8, renderOrigin);
+    presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
     audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
       [value.identity.stableId, value]
@@ -7794,7 +7930,7 @@ test('direct 64m canonical Tree batch publishes one low-poly identity through Di
 
   assert.equal(apply(3, [{ ...presentationPage, readyAtMs: performance.now() }], 'low'), true);
   for (let frame = 0; frame < 240; frame += 1) {
-    presentation.update(8, 8, renderOrigin);
+    presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
     snapshot = presentation.snapshot();
     if (snapshot.staticTreeCurrentPublishedOwnerCount === 16

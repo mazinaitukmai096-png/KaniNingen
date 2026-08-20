@@ -3,10 +3,18 @@ import assert from 'node:assert/strict';
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   W8_RENDER_FOG_COLOR_HEX,
+  W8_PRESENTATION_DISTANCE_KINDS,
+  W8_PRESENTATION_DISTANCE_LANES,
+  W8_RENDER_DISTANCE_CHANNELS,
   W8_RENDER_DISTANCE_PRESETS,
+  W8_WORLD_PRESENTATION_DISTANCE_CONTRACT_SCHEMA,
+  isW8PresentationDistanceKind,
   normalizeW8RenderDistancePreset,
+  resolveW8PresentationDistanceProfile,
+  resolveW8RenderDistanceMeters,
   resolveW8RenderDistancePolicy,
   resolveW8SettlementHandoffState,
+  resolveW8WorldPresentationDistanceContract,
 } from '../src/infinite-world/render-distance-policy.js';
 import {
   W8_SETTLEMENT_SILHOUETTE_COLOR_HEX,
@@ -48,6 +56,147 @@ test('Render Distance exposes the three exact presets from one immutable policy 
   assert.equal(Object.isFrozen(W8_RENDER_DISTANCE_PRESETS), true);
   assert.equal(resolveW8RenderDistancePolicy('invalid'), W8_RENDER_DISTANCE_PRESETS.current);
   assert.equal(normalizeW8RenderDistancePreset(undefined), 'current');
+});
+
+
+test('World Presentation Distance exposes one immutable shared contract without changing preset reach', () => {
+  const expected = {
+    short: {
+      world: 163.636364,
+      terrain: 192,
+      general: 112.5,
+      natural: 84,
+      innerWarm: 84,
+      settlementMetadata: 352,
+      worldScale: 0.545455,
+      detailScale: 0.6,
+    },
+    standard: {
+      world: 218.181818,
+      terrain: 256,
+      general: 150,
+      natural: 112,
+      innerWarm: 84,
+      settlementMetadata: 656.25,
+      worldScale: 0.727273,
+      detailScale: 0.8,
+    },
+    current: {
+      world: 300,
+      terrain: 352,
+      general: 187.5,
+      natural: 140,
+      innerWarm: 84,
+      settlementMetadata: 875,
+      worldScale: 1,
+      detailScale: 1,
+    },
+  };
+  for (const [presetId, values] of Object.entries(expected)) {
+    const policy = resolveW8RenderDistancePolicy(presetId);
+    const contract = resolveW8WorldPresentationDistanceContract(presetId);
+    assert.equal(contract, policy.worldPresentationDistanceContract);
+    assert.equal(contract, policy.distanceContract);
+    assert.equal(contract.schemaVersion, W8_WORLD_PRESENTATION_DISTANCE_CONTRACT_SCHEMA);
+    assert.equal(contract.renderDistancePreset, presetId);
+    assert.equal(Object.isFrozen(contract), true);
+    assert.equal(Object.isFrozen(contract.distanceByChannel), true);
+    assert.equal(Object.isFrozen(contract.lanes), true);
+    assert.equal(Object.isFrozen(contract.byKind), true);
+    assert.deepEqual(contract.distanceByChannel, {
+      [W8_RENDER_DISTANCE_CHANNELS.WORLD_PRESENTATION]: values.world,
+      [W8_RENDER_DISTANCE_CHANNELS.TERRAIN_COVERAGE]: values.terrain,
+      [W8_RENDER_DISTANCE_CHANNELS.GENERAL_DETAIL]: values.general,
+      [W8_RENDER_DISTANCE_CHANNELS.NATURAL_DETAIL]: values.natural,
+      [W8_RENDER_DISTANCE_CHANNELS.NATURAL_INNER_WARM]: values.innerWarm,
+      [W8_RENDER_DISTANCE_CHANNELS.SETTLEMENT_METADATA]: values.settlementMetadata,
+    });
+    for (const [channel, distanceMeters] of Object.entries(contract.distanceByChannel)) {
+      assert.equal(resolveW8RenderDistanceMeters(channel, presetId), distanceMeters);
+    }
+
+    assert.deepEqual(contract.lanes[W8_PRESENTATION_DISTANCE_LANES.WORLD], {
+      lane: 'world',
+      scale: values.worldScale,
+      visibilityMeters: values.world,
+      terrainCoverageMeters: values.terrain,
+    });
+    assert.deepEqual(contract.lanes[W8_PRESENTATION_DISTANCE_LANES.DETAIL], {
+      lane: 'detail',
+      scale: values.detailScale,
+      visibilityMeters: values.general,
+      naturalVisibilityMeters: values.natural,
+      naturalInnerWarmMeters: values.innerWarm,
+    });
+    assert.deepEqual(contract.lanes[W8_PRESENTATION_DISTANCE_LANES.METADATA], {
+      lane: 'metadata',
+      settlementQueryDistanceMeters: values.settlementMetadata,
+    });
+
+    const terrain = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.TERRAIN,
+      presetId,
+    );
+    const tree = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.TREE,
+      presetId,
+    );
+    const road = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.ROAD,
+      presetId,
+    );
+    const building = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.BUILDING,
+      presetId,
+    );
+    const natural = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.NATURAL,
+      presetId,
+    );
+    const settlement = resolveW8PresentationDistanceProfile(
+      W8_PRESENTATION_DISTANCE_KINDS.SETTLEMENT,
+      presetId,
+    );
+    assert.equal(terrain.visibilityMeters, values.world);
+    assert.equal(terrain.coverageMeters, values.terrain);
+    assert.equal(tree.visibilityMeters, values.world);
+    assert.equal(road.visibilityMeters, values.world);
+    assert.equal(building.visibilityMeters, values.general);
+    assert.equal(natural.visibilityMeters, values.natural);
+    assert.equal(natural.innerWarmMeters, values.innerWarm);
+    assert.equal(settlement.visibilityMeters, values.general);
+    assert.equal(settlement.queryDistanceMeters, values.settlementMetadata);
+
+    assert.equal(policy.worldPresentationDistanceMeters, values.world);
+    assert.equal(policy.terrainCoverageDistanceMeters, values.terrain);
+    assert.equal(policy.generalDetailDistanceMeters, values.general);
+    assert.equal(policy.naturalDetailDistanceMeters, values.natural);
+    assert.equal(policy.naturalInnerWarmDistanceMeters, values.innerWarm);
+    assert.equal(policy.settlementMetadataDistanceMeters, values.settlementMetadata);
+
+    // Compatibility aliases remain exact while runtime code migrates to the
+    // semantic contract above.
+    assert.equal(policy.fogFarMeters, policy.worldPresentationDistanceMeters);
+    assert.equal(
+      policy.majorSilhouetteVisibilityMeters,
+      policy.worldPresentationDistanceMeters,
+    );
+    assert.equal(policy.terrainRiverExtentMeters, policy.terrainCoverageDistanceMeters);
+    assert.equal(policy.generalObjectVisibilityMeters, policy.generalDetailDistanceMeters);
+    assert.equal(policy.naturalVisibilityMeters, policy.naturalDetailDistanceMeters);
+    assert.equal(policy.naturalInnerWarmMeters, policy.naturalInnerWarmDistanceMeters);
+    assert.equal(policy.settlementHorizonMeters, policy.settlementMetadataDistanceMeters);
+  }
+  assert.equal(isW8PresentationDistanceKind('tree'), true);
+  assert.equal(isW8PresentationDistanceKind('mob'), false);
+  assert.throws(
+    () => resolveW8PresentationDistanceProfile('mob', 'current'),
+    /unsupported World Presentation distance kind/,
+  );
+  assert.throws(
+    () => resolveW8RenderDistanceMeters('object-specific-distance', 'current'),
+    /unsupported Render Distance channel/,
+  );
 });
 
 test('Building handoff bands are centered on each unchanged full-distance boundary', () => {

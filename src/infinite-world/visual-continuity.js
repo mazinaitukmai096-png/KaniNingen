@@ -174,7 +174,11 @@ function stableIdSet(values, label) {
 }
 
 function setsEqual(left, right) {
-  return left.size === right.size && [...left].every(value => right.has(value));
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
 }
 
 function isCanonicalStructure(record) {
@@ -212,8 +216,12 @@ function embeddedTerrainOwnerKeys(mesh) {
   const visible = mesh?.userData?.visibleOwnerKeys;
   const owners = visible && typeof visible[Symbol.iterator] === 'function'
     ? visible : mesh?.userData?.ownerKeys;
-  if (!owners || typeof owners[Symbol.iterator] !== 'function') return new Set();
-  return new Set([...owners].filter(value => typeof value === 'string' && value));
+  const result = new Set();
+  if (!owners || typeof owners[Symbol.iterator] !== 'function') return result;
+  for (const value of owners) {
+    if (typeof value === 'string' && value) result.add(value);
+  }
+  return result;
 }
 
 function numericArray(values) {
@@ -365,7 +373,9 @@ function uniformNumber(uniforms, name) {
 }
 
 function smoothstep(edge0, edge1, value) {
-  if (![edge0, edge1, value].every(Number.isFinite)) return Number.NaN;
+  if (!Number.isFinite(edge0) || !Number.isFinite(edge1) || !Number.isFinite(value)) {
+    return Number.NaN;
+  }
   if (edge0 === edge1) return value < edge0 ? 0 : 1;
   const progress = Math.max(0, Math.min(1, (value - edge0) / (edge1 - edge0)));
   return progress * progress * (3 - 2 * progress);
@@ -381,7 +391,8 @@ function forestShaderOpacity(mesh, slot, receipt) {
   const anchorX = attributeSlotComponent(anchorAttribute, slot, 0, receipt);
   const anchorZ = attributeSlotComponent(anchorAttribute, slot, 1, receipt);
   const initialReveal = attributeSlotComponent(revealAttribute, slot, 0, receipt);
-  if (![anchorX, anchorZ, initialReveal].every(Number.isFinite)) return 0;
+  if (!Number.isFinite(anchorX) || !Number.isFinite(anchorZ)
+    || !Number.isFinite(initialReveal)) return 0;
 
   let maximumOpacity = 0;
   for (const material of materials) {
@@ -395,8 +406,11 @@ function forestShaderOpacity(mesh, slot, receipt) {
     const exitStart = uniformNumber(uniforms, 'w8NaturalExitStart');
     const exitEnd = uniformNumber(uniforms, 'w8NaturalExitEnd');
     const reveal = uniformNumber(uniforms, 'w8NaturalReveal');
-    if (![playerX, playerZ, unitsPerMeter, enterStart, enterEnd,
-      exitStart, exitEnd, reveal].every(Number.isFinite) || unitsPerMeter <= 0) continue;
+    if (!Number.isFinite(playerX) || !Number.isFinite(playerZ)
+      || !Number.isFinite(unitsPerMeter) || !Number.isFinite(enterStart)
+      || !Number.isFinite(enterEnd) || !Number.isFinite(exitStart)
+      || !Number.isFinite(exitEnd) || !Number.isFinite(reveal)
+      || unitsPerMeter <= 0) continue;
 
     const distanceMeters = Math.hypot(anchorX - playerX, anchorZ - playerZ) / unitsPerMeter;
     const mode = material.userData.naturalLodMode;
@@ -410,6 +424,78 @@ function forestShaderOpacity(mesh, slot, receipt) {
     if (Number.isFinite(shaderOpacity)) maximumOpacity = Math.max(maximumOpacity, shaderOpacity);
   }
   return maximumOpacity;
+}
+
+
+// Hot-path equivalent of forestShaderOpacity(). Resolve GPU mirrors and shader
+// uniforms once per mesh/receipt, then evaluate only per-slot anchor distance.
+// The scalar helper remains above for focused tests and non-hot callers.
+function createForestShaderOpacityEvaluator(mesh, receipt) {
+  const materials = naturalLodMaterials(mesh?.material);
+  if (materials.length === 0) return () => 1;
+
+  const anchorAttribute = mesh?.geometry?.attributes?.w8NaturalAnchorXZ;
+  const revealAttribute = mesh?.geometry?.attributes?.w8NaturalInitialReveal;
+  if (!anchorAttribute || !revealAttribute) return () => 0;
+  const anchors = gpuPreferredAttributeArray(anchorAttribute, receipt);
+  const reveals = gpuPreferredAttributeArray(revealAttribute, receipt);
+  const anchorItemSize = Number.isSafeInteger(anchorAttribute?.itemSize)
+    && anchorAttribute.itemSize > 0 ? anchorAttribute.itemSize : 1;
+  const revealItemSize = Number.isSafeInteger(revealAttribute?.itemSize)
+    && revealAttribute.itemSize > 0 ? revealAttribute.itemSize : 1;
+  if (!anchors || !reveals) return () => 0;
+
+  const materialStates = [];
+  for (const material of materials) {
+    const uniforms = material.userData.naturalLodUniforms;
+    const player = uniforms.w8NaturalPlayerLocalXZ?.value;
+    const playerX = Number(player?.x);
+    const playerZ = Number(player?.y ?? player?.z);
+    const unitsPerMeter = uniformNumber(uniforms, 'w8NaturalUnitsPerMeter');
+    const enterStart = uniformNumber(uniforms, 'w8NaturalEnterStart');
+    const enterEnd = uniformNumber(uniforms, 'w8NaturalEnterEnd');
+    const exitStart = uniformNumber(uniforms, 'w8NaturalExitStart');
+    const exitEnd = uniformNumber(uniforms, 'w8NaturalExitEnd');
+    const reveal = uniformNumber(uniforms, 'w8NaturalReveal');
+    if (!Number.isFinite(playerX) || !Number.isFinite(playerZ)
+      || !Number.isFinite(unitsPerMeter) || !Number.isFinite(enterStart)
+      || !Number.isFinite(enterEnd) || !Number.isFinite(exitStart)
+      || !Number.isFinite(exitEnd) || !Number.isFinite(reveal)
+      || unitsPerMeter <= 0) continue;
+    materialStates.push({
+      playerX, playerZ, unitsPerMeter, enterStart, enterEnd, exitStart, exitEnd, reveal,
+      mode: material.userData.naturalLodMode,
+      coarseMidTree: material.userData.canonicalCoarseTree === true
+        && material.userData.naturalLodMode === 'forest',
+    });
+  }
+  if (materialStates.length === 0) return () => 0;
+
+  return slot => {
+    const anchorOffset = slot * anchorItemSize;
+    const revealOffset = slot * revealItemSize;
+    const anchorX = Number(anchors[anchorOffset]);
+    const anchorZ = Number(anchors[anchorOffset + 1]);
+    const initialReveal = Number(reveals[revealOffset]);
+    if (!Number.isFinite(anchorX) || !Number.isFinite(anchorZ)
+      || !Number.isFinite(initialReveal)) return 0;
+    let maximumOpacity = 0;
+    for (const state of materialStates) {
+      const dx = anchorX - state.playerX;
+      const dz = anchorZ - state.playerZ;
+      const distanceMeters = Math.sqrt(dx * dx + dz * dz) / state.unitsPerMeter;
+      const entryOpacity = state.mode === 'full' || state.coarseMidTree
+        ? 1 : smoothstep(state.enterStart, state.enterEnd, distanceMeters);
+      const exitOpacity = 1 - smoothstep(state.exitStart, state.exitEnd, distanceMeters);
+      const streamReveal = Math.max(Math.max(0, Math.min(1, initialReveal)), state.reveal);
+      const handoffOpacity = initialReveal >= -0.5 ? 1 : 0;
+      const shaderOpacity = entryOpacity * exitOpacity * streamReveal * handoffOpacity;
+      if (Number.isFinite(shaderOpacity) && shaderOpacity > maximumOpacity) {
+        maximumOpacity = shaderOpacity;
+      }
+    }
+    return maximumOpacity;
+  };
 }
 
 function inheritedChunkOwnerKey(object) {
@@ -820,24 +906,28 @@ function matrixElements(matrix) {
   return ArrayBuffer.isView(values) || Array.isArray(values) ? values : null;
 }
 
-function matrixOffsetElements(attribute, slot) {
+function isValidDrawableMatrixElements(values, offset = 0) {
+  if (!values || values.length < offset + 16) return false;
+  for (let index = offset; index < offset + 16; index += 1) {
+    if (!Number.isFinite(values[index])) return false;
+  }
+  // A finite but zero-scale instance reaches the draw call while producing no
+  // visible fragments. It therefore cannot be renderer evidence for a visual
+  // component.
+  return Math.hypot(values[offset], values[offset + 1], values[offset + 2]) > Number.EPSILON
+    && Math.hypot(values[offset + 4], values[offset + 5], values[offset + 6]) > Number.EPSILON
+    && Math.hypot(values[offset + 8], values[offset + 9], values[offset + 10]) > Number.EPSILON;
+}
+
+function isValidDrawableMatrixSlot(attribute, slot) {
+  if (!Number.isSafeInteger(slot) || slot < 0) return false;
   const values = attributeArray(attribute);
-  const offset = slot * 16;
-  return values && Number.isSafeInteger(slot) && slot >= 0 && values.length >= offset + 16
-    ? values.subarray?.(offset, offset + 16) ?? values.slice(offset, offset + 16)
-    : null;
+  return isValidDrawableMatrixElements(values, slot * 16);
 }
 
 export function isValidDrawableMatrix(matrix) {
   const values = matrixElements(matrix);
-  if (values === null || values.length < 16
-    || !Array.from(values).slice(0, 16).every(Number.isFinite)) return false;
-  // A finite but zero-scale instance reaches the draw call while producing no
-  // visible fragments. It therefore cannot be renderer evidence for a visual
-  // component.
-  return Math.hypot(values[0], values[1], values[2]) > Number.EPSILON
-    && Math.hypot(values[4], values[5], values[6]) > Number.EPSILON
-    && Math.hypot(values[8], values[9], values[10]) > Number.EPSILON;
+  return isValidDrawableMatrixElements(values, 0);
 }
 
 function objectWorldVisible(object) {
@@ -848,11 +938,72 @@ function objectWorldVisible(object) {
 }
 
 function effectiveMaterialOpacity(material) {
-  const values = Array.isArray(material) ? material : [material];
-  if (values.length === 0 || values.every(value => !value)) return 0;
-  return Math.max(...values.filter(Boolean).map(value => (
-    value.visible === false ? 0 : Number.isFinite(value.opacity) ? value.opacity : 1
-  )));
+  if (Array.isArray(material)) {
+    if (material.length === 0) return 0;
+    let maximum = Number.NEGATIVE_INFINITY;
+    let found = false;
+    for (const value of material) {
+      if (!value) continue;
+      found = true;
+      const opacity = value.visible === false
+        ? 0 : Number.isFinite(value.opacity) ? value.opacity : 1;
+      if (opacity > maximum) maximum = opacity;
+    }
+    return found ? maximum : 0;
+  }
+  if (!material) return 0;
+  if (material.visible === false) return 0;
+  return Number.isFinite(material.opacity) ? material.opacity : 1;
+}
+
+function drawableAttributeMatchesReceipt(attribute, receipt) {
+  if (!attributeArray(attribute)) return false;
+  return !receipt.gpuMirror || receipt.gpuMirror.matches(attribute);
+}
+
+function drawableAttributesMatchReceipt(mesh, receipt, requiredAttributes = null) {
+  if (requiredAttributes !== null) {
+    for (const attribute of requiredAttributes) {
+      if (!drawableAttributeMatchesReceipt(attribute, receipt)) return false;
+    }
+    return true;
+  }
+  const attributes = mesh?.geometry?.attributes ?? null;
+  if (attributes) {
+    for (const name in attributes) {
+      if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
+      const attribute = attributes[name];
+      if (attribute && !drawableAttributeMatchesReceipt(attribute, receipt)) return false;
+    }
+  }
+  if (mesh?.geometry?.index
+    && !drawableAttributeMatchesReceipt(mesh.geometry.index, receipt)) return false;
+  if (mesh?.instanceMatrix
+    && !drawableAttributeMatchesReceipt(mesh.instanceMatrix, receipt)) return false;
+  if (mesh?.instanceColor
+    && !drawableAttributeMatchesReceipt(mesh.instanceColor, receipt)) return false;
+  return true;
+}
+
+function drawableInCompletedFrame(
+  mesh,
+  receipt,
+  matrix = null,
+  effectiveOpacity = null,
+  requiredAttributes = null,
+  matrixAttribute = null,
+  matrixSlot = null,
+) {
+  if (!isCompletedRenderFrameReceipt(receipt) || !mesh
+    || !objectBelongsToCompletedFrame(mesh, receipt) || !objectWorldVisible(mesh)) return false;
+  if (!mesh.geometry) return false;
+  if (matrixAttribute) {
+    if (!isValidDrawableMatrixSlot(matrixAttribute, matrixSlot)) return false;
+  } else if (!isValidDrawableMatrix(matrix ?? mesh?.matrixWorld ?? mesh?.matrix)) return false;
+  if (Number.isFinite(mesh.count) && mesh.count <= 0) return false;
+  const opacity = effectiveOpacity ?? effectiveMaterialOpacity(mesh.material);
+  if (!Number.isFinite(opacity) || opacity <= 0) return false;
+  return drawableAttributesMatchReceipt(mesh, receipt, requiredAttributes);
 }
 
 export function isDrawableInCompletedFrame({
@@ -862,18 +1013,9 @@ export function isDrawableInCompletedFrame({
   effectiveOpacity = null,
   requiredAttributes = null,
 } = {}) {
-  if (!isCompletedRenderFrameReceipt(receipt) || !mesh
-    || !objectBelongsToCompletedFrame(mesh, receipt) || !objectWorldVisible(mesh)) return false;
-  if (!mesh.geometry || !isValidDrawableMatrix(matrix)) return false;
-  if (Number.isFinite(mesh.count) && mesh.count <= 0) return false;
-  const opacity = effectiveOpacity ?? effectiveMaterialOpacity(mesh.material);
-  if (!Number.isFinite(opacity) || opacity <= 0) return false;
-  const attributes = requiredAttributes ?? drawableAttributes(mesh);
-  if (attributes.some(attribute => !attributeArray(attribute))) return false;
-  if (receipt.gpuMirror && attributes.some(attribute => !receipt.gpuMirror.matches(attribute))) {
-    return false;
-  }
-  return true;
+  return drawableInCompletedFrame(
+    mesh, receipt, matrix, effectiveOpacity, requiredAttributes,
+  );
 }
 
 export function hasDrawableInCompletedFrame({ root, receipt, predicate = () => true } = {}) {
@@ -1046,7 +1188,6 @@ export function createVisualContinuityRegistry({
   }
   const records = new Map();
   let sequence = 0;
-  let coarseRequirementRevision = 0;
   const canonicalCoarseTreeReceiptCache = new WeakMap();
   let canonicalCoarseTreeSlotScanCount = 0;
   let canonicalCoarseTreeSlotScanEarlyOutCount = 0;
@@ -1171,7 +1312,6 @@ export function createVisualContinuityRegistry({
         nearRepresentationAvailableAt: null,
       };
       records.set(key, record);
-      coarseRequirementRevision += 1;
       emit('expected', record);
     } else {
       record.expectedAt = Math.min(record.expectedAt, expected);
@@ -1272,7 +1412,6 @@ export function createVisualContinuityRegistry({
       return frozenOwnerRecord(record, now());
     }
     record.coarseRequirementsResolvedAt = timestamp;
-    coarseRequirementRevision += 1;
     record.terrainRequired = true;
     record.requiredStructureStableIds = structureStableIds;
     record.requiredForestStableIds = forestStableIds;
@@ -1309,7 +1448,6 @@ export function createVisualContinuityRegistry({
       changed ||= declared;
     }
     if (changed) emit('destroyed-requirements-excluded', record);
-    if (changed) coarseRequirementRevision += 1;
     promoteWhenCoarseComplete(record);
     return frozenOwnerRecord(record, now());
   };
@@ -1326,6 +1464,23 @@ export function createVisualContinuityRegistry({
     return evidence;
   };
 
+  const rememberCoarseComponentStableIdReceiptEvidence = ({
+    record,
+    component,
+    stableId,
+    receipt,
+  }) => {
+    const evidence = coarseComponentReceiptEvidence(receipt);
+    const byOwner = component === 'structure'
+      ? evidence.structureStableIdsByOwner : evidence.forestStableIdsByOwner;
+    let ownerStableIds = byOwner.get(record.ownerKey);
+    if (!ownerStableIds) {
+      ownerStableIds = new Set();
+      byOwner.set(record.ownerKey, ownerStableIds);
+    }
+    ownerStableIds.add(stableId);
+  };
+
   const rememberCoarseComponentReceiptEvidence = ({
     record,
     component,
@@ -1337,84 +1492,103 @@ export function createVisualContinuityRegistry({
       evidence.terrainOwnerKeys.add(record.ownerKey);
       return;
     }
-    const byOwner = component === 'structure'
-      ? evidence.structureStableIdsByOwner : evidence.forestStableIdsByOwner;
-    let ownerStableIds = byOwner.get(record.ownerKey);
-    if (!ownerStableIds) {
-      ownerStableIds = new Set();
-      byOwner.set(record.ownerKey, ownerStableIds);
+    for (const stableId of stableIds) {
+      rememberCoarseComponentStableIdReceiptEvidence({
+        record, component, stableId, receipt,
+      });
     }
-    for (const stableId of stableIds) ownerStableIds.add(stableId);
   };
 
   const finalizeCurrentReceiptCoarseComponentMetrics = (receipt, evidence) => {
-    const activeRecords = [...records.values()]
-      .filter(record => record.state !== VISUAL_CONTINUITY_STATE.RETIRING);
-    const resolvedRecords = activeRecords
-      .filter(record => record.coarseRequirementsResolvedAt !== null);
+    const activeRecords = [];
+    const resolvedRecords = [];
+    for (const record of records.values()) {
+      if (record.state === VISUAL_CONTINUITY_STATE.RETIRING) continue;
+      activeRecords.push(record);
+      if (record.coarseRequirementsResolvedAt !== null) resolvedRecords.push(record);
+    }
+
     // Current missing includes owners still in their initial fill. The
     // cumulative counter advances only when that same requirement has already
     // crossed an earlier completed receipt, which makes the miss a real
     // presentation disappearance without reversing the owner's lifecycle.
-    const missingTerrainRecords = resolvedRecords.filter(record => (
-      record.terrainRequired && !evidence.terrainOwnerKeys.has(record.ownerKey)
-    ));
-    const terrainDisappearances = missingTerrainRecords
-      .filter(record => record.terrainDrawableAt !== null);
+    const missingTerrainRecords = [];
+    const terrainDisappearances = [];
+    let terrainRequiredCount = 0;
+    let terrainDrawableCount = 0;
+    for (const record of resolvedRecords) {
+      if (!record.terrainRequired) continue;
+      terrainRequiredCount += 1;
+      if (evidence.terrainOwnerKeys.has(record.ownerKey)) {
+        terrainDrawableCount += 1;
+        continue;
+      }
+      missingTerrainRecords.push(record);
+      if (record.terrainDrawableAt !== null) terrainDisappearances.push(record);
+    }
     if (terrainDisappearances.length > 0) terrainDisappearanceFrameCount += 1;
 
-    const stableIdComponentMetric = (component, frameCount) => {
+    const stableIdComponentMetric = component => {
       const requiredStableIdsField = component === 'structure'
         ? 'requiredStructureStableIds' : 'requiredForestStableIds';
       const drawnStableIdsField = component === 'structure'
         ? 'structureDrawnAtByStableId' : 'forestDrawnAtByStableId';
       const presentedByOwner = component === 'structure'
         ? evidence.structureStableIdsByOwner : evidence.forestStableIdsByOwner;
-      const missing = resolvedRecords.flatMap(record => (
-        [...record[requiredStableIdsField]]
-          .filter(stableId => !presentedByOwner.get(record.ownerKey)?.has(stableId))
-          .map(stableId => ({ record, ownerKey: record.ownerKey, stableId }))
-      )).sort((left, right) => left.ownerKey.localeCompare(right.ownerKey)
-        || left.stableId.localeCompare(right.stableId));
-      const disappearances = missing.filter(({ record, stableId }) => (
-        record[drawnStableIdsField].has(stableId)
-      ));
-      const freezeRequirements = requirements => Object.freeze(requirements.map(
+      const missing = [];
+      let requiredCount = 0;
+      let hasDisappearance = false;
+      for (const record of resolvedRecords) {
+        const requiredStableIds = record[requiredStableIdsField];
+        requiredCount += requiredStableIds.size;
+        const presentedStableIds = presentedByOwner.get(record.ownerKey);
+        if (presentedStableIds?.size === requiredStableIds.size) {
+          // The presenter evidence can only contain declared component IDs, so
+          // equal cardinality proves the complete owner component without an
+          // O(N) Stable-ID membership walk on unchanged receipts.
+          continue;
+        }
+        for (const stableId of requiredStableIds) {
+          if (presentedStableIds?.has(stableId)) continue;
+          const entry = { record, ownerKey: record.ownerKey, stableId };
+          missing.push(entry);
+          if (record[drawnStableIdsField].has(stableId)) hasDisappearance = true;
+        }
+      }
+      if (hasDisappearance) {
+        if (component === 'structure') structureDisappearanceFrameCount += 1;
+        else forestDisappearanceFrameCount += 1;
+      }
+      if (missing.length > 1) {
+        missing.sort((left, right) => left.ownerKey.localeCompare(right.ownerKey)
+          || left.stableId.localeCompare(right.stableId));
+      }
+      const disappearances = hasDisappearance
+        ? missing.filter(({ record, stableId }) => record[drawnStableIdsField].has(stableId))
+        : [];
+      const missingStableIds = Object.freeze(missing.map(({ stableId }) => stableId));
+      const missingRequirements = Object.freeze(missing.map(({ ownerKey, stableId }) => (
+        Object.freeze({ ownerKey, stableId })
+      )));
+      const disappearanceStableIds = Object.freeze(
+        disappearances.map(({ stableId }) => stableId),
+      );
+      const disappearanceRequirements = Object.freeze(disappearances.map(
         ({ ownerKey, stableId }) => Object.freeze({ ownerKey, stableId }),
       ));
-      const requiredCount = resolvedRecords.reduce(
-        (count, record) => count + record[requiredStableIdsField].size,
-        0,
-      );
       return Object.freeze({
         requiredCount,
         drawableCount: requiredCount - missing.length,
         missingCount: missing.length,
-        missingStableIds: Object.freeze(missing.map(({ stableId }) => stableId)),
-        missingRequirements: freezeRequirements(missing),
+        missingStableIds,
+        missingRequirements,
         disappearanceCount: disappearances.length,
-        disappearanceStableIds: Object.freeze(
-          disappearances.map(({ stableId }) => stableId),
-        ),
-        disappearanceRequirements: freezeRequirements(disappearances),
-        disappearanceFrameCount: frameCount,
+        disappearanceStableIds,
+        disappearanceRequirements,
+        disappearanceFrameCount: component === 'structure'
+          ? structureDisappearanceFrameCount : forestDisappearanceFrameCount,
       });
     };
-
-    const structureMissingBefore = resolvedRecords.some(record => (
-      [...record.requiredStructureStableIds].some(stableId => (
-        !evidence.structureStableIdsByOwner.get(record.ownerKey)?.has(stableId)
-        && record.structureDrawnAtByStableId.has(stableId)
-      ))
-    ));
-    const forestMissingBefore = resolvedRecords.some(record => (
-      [...record.requiredForestStableIds].some(stableId => (
-        !evidence.forestStableIdsByOwner.get(record.ownerKey)?.has(stableId)
-        && record.forestDrawnAtByStableId.has(stableId)
-      ))
-    ));
-    if (structureMissingBefore) structureDisappearanceFrameCount += 1;
-    if (forestMissingBefore) forestDisappearanceFrameCount += 1;
 
     const missingTerrainOwnerKeys = Object.freeze(
       missingTerrainRecords.map(record => record.ownerKey).sort(),
@@ -1428,21 +1602,16 @@ export function createVisualContinuityRegistry({
       requirementsResolvedOwnerCount: resolvedRecords.length,
       requirementsUnresolvedOwnerCount: activeRecords.length - resolvedRecords.length,
       terrain: Object.freeze({
-        requiredCount: resolvedRecords.filter(record => record.terrainRequired).length,
-        drawableCount: resolvedRecords.filter(record => (
-          record.terrainRequired && evidence.terrainOwnerKeys.has(record.ownerKey)
-        )).length,
+        requiredCount: terrainRequiredCount,
+        drawableCount: terrainDrawableCount,
         missingCount: missingTerrainRecords.length,
         missingOwnerKeys: missingTerrainOwnerKeys,
         disappearanceCount: terrainDisappearances.length,
         disappearanceOwnerKeys,
         disappearanceFrameCount: terrainDisappearanceFrameCount,
       }),
-      structure: stableIdComponentMetric(
-        'structure',
-        structureDisappearanceFrameCount,
-      ),
-      forest: stableIdComponentMetric('forest', forestDisappearanceFrameCount),
+      structure: stableIdComponentMetric('structure'),
+      forest: stableIdComponentMetric('forest'),
     });
   };
 
@@ -1477,7 +1646,15 @@ export function createVisualContinuityRegistry({
       }
       if (componentStableIds.size === 0) return false;
     }
-    if (!isDrawableInCompletedFrame({ ...drawable, receipt })) return false;
+    if (!drawableInCompletedFrame(
+      drawable?.mesh,
+      receipt,
+      drawable?.matrix ?? null,
+      drawable?.effectiveOpacity ?? null,
+      drawable?.requiredAttributes ?? null,
+      drawable?.matrixAttribute ?? null,
+      drawable?.matrixSlot ?? null,
+    )) return false;
     const timestamp = receipt.completedAtMs;
     const evidence = Object.freeze({
       actualDrawableAt: timestamp,
@@ -1515,6 +1692,40 @@ export function createVisualContinuityRegistry({
     return true;
   };
 
+  const acknowledgePreviouslyDrawnTerrain = ({ record, receipt } = {}) => {
+    if (!record || record.state === VISUAL_CONTINUITY_STATE.RETIRING
+      || record.terrainDrawableAt === null) return false;
+    coarseComponentReceiptEvidence(receipt).terrainOwnerKeys.add(record.ownerKey);
+    const timestamp = receipt.completedAtMs;
+    record.lastActualDrawAt = Math.max(record.lastActualDrawAt ?? timestamp, timestamp);
+    if (onTransition) emit('terrain-actual-drawable', record);
+    return true;
+  };
+
+  const acknowledgePreviouslyDrawnCoarseStableId = ({
+    record,
+    component,
+    stableId,
+    receipt,
+  }) => {
+    if (!record || record.state === VISUAL_CONTINUITY_STATE.RETIRING) return false;
+    const requiredStableIds = component === 'structure'
+      ? record.requiredStructureStableIds : record.requiredForestStableIds;
+    const drawnStableIds = component === 'structure'
+      ? record.structureDrawnAtByStableId : record.forestDrawnAtByStableId;
+    if (!requiredStableIds.has(stableId) || !drawnStableIds.has(stableId)) return false;
+    rememberCoarseComponentStableIdReceiptEvidence({
+      record, component, stableId, receipt,
+    });
+    const timestamp = receipt.completedAtMs;
+    record.lastActualDrawAt = Math.max(record.lastActualDrawAt ?? timestamp, timestamp);
+    // Preserve transition callbacks for callers that explicitly opted into
+    // them, while the normal production registry (no callback) avoids
+    // rebuilding a frozen owner snapshot for thousands of unchanged Trees.
+    if (onTransition) emit(`${component}-actual-drawable`, record);
+    return true;
+  };
+
   const acknowledgeDrawable = ({
     ownerKey,
     level = 'coarse',
@@ -1540,7 +1751,15 @@ export function createVisualContinuityRegistry({
         drawable,
       });
     }
-    if (!isDrawableInCompletedFrame({ ...drawable, receipt })) return false;
+    if (!drawableInCompletedFrame(
+      drawable?.mesh,
+      receipt,
+      drawable?.matrix ?? null,
+      drawable?.effectiveOpacity ?? null,
+      drawable?.requiredAttributes ?? null,
+      drawable?.matrixAttribute ?? null,
+      drawable?.matrixSlot ?? null,
+    )) return false;
     const timestamp = receipt.completedAtMs;
     record.pendingDetailDrawableAt = Math.min(record.pendingDetailDrawableAt ?? timestamp, timestamp);
     if (record.coarseDrawableAt !== null) {
@@ -1569,41 +1788,84 @@ export function createVisualContinuityRegistry({
     return frozenOwnerRecord(record, now());
   };
 
-  const addCanonicalIdentities = ({ ownerKey, stableIds = [] } = {}) => {
-    const record = get(ownerKey);
-    if (!record) throw new Error(`visual owner is not Expected: ${ownerKey}`);
+  const addCanonicalIdentitiesToRecord = (record, stableIds) => {
     for (const stableId of stableIds) {
       if (typeof stableId !== 'string' || !stableId) {
         throw new TypeError('canonical Stable IDs must be non-empty strings');
       }
       record.canonicalStableIds.add(stableId);
     }
+  };
+
+  const addCanonicalIdentities = ({ ownerKey, stableIds = [] } = {}) => {
+    const record = get(ownerKey);
+    if (!record) throw new Error(`visual owner is not Expected: ${ownerKey}`);
+    addCanonicalIdentitiesToRecord(record, stableIds);
     return frozenOwnerRecord(record, now());
   };
 
+  const coarseTreeAttributeVersions = mesh => {
+    const versions = [];
+    const attributes = mesh?.geometry?.attributes ?? null;
+    if (attributes) {
+      for (const name in attributes) {
+        if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
+        const attribute = attributes[name];
+        if (attribute) versions.push(attributeVersion(attribute));
+      }
+    }
+    if (mesh?.geometry?.index) versions.push(attributeVersion(mesh.geometry.index));
+    if (mesh?.instanceMatrix) versions.push(attributeVersion(mesh.instanceMatrix));
+    if (mesh?.instanceColor) versions.push(attributeVersion(mesh.instanceColor));
+    return Object.freeze(versions);
+  };
+
   const coarseTreeReceiptCacheSignature = mesh => Object.freeze({
-    requirementRevision: coarseRequirementRevision,
     visualRevision: mesh?.userData?.canonicalVisualRevision ?? null,
     count: mesh?.count ?? null,
     canonicalObjects: mesh?.userData?.canonicalObjects ?? null,
     canonicalOpacities: mesh?.userData?.canonicalOpacities ?? null,
     materialOpacity: effectiveMaterialOpacity(mesh?.material),
-    attributeVersions: Object.freeze(drawableAttributes(mesh).map(attribute => (
-      attributeVersion(attribute)
-    ))),
+    attributeVersions: coarseTreeAttributeVersions(mesh),
   });
 
-  const coarseTreeReceiptCacheMatches = (cached, signature) => Boolean(cached
-    && cached.signature.requirementRevision === signature.requirementRevision
-    && cached.signature.visualRevision === signature.visualRevision
-    && cached.signature.count === signature.count
-    && cached.signature.canonicalObjects === signature.canonicalObjects
-    && cached.signature.canonicalOpacities === signature.canonicalOpacities
-    && cached.signature.materialOpacity === signature.materialOpacity
-    && cached.signature.attributeVersions.length === signature.attributeVersions.length
-    && cached.signature.attributeVersions.every((version, index) => (
-      version === signature.attributeVersions[index]
-    )));
+  const coarseTreeAttributeVersionsMatch = (mesh, versions) => {
+    let index = 0;
+    const attributes = mesh?.geometry?.attributes ?? null;
+    if (attributes) {
+      for (const name in attributes) {
+        if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
+        const attribute = attributes[name];
+        if (!attribute) continue;
+        if (index >= versions.length || attributeVersion(attribute) !== versions[index]) return false;
+        index += 1;
+      }
+    }
+    if (mesh?.geometry?.index) {
+      if (index >= versions.length
+        || attributeVersion(mesh.geometry.index) !== versions[index]) return false;
+      index += 1;
+    }
+    if (mesh?.instanceMatrix) {
+      if (index >= versions.length
+        || attributeVersion(mesh.instanceMatrix) !== versions[index]) return false;
+      index += 1;
+    }
+    if (mesh?.instanceColor) {
+      if (index >= versions.length
+        || attributeVersion(mesh.instanceColor) !== versions[index]) return false;
+      index += 1;
+    }
+    return index === versions.length;
+  };
+
+  const coarseTreeReceiptCacheMatches = (cached, mesh) => Boolean(cached
+    && cached.signature.visualRevision === (mesh?.userData?.canonicalVisualRevision ?? null)
+    && cached.signature.count === (mesh?.count ?? null)
+    && cached.signature.canonicalObjects === (mesh?.userData?.canonicalObjects ?? null)
+    && cached.signature.canonicalOpacities === (mesh?.userData?.canonicalOpacities ?? null)
+    && cached.signature.materialOpacity === effectiveMaterialOpacity(mesh?.material)
+    && coarseTreeAttributeVersionsMatch(mesh, cached.signature.attributeVersions));
 
   const acknowledgeScene = ({
     receipt,
@@ -1618,7 +1880,7 @@ export function createVisualContinuityRegistry({
       'terrainCoverageOwnerKeys',
     );
     let acknowledged = 0;
-    const seen = new Set();
+    const detailAcknowledgedOwnerKeys = new Set();
     const acknowledgedOwnerKeys = new Set();
     const coarseTreePresenterStableIds = new Set();
     const coarseTreePresenterOccurrences = new Map();
@@ -1647,15 +1909,15 @@ export function createVisualContinuityRegistry({
           )));
         for (const ownerKey of coveredOwners) {
           if (!records.has(ownerKey)) continue;
-          const key = `terrain\n${ownerKey}`;
-          if (seen.has(key)) continue;
-          if (acknowledgeCoarseComponent({
+          if (receiptCoarseComponentEvidence.terrainOwnerKeys.has(ownerKey)) continue;
+          const record = records.get(ownerKey);
+          const alreadyDrawn = acknowledgePreviouslyDrawnTerrain({ record, receipt });
+          if (alreadyDrawn || acknowledgeCoarseComponent({
             ownerKey,
             component: 'terrain',
             receipt,
             drawable: { mesh, matrix: mesh.matrixWorld ?? mesh.matrix },
           })) {
-            seen.add(key);
             acknowledgedOwnerKeys.add(ownerKey);
             acknowledged += 1;
           }
@@ -1666,61 +1928,78 @@ export function createVisualContinuityRegistry({
       const opacities = mesh.userData?.canonicalOpacities ?? [];
       const cacheableCoarseTreeMesh =
         mesh.userData?.canonicalCoarseTreeSubmission === true;
-      const coarseTreeCacheSignature = cacheableCoarseTreeMesh
-        ? coarseTreeReceiptCacheSignature(mesh) : null;
       const cachedCoarseTreeReceipt = cacheableCoarseTreeMesh
         ? canonicalCoarseTreeReceiptCache.get(mesh) : null;
+      const handoffOpacityAttribute = mesh.geometry?.getAttribute?.('w8LocalHandoffOpacity')
+        ?? mesh.geometry?.attributes?.w8LocalHandoffOpacity
+        ?? null;
+      const gpuHandoffOpacities = handoffOpacityAttribute
+        ? gpuPreferredAttributeArray(handoffOpacityAttribute, receipt) : null;
       if (cacheableCoarseTreeMesh
-        && coarseTreeReceiptCacheMatches(
-          cachedCoarseTreeReceipt,
-          coarseTreeCacheSignature,
-        )
+        && coarseTreeReceiptCacheMatches(cachedCoarseTreeReceipt, mesh)
         && isDrawableInCompletedFrame({ mesh, receipt })) {
         canonicalCoarseTreeSlotScanEarlyOutCount += 1;
-        for (const value of cachedCoarseTreeReceipt.coarseSlots) {
+        const forestOpacityForSlot = createForestShaderOpacityEvaluator(mesh, receipt);
+        const meshMaterialOpacity = effectiveMaterialOpacity(mesh.material);
+        for (const value of cachedCoarseTreeReceipt.canonicalSlots) {
+          const record = records.get(value.ownerKey);
+          if (!record || record.state === VISUAL_CONTINUITY_STATE.RETIRING
+            || record.coarseRequirementsResolvedAt === null) continue;
+          const component = value.semanticComponent === 'forest'
+            && record.requiredForestStableIds.has(value.stableId)
+            ? 'forest'
+            : value.semanticComponent === 'structure'
+              && record.requiredStructureStableIds.has(value.stableId)
+              ? 'structure' : null;
+          if (!component) continue;
           // Player position is a shader uniform, not a BufferAttribute version.
-          // Re-evaluate only the cached declared Forest slots so a prewarmed
-          // silhouette can become drawable on approach without rescanning every
-          // canonical Tree or waiting for unrelated CPU visibility dirt.
-          const opacity = value.component === 'forest'
-            ? (Number.isFinite(opacities[value.slot]) ? opacities[value.slot] : 1)
-              * effectiveMaterialOpacity(mesh.material)
-              * forestShaderOpacity(mesh, value.slot, receipt)
-            : value.opacity;
+          // Re-evaluate only cached canonical slots. Requirement membership is
+          // resolved against the current owner contract, so unrelated owner
+          // enter/retire events do not invalidate every Tree mesh cache.
+          const declaredOpacity = component === 'structure' && handoffOpacityAttribute
+            ? Number(gpuHandoffOpacities?.[value.slot] ?? 0)
+            : (Number.isFinite(opacities[value.slot]) ? opacities[value.slot] : 1);
+          const opacity = component === 'forest'
+            ? declaredOpacity * meshMaterialOpacity * forestOpacityForSlot(value.slot)
+            : declaredOpacity * meshMaterialOpacity;
           if (!(opacity > 0)) continue;
-          if (value.component === 'forest') {
+          if (component === 'forest') {
             coarseTreePresenterStableIds.add(value.stableId);
             coarseTreePresenterOccurrences.set(
               value.stableId,
               (coarseTreePresenterOccurrences.get(value.stableId) ?? 0) + 1,
             );
           }
-          const key = `${value.componentKey}\n${value.stableId}`;
-          if (seen.has(key)) continue;
-          if (!acknowledgeCoarseComponent({
+          const componentEvidence = component === 'structure'
+            ? receiptCoarseComponentEvidence.structureStableIdsByOwner
+            : receiptCoarseComponentEvidence.forestStableIdsByOwner;
+          if (componentEvidence.get(value.ownerKey)?.has(value.stableId)) continue;
+          const alreadyDrawn = acknowledgePreviouslyDrawnCoarseStableId({
+            record, component, stableId: value.stableId, receipt,
+          });
+          if (!alreadyDrawn && !acknowledgeCoarseComponent({
             ownerKey: value.ownerKey,
-            component: value.component,
+            component,
             stableIds: [value.stableId],
             receipt,
             drawable: {
               mesh,
               effectiveOpacity: opacity,
-              matrix: value.matrix,
+              matrix: value.matrix ?? null,
+              matrixAttribute: value.matrixAttribute ?? null,
+              matrixSlot: value.matrixSlot ?? null,
             },
           })) continue;
-          seen.add(key);
           acknowledgedOwnerKeys.add(value.ownerKey);
           acknowledged += 1;
-          addCanonicalIdentities({ ownerKey: value.ownerKey, stableIds: [value.stableId] });
         }
         return;
       }
-      const handoffOpacityAttribute = mesh.geometry?.getAttribute?.('w8LocalHandoffOpacity')
-        ?? mesh.geometry?.attributes?.w8LocalHandoffOpacity
-        ?? null;
-      const gpuHandoffOpacities = handoffOpacityAttribute
-        ? gpuPreferredAttributeArray(handoffOpacityAttribute, receipt) : null;
       const coarseSlots = [];
+      const cacheableCanonicalSlots = [];
+      const forestOpacityForSlot = cacheableCoarseTreeMesh
+        ? createForestShaderOpacityEvaluator(mesh, receipt) : null;
+      const meshMaterialOpacity = effectiveMaterialOpacity(mesh.material);
       const canonicalSlotCount = Math.min(
         canonicalObjects.length,
         Number.isSafeInteger(mesh.count) ? mesh.count : canonicalObjects.length,
@@ -1729,13 +2008,29 @@ export function createVisualContinuityRegistry({
         if (cacheableCoarseTreeMesh) canonicalCoarseTreeSlotScanCount += 1;
         const canonicalRecord = canonicalObjects[slot];
         const ownerKey = canonicalOwnerKey(canonicalRecord);
+        const stableId = stableIdFrom(canonicalRecord);
+        const semanticComponent = isCanonicalStructure(canonicalRecord)
+          ? 'structure' : isCanonicalForestTree(canonicalRecord) ? 'forest' : null;
+        // Cache canonical slot identity independently from the current expected
+        // owner set. Requirement churn is far more frequent than immutable GPU
+        // Tree identity changes and must not force a full canonical rescan.
+        if (cacheableCoarseTreeMesh && ownerKey && semanticComponent
+          && typeof stableId === 'string' && stableId) {
+          if (!mesh.instanceMatrix || isValidDrawableMatrixSlot(mesh.instanceMatrix, slot)) {
+            cacheableCanonicalSlots.push({
+              ownerKey, semanticComponent, slot, stableId,
+              matrix: mesh.instanceMatrix ? null : (mesh.matrixWorld ?? mesh.matrix),
+              matrixAttribute: mesh.instanceMatrix ?? null,
+              matrixSlot: mesh.instanceMatrix ? slot : null,
+            });
+          }
+        }
         if (!ownerKey || !records.has(ownerKey)) continue;
         const ownerRecord = records.get(ownerKey);
-        const stableId = stableIdFrom(canonicalRecord);
-        const component = isCanonicalStructure(canonicalRecord)
+        const component = semanticComponent === 'structure'
           && ownerRecord.requiredStructureStableIds.has(stableId)
           ? 'structure'
-          : isCanonicalForestTree(canonicalRecord)
+          : semanticComponent === 'forest'
             && ownerRecord.requiredForestStableIds.has(stableId)
             ? 'forest'
             : null;
@@ -1747,25 +2042,23 @@ export function createVisualContinuityRegistry({
         const declaredOpacity = component === 'structure' && handoffOpacityAttribute
           ? Number(gpuHandoffOpacities?.[slot] ?? 0)
           : (Number.isFinite(opacities[slot]) ? opacities[slot] : 1);
-        const opacity = declaredOpacity * effectiveMaterialOpacity(mesh.material)
-          * (component === 'forest' ? forestShaderOpacity(mesh, slot, receipt) : 1);
+        const opacity = declaredOpacity * meshMaterialOpacity
+          * (component === 'forest'
+            ? (forestOpacityForSlot?.(slot) ?? forestShaderOpacity(mesh, slot, receipt)) : 1);
         if (opacity <= 0 && !(cacheableCoarseTreeMesh && component === 'forest')) continue;
-        const instanceMatrix = matrixOffsetElements(mesh.instanceMatrix, slot);
-        if (mesh.instanceMatrix && !isValidDrawableMatrix(instanceMatrix)) continue;
-        const componentKey = `${component}\n${ownerKey}`;
+        if (mesh.instanceMatrix && !isValidDrawableMatrixSlot(mesh.instanceMatrix, slot)) continue;
         coarseSlots.push({
           ownerKey,
           component,
-          componentKey,
           slot,
           opacity,
           stableId,
-          matrix: instanceMatrix ?? mesh.matrixWorld ?? mesh.matrix,
+          matrix: mesh.instanceMatrix ? null : (mesh.matrixWorld ?? mesh.matrix),
+          matrixAttribute: mesh.instanceMatrix ?? null,
+          matrixSlot: mesh.instanceMatrix ? slot : null,
         });
       }
-      const cacheableCoarseSlots = [];
       for (const value of coarseSlots) {
-        if (cacheableCoarseTreeMesh) cacheableCoarseSlots.push(value);
         if (!(value.opacity > 0)) continue;
         if (value.component === 'forest') {
           coarseTreePresenterStableIds.add(value.stableId);
@@ -1774,9 +2067,18 @@ export function createVisualContinuityRegistry({
             (coarseTreePresenterOccurrences.get(value.stableId) ?? 0) + 1,
           );
         }
-        const key = `${value.componentKey}\n${value.stableId}`;
-        if (seen.has(key)) continue;
-        if (!acknowledgeCoarseComponent({
+        const componentEvidence = value.component === 'structure'
+          ? receiptCoarseComponentEvidence.structureStableIdsByOwner
+          : receiptCoarseComponentEvidence.forestStableIdsByOwner;
+        if (componentEvidence.get(value.ownerKey)?.has(value.stableId)) continue;
+        const record = records.get(value.ownerKey);
+        const alreadyDrawn = acknowledgePreviouslyDrawnCoarseStableId({
+          record,
+          component: value.component,
+          stableId: value.stableId,
+          receipt,
+        });
+        if (!alreadyDrawn && !acknowledgeCoarseComponent({
           ownerKey: value.ownerKey,
           component: value.component,
           stableIds: [value.stableId],
@@ -1784,25 +2086,24 @@ export function createVisualContinuityRegistry({
           drawable: {
             mesh,
             effectiveOpacity: value.opacity,
-            matrix: value.matrix,
+            matrix: value.matrix ?? null,
+            matrixAttribute: value.matrixAttribute ?? null,
+            matrixSlot: value.matrixSlot ?? null,
           },
         })) continue;
-        seen.add(key);
         acknowledgedOwnerKeys.add(value.ownerKey);
         acknowledged += 1;
-        addCanonicalIdentities({ ownerKey: value.ownerKey, stableIds: [value.stableId] });
       }
       if (cacheableCoarseTreeMesh
         && isDrawableInCompletedFrame({ mesh, receipt })) {
         canonicalCoarseTreeReceiptCache.set(mesh, Object.freeze({
-          signature: coarseTreeCacheSignature,
-          coarseSlots: Object.freeze(cacheableCoarseSlots),
+          signature: coarseTreeReceiptCacheSignature(mesh),
+          canonicalSlots: Object.freeze(cacheableCanonicalSlots),
         }));
       }
 
       if (canonicalObjects.length > 0 || terrainBand) return;
       const ownerKey = inheritedChunkOwnerKey(mesh);
-      const key = `detail\n${ownerKey}`;
       if (!ownerKey || !records.has(ownerKey)) return;
 
       // Near content is a representation of the same canonical owner/Stable
@@ -1811,7 +2112,7 @@ export function createVisualContinuityRegistry({
       // a takeover from stranding the owner after coarse has yielded the ID.
       const nearStableIds = new Set(mesh.userData?.treeStableIds ?? []);
       const featureStableIds = mesh.userData?.featureStableIds ?? [];
-      const drawableNearStableIds = [];
+      let hasDrawableNearStableId = false;
       const ownerRecord = records.get(ownerKey);
       const slotCount = Math.min(
         Number.isSafeInteger(mesh.count) ? mesh.count : featureStableIds.length,
@@ -1820,9 +2121,16 @@ export function createVisualContinuityRegistry({
       for (let slot = 0; slot < slotCount; slot += 1) {
         const stableId = featureStableIds[slot];
         if (typeof stableId !== 'string' || !stableId) continue;
-        const matrix = matrixOffsetElements(mesh.instanceMatrix, slot);
-        if (!isValidDrawableMatrix(matrix)) continue;
-        if (!isDrawableInCompletedFrame({ mesh, receipt, matrix })) continue;
+        if (mesh.instanceMatrix && !isValidDrawableMatrixSlot(mesh.instanceMatrix, slot)) continue;
+        if (!drawableInCompletedFrame(
+          mesh,
+          receipt,
+          mesh.instanceMatrix ? null : (mesh.matrixWorld ?? mesh.matrix),
+          null,
+          null,
+          mesh.instanceMatrix ?? null,
+          mesh.instanceMatrix ? slot : null,
+        )) continue;
         const nearTree = nearStableIds.has(stableId);
         if (nearTree) nearTreePresenterStableIds.add(stableId);
         const component = nearTree && ownerRecord.requiredForestStableIds.has(stableId)
@@ -1830,24 +2138,32 @@ export function createVisualContinuityRegistry({
           : ownerRecord.requiredStructureStableIds.has(stableId)
             ? 'structure'
             : null;
-        if (nearTree || component) drawableNearStableIds.push(stableId);
+        if (nearTree || component) {
+          ownerRecord.canonicalStableIds.add(stableId);
+          hasDrawableNearStableId = true;
+        }
         if (!component) continue;
-        const componentKey = `${component}\n${ownerKey}\n${stableId}`;
-        if (seen.has(componentKey)) continue;
+        const componentEvidence = component === 'structure'
+          ? receiptCoarseComponentEvidence.structureStableIdsByOwner
+          : receiptCoarseComponentEvidence.forestStableIdsByOwner;
+        if (componentEvidence.get(ownerKey)?.has(stableId)) continue;
         if (!acknowledgeCoarseComponent({
           ownerKey,
           component,
           stableIds: [stableId],
           receipt,
-          drawable: { mesh, matrix },
+          drawable: {
+            mesh,
+            matrix: mesh.instanceMatrix ? null : (mesh.matrixWorld ?? mesh.matrix),
+            matrixAttribute: mesh.instanceMatrix ?? null,
+            matrixSlot: mesh.instanceMatrix ? slot : null,
+          },
         })) continue;
-        seen.add(componentKey);
         acknowledgedOwnerKeys.add(ownerKey);
         acknowledged += 1;
       }
-      if (drawableNearStableIds.length > 0) {
-        addCanonicalIdentities({ ownerKey, stableIds: drawableNearStableIds });
-        if (records.get(ownerKey).nearRepresentationAvailableAt === null) {
+      if (hasDrawableNearStableId) {
+        if (ownerRecord.nearRepresentationAvailableAt === null) {
           markRepresentationAvailable({
             ownerKey,
             representation: 'near',
@@ -1856,14 +2172,14 @@ export function createVisualContinuityRegistry({
         }
       }
 
-      if (seen.has(key)) return;
+      if (detailAcknowledgedOwnerKeys.has(ownerKey)) return;
       if (acknowledgeDrawable({
         ownerKey,
         level: 'detail',
         receipt,
         drawable: { mesh, matrix: mesh.matrixWorld ?? mesh.matrix },
       })) {
-        seen.add(key);
+        detailAcknowledgedOwnerKeys.add(ownerKey);
         acknowledgedOwnerKeys.add(ownerKey);
         acknowledged += 1;
       }
@@ -1874,35 +2190,45 @@ export function createVisualContinuityRegistry({
         scanErrorCount += 1;
       }
     });
-    const requiredForestStableIds = new Set([...records.values()]
-      .filter(record => record.state !== VISUAL_CONTINUITY_STATE.RETIRING
-        && record.coarseRequirementsResolvedAt !== null)
-      .flatMap(record => [...record.requiredForestStableIds]));
-    const treePresenterStableIds = new Set([
-      ...coarseTreePresenterStableIds,
-      ...nearTreePresenterStableIds,
-    ]);
-    const duplicateStableIds = [...coarseTreePresenterStableIds]
-      .filter(stableId => nearTreePresenterStableIds.has(stableId)).sort();
-    const duplicateCoarseStableIds = [...coarseTreePresenterOccurrences]
-      .filter(([, count]) => count > 1)
-      .map(([stableId]) => stableId)
-      .sort();
+    const requiredForestStableIds = new Set();
+    for (const record of records.values()) {
+      if (record.state === VISUAL_CONTINUITY_STATE.RETIRING
+        || record.coarseRequirementsResolvedAt === null) continue;
+      for (const stableId of record.requiredForestStableIds) {
+        requiredForestStableIds.add(stableId);
+      }
+    }
+    const duplicateStableIds = [];
+    for (const stableId of coarseTreePresenterStableIds) {
+      if (nearTreePresenterStableIds.has(stableId)) duplicateStableIds.push(stableId);
+    }
+    if (duplicateStableIds.length > 1) duplicateStableIds.sort();
+    const duplicateCoarseStableIds = [];
+    for (const [stableId, count] of coarseTreePresenterOccurrences) {
+      if (count > 1) duplicateCoarseStableIds.push(stableId);
+    }
+    if (duplicateCoarseStableIds.length > 1) duplicateCoarseStableIds.sort();
+    // Reuse the coarse presenter set as the current union after duplicate
+    // detection. Both sets are frame-local scratch state, so this avoids a
+    // thousands-of-IDs spread/copy without changing the continuity evidence.
+    const treePresenterStableIds = coarseTreePresenterStableIds;
+    for (const stableId of nearTreePresenterStableIds) treePresenterStableIds.add(stableId);
     // A not-yet-drawn requirement is a coarse-fill miss, not a continuity
     // disappearance. Zero-presenter frames begin only after the same Stable ID
     // has crossed an actual completed renderer receipt in the current Expected
     // contract. Retiring an owner ends that contract; a later velocity-corridor
     // re-entry must not inherit an old presentation while it is still outside
     // the drawable distance domain.
-    for (const stableId of [...treeEverPresentedStableIds]) {
-      if (!requiredForestStableIds.has(stableId)) {
-        treeEverPresentedStableIds.delete(stableId);
+    for (const stableId of treeEverPresentedStableIds) {
+      if (!requiredForestStableIds.has(stableId)) treeEverPresentedStableIds.delete(stableId);
+    }
+    let zeroPresenterRequiredCount = 0;
+    for (const stableId of requiredForestStableIds) {
+      if (treeEverPresentedStableIds.has(stableId) && !treePresenterStableIds.has(stableId)) {
+        zeroPresenterRequiredCount += 1;
       }
     }
-    const zeroPresenterStableIds = [...requiredForestStableIds].filter(stableId => (
-      treeEverPresentedStableIds.has(stableId) && !treePresenterStableIds.has(stableId)
-    ));
-    if (zeroPresenterStableIds.length > 0) treeZeroPresenterFrameCount += 1;
+    if (zeroPresenterRequiredCount > 0) treeZeroPresenterFrameCount += 1;
     if (duplicateStableIds.length > 0) treeDuplicatePresenterFrameCount += 1;
     if (duplicateCoarseStableIds.length > 0) treeDuplicateCoarsePresenterFrameCount += 1;
     for (const stableId of treePresenterStableIds) {
@@ -1920,7 +2246,7 @@ export function createVisualContinuityRegistry({
       acknowledgedOwnerKeys: Object.freeze([...acknowledgedOwnerKeys].sort()),
       treePresenterCount: treePresenterStableIds.size + duplicateStableIds.length,
       treePresenterStableIds: Object.freeze([...treePresenterStableIds].sort()),
-      treeZeroPresenterRequiredCount: zeroPresenterStableIds.length,
+      treeZeroPresenterRequiredCount: zeroPresenterRequiredCount,
       treeDuplicatePresenterCount: duplicateStableIds.length,
       treeDuplicateStableIds: Object.freeze(duplicateStableIds),
       treeDuplicateCoarsePresenterCount: duplicateCoarseStableIds.length,
@@ -1939,7 +2265,6 @@ export function createVisualContinuityRegistry({
     if (!record) return false;
     record.retiringAt ??= finiteTime(at, 'retiringAt');
     record.state = VISUAL_CONTINUITY_STATE.RETIRING;
-    coarseRequirementRevision += 1;
     emit('retiring', record);
     return true;
   };
@@ -2112,7 +2437,6 @@ export function createVisualContinuityRegistry({
     snapshot,
     clear: () => {
       records.clear();
-      coarseRequirementRevision += 1;
       canonicalCoarseTreeSlotScanCount = 0;
       canonicalCoarseTreeSlotScanEarlyOutCount = 0;
       treeEverPresentedStableIds.clear();

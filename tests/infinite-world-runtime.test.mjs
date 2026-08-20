@@ -144,6 +144,42 @@ class RecordingAdapter {
   }
 }
 
+test('required traversal yields between expensive replacement projections instead of batching them in one task', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-required-projection-yield' });
+  const adapter = new RecordingAdapter();
+  let yieldCount = 0;
+  let captureProjectionYields = false;
+  const projectionYieldCounts = [];
+  const originalProjectChunk = adapter.projectChunk.bind(adapter);
+  adapter.projectChunk = async data => {
+    if (captureProjectionYields) projectionYieldCounts.push(yieldCount);
+    return originalProjectChunk(data);
+  };
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    yieldToHost: async () => {
+      yieldCount += 1;
+      await Promise.resolve();
+    },
+  });
+  await runtime.initialize(0, 0);
+
+  yieldCount = 0;
+  captureProjectionYields = true;
+  await runtime.transitionToChunk(1, 0, { required: true });
+
+  assert.equal(projectionYieldCounts.length, 3);
+  assert.equal(projectionYieldCounts[1] > projectionYieldCounts[0], true,
+    'required traversal yields after the first replacement projection');
+  assert.equal(projectionYieldCounts[2] > projectionYieldCounts[1], true,
+    'required traversal yields again before the third replacement projection');
+  assert.equal(runtime.snapshot().renderedCount, 9);
+  assert.equal(adapter.loaded.size, 9);
+  await runtime.shutdown();
+});
+
 test('runtime maintains 3x3 render and 5x5 data sets and generates only an entering column', async () => {
   const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-lifecycle' });
   const adapter = new RecordingAdapter();

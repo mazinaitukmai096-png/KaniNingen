@@ -193,7 +193,7 @@ function distanceToSegment(point, start, end) {
   return Math.hypot(point.x - start.x - dx * t, point.z - start.z - dz * t);
 }
 
-test('Phase 1 natural presentation policy is world-fixed, smooth, and preserves Shrub inputs', async () => {
+test('Phase 1 natural presentation policy is world-fixed, smooth, and rejects formal Shrub proposals', async () => {
   const policy = await createW8NaturalPresentationPhase1Policy({
     worldSeedHash: 'sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
   });
@@ -205,13 +205,37 @@ test('Phase 1 natural presentation policy is world-fixed, smooth, and preserves 
   assert.ok(Math.abs(leftEvaluation.groveField - rightEvaluation.groveField) < 0.001);
   assert.deepEqual(policy.evaluateTree({ candidate: left }), leftEvaluation);
 
+  const landscapeAcceptance = [];
+  for (let x = -256; x <= 256; x += 16) {
+    for (let z = -256; z <= 256; z += 16) {
+      landscapeAcceptance.push(policy.evaluateTree({
+        candidate: candidateAt({ id: 'phase-2:contrast-fixture', x, z }),
+      }).baseAcceptance);
+    }
+  }
+  assert.ok(Math.min(...landscapeAcceptance) <= 0.181,
+    'open-land field must be able to reach the low Tree-acceptance floor');
+  assert.ok(Math.max(...landscapeAcceptance) >= 0.879,
+    'woodland field must still be able to retain a dense Tree population');
+  assert.ok(Math.max(...landscapeAcceptance) - Math.min(...landscapeAcceptance) >= 0.65,
+    'world-fixed fields must create a strong grove/open-land contrast');
+
   const settlement = Object.freeze({
     center: Object.freeze({ x: 0, z: 0 }),
     radiusMeters: 100,
   });
-  const settlementFactors = [0, 0.65, 0.725, 0.8, 0.9, 1, 1.125, 1.25, 1.5]
+  const settlementScales = [0, 0.7, 0.85, 1, 1.175, 1.35, 1.575, 1.8, 2];
+  const settlementFactors = settlementScales
     .map(q => evaluateW8SettlementDensityFactor([settlement], { x: q * 100, z: 0 }));
-  assert.equal(settlementFactors[0], 0.18);
+  assert.equal(W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion,
+    'w8-natural-presentation-phase-3');
+  assert.equal(W8_NATURAL_PRESENTATION_PHASE_1.fieldSeedVersion,
+    'w8-natural-presentation-phase-1');
+  assert.equal(settlementFactors[0], W8_NATURAL_PRESENTATION_PHASE_1.settlementDensity.coreFactor);
+  assert.ok(evaluateW8SettlementDensityFactor(
+    [settlement], { x: 1.25 * 100, z: 0 },
+  ) < 1, 'Settlement open-land feather must still suppress Trees at 1.25 radii');
+  assert.equal(settlementFactors[settlementScales.indexOf(1.8)], 1);
   assert.equal(settlementFactors.at(-1), 1);
   for (let index = 1; index < settlementFactors.length; index += 1) {
     assert.ok(settlementFactors[index] >= settlementFactors[index - 1]);
@@ -235,8 +259,58 @@ test('Phase 1 natural presentation policy is world-fixed, smooth, and preserves 
   const shrub = candidateAt({ id: 'phase-1:shrub', x: 100, z: 100, subtype: 'shrub' });
   const tree = candidateAt({ id: 'phase-1:tree', x: 100, z: 100 });
   const selected = policy.selectVegetation({ candidates: [shrub, tree] });
-  assert.equal(selected.includes(shrub), true);
-  assert.equal(selected.filter(candidate => candidate.subtype === 'shrub').length, 1);
+  assert.equal(selected.includes(shrub), false);
+  assert.equal(selected.filter(candidate => candidate.subtype === 'shrub').length, 0);
+});
+
+test('Natural Tree density feather reaches beyond Settlement presentation influence without widening Settlement projection', async () => {
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: 'KaniNingen Infinite Natural World',
+  });
+  try {
+    // This owner is outside the RURAL 88 m Settlement presentation influence,
+    // but still inside the 1.8-radius Tree-density feather of the nearby suburb.
+    const chunkX = 40;
+    const chunkZ = 24;
+    const full = await generator.generateChunk(chunkX, chunkZ);
+    const presentationOwner = await generator.generatePresentationOwner(chunkX, chunkZ);
+    assert.equal(full.sourceChunkData.settlementReferences.length, 0,
+      'the density-only feather must not widen W5 Settlement projection/surface influence');
+
+    const centerX = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const centerZ = (chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const nearby = await generator.distributor.findSettlementsNear(centerX, centerZ, 12);
+    const densityReferences = nearby.filter(reference => Math.hypot(
+      reference.center.x - centerX,
+      reference.center.z - centerZ,
+    ) <= reference.radiusMeters
+      * W8_NATURAL_PRESENTATION_PHASE_1.settlementDensity.fullRecoveryRadiusScale + 12);
+    assert.equal(densityReferences.length, 1);
+
+    const policy = await createW8NaturalPresentationPhase1Policy({
+      worldSeedHash: generator.worldSeedHash,
+    });
+    const rawTrees = full.sourceChunkData.vegetationCandidates
+      .filter(candidate => candidate.subtype !== 'shrub');
+    const withoutDensityFeather = rawTrees.filter(candidate => policy.evaluateTree({
+      candidate,
+    }).accepted);
+    const withDensityFeather = rawTrees.filter(candidate => policy.evaluateTree({
+      candidate,
+      settlementReferences: densityReferences,
+    }).accepted);
+    assert.equal(withoutDensityFeather.length, 1,
+      'fixture must contain a Tree that would survive without the density-only reference');
+    assert.equal(withDensityFeather.length, 0,
+      'the outer Settlement feather must remove that Tree without extending Settlement geometry');
+    assert.equal(full.presentationLayers.natural.vegetation
+      .filter(candidate => candidate.subtype !== 'shrub').length, 0);
+    assert.equal(presentationOwner.resource.natural
+      .filter(record => record.objectType === 'tree').length, 0,
+    'Full and sparse PresentationOwner paths must share the density-only Settlement contract');
+  } finally {
+    await generator.shutdown();
+  }
 });
 
 test('Phase 1 applies one immutable 50 percent Tree world sample', async () => {
@@ -303,6 +377,11 @@ test('W8 wraps byte-identical W5 output and publishes sorted deterministic overl
       parity[name].map(value => value.stableId).toSorted());
   }
   assert.ok(parity.ambientDetails.length > 8);
+  assert.equal(parity.ambientDetails.every(detail => detail.destructible === false), true,
+    'ambient Grass/Flower/Bush are decoration-only before canonicalization');
+  assert.equal(parity.presentationLayers.natural.vegetation
+    .some(candidate => candidate.subtype === 'shrub'), false,
+  'formal Shrub proposals must never become published Natural objects');
 });
 
 test('Settlement presentation template exposes the exact multi-owner W8 Building Stable ID set', async () => {
@@ -604,7 +683,8 @@ test('Phase 1 creates deterministic meadow and grove diagnostics from the legacy
   }));
   assert.deepEqual(
     stableCandidateIds(policy.selectVegetation({ candidates: shrubInputs })),
-    stableCandidateIds(shrubInputs),
+    [],
+    'formal Shrub proposals are not published; Bush comes from ambient decoration only',
   );
 });
 

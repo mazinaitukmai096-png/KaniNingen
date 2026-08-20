@@ -124,6 +124,8 @@ import { createWebGLRenderDiagnostics } from './webgl-render-diagnostics.js';
 import {
   PRESENTATION_OWNER_SCHEMA,
   PRESENTATION_OWNER_SHARED_CORE_REVISION,
+  W8_CANONICAL_NATURAL_PRESENCE_SCHEMA,
+  W8_CANONICAL_TREE_CELL_SCHEMA,
   derivePresentationOwnerCoarseSummary,
 } from './presentation-owner-generator.js';
 
@@ -426,39 +428,52 @@ function directCanonicalTreeOwnerView(batch, boundary, worldSeedHash) {
     chunkZ,
     treeOffset,
     treeCount,
+    rockOffset,
+    rockCount,
   } = boundary ?? {};
+  const presence = batch?.naturalPresence;
+  const validSlice = (offset, count, records) => Number.isSafeInteger(offset) && offset >= 0
+    && Number.isSafeInteger(count) && count >= 0 && offset + count <= records.length;
   if (typeof ownerKey !== 'string' || !ownerKey
     || !Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)
     || ownerKey !== `${chunkX},${chunkZ}`
-    || !Number.isSafeInteger(treeOffset) || treeOffset < 0
-    || !Number.isSafeInteger(treeCount) || treeCount < 0
-    || treeOffset + treeCount > batch.trees.length) {
-    throw new Error(`invalid canonical Tree owner boundary: ${ownerKey ?? 'unknown'}`);
+    || !validSlice(treeOffset, treeCount, batch.trees)
+    || presence?.schemaVersion !== W8_CANONICAL_NATURAL_PRESENCE_SCHEMA
+    || !Array.isArray(presence.rocks)
+    || Object.hasOwn(presence, 'shrubs')
+    || Object.hasOwn(presence, 'grassPatches')
+    || Object.hasOwn(presence, 'rockProxies')
+    || !validSlice(rockOffset, rockCount, presence.rocks)) {
+    throw new Error(`invalid canonical Natural owner boundary: ${ownerKey ?? 'unknown'}`);
   }
   const trees = batch.trees.slice(treeOffset, treeOffset + treeCount);
-  if (trees.some(record => record?.objectType !== 'tree'
-    || record.owner !== ownerKey || typeof record.stableId !== 'string')) {
-    throw new Error(`canonical Tree owner view escaped ${ownerKey}`);
+  const rocks = presence.rocks.slice(rockOffset, rockOffset + rockCount);
+  const natural = [...trees, ...rocks]
+    .sort((left, right) => left.stableId.localeCompare(right.stableId));
+  if (natural.some(record => !['tree', 'rock'].includes(record?.objectType)
+    || record.owner !== ownerKey || typeof record.stableId !== 'string'
+    || (record.objectType === 'rock' && record.coarsePresenceKind !== 'canonical-rock'))) {
+    throw new Error(`canonical Natural owner view escaped ${ownerKey}`);
   }
   const resource = Object.freeze({
     schemaVersion: PRESENTATION_OWNER_SCHEMA,
     identity: Object.freeze({
       owner: Object.freeze({ x: chunkX, z: chunkZ, key: ownerKey }),
-      chunkId: `direct-canonical-tree:${worldSeedHash}:${ownerKey}`,
+      chunkId: `direct-canonical-natural:${worldSeedHash}:${ownerKey}`,
       sharedCoreRevision: PRESENTATION_OWNER_SHARED_CORE_REVISION,
     }),
     surface: Object.freeze({
       settlementRegionRefs: Object.freeze([]),
       riverCorridorRefs: Object.freeze([]),
     }),
-    natural: Object.freeze(trees),
+    natural: Object.freeze(natural),
     structures: Object.freeze([]),
     water: Object.freeze([]),
     landmarks: Object.freeze([]),
     street: Object.freeze([]),
   });
   return Object.freeze({
-    schemaVersion: 'w8-direct-canonical-tree-owner-view-1',
+    schemaVersion: 'w8-direct-canonical-natural-owner-view-4',
     chunkId: resource.identity.chunkId,
     contentHash: `${batch.contentHash}:owner:${ownerKey}`,
     chunkX,
@@ -468,13 +483,16 @@ function directCanonicalTreeOwnerView(batch, boundary, worldSeedHash) {
     diagnostics: Object.freeze({
       presentationOwnerGenerated: false,
       canonicalTreeCount: trees.length,
+      coarseShrubCount: 0,
+      canonicalRockCount: rocks.length,
     }),
   });
 }
 
 /**
- * Passive fan-out of an already-generated 64 m Tree batch into immutable
- * 16 m metadata views. It owns no admission, scheduling, or publication; the
+ * Passive fan-out of the already-generated 64 m canonical Tree batch plus its
+ * bounded canonical Rock presence into immutable 16 m metadata views. Bush is
+ * deliberately Near-only ambient decoration. It owns no admission, scheduling, or publication; the
  * existing Macro controller and Static Object Stream remain those owners.
  */
 export function createCanonicalTreeOwnerViewBroker({
@@ -532,9 +550,14 @@ export function createCanonicalTreeOwnerViewBroker({
   };
   const publishBatch = batch => {
     if (disposed) return 0;
-    if (batch?.schemaVersion !== 'w8-canonical-tree-cell-1'
+    if (batch?.schemaVersion !== W8_CANONICAL_TREE_CELL_SCHEMA
       || typeof batch.key !== 'string' || typeof batch.contentHash !== 'string'
       || !Array.isArray(batch.trees)
+      || batch?.naturalPresence?.schemaVersion !== W8_CANONICAL_NATURAL_PRESENCE_SCHEMA
+      || !Array.isArray(batch.naturalPresence.rocks)
+      || Object.hasOwn(batch.naturalPresence, 'shrubs')
+      || Object.hasOwn(batch.naturalPresence, 'grassPatches')
+      || Object.hasOwn(batch.naturalPresence, 'rockProxies')
       || !Array.isArray(batch.ownerKeys) || !Array.isArray(batch.ownerBoundaries)
       || batch.ownerKeys.length !== batch.ownerBoundaries.length
       || batch.identity?.worldSeedHash !== worldSeedHash) {
@@ -1554,7 +1577,8 @@ export async function bootInfiniteWorldSandbox({
       ...coarseSummary.selectedForestStableIds,
     ].filter(stableId => worldState.isFeatureDestroyed(stableId));
     const at = clock();
-    if (value.schemaVersion === 'w8-direct-canonical-tree-owner-view-1') {
+    if (value.schemaVersion === 'w8-direct-canonical-natural-owner-view-4'
+      || value.schemaVersion === 'w8-direct-canonical-tree-owner-view-1') {
       visualContinuity.recordPipelineStage({
         ownerKey,
         stage: VISUAL_PIPELINE_STAGE.RESOURCE_READY,
@@ -1671,7 +1695,14 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingPolicyRegistry.register(createLegacyRuntimeChunkStreamingPolicy({
       ownerMetadataCache: streamingOwnerMetadataCache,
     }));
-    const staticNaturalKinds = Object.freeze(Object.values(W8_VEGETATION_LOD_KINDS));
+    // Persistent Natural streaming is only for kinds with an actual far/world
+    // representation. Bush is finite-style Near decoration and Grass has no
+    // canonical far payload yet; registering either here only expands the
+    // coverage plan and admission cursor without producing drawable pages.
+    const staticNaturalKinds = Object.freeze([
+      W8_VEGETATION_LOD_KINDS.TREE,
+      W8_VEGETATION_LOD_KINDS.ROCK,
+    ]);
     const staticNaturalPolicyRuntimes = new Map(staticNaturalKinds.map(kind => {
       const distanceProfileResolver = renderDistancePreset => (
         resolveW8VegetationVisibilityContract(renderDistancePreset).byKind[kind]
@@ -2051,7 +2082,7 @@ export async function bootInfiniteWorldSandbox({
       nextScene.fog = new THREE.Fog(
         W8_RENDER_FOG_COLOR_HEX,
         W8_GAMEPLAY_FOG_NEAR,
-        defaultRenderDistancePolicy.fogFarMeters * UNITS_PER_METER,
+        defaultRenderDistancePolicy.worldPresentationDistanceMeters * UNITS_PER_METER,
       );
       const nextCamera = new THREE.PerspectiveCamera(
         70,
@@ -2339,7 +2370,8 @@ export async function bootInfiniteWorldSandbox({
         }
         if (directCanonicalTreeSupplyActive) {
           // The Static stream observes the 16 m ownership slices of the same
-          // real Tree batch. It does not start 16 PresentationOwner requests;
+          // Macro Natural batch (Tree + coarse non-Tree presence). It does not
+          // start 16 PresentationOwner requests;
           // the 64 m Macro controller remains the sole request producer.
           return observeReady(canonicalTreeOwnerViewBroker.requestOwner({ ownerKey }));
         }
@@ -3571,7 +3603,7 @@ export async function bootInfiniteWorldSandbox({
       scene.fog.near = W8_GAMEPLAY_FOG_NEAR;
       scene.fog.far = resolveW8RenderDistancePolicy(
         renderDistancePreset,
-      ).fogFarMeters * UNITS_PER_METER;
+      ).worldPresentationDistanceMeters * UNITS_PER_METER;
     };
     const applyRuntimeSettings = (settings, { applyRenderDistance = true } = {}) => {
       const qualityRatio = { low: 1, medium: 1.2, high: 1.5 }[settings.quality] ?? 1.5;
@@ -5345,7 +5377,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           .sort();
         const fogRenderDistancePreset = Object.keys(W8_RENDER_DISTANCE_PRESETS).find(preset => (
           Math.abs(
-            resolveW8RenderDistancePolicy(preset).fogFarMeters * UNITS_PER_METER
+            resolveW8RenderDistancePolicy(preset).worldPresentationDistanceMeters * UNITS_PER_METER
               - scene.fog.far,
           ) < 1e-6
         )) ?? null;

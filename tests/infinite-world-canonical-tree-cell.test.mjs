@@ -127,10 +127,11 @@ test('canonical Tree cell exactly matches production PresentationOwner Trees for
       assert.match(cell.contentHash, /^sha256:[0-9a-f]{64}$/);
       assert.equal(cell.diagnostics.ownerCount, 16);
       assert.equal(cell.diagnostics.treeCount, cell.trees.length);
-      assert.equal(cell.diagnostics.rockCandidateCount, 0);
-      assert.equal(cell.diagnostics.rockGenerationSkippedOwnerCount, 16);
+      assert.ok(cell.diagnostics.rockCandidateCount >= cell.naturalPresence.rocks.length);
+      assert.equal(cell.diagnostics.rockGenerationSkippedOwnerCount, 0);
       assert.equal(cell.identity.worldSeedHash, generator.worldSeedHash);
       assert.ok(cell.identity.sourceRevision.includes('formal-natural-candidate-kernel-1'));
+      assert.ok(cell.identity.sourceRevision.includes('w8-natural-presentation-phase-3'));
 
       for (const tree of cell.trees) {
         assert.deepEqual(Object.keys(tree), compactTreeFields);
@@ -239,7 +240,7 @@ test('real Worker performs one logical 64m Tree-only batch matching Inline ident
 
     assert.deepEqual(workerCell, inlineCell);
     assert.equal(workerCell.ownerKeys.length, 16);
-    assert.equal(workerCell.diagnostics.rockCandidateCount, 0);
+    assert.ok(workerCell.diagnostics.rockCandidateCount >= workerCell.naturalPresence.rocks.length);
     assert.equal(worker.snapshot().counts.canonicalTreeCellsGenerated, 1);
     assert.equal(worker.snapshot().counts.generated, 0);
     assert.equal(inline.snapshot().canonicalTreeCellGeneratedCount, 1);

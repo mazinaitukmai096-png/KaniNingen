@@ -900,8 +900,6 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(snapshot.staticObjectStreaming.counts.plans > 0, true);
     assert.deepEqual(new Set(snapshot.staticObjectStreaming.policyKinds), new Set([
       'natural-tree',
-      'natural-bush',
-      'natural-grass',
       'natural-rock',
     ]));
     assert.equal(

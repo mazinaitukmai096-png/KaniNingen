@@ -16,6 +16,7 @@ function defaultClock() {
 }
 
 function defaultYieldToHost() {
+  if (typeof globalThis.scheduler?.yield === 'function') return globalThis.scheduler.yield();
   return new Promise(resolve => globalThis.setTimeout(resolve, 0));
 }
 
@@ -1346,6 +1347,7 @@ export class ChunkRuntimeManager {
       const projectionStartedAt = this.clock();
       const projected = await this.renderAdapter.projectChunk(entry.data, this.renderOrigin, {
         deferredRegistration: true,
+        yieldToHost: this.yieldToHost,
       });
       this.performance.record('projection', this.clock() - projectionStartedAt);
       this.counts.preparedProjections += 1;
@@ -1888,6 +1890,7 @@ export class ChunkRuntimeManager {
         const projectionStartedAt = this.clock();
         const projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
           deferredRegistration: true,
+          yieldToHost: yieldBetweenUnits ? this.yieldToHost : null,
         });
         this.performance.record('projection', this.clock() - projectionStartedAt);
         plan.projectedByKey.set(coordinate.key, projected);
@@ -1900,7 +1903,10 @@ export class ChunkRuntimeManager {
           epoch: plan.epoch,
         });
         this.counts.preparedProjections += 1;
-        if (yieldBetweenUnits && !plan.required) await this.yieldToHost();
+        // Required traversal must still yield between expensive projection units.
+        // The transition awaits the complete prepared set, but yielding here keeps
+        // three-to-nine replacement chunks from monopolizing one main-thread task.
+        if (yieldBetweenUnits) await this.yieldToHost();
       }
       if (plan.discarded) {
         await this.#discardPreparedTransition(plan);
@@ -2099,6 +2105,7 @@ export class ChunkRuntimeManager {
           const projectionStartedAt = this.clock();
           projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
             deferredRegistration: true,
+            yieldToHost: this.yieldToHost,
           });
           this.performance.record('projection', this.clock() - projectionStartedAt);
           if (required) this.counts.terrainReadyRequiredProjections += 1;

@@ -1576,10 +1576,10 @@ test('MAX Sprint starts preparation before the boundary, deduplicates it, and co
   await chunkDataService.shutdown();
 });
 
-test('required transition skips only projection yields while normal transition and prefetch keep them', async () => {
+test('required transition yields between projection units just like normal transition and prefetch', async () => {
   assert.equal(await countPreparationYields('p1-prefetch-yields'), 8);
   assert.equal(await countPreparationYields('p1-normal-transition-yields', {}), 8);
-  assert.equal(await countPreparationYields('p1-required-transition-yields', { required: true }), 5);
+  assert.equal(await countPreparationYields('p1-required-transition-yields', { required: true }), 8);
 });
 
 test('new-territory diagnostics preserve request, ready, Terrain prepare, attach, verification, and release order', async () => {

@@ -79,7 +79,7 @@ export function createW8BuildingSettlementShadowPolicies({ readObservation } = {
       observedKey: 'buildingOwnerKeys',
       distanceResolver: preset => resolveW8RenderDistancePolicy(
         preset,
-      ).generalObjectVisibilityMeters,
+      ).generalDetailDistanceMeters,
       readObservation,
     }),
     createShadowPolicy({
@@ -139,7 +139,7 @@ export function compareW8BuildingSettlementShadow({ plan, observation } = {}) {
     observation.settlementOwnerKeys,
   );
   const presetBoundaryMatches = observation.generalVisibilityMeters
-      === distance.generalObjectVisibilityMeters
+      === distance.generalDetailDistanceMeters
     && observation.metadataQueryDistanceMeters === settlement.metadata.queryDistanceMeters;
   const identityMatches = observation.duplicateStableIdCount === 0
     && observation.duplicateSettlementIdCount === 0

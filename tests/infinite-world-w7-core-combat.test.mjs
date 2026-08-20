@@ -2563,3 +2563,38 @@ test('W7C keeps one World State and one entity registry', () => {
   assert.match(runtimeSource, /this\.state\.damageFeature/);
   assert.match(runtimeSource, /this\.state\.damageEntity/);
 });
+
+test('formal Shrub safety fallback never becomes a W8 gameplay target', async () => {
+  const shrub = Object.freeze({
+    candidateId: 'detail-v1:vegetation:formal-shrub-decoration-only',
+    candidateType: 'vegetation',
+    subtype: 'shrub',
+    variationSeed: 0.5,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 6, y: 0.2, z: 6 }),
+    owningChunkCoordinate: Object.freeze({ x: 0, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2 }),
+  });
+  const chunk = Object.freeze({
+    chunkX: 0,
+    chunkZ: 0,
+    generatorVersion: Object.freeze({ major: 800 }),
+    presentationLayers: Object.freeze({
+      natural: Object.freeze({ vegetation: Object.freeze([shrub]), rocks: Object.freeze([]) }),
+    }),
+    vegetationCandidates: Object.freeze([shrub]),
+    rockCandidates: Object.freeze([]),
+    settlementFeatures: Object.freeze([]),
+    settlementReferences: Object.freeze([]),
+    settlementLandmarks: Object.freeze([]),
+    ambientDetails: Object.freeze([]),
+    streetDetails: Object.freeze([]),
+  });
+  const model = await createW6ChunkGameplay({
+    chunkData: chunk,
+    worldSeedHash,
+    generatorMajor: 800,
+  });
+  assert.equal(model.staticTargets.some(target => target.stableId === shrub.candidateId), false,
+    'formal Shrub cannot re-enter combat even if stale data reaches Gameplay');
+});
