@@ -16,6 +16,7 @@ import {
   RESIDENT_WORLD_OWNER_COUNT,
   RESIDENT_WORLD_REQUIRED_RADIUS_METERS,
   createResidentWorldCoverage,
+  resolvePresentationResidentRadiusMeters,
   planRuntimeTerrainReadySet,
 } from '../src/infinite-world/chunk-streaming-plan.js';
 import { ChunkDataService } from '../src/infinite-world/chunk-data-service.js';
@@ -102,6 +103,26 @@ test('Resident World is one 360-degree player-Chunk set independent of camera an
   assert.strictEqual(coverage.residentTerrainOwnerKeys, coverage.fullView.ownerKeys);
   assert.strictEqual(coverage.residentNaturalOwnerKeys, coverage.presentationView.ownerKeys);
   assert.strictEqual(coverage.residentStructureOwnerKeys, coverage.presentationView.ownerKeys);
+  assert.equal(coverage.renderDistancePreset, 'current');
+
+  const presetResidentExpectations = Object.freeze({
+    short: Object.freeze({ radiusMeters: 208, ownerCount: 593 }),
+    standard: Object.freeze({ radiusMeters: 272, ownerCount: 981 }),
+    current: Object.freeze({ radiusMeters: 368, ownerCount: 1757 }),
+  });
+  for (const [renderDistancePreset, expected] of Object.entries(presetResidentExpectations)) {
+    const presetCoverage = createResidentWorldCoverage({
+      centerChunkX: 0,
+      centerChunkZ: 0,
+      renderDistancePreset,
+    });
+    assert.equal(resolvePresentationResidentRadiusMeters(renderDistancePreset),
+      expected.radiusMeters);
+    assert.equal(presetCoverage.presentationView.radiusMeters, expected.radiusMeters);
+    assert.equal(presetCoverage.presentationView.ownerKeys.length, expected.ownerCount);
+    assert.equal(presetCoverage.fullView.radiusMeters, FULL_RESIDENT_RADIUS_METERS);
+    assert.equal(presetCoverage.fullView.ownerKeys.length, FULL_RESIDENT_OWNER_COUNT);
+  }
 
   const profile = getW6ScaleProfile('MAX');
   const directions = [
@@ -140,13 +161,36 @@ test('Resident World is one 360-degree player-Chunk set independent of camera an
   assert.strictEqual(sameChunkPlan, firstPlan);
 });
 
-test('one Resident master coverage exposes nested Presentation 368m and Full 100m views', t => {
+test('Resident master coverage scales Presentation by preset while Full remains 100m', t => {
   const centered = createResidentWorldCoverage({ centerChunkX: 0, centerChunkZ: 0 });
   assert.equal(PRESENTATION_RESIDENT_RADIUS_METERS, 368);
   assert.equal(FULL_RESIDENT_RADIUS_METERS, 100);
   assert.equal(centered.presentationView.ownerKeys.length, 1757);
   assert.equal(centered.fullView.ownerKeys.length, 145);
+  const short = createResidentWorldCoverage({
+    centerChunkX: 0, centerChunkZ: 0, renderDistancePreset: 'short',
+  });
+  const standard = createResidentWorldCoverage({
+    centerChunkX: 0, centerChunkZ: 0, renderDistancePreset: 'standard',
+  });
+  assert.equal(short.presentationView.radiusMeters, 208);
+  assert.equal(short.presentationView.ownerKeys.length, 593);
+  assert.equal(standard.presentationView.radiusMeters, 272);
+  assert.equal(standard.presentationView.ownerKeys.length, 981);
+  assert.deepEqual(short.fullView.ownerKeys, centered.fullView.ownerKeys);
+  assert.deepEqual(standard.fullView.ownerKeys, centered.fullView.ownerKeys);
   assert.ok(centered.fullView.ownerKeys.every(key => centered.presentationView.ownerKeys.includes(key)));
+  assert.ok(short.presentationView.ownerKeys.every(
+    key => centered.presentationView.ownerKeys.includes(key),
+  ));
+  assert.ok(standard.presentationView.ownerKeys.every(
+    key => centered.presentationView.ownerKeys.includes(key),
+  ));
+  assert.equal(new Set([
+    ...centered.presentationView.ownerKeys,
+    ...short.presentationView.ownerKeys,
+  ]).size, centered.presentationView.ownerKeys.length,
+  'Current -> Short staging can protect the old and requested presets without exceeding Current');
 
   const straight = createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 0 });
   const diagonal = createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 1 });
@@ -447,14 +491,19 @@ test('Runtime and Static Natural required coverage derive from the same Resident
     centerChunkX,
     centerChunkZ,
     velocity = { x: 0, z: 0 },
+    renderDistancePreset = 'current',
   ) => {
-    const centeredCoverage = createResidentWorldCoverage({ centerChunkX, centerChunkZ });
+    const centeredCoverage = createResidentWorldCoverage({
+      centerChunkX,
+      centerChunkZ,
+      renderDistancePreset,
+    });
     return createWorldStreamingPlan({
       sequence,
       generatedAtMs: sequence,
       player: { x: centerChunkX * 16 + 8, z: centerChunkZ * 16 + 8 },
       velocity,
-      renderDistancePreset: 'current',
+      renderDistancePreset,
       policies: naturalPolicies,
       residentCoverage: centeredCoverage,
     });
@@ -472,15 +521,16 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   const stationaryRequired = requiredUnion(stationary);
   const straightEntering = difference(requiredUnion(shiftedStraight), stationaryRequired);
   const diagonalEntering = difference(requiredUnion(shiftedDiagonal), stationaryRequired);
-  assert.equal(stationaryRequired.length, PRESENTATION_RESIDENT_OWNER_COUNT,
-    'resource coverage keeps the full shared 368 m Presentation resident window');
-  assert.equal(straightEntering.length, difference(
+  assert.equal(stationaryRequired.length, 1305,
+    'Current Static Natural required coverage is its 300 m visual envelope plus one Chunk');
+  assert.ok(stationaryRequired.length < PRESENTATION_RESIDENT_OWNER_COUNT,
+    "Natural required work must not consume Terrain's entire 368 m Current resource window");
+  assert.equal(straightEntering.length, 41,
+    'Current Natural 316 m resource circle adds only its own straight entering edge');
+  assert.equal(diagonalEntering.length, 57,
+    'Current Natural 316 m resource circle adds only its own diagonal entering edge');
+  assert.ok(straightEntering.length < difference(
     createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 0 })
-      .presentationView.ownerKeys,
-    coverage.presentationView.ownerKeys,
-  ).length);
-  assert.equal(diagonalEntering.length, difference(
-    createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 1 })
       .presentationView.ownerKeys,
     coverage.presentationView.ownerKeys,
   ).length);
@@ -488,6 +538,33 @@ test('Runtime and Static Natural required coverage derive from the same Resident
   assert.ok(stationary.policyPlans.every(policy => policy.requiredOwnerKeys.every(
     ownerKey => coverage.residentNaturalOwnerKeys.includes(ownerKey),
   )));
+
+  const presetNaturalExpectations = Object.freeze({
+    short: Object.freeze({ resident: 593, required: 437, maxSprintAll: 768 }),
+    standard: Object.freeze({ resident: 981, required: 741, maxSprintAll: 1207 }),
+    current: Object.freeze({ resident: 1757, required: 1305, maxSprintAll: 2001 }),
+  });
+  let presetSequence = 20;
+  for (const [renderDistancePreset, expected] of Object.entries(presetNaturalExpectations)) {
+    const stationaryPreset = centeredNaturalPlan(
+      presetSequence++, 0, 0, { x: 0, z: 0 }, renderDistancePreset,
+    );
+    const sprintPreset = centeredNaturalPlan(
+      presetSequence++, 0, 0, { x: 30, z: 0 }, renderDistancePreset,
+    );
+    const residentPreset = createResidentWorldCoverage({
+      centerChunkX: 0,
+      centerChunkZ: 0,
+      renderDistancePreset,
+    });
+    assert.equal(residentPreset.presentationView.ownerKeys.length, expected.resident);
+    assert.equal(requiredUnion(stationaryPreset).length, expected.required);
+    assert.equal(allOwnerUnion(sprintPreset).length, expected.maxSprintAll);
+    assert.ok(allOwnerUnion(sprintPreset).length <= PRESENTATION_OWNER_CACHE_CAPACITY);
+    assert.ok(stationaryPreset.policyPlans.every(policy => policy.requiredOwnerKeys.every(
+      ownerKey => residentPreset.presentationView.ownerKeys.includes(ownerKey),
+    )));
+  }
   t.diagnostic(JSON.stringify({
     naturalRequiredOwnerCount: stationaryRequired.length,
     straightEnteringOwnerCount: straightEntering.length,

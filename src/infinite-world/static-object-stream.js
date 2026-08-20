@@ -443,8 +443,19 @@ export function createCircularStaticStreamingPolicy({
       profile.exactDistanceMeters,
       profile.horizonDistanceMeters ?? profile.exactDistanceMeters,
     );
+    // Static Natural only needs its own visible envelope plus one owner-width
+    // prewarm shell. The Resident master may be wider because Terrain uses a
+    // larger coverage radius; treating that whole Terrain domain as Natural
+    // required work is unnecessary and made Short/Standard behave like Current.
+    const presentationResidentRadiusMeters = residentCoverage?.presentationView?.radiusMeters
+      ?? residentCoverage?.radiusMeters
+      ?? presentationRadiusMeters;
     const requiredRadiusMeters = residentCoverage === null
-      ? presentationRadiusMeters : residentCoverage.radiusMeters;
+      ? presentationRadiusMeters
+      : Math.min(
+        presentationResidentRadiusMeters,
+        presentationRadiusMeters + LOGICAL_CHUNK_SIZE_METERS,
+      );
     const required = residentCoverage === null
       ? coverageFor(player, renderDistancePreset)
       : new Set(residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters));
@@ -497,10 +508,14 @@ export function createCircularStaticStreamingPolicy({
       : new Set();
     const visualPrefetched = new Set(visualCorridor);
     for (const ownerKey of visualRequired) visualPrefetched.delete(ownerKey);
-    const retainedRadiusMeters = requiredRadiusMeters + retentionMarginMeters;
+    const retainedRadiusMeters = residentCoverage === null
+      ? requiredRadiusMeters + retentionMarginMeters
+      : Math.min(
+        presentationResidentRadiusMeters,
+        requiredRadiusMeters + retentionMarginMeters,
+      );
     const retained = residentCoverage !== null
-      ? new Set(residentCoverage.presentationView?.ownerKeys
-        ?? residentOwnerKeysWithinRadius(residentCoverage, requiredRadiusMeters))
+      ? new Set(residentOwnerKeysWithinRadius(residentCoverage, retainedRadiusMeters))
       : coverageFor(player, renderDistancePreset, retentionMarginMeters);
     const requiredOwnerKeys = freezeCollectedOwnerKeys(required, ownerMetadataCache);
     const prefetchedOwnerKeys = freezeCollectedOwnerKeys(prefetched, ownerMetadataCache);

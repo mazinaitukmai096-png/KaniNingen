@@ -3379,6 +3379,88 @@ test('persistent Distant reuses Settlement slots while Natural remains on Static
   presentation.dispose();
 });
 
+
+
+test('prepared Render Distance commit keeps persistent Distant live meshes valid across the next owner move', async () => {
+  const ownerX = 5;
+  const ownerZ = 0;
+  const source = canonicalChunk(ownerX, ownerZ, [CANONICAL_BUILDING]);
+  const scene = new DistantTestGroup();
+  const presentation = await createLocalTerrainTestPresentation(scene, {
+    incrementalStaticTreePages: true,
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === ownerX && chunkZ === ownerZ
+        ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+    yieldToMainThread: () => new Promise(resolve => setImmediate(resolve)),
+  });
+  const coverage = centerChunkX => {
+    const result = localTerrainCoverageFixture(centerChunkX, 0);
+    if (result.chunks.has(`${ownerX},${ownerZ}`)) {
+      result.chunks.set(`${ownerX},${ownerZ}`, source);
+    }
+    return result;
+  };
+  const initial = coverage(4);
+  assert.equal(presentation.syncLocalTerrain({
+    coverageEpoch: 1,
+    renderDistancePreset: 'current',
+    ...initial,
+  }).committed, true);
+  assert.equal(await presentation.sync({
+    ...initial,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+  }), true);
+
+  presentation.stageStaticNaturalRenderDistancePreset('short');
+  assert.equal(await presentation.sync({
+    ...initial,
+    quality: 'high',
+    renderDistancePreset: 'short',
+    playerLogicalX: 72,
+    playerLogicalZ: 8,
+    deferPublication: true,
+    preserveStaticNatural: true,
+  }), true);
+  const terrainPrepared = await presentation.syncLocalTerrainPreset({
+    coverageEpoch: 2,
+    renderDistancePreset: 'short',
+    deferPublication: true,
+    ...initial,
+  });
+  assert.equal(terrainPrepared.prepared, true);
+  assert.equal(presentation.commitPreparedRenderDistancePreset('short'), true);
+
+  const outer = coverage(3);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: outer.activeDataKeys,
+    renderedKeys: outer.renderedKeys,
+    renderOrigin: outer.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  assert.equal(await presentation.sync({
+    ...outer,
+    quality: 'high',
+    renderDistancePreset: 'short',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  let frames = 0;
+  while (presentation.snapshot().distantPersistentPublicationPending && frames < 256) {
+    presentation.update(56, 8, outer.renderOrigin);
+    presentation.markFirstDraw();
+    frames += 1;
+  }
+  assert.equal(presentation.snapshot().distantPersistentPublicationPending, false);
+  assert.ok(frames < 256);
+  presentation.dispose();
+});
+
 test('revisited Near Building publication suppresses every persistent Distant part before render', async () => {
   const building = Object.freeze({
     ...CANONICAL_BUILDING,

@@ -528,7 +528,8 @@ test('Stage 2 cuts production Natural over to PresentationOwner and keeps Full s
   assert.equal(sandbox.includes("resourceKind: 'presentation'"), true);
   assert.equal(sandbox.includes("kind !== 'presentation'"), true);
   assert.equal(sandbox.includes('PRESENTATION_OWNER_CACHE_CAPACITY'), true);
-  assert.equal(sandbox.includes('residentWorldCoverage.fullView.ownerKeys'), true);
+  assert.equal(sandbox.includes('requestedResidentWorldCoverage.fullView.ownerKeys'), true);
+  assert.equal(sandbox.includes('setProtectedResidentRenderDistancePresets'), true);
   assert.equal(sandbox.includes('cacheCapacity: 2366'), false);
 });
 

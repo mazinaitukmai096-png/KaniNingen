@@ -4,7 +4,10 @@ import {
   CHUNK_DATA_PRIORITY,
   createCanonicalTreeCellRequestKey,
 } from './chunk-data-service-protocol.js';
-import { createOwnerGenerationCoordinator } from './owner-generation-coordinator.js';
+import {
+  createOwnerGenerationCoordinator,
+  defaultOwnerGenerationPriorityClass,
+} from './owner-generation-coordinator.js';
 import {
   WORLD_GENERATION_PRIORITY_CLASS,
   WORLD_GENERATION_REPRESENTATION_CLASS,
@@ -1418,6 +1421,7 @@ export async function bootInfiniteWorldSandbox({
   let chunkDataService = null;
   let presentationOwnerService = null;
   let ownerGenerationCoordinator = null;
+  let scheduleSharedWorkerControl = null;
   let visualContinuity = null;
   let renderFrameAcknowledger = null;
   let chunkGeneratorTransport = null;
@@ -1955,6 +1959,54 @@ export async function bootInfiniteWorldSandbox({
         // execution gate, not a second 25-entry feeder.
         maximumConcurrentRequests: 1,
       });
+      scheduleSharedWorkerControl = ({
+        ownerKey,
+        resourceKind,
+        operationKind,
+        priority,
+        required,
+        representationClass,
+        consumerId,
+        target,
+        stream = WORLD_STREAMING_STREAM.DISTANT,
+        correlationId = null,
+        execute,
+      }) => {
+        const createdAtMs = clock();
+        const priorityClass = defaultOwnerGenerationPriorityClass({
+          resourceKind,
+          priority,
+          required,
+        });
+        const handle = ownerGenerationCoordinator.schedule({
+          ownerKey,
+          resourceKind,
+          operationKind,
+          priority,
+          priorityClass,
+          required,
+          createdAtMs,
+          representationClass,
+          subscriberIdentity: `${resourceKind}:${consumerId}:${ownerKey}`,
+          consumerId,
+          epoch: 0,
+          correlationId,
+          target,
+          stream,
+          execute: execution => {
+            if (execution.cancelled) return null;
+            return execute({
+              priority: execution.envelope.priority,
+              required: execution.envelope.required,
+              createdAtMs: execution.envelope.createdAtMs,
+              deadlineAtMs: execution.envelope.firstVisibleDeadlineMs,
+              consumerId: execution.envelope.consumerId,
+              scheduler: execution.envelope,
+            });
+          },
+        });
+        return handle.promise;
+      };
       chunkDataService = new ChunkDataService({
         transport: chunkGeneratorTransport,
         cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
@@ -1996,27 +2048,79 @@ export async function bootInfiniteWorldSandbox({
       experienceSpawn: generatorMetadata.experienceSpawn,
       reviewSpawn: generatorMetadata.reviewSpawn,
       distributor: Object.freeze({
-        findSettlementsNear: (centerWorldX, centerWorldZ, radiusMeters) =>
-          traceGenerationBoundary({
+        findSettlementsNear: (centerWorldX, centerWorldZ, radiusMeters) => {
+          const resourceKey = `settlement-query:${centerWorldX}:${centerWorldZ}:${radiusMeters}`;
+          return traceGenerationBoundary({
             target: WORLD_STREAMING_TARGET.SETTLEMENT,
-            resourceKey: `settlement-query:${centerWorldX}:${centerWorldZ}:${radiusMeters}`,
+            resourceKey,
             metadata: { centerWorldX, centerWorldZ, radiusMeters },
-          }, schedulerOptions => chunkGeneratorTransport.findSettlementsNear(
-            centerWorldX,
-            centerWorldZ,
-            radiusMeters,
-            schedulerOptions,
-          )),
+          }, (telemetryOptions = {}) => scheduleSharedWorkerControl({
+            ownerKey: resourceKey,
+            resourceKind: 'settlement-query',
+            operationKind: 'settlement-query',
+            priority: CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+            required: true,
+            representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.COARSE,
+            consumerId: 'settlement-query',
+            target: WORLD_STREAMING_TARGET.SETTLEMENT,
+            correlationId: telemetryOptions.telemetryCorrelationId ?? null,
+            execute: schedulerOptions => chunkGeneratorTransport.findSettlementsNear(
+              centerWorldX,
+              centerWorldZ,
+              radiusMeters,
+              { ...telemetryOptions, ...schedulerOptions },
+            ),
+          }));
+        },
       }),
       resolveSettlementPresentationTemplate: request => {
         const settlementId = request?.candidate?.settlementId ?? request?.settlementId ?? 'unknown';
+        const resourceKey = `settlement-template:${settlementId}`;
         return traceGenerationBoundary({
           target: WORLD_STREAMING_TARGET.BUILDING,
-          resourceKey: `settlement-template:${settlementId}`,
+          resourceKey,
           metadata: { settlementId },
-        }, schedulerOptions => chunkGeneratorTransport.resolveSettlementPresentationTemplate({
-          ...request,
-          ...schedulerOptions,
+        }, (telemetryOptions = {}) => scheduleSharedWorkerControl({
+          ownerKey: resourceKey,
+          resourceKind: 'settlement-template',
+          operationKind: 'settlement-template',
+          priority: request?.priority ?? CHUNK_DATA_PRIORITY.DISTANT_OWNER,
+          required: request?.required ?? true,
+          representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.DETAIL,
+          consumerId: request?.consumerId ?? 'settlement-template',
+          target: WORLD_STREAMING_TARGET.BUILDING,
+          correlationId: telemetryOptions.telemetryCorrelationId ?? null,
+          execute: schedulerOptions => chunkGeneratorTransport.resolveSettlementPresentationTemplate({
+            ...request,
+            ...telemetryOptions,
+            ...schedulerOptions,
+          }),
+        }));
+      },
+      resolveCanonicalMajorRoadOwnerCoverage: request => {
+        const centerWorldX = Number(request?.centerWorldX);
+        const centerWorldZ = Number(request?.centerWorldZ);
+        const radiusMeters = Number(request?.radiusMeters);
+        const resourceKey = `canonical-major-road-owner-query:${centerWorldX}:${centerWorldZ}:${radiusMeters}`;
+        return traceGenerationBoundary({
+          target: WORLD_STREAMING_TARGET.ROAD,
+          resourceKey,
+          metadata: { centerWorldX, centerWorldZ, radiusMeters },
+        }, (telemetryOptions = {}) => scheduleSharedWorkerControl({
+          ownerKey: resourceKey,
+          resourceKind: 'canonical-major-road-owner-query',
+          operationKind: 'canonical-major-road-owner-query',
+          priority: request?.priority ?? CHUNK_DATA_PRIORITY.GAMEPLAY_REQUIRED,
+          required: request?.required ?? true,
+          representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.COARSE,
+          consumerId: request?.consumerId ?? 'canonical-major-road-owner-query',
+          target: WORLD_STREAMING_TARGET.ROAD,
+          correlationId: telemetryOptions.telemetryCorrelationId ?? null,
+          execute: schedulerOptions => chunkGeneratorTransport.resolveCanonicalMajorRoadOwnerCoverage({
+            ...request,
+            ...telemetryOptions,
+            ...schedulerOptions,
+          }),
         }));
       },
       requestDiagnostics: () => chunkGeneratorTransport.requestDiagnostics(),
@@ -2292,27 +2396,67 @@ export async function bootInfiniteWorldSandbox({
       };
     });
     const { logicalPlayer, initialOwner } = runtimeContext;
-    let residentWorldCoverage = createResidentWorldCoverage({
-      centerChunkX: initialOwner.chunkX,
-      centerChunkZ: initialOwner.chunkZ,
+    const initialResidentRenderDistancePreset = normalizeW8RenderDistancePreset(
+      worldState.experience.settings.renderDistance ?? W8_DEFAULT_RENDER_DISTANCE_PRESET,
+    );
+    let residentWorldCenterOwner = Object.freeze({
+      key: initialOwner.key,
+      chunkX: initialOwner.chunkX,
+      chunkZ: initialOwner.chunkZ,
     });
-    const synchronizePresentationResidentCoverage = coverage => {
-      const ownerKeys = coverage.presentationView.ownerKeys;
-      presentationOwnerService.replaceProtectedOwnerKeys(ownerKeys);
+    const residentWorldCoverageByPreset = new Map();
+    let protectedResidentRenderDistancePresets = new Set([
+      initialResidentRenderDistancePreset,
+    ]);
+    const refreshResidentWorldCenter = () => {
+      const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      if (owner.key === residentWorldCenterOwner.key) return false;
+      residentWorldCenterOwner = Object.freeze({
+        key: owner.key,
+        chunkX: owner.chunkX,
+        chunkZ: owner.chunkZ,
+      });
+      residentWorldCoverageByPreset.clear();
+      return true;
+    };
+    const residentCoverageForPreset = renderDistancePreset => {
+      const preset = normalizeW8RenderDistancePreset(renderDistancePreset);
+      let coverage = residentWorldCoverageByPreset.get(preset);
+      if (coverage) return coverage;
+      coverage = createResidentWorldCoverage({
+        centerChunkX: residentWorldCenterOwner.chunkX,
+        centerChunkZ: residentWorldCenterOwner.chunkZ,
+        renderDistancePreset: preset,
+      });
+      residentWorldCoverageByPreset.set(preset, coverage);
       return coverage;
     };
-    synchronizePresentationResidentCoverage(residentWorldCoverage);
-    const resolveResidentWorldCoverage = () => {
-      const owner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-      if (residentWorldCoverage.centerOwnerKey !== owner.key) {
-        residentWorldCoverage = createResidentWorldCoverage({
-          centerChunkX: owner.chunkX,
-          centerChunkZ: owner.chunkZ,
-        });
-        synchronizePresentationResidentCoverage(residentWorldCoverage);
+    const synchronizePresentationResidentCoverage = () => {
+      refreshResidentWorldCenter();
+      const ownerKeys = new Set();
+      for (const preset of protectedResidentRenderDistancePresets) {
+        for (const ownerKey of residentCoverageForPreset(preset).presentationView.ownerKeys) {
+          ownerKeys.add(ownerKey);
+        }
       }
-      return residentWorldCoverage;
+      presentationOwnerService.replaceProtectedOwnerKeys([...ownerKeys]);
+      return ownerKeys.size;
     };
+    const setProtectedResidentRenderDistancePresets = presets => {
+      protectedResidentRenderDistancePresets = new Set(
+        [...presets].map(normalizeW8RenderDistancePreset),
+      );
+      return synchronizePresentationResidentCoverage();
+    };
+    const resolveResidentWorldCoverage = (
+      renderDistancePreset = initialResidentRenderDistancePreset,
+    ) => {
+      const centerChanged = refreshResidentWorldCenter();
+      const coverage = residentCoverageForPreset(renderDistancePreset);
+      if (centerChanged) synchronizePresentationResidentCoverage();
+      return coverage;
+    };
+    synchronizePresentationResidentCoverage();
 
     await runStage('Terrain', () => runtime.initialize(initialOwner.chunkX, initialOwner.chunkZ));
     scenePresentation.rebase(runtime.snapshot().renderOrigin);
@@ -2442,7 +2586,7 @@ export async function bootInfiniteWorldSandbox({
       findSettlementsNear: generator.distributor.findSettlementsNear,
       resolveTemplate: request => generator.resolveSettlementPresentationTemplate(request),
       resolveCanonicalMajorRoadOwnerCoverage: request =>
-        chunkGeneratorTransport.resolveCanonicalMajorRoadOwnerCoverage(request),
+        generator.resolveCanonicalMajorRoadOwnerCoverage(request),
       getCanonicalChunkData: async (chunkX, chunkZ, request = {}) => {
         const ownerKey = `${chunkX},${chunkZ}`;
         const fallback = async () => {
@@ -3616,6 +3760,10 @@ export async function bootInfiniteWorldSandbox({
 
     const beginRenderDistancePublication = nextRenderDistance => {
       const revision = ++renderDistanceRequestRevision;
+      setProtectedResidentRenderDistancePresets([
+        distantRenderDistance,
+        nextRenderDistance,
+      ]);
       runtime.invalidateTerrainPresentationGenerations?.();
       distantPresentation.discardPreparedRenderDistancePreset?.();
       distantPresentation.stageStaticNaturalRenderDistancePreset?.(nextRenderDistance);
@@ -3663,6 +3811,7 @@ export async function bootInfiniteWorldSandbox({
         if (pendingRenderDistancePublication?.revision === revision) {
           pendingRenderDistancePublication = null;
           distantPresentation.discardPreparedRenderDistancePreset?.();
+          setProtectedResidentRenderDistancePresets([distantRenderDistance]);
         }
         transitionError = error;
       });
@@ -3712,6 +3861,7 @@ export async function bootInfiniteWorldSandbox({
         throw new Error('Building/Settlement revision publication failed after staging');
       }
       distantRenderDistance = pending.preset;
+      setProtectedResidentRenderDistancePresets([distantRenderDistance]);
       appliedStaticNaturalRetainedOwnerKeys = pending.retainedNaturalOwnerKeys
         ?? appliedStaticNaturalRetainedOwnerKeys;
       distantPresentation.releaseStaticNaturalRetainedOwners?.(
@@ -3937,6 +4087,7 @@ export async function bootInfiniteWorldSandbox({
           beginRenderDistancePublication(nextRenderDistance);
         } else if (renderDistanceChanged) {
           distantRenderDistance = nextRenderDistance;
+          setProtectedResidentRenderDistancePresets([distantRenderDistance]);
           applyRenderDistanceFog(nextRenderDistance);
         } else if (qualityChanged && diagnosticProfile.distant) {
           const runtimeSnapshot = runtime.snapshot();
@@ -4061,7 +4212,7 @@ export async function bootInfiniteWorldSandbox({
     function requestTerrainReadySet(movement) {
       const streaming = runtime.getStreamingState();
       if (streaming.centerChunkX === null) return;
-      const currentResidentCoverage = resolveResidentWorldCoverage();
+      const currentResidentCoverage = resolveResidentWorldCoverage(distantRenderDistance);
       let plan;
       try {
         plan = planRuntimeTerrainReadySet({
@@ -4338,6 +4489,9 @@ export async function bootInfiniteWorldSandbox({
             ?? `runtime:${committedChunkState.centerChunkX},${committedChunkState.centerChunkZ}`,
         ownerMetadataCache: streamingOwnerMetadataCache,
       });
+      const requestedResidentWorldCoverage = resolveResidentWorldCoverage(
+        requestedDistantRenderDistance,
+      );
       const coverageResolution = diagnosticMeasure(
         'world-streaming-plan',
         () => worldStreamingCoordinator.resolveCoveragePlan({
@@ -4347,12 +4501,12 @@ export async function bootInfiniteWorldSandbox({
             player: { x: logicalPlayer.x, z: logicalPlayer.z },
             velocity: { x: movement.velocityX, z: movement.velocityZ },
             renderDistancePreset: requestedDistantRenderDistance,
-            residentCoverage: resolveResidentWorldCoverage(),
+            residentCoverage: requestedResidentWorldCoverage,
             currentRequests: {
               [LEGACY_RUNTIME_CHUNK_POLICY_KIND]: {
-                requiredOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
-                requestOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
-                retainedOwnerKeys: residentWorldCoverage.fullView.ownerKeys,
+                requiredOwnerKeys: requestedResidentWorldCoverage.fullView.ownerKeys,
+                requestOwnerKeys: requestedResidentWorldCoverage.fullView.ownerKeys,
+                retainedOwnerKeys: requestedResidentWorldCoverage.fullView.ownerKeys,
               },
               ...(settlementStreamingObservation ? {
                 [W8_BUILDING_STREAM_POLICY_KIND]: {

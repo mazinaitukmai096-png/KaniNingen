@@ -924,45 +924,94 @@ export function projectCanonicalMajorRoadsToChunk({
   return Object.freeze(features.sort((left, right) => left.stableId.localeCompare(right.stableId)));
 }
 
-export function graphEdgesPotentiallyIntersectChunk({ graph, chunkX, chunkZ } = {}) {
-  if (!graph?.nodes || !graph?.edges) return Object.freeze([]);
+const frozenGraphChunkQueryPreparationCache = new WeakMap();
+
+function prepareGraphEdgesForChunkQueries(graph) {
+  const canCache = Object.isFrozen(graph)
+    && Object.isFrozen(graph.nodes)
+    && Object.isFrozen(graph.edges);
+  if (canCache) {
+    const cached = frozenGraphChunkQueryPreparationCache.get(graph);
+    if (cached) return cached;
+  }
+
   const nodesById = new Map(graph.nodes.map(node => [node.stableId, node]));
-  const corners = [
-    { x: chunkX * LOGICAL_CHUNK_SIZE_METERS, z: chunkZ * LOGICAL_CHUNK_SIZE_METERS },
-    { x: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS, z: chunkZ * LOGICAL_CHUNK_SIZE_METERS },
-    { x: chunkX * LOGICAL_CHUNK_SIZE_METERS, z: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS },
-    { x: (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS, z: (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS },
-  ];
-  return Object.freeze(graph.edges.filter(edge => {
+  const terminalClearance = W8_CANONICAL_MAJOR_ROAD.widthMeters * 2
+    + W8_CANONICAL_MAJOR_ROAD.obstacleClearanceMeters;
+  const prepared = Object.freeze(graph.edges.map(edge => {
     const endpoints = edge.settlementIds.map(id => nodesById.get(id));
-    if (!endpoints.every(Boolean)) return false;
-    const centerDx = endpoints[1].center.x - endpoints[0].center.x;
-    const centerDz = endpoints[1].center.z - endpoints[0].center.z;
-    const centerDistance = Math.hypot(centerDx, centerDz);
-    if (centerDistance <= 1e-9) return false;
-    const forwardX = centerDx / centerDistance;
-    const forwardZ = centerDz / centerDistance;
-    const rightX = forwardZ;
-    const rightZ = -forwardX;
+    if (!endpoints.every(Boolean)) {
+      return Object.freeze({ edge, valid: false });
+    }
     const start = endpoints[0].center;
     const end = endpoints[1].center;
-    const routeLength = Math.hypot(end.x - start.x, end.z - start.z);
-    if (routeLength <= 1e-9) return false;
-    const projections = corners.map(corner => {
-      const dx = corner.x - start.x;
-      const dz = corner.z - start.z;
-      return { along: dx * forwardX + dz * forwardZ, lateral: dx * rightX + dz * rightZ };
+    const centerDx = end.x - start.x;
+    const centerDz = end.z - start.z;
+    const routeLength = Math.hypot(centerDx, centerDz);
+    if (routeLength <= 1e-9) return Object.freeze({ edge, valid: false });
+    let maximumEndpointRadius = Number.NEGATIVE_INFINITY;
+    for (const endpoint of endpoints) {
+      maximumEndpointRadius = Math.max(maximumEndpointRadius, endpoint.radiusMeters);
+    }
+    const forwardX = centerDx / routeLength;
+    const forwardZ = centerDz / routeLength;
+    return Object.freeze({
+      edge,
+      valid: true,
+      startX: start.x,
+      startZ: start.z,
+      forwardX,
+      forwardZ,
+      rightX: forwardZ,
+      rightZ: -forwardX,
+      routeLength,
+      startTerminalLimit: -(endpoints[0].radiusMeters + terminalClearance),
+      endTerminalLimit: routeLength + endpoints[1].radiusMeters + terminalClearance,
+      maximumLateralOffset: maximumEndpointRadius * 2
+        + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8,
     });
-    const minimumAlong = Math.min(...projections.map(value => value.along));
-    const maximumAlong = Math.max(...projections.map(value => value.along));
-    const terminalClearance = W8_CANONICAL_MAJOR_ROAD.widthMeters * 2
-      + W8_CANONICAL_MAJOR_ROAD.obstacleClearanceMeters;
-    if (maximumAlong < -(endpoints[0].radiusMeters + terminalClearance)
-      || minimumAlong > routeLength + endpoints[1].radiusMeters + terminalClearance) return false;
-    const maximumLateralOffset = Math.max(...endpoints.map(value => value.radiusMeters)) * 2
-      + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8;
-    const minimumLateral = Math.min(...projections.map(value => value.lateral));
-    const maximumLateral = Math.max(...projections.map(value => value.lateral));
-    return minimumLateral <= maximumLateralOffset && maximumLateral >= -maximumLateralOffset;
   }));
+  if (canCache) frozenGraphChunkQueryPreparationCache.set(graph, prepared);
+  return prepared;
+}
+
+export function graphEdgesPotentiallyIntersectChunk({ graph, chunkX, chunkZ } = {}) {
+  if (!graph?.nodes || !graph?.edges) return Object.freeze([]);
+  const minX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
+  const minZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+  const maxX = (chunkX + 1) * LOGICAL_CHUNK_SIZE_METERS;
+  const maxZ = (chunkZ + 1) * LOGICAL_CHUNK_SIZE_METERS;
+  const matches = [];
+
+  for (const prepared of prepareGraphEdgesForChunkQueries(graph)) {
+    if (!prepared.valid) continue;
+    const dx00 = minX - prepared.startX;
+    const dz00 = minZ - prepared.startZ;
+    const dx10 = maxX - prepared.startX;
+    const dz10 = dz00;
+    const dx01 = dx00;
+    const dz01 = maxZ - prepared.startZ;
+    const dx11 = dx10;
+    const dz11 = dz01;
+    const along00 = dx00 * prepared.forwardX + dz00 * prepared.forwardZ;
+    const along10 = dx10 * prepared.forwardX + dz10 * prepared.forwardZ;
+    const along01 = dx01 * prepared.forwardX + dz01 * prepared.forwardZ;
+    const along11 = dx11 * prepared.forwardX + dz11 * prepared.forwardZ;
+    const minimumAlong = Math.min(along00, along10, along01, along11);
+    const maximumAlong = Math.max(along00, along10, along01, along11);
+    if (maximumAlong < prepared.startTerminalLimit
+      || minimumAlong > prepared.endTerminalLimit) continue;
+
+    const lateral00 = dx00 * prepared.rightX + dz00 * prepared.rightZ;
+    const lateral10 = dx10 * prepared.rightX + dz10 * prepared.rightZ;
+    const lateral01 = dx01 * prepared.rightX + dz01 * prepared.rightZ;
+    const lateral11 = dx11 * prepared.rightX + dz11 * prepared.rightZ;
+    const minimumLateral = Math.min(lateral00, lateral10, lateral01, lateral11);
+    const maximumLateral = Math.max(lateral00, lateral10, lateral01, lateral11);
+    if (minimumLateral <= prepared.maximumLateralOffset
+      && maximumLateral >= -prepared.maximumLateralOffset) {
+      matches.push(prepared.edge);
+    }
+  }
+  return Object.freeze(matches);
 }

@@ -119,8 +119,10 @@ test('resource prewarm margin stays outside the true visual Expected boot cohort
   });
   const member = policyPlan(plan);
   const source = member.sourceSnapshot;
-  assert.equal(source.requiredRadiusMeters, residentCoverage.presentationView.radiusMeters,
-    'resource coverage preserves the shared 368 m Presentation resident window');
+  assert.equal(source.requiredRadiusMeters, 32,
+    'resource coverage keeps the 16 m visual radius plus one 16 m prewarm owner width');
+  assert.ok(source.requiredRadiusMeters < residentCoverage.presentationView.radiusMeters,
+    "Static policy work must not inherit Terrain's entire Presentation resident radius");
   assert.equal(source.visualRadiusMeters, 16);
   assert.deepEqual(source.visualExpected, source.visualRequired,
     'stationary visual Expected must not invent a corridor');

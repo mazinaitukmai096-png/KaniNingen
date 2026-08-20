@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
+import { createInlineChunkGeneratorTransport } from '../src/infinite-world/inline-chunk-generator-transport.js';
 import {
   W8_PARITY_CACHE_CAPACITIES,
   createPendingSafeLruCache,
@@ -10,6 +11,11 @@ import {
 
 const defaultSeed = 'KaniNingen Infinite Natural World';
 const chunksPerMacroRegion = 768 / 16;
+const requestOrderFixtureOwner = Object.freeze({ x: 55, z: 77 });
+const requestOrderFixtureCenter = Object.freeze({
+  x: (requestOrderFixtureOwner.x + 0.5) * 16,
+  z: (requestOrderFixtureOwner.z + 0.5) * 16,
+});
 
 function deferred() {
   let resolve;
@@ -148,6 +154,226 @@ function chunkIdentity(chunk) {
     sourceW5ContentHash: chunk.sourceW5ContentHash,
     stableOwners: stableOwnerRecords(chunk),
     riverPorts: (chunk.riverPorts ?? []).map(port => Object.freeze({ ...port })),
+  });
+}
+
+function collectCanonicalEntries(value, select, path = '$', entries = []) {
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => {
+      collectCanonicalEntries(entry, select, `${path}[${index}]`, entries);
+    });
+    return entries;
+  }
+  if (!value || typeof value !== 'object') return entries;
+  const selected = select(value, path);
+  if (selected !== null && selected !== undefined) entries.push(selected);
+  for (const [key, entry] of Object.entries(value)) {
+    collectCanonicalEntries(entry, select, `${path}.${key}`, entries);
+  }
+  return entries;
+}
+
+function canonicalStableIds(value) {
+  const idKeys = new Set([
+    'candidateId',
+    'settlementId',
+    'sourceSegmentStableId',
+    'sourceStableId',
+    'stableId',
+  ]);
+  const entries = [];
+  const visit = (current, path = '$') => {
+    if (Array.isArray(current)) {
+      current.forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    if (!current || typeof current !== 'object') return;
+    for (const [key, entry] of Object.entries(current)) {
+      const entryPath = `${path}.${key}`;
+      if (idKeys.has(key) && typeof entry === 'string') {
+        entries.push(Object.freeze({ path: entryPath, id: entry }));
+      }
+      visit(entry, entryPath);
+    }
+  };
+  visit(value);
+  return Object.freeze(entries);
+}
+
+function canonicalCoordinates(value) {
+  return Object.freeze(collectCanonicalEntries(value, (entry, path) => {
+    if (!Number.isFinite(entry.x) || !Number.isFinite(entry.z)) return null;
+    if (Object.hasOwn(entry, 'y')) {
+      assert.ok(Number.isFinite(entry.y), `${path}.y must be a finite canonical Terrain Y`);
+    }
+    return Object.freeze({
+      path,
+      x: entry.x,
+      y: Object.hasOwn(entry, 'y') ? entry.y : null,
+      z: entry.z,
+    });
+  }));
+}
+
+function canonicalOwnerIdentities(value) {
+  const ownerKeys = new Set([
+    'macroRegion',
+    'ownerChunk',
+    'ownerRegion',
+    'owningChunkCoordinate',
+  ]);
+  const entries = [];
+  const visit = (current, path = '$') => {
+    if (Array.isArray(current)) {
+      current.forEach((entry, index) => visit(entry, `${path}[${index}]`));
+      return;
+    }
+    if (!current || typeof current !== 'object') return;
+    for (const [key, entry] of Object.entries(current)) {
+      const entryPath = `${path}.${key}`;
+      if (ownerKeys.has(key) && Number.isFinite(entry?.x) && Number.isFinite(entry?.z)) {
+        entries.push(Object.freeze({ path: entryPath, x: entry.x, z: entry.z }));
+      }
+      visit(entry, entryPath);
+    }
+  };
+  visit(value);
+  return Object.freeze(entries);
+}
+
+function canonicalFeatureRecords(value, kind) {
+  return Object.freeze(collectCanonicalEntries(value, (entry, path) => {
+    if (typeof entry.stableId !== 'string') return null;
+    const featureType = `${entry.featureType ?? ''}`.toLowerCase();
+    const matches = kind === 'Road'
+      ? entry.canonicalMajorRoad === true || featureType.includes('road')
+      : featureType.includes('building') || typeof entry.buildingType === 'string';
+    return matches ? Object.freeze({ path, record: entry }) : null;
+  }));
+}
+
+function assertFiniteSettlementMetadata(world, label) {
+  const references = world.chunk.settlementReferences ?? [];
+  assert.ok(references.length > 0, `${label}: fixture must contain a Settlement reference`);
+  const metadata = [...references, world.template];
+  for (const entry of metadata) {
+    const prefix = `${label}: ${entry.settlementId ?? entry.stableId}`;
+    assert.equal(typeof entry.settlementId, 'string', `${prefix} Settlement ID`);
+    assert.ok(Number.isFinite(entry.center?.x), `${prefix} center.x`);
+    assert.ok(Number.isFinite(entry.center?.z), `${prefix} center.z`);
+    assert.ok(Number.isFinite(entry.radiusMeters), `${prefix} radiusMeters`);
+    assert.ok(Number.isFinite(entry.urbanization), `${prefix} urbanization`);
+    assert.ok(Number.isFinite(entry.terrainSuitability), `${prefix} terrainSuitability`);
+    assert.ok(Number.isSafeInteger(entry.macroRegion?.x), `${prefix} macroRegion.x`);
+    assert.ok(Number.isSafeInteger(entry.macroRegion?.z), `${prefix} macroRegion.z`);
+  }
+}
+
+function assertCanonicalWorldMatches(actual, expected, label) {
+  assertFiniteSettlementMetadata(actual, label);
+  assert.equal(actual.chunk.contentHash, expected.chunk.contentHash,
+    `${label}: W8 content hash`);
+  assert.equal(actual.chunk.sourceW5ContentHash, expected.chunk.sourceW5ContentHash,
+    `${label}: source W5 content hash`);
+  assert.equal(actual.chunk.sourceChunkData.contentHash, expected.chunk.sourceChunkData.contentHash,
+    `${label}: embedded source content hash`);
+  assert.equal(actual.chunk.sourceChunkData.contentHash, actual.chunk.sourceW5ContentHash,
+    `${label}: embedded source identity`);
+  assert.deepEqual(canonicalStableIds(actual), canonicalStableIds(expected),
+    `${label}: Stable IDs`);
+  assert.deepEqual(canonicalCoordinates(actual), canonicalCoordinates(expected),
+    `${label}: canonical XYZ and Terrain Y`);
+  assert.deepEqual(actual.chunk.terrain.heights, expected.chunk.terrain.heights,
+    `${label}: canonical Terrain height samples`);
+  assert.deepEqual(actual.chunk.terrain.heightRangeMeters,
+    expected.chunk.terrain.heightRangeMeters, `${label}: canonical Terrain height range`);
+  assert.deepEqual(
+    (actual.chunk.settlementReferences ?? []).map(reference => Object.freeze({
+      settlementId: reference.settlementId,
+      settlementType: reference.settlementType,
+      townType: reference.townType,
+      macroRegion: reference.macroRegion,
+      center: reference.center,
+      radiusMeters: reference.radiusMeters,
+      urbanization: reference.urbanization,
+      terrainSuitability: reference.terrainSuitability,
+    })),
+    (expected.chunk.settlementReferences ?? []).map(reference => Object.freeze({
+      settlementId: reference.settlementId,
+      settlementType: reference.settlementType,
+      townType: reference.townType,
+      macroRegion: reference.macroRegion,
+      center: reference.center,
+      radiusMeters: reference.radiusMeters,
+      urbanization: reference.urbanization,
+      terrainSuitability: reference.terrainSuitability,
+    })),
+    `${label}: Settlement metadata`,
+  );
+  assert.deepEqual(canonicalFeatureRecords(actual, 'Road'),
+    canonicalFeatureRecords(expected, 'Road'), `${label}: canonical Road records`);
+  assert.deepEqual(canonicalFeatureRecords(actual, 'Building'),
+    canonicalFeatureRecords(expected, 'Building'), `${label}: canonical Building records`);
+  assert.deepEqual(canonicalOwnerIdentities(actual), canonicalOwnerIdentities(expected),
+    `${label}: canonical owner identity`);
+  assert.deepEqual(actual.template, expected.template,
+    `${label}: complete Settlement presentation template`);
+  assert.deepEqual(actual.presentationOwner, expected.presentationOwner,
+    `${label}: complete PresentationOwner`);
+  assert.deepEqual(actual.chunk, expected.chunk, `${label}: complete ChunkData`);
+}
+
+async function withInlineW8Generator(options, operation) {
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: defaultSeed,
+    ...(options ?? {}),
+  });
+  const transport = createInlineChunkGeneratorTransport({ generator });
+  try {
+    await transport.initialize();
+    return await operation({ generator, transport });
+  } finally {
+    await transport.shutdown();
+  }
+}
+
+function canonicalPresentationOwner(owner) {
+  return Object.freeze({
+    schemaVersion: owner.schemaVersion,
+    chunkId: owner.chunkId,
+    contentHash: owner.contentHash,
+    chunkX: owner.chunkX,
+    chunkZ: owner.chunkZ,
+    resource: owner.resource,
+    canonicalSurfacePolicy: owner.canonicalSurfacePolicy,
+    riverProjection: owner.riverProjection,
+  });
+}
+
+async function collectCanonicalWorld({
+  transport,
+  candidate,
+  chunk = null,
+  template = null,
+  presentationOwner = null,
+}) {
+  const resolvedChunk = chunk ?? await transport.generateChunk({
+    chunkX: requestOrderFixtureOwner.x,
+    chunkZ: requestOrderFixtureOwner.z,
+  });
+  const resolvedTemplate = template ?? await transport.resolveSettlementPresentationTemplate({
+    candidate,
+  });
+  const resolvedPresentationOwner = presentationOwner
+    ?? await transport.generatePresentationOwner({
+      chunkX: requestOrderFixtureOwner.x,
+      chunkZ: requestOrderFixtureOwner.z,
+    });
+  return Object.freeze({
+    chunk: resolvedChunk,
+    template: resolvedTemplate,
+    // CPU diagnostics are intentionally run-dependent and are not World content.
+    presentationOwner: canonicalPresentationOwner(resolvedPresentationOwner),
   });
 }
 
@@ -296,6 +522,422 @@ test('GP-STR-01 source shutdown cannot let an in-flight template repopulate its 
   assert.equal(snapshot.distributor.acceptedCacheSize, 0);
   assert.equal(snapshot.distributor.connectivityNeighborCacheSize, 0);
   await assert.rejects(source.resolveSettlementTemplate({ candidate }), /shut down/);
+});
+
+test('P0 source template cache rejects missing or non-finite identity before lookup', async () => {
+  const source = await createDistributedSettlementChunkGenerator({ worldSeed: defaultSeed });
+  try {
+    const candidate = await source.distributor.findHomeSettlement(0, 0);
+    const before = source.snapshot();
+    await assert.rejects(
+      source.resolveSettlementTemplate({ candidate: null }),
+      /Settlement candidate is required/,
+    );
+    await assert.rejects(
+      source.resolveSettlementTemplate({
+        candidate: Object.freeze({ ...candidate, terrainSuitability: null }),
+      }),
+      /finite canonical metadata/,
+    );
+    const after = source.snapshot();
+    assert.equal(after.templateCacheSize, before.templateCacheSize);
+    assert.equal(after.templateCachePendingCount, before.templateCachePendingCount);
+    assert.equal(after.templateCacheHits, before.templateCacheHits);
+    assert.equal(after.templateCacheMisses, before.templateCacheMisses);
+    assert.equal(after.templatesMaterialized, before.templatesMaterialized);
+  } finally {
+    await source.shutdown();
+  }
+});
+
+test('P0 source template cache rejects changed finite metadata for a cached Settlement ID',
+  async () => {
+    const source = await createDistributedSettlementChunkGenerator({ worldSeed: defaultSeed });
+    try {
+      const candidate = await source.distributor.findHomeSettlement(0, 0);
+      await source.resolveSettlementTemplate({ candidate });
+      const beforeConflict = source.snapshot();
+      const changed = Object.freeze({
+        ...candidate,
+        urbanization: candidate.urbanization + 0.000001,
+      });
+      await assert.rejects(
+        source.resolveSettlementTemplate({ candidate: changed }),
+        new RegExp(`candidate identity conflict for ${candidate.settlementId}`),
+      );
+      const afterConflict = source.snapshot();
+      assert.equal(afterConflict.templateCacheSize, 1);
+      assert.equal(afterConflict.templateCachePendingCount, 0);
+      assert.equal(afterConflict.templateCacheHits, beforeConflict.templateCacheHits);
+      assert.equal(afterConflict.templateCacheMisses, beforeConflict.templateCacheMisses);
+      assert.equal(afterConflict.templatesMaterialized, beforeConflict.templatesMaterialized);
+    } finally {
+      await source.shutdown();
+    }
+  });
+
+test('P0 source template cache rejects a simultaneous same-ID different identity', async () => {
+  const source = await createDistributedSettlementChunkGenerator({ worldSeed: defaultSeed });
+  try {
+    const candidate = await source.distributor.findHomeSettlement(0, 0);
+    const pending = source.resolveSettlementTemplate({ candidate });
+    const changed = Object.freeze({
+      ...candidate,
+      terrainSuitability: candidate.terrainSuitability + 0.000001,
+    });
+    await assert.rejects(
+      source.resolveSettlementTemplate({ candidate: changed }),
+      new RegExp(`Pending Settlement template candidate identity conflict for ${candidate.settlementId}`),
+    );
+    const template = await pending;
+    assert.equal(template.settlementId, candidate.settlementId);
+    const snapshot = source.snapshot();
+    assert.equal(snapshot.templateCacheSize, 1);
+    assert.equal(snapshot.templateCachePendingCount, 0);
+    assert.equal(snapshot.templateCacheMisses, 1);
+    assert.equal(snapshot.templatesMaterialized, 1);
+  } finally {
+    await source.shutdown();
+  }
+});
+
+test('P0 source template generation snapshots a mutable candidate before its first await',
+  async () => {
+    const source = await createDistributedSettlementChunkGenerator({ worldSeed: defaultSeed });
+    try {
+      const candidate = await source.distributor.findHomeSettlement(0, 0);
+      const mutable = {
+        ...candidate,
+        macroRegion: { ...candidate.macroRegion },
+        center: { ...candidate.center },
+      };
+      const pending = source.resolveSettlementTemplate({ candidate: mutable });
+      mutable.settlementId = `${candidate.settlementId}:mutated`;
+      mutable.macroRegion.x += 1;
+      mutable.center.x += 1_000;
+      mutable.urbanization += 0.1;
+      mutable.terrainSuitability -= 0.1;
+
+      const first = await pending;
+      assert.equal(first.settlementId, candidate.settlementId);
+      assert.deepEqual(first.center, candidate.center);
+      assert.equal(first.urbanization, candidate.urbanization);
+      assert.equal(first.terrainSuitability, candidate.terrainSuitability);
+      assert.deepEqual(
+        await source.resolveSettlementTemplate({ candidate }),
+        first,
+        'the cached template must retain the pre-await canonical snapshot',
+      );
+      const snapshot = source.snapshot();
+      assert.equal(snapshot.templateCacheSize, 1);
+      assert.equal(snapshot.templatesMaterialized, 1);
+    } finally {
+      await source.shutdown();
+    }
+  });
+
+test('P0 W8 public template resolution snapshots mutable candidate input end-to-end', async () => {
+  const generator = await createW8ParityChunkGenerator({ worldSeed: defaultSeed });
+  try {
+    const candidate = await generator.distributor.findHomeSettlement(0, 0);
+    const mutable = {
+      ...candidate,
+      macroRegion: { ...candidate.macroRegion },
+      center: { ...candidate.center },
+    };
+    const pending = generator.resolveSettlementPresentationTemplate({ candidate: mutable });
+    mutable.settlementId = `${candidate.settlementId}:mutated`;
+    mutable.macroRegion.z += 1;
+    mutable.center.z -= 1_000;
+    mutable.urbanization += 0.1;
+    mutable.terrainSuitability -= 0.1;
+
+    const first = await pending;
+    assert.equal(first.settlementId, candidate.settlementId);
+    assert.deepEqual(first.center, candidate.center);
+    assert.equal(first.urbanization, candidate.urbanization);
+    assert.equal(first.terrainSuitability, candidate.terrainSuitability);
+    assert.deepEqual(
+      await generator.resolveSettlementPresentationTemplate({ candidate }),
+      first,
+      'the W8 overlay and source cache must retain the same pre-await snapshot',
+    );
+  } finally {
+    await generator.shutdown();
+  }
+});
+
+test('P0 resident W8 identity rejects a changed candidate before an evicted source can be poisoned', {
+  timeout: 60_000,
+}, async () => {
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: defaultSeed,
+    cacheCapacities: Object.freeze({
+      ...W8_PARITY_CACHE_CAPACITIES,
+      settlementOverlay: 129,
+    }),
+  });
+  try {
+    const target = await generator.distributor.findHomeSettlement(0, 0);
+    const expected = await generator.resolveSettlementPresentationTemplate({ candidate: target });
+    const initial = generator.snapshot();
+    const sourceCapacity = initial.source.templateCacheCapacity;
+    assert.equal(sourceCapacity, 128);
+    assert.ok(initial.settlementOverlayCacheCapacity > sourceCapacity);
+    const candidates = await generator.distributor.findSettlementsNear(0, 0, 8_000);
+    const fillers = candidates.filter(candidate => candidate.settlementId !== target.settlementId)
+      .slice(0, sourceCapacity);
+    assert.equal(fillers.length, sourceCapacity,
+      'fixture must fill the production source cache while retaining the target W8 overlay');
+    for (const candidate of fillers) {
+      await generator.resolveSettlementPresentationTemplate({ candidate });
+    }
+    const beforeConflict = generator.snapshot();
+    assert.equal(beforeConflict.source.templateCacheSize, sourceCapacity);
+    assert.equal(beforeConflict.settlementOverlayCacheSize, sourceCapacity + 1);
+
+    const changed = Object.freeze({
+      ...target,
+      urbanization: target.urbanization + 0.000001,
+    });
+    await assert.rejects(
+      generator.resolveSettlementPresentationTemplate({ candidate: changed }),
+      new RegExp(`Settlement overlay candidate identity conflict for ${target.settlementId}`),
+    );
+    const afterConflict = generator.snapshot();
+    assert.equal(afterConflict.source.templateCacheHits,
+      beforeConflict.source.templateCacheHits);
+    assert.equal(afterConflict.source.templateCacheMisses,
+      beforeConflict.source.templateCacheMisses);
+    assert.equal(afterConflict.source.templatesMaterialized,
+      beforeConflict.source.templatesMaterialized);
+    assert.equal(afterConflict.settlementOverlayCacheSize,
+      beforeConflict.settlementOverlayCacheSize);
+    assert.equal(afterConflict.settlementOverlayCacheEvictionCount,
+      beforeConflict.settlementOverlayCacheEvictionCount);
+    assert.equal(afterConflict.canonicalMajorRoad.settlementTemplateRequests,
+      beforeConflict.canonicalMajorRoad.settlementTemplateRequests);
+
+    const recovered = await generator.resolveSettlementPresentationTemplate({ candidate: target });
+    assert.deepEqual(recovered, expected,
+      'a rejected conflict must not poison the next canonical source-cache rebuild');
+    const afterRecovery = generator.snapshot();
+    assert.equal(afterRecovery.source.templateCacheMisses,
+      beforeConflict.source.templateCacheMisses + 1);
+    assert.equal(afterRecovery.source.templatesMaterialized,
+      beforeConflict.source.templatesMaterialized + 1);
+    assert.equal(afterRecovery.canonicalMajorRoad.settlementTemplateCacheHits,
+      beforeConflict.canonicalMajorRoad.settlementTemplateCacheHits + 1);
+  } finally {
+    await generator.shutdown();
+  }
+});
+
+test('P0 Inline canonical World content is independent of request order and cache history', {
+  timeout: 180_000,
+}, async t => {
+  const timings = {};
+  const freshStartedAt = performance.now();
+  const fresh = await withInlineW8Generator(null, async ({ transport }) => {
+    const chunk = await transport.generateChunk({
+      chunkX: requestOrderFixtureOwner.x,
+      chunkZ: requestOrderFixtureOwner.z,
+    });
+    const settlementId = chunk.settlementReferences?.[0]?.settlementId;
+    assert.equal(typeof settlementId, 'string',
+      'request-order fixture must expose its canonical Settlement reference');
+    const candidates = await transport.findSettlementsNear(
+      requestOrderFixtureCenter.x,
+      requestOrderFixtureCenter.z,
+      256,
+    );
+    const candidate = candidates.find(value => value.settlementId === settlementId);
+    assert.ok(candidate, `missing canonical candidate ${settlementId}`);
+    return Object.freeze({
+      candidate,
+      world: await collectCanonicalWorld({ transport, candidate, chunk }),
+    });
+  });
+  timings.freshMs = performance.now() - freshStartedAt;
+  assertCanonicalWorldMatches(fresh.world, fresh.world, 'fresh');
+  assert.ok(canonicalFeatureRecords(fresh.world, 'Road').length > 0,
+    'fixture must compare canonical Road records');
+  assert.ok(canonicalFeatureRecords(fresh.world, 'Building').length > 0,
+    'fixture must compare canonical Building records');
+
+  const coverageRequest = transport => transport.resolveCanonicalMajorRoadOwnerCoverage({
+    centerWorldX: requestOrderFixtureCenter.x,
+    centerWorldZ: requestOrderFixtureCenter.z,
+    radiusMeters: 0,
+  });
+  const generateFixtureChunk = transport => transport.generateChunk({
+    chunkX: requestOrderFixtureOwner.x,
+    chunkZ: requestOrderFixtureOwner.z,
+  });
+  const generateFixtureOwner = transport => transport.generatePresentationOwner({
+    chunkX: requestOrderFixtureOwner.x,
+    chunkZ: requestOrderFixtureOwner.z,
+  });
+  const resolveFixtureTemplate = transport => (
+    transport.resolveSettlementPresentationTemplate({ candidate: fresh.candidate })
+  );
+
+  const scenarios = Object.freeze([
+    Object.freeze({
+      name: 'coverage-first',
+      run: async transport => {
+        const coverage = await coverageRequest(transport);
+        assert.ok(coverage.roadCount > 0, 'coverage-first must exercise canonical MAJOR Roads');
+        return collectCanonicalWorld({ transport, candidate: fresh.candidate });
+      },
+    }),
+    Object.freeze({
+      name: 'template-first',
+      run: async transport => {
+        const template = await resolveFixtureTemplate(transport);
+        return collectCanonicalWorld({ transport, candidate: fresh.candidate, template });
+      },
+    }),
+    Object.freeze({
+      name: 'PresentationOwner-first',
+      run: async transport => {
+        const presentationOwner = await generateFixtureOwner(transport);
+        return collectCanonicalWorld({
+          transport,
+          candidate: fresh.candidate,
+          presentationOwner,
+        });
+      },
+    }),
+    Object.freeze({
+      name: 'parallel',
+      repeat: 5,
+      run: async transport => {
+        const [coverage, template, presentationOwner, chunk, duplicateChunk] = await Promise.all([
+          coverageRequest(transport),
+          resolveFixtureTemplate(transport),
+          generateFixtureOwner(transport),
+          generateFixtureChunk(transport),
+          generateFixtureChunk(transport),
+        ]);
+        assert.ok(coverage.roadCount > 0, 'parallel must exercise canonical MAJOR Roads');
+        assert.deepEqual(duplicateChunk, chunk,
+          'parallel duplicate Full requests must resolve identical ChunkData');
+        return collectCanonicalWorld({
+          transport,
+          candidate: fresh.candidate,
+          chunk,
+          template,
+          presentationOwner,
+        });
+      },
+    }),
+    Object.freeze({
+      name: 'reverse',
+      run: async transport => {
+        const presentationOwner = await generateFixtureOwner(transport);
+        const template = await resolveFixtureTemplate(transport);
+        const coverage = await coverageRequest(transport);
+        assert.ok(coverage.roadCount > 0, 'reverse must exercise canonical MAJOR Roads');
+        const chunk = await generateFixtureChunk(transport);
+        return collectCanonicalWorld({
+          transport,
+          candidate: fresh.candidate,
+          chunk,
+          template,
+          presentationOwner,
+        });
+      },
+    }),
+  ]);
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const runTimes = [];
+      for (let iteration = 0; iteration < (scenario.repeat ?? 1); iteration += 1) {
+        const startedAt = performance.now();
+        const actual = await withInlineW8Generator(null, ({ transport }) => (
+          scenario.run(transport)
+        ));
+        runTimes.push(performance.now() - startedAt);
+        assertCanonicalWorldMatches(actual, fresh.world,
+          `${scenario.name} run ${iteration + 1}`);
+      }
+      timings[`${scenario.name}Ms`] = scenario.repeat
+        ? Object.freeze(runTimes)
+        : runTimes[0];
+    });
+  }
+
+  await t.test('cache eviction and revisit', async () => {
+    const startedAt = performance.now();
+    const smallCapacities = Object.freeze(Object.fromEntries(
+      Object.keys(W8_PARITY_CACHE_CAPACITIES).map(key => [key, 1]),
+    ));
+    const revisited = await withInlineW8Generator({
+      cacheCapacities: smallCapacities,
+    }, async ({ generator, transport }) => {
+      const initial = await collectCanonicalWorld({
+        transport,
+        candidate: fresh.candidate,
+      });
+      assertCanonicalWorldMatches(initial, fresh.world, 'pre-eviction');
+      // Touch the target last, then materialize enough distinct canonical
+      // templates to force both W8 overlay eviction and the source LRU past it.
+      await resolveFixtureTemplate(transport);
+      const beforeFill = generator.snapshot();
+      const sourceCapacity = beforeFill.source.templateCacheCapacity;
+      const candidates = await transport.findSettlementsNear(
+        requestOrderFixtureCenter.x,
+        requestOrderFixtureCenter.z,
+        8_000,
+      );
+      const requiredFillerCount = sourceCapacity + beforeFill.source.templateCacheSize + 1;
+      const fillers = candidates.filter(candidate => (
+        candidate.settlementId !== fresh.candidate.settlementId
+      )).slice(0, requiredFillerCount);
+      assert.equal(fillers.length, requiredFillerCount,
+        'fixture must contain enough distinct Settlements for real source-cache eviction');
+      for (const candidate of fillers) {
+        await transport.resolveSettlementPresentationTemplate({ candidate });
+      }
+      const afterFill = generator.snapshot();
+      assert.ok(afterFill.settlementOverlayCacheEvictionCount
+        > beforeFill.settlementOverlayCacheEvictionCount,
+      'the W8 Settlement overlay LRU must actually evict entries');
+      assert.equal(afterFill.source.templateCacheSize, sourceCapacity,
+        'the source Settlement template LRU must reach its bounded capacity');
+
+      await transport.generateChunk({
+        chunkX: requestOrderFixtureOwner.x + chunksPerMacroRegion * 8,
+        chunkZ: requestOrderFixtureOwner.z + chunksPerMacroRegion * 5,
+      });
+      const beforeRevisit = generator.snapshot();
+      assert.ok(beforeRevisit.canonicalOwnerCache.counts.evictions > 0,
+        'the W8 canonical owner cache must actually evict the target owner');
+      const result = await collectCanonicalWorld({
+        transport,
+        candidate: fresh.candidate,
+      });
+      const afterRevisit = generator.snapshot();
+      assert.ok(afterRevisit.source.templateCacheMisses
+        > beforeRevisit.source.templateCacheMisses,
+      'revisit must miss the underlying source template cache, not reuse the target');
+      assert.ok(afterRevisit.canonicalOwnerCache.counts.loads
+        > beforeRevisit.canonicalOwnerCache.counts.loads,
+      'revisit must rebuild the evicted canonical owner');
+      return result;
+    });
+    timings.cacheEvictionRevisitMs = performance.now() - startedAt;
+    assertCanonicalWorldMatches(revisited, fresh.world, 'cache eviction and revisit');
+  });
+
+  t.diagnostic(JSON.stringify({
+    owner: requestOrderFixtureOwner,
+    contentHash: fresh.world.chunk.contentHash,
+    sourceW5ContentHash: fresh.world.chunk.sourceW5ContentHash,
+    timings,
+  }));
 });
 
 test('GP-STR-01 320-Macro-Region traversal keeps real W8 generation caches bounded', {

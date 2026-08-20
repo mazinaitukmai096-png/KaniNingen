@@ -74,29 +74,40 @@ export function orientedRectangleIntersectsCircle(rectangle, circle, clearance =
 }
 
 export function orientedRectanglesOverlap(first, second, minimumSeparation = 0) {
-  const firstAxes = axes(first.rotationY);
-  const secondAxes = axes(second.rotationY);
-  const testAxes = [
-    { x: firstAxes.rightX, z: firstAxes.rightZ },
-    { x: firstAxes.frontX, z: firstAxes.frontZ },
-    { x: secondAxes.rightX, z: secondAxes.rightZ },
-    { x: secondAxes.frontX, z: secondAxes.frontZ },
-  ];
+  // SAT is called for every candidate Lot against the already accepted Lots.
+  // Keep the same four-axis/order contract without allocating two basis
+  // objects, an axis array, and four axis objects for each comparison.
+  const firstRightX = Math.cos(first.rotationY);
+  const firstRightZ = -Math.sin(first.rotationY);
+  const firstFrontX = Math.sin(first.rotationY);
+  const firstFrontZ = Math.cos(first.rotationY);
+  const secondRightX = Math.cos(second.rotationY);
+  const secondRightZ = -Math.sin(second.rotationY);
+  const secondFrontX = Math.sin(second.rotationY);
+  const secondFrontZ = Math.cos(second.rotationY);
   const centerDx = second.centerX - first.centerX;
   const centerDz = second.centerZ - first.centerZ;
+  const firstHalfWidth = first.width / 2;
+  const firstHalfDepth = first.depth / 2;
+  const secondHalfWidth = second.width / 2;
+  const secondHalfDepth = second.depth / 2;
   const addedHalfSeparation = minimumSeparation / 2;
 
-  for (const axis of testAxes) {
-    const centerDistance = Math.abs(centerDx * axis.x + centerDz * axis.z);
-    const firstRadius = first.width / 2 * Math.abs(firstAxes.rightX * axis.x + firstAxes.rightZ * axis.z)
-      + first.depth / 2 * Math.abs(firstAxes.frontX * axis.x + firstAxes.frontZ * axis.z)
+  const overlapsOnAxis = (axisX, axisZ) => {
+    const centerDistance = Math.abs(centerDx * axisX + centerDz * axisZ);
+    const firstRadius = firstHalfWidth * Math.abs(firstRightX * axisX + firstRightZ * axisZ)
+      + firstHalfDepth * Math.abs(firstFrontX * axisX + firstFrontZ * axisZ)
       + addedHalfSeparation;
-    const secondRadius = second.width / 2 * Math.abs(secondAxes.rightX * axis.x + secondAxes.rightZ * axis.z)
-      + second.depth / 2 * Math.abs(secondAxes.frontX * axis.x + secondAxes.frontZ * axis.z)
+    const secondRadius = secondHalfWidth * Math.abs(secondRightX * axisX + secondRightZ * axisZ)
+      + secondHalfDepth * Math.abs(secondFrontX * axisX + secondFrontZ * axisZ)
       + addedHalfSeparation;
-    if (centerDistance >= firstRadius + secondRadius) return false;
-  }
-  return true;
+    return !(centerDistance >= firstRadius + secondRadius);
+  };
+
+  return overlapsOnAxis(firstRightX, firstRightZ)
+    && overlapsOnAxis(firstFrontX, firstFrontZ)
+    && overlapsOnAxis(secondRightX, secondRightZ)
+    && overlapsOnAxis(secondFrontX, secondFrontZ);
 }
 
 export function roadSurfaceToRectangle(surface) {

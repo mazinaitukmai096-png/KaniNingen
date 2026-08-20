@@ -26,6 +26,7 @@ import {
 
 export const W5_GENERATOR_VERSION = parseGeneratorVersion('500.0.0');
 export const W5_CHUNK_DATA_SCHEMA = 'w5-distributed-settlement-chunk-data-1';
+const SETTLEMENT_TEMPLATE_CACHE_CAPACITY = 128;
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
   return Object.is(rounded, -0) ? 0 : rounded;
@@ -179,6 +180,61 @@ function lruSet(map, key, value, capacity) {
   return value;
 }
 
+function settlementTemplateCandidateIdentity(candidate) {
+  if (typeof candidate?.settlementId !== 'string' || candidate.settlementId.length === 0) {
+    throw new TypeError('Settlement candidate requires a non-empty settlementId');
+  }
+  if (typeof candidate.settlementType !== 'string' || candidate.settlementType.length === 0
+    || typeof candidate.townType !== 'string' || candidate.townType.length === 0) {
+    throw new TypeError(`Settlement candidate ${candidate.settlementId} requires canonical types`);
+  }
+  if (!Number.isSafeInteger(candidate.macroRegion?.x)
+    || !Number.isSafeInteger(candidate.macroRegion?.z)) {
+    throw new TypeError(`Settlement candidate ${candidate.settlementId} requires a canonical macroRegion`);
+  }
+  if (![candidate.center?.x, candidate.center?.z, candidate.radiusMeters,
+    candidate.urbanization, candidate.terrainSuitability].every(Number.isFinite)) {
+    throw new TypeError(`Settlement candidate ${candidate.settlementId} requires finite canonical metadata`);
+  }
+  if (candidate.radiusMeters <= 0) {
+    throw new RangeError(`Settlement candidate ${candidate.settlementId} requires a positive radiusMeters`);
+  }
+  // These are the candidate fields read by every supported Settlement template
+  // adapter, including the connectivity-graph query used by Road Graph modes.
+  // Per-generator world/config identity is fixed outside the candidate.
+  return canonicalizeJson({
+    settlementId: candidate.settlementId,
+    settlementType: candidate.settlementType,
+    townType: candidate.townType,
+    macroRegion: candidate.macroRegion,
+    center: candidate.center,
+    radiusMeters: candidate.radiusMeters,
+    urbanization: candidate.urbanization,
+    terrainSuitability: candidate.terrainSuitability,
+  });
+}
+
+function snapshotSettlementTemplateCandidate(candidate) {
+  const snapshot = Object.freeze({
+    settlementId: candidate?.settlementId,
+    settlementType: candidate?.settlementType,
+    townType: candidate?.townType,
+    macroRegion: candidate?.macroRegion && typeof candidate.macroRegion === 'object'
+      ? Object.freeze({ ...candidate.macroRegion })
+      : candidate?.macroRegion,
+    center: candidate?.center && typeof candidate.center === 'object'
+      ? Object.freeze({ ...candidate.center })
+      : candidate?.center,
+    radiusMeters: candidate?.radiusMeters,
+    urbanization: candidate?.urbanization,
+    terrainSuitability: candidate?.terrainSuitability,
+  });
+  return Object.freeze({
+    candidate: snapshot,
+    candidateIdentity: settlementTemplateCandidateIdentity(snapshot),
+  });
+}
+
 export async function hashW5ChunkContent(content, { stageRecorder = null } = {}) {
   const envelope = {
     schemaVersion: 'w5-transitive-content-envelope-1',
@@ -256,7 +312,7 @@ export async function createDistributedSettlementChunkGenerator({
   const distributor = await createSettlementDistributor({ worldSeedHash: formalGenerator.worldSeedHash });
   const reviewSettlement = await distributor.findHomeSettlement(0, 0);
   const templateCache = new Map();
-  const templateCacheCapacity = 128;
+  const pendingTemplates = new Map();
   let isShutdown = false;
   let templatesMaterialized = 0;
   let templateGenerationMs = 0;
@@ -265,46 +321,79 @@ export async function createDistributedSettlementChunkGenerator({
 
   async function getTemplate(candidate, roadTimingRun = null) {
     if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
+    const canonical = snapshotSettlementTemplateCandidate(candidate);
+    candidate = canonical.candidate;
+    const { candidateIdentity } = canonical;
     const cacheLookupStartedAt = roadTimingRun
       ? (globalThis.performance?.now?.() ?? Date.now()) : null;
-    const hasCachedTemplate = templateCache.has(candidate.settlementId);
+    const cached = templateCache.get(candidate.settlementId);
+    const pending = pendingTemplates.get(candidate.settlementId);
     if (cacheLookupStartedAt !== null) {
       roadTimingRun.recordFunction('source-template-cache-lookup', Math.max(0,
         (globalThis.performance?.now?.() ?? Date.now()) - cacheLookupStartedAt));
     }
-    if (hasCachedTemplate) {
+    if (cached) {
+      if (cached.candidateIdentity !== candidateIdentity) {
+        throw new Error(
+          `Settlement template candidate identity conflict for ${candidate.settlementId}`,
+        );
+      }
       templateCacheHits += 1;
       roadTimingRun?.recordCacheHit();
-      const cached = templateCache.get(candidate.settlementId);
       templateCache.delete(candidate.settlementId);
       templateCache.set(candidate.settlementId, cached);
-      return cached;
+      return cached.template;
+    }
+    if (pending) {
+      if (pending.candidateIdentity !== candidateIdentity) {
+        throw new Error(
+          `Pending Settlement template candidate identity conflict for ${candidate.settlementId}`,
+        );
+      }
+      templateCacheHits += 1;
+      roadTimingRun?.recordCacheHit();
+      return pending.promise;
     }
     templateCacheMisses += 1;
     roadTimingRun?.recordCacheMiss();
-    const startedAt = globalThis.performance?.now?.() ?? Date.now();
-    const roadGraphTemplateOptions = {
-      worldSeedHash: formalGenerator.worldSeedHash,
-      candidate,
-      connectivityGraph: await distributor.buildConnectivityGraphNear(
-        candidate.center.x,
-        candidate.center.z,
-        Math.max(candidate.radiusMeters ?? 0, 1),
-      ),
-      roadTimingRun,
-      ...(settlementLotMode ? { settlementLotMode } : {}),
-    };
-    const template = useRoadGraphV3
-      ? await createRoadGraphV3SettlementTemplate(roadGraphTemplateOptions)
-      : useRoadGraphV2
-        ? await createRoadGraphV2SettlementTemplate(roadGraphTemplateOptions)
-      : useRoadGraphV1
-        ? await createRoadGraphV1SettlementTemplate(roadGraphTemplateOptions)
-        : await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
-    if (isShutdown) return template;
-    templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
-    templatesMaterialized += 1;
-    return lruSet(templateCache, candidate.settlementId, template, templateCacheCapacity);
+    const promise = (async () => {
+      const startedAt = globalThis.performance?.now?.() ?? Date.now();
+      const roadGraphTemplateOptions = {
+        worldSeedHash: formalGenerator.worldSeedHash,
+        candidate,
+        connectivityGraph: await distributor.buildConnectivityGraphNear(
+          candidate.center.x,
+          candidate.center.z,
+          candidate.radiusMeters,
+        ),
+        roadTimingRun,
+        ...(settlementLotMode ? { settlementLotMode } : {}),
+      };
+      const template = useRoadGraphV3
+        ? await createRoadGraphV3SettlementTemplate(roadGraphTemplateOptions)
+        : useRoadGraphV2
+          ? await createRoadGraphV2SettlementTemplate(roadGraphTemplateOptions)
+        : useRoadGraphV1
+          ? await createRoadGraphV1SettlementTemplate(roadGraphTemplateOptions)
+          : await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
+      if (isShutdown) return template;
+      templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
+      templatesMaterialized += 1;
+      lruSet(templateCache, candidate.settlementId, Object.freeze({
+        candidateIdentity,
+        template,
+      }), SETTLEMENT_TEMPLATE_CACHE_CAPACITY);
+      return template;
+    })();
+    const pendingEntry = Object.freeze({ candidateIdentity, promise });
+    pendingTemplates.set(candidate.settlementId, pendingEntry);
+    try {
+      return await promise;
+    } finally {
+      if (pendingTemplates.get(candidate.settlementId) === pendingEntry) {
+        pendingTemplates.delete(candidate.settlementId);
+      }
+    }
   }
 
   return Object.freeze({
@@ -398,13 +487,17 @@ export async function createDistributedSettlementChunkGenerator({
       if (isShutdown) return;
       isShutdown = true;
       templateCache.clear();
+      const pending = [...pendingTemplates.values()].map(entry => entry.promise);
+      await Promise.allSettled(pending);
+      pendingTemplates.clear();
       await distributor.shutdown?.();
       await formalGenerator.shutdown?.();
     },
     snapshot: () => Object.freeze({
       isShutdown,
       templateCacheSize: templateCache.size,
-      templateCacheCapacity,
+      templateCacheCapacity: SETTLEMENT_TEMPLATE_CACHE_CAPACITY,
+      templateCachePendingCount: pendingTemplates.size,
       templatesMaterialized,
       templateGenerationMs,
       templateCacheHits,

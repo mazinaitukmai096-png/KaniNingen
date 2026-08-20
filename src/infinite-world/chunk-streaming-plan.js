@@ -6,6 +6,7 @@ import {
 } from './chunk-coordinates.js';
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  normalizeW8RenderDistancePreset,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
 
@@ -24,13 +25,29 @@ const currentRenderDistance = resolveW8RenderDistancePolicy(
 // interpreted as evidence that an owner has a visible GPU-backed drawable;
 // that is tracked by the separate Visual Continuity lifecycle.
 // Remote Settlement metadata remains a sparse Presentation Resource query.
+//
+// Capacity constants deliberately stay sized for Current (the largest preset),
+// while live Presentation residency follows the selected Render Distance. This
+// keeps one bounded cache capable of every preset without forcing Short and
+// Standard to keep Current's entire resource window required.
 export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS =
   currentRenderDistance.distanceContract.residentCoverageDistanceMeters;
+export const FULL_RESIDENT_RADIUS_METERS = 100;
+
+export function resolvePresentationResidentRadiusMeters(
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+) {
+  const policy = resolveW8RenderDistancePolicy(renderDistancePreset);
+  return Math.max(
+    FULL_RESIDENT_RADIUS_METERS,
+    policy.distanceContract.residentCoverageDistanceMeters + LOGICAL_CHUNK_SIZE_METERS,
+  );
+}
+
 export const RESIDENT_WORLD_REQUIRED_RADIUS_METERS =
-  RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS + LOGICAL_CHUNK_SIZE_METERS;
+  resolvePresentationResidentRadiusMeters(W8_DEFAULT_RENDER_DISTANCE_PRESET);
 export const PRESENTATION_RESIDENT_RADIUS_METERS =
   RESIDENT_WORLD_REQUIRED_RADIUS_METERS;
-export const FULL_RESIDENT_RADIUS_METERS = 100;
 
 function chunkAabbDistanceSquared(chunkX, chunkZ, centerX, centerZ) {
   const minimumX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
@@ -91,29 +108,44 @@ function createNamedResidentView(name, radiusMeters, ownerCoordinates) {
 export function createResidentWorldCoverage({
   centerChunkX,
   centerChunkZ,
-  radiusMeters = RESIDENT_WORLD_REQUIRED_RADIUS_METERS,
+  renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
+  radiusMeters = null,
 } = {}) {
   if (!Number.isSafeInteger(centerChunkX) || !Number.isSafeInteger(centerChunkZ)) {
     throw new TypeError('Resident World center must use safe Chunk coordinates');
   }
-  if (!Number.isFinite(radiusMeters)
-    || radiusMeters < RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS) {
-    throw new RangeError('Resident World radius must cover the maximum visible radius');
+  const normalizedRenderDistancePreset = normalizeW8RenderDistancePreset(
+    renderDistancePreset,
+  );
+  const renderDistancePolicy = resolveW8RenderDistancePolicy(
+    normalizedRenderDistancePreset,
+  );
+  const maximumVisibleRadiusMeters =
+    renderDistancePolicy.distanceContract.residentCoverageDistanceMeters;
+  const presentationResidentRadiusMeters = resolvePresentationResidentRadiusMeters(
+    normalizedRenderDistancePreset,
+  );
+  const resolvedRadiusMeters = radiusMeters ?? presentationResidentRadiusMeters;
+  if (!Number.isFinite(resolvedRadiusMeters)
+    || resolvedRadiusMeters < presentationResidentRadiusMeters) {
+    throw new RangeError(
+      'Resident World radius must cover the selected Render Distance resource margin',
+    );
   }
   const ownerCoordinates = collectResidentCoordinates(
     centerChunkX,
     centerChunkZ,
-    radiusMeters,
+    resolvedRadiusMeters,
   );
   const ownerKeys = Object.freeze(ownerCoordinates.map(value => value.key));
   const presentationView = createNamedResidentView(
     'presentation',
-    Math.min(PRESENTATION_RESIDENT_RADIUS_METERS, radiusMeters),
+    presentationResidentRadiusMeters,
     ownerCoordinates,
   );
   const fullView = createNamedResidentView(
     'full',
-    Math.min(FULL_RESIDENT_RADIUS_METERS, radiusMeters),
+    Math.min(FULL_RESIDENT_RADIUS_METERS, resolvedRadiusMeters),
     ownerCoordinates,
   );
   return Object.freeze({
@@ -121,11 +153,13 @@ export function createResidentWorldCoverage({
     contract: 'resource-resident-not-drawable',
     centerChunkX,
     centerChunkZ,
+    renderDistancePreset: normalizedRenderDistancePreset,
     centerOwnerKey: createChunkKey(centerChunkX, centerChunkZ),
     centerX: centerChunkX * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2,
     centerZ: centerChunkZ * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2,
-    maximumVisibleRadiusMeters: RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS,
-    radiusMeters,
+    maximumVisibleRadiusMeters,
+    requiredRadiusMeters: presentationResidentRadiusMeters,
+    radiusMeters: resolvedRadiusMeters,
     ownerCoordinates,
     presentationView,
     fullView,
@@ -134,7 +168,8 @@ export function createResidentWorldCoverage({
     residentTerrainOwnerKeys: fullView.ownerKeys,
     residentNaturalOwnerKeys: presentationView.ownerKeys,
     residentStructureOwnerKeys: presentationView.ownerKeys,
-    signature: `resident:${centerChunkX},${centerChunkZ}:${radiusMeters}:${ownerKeys.length}`,
+    signature: `resident:${normalizedRenderDistancePreset}:${centerChunkX},${centerChunkZ}:`
+      + `${resolvedRadiusMeters}:${ownerKeys.length}`,
   });
 }
 
@@ -335,6 +370,7 @@ export function planRuntimeTerrainReadySet({
     ? createResidentWorldCoverage({
       centerChunkX: endpoint.chunkX,
       centerChunkZ: endpoint.chunkZ,
+      renderDistancePreset: residentCoverage.renderDistancePreset,
       radiusMeters: residentCoverage.radiusMeters,
     })
     : null;

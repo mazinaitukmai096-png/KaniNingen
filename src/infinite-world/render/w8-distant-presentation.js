@@ -2501,6 +2501,12 @@ export async function createW8DistantPresentation({
       .filter(([, bucket]) => bucket.mesh || bucket.persistentReuseEntryKey)
       .map(([key, bucket]) => [`bucket:${key}`, { key, bucket, mesh: bucket.mesh, generation }]),
   );
+  const assertPreparedDistantGenerationMaterialized = generation => {
+    for (const [key, bucket] of generation?.canonicalBuckets?.entries?.() ?? []) {
+      if (!bucket?.items?.length || bucket.mesh) continue;
+      throw new Error(`prepared Distant bucket is not materialized: ${key}`);
+    }
+  };
   const directAuxiliaryMeshEntries = generation => {
     const canonicalMeshes = new Set(
       [...(generation?.canonicalBuckets?.values?.() ?? [])].map(bucket => bucket.mesh),
@@ -6205,6 +6211,7 @@ export async function createW8DistantPresentation({
     const persistentEntryKey = `bucket:${bucket.key
       ?? `${bucket.geometry}:${bucket.material}:${bucket.name}`}`;
     const reusableEntry = context.generation.persistentDistant === true
+      && context.generation.allowPersistentDistantMeshReuse !== false
       && persistentDistantRoot
       && isPersistentDistantBucketName(bucket.name)
       ? liveDistantEntries.get(persistentEntryKey) ?? null
@@ -14365,6 +14372,12 @@ export async function createW8DistantPresentation({
         excludeTreeNatural: true,
         excludeNatural: true,
         persistentDistant: incrementalStaticTreePages,
+        // A deferred Render Distance generation owns a detached staging root.
+        // Reusing a live persistent mesh here would leave the staged bucket with
+        // only a reuse key and no mesh to own after the atomic preset commit.
+        // Materialize detached meshes instead; ordinary live syncs keep the
+        // persistent slot-reuse path below.
+        allowPersistentDistantMeshReuse: deferPublication !== true,
         independentRoadPresentation,
         ownedGeometries: new Set(),
         ownedMaterials: new Set(),
@@ -14703,6 +14716,11 @@ export async function createW8DistantPresentation({
         || distant.previous !== activeGeneration
         || localTerrain.previous !== activeLocalTerrainGeneration) return false;
       const distantGeneration = distant.generation;
+      // Commit is an atomic root swap. Every canonical bucket in the prepared
+      // generation must therefore own a concrete mesh before any live state is
+      // mutated; persistent reuse markers are valid only for incremental live
+      // publication, not for detached preset staging.
+      assertPreparedDistantGenerationMaterialized(distantGeneration);
       root.add(distantGeneration.root);
       activeGeneration = distantGeneration;
       markRoadLifecyclePublished(distantGeneration);

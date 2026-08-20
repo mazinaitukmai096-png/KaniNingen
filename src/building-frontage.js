@@ -50,44 +50,64 @@ export function closestPointOnRoad(x, z, road) {
 }
 
 export function selectFrontageRoad({ x, z, roads, townId = null }) {
-  const candidates = roads
-    .filter(road => (
-      road.kind !== ROAD_KINDS.START_APPROACH
-      && ROAD_KIND_DISTANCE_BIAS[road.kind] !== undefined
-      && (townId === null || road.townId === townId)
-    ))
-    .map(road => {
-      const closest = closestPointOnRoad(x, z, road);
-      return {
-        road,
-        closest,
-        score: closest.distance + ROAD_KIND_DISTANCE_BIAS[road.kind],
-      };
-    })
-    .sort((first, second) => (
-      first.score - second.score
-      || first.closest.distance - second.closest.distance
-      || first.road.roadId.localeCompare(second.road.roadId)
-    ));
+  // This is a placement hotpath during cold Settlement generation.  Keep the
+  // exact ranking contract, but select the minimum in one pass instead of
+  // allocating/filtering/mapping/sorting a candidate array for every anchor.
+  let selectedRoad = null;
+  let selectedClosestX = 0;
+  let selectedClosestZ = 0;
+  let selectedDistance = 0;
+  let selectedT = 0;
+  let selectedScore = 0;
 
-  if (candidates.length === 0) return null;
-  const selected = candidates[0];
+  for (const road of roads) {
+    const distanceBias = ROAD_KIND_DISTANCE_BIAS[road.kind];
+    if (road.kind === ROAD_KINDS.START_APPROACH
+      || distanceBias === undefined
+      || (townId !== null && road.townId !== townId)) continue;
+
+    const dx = road.end.x - road.start.x;
+    const dz = road.end.z - road.start.z;
+    const lengthSq = dx * dx + dz * dz;
+    const t = lengthSq <= EPSILON
+      ? 0
+      : clamp(((x - road.start.x) * dx + (z - road.start.z) * dz) / lengthSq, 0, 1);
+    const closestX = road.start.x + dx * t;
+    const closestZ = road.start.z + dz * t;
+    const distance = Math.hypot(x - closestX, z - closestZ);
+    const score = distance + distanceBias;
+    const isBetter = selectedRoad === null
+      || score < selectedScore
+      || (score === selectedScore && distance < selectedDistance)
+      || (score === selectedScore && distance === selectedDistance
+        && road.roadId.localeCompare(selectedRoad.roadId) < 0);
+    if (!isBetter) continue;
+
+    selectedRoad = road;
+    selectedClosestX = closestX;
+    selectedClosestZ = closestZ;
+    selectedDistance = distance;
+    selectedT = t;
+    selectedScore = score;
+  }
+
+  if (selectedRoad === null) return null;
   return Object.freeze({
-    roadId: selected.road.roadId,
-    routeId: selected.road.routeId,
-    kind: selected.road.kind,
-    width: selected.road.width,
-    tangentX: selected.road.tangentX,
-    tangentZ: selected.road.tangentZ,
-    normalX: selected.road.normalX,
-    normalZ: selected.road.normalZ,
-    closestX: selected.closest.x,
-    closestZ: selected.closest.z,
-    distance: selected.closest.distance,
-    roadT: selected.closest.t,
+    roadId: selectedRoad.roadId,
+    routeId: selectedRoad.routeId,
+    kind: selectedRoad.kind,
+    width: selectedRoad.width,
+    tangentX: selectedRoad.tangentX,
+    tangentZ: selectedRoad.tangentZ,
+    normalX: selectedRoad.normalX,
+    normalZ: selectedRoad.normalZ,
+    closestX: selectedClosestX,
+    closestZ: selectedClosestZ,
+    distance: selectedDistance,
+    roadT: selectedT,
     roadLength: Math.hypot(
-      selected.road.end.x - selected.road.start.x,
-      selected.road.end.z - selected.road.start.z,
+      selectedRoad.end.x - selectedRoad.start.x,
+      selectedRoad.end.z - selectedRoad.start.z,
     ),
   });
 }

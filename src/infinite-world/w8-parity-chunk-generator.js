@@ -1134,11 +1134,15 @@ export async function createW8ParityChunkGenerator({
   const warmSourceChunks = new Map();
   const pendingSourceChunks = new Map();
   const settlementDiagnostics = new Map();
+  const settlementOverlayCandidateIdentities = new Map();
   const majorRoadRouteKeyByEdge = new Map();
   const majorRoadObstacleKeyBySettlement = new Map();
   const settlementOverlayTemplates = createPendingSafeLruCache({
     capacity: cacheCapacities.settlementOverlay,
-    onRemove: settlementId => settlementDiagnostics.delete(settlementId),
+    onRemove: settlementId => {
+      settlementDiagnostics.delete(settlementId);
+      settlementOverlayCandidateIdentities.delete(settlementId);
+    },
   });
   const majorRoadGraphCache = createPendingSafeLruCache({
     capacity: cacheCapacities.majorRoadGraph,
@@ -1295,75 +1299,202 @@ export async function createW8ParityChunkGenerator({
     pendingSourceChunks.set(key, pending);
     return pending;
   };
-  const getSettlementOverlay = async (reference, roadTimingContext = null) => {
+  const assertCanonicalCandidateField = (settlementId, field, actual, expected) => {
+    if (canonicalizeJson(actual) === canonicalizeJson(expected)) return;
+    throw new Error(`canonical Settlement candidate mismatch for ${settlementId}: ${field}`);
+  };
+  const snapshotSettlementTemplateCandidate = candidate => Object.freeze({
+    settlementId: candidate?.settlementId,
+    settlementType: candidate?.settlementType,
+    townType: candidate?.townType,
+    macroRegion: candidate?.macroRegion && typeof candidate.macroRegion === 'object'
+      ? Object.freeze({ ...candidate.macroRegion })
+      : candidate?.macroRegion,
+    center: candidate?.center && typeof candidate.center === 'object'
+      ? Object.freeze({ ...candidate.center })
+      : candidate?.center,
+    radiusMeters: candidate?.radiusMeters,
+    urbanization: candidate?.urbanization,
+    terrainSuitability: candidate?.terrainSuitability,
+  });
+  const resolveCanonicalCandidateAt = async (settlementId, center, ownerRegion = null) => {
+    if (typeof settlementId !== 'string' || settlementId.length === 0
+      || ![center?.x, center?.z].every(Number.isFinite)) {
+      throw new TypeError('canonical Settlement candidate identity and center are required');
+    }
+    let matches = await base.distributor.findSettlementCentersNear(
+      center.x,
+      center.z,
+      0,
+    );
+    let candidate = matches.find(value => value.settlementId === settlementId);
+    if (!candidate && Number.isSafeInteger(ownerRegion?.x)
+      && Number.isSafeInteger(ownerRegion?.z)) {
+      const regionSize = W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters;
+      matches = await base.distributor.findSettlementCentersNear(
+        (ownerRegion.x + 0.5) * regionSize,
+        (ownerRegion.z + 0.5) * regionSize,
+        Math.SQRT2 * regionSize,
+      );
+      candidate = matches.find(value => value.settlementId === settlementId);
+    }
+    if (!candidate) {
+      throw new Error(`canonical Settlement candidate not found for ${settlementId}`);
+    }
+    if (typeof candidate.settlementType !== 'string'
+      || typeof candidate.townType !== 'string'
+      || !Number.isSafeInteger(candidate.macroRegion?.x)
+      || !Number.isSafeInteger(candidate.macroRegion?.z)
+      || ![candidate.center?.x, candidate.center?.z, candidate.radiusMeters,
+        candidate.urbanization, candidate.terrainSuitability].every(Number.isFinite)
+      || candidate.radiusMeters <= 0) {
+      throw new Error(`invalid canonical Settlement candidate for ${settlementId}`);
+    }
+    assertCanonicalCandidateField(settlementId, 'center', candidate.center, center);
+    return candidate;
+  };
+  const hasCompleteSettlementTemplateMetadata = reference => (
+    typeof reference?.settlementId === 'string'
+      && reference.settlementId.length > 0
+      && typeof reference.settlementType === 'string'
+      && reference.settlementType.length > 0
+      && typeof reference.townType === 'string'
+      && reference.townType.length > 0
+      && Number.isSafeInteger(reference.macroRegion?.x)
+      && Number.isSafeInteger(reference.macroRegion?.z)
+      && [reference.center?.x, reference.center?.z, reference.radiusMeters,
+        reference.urbanization, reference.terrainSuitability].every(Number.isFinite)
+      && reference.radiusMeters > 0
+  );
+  const resolveSettlementTemplateCandidate = async reference => {
     if (!reference) return null;
+    const referenceSnapshot = snapshotSettlementTemplateCandidate(reference);
+    if (hasCompleteSettlementTemplateMetadata(referenceSnapshot)) return referenceSnapshot;
+    const candidate = await resolveCanonicalCandidateAt(
+      referenceSnapshot.settlementId,
+      referenceSnapshot.center,
+      referenceSnapshot.macroRegion,
+    );
+    for (const [field, expected] of [
+      ['settlementType', candidate.settlementType],
+      ['townType', candidate.townType],
+      ['macroRegion', candidate.macroRegion],
+      ['center', candidate.center],
+      ['radiusMeters', candidate.radiusMeters],
+      ['urbanization', candidate.urbanization],
+      ['terrainSuitability', candidate.terrainSuitability],
+    ]) {
+      if (!Object.hasOwn(referenceSnapshot, field)
+        || referenceSnapshot[field] === null
+        || referenceSnapshot[field] === undefined) continue;
+      assertCanonicalCandidateField(
+        candidate.settlementId,
+        field,
+        referenceSnapshot[field],
+        expected,
+      );
+    }
+    return snapshotSettlementTemplateCandidate(candidate);
+  };
+  const resolveCanonicalCandidateFromGraphNode = async node => {
+    const candidate = await resolveCanonicalCandidateAt(
+      node?.stableId,
+      node?.center,
+      node?.ownerRegion,
+    );
+    for (const [field, actual, expected] of [
+      ['settlementType', node.settlementType, candidate.settlementType],
+      ['role', node.role, candidate.townType],
+      ['ownerRegion', node.ownerRegion, candidate.macroRegion],
+      ['center', node.center, candidate.center],
+      ['radiusMeters', node.radiusMeters, candidate.radiusMeters],
+    ]) {
+      assertCanonicalCandidateField(candidate.settlementId, field, actual, expected);
+    }
+    return candidate;
+  };
+  const getCanonicalSettlementOverlay = async (candidate, roadTimingContext = null) => {
+    if (!candidate) return null;
+    candidate = snapshotSettlementTemplateCandidate(candidate);
     const roadTimingRun = roadTimingContext?.run ?? null;
+    const candidateIdentity = canonicalizeJson({
+      settlementId: candidate.settlementId,
+      settlementType: candidate.settlementType,
+      townType: candidate.townType,
+      macroRegion: candidate.macroRegion,
+      center: candidate.center,
+      radiusMeters: candidate.radiusMeters,
+      urbanization: candidate.urbanization,
+      terrainSuitability: candidate.terrainSuitability,
+    });
+    const previousCandidateIdentity = settlementOverlayCandidateIdentities
+      .get(candidate.settlementId);
+    if (previousCandidateIdentity && previousCandidateIdentity !== candidateIdentity) {
+      throw new Error(
+        `Settlement overlay candidate identity conflict for ${candidate.settlementId}`,
+      );
+    }
     majorRoadDiagnostics.settlementTemplateRequests += 1;
+    // A resident overlay identity is checked before touching the source cache.
+    // Once accepted, resolve through the source cache so its finite/signature
+    // guard remains authoritative even for W8 overlay hits.
+    const sourceStartedAt = nowMs();
+    const sourceTemplate = await base.resolveSettlementTemplate({
+      candidate,
+      roadTimingRun,
+    });
+    majorRoadDiagnostics.settlementSourceTemplateResolutionMs += nowMs() - sourceStartedAt;
+    recordRoadFunction(roadTimingRun, 'settlement-template-resolution', sourceStartedAt);
     const overlayCacheLookupStartedAt = roadTimingRun ? nowMs() : null;
-    const hasCachedOverlay = settlementOverlayTemplates.has(reference.settlementId);
+    const hasCachedOverlay = settlementOverlayTemplates.has(candidate.settlementId);
     recordRoadFunction(roadTimingRun, 'settlement-overlay-cache-lookup', overlayCacheLookupStartedAt);
     if (hasCachedOverlay) {
       majorRoadDiagnostics.settlementTemplateCacheHits += 1;
       recordRoadCache(roadTimingContext, true);
-      return settlementOverlayTemplates.get(reference.settlementId);
+      settlementOverlayCandidateIdentities.set(candidate.settlementId, candidateIdentity);
+      return settlementOverlayTemplates.get(candidate.settlementId);
     }
     majorRoadDiagnostics.settlementTemplateCacheMisses += 1;
     recordRoadCache(roadTimingContext, false);
-    return settlementOverlayTemplates.getOrCreate(reference.settlementId, async () => {
-      const startedAt = nowMs();
-      const candidate = {
-          settlementId: reference.settlementId,
-          settlementType: reference.settlementType,
-          townType: reference.townType,
-          macroRegion: reference.macroRegion,
-          center: reference.center,
-          urbanization: reference.urbanization,
-          terrainSuitability: reference.terrainSuitability,
-      };
-      const sourceStartedAt = nowMs();
-      const sourceTemplate = await base.resolveSettlementTemplate({
-        candidate,
-        roadTimingRun,
-      });
-      majorRoadDiagnostics.settlementSourceTemplateResolutionMs += nowMs() - sourceStartedAt;
-      recordRoadFunction(roadTimingRun, 'settlement-template-resolution', sourceStartedAt);
-      const overlayStartedAt = nowMs();
-      const overlay = await createW8SettlementParityOverlay({
-        worldSeedHash: base.worldSeedHash,
-        candidate,
-        sourceTemplate,
-        roadTimingRun,
-      });
-      majorRoadDiagnostics.settlementOverlayCompositionMs += nowMs() - overlayStartedAt;
-      majorRoadDiagnostics.settlementOverlayGenerationMs += nowMs() - startedAt;
-      recordRoadFunction(roadTimingRun, 'settlement-overlay-generation', overlayStartedAt);
-      if (!isShutdown) {
-        setLruValue(settlementDiagnostics, reference.settlementId, Object.freeze({
-          settlementId: reference.settlementId,
-          settlementType: reference.settlementType,
-          townType: reference.townType,
-          center: reference.center,
-          macroRegion: reference.macroRegion,
-          radiusMeters: reference.radiusMeters,
-          sourceBuildingCount: overlay.sourceBuildingCount,
-          overlayBuildingCount: overlay.overlayBuildingCount,
-          buildingCount: overlay.sourceBuildingCount + overlay.overlayBuildingCount,
-        }), cacheCapacities.settlementDiagnostics);
-      }
-      return overlay;
-    });
+    const overlayPromise = settlementOverlayTemplates.getOrCreate(
+      candidate.settlementId,
+      async () => {
+        const startedAt = nowMs();
+        const overlayStartedAt = nowMs();
+        const overlay = await createW8SettlementParityOverlay({
+          worldSeedHash: base.worldSeedHash,
+          candidate,
+          sourceTemplate,
+          roadTimingRun,
+        });
+        majorRoadDiagnostics.settlementOverlayCompositionMs += nowMs() - overlayStartedAt;
+        majorRoadDiagnostics.settlementOverlayGenerationMs += nowMs() - startedAt;
+        recordRoadFunction(roadTimingRun, 'settlement-overlay-generation', overlayStartedAt);
+        if (!isShutdown) {
+          setLruValue(settlementDiagnostics, candidate.settlementId, Object.freeze({
+            settlementId: candidate.settlementId,
+            settlementType: candidate.settlementType,
+            townType: candidate.townType,
+            center: candidate.center,
+            macroRegion: candidate.macroRegion,
+            radiusMeters: candidate.radiusMeters,
+            sourceBuildingCount: overlay.sourceBuildingCount,
+            overlayBuildingCount: overlay.overlayBuildingCount,
+            buildingCount: overlay.sourceBuildingCount + overlay.overlayBuildingCount,
+          }), cacheCapacities.settlementDiagnostics);
+        }
+        return overlay;
+      },
+    );
+    settlementOverlayCandidateIdentities.set(candidate.settlementId, candidateIdentity);
+    return overlayPromise;
   };
-  const referenceFromGraphNode = node => Object.freeze({
-    stableId: `${node.stableId}:reference`,
-    settlementId: node.stableId,
-    settlementType: node.settlementType,
-    townType: node.role,
-    macroRegion: node.ownerRegion,
-    center: node.center,
-    radiusMeters: node.radiusMeters,
-    urbanization: null,
-    terrainSuitability: null,
-  });
+  const getSettlementOverlay = async (reference, roadTimingContext = null) => (
+    getCanonicalSettlementOverlay(
+      await resolveSettlementTemplateCandidate(reference),
+      roadTimingContext,
+    )
+  );
   const majorRoadSurfacePolicyVersion = 'w8-settlement-surface-policy-1';
   const majorRoadSourceContractVersion = useRoadGraphV3
     ? (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
@@ -1470,17 +1601,17 @@ export async function createW8ParityChunkGenerator({
     }
     majorRoadDiagnostics.obstacleCacheMisses += 1;
     recordRoadCache(roadTimingContext, false);
-    const reference = referenceFromGraphNode(node);
     return majorRoadObstacleCache.getOrCreate(cacheKey, async () => {
       const sourceStartedAt = nowMs();
-      const overlay = await getSettlementOverlay(reference, roadTimingContext);
+      const candidate = await resolveCanonicalCandidateFromGraphNode(node);
+      const overlay = await getCanonicalSettlementOverlay(candidate, roadTimingContext);
       majorRoadDiagnostics.obstacleSourceMs += nowMs() - sourceStartedAt;
       recordRoadFunction(roadTimingRun, 'road-obstacle-settlement-source', sourceStartedAt);
       const boundsStartedAt = nowMs();
       const presentation = composeW8SettlementPresentationTemplate(overlay);
       const obstacles = createCanonicalMajorRoadObstacles({
         buildings: presentation.buildings,
-        landmarks: createMajorRoadLandmarkObstacles(reference),
+        landmarks: createMajorRoadLandmarkObstacles(candidate),
         preserveFrontageRoadId: useExperimentalRoadGraph,
       });
       majorRoadDiagnostics.obstacleBuildingCount += obstacles
