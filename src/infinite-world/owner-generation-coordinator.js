@@ -7,6 +7,12 @@ import {
 } from './world-generation-scheduler.js';
 
 export const OWNER_GENERATION_COORDINATOR_SCHEMA = 'owner-generation-coordinator-1';
+export const FIXED_LANE_OWNER_GENERATION_COORDINATOR_SCHEMA =
+  'owner-generation-fixed-lanes-1';
+export const OWNER_GENERATION_LANE = Object.freeze({
+  CRITICAL: 'critical',
+  BACKGROUND: 'background',
+});
 
 const defaultClock = () => globalThis.performance?.now?.() ?? Date.now();
 const scheduleMicrotask = callback => {
@@ -38,6 +44,7 @@ export function createOwnerGenerationCoordinator({
   maximumConcurrentRequests = 1,
   agingIntervalMs = 250,
   imminentWindowMs = 100,
+  shutdownDrainTimeoutMs = 1_000,
   onEvent = null,
 } = {}) {
   if (typeof clock !== 'function') throw new TypeError('Owner generation coordinator clock is required');
@@ -50,6 +57,9 @@ export function createOwnerGenerationCoordinator({
   if (!Number.isFinite(imminentWindowMs) || imminentWindowMs < 0) {
     throw new RangeError('imminentWindowMs must be non-negative');
   }
+  if (!Number.isFinite(shutdownDrainTimeoutMs) || shutdownDrainTimeoutMs < 0) {
+    throw new RangeError('shutdownDrainTimeoutMs must be a finite non-negative number');
+  }
   if (onEvent !== null && typeof onEvent !== 'function') {
     throw new TypeError('Owner generation coordinator onEvent must be a function');
   }
@@ -61,7 +71,10 @@ export function createOwnerGenerationCoordinator({
   let sequence = 0;
   let dispatchScheduled = false;
   let isShutdown = false;
+  let shutdownPromise = null;
   let maximumBacklog = 0;
+  let observerDisabled = false;
+  let lastObserverFailure = null;
   const counts = {
     scheduled: 0,
     deduplicated: 0,
@@ -74,17 +87,56 @@ export function createOwnerGenerationCoordinator({
     promotions: 0,
     deadlineMisses: 0,
     deadlineImminentStarts: 0,
+    cancelRequests: 0,
+    cancelAcknowledgements: 0,
+    preemptionRequests: 0,
+    preemptionAcknowledgements: 0,
+    cancelCallbackFailures: 0,
+    shutdownDrainTimeouts: 0,
   };
 
   const emit = event => {
-    if (!onEvent) return;
-    try { onEvent(Object.freeze(event)); } catch { /* diagnostics are isolated */ }
+    if (!onEvent || observerDisabled) return;
+    try {
+      onEvent(Object.freeze(event));
+    } catch (error) {
+      observerDisabled = true;
+      lastObserverFailure = Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        observedAtMs: clock(),
+      });
+    }
   };
   const backlog = () => queued.length + inFlight.size;
   const rankingOptions = Object.freeze({ agingIntervalMs, imminentWindowMs });
 
-  const settle = (entry, state, value = null, error = null) => {
+  const settle = (entry, requestedState, value = null, error = null) => {
     if (entry.terminal) return;
+    const cancellationCallbackError = entry.cancellationCallbackError;
+    const state = cancellationCallbackError ? 'failed' : requestedState;
+    const terminalError = cancellationCallbackError ?? error;
+    const terminalAtMs = clock();
+    if (state === 'cancelled' && entry.cancellationRequestedAtMs !== null
+      && entry.cancellationAcknowledgedAtMs === null) {
+      entry.cancellationAcknowledgedAtMs = terminalAtMs;
+      counts.cancelAcknowledgements += 1;
+      if (entry.preemptedByRequestId !== null) counts.preemptionAcknowledgements += 1;
+      emit({
+        type: 'cancel-acknowledged',
+        envelope: entry.envelope,
+        state,
+        cancellationReason: entry.cancellationReason,
+        cancellationRequestedAtMs: entry.cancellationRequestedAtMs,
+        cancellationAcknowledgedAtMs: terminalAtMs,
+        cancellationAcknowledgementMs: Math.max(
+          0,
+          terminalAtMs - entry.cancellationRequestedAtMs,
+        ),
+        preemptedByRequestId: entry.preemptedByRequestId,
+        backlog: backlog(),
+      });
+    }
     entry.terminal = true;
     entry.state = state;
     active.delete(entry.envelope.requestId);
@@ -100,7 +152,7 @@ export function createOwnerGenerationCoordinator({
       for (const subscriber of entry.subscribers) subscriber.resolve(null);
     } else {
       counts.failed += 1;
-      for (const subscriber of entry.subscribers) subscriber.reject(error);
+      for (const subscriber of entry.subscribers) subscriber.reject(terminalError);
     }
     entry.subscribers.clear();
     entry.resolveTerminal();
@@ -108,9 +160,17 @@ export function createOwnerGenerationCoordinator({
       type: 'terminal',
       state,
       envelope: entry.envelope,
-      error: state === 'failed' ? error : null,
+      error: state === 'failed' ? terminalError : null,
+      cancellationCallbackError,
       cancellationReason: state === 'cancelled' ? entry.cancellationReason : null,
-      terminalAtMs: clock(),
+      cancellationRequestedAtMs: entry.cancellationRequestedAtMs,
+      cancellationAcknowledgedAtMs: entry.cancellationAcknowledgedAtMs,
+      cancellationAcknowledgementMs: entry.cancellationRequestedAtMs !== null
+        && entry.cancellationAcknowledgedAtMs !== null
+        ? Math.max(0, entry.cancellationAcknowledgedAtMs - entry.cancellationRequestedAtMs)
+        : null,
+      preemptedByRequestId: entry.preemptedByRequestId,
+      terminalAtMs,
       backlog: backlog(),
     });
     scheduleDispatch();
@@ -135,7 +195,7 @@ export function createOwnerGenerationCoordinator({
       backlog: backlog(),
     });
     const execution = Object.freeze({
-      envelope: entry.envelope,
+      get envelope() { return entry.envelope; },
       startedAtMs,
       ranking,
       get cancelled() { return entry.cancelRequested; },
@@ -144,10 +204,10 @@ export function createOwnerGenerationCoordinator({
       .then(() => entry.execute(execution))
       .then(value => settle(
         entry,
-        entry.cancelRequested || value === null ? 'cancelled' : 'completed',
+        value === null ? 'cancelled' : 'completed',
         value,
       ))
-      .catch(error => settle(entry, entry.cancelRequested ? 'cancelled' : 'failed', null, error));
+      .catch(error => settle(entry, 'failed', null, error));
   };
 
   const dispatch = () => {
@@ -174,6 +234,72 @@ export function createOwnerGenerationCoordinator({
     scheduleMicrotask(dispatch);
   }
 
+  const requestCancellation = (entry, reason, { preemptedByRequestId = null } = {}) => {
+    if (!entry || entry.terminal || entry.cancelRequested) return false;
+    const cancellationRequestedAtMs = clock();
+    entry.cancelRequested = true;
+    entry.cancellationReason = reason;
+    entry.cancellationRequestedAtMs = cancellationRequestedAtMs;
+    entry.preemptedByRequestId = preemptedByRequestId;
+    counts.cancelRequests += 1;
+    if (preemptedByRequestId !== null) counts.preemptionRequests += 1;
+    emit({
+      type: 'cancel-requested',
+      envelope: entry.envelope,
+      state: entry.state,
+      cancellationReason: reason,
+      cancellationRequestedAtMs,
+      preemptedByRequestId,
+      backlog: backlog(),
+    });
+    if (entry.state === 'queued') {
+      const index = queued.indexOf(entry);
+      if (index >= 0) queued.splice(index, 1);
+      counts.queuedCancelled += 1;
+      settle(entry, 'cancelled');
+    } else {
+      counts.inFlightCancelled += 1;
+      try {
+        entry.onCancel?.(reason, entry.envelope);
+      } catch (error) {
+        entry.cancellationCallbackError = error instanceof Error
+          ? error : new Error(String(error));
+        counts.cancelCallbackFailures += 1;
+        emit({
+          type: 'cancel-callback-failed',
+          envelope: entry.envelope,
+          state: entry.state,
+          cancellationReason: reason,
+          cancellationRequestedAtMs,
+          preemptedByRequestId,
+          error: entry.cancellationCallbackError,
+          backlog: backlog(),
+        });
+      }
+    }
+    return true;
+  };
+
+  const preemptActiveFor = contender => {
+    if (!contender.envelope.required || inFlight.size < maximumConcurrentRequests) return false;
+    const timestamp = clock();
+    const victim = [...inFlight.values()]
+      .filter(entry => !entry.cancelRequested && !entry.envelope.required
+        && compareWorldGenerationRequests(contender, entry, timestamp, rankingOptions) < 0)
+      .sort((left, right) => compareWorldGenerationRequests(
+        right,
+        left,
+        timestamp,
+        rankingOptions,
+      ))[0] ?? null;
+    if (!victim) return false;
+    return requestCancellation(
+      victim,
+      `preempted-by-higher-priority:${contender.envelope.requestId}`,
+      { preemptedByRequestId: contender.envelope.requestId },
+    );
+  };
+
   const createSubscriber = identity => {
     let resolve;
     let reject;
@@ -196,7 +322,6 @@ export function createOwnerGenerationCoordinator({
   } = {}) => {
     if (entry.terminal || entry.cancelRequested) return false;
     if (nextSubscriberIdentity) entry.subscriberIdentities.add(nextSubscriberIdentity);
-    if (entry.state !== 'queued') return false;
     const mergedPriority = Math.min(entry.envelope.priority, nextPriority);
     const mergedPriorityClass = Math.min(
       entry.envelope.priorityClass ?? entry.envelope.priority,
@@ -217,8 +342,8 @@ export function createOwnerGenerationCoordinator({
         entry.envelope.representationClass,
         nextRepresentation,
       ),
-      consumerId: nextConsumerId,
-      epoch: nextEpoch,
+      consumerId: entry.state === 'queued' ? nextConsumerId : entry.envelope.consumerId,
+      epoch: entry.state === 'queued' ? nextEpoch : entry.envelope.epoch,
     });
     counts.promotions += 1;
     scheduleDispatch();
@@ -231,17 +356,7 @@ export function createOwnerGenerationCoordinator({
     entry.subscribers.delete(subscriber);
     subscriber.resolve(null);
     if (entry.subscribers.size > 0 || entry.cancelRequested) return true;
-    entry.cancelRequested = true;
-    entry.cancellationReason = reason;
-    if (entry.state === 'queued') {
-      const index = queued.indexOf(entry);
-      if (index >= 0) queued.splice(index, 1);
-      counts.queuedCancelled += 1;
-      settle(entry, 'cancelled');
-    } else {
-      counts.inFlightCancelled += 1;
-      try { entry.onCancel?.(reason, entry.envelope); } catch { /* best effort */ }
-    }
+    requestCancellation(entry, reason);
     return true;
   };
 
@@ -258,6 +373,7 @@ export function createOwnerGenerationCoordinator({
   });
 
   const schedule = ({
+    requestId = null,
     ownerKey,
     resourceKind,
     operationKind = resourceKind,
@@ -305,6 +421,13 @@ export function createOwnerGenerationCoordinator({
       return createHandle(existing, subscriber);
     }
     const requestSequence = ++sequence;
+    const resolvedRequestId = requestId ?? requestSequence;
+    if (!Number.isSafeInteger(resolvedRequestId) || resolvedRequestId < 1) {
+      throw new RangeError('Owner generation requestId must be a positive safe integer');
+    }
+    if (active.has(resolvedRequestId)) {
+      throw new Error(`duplicate Owner generation requestId: ${resolvedRequestId}`);
+    }
     const subscriber = createSubscriber(subscriberIdentity);
     let resolveTerminal;
     const terminalPromise = new Promise(resolve => { resolveTerminal = resolve; });
@@ -313,7 +436,7 @@ export function createOwnerGenerationCoordinator({
     );
     const entry = {
       envelope: createWorldGenerationRequestEnvelope({
-        requestId: requestSequence,
+        requestId: resolvedRequestId,
         operationKind,
         priority,
         priorityClass,
@@ -345,14 +468,19 @@ export function createOwnerGenerationCoordinator({
       ranking: null,
       cancelRequested: false,
       cancellationReason: null,
+      cancellationRequestedAtMs: null,
+      cancellationAcknowledgedAtMs: null,
+      preemptedByRequestId: null,
+      cancellationCallbackError: null,
       terminal: false,
     };
-    active.set(requestSequence, entry);
+    active.set(resolvedRequestId, entry);
     activeByCompositeKey.set(compositeKey, entry);
     queued.push(entry);
     counts.scheduled += 1;
     maximumBacklog = Math.max(maximumBacklog, backlog());
     emit({ type: 'queued', envelope: entry.envelope, state: entry.state, backlog: backlog() });
+    preemptActiveFor(entry);
     scheduleDispatch();
     return createHandle(entry, subscriber);
   };
@@ -379,6 +507,17 @@ export function createOwnerGenerationCoordinator({
       firstVisibleDeadlineMs: entry.envelope.firstVisibleDeadlineMs,
       subscriberIdentities: Object.freeze([...entry.subscriberIdentities]),
       subscriberCount: entry.subscribers.size,
+      state: entry.state,
+      cancelRequested: entry.cancelRequested,
+      cancellationReason: entry.cancellationReason,
+      cancellationRequestedAtMs: entry.cancellationRequestedAtMs,
+      cancellationAcknowledgedAtMs: entry.cancellationAcknowledgedAtMs,
+      preemptedByRequestId: entry.preemptedByRequestId,
+      cancellationCallbackError: entry.cancellationCallbackError
+        ? Object.freeze({
+          name: entry.cancellationCallbackError.name,
+          message: entry.cancellationCallbackError.message,
+        }) : null,
       ...describeWorldGenerationPriority(entry.envelope, now, rankingOptions),
     });
     return Object.freeze({
@@ -387,38 +526,51 @@ export function createOwnerGenerationCoordinator({
       maximumConcurrentRequests,
       agingIntervalMs,
       imminentWindowMs,
+      shutdownDrainTimeoutMs,
       queuedCount: queued.length,
       inFlightCount: inFlight.size,
       backlog: backlog(),
       maximumBacklog,
+      observerFailureCount: lastObserverFailure ? 1 : 0,
+      observerCircuitBreaker: observerDisabled,
+      lastObserverFailure,
       queued: Object.freeze(ranked.map(describe)),
       inFlight: Object.freeze([...inFlight.values()].map(describe)),
       counts: Object.freeze({ ...counts }),
     });
   };
 
-  const shutdown = async ({ reason = 'shutdown', awaitInFlight = false } = {}) => {
+  const shutdown = ({
+    reason = 'shutdown',
+    awaitInFlight = true,
+    drainTimeoutMs = shutdownDrainTimeoutMs,
+  } = {}) => {
+    if (!Number.isFinite(drainTimeoutMs) || drainTimeoutMs < 0) {
+      throw new RangeError('shutdown drainTimeoutMs must be a finite non-negative number');
+    }
+    if (shutdownPromise) return shutdownPromise;
     if (!isShutdown) {
       isShutdown = true;
       for (const entry of [...active.values()]) {
-        if (!entry.terminal && !entry.cancelRequested) {
-          entry.cancelRequested = true;
-          entry.cancellationReason = reason;
-          if (entry.state === 'queued') {
-            const index = queued.indexOf(entry);
-            if (index >= 0) queued.splice(index, 1);
-            counts.queuedCancelled += 1;
-            settle(entry, 'cancelled');
-          } else {
-            counts.inFlightCancelled += 1;
-            try { entry.onCancel?.(reason, entry.envelope); } catch { /* best effort */ }
-          }
-        }
+        requestCancellation(entry, reason);
       }
     }
-    if (awaitInFlight && inFlight.size > 0) {
-      await Promise.allSettled([...inFlight.values()].map(entry => entry.terminalPromise));
-    }
+    shutdownPromise = (async () => {
+      if (!awaitInFlight || inFlight.size === 0) return true;
+      let timeoutId = null;
+      const drained = await Promise.race([
+        Promise.allSettled([...inFlight.values()].map(entry => entry.terminalPromise))
+          .then(() => true),
+        new Promise(resolve => {
+          timeoutId = globalThis.setTimeout?.(() => resolve(false), drainTimeoutMs) ?? null;
+          if (timeoutId === null) resolve(false);
+        }),
+      ]);
+      if (timeoutId !== null) globalThis.clearTimeout?.(timeoutId);
+      if (!drained) counts.shutdownDrainTimeouts += 1;
+      return drained;
+    })();
+    return shutdownPromise;
   };
 
   return Object.freeze({
@@ -426,6 +578,214 @@ export function createOwnerGenerationCoordinator({
     snapshot,
     shutdown,
     get backlog() { return backlog(); },
+    get isShutdown() { return isShutdown; },
+  });
+}
+
+function aggregateLaneCounts(left, right) {
+  const keys = new Set([
+    ...Object.keys(left ?? {}),
+    ...Object.keys(right ?? {}),
+  ]);
+  return Object.freeze(Object.fromEntries([...keys].map(key => [
+    key,
+    (Number(left?.[key]) || 0) + (Number(right?.[key]) || 0),
+  ])));
+}
+
+/**
+ * Fixed two-lane owner admission. Full ChunkData (including future-Full
+ * prefetch) is the only Critical-lane resource; all presentation/control work
+ * stays on one Background lane. This is deliberately not a configurable pool.
+ */
+export function createFixedLaneOwnerGenerationCoordinator({
+  clock = defaultClock,
+  agingIntervalMs = 250,
+  imminentWindowMs = 100,
+  shutdownDrainTimeoutMs = 1_000,
+  onEvent = null,
+} = {}) {
+  if (onEvent !== null && typeof onEvent !== 'function') {
+    throw new TypeError('Fixed-lane Owner generation onEvent must be a function');
+  }
+
+  let isShutdown = false;
+  let nextRequestId = 0;
+  const backgroundAdmissionWaiters = new Map();
+  let critical = null;
+  let criticalPrefetch = null;
+
+  const emit = (lane, event) => {
+    if (!onEvent) return;
+    onEvent(Object.freeze({ ...event, lane }));
+  };
+  const criticalRequiredPending = () => {
+    const snapshots = [critical?.snapshot(), criticalPrefetch?.snapshot()];
+    return snapshots.flatMap(snapshot => [
+      ...(snapshot?.queued ?? []),
+      ...(snapshot?.inFlight ?? []),
+    ])
+      .some(entry => entry.required === true);
+  };
+  const releaseBackgroundAdmission = () => {
+    if (criticalRequiredPending()) return;
+    for (const resolve of backgroundAdmissionWaiters.values()) resolve();
+    backgroundAdmissionWaiters.clear();
+  };
+  const waitForCriticalIdle = async requestId => {
+    if (!criticalRequiredPending() || isShutdown) return;
+    await new Promise(resolve => backgroundAdmissionWaiters.set(requestId, resolve));
+    backgroundAdmissionWaiters.delete(requestId);
+  };
+  const commonOptions = {
+    clock,
+    agingIntervalMs,
+    imminentWindowMs,
+    shutdownDrainTimeoutMs,
+  };
+  critical = createOwnerGenerationCoordinator({
+    ...commonOptions,
+    maximumConcurrentRequests: 1,
+    onEvent: event => {
+      emit(OWNER_GENERATION_LANE.CRITICAL, event);
+      if (event.type === 'terminal') scheduleMicrotask(releaseBackgroundAdmission);
+    },
+  });
+  criticalPrefetch = createOwnerGenerationCoordinator({
+    ...commonOptions,
+    maximumConcurrentRequests: 1,
+    onEvent: event => emit(OWNER_GENERATION_LANE.CRITICAL, event),
+  });
+  const background = createOwnerGenerationCoordinator({
+    ...commonOptions,
+    maximumConcurrentRequests: 1,
+    onEvent: event => emit(OWNER_GENERATION_LANE.BACKGROUND, event),
+  });
+
+  const laneFor = options => options?.resourceKind === 'full'
+    ? OWNER_GENERATION_LANE.CRITICAL : OWNER_GENERATION_LANE.BACKGROUND;
+  const schedule = options => {
+    if (isShutdown) throw new Error('Fixed-lane Owner generation coordinator is shut down');
+    const lane = laneFor(options);
+    const coordinator = lane === OWNER_GENERATION_LANE.CRITICAL
+      ? options?.required === false ? criticalPrefetch : critical
+      : background;
+    const requestId = ++nextRequestId;
+    const execute = options?.execute;
+    const laneOptions = lane === OWNER_GENERATION_LANE.BACKGROUND ? {
+      ...options,
+      requestId,
+      execute: async execution => {
+        await waitForCriticalIdle(requestId);
+        if (isShutdown || execution.cancelled) return null;
+        return execute(execution);
+      },
+      onCancel: (reason, envelope) => {
+        const release = backgroundAdmissionWaiters.get(requestId);
+        if (release) {
+          backgroundAdmissionWaiters.delete(requestId);
+          release();
+        }
+        return options?.onCancel?.(reason, envelope);
+      },
+    } : { ...options, requestId };
+    const handle = coordinator.schedule(laneOptions);
+    return Object.freeze({
+      requestId: handle.requestId,
+      sequence: handle.sequence,
+      lane,
+      promise: handle.promise,
+      cancel: handle.cancel,
+      update: handle.update,
+      get state() { return handle.state; },
+      get envelope() { return handle.envelope; },
+    });
+  };
+  const snapshot = () => {
+    const criticalRequiredSnapshot = critical.snapshot();
+    const criticalPrefetchSnapshot = criticalPrefetch.snapshot();
+    const criticalSnapshot = Object.freeze({
+      schemaVersion: FIXED_LANE_OWNER_GENERATION_COORDINATOR_SCHEMA,
+      maximumConcurrentRequests: 2,
+      queuedCount:
+        criticalRequiredSnapshot.queuedCount + criticalPrefetchSnapshot.queuedCount,
+      inFlightCount:
+        criticalRequiredSnapshot.inFlightCount + criticalPrefetchSnapshot.inFlightCount,
+      backlog: criticalRequiredSnapshot.backlog + criticalPrefetchSnapshot.backlog,
+      maximumBacklog:
+        criticalRequiredSnapshot.maximumBacklog + criticalPrefetchSnapshot.maximumBacklog,
+      queued: Object.freeze([
+        ...criticalRequiredSnapshot.queued,
+        ...criticalPrefetchSnapshot.queued,
+      ].sort((left, right) => left.requestId - right.requestId)),
+      inFlight: Object.freeze([
+        ...criticalRequiredSnapshot.inFlight,
+        ...criticalPrefetchSnapshot.inFlight,
+      ].sort((left, right) => left.requestId - right.requestId)),
+      counts: aggregateLaneCounts(
+        criticalRequiredSnapshot.counts,
+        criticalPrefetchSnapshot.counts,
+      ),
+      subdivisions: Object.freeze({
+        required: criticalRequiredSnapshot,
+        prefetch: criticalPrefetchSnapshot,
+      }),
+    });
+    const backgroundSnapshot = background.snapshot();
+    const annotate = (lane, entries) => entries.map(entry => Object.freeze({ ...entry, lane }));
+    const queued = [
+      ...annotate(OWNER_GENERATION_LANE.CRITICAL, criticalSnapshot.queued),
+      ...annotate(OWNER_GENERATION_LANE.BACKGROUND, backgroundSnapshot.queued),
+    ].sort((left, right) => left.requestId - right.requestId);
+    const inFlight = [
+      ...annotate(OWNER_GENERATION_LANE.CRITICAL, criticalSnapshot.inFlight),
+      ...annotate(OWNER_GENERATION_LANE.BACKGROUND, backgroundSnapshot.inFlight),
+    ].sort((left, right) => left.requestId - right.requestId);
+    return Object.freeze({
+      schemaVersion: FIXED_LANE_OWNER_GENERATION_COORDINATOR_SCHEMA,
+      isShutdown,
+      maximumConcurrentRequests: 2,
+      queuedCount: queued.length,
+      inFlightCount: inFlight.length,
+      backlog: queued.length + inFlight.length,
+      maximumBacklog:
+        criticalSnapshot.maximumBacklog + backgroundSnapshot.maximumBacklog,
+      backgroundAdmissionSuppressed:
+        backgroundAdmissionWaiters.size > 0 && criticalRequiredPending(),
+      queued: Object.freeze(queued),
+      inFlight: Object.freeze(inFlight),
+      counts: aggregateLaneCounts(criticalSnapshot.counts, backgroundSnapshot.counts),
+      lanes: Object.freeze({
+        [OWNER_GENERATION_LANE.CRITICAL]: criticalSnapshot,
+        [OWNER_GENERATION_LANE.BACKGROUND]: backgroundSnapshot,
+      }),
+    });
+  };
+  let shutdownPromise = null;
+  const shutdown = ({
+    reason = 'shutdown',
+    awaitInFlight = true,
+    drainTimeoutMs = shutdownDrainTimeoutMs,
+  } = {}) => {
+    if (shutdownPromise) return shutdownPromise;
+    if (!isShutdown) {
+      isShutdown = true;
+      for (const resolve of backgroundAdmissionWaiters.values()) resolve();
+      backgroundAdmissionWaiters.clear();
+    }
+    shutdownPromise = Promise.all([
+      critical.shutdown({ reason, awaitInFlight, drainTimeoutMs }),
+      criticalPrefetch.shutdown({ reason, awaitInFlight, drainTimeoutMs }),
+      background.shutdown({ reason, awaitInFlight, drainTimeoutMs }),
+    ]).then(results => results.every(Boolean));
+    return shutdownPromise;
+  };
+
+  return Object.freeze({
+    schedule,
+    snapshot,
+    shutdown,
+    get backlog() { return critical.backlog + criticalPrefetch.backlog + background.backlog; },
     get isShutdown() { return isShutdown; },
   });
 }

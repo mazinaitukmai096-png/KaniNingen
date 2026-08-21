@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { createBrowserFrameDiagnostics } from '../src/infinite-world/browser-frame-diagnostics.js';
+import {
+  BROWSER_FRAME_DIAGNOSTIC_MODE,
+  createBrowserFrameDiagnostics,
+} from '../src/infinite-world/browser-frame-diagnostics.js';
 import {
   createW8RuntimeDiagnostics,
   parseW8DiagnosticProfile,
+  RUNTIME_DIAGNOSTIC_MODE,
 } from '../src/infinite-world/runtime-diagnostics.js';
 
 function createClock() {
@@ -15,22 +19,24 @@ function createClock() {
   });
 }
 
-test('Browser frame attribution is allocation-free and clock-free while disabled', () => {
+test('disabled Browser frame attribution is inert, clock-free, and reuses one snapshot', () => {
   let clockCalls = 0;
   const diagnostics = createBrowserFrameDiagnostics({
     enabled: false,
     clock: () => { clockCalls += 1; return 0; },
   });
-  diagnostics.startFrame(0);
-  diagnostics.recordStage('render', 12);
-  diagnostics.recordWork('persistent-natural-frame', { matrixUpdates: 20 });
-  diagnostics.recordTerrainGate({ blocked: true, ownerKey: '1,2' });
-  diagnostics.sealFrame({ rendererInfo: { render: { calls: 3 } } });
-  diagnostics.finishFrame(50, 50);
+  assert.equal(diagnostics.startFrame(0), null);
+  assert.equal(diagnostics.recordStage('render', 12), null);
+  assert.equal(diagnostics.recordWork('persistent-natural-frame', { matrixUpdates: 20 }), null);
+  assert.equal(diagnostics.recordTerrainGate({ blocked: true, ownerKey: '1,2' }), null);
+  assert.equal(diagnostics.sealFrame({ rendererInfo: { render: { calls: 3 } } }), null);
+  assert.equal(diagnostics.finishFrame(50, 50), null);
   const snapshot = diagnostics.snapshot();
   assert.equal(clockCalls, 0);
   assert.equal(snapshot.enabled, false);
   assert.equal(snapshot.frames.length, 0);
+  assert.equal(diagnostics.snapshot(), snapshot,
+    'disabled callers must receive the shared immutable empty snapshot');
 });
 
 test('Browser frame attribution retains exactly 300 frames and separates rAF from callback CPU', () => {
@@ -40,7 +46,7 @@ test('Browser frame attribution retains exactly 300 frames and separates rAF fro
     memory: { usedJSHeapSize: 10_000_000 },
   };
   const diagnostics = createBrowserFrameDiagnostics({
-    enabled: true,
+    mode: BROWSER_FRAME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
     clock: clock.read,
     globalObject: {
       performance,
@@ -84,7 +90,7 @@ test('Browser frame attribution retains exactly 300 frames and separates rAF fro
 test('33/50/100ms hitches retain five frames before and after with stage attribution', () => {
   const clock = createClock();
   const diagnostics = createBrowserFrameDiagnostics({
-    enabled: true,
+    mode: BROWSER_FRAME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
     clock: clock.read,
     globalObject: {
       performance: { now: clock.read },
@@ -116,7 +122,7 @@ test('33/50/100ms hitches retain five frames before and after with stage attribu
 test('Terrain ready gate and transition lifecycle share the browser frame timeline', () => {
   const clock = createClock();
   const diagnostics = createW8RuntimeDiagnostics({
-    enabled: true,
+    mode: RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
     clock: clock.read,
     globalObject: { performance: { now: clock.read } },
     profile: parseW8DiagnosticProfile('baseline'),
@@ -163,7 +169,7 @@ test('Terrain ready gate and transition lifecycle share the browser frame timeli
 test('Async wait is separated from synchronous Browser callback stage attribution', async () => {
   const clock = createClock();
   const diagnostics = createW8RuntimeDiagnostics({
-    enabled: true,
+    mode: RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
     clock: clock.read,
     globalObject: { performance: { now: clock.read } },
     environment: { userAgent: 'Node.js/22 FakeThree' },
@@ -178,6 +184,189 @@ test('Async wait is separated from synchronous Browser callback stage attributio
   assert.equal(frame.asyncStages['chunk-prefetch'], 40);
   assert.equal(frame.stages['chunk-prefetch'], undefined);
   assert.equal(diagnostics.snapshot().browserFrameAttribution.measurementSource, 'node-fakethree');
+});
+
+test('runtime stage timing clears every User Timing measure after recording', () => {
+  const clock = createClock();
+  const marks = new Map();
+  const measures = [];
+  let markCalls = 0;
+  let measureCalls = 0;
+  const performanceObject = {
+    now: clock.read,
+    mark(name) {
+      markCalls += 1;
+      marks.set(name, clock.read());
+    },
+    measure(name, start, end) {
+      measureCalls += 1;
+      measures.push({ name, start, end });
+    },
+    clearMarks(name) {
+      marks.delete(name);
+    },
+    clearMeasures(name) {
+      for (let index = measures.length - 1; index >= 0; index -= 1) {
+        if (measures[index].name === name) measures.splice(index, 1);
+      }
+    },
+  };
+  const diagnostics = createW8RuntimeDiagnostics({
+    mode: RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
+    clock: clock.read,
+    globalObject: { performance: performanceObject },
+  });
+  for (let index = 0; index < 100; index += 1) {
+    diagnostics.measure('render', () => clock.advance(0.25));
+  }
+  assert.equal(marks.size, 0);
+  assert.equal(measures.length, 0);
+  assert.equal(markCalls, 200);
+  assert.equal(measureCalls, 100);
+  assert.equal(diagnostics.snapshot().stages.render.count, 100);
+});
+
+test('light diagnostics collect numeric samples without touching User Timing', () => {
+  const clock = createClock();
+  const performanceObject = {
+    now: clock.read,
+    mark() { throw new Error('light diagnostics must not create marks'); },
+    measure() { throw new Error('light diagnostics must not create measures'); },
+    clearMarks() { throw new Error('light diagnostics must not clear absent marks'); },
+    clearMeasures() { throw new Error('light diagnostics must not clear absent measures'); },
+  };
+  const diagnostics = createW8RuntimeDiagnostics({
+    mode: RUNTIME_DIAGNOSTIC_MODE.LIGHT,
+    clock: clock.read,
+    globalObject: { performance: performanceObject },
+  });
+  diagnostics.startFrame(0);
+  diagnostics.measure('render', () => clock.advance(2));
+  diagnostics.recordWork('light-work', { calls: 1, bytes: 256 });
+  diagnostics.finishFrame(16, clock.read());
+  const report = diagnostics.snapshot();
+  assert.equal(report.mode, RUNTIME_DIAGNOSTIC_MODE.LIGHT);
+  assert.equal(report.browserFrameAttribution.mode, BROWSER_FRAME_DIAGNOSTIC_MODE.LIGHT);
+  assert.equal(report.stages.render.p95, 2);
+  assert.equal(report.observers.userTimingSupported, true);
+  assert.equal(report.observers.userTimingActive, false);
+  assert.equal(report.observers.errorCount, 0);
+  assert.equal(report.frames.length, 0);
+  assert.equal(report.hitches.length, 0);
+  assert.equal(report.work['light-work'].calls.max, 1);
+  assert.equal(report.browserFrameAttribution.frames.length, 0);
+  assert.equal(report.storage.numericOnlyLightPath, true);
+  assert.equal(report.browserFrameAttribution.storage.numericOnlyLightPath, true);
+});
+
+test('HUD percentile materialization is cached for one second', () => {
+  const clock = createClock();
+  const stages = ['render'];
+  const diagnostics = createW8RuntimeDiagnostics({
+    mode: RUNTIME_DIAGNOSTIC_MODE.LIGHT,
+    clock: clock.read,
+    globalObject: { performance: { now: clock.read } },
+    hudRefreshIntervalMs: 1_000,
+  });
+  diagnostics.startFrame(0);
+  diagnostics.measure('render', () => clock.advance(2));
+  diagnostics.finishFrame(16, clock.read());
+  const first = diagnostics.hudSnapshot({ drawCalls: 1 }, stages);
+  diagnostics.startFrame(clock.read());
+  diagnostics.measure('render', () => clock.advance(20));
+  diagnostics.finishFrame(32, clock.read());
+  const cached = diagnostics.hudSnapshot({ drawCalls: 2 }, stages);
+  assert.equal(cached, first);
+  assert.equal(cached.resources.drawCalls, 1);
+  clock.advance(1_000);
+  const refreshed = diagnostics.hudSnapshot({ drawCalls: 2 }, stages);
+  assert.notEqual(refreshed, first);
+  assert.equal(refreshed.frame.count, 2);
+  assert.equal(refreshed.resources.drawCalls, 2);
+});
+
+test('runtime and Browser diagnostic storage stays bounded under long captures', () => {
+  const clock = createClock();
+  const diagnostics = createW8RuntimeDiagnostics({
+    mode: RUNTIME_DIAGNOSTIC_MODE.LIGHT,
+    clock: clock.read,
+    globalObject: { performance: { now: clock.read } },
+    sampleLimit: 32,
+    hitchLimit: 4,
+  });
+  for (let sequence = 1; sequence <= 3_000; sequence += 1) {
+    diagnostics.startFrame(clock.read());
+    diagnostics.recordWork('steady', { allocations: sequence });
+    diagnostics.recordEvent('bounded-event', { sequence });
+    clock.advance(0.1);
+    diagnostics.measure('render', () => clock.advance(0.1));
+    diagnostics.finishFrame(sequence % 11 === 0 ? 55 : 16, clock.read());
+  }
+  const report = diagnostics.snapshot();
+  assert.deepEqual(report.storage, {
+    numericFrameSampleCount: 32,
+    numericFrameSampleCapacity: 32,
+    numericHitchFlagCount: 32,
+    frameDetailCount: 0,
+    frameDetailCapacity: 512,
+    numericOnlyLightPath: true,
+    eventCount: 2_048,
+    eventCapacity: 2_048,
+    longTaskCount: 0,
+    longTaskCapacity: 4,
+  });
+  assert.equal(report.events[0].sequence, 953);
+  assert.equal(report.events.at(-1).sequence, 3_000);
+  assert.equal(report.storage.frameDetailCount, 0);
+  assert.equal(report.work.steady.allocations.count, 32);
+  assert.equal(report.work.steady.allocations.max, 3_000);
+  assert.equal(report.browserFrameAttribution.frames.length, 0);
+  assert.equal(report.browserFrameAttribution.timeline.length, 2_048);
+  assert.equal(report.browserFrameAttribution.storage.frameCapacity, 300);
+  assert.equal(report.browserFrameAttribution.storage.numericFrameCount, 300);
+  assert.equal(report.browserFrameAttribution.storage.detailedFrameCount, 0);
+  assert.equal(report.browserFrameAttribution.storage.numericOnlyLightPath, true);
+});
+
+test('Long Task observer records a bounded ring and quarantines a failing callback once', () => {
+  const clock = createClock();
+  let callback = null;
+  let disconnectCalls = 0;
+  const reported = [];
+  class PerformanceObserver {
+    constructor(next) { callback = next; }
+    observe() {}
+    disconnect() { disconnectCalls += 1; }
+  }
+  const diagnostics = createW8RuntimeDiagnostics({
+    enabled: true,
+    clock: clock.read,
+    globalObject: {
+      performance: { now: clock.read },
+      PerformanceObserver,
+    },
+    hitchLimit: 3,
+    onObserverError: fault => reported.push(fault),
+  });
+  callback({
+    getEntries: () => Array.from({ length: 8 }, (_, index) => ({
+      name: `task-${index}`,
+      startTime: index,
+      duration: 50 + index,
+    })),
+  });
+  let report = diagnostics.snapshot();
+  assert.deepEqual(report.longTasks.map(entry => entry.name), ['task-5', 'task-6', 'task-7']);
+  assert.equal(report.storage.longTaskCount, 3);
+  callback({ getEntries() { throw new Error('observer callback failed'); } });
+  callback({ getEntries() { throw new Error('must be quarantined'); } });
+  report = diagnostics.snapshot();
+  assert.equal(report.observers.longTaskQuarantined, true);
+  assert.equal(report.observers.longTaskActive, false);
+  assert.equal(report.observers.errorCount, 1);
+  assert.match(report.observers.lastError.message, /observer callback failed/);
+  assert.equal(disconnectCalls, 1);
+  assert.equal(reported.length, 1);
 });
 
 test('Worker scheduler request and response events retain queue, execution, and backlog context', () => {

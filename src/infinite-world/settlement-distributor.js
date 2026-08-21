@@ -122,6 +122,15 @@ const q6 = value => {
 };
 const clamp = value => Math.max(0, Math.min(1, value));
 
+async function reachGenerationCheckpoint(generationControl) {
+  if (!generationControl) return;
+  if (typeof generationControl.cooperativeCheckpoint === 'function') {
+    await generationControl.cooperativeCheckpoint();
+    return;
+  }
+  generationControl.checkpoint?.();
+}
+
 function mix32(value) {
   let result = value >>> 0;
   result ^= result >>> 16;
@@ -322,6 +331,23 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     ).filter(Boolean);
   }
 
+  async function rawCandidatesInRegionCooperatively(
+    regionX,
+    regionZ,
+    generationControl,
+  ) {
+    if (!generationControl) return rawCandidatesInRegion(regionX, regionZ);
+    const candidates = [];
+    for (let proposalSlot = 0;
+      proposalSlot < W5_SETTLEMENT_DISTRIBUTION.proposalSlotsPerMacroRegion;
+      proposalSlot += 1) {
+      await reachGenerationCheckpoint(generationControl);
+      const candidate = rawCandidate(regionX, regionZ, proposalSlot);
+      if (candidate) candidates.push(candidate);
+    }
+    return candidates;
+  }
+
   function hasHomePrimaryContinuity(candidate) {
     if (candidate.proposalKind !== 'PRIMARY') return false;
     for (let dz = -conflictRegionRadius; dz <= conflictRegionRadius; dz += 1) {
@@ -346,14 +372,24 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     return true;
   }
 
-  async function acceptedCandidate(regionX, regionZ, proposalSlot = 0) {
+  async function acceptedCandidate(
+    regionX,
+    regionZ,
+    proposalSlot = 0,
+    generationControl = null,
+  ) {
     const key = `${regionX},${regionZ},${proposalSlot}`;
     if (acceptedCache.has(key)) {
       const cached = acceptedCache.get(key); acceptedCache.delete(key); acceptedCache.set(key, cached); return cached;
     }
     const candidate = rawCandidate(regionX, regionZ, proposalSlot);
     if (!candidate) return lruSet(acceptedCache, key, null, 4096);
-    const regionRanked = rawCandidatesInRegion(regionX, regionZ).sort((first, second) => (
+    await reachGenerationCheckpoint(generationControl);
+    const regionRanked = (await rawCandidatesInRegionCooperatively(
+      regionX,
+      regionZ,
+      generationControl,
+    )).sort((first, second) => (
       candidateWins(first, second) ? -1 : candidateWins(second, first) ? 1 : 0
     ));
     if (regionRanked.indexOf(candidate)
@@ -362,7 +398,12 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     }
     for (let dz = -conflictRegionRadius; dz <= conflictRegionRadius; dz += 1) {
       for (let dx = -conflictRegionRadius; dx <= conflictRegionRadius; dx += 1) {
-        for (const other of rawCandidatesInRegion(regionX + dx, regionZ + dz)) {
+        const otherCandidates = await rawCandidatesInRegionCooperatively(
+          regionX + dx,
+          regionZ + dz,
+          generationControl,
+        );
+        for (const other of otherCandidates) {
           if (other === candidate) continue;
           const requiredDistance = typePairMinimumDistance(
             candidate.settlementType,
@@ -373,7 +414,9 @@ export async function createSettlementDistributor({ worldSeedHash }) {
           if (candidateWins(other, candidate)) return lruSet(acceptedCache, key, null, 4096);
         }
       }
+      await reachGenerationCheckpoint(generationControl);
     }
+    await reachGenerationCheckpoint(generationControl);
     const settlementId = `settlement-v1:${(await sha256Hex(canonicalizeJson({
       schema: W5_SETTLEMENT_DISTRIBUTION.schemaVersion,
       worldSeedHash,
@@ -386,23 +429,52 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     return lruSet(acceptedCache, key, Object.freeze({ ...candidate, settlementId }), 4096);
   }
 
-  async function findInMacroRange(minRegionX, maxRegionX, minRegionZ, maxRegionZ) {
-    const tasks = [];
+  async function findInMacroRange(
+    minRegionX,
+    maxRegionX,
+    minRegionZ,
+    maxRegionZ,
+    generationControl = null,
+  ) {
+    const candidates = [];
     for (let z = minRegionZ; z <= maxRegionZ; z += 1) {
-      for (let x = minRegionX; x <= maxRegionX; x += 1) {
-        for (let proposalSlot = 0;
-          proposalSlot < W5_SETTLEMENT_DISTRIBUTION.proposalSlotsPerMacroRegion;
-          proposalSlot += 1) tasks.push(acceptedCandidate(x, z, proposalSlot));
+      const rowTasks = [];
+      let earlyRowRejection = null;
+      try {
+        for (let x = minRegionX; x <= maxRegionX; x += 1) {
+          for (let proposalSlot = 0;
+            proposalSlot < W5_SETTLEMENT_DISTRIBUTION.proposalSlotsPerMacroRegion;
+            proposalSlot += 1) {
+            await reachGenerationCheckpoint(generationControl);
+            const task = acceptedCandidate(x, z, proposalSlot, generationControl);
+            // A later construction checkpoint can cancel before Promise.all is
+            // attached below. Observe each already-started rejection immediately,
+            // retain it, and still let the original task reject through Promise.all.
+            void task.catch(error => {
+              earlyRowRejection ??= error;
+            });
+            rowTasks.push(task);
+          }
+        }
+        candidates.push(...await Promise.all(rowTasks));
+      } catch (error) {
+        // A checkpoint can cancel while earlier candidates in this row are
+        // already running but before Promise.all has attached its handlers.
+        // Drain those exact tasks so their cancellation cannot escape as an
+        // unhandled rejection or poison the successor request's cache view.
+        await Promise.allSettled(rowTasks);
+        throw earlyRowRejection ?? error;
       }
+      await reachGenerationCheckpoint(generationControl);
     }
-    return (await Promise.all(tasks)).filter(Boolean).sort((a, b) => (
+    return candidates.filter(Boolean).sort((a, b) => (
       a.macroRegion.z - b.macroRegion.z
       || a.macroRegion.x - b.macroRegion.x
       || a.proposalSlot - b.proposalSlot
     ));
   }
 
-  async function findSettlementCentersNear(x, z, radiusMeters) {
+  async function findSettlementCentersNear(x, z, radiusMeters, generationControl = null) {
     if (![x, z, radiusMeters].every(Number.isFinite) || radiusMeters < 0) {
       throw new TypeError('invalid Settlement center query');
     }
@@ -410,21 +482,33 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     const maxRegionX = Math.floor((x + radiusMeters) / size);
     const minRegionZ = Math.floor((z - radiusMeters) / size);
     const maxRegionZ = Math.floor((z + radiusMeters) / size);
-    const candidates = await findInMacroRange(minRegionX, maxRegionX, minRegionZ, maxRegionZ);
+    const candidates = await findInMacroRange(
+      minRegionX,
+      maxRegionX,
+      minRegionZ,
+      maxRegionZ,
+      generationControl,
+    );
     return candidates.filter(candidate => Math.hypot(
       candidate.center.x - x,
       candidate.center.z - z,
     ) <= radiusMeters);
   }
 
-  async function findSettlementsNear(x, z, radiusMeters) {
+  async function findSettlementsNear(x, z, radiusMeters, generationControl = null) {
     if (![x, z, radiusMeters].every(Number.isFinite) || radiusMeters < 0) throw new TypeError('invalid Settlement query');
     const expansion = radiusMeters + W5_SETTLEMENT_DISTRIBUTION.maximumInfluenceRadiusMeters;
     const minRegionX = Math.floor((x - expansion) / size);
     const maxRegionX = Math.floor((x + expansion) / size);
     const minRegionZ = Math.floor((z - expansion) / size);
     const maxRegionZ = Math.floor((z + expansion) / size);
-    const candidates = await findInMacroRange(minRegionX, maxRegionX, minRegionZ, maxRegionZ);
+    const candidates = await findInMacroRange(
+      minRegionX,
+      maxRegionX,
+      minRegionZ,
+      maxRegionZ,
+      generationControl,
+    );
     return candidates.filter(candidate => Math.hypot(candidate.center.x - x, candidate.center.z - z)
       <= expansion);
   }
@@ -496,7 +580,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
     throw new RangeError('no Settlement Candidate found within the home search radius');
   }
 
-  async function buildConnectivityGraphNear(x, z, radiusMeters) {
+  async function buildConnectivityGraphNear(x, z, radiusMeters, generationControl = null) {
     const preference = Object.freeze({
       [SETTLEMENT_TYPES.CITY]: Object.freeze([
         SETTLEMENT_TYPES.TOWN,
@@ -525,6 +609,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
         candidate.center.x,
         candidate.center.z,
         W5_SETTLEMENT_DISTRIBUTION.connectivity.queryRadiusMeters,
+        generationControl,
       );
       const limit = W5_SETTLEMENT_DISTRIBUTION.connectivity
         .maximumNeighborsByType[candidate.settlementType];
@@ -546,8 +631,10 @@ export async function createSettlementDistributor({ worldSeedHash }) {
       );
     };
 
-    const coreNodes = await findSettlementCentersNear(x, z, radiusMeters);
+    const coreNodes = await findSettlementCentersNear(x, z, radiusMeters, generationControl);
+    await reachGenerationCheckpoint(generationControl);
     const neighborLists = await Promise.all(coreNodes.map(canonicalNeighborsFor));
+    await reachGenerationCheckpoint(generationControl);
     const byId = new Map(coreNodes.map(candidate => [candidate.settlementId, candidate]));
     for (const neighbors of neighborLists) {
       for (const candidate of neighbors) byId.set(candidate.settlementId, candidate);
@@ -579,6 +666,7 @@ export async function createSettlementDistributor({ worldSeedHash }) {
           )),
         }));
       }
+      await reachGenerationCheckpoint(generationControl);
     }
     const edges = [...edgeMap.values()].sort((first, second) => (
       first.stableId.localeCompare(second.stableId)

@@ -546,6 +546,23 @@ async function hashCanonicalTreeCellContent(content) {
   return `sha256:${await sha256Hex(canonicalizeJson(content))}`;
 }
 
+function createGenerationControl(checkpoint = null, cooperativeCheckpoint = null) {
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('Presentation owner checkpoint must be a function when provided');
+  }
+  if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+    throw new TypeError('Presentation owner cooperative checkpoint must be a function when provided');
+  }
+  return checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
+}
+
+async function reachGenerationCheckpoint(control) {
+  if (!control) return;
+  if (control.cooperativeCheckpoint) await control.cooperativeCheckpoint();
+  else control.checkpoint?.();
+}
+
 /**
  * Purpose-built Stage 1 generator. It evaluates only Natural lattice samples
  * reached by semantic candidates and consumes compact settlement/structure
@@ -578,6 +595,8 @@ export async function createPresentationOwnerGenerator({
     resolvedCandidates = undefined,
     rockProposalSampleRate = 1,
     sharedRockFieldCache = null,
+    checkpoint = null,
+    cooperativeCheckpoint = null,
   } = {}) => {
     if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) {
       throw new TypeError('Presentation owner coordinates are required');
@@ -601,6 +620,7 @@ export async function createPresentationOwnerGenerator({
       && typeof resolvedContextPromise?.then !== 'function') {
       throw new TypeError('resolvedContextPromise must be Promise-like');
     }
+    const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
     let contextReadyAt = startedAt;
     const pendingContext = Promise.resolve(resolvedContextPromise ?? (
@@ -639,6 +659,7 @@ export async function createPresentationOwnerGenerator({
         chunk: { chunkX, chunkZ, worldSeedHash },
         sampleTerrainAt,
         sampleBiomeWeightsAt,
+        ...(generationControl ?? {}),
       });
       const rockGeneration = includeRocks
         ? await candidateKernel.generateRocks({
@@ -648,6 +669,7 @@ export async function createPresentationOwnerGenerator({
           sampleBiomeWeightsAt,
           proposalSampleRate: rockProposalSampleRate,
           sharedFieldCache: sharedRockFieldCache,
+          ...(generationControl ?? {}),
         })
         : Object.freeze({
           rockCandidates: Object.freeze([]),
@@ -674,6 +696,7 @@ export async function createPresentationOwnerGenerator({
       });
     });
     const [context, candidates] = await Promise.all([pendingContext, pendingCandidates]);
+    await reachGenerationCheckpoint(generationControl);
     const preparationReadyAt = globalThis.performance?.now?.() ?? Date.now();
     const excluded = new Set(context.excludedNaturalStableIds ?? []);
     const exclusionTemplates = context.naturalExclusionTemplates
@@ -712,6 +735,7 @@ export async function createPresentationOwnerGenerator({
         settlementReferences: settlementRegionRefs,
         settlementStructures,
       }) ?? [] : [];
+    await reachGenerationCheckpoint(generationControl);
     const preliminaryStructures = [
       ...settlementStructures,
       ...majorRoadStructures,
@@ -728,6 +752,7 @@ export async function createPresentationOwnerGenerator({
           preliminaryGround.finalGround(worldX, worldZ).heightMeters
         ),
       }) : null;
+    await reachGenerationCheckpoint(generationControl);
     const canonicalSurfacePolicy = context.canonicalSurfacePolicy
       ?? createSettlementSurfacePolicy(
         settlementRegionRefs,
@@ -747,6 +772,7 @@ export async function createPresentationOwnerGenerator({
           riverProjection,
           naturalOnly: !materializePresentationOwner,
         }) ?? {} : {};
+    await reachGenerationCheckpoint(generationControl);
     const water = [
       ...(context.water ?? []),
       ...(auxiliary.water ?? []),
@@ -786,6 +812,7 @@ export async function createPresentationOwnerGenerator({
     };
     const groundedVegetation = Object.freeze(vegetation.map(regroundNaturalCandidate));
     const groundedRocks = Object.freeze(rocks.map(regroundNaturalCandidate));
+    await reachGenerationCheckpoint(generationControl);
     const coarsePresence = includeCoarsePresence ? (() => {
       // Macro Natural presence may only reuse real canonical Rock objects.
       // Bush is a Near-only ambient decoration and must never enter the Macro
@@ -825,6 +852,7 @@ export async function createPresentationOwnerGenerator({
       landmarks,
       street: [...(context.street ?? []), ...(auxiliary.street ?? [])],
     }) : null;
+    await reachGenerationCheckpoint(generationControl);
     const trees = Object.freeze((resource
       ? resource.natural.filter(record => record.objectType === 'tree')
       : groundedVegetation.filter(candidate => candidate.subtype !== 'shrub')
@@ -873,10 +901,15 @@ export async function createPresentationOwnerGenerator({
     });
   };
 
-  const generateCanonicalTreeCell = async (macroX, macroZ) => {
+  const generateCanonicalTreeCell = async (
+    macroX,
+    macroZ,
+    { checkpoint = null, cooperativeCheckpoint = null } = {},
+  ) => {
     assertCanonicalTreeMacroCoordinate(macroX, 'macroX');
     assertCanonicalTreeMacroCoordinate(macroZ, 'macroZ');
     const key = `${macroX},${macroZ}`;
+    const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
     const bounds = canonicalTreeCellBounds(macroX, macroZ);
     const ownerCoordinates = [];
     for (let ownerOffsetZ = 0;
@@ -913,8 +946,10 @@ export async function createPresentationOwnerGenerator({
         includeCoarsePresence: true,
         materializePresentationOwner: false,
         resolvedContextPromise: resolvedContextsPromise?.then(contexts => contexts[index]) ?? null,
+        ...(generationControl ?? {}),
       })
     )));
+    await reachGenerationCheckpoint(generationControl);
     const ownerKeys = Object.freeze(ownerCoordinates.map(({ chunkX, chunkZ }) => (
       createChunkKey(chunkX, chunkZ)
     )));
@@ -952,6 +987,9 @@ export async function createPresentationOwnerGenerator({
       }));
       trees.push(...ownerTrees);
       rocks.push(...ownerRocks);
+      if ((ownerIndex + 1) % 4 === 0 || ownerIndex === preparedOwners.length - 1) {
+        await reachGenerationCheckpoint(generationControl);
+      }
     }
     const allNatural = [...trees, ...rocks];
     const stableIds = new Set(allNatural.map(record => record.stableId));
@@ -985,6 +1023,7 @@ export async function createPresentationOwnerGenerator({
       naturalPresence: frozenNaturalPresence,
     });
     const contentHash = await hashCanonicalTreeCellContent(content);
+    await reachGenerationCheckpoint(generationControl);
     return Object.freeze({
       ...content,
       contentHash,
@@ -1023,8 +1062,8 @@ export async function createPresentationOwnerGenerator({
     worldSeed: normalizedWorldSeed,
     worldSeedHash,
     prepareCanonicalNaturalOwner: prepareOwner,
-    generateOwner(chunkX, chunkZ) {
-      return prepareOwner(chunkX, chunkZ, { includeRocks: true });
+    generateOwner(chunkX, chunkZ, options = {}) {
+      return prepareOwner(chunkX, chunkZ, { ...options, includeRocks: true });
     },
     generateCanonicalTreeCell,
   });

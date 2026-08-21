@@ -33,6 +33,7 @@ export function createPresentationManifestCache({
   }
 
   const entries = new Map();
+  const inFlightRequests = new Set();
   let closed = false;
   const counts = {
     requests: 0,
@@ -61,7 +62,7 @@ export function createPresentationManifestCache({
     }
   };
 
-  const getOrCreate = async ({
+  const runGetOrCreate = async ({
     manifestKind,
     ownerKey,
     sourceRevision,
@@ -114,11 +115,25 @@ export function createPresentationManifestCache({
     counts.stateApplications += 1;
     return applyState(manifest);
   };
+  const getOrCreate = options => {
+    const request = runGetOrCreate(options);
+    inFlightRequests.add(request);
+    void request.then(
+      () => inFlightRequests.delete(request),
+      () => inFlightRequests.delete(request),
+    );
+    return request;
+  };
 
   return Object.freeze({
     schemaVersion: PRESENTATION_MANIFEST_CACHE_SCHEMA,
     getOrCreate,
     clear() { entries.clear(); },
+    async settlePending() {
+      while (inFlightRequests.size > 0) {
+        await Promise.allSettled([...inFlightRequests]);
+      }
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -129,6 +144,7 @@ export function createPresentationManifestCache({
       capacity,
       size: entries.size,
       pendingCount: [...entries.values()].filter(entry => entry.pending).length,
+      inFlightRequestCount: inFlightRequests.size,
       closed,
       counts: Object.freeze({ ...counts }),
     }),

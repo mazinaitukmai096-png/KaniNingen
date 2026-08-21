@@ -103,7 +103,8 @@ import {
   isCompletedRenderFrameReceipt,
 } from '../visual-continuity.js';
 import {
-  buildSettlementRoadRibbonMeshData,
+  advanceSettlementRoadRibbonMeshWork,
+  createSettlementRoadRibbonMeshWork,
   createRoadRibbonHeightSampler,
 } from './settlement-road-ribbon-geometry.js';
 import { createMacroCoarseWorldPresentation } from './macro-coarse-world-presentation.js';
@@ -1254,6 +1255,7 @@ export async function createW8DistantPresentation({
   measure = (_stage, operation) => operation(),
   yieldToMainThread = null,
   terrainContinuationScheduler = null,
+  presentationClock = null,
   telemetry = null,
   resolveStaticNaturalCapacity = null,
   diagnosticsEnabled = false,
@@ -1306,6 +1308,9 @@ export async function createW8DistantPresentation({
   }
   if (yieldToMainThread !== null && typeof yieldToMainThread !== 'function') {
     throw new TypeError('yieldToMainThread must be a function when provided');
+  }
+  if (presentationClock !== null && typeof presentationClock !== 'function') {
+    throw new TypeError('presentationClock must be a function when provided');
   }
   if (terrainContinuationScheduler !== null
     && (typeof terrainContinuationScheduler.waitForContinuation !== 'function'
@@ -1501,6 +1506,13 @@ export async function createW8DistantPresentation({
   let settlementPublicationPlanId = null;
   let settlementPublicationRevision = 0;
   const settlementStreamingSnapshotCache = createSettlementStreamingSnapshotCache();
+  const touchSettlementOwnerRevision = generation => {
+    if (!generation) return 0;
+    const current = Number.isSafeInteger(generation.settlementOwnerRevision)
+      ? generation.settlementOwnerRevision : 0;
+    generation.settlementOwnerRevision = current + 1;
+    return generation.settlementOwnerRevision;
+  };
   let settlementShadowSnapshotRequestCount = 0;
   let settlementShadowSnapshotReuseCount = 0;
   let settlementShadowSnapshotCount = 0;
@@ -2143,7 +2155,8 @@ export async function createW8DistantPresentation({
   const SYNC_CANCELLED = Symbol('w8-distant-sync-cancelled');
   const LOCAL_SYNC_CANCELLED = Symbol('w8-local-terrain-sync-cancelled');
 
-  const monotonicNow = () => globalThis.performance?.now?.() ?? Date.now();
+  const monotonicNow = presentationClock
+    ?? (() => globalThis.performance?.now?.() ?? Date.now());
   const yieldPresentationWorkToMainThread = yieldToMainThread
     ?? (() => new Promise(resolve => globalThis.setTimeout(resolve, 0)));
   const terrainScheduler = terrainContinuationScheduler
@@ -3824,6 +3837,9 @@ export async function createW8DistantPresentation({
       instances: [],
     };
     context.generation.canonicalObjects.set(record.stableId, object);
+    if (identity.settlementId !== null && identity.settlementId !== undefined) {
+      touchSettlementOwnerRevision(context.generation);
+    }
     context.generation.currentPageStableIds?.push?.(record.stableId);
     context.stats.canonicalRecordCount += 1;
     if (record.remotePresentationOnly === true) {
@@ -5179,6 +5195,7 @@ export async function createW8DistantPresentation({
   const installRoadCanonicalReferences = (targetGeneration, roadGeneration) => {
     if (!targetGeneration) return;
     const previousRoadStableIds = [];
+    const previousRoadIdentity = [];
     let previousRoadRecordCount = 0;
     for (const [key, bucket] of [...targetGeneration.canonicalBuckets.entries()]) {
       if (isSettlementRoadBucket(bucket)) targetGeneration.canonicalBuckets.delete(key);
@@ -5186,6 +5203,7 @@ export async function createW8DistantPresentation({
     for (const [stableId, object] of [...targetGeneration.canonicalObjects.entries()]) {
       if (object.record?.featureType !== 'settlement-road') continue;
       previousRoadStableIds.push(stableId);
+      previousRoadIdentity.push([stableId, object.settlementId, object.ownerKey]);
       previousRoadRecordCount += 1;
       targetGeneration.canonicalObjects.delete(stableId);
     }
@@ -5198,6 +5216,13 @@ export async function createW8DistantPresentation({
     }
     for (const object of nextRoadObjects) {
       targetGeneration.canonicalObjects.set(object.stableId, object);
+    }
+    const nextRoadIdentity = nextRoadObjects
+      .map(object => [object.stableId, object.settlementId, object.ownerKey])
+      .sort((left, right) => left[0].localeCompare(right[0]));
+    previousRoadIdentity.sort((left, right) => left[0].localeCompare(right[0]));
+    if (JSON.stringify(previousRoadIdentity) !== JSON.stringify(nextRoadIdentity)) {
+      touchSettlementOwnerRevision(targetGeneration);
     }
     targetGeneration.roadPresentationGeneration = roadGeneration;
     if (targetGeneration.distantVisibleStableIds instanceof Set) {
@@ -5967,7 +5992,7 @@ export async function createW8DistantPresentation({
     return [...itemsByOwner.entries()].sort(([left], [right]) => left.localeCompare(right));
   };
 
-  const buildSettlementRoadOwnerPart = (ownerKey, ownerItems, generation) => {
+  const createSettlementRoadOwnerPartWork = (ownerKey, ownerItems, generation) => {
     const [chunkX, chunkZ] = ownerKey.split(',').map(Number);
     const sourceRoads = ownerItems.map(item => item.object.record);
     const roads = roadVisibilityDiagnostic.widthMultiplier === 1
@@ -5986,7 +6011,7 @@ export async function createW8DistantPresentation({
     });
     return {
       ownerKey,
-      meshData: buildSettlementRoadRibbonMeshData({
+      meshWork: createSettlementRoadRibbonMeshWork({
         roads,
         heightAt,
         originX: generation.buildOriginChunkX * LOGICAL_CHUNK_SIZE_METERS,
@@ -6006,20 +6031,38 @@ export async function createW8DistantPresentation({
   const createSettlementRoadGeometryFromParts = (parts, items, generation) => {
     const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
     const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
-    const positions = [];
-    const normals = [];
-    const indices = [];
+    const Uint32BufferAttribute = requireConstructor(THREE, 'Uint32BufferAttribute');
+    const positionLength = parts.reduce(
+      (total, part) => total + part.meshData.positions.length, 0,
+    );
+    const normalLength = parts.reduce(
+      (total, part) => total + part.meshData.normals.length, 0,
+    );
+    const indexLength = parts.reduce(
+      (total, part) => total + part.meshData.indices.length, 0,
+    );
+    const positions = new Float32Array(positionLength);
+    const normals = new Float32Array(normalLength);
+    const indices = new Uint32Array(indexLength);
+    let positionOffset = 0;
+    let normalOffset = 0;
+    let indexOffset = 0;
     let vertexOffset = 0;
     for (const { meshData } of parts) {
-      positions.push(...meshData.positions);
-      normals.push(...meshData.normals);
-      indices.push(...[...meshData.indices].map(index => index + vertexOffset));
+      positions.set(meshData.positions, positionOffset);
+      normals.set(meshData.normals, normalOffset);
+      for (let index = 0; index < meshData.indices.length; index += 1) {
+        indices[indexOffset + index] = meshData.indices[index] + vertexOffset;
+      }
+      positionOffset += meshData.positions.length;
+      normalOffset += meshData.normals.length;
+      indexOffset += meshData.indices.length;
       vertexOffset += meshData.stats.vertexCount;
     }
     const meshData = {
-      positions: new Float32Array(positions),
-      normals: new Float32Array(normals),
-      indices: new Uint32Array(indices),
+      positions,
+      normals,
+      indices,
       hash: parts.map(part => `${part.ownerKey}:${part.meshData.hash}`).join('|'),
       stats: Object.freeze({
         roadRecordCount: items.length,
@@ -6030,23 +6073,24 @@ export async function createW8DistantPresentation({
         junctionCount: parts.reduce((total, part) => total + part.meshData.stats.junctionCount, 0),
         miterJoinCount: parts.reduce((total, part) => total + part.meshData.stats.miterJoinCount, 0),
         bevelJoinCount: parts.reduce((total, part) => total + part.meshData.stats.bevelJoinCount, 0),
-        vertexCount: positions.length / 3,
-        indexCount: indices.length,
-        triangleCount: indices.length / 3,
+        vertexCount: positionLength / 3,
+        indexCount: indexLength,
+        triangleCount: indexLength / 3,
         duplicateFaceCount: parts.reduce(
           (total, part) => total + part.meshData.stats.duplicateFaceCount, 0,
         ),
         degenerateTriangleCount: parts.reduce(
           (total, part) => total + part.meshData.stats.degenerateTriangleCount, 0,
         ),
-        uploadBytes: positions.length * 4 + normals.length * 4 + indices.length * 4,
+        uploadBytes: positions.byteLength + normals.byteLength + indices.byteLength,
       }),
     };
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new Float32BufferAttribute(meshData.positions, 3));
     geometry.setAttribute('normal', new Float32BufferAttribute(meshData.normals, 3));
-    if (typeof geometry.setIndex === 'function') geometry.setIndex([...meshData.indices]);
-    else geometry.index = meshData.indices;
+    const indexAttribute = new Uint32BufferAttribute(meshData.indices, 1);
+    if (typeof geometry.setIndex === 'function') geometry.setIndex(indexAttribute);
+    else geometry.index = indexAttribute;
     geometry.userData = {
       roadRibbon: meshData.stats,
       roadRibbonHash: meshData.hash,
@@ -6076,11 +6120,25 @@ export async function createW8DistantPresentation({
     return geometry;
   };
 
-  const createSettlementRoadBucketGeometry = (items, generation) => {
-    const parts = settlementRoadOwnerEntries(items).map(([ownerKey, ownerItems]) => (
-      buildSettlementRoadOwnerPart(ownerKey, ownerItems, generation)
-    ));
-    return createSettlementRoadGeometryFromParts(parts, items, generation);
+  const createSettlementRoadBucketGeometryIncrementally = async (
+    items,
+    generation,
+    scheduler,
+  ) => {
+    const parts = [];
+    for (const [ownerKey, ownerItems] of settlementRoadOwnerEntries(items)) {
+      const ownerWork = createSettlementRoadOwnerPartWork(ownerKey, ownerItems, generation);
+      while (!ownerWork.meshWork.done) {
+        advanceSettlementRoadRibbonMeshWork(ownerWork.meshWork, { unitLimit: 1 });
+        const pendingYield = scheduler.checkpoint();
+        if (pendingYield) await pendingYield;
+      }
+      parts.push({ ownerKey, meshData: ownerWork.meshWork.result });
+    }
+    const geometry = createSettlementRoadGeometryFromParts(parts, items, generation);
+    const pendingYield = scheduler.checkpoint();
+    if (pendingYield) await pendingYield;
+    return geometry;
   };
 
   const disposeSettlementRoadGeometry = (geometry, generation) => {
@@ -6092,20 +6150,6 @@ export async function createW8DistantPresentation({
     disposedRoadGeometries.add(geometry);
     generation.ownedGeometries.delete(geometry);
     geometry.dispose?.();
-    return true;
-  };
-
-  const replaceSettlementRoadBucketGeometry = (bucket, generation, items) => {
-    const signature = items.map(item => item.object.stableId).sort().join('\n');
-    if (bucket.roadRibbonSignature === signature && bucket.mesh?.geometry) return false;
-    const previous = bucket.roadRibbonGeometry ?? null;
-    const geometry = createSettlementRoadBucketGeometry(items, generation);
-    bucket.roadRibbonGeometry = geometry;
-    bucket.roadRibbonSignature = signature;
-    if (bucket.mesh) bucket.mesh.geometry = geometry;
-    if (previous && previous !== geometry) {
-      disposeSettlementRoadGeometry(previous, generation);
-    }
     return true;
   };
 
@@ -6206,8 +6250,11 @@ export async function createW8DistantPresentation({
     return geometry;
   };
 
-  const prepareCanonicalBucketMesh = (bucket, context) => {
+  const prepareCanonicalBucketMesh = (bucket, context, preparedRoadGeometry = null) => {
     if (!bucket.items.length) return null;
+    if (isSettlementRoadBucket(bucket) && !preparedRoadGeometry) {
+      throw new Error('Settlement Road mesh preparation requires resumable geometry work');
+    }
     const persistentEntryKey = `bucket:${bucket.key
       ?? `${bucket.geometry}:${bucket.material}:${bucket.name}`}`;
     const reusableEntry = context.generation.persistentDistant === true
@@ -6229,7 +6276,7 @@ export async function createW8DistantPresentation({
     let geometry = canonicalFarTree
       ? createCanonicalFarTreeGeometry(bucket, context)
       : isSettlementRoadBucket(bucket)
-      ? createSettlementRoadBucketGeometry(bucket.items, context.generation)
+      ? preparedRoadGeometry
       : bucket.geometry === '__road__' ? roadGeometry : visualAssets.geometries[bucket.geometry];
     const sourceMaterial = canonicalFarTree
       ? null : visualAssets.materials[bucket.material];
@@ -6350,7 +6397,14 @@ export async function createW8DistantPresentation({
 
   const finalizeCanonicalMeshesIncrementally = async (context, scheduler) => {
     for (const bucket of context.generation.canonicalBuckets.values()) {
-      const prepared = prepareCanonicalBucketMesh(bucket, context);
+      const preparedRoadGeometry = bucket.items.length && isSettlementRoadBucket(bucket)
+        ? await createSettlementRoadBucketGeometryIncrementally(
+          bucket.items,
+          context.generation,
+          scheduler,
+        )
+        : null;
+      const prepared = prepareCanonicalBucketMesh(bucket, context, preparedRoadGeometry);
       if (!prepared) continue;
       for (const item of bucket.items) {
         if (!item.object.instances.some(instance => instance.item === item)) {
@@ -6625,31 +6679,12 @@ export async function createW8DistantPresentation({
     const mesh = bucket.mesh;
     if (!mesh) return Object.freeze({ composed: 0, matrices: 0, attributes: 0 });
     if (isSettlementRoadBucket(bucket)) {
-      const startedAt = monotonicNow();
-      const activeItems = bucket.items.filter(item => {
-        const opacity = canonicalInstanceOpacity(item.object, item);
-        return ['mid', 'far'].includes(item.object.visibleLod)
-          && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
-          && opacity > 0;
-      });
-      replaceSettlementRoadBucketGeometry(
-        bucket,
-        bucket.resourceOwnerGeneration ?? generation,
-        activeItems,
-      );
-      mesh.count = activeItems.length;
-      mesh.userData.visibleInstanceCount = activeItems.length;
-      mesh.userData.canonicalStableIds = activeItems.map(item => item.object.stableId);
-      mesh.userData.canonicalObjects = activeItems.map(item => item.object.record);
-      mesh.userData.canonicalOpacities = activeItems.map(item => (
-        canonicalInstanceOpacity(item.object, item)
-      ));
-      mesh.userData.roadRibbon = mesh.geometry.userData?.roadRibbon ?? null;
-      mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
-      mesh.userData.roadVisibilityDiagnostic =
-        mesh.geometry.userData?.roadVisibilityDiagnostic ?? null;
-      generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - startedAt;
-      return Object.freeze({ composed: 1, matrices: 0, attributes: 2 });
+      // Road geometry is an all-owner typed merge. Never perform that merge
+      // from a nominally synchronous visibility/owner-maintenance path: keep
+      // the currently drawn geometry until the deterministic Road state
+      // machine has completed and can atomically publish its replacement.
+      requestSettlementRoadBucketCompose(generation, bucket);
+      return Object.freeze({ composed: 0, matrices: 0, attributes: 0 });
     }
     if (generation.persistentDistant === true && bucket.persistent === true) {
       const hidden = hiddenCanonicalMatrix();
@@ -6786,6 +6821,7 @@ export async function createW8DistantPresentation({
       signature: null,
       ownerEntries: [],
       ownerIndex: 0,
+      ownerWork: null,
       parts: [],
       createdFrame: roadPresentationFrameSequence,
       accumulatedMs: 0,
@@ -6813,6 +6849,7 @@ export async function createW8DistantPresentation({
     work.signature = work.activeItems.map(item => item.object.stableId).sort().join('\n');
     work.ownerEntries = settlementRoadOwnerEntries(work.activeItems);
     work.ownerIndex = 0;
+    work.ownerWork = null;
     work.parts = [];
     work.stage = work.bucket.roadRibbonSignature === work.signature
       && work.bucket.mesh?.geometry ? 'publish' : 'owners';
@@ -6857,6 +6894,14 @@ export async function createW8DistantPresentation({
     mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
     mesh.userData.roadVisibilityDiagnostic =
       mesh.geometry.userData?.roadVisibilityDiagnostic ?? null;
+    bucket.dirtySlots?.clear?.();
+    if (bucket.pendingRoadComposeWork === work) {
+      bucket.pendingRoadComposeWork = null;
+    } else if (bucket.pendingRoadComposeWork
+      && !settlementRoadComposeWorkCurrent(bucket.pendingRoadComposeWork)) {
+      discardSettlementRoadComposeWork(bucket.pendingRoadComposeWork);
+      bucket.pendingRoadComposeWork = null;
+    }
     work.done = true;
     work.stage = 'done';
     if (bucket.pendingRoadComposeSequence === work.sequence) {
@@ -6882,6 +6927,18 @@ export async function createW8DistantPresentation({
       budgetMs = ROAD_PRESENTATION_FRAME_BUDGET_MS,
     } = {},
   ) => {
+    // Multiple deterministic consumers may borrow the same bucket-owned work.
+    // The normal dirty queue can publish after a coverage consumer yields; a
+    // later borrower must observe that terminal success instead of treating
+    // the cleared pending sequence as a stale revision and rebuilding it.
+    if (work?.done) return Object.freeze({
+      done: true,
+      stale: false,
+      alreadyPublished: true,
+      matrices: 0,
+      attributes: 0,
+      bytes: 0,
+    });
     presentationSchedulerRoadSlices += 1;
     const sliceStartedAt = monotonicNow();
     let units = 0;
@@ -6899,14 +6956,36 @@ export async function createW8DistantPresentation({
     while (!work.done && !work.cancelled
       && (units === 0 || monotonicNow() - budgetStartedAtMs < budgetMs)) {
       const unitStartedAt = monotonicNow();
+      let stopAfterUnit = false;
       if (work.stage === 'initialize') {
         initializeSettlementRoadComposeWork(work);
       } else if (work.stage === 'owners') {
         const entry = work.ownerEntries[work.ownerIndex];
         if (entry) {
-          work.parts.push(buildSettlementRoadOwnerPart(entry[0], entry[1], work.generation));
-          work.ownerIndex += 1;
-          roadPresentationOwnerWorkCount += 1;
+          if (!work.ownerWork) {
+            work.ownerWork = createSettlementRoadOwnerPartWork(
+              entry[0], entry[1], work.generation,
+            );
+          } else {
+            const result = advanceSettlementRoadRibbonMeshWork(
+              work.ownerWork.meshWork,
+              { unitLimit: 1 },
+            );
+            if (result.done) {
+              work.parts.push({
+                ownerKey: work.ownerWork.ownerKey,
+                meshData: result.result,
+              });
+              work.ownerWork = null;
+              work.ownerIndex += 1;
+              roadPresentationOwnerWorkCount += 1;
+              // Keep final typed merge/publication in a later scheduler slice.
+              // This preserves an observable supersede point after a complete
+              // owner and prevents owner completion plus GPU-visible swap from
+              // accumulating in one rendered frame.
+              stopAfterUnit = true;
+            }
+          }
         }
         if (work.ownerIndex >= work.ownerEntries.length) work.stage = 'publish';
       } else if (work.stage === 'publish') {
@@ -6921,6 +7000,7 @@ export async function createW8DistantPresentation({
       }
       roadPresentationMaximumUnitMs = Math.max(roadPresentationMaximumUnitMs, unitMs);
       units += 1;
+      if (stopAfterUnit) break;
     }
     const durationMs = monotonicNow() - sliceStartedAt;
     roadPresentationMaximumSliceMs = Math.max(roadPresentationMaximumSliceMs, durationMs);
@@ -6931,6 +7011,7 @@ export async function createW8DistantPresentation({
     return Object.freeze({
       done: work.done || work.cancelled,
       stale: work.cancelled && !work.done,
+      alreadyPublished: false,
       matrices: 0,
       attributes: published ? 2 : 0,
       bytes: published ? Number(work.bucket.mesh?.geometry?.userData
@@ -6942,7 +7023,7 @@ export async function createW8DistantPresentation({
     generation,
     bucket,
     roadWork: isSettlementRoadBucket(bucket)
-      ? createSettlementRoadComposeWork(generation, bucket) : null,
+      ? requestSettlementRoadBucketCompose(generation, bucket) : null,
     slots: generation.persistentDistant === true && bucket.persistent === true
       ? [...(bucket.dirtySlots ?? [])].sort((left, right) => left - right)
       : null,
@@ -6954,6 +7035,40 @@ export async function createW8DistantPresentation({
     matrices: 0,
     startedAtMs: monotonicNow(),
   });
+
+  const requestSettlementRoadBucketCompose = (generation, bucket) => {
+    if (!isSettlementRoadBucket(bucket) || !bucket.mesh) return null;
+    const pending = bucket.pendingRoadComposeWork ?? null;
+    if (pending && settlementRoadComposeWorkCurrent(pending)) return pending;
+    if (pending) discardSettlementRoadComposeWork(pending);
+    const work = createSettlementRoadComposeWork(generation, bucket);
+    bucket.pendingRoadComposeWork = work;
+    return work;
+  };
+
+  const processPendingSettlementRoadCompose = (generation, budgetMs) => {
+    if (!generation?.canonicalBuckets || !(budgetMs > 0)) return null;
+    for (const bucket of generation.canonicalBuckets.values()) {
+      const pending = bucket.pendingRoadComposeWork ?? null;
+      if (!pending) continue;
+      if (!settlementRoadComposeWorkCurrent(pending)) {
+        discardSettlementRoadComposeWork(pending);
+        bucket.pendingRoadComposeWork = null;
+        if ((bucket.dirtySlots?.size ?? 0) > 0) {
+          requestSettlementRoadBucketCompose(generation, bucket);
+        }
+        continue;
+      }
+      const startedAt = monotonicNow();
+      const result = advanceSettlementRoadComposeWork(pending, {
+        budgetStartedAtMs: startedAt,
+        budgetMs: Math.min(budgetMs, ROAD_PRESENTATION_FRAME_BUDGET_MS),
+      });
+      if (result.attributes > 0) finishCanonicalCompose(generation, 1, 0);
+      return result;
+    }
+    return null;
+  };
 
   const advanceCanonicalBucketComposeWork = (
     work,
@@ -7124,7 +7239,8 @@ export async function createW8DistantPresentation({
   const processPersistentDistantVisibility = (generation, budgetMs) => {
     if (!generation?.persistentDistant || !(budgetMs > 0)) return null;
     const bucket = [...generation.canonicalBuckets.values()].find(candidate => (
-      candidate.persistent === true && candidate.mesh && candidate.dirtySlots?.size > 0
+      candidate.persistent === true && !isSettlementRoadBucket(candidate)
+        && candidate.mesh && candidate.dirtySlots?.size > 0
     ));
     if (!bucket) return null;
     const startedAt = monotonicNow();
@@ -7154,33 +7270,20 @@ export async function createW8DistantPresentation({
       const mesh = bucket.mesh;
       if (!mesh) continue;
       if (isSettlementRoadBucket(bucket)) {
-        const startedAt = monotonicNow();
-        const activeItems = bucket.items.filter(item => {
-          const opacity = canonicalInstanceOpacity(item.object, item);
-          return ['mid', 'far'].includes(item.object.visibleLod)
-            && !(item.object.remoteHorizon && nearStableIds.has(item.object.stableId))
-            && opacity > 0;
-        });
-        replaceSettlementRoadBucketGeometry(
-          bucket,
-          bucket.resourceOwnerGeneration ?? generation,
-          activeItems,
-        );
-        mesh.count = activeItems.length;
-        mesh.userData.visibleInstanceCount = activeItems.length;
-        mesh.userData.canonicalStableIds = activeItems.map(item => item.object.stableId);
-        mesh.userData.canonicalObjects = activeItems.map(item => item.object.record);
-        mesh.userData.canonicalOpacities = activeItems.map(item => (
-          canonicalInstanceOpacity(item.object, item)
-        ));
-        mesh.userData.roadRibbon = mesh.geometry.userData?.roadRibbon ?? null;
-        mesh.userData.roadRibbonHash = mesh.geometry.userData?.roadRibbonHash ?? null;
-        mesh.userData.roadVisibilityDiagnostic =
-          mesh.geometry.userData?.roadVisibilityDiagnostic ?? null;
-        generation.stats.canonicalRoadMatrixComposeMs += monotonicNow() - startedAt;
-        composed += 1;
-        const pendingYield = scheduler.checkpoint();
-        if (pendingYield) await pendingYield;
+        // The incremental bootstrap, runtime dirty queue, handoff and coverage
+        // barrier are consumers of one bucket-owned replacement. Creating a
+        // second work item here would invalidate (or duplicate) the identical
+        // canonical owner merge while the first consumer is yielded.
+        const roadWork = requestSettlementRoadBucketCompose(generation, bucket);
+        while (!roadWork.done && !roadWork.cancelled) {
+          advanceSettlementRoadComposeWork(roadWork, {
+            budgetStartedAtMs: monotonicNow(),
+            budgetMs: ROAD_PRESENTATION_FRAME_BUDGET_MS,
+          });
+          const pendingYield = scheduler.checkpoint();
+          if (pendingYield) await pendingYield;
+        }
+        composed += Number(roadWork.done);
         continue;
       }
       if (generation.persistentDistant === true && bucket.persistent === true) {
@@ -8019,7 +8122,6 @@ export async function createW8DistantPresentation({
     const activeOwners = new Set();
     const renderedOwners = new Set();
     const dirtyBuckets = new Map();
-    const immediatePersistentRoadReplacementBuckets = new Set();
     const markObjectDirty = object => {
       for (const instance of object.instances) {
         dirtyBuckets.set(canonicalBucketVisibilityKey(instance.bucket), instance.bucket);
@@ -8270,13 +8372,6 @@ export async function createW8DistantPresentation({
       if (object.visibleLod === nextLod && object.presentationTier === presentationTier
         && !opacityChanged) continue;
       markObjectDirty(object);
-      if (replacedByPersistentCoarseStructure) {
-        for (const instance of object.instances) {
-          if (isSettlementRoadBucket(instance.bucket)) {
-            immediatePersistentRoadReplacementBuckets.add(instance.bucket);
-          }
-        }
-      }
       if (tree) {
         generation.treeVisibilityChangeCount =
           (generation.treeVisibilityChangeCount ?? 0) + 1;
@@ -8301,9 +8396,9 @@ export async function createW8DistantPresentation({
       && generation.persistentDistant !== true) {
       composeCanonicalMeshes(generation, dirtyBuckets);
     }
-    if (generation.persistentDistant === true) {
-      for (const bucket of immediatePersistentRoadReplacementBuckets) {
-        composeCanonicalBucket(generation, bucket);
+    for (const bucket of dirtyBuckets.values()) {
+      if (isSettlementRoadBucket(bucket)) {
+        requestSettlementRoadBucketCompose(generation, bucket);
       }
     }
     if (updateStats) {
@@ -9426,6 +9521,10 @@ export async function createW8DistantPresentation({
         slots.sort((left, right) => left - right);
       }
       if (!bucket.mesh || slots.length === 0) continue;
+      if (isSettlementRoadBucket(bucket)) {
+        requestSettlementRoadBucketCompose(generation, bucket);
+        continue;
+      }
       const processedSlots = [];
       for (const slot of slots) {
         if (matrixUpdates >= unitLimit
@@ -9435,12 +9534,6 @@ export async function createW8DistantPresentation({
           || item.coarseTreeSubmitted === true;
         const opacity = coarseTreeSubmitted
           ? canonicalInstanceOpacity(item.object, item) : 0;
-        if (isSettlementRoadBucket(bucket)) {
-          bucket.dirtySlots.delete(slot);
-          processedSlots.push(slot);
-          matrixUpdates += 1;
-          continue;
-        }
         bucket.mesh.setMatrixAt(slot, opacity > 0 ? item.matrix : hidden);
         writeNaturalAnchor(bucket, slot, item.object, generation);
         writeNaturalInitialReveal(bucket, slot, item.object, generation, item);
@@ -9455,13 +9548,6 @@ export async function createW8DistantPresentation({
         matrixUpdates += 1;
       }
       if (processedSlots.length === 0) break;
-      if (isSettlementRoadBucket(bucket)) {
-        composeCanonicalBucket(generation, bucket);
-        bucket.dirtySlots.clear();
-        bucketUpdates += 1;
-        if (matrixUpdates >= unitLimit || monotonicNow() - startedAt >= budgetMs) break;
-        continue;
-      }
       bucket.mesh.count = isPersistentCoarseTreeBucket(bucket)
         ? (bucket.coarseTreeSubmittedCount ?? 0) : bucket.items.length;
       bucket.mesh.userData.canonicalVisualRevision =
@@ -9673,8 +9759,8 @@ export async function createW8DistantPresentation({
       persistentTreeGeneration.canonicalObjects.delete(stableId);
     }
     for (const bucket of roadBuckets) {
-      composeCanonicalBucket(persistentTreeGeneration, bucket);
-      bucket.dirtySlots?.clear?.();
+      bucket.roadComposeRevision = (bucket.roadComposeRevision ?? 0) + 1;
+      requestSettlementRoadBucketCompose(persistentTreeGeneration, bucket);
     }
     persistentTreeGeneration.distantVisibleStableIds = new Set(
       [...persistentTreeGeneration.canonicalBuckets.values()].flatMap(bucket => (
@@ -10022,7 +10108,17 @@ export async function createW8DistantPresentation({
             coarseTreeSubmittedCount: 0,
           } : {}),
         };
-        const prepared = prepareCanonicalBucketMesh(bucket, preparationContext);
+        const preparedRoadGeometry = isSettlementRoadBucket(bucket)
+          ? await createSettlementRoadBucketGeometryIncrementally(
+            stagedItems,
+            generation,
+            scheduler,
+          ) : null;
+        const prepared = prepareCanonicalBucketMesh(
+          bucket,
+          preparationContext,
+          preparedRoadGeometry,
+        );
         bucket.items = [];
         preparedBuckets.set(stagedBucket.key, { bucket, prepared });
       }
@@ -10081,7 +10177,8 @@ export async function createW8DistantPresentation({
     }
     for (const stagedBucket of stagedGeneration.canonicalBuckets.values()) {
       const bucket = generation.canonicalBuckets.get(stagedBucket.key);
-      for (const stagedItem of stagedItemsForBucket(stagedBucket)) {
+      const stagedItems = stagedItemsForBucket(stagedBucket);
+      for (const stagedItem of stagedItems) {
         const object = generation.canonicalObjects.get(stagedItem.object.stableId);
         const item = {
           ...stagedItem,
@@ -10094,6 +10191,12 @@ export async function createW8DistantPresentation({
         bucket.items.push(item);
         object.instances.push({ bucket, item });
         bucket.dirtySlots.add(item.slot);
+      }
+      if (isSettlementRoadBucket(bucket) && stagedItems.length > 0) {
+        // Adding another PresentationOwner can overlap an already sliced Road
+        // replacement. Invalidate its captured owner list before the next
+        // frame so it can never publish geometry that omits the new records.
+        bucket.roadComposeRevision = (bucket.roadComposeRevision ?? 0) + 1;
       }
     }
     mergeNumericStats(generation.stats, stagedGeneration.stats);
@@ -10525,8 +10628,41 @@ export async function createW8DistantPresentation({
     const scheduled = pages.map(page => (
       enqueuePersistentNaturalOwnerBuild(page, pageBudgetMs, { deferStart: true })
     ));
-    void Promise.all(scheduled)
-      .then(allocations => {
+    void Promise.allSettled(scheduled)
+      .then(results => {
+        const allocations = [];
+        for (let index = 0; index < results.length; index += 1) {
+          const result = results[index];
+          if (result.status === 'fulfilled') {
+            if (result.value) allocations.push(result.value);
+            continue;
+          }
+          if (result.reason === SYNC_CANCELLED) continue;
+          const page = pages[index];
+          const retryAttempt = (page.buildRetryAttempt ?? 0) + 1;
+          const desiredResourceKind = persistentTreeDesiredResourceKinds.get(page.ownerKey);
+          const resourceStillDesired = page.resourceKind === DIRECT_CANONICAL_TREE_RESOURCE_KIND
+            ? directCanonicalTreeCells.has(page.macroCellKey)
+            : !desiredResourceKind || desiredResourceKind === page.resourceKind;
+          const retryCurrent = !disposed
+            && page.coverageGeneration === persistentTreeCoverageGeneration
+            && page.planRevision === persistentTreePlanRevision
+            && resourceStillDesired;
+          if (retryCurrent && retryAttempt <= 2) {
+            pendingPersistentTreePages.set(page.ownerKey, Object.freeze({
+              ...page,
+              buildRetryAttempt: retryAttempt,
+            }));
+          }
+          recordDiagnosticEvent('persistent-natural-owner-build-failed', {
+            ownerKey: page.ownerKey,
+            resourceKind: page.resourceKind,
+            retryAttempt,
+            retryScheduled: retryCurrent && retryAttempt <= 2,
+            name: result.reason?.name ?? 'Error',
+            message: result.reason?.message ?? String(result.reason),
+          });
+        }
         if (frameSample) {
           for (const allocation of allocations.filter(Boolean)) {
             frameSample.builtOwners += 1;
@@ -10540,8 +10676,6 @@ export async function createW8DistantPresentation({
             frameSample.allocatedBuckets += allocation.bucketCount;
           }
         }
-      }).catch(error => {
-        if (error !== SYNC_CANCELLED) throw error;
       }).finally(finishFrameSample);
     return Object.freeze({ remainingMs: 0, buildStarted: true });
   };
@@ -10747,13 +10881,13 @@ export async function createW8DistantPresentation({
 
   const discardRuntimePresentationBarrierRoadWork = barrier => {
     if (!barrier) return 0;
-    let discarded = 0;
-    for (const work of barrier.roadWorks ?? []) {
-      discarded += discardSettlementRoadComposeWork(work);
-    }
+    // Barrier entries borrow bucket-owned Road work from
+    // requestSettlementRoadBucketCompose(). Superseding a barrier releases
+    // only those references: the normal dirty queue (or another handoff) may
+    // still require the exact same revision and must be allowed to finish it.
     barrier.roadWorks = [];
     barrier.roadWorkIndex = 0;
-    return discarded;
+    return 0;
   };
 
   const resetRuntimePresentationCoverageBarrierWork = (barrier, generation) => {
@@ -10810,7 +10944,7 @@ export async function createW8DistantPresentation({
       barrier.roadWorkIndex = 0;
       for (const bucket of criticalBuckets) {
         if (isSettlementRoadBucket(bucket)) {
-          barrier.roadWorks.push(createSettlementRoadComposeWork(generation, bucket));
+          barrier.roadWorks.push(requestSettlementRoadBucketCompose(generation, bucket));
         } else if (generation.persistentDistant === true && bucket.persistent === true) {
           const work = createCanonicalBucketComposeWork(generation, bucket);
           const composed = advanceCanonicalBucketComposeWork(work, {
@@ -10866,7 +11000,7 @@ export async function createW8DistantPresentation({
       barrier.matrixUpdates += composed.matrices;
       barrier.bufferUpdates += composed.attributes;
       if (!composed.done) break;
-      barrier.composedBuckets += 1;
+      barrier.composedBuckets += Number(composed.alreadyPublished !== true);
       barrier.roadWorkIndex += 1;
     }
     roadPresentationMaximumSliceMs = Math.max(
@@ -10971,7 +11105,8 @@ export async function createW8DistantPresentation({
     coverageBarrier = null,
   }) => {
     if (pendingRuntimePresentationHandoff) {
-      discardSettlementRoadComposeWork(pendingRuntimePresentationHandoff.bucketWork?.roadWork);
+      // bucketWork.roadWork is shared with the bucket's ordinary dirty queue.
+      // Dropping this handoff must not cancel work still needed by that queue.
       discardRuntimePresentationBarrierRoadWork(
         pendingRuntimePresentationHandoff.coverageBarrier,
       );
@@ -11012,7 +11147,6 @@ export async function createW8DistantPresentation({
       uploadBytes: 0,
       localTerrainHandoffs: 0,
     });
-    roadPresentationFrameSequence += 1;
     if (pendingDistantPublication?.generation === handoff.targetGeneration) {
       recordRuntimePresentationCoverageFrame(
         handoff.targetGeneration,
@@ -11103,7 +11237,7 @@ export async function createW8DistantPresentation({
         frameBufferUpdates += composed.attributes;
         frameUploadBytes += composed.bytes ?? 0;
         if (composed.done) {
-          handoff.composedBuckets += 1;
+          handoff.composedBuckets += Number(composed.alreadyPublished !== true);
           handoff.dirtyBucketIndex += 1;
           handoff.bucketWork = null;
         }
@@ -14566,15 +14700,24 @@ export async function createW8DistantPresentation({
         await scheduler.checkpoint({ force: true });
         markRoadLifecycleRegistered(generation);
         positionGenerationForOrigin(generation, renderOrigin);
-        const dirtyBuckets = updateCanonicalVisibility(
+        let dirtyBuckets = updateCanonicalVisibility(
           generation,
           playerLogicalX,
           playerLogicalZ,
           { compose: false },
         );
-        await scheduler.checkpoint({ force: true });
-        if (dirtyBuckets.size) {
+        while (dirtyBuckets.size > 0) {
+          await scheduler.checkpoint({ force: true });
           await composeCanonicalMeshesIncrementally(generation, dirtyBuckets, scheduler);
+          // A destruction or Near receipt can arrive at a cooperative yield.
+          // Re-read until a complete compose is followed by a synchronous,
+          // clean validation; only that state is eligible for publication.
+          dirtyBuckets = updateCanonicalVisibility(
+            generation,
+            playerLogicalX,
+            playerLogicalZ,
+            { compose: false },
+          );
         }
         const sliceSnapshot = scheduler.finish();
         generation.maximumSliceMs = sliceSnapshot.maximumSliceMs;
@@ -14602,16 +14745,6 @@ export async function createW8DistantPresentation({
         pendingFarSyncEpochs.delete(epoch);
         return false;
       }
-      // Re-read Near ownership and feature damage after the last asynchronous
-      // slice. A Tree destroyed while this staging generation was composing
-      // must never publish a stale Full/Forest/Atmospheric/Horizon instance.
-      const commitDirtyBuckets = updateCanonicalVisibility(
-        generation,
-        playerLogicalX,
-        playerLogicalZ,
-        { compose: false },
-      );
-      if (commitDirtyBuckets.size) composeCanonicalMeshes(generation, commitDirtyBuckets);
       const previous = activeGeneration;
       generation.staticPublicationTickets = Object.freeze([]);
       const rootSwapStartedAt = globalThis.performance?.now?.() ?? Date.now();
@@ -14941,6 +15074,7 @@ export async function createW8DistantPresentation({
     ) {
       if (disposed) return;
       if (!acceptCommittedRenderOrigin(renderOrigin)) return false;
+      roadPresentationFrameSequence += 1;
       updateIndependentRoadTargetPosition(playerLogicalX, playerLogicalZ, renderOrigin);
       const frameStartedAt = monotonicNow();
       if (enableMacroCoarseWorld) {
@@ -15025,9 +15159,22 @@ export async function createW8DistantPresentation({
             { compose: activeGeneration.persistentDistant !== true },
           );
           if (handoffFrame.meshUpdates === 0 && publicationFrame.admissions === 0) {
-            processPersistentDistantVisibility(activeGeneration, remainingFrameBudgetMs());
+            const roadFrame = processPendingSettlementRoadCompose(
+              activeGeneration,
+              remainingFrameBudgetMs(),
+            );
+            if (!roadFrame) {
+              processPersistentDistantVisibility(activeGeneration, remainingFrameBudgetMs());
+            }
           }
         }
+      }
+      if (persistentTreeGeneration && persistentTreeGeneration !== activeGeneration
+        && handoffFrame.meshUpdates === 0 && publicationFrame.admissions === 0) {
+        processPendingSettlementRoadCompose(
+          persistentTreeGeneration,
+          remainingFrameBudgetMs(),
+        );
       }
       const disposedResources = processDeferredGenerationDisposals(Math.min(
         STATIC_TREE_DISPOSE_BUDGET_MS,
@@ -15142,6 +15289,17 @@ export async function createW8DistantPresentation({
           snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.stableId);
           snapshotHash = appendSettlementSnapshotHash(snapshotHash, damageState.destroyed ? 1 : 0);
         }
+        const publicationSource = buildingPublicationSource === settlementRoadPublicationSource
+          && buildingPublicationSource === settlementMetadataPublicationSource
+          ? buildingPublicationSource : 'mixed-exclusive-handoff';
+        for (const publicationIdentity of [
+          publicationSource,
+          buildingPublicationSource,
+          settlementRoadPublicationSource,
+          settlementMetadataPublicationSource,
+          settlementPublicationPlanId,
+          settlementPublicationRevision,
+        ]) snapshotHash = appendSettlementSnapshotHash(snapshotHash, publicationIdentity);
         settlementShadowStableIdMaterializationCount += stableIds.length;
         if (diagnosticsEnabled) recordDiagnosticWork('settlement-shadow-observation', {
           calls: 1,
@@ -15161,12 +15319,13 @@ export async function createW8DistantPresentation({
           coverageContentHash:
             `settlement-coverage:${coverageHash.toString(16).padStart(8, '0')}`,
           frameSequence,
+          generationEpoch: generation.epoch,
           presentationRevision: generation.epoch,
           renderDistanceRevision,
+          featureDamageRevision: stateRevision,
           stateRevision,
-          publicationSource: buildingPublicationSource === settlementRoadPublicationSource
-            && buildingPublicationSource === settlementMetadataPublicationSource
-            ? buildingPublicationSource : 'mixed-exclusive-handoff',
+          ownerRevision: generation.settlementOwnerRevision ?? 0,
+          publicationSource,
           buildingPublicationSource,
           settlementRoadPublicationSource,
           settlementMetadataPublicationSource,
@@ -15192,9 +15351,10 @@ export async function createW8DistantPresentation({
       if (!Number.isSafeInteger(frameSequence) || frameSequence < 0) return materialize();
       const snapshot = settlementStreamingSnapshotCache.read({
         frameSequence,
-        presentationRevision: generation.epoch,
+        generationEpoch: generation.epoch,
         renderDistanceRevision,
-        stateRevision,
+        featureDamageRevision: stateRevision,
+        ownerRevision: generation.settlementOwnerRevision ?? 0,
         materialize,
       });
       if (settlementStreamingSnapshotCache.lastReadReused) {
@@ -15230,15 +15390,23 @@ export async function createW8DistantPresentation({
           renderDistanceRevision ?? observation.renderDistanceRevision
         )
         || !isSettlementStreamingSnapshotCurrent(currentObservation, {
-          presentationRevision: generation.epoch,
+          generationEpoch: generation.epoch,
           renderDistanceRevision: renderDistanceRevision ?? currentObservation.renderDistanceRevision,
-          stateRevision: stateRevision ?? currentObservation.stateRevision,
+          featureDamageRevision: stateRevision ?? currentObservation.stateRevision,
+          ownerRevision: generation.settlementOwnerRevision ?? 0,
         })) return false;
       return true;
     },
     claimBuildingSettlementPublication(stage, options = {}) {
       if (!this.canClaimBuildingSettlementPublication(stage, options)) return false;
       const { publicationKinds = Object.freeze(['building']) } = options;
+      const previousPublicationIdentity = [
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
+        settlementPublicationPlanId,
+        settlementPublicationRevision,
+      ];
       if (publicationKinds.includes('building')) {
         buildingPublicationSource = 'shared-streaming-plan';
       }
@@ -15250,6 +15418,14 @@ export async function createW8DistantPresentation({
       }
       settlementPublicationPlanId = stage.planId;
       settlementPublicationRevision = stage.renderDistanceRevision;
+      const publicationChanged = previousPublicationIdentity.some((value, index) => value !== [
+        buildingPublicationSource,
+        settlementRoadPublicationSource,
+        settlementMetadataPublicationSource,
+        settlementPublicationPlanId,
+        settlementPublicationRevision,
+      ][index]);
+      if (publicationChanged) settlementStreamingSnapshotCache.invalidate();
       activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
       activeGeneration.root.userData.settlementRoadPublicationSource =
         settlementRoadPublicationSource;
@@ -15258,11 +15434,17 @@ export async function createW8DistantPresentation({
       return true;
     },
     useLegacyBuildingSettlementPublication() {
+      const publicationChanged = buildingPublicationSource !== 'legacy-distant-root'
+        || settlementRoadPublicationSource !== 'legacy-distant-root'
+        || settlementMetadataPublicationSource !== 'legacy-distant-root'
+        || settlementPublicationPlanId !== null
+        || settlementPublicationRevision !== 0;
       buildingPublicationSource = 'legacy-distant-root';
       settlementRoadPublicationSource = 'legacy-distant-root';
       settlementMetadataPublicationSource = 'legacy-distant-root';
       settlementPublicationPlanId = null;
       settlementPublicationRevision = 0;
+      if (publicationChanged) settlementStreamingSnapshotCache.invalidate();
       if (activeGeneration?.root?.userData) {
         activeGeneration.root.userData.buildingPublicationSource = buildingPublicationSource;
         activeGeneration.root.userData.settlementRoadPublicationSource =
@@ -15386,6 +15568,21 @@ export async function createW8DistantPresentation({
         ? snapshotRemoteHorizonAtmospheres(activeGeneration)
         : emptyRemoteHorizonAtmospheres;
       const terrainSchedulerSnapshot = terrainScheduler.snapshot();
+      const pendingRoadWorks = new Set([
+        pendingRuntimePresentationHandoff?.bucketWork?.roadWork,
+        ...(pendingRuntimePresentationHandoff?.coverageBarrier?.roadWorks ?? []),
+      ].filter(Boolean));
+      for (const generation of new Set(
+        [activeGeneration, persistentTreeGeneration].filter(Boolean),
+      )) {
+        for (const bucket of generation.canonicalBuckets?.values?.() ?? []) {
+          if (bucket.pendingRoadComposeWork) {
+            pendingRoadWorks.add(bucket.pendingRoadComposeWork);
+          }
+        }
+      }
+      const roadPresentationQueueLength = [...pendingRoadWorks]
+        .reduce((total, work) => total + settlementRoadWorkRemaining(work), 0);
       const macroCoarseWorldSnapshot = enableMacroCoarseWorld
         ? Object.freeze({
           ...(macroCoarseWorldController?.snapshot() ?? { enabled: false }),
@@ -15627,10 +15824,7 @@ export async function createW8DistantPresentation({
         staticNaturalOrphanSlotCount: persistentNaturalOrphanSlotCount,
         runtimePresentationFrameBudgetMs: RUNTIME_PRESENTATION_FRAME_BUDGET_MS,
         roadPresentationFrameBudgetMs: ROAD_PRESENTATION_FRAME_BUDGET_MS,
-        roadPresentationQueueLength:
-          settlementRoadWorkRemaining(pendingRuntimePresentationHandoff?.bucketWork?.roadWork)
-          + (pendingRuntimePresentationHandoff?.coverageBarrier?.roadWorks ?? [])
-            .reduce((total, work) => total + settlementRoadWorkRemaining(work), 0),
+        roadPresentationQueueLength,
         roadPresentationMaximumQueueLength,
         roadPresentationMaximumWaitFrames,
         roadPresentationMaximumSliceMs,

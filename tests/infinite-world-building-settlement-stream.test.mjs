@@ -81,14 +81,16 @@ test('transactional staging remains detached and legacy is the only publisher', 
   await stream.dispose();
 });
 
-test('frame/revision/state cache materializes once and never reuses a stale snapshot', () => {
+test('exact content revisions cache across frames and general player state', () => {
   const cache = createSettlementStreamingSnapshotCache();
   let materializeCount = 0;
   const read = overrides => cache.read({
     frameSequence: 10,
-    presentationRevision: 3,
+    generationEpoch: 3,
     renderDistanceRevision: 4,
-    stateRevision: 5,
+    featureDamageRevision: 5,
+    ownerRevision: 7,
+    stateRevision: 900,
     ...overrides,
     materialize: () => Object.freeze({ sequence: ++materializeCount }),
   });
@@ -96,27 +98,51 @@ test('frame/revision/state cache materializes once and never reuses a stale snap
   const sameFrame = read();
   assert.equal(sameFrame, first);
   assert.equal(materializeCount, 1);
-  assert.notEqual(read({ frameSequence: 11 }), first);
-  assert.equal(materializeCount, 2);
-  assert.equal(read({ frameSequence: 11, stateRevision: 6 }).sequence, 3);
-  assert.equal(read({ frameSequence: 11, stateRevision: 6, renderDistanceRevision: 5 }).sequence, 4);
+  assert.equal(read({ frameSequence: 11 }), first);
+  assert.equal(materializeCount, 1);
+  assert.equal(read({ frameSequence: 11, stateRevision: 901 }), first,
+    'general player/world revision is not a content key');
+  assert.equal(read({ featureDamageRevision: 6 }).sequence, 2);
+  assert.equal(read({ featureDamageRevision: 6, renderDistanceRevision: 5 }).sequence, 3);
   assert.equal(read({
-    frameSequence: 11,
-    stateRevision: 6,
+    featureDamageRevision: 6,
     renderDistanceRevision: 5,
-    presentationRevision: 4,
+    generationEpoch: 4,
+  }).sequence, 4);
+  assert.equal(read({
+    featureDamageRevision: 6,
+    renderDistanceRevision: 5,
+    generationEpoch: 4,
+    ownerRevision: 8,
   }).sequence, 5);
-  assert.deepEqual(cache.snapshot().counts, { requests: 6, materialized: 5, reused: 1 });
+  assert.deepEqual(cache.snapshot().counts, { requests: 8, materialized: 5, reused: 3 });
+  assert.deepEqual({
+    generationEpoch: cache.snapshot().generationEpoch,
+    renderDistanceRevision: cache.snapshot().renderDistanceRevision,
+    featureDamageRevision: cache.snapshot().featureDamageRevision,
+    ownerRevision: cache.snapshot().ownerRevision,
+  }, {
+    generationEpoch: 4,
+    renderDistanceRevision: 5,
+    featureDamageRevision: 6,
+    ownerRevision: 8,
+  });
   assert.equal(isSettlementStreamingSnapshotCurrent(observation, {
-    presentationRevision: 1,
+    generationEpoch: 1,
     renderDistanceRevision: 0,
-    stateRevision: 1,
+    featureDamageRevision: 1,
   }), true);
   assert.equal(isSettlementStreamingSnapshotCurrent(observation, {
-    presentationRevision: 1,
+    generationEpoch: 1,
     renderDistanceRevision: 1,
-    stateRevision: 1,
+    featureDamageRevision: 1,
   }), false, 'next revision cannot publish the prior snapshot');
+  assert.equal(isSettlementStreamingSnapshotCurrent(observation, {
+    generationEpoch: 1,
+    renderDistanceRevision: 0,
+    featureDamageRevision: 1,
+    ownerRevision: 1,
+  }), false, 'canonical owner publication changes cannot reuse an old snapshot');
 });
 
 test('Building and Settlement policy plans retain one shared immutable snapshot identity', () => {

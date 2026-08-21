@@ -10,6 +10,9 @@ import {
   W5_SETTLEMENT_DISTRIBUTION,
 } from './settlement-distributor.js';
 import { createLegacyMigratedSettlementTemplate } from './legacy-migrated-settlement-adapter.js';
+import {
+  acquireW8SettlementBuildingGenerationCheckpoint,
+} from './w8-settlement-building-visual-policy.js';
 import { ROAD_GRAPH_V1_GENERATOR_ID } from './road-graph-v1.js';
 import { createRoadGraphV1SettlementTemplate } from './road-graph-v1-settlement-adapter.js';
 import { ROAD_GRAPH_V2_GENERATOR_ID } from './road-graph-v2.js';
@@ -31,6 +34,23 @@ const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
   return Object.is(rounded, -0) ? 0 : rounded;
 };
+
+function createGenerationControl(checkpoint = null, cooperativeCheckpoint = null) {
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('generation checkpoint must be a function when provided');
+  }
+  if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+    throw new TypeError('cooperative generation checkpoint must be a function when provided');
+  }
+  return checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
+}
+
+async function reachGenerationCheckpoint(control) {
+  if (!control) return;
+  if (control.cooperativeCheckpoint) await control.cooperativeCheckpoint();
+  else control.checkpoint?.();
+}
 
 function chunkBounds(chunkX, chunkZ) {
   return {
@@ -319,7 +339,30 @@ export async function createDistributedSettlementChunkGenerator({
   let templateCacheHits = 0;
   let templateCacheMisses = 0;
 
-  async function getTemplate(candidate, roadTimingRun = null) {
+  const createLegacyTemplateAtCheckpoints = async ({
+    candidate,
+    roadTimingRun,
+    generationControl,
+  }) => {
+    await reachGenerationCheckpoint(generationControl);
+    const unregisterBuildingCheckpoint = await acquireW8SettlementBuildingGenerationCheckpoint({
+      townId: candidate.settlementId,
+      checkpoint: generationControl?.checkpoint ?? null,
+    });
+    let template;
+    try {
+      generationControl?.checkpoint?.({
+        site: `cooperative-migrated-settlement-lease:${candidate.settlementId}`,
+      });
+      template = await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
+    } finally {
+      unregisterBuildingCheckpoint?.();
+    }
+    await reachGenerationCheckpoint(generationControl);
+    return template;
+  };
+
+  async function getTemplate(candidate, roadTimingRun = null, generationControl = null) {
     if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
     const canonical = snapshotSettlementTemplateCandidate(candidate);
     candidate = canonical.candidate;
@@ -358,15 +401,19 @@ export async function createDistributedSettlementChunkGenerator({
     roadTimingRun?.recordCacheMiss();
     const promise = (async () => {
       const startedAt = globalThis.performance?.now?.() ?? Date.now();
+      const connectivityGraph = await distributor.buildConnectivityGraphNear(
+        candidate.center.x,
+        candidate.center.z,
+        candidate.radiusMeters,
+        generationControl,
+      );
+      await reachGenerationCheckpoint(generationControl);
       const roadGraphTemplateOptions = {
         worldSeedHash: formalGenerator.worldSeedHash,
         candidate,
-        connectivityGraph: await distributor.buildConnectivityGraphNear(
-          candidate.center.x,
-          candidate.center.z,
-          candidate.radiusMeters,
-        ),
+        connectivityGraph,
         roadTimingRun,
+        ...(generationControl ?? {}),
         ...(settlementLotMode ? { settlementLotMode } : {}),
       };
       const template = useRoadGraphV3
@@ -375,7 +422,12 @@ export async function createDistributedSettlementChunkGenerator({
           ? await createRoadGraphV2SettlementTemplate(roadGraphTemplateOptions)
         : useRoadGraphV1
           ? await createRoadGraphV1SettlementTemplate(roadGraphTemplateOptions)
-          : await createLegacyMigratedSettlementTemplate({ candidate, roadTimingRun });
+          : await createLegacyTemplateAtCheckpoints({
+            candidate,
+            roadTimingRun,
+            generationControl,
+          });
+      await reachGenerationCheckpoint(generationControl);
       if (isShutdown) return template;
       templateGenerationMs += (globalThis.performance?.now?.() ?? Date.now()) - startedAt;
       templatesMaterialized += 1;
@@ -405,15 +457,28 @@ export async function createDistributedSettlementChunkGenerator({
     reviewSpawn: Object.freeze({ ...reviewSettlement.center, settlementId: reviewSettlement.settlementId }),
     ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
     ...(settlementLotMode ? { settlementLotMode } : {}),
-    async resolveSettlementTemplate({ candidate, roadTimingRun = null } = {}) {
+    async resolveSettlementTemplate({
+      candidate,
+      roadTimingRun = null,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
+    } = {}) {
       if (!candidate?.settlementId) throw new TypeError('Settlement candidate is required');
-      return getTemplate(candidate, roadTimingRun);
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
+      return getTemplate(candidate, roadTimingRun, generationControl);
     },
-    async generateChunk(chunkX, chunkZ, { stageRecorder = null } = {}) {
+    async generateChunk(chunkX, chunkZ, {
+      stageRecorder = null,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
+    } = {}) {
       if (isShutdown) throw new Error('Distributed Settlement Chunk generator is shut down');
-      const formal = stageRecorder
-        ? await formalGenerator.generateChunk(chunkX, chunkZ, { stageRecorder })
-        : await formalGenerator.generateChunk(chunkX, chunkZ);
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
+      const formal = await formalGenerator.generateChunk(chunkX, chunkZ, {
+        ...(stageRecorder ? { stageRecorder } : {}),
+        ...(generationControl ?? {}),
+      });
+      await reachGenerationCheckpoint(generationControl);
       const settlementToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.SETTLEMENT);
       const bounds = chunkBounds(formal.chunkX, formal.chunkZ);
       const chunkCenter = {
@@ -424,12 +489,16 @@ export async function createDistributedSettlementChunkGenerator({
         chunkCenter.x,
         chunkCenter.z,
         Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS / 2,
+        generationControl,
       );
       const candidateInfluence = { CITY: 204, TOWN: 95, RURAL: 88 };
       const intersectingCandidates = candidates.filter(candidate => (
         rectangleDistance(candidate.center, bounds) <= candidateInfluence[candidate.settlementType]
       ));
-      const templates = await Promise.all(intersectingCandidates.map(candidate => getTemplate(candidate)));
+      const templates = await Promise.all(intersectingCandidates.map(candidate => (
+        getTemplate(candidate, null, generationControl)
+      )));
+      await reachGenerationCheckpoint(generationControl);
       const projections = templates.map(template => projectMigratedSettlementTemplate(template, formal));
       const settlementReferences = projections.flatMap(projection => projection.references)
         .sort((a, b) => a.stableId.localeCompare(b.stableId));
@@ -478,10 +547,17 @@ export async function createDistributedSettlementChunkGenerator({
       const contentHash = stageRecorder
         ? await hashW5ChunkContent(content, { stageRecorder })
         : await hashW5ChunkContent(content);
+      await reachGenerationCheckpoint(generationControl);
       const chunkData = { ...content, contentHash };
       const validation = validateW5DistributedChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W5 ChunkData: ${validation.errors.join('; ')}`);
       return chunkData;
+    },
+    async settleCancelledGeneration() {
+      while (pendingTemplates.size > 0) {
+        const pending = [...pendingTemplates.values()].map(entry => entry.promise);
+        await Promise.allSettled(pending);
+      }
     },
     async shutdown() {
       if (isShutdown) return;

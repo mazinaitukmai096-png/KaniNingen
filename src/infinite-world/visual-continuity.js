@@ -24,7 +24,10 @@ export const VISUAL_PIPELINE_STAGE = Object.freeze({
 
 const FRAME_TOKEN = Symbol('render-frame-token');
 const FRAME_RECEIPT = Symbol('render-frame-receipt');
-const FRAME_SCENE = Symbol('render-frame-scene');
+const FRAME_EVIDENCE = Symbol('render-frame-evidence-registry');
+const FRAME_EVIDENCE_SEQUENCE = Symbol('render-frame-evidence-sequence');
+const GPU_FRAME_EVIDENCE = Symbol('gpu-frame-evidence');
+const GPU_FRAME_EVIDENCE_SEQUENCE = Symbol('gpu-frame-evidence-sequence');
 const PIPELINE_TIME_FIELD = Object.freeze({
   [VISUAL_PIPELINE_STAGE.REQUEST]: 'requestAt',
   [VISUAL_PIPELINE_STAGE.WORKER_START]: 'workerStartAt',
@@ -88,13 +91,135 @@ function visitSceneObject(root, visitor) {
   for (const child of root.children ?? []) visitSceneObject(child, visitor);
 }
 
+function visitDrawableAttributes(mesh, visitor) {
+  const attributes = mesh?.geometry?.attributes ?? null;
+  if (attributes) {
+    for (const name in attributes) {
+      if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
+      const attribute = attributes[name];
+      if (attribute) visitor(attribute);
+    }
+  }
+  if (mesh?.geometry?.index) visitor(mesh.geometry.index);
+  if (mesh?.instanceMatrix) visitor(mesh.instanceMatrix);
+  if (mesh?.instanceColor) visitor(mesh.instanceColor);
+}
+
 function drawableAttributes(mesh) {
-  return Object.freeze([
-    ...Object.values(mesh?.geometry?.attributes ?? {}),
-    ...(mesh?.geometry?.index ? [mesh.geometry.index] : []),
-    ...(mesh?.instanceMatrix ? [mesh.instanceMatrix] : []),
-    ...(mesh?.instanceColor ? [mesh.instanceColor] : []),
-  ].filter(Boolean));
+  const attributes = [];
+  visitDrawableAttributes(mesh, attribute => attributes.push(attribute));
+  return Object.freeze(attributes);
+}
+
+function drawableOwnsAttribute(mesh, target) {
+  const attributes = mesh?.geometry?.attributes ?? null;
+  if (attributes) {
+    for (const name in attributes) {
+      if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
+      if (attributes[name] === target) return true;
+    }
+  }
+  return mesh?.geometry?.index === target
+    || mesh?.instanceMatrix === target
+    || mesh?.instanceColor === target;
+}
+
+function createCompletedFrameEvidenceRegistry() {
+  const objectSceneFrame = new WeakMap();
+  const objectAttributeFrames = new WeakMap();
+  const drawableCounts = new WeakMap();
+  const attributeResidency = new WeakMap();
+  let objectRegistrationCount = 0;
+  let relationRegistryAllocationCount = 0;
+  let relationRegistrationCount = 0;
+  let drawableRecordAllocationCount = 0;
+  let residencyRecordAllocationCount = 0;
+
+  const markSceneObject = (object, frameSequence) => {
+    if (!objectSceneFrame.has(object)) objectRegistrationCount += 1;
+    objectSceneFrame.set(object, frameSequence);
+  };
+  const markDrawableCount = (object, frameSequence, count) => {
+    let record = drawableCounts.get(object);
+    if (!record) {
+      record = { frameSequence, count };
+      drawableCounts.set(object, record);
+      drawableRecordAllocationCount += 1;
+      return;
+    }
+    record.frameSequence = frameSequence;
+    record.count = count;
+  };
+  const markObjectAttribute = (object, attribute, frameSequence) => {
+    let relations = objectAttributeFrames.get(object);
+    if (!relations) {
+      relations = new WeakMap();
+      objectAttributeFrames.set(object, relations);
+      relationRegistryAllocationCount += 1;
+    }
+    if (!relations.has(attribute)) relationRegistrationCount += 1;
+    relations.set(attribute, frameSequence);
+  };
+  const markAttributeResidency = (
+    attribute,
+    frameSequence,
+    version,
+    gpuResident,
+  ) => {
+    let record = attributeResidency.get(attribute);
+    if (!record) {
+      record = { frameSequence, version, gpuResident };
+      attributeResidency.set(attribute, record);
+      residencyRecordAllocationCount += 1;
+      return;
+    }
+    record.frameSequence = frameSequence;
+    record.version = version;
+    record.gpuResident = gpuResident;
+  };
+
+  return Object.freeze({
+    objectSceneFrame,
+    objectAttributeFrames,
+    drawableCounts,
+    attributeResidency,
+    markSceneObject,
+    markDrawableCount,
+    markObjectAttribute,
+    markAttributeResidency,
+    snapshot: () => Object.freeze({
+      objectRegistrationCount,
+      relationRegistryAllocationCount,
+      relationRegistrationCount,
+      drawableRecordAllocationCount,
+      residencyRecordAllocationCount,
+    }),
+  });
+}
+
+function captureCompletedFrameEvidence(scene, gpuMirror, registry, frameSequence) {
+  visitSceneObject(scene, object => {
+    registry.markSceneObject(object, frameSequence);
+    const attributes = drawableAttributes(object);
+    if (attributes.length === 0) return;
+    registry.markDrawableCount(object, frameSequence, attributes.length);
+    for (const attribute of attributes) {
+      registry.markObjectAttribute(object, attribute, frameSequence);
+      const version = attributeVersion(attribute);
+      const residentVersion = typeof gpuMirror?.residentVersion === 'function'
+        ? gpuMirror.residentVersion(attribute) : null;
+      registry.markAttributeResidency(
+        attribute,
+        frameSequence,
+        version,
+        gpuMirror === null
+          || (residentVersion !== null
+            ? residentVersion === version
+            : gpuMirror.matches(attribute) === true),
+      );
+    }
+  });
+  return registry;
 }
 
 function rendererAttributeRecord(renderer, attribute) {
@@ -577,6 +702,11 @@ export function createGpuAttributeMirror() {
     uploadFrame,
     uploadAttribute,
     matches,
+    residentVersion: attribute => {
+      const target = mirrored.get(attribute);
+      return Number.isSafeInteger(target?.version) && target.version >= 0
+        ? target.version : null;
+    },
     read: attribute => {
       const target = mirrored.get(attribute);
       return target ? Object.freeze(Array.from(target.values)) : null;
@@ -598,10 +728,14 @@ export function createGpuAttributeMirror() {
  */
 export function createRendererGpuAttributeMirror() {
   const mirrored = new WeakMap();
+  const evidenceRegistry = createCompletedFrameEvidenceRegistry();
   let pendingFrame = null;
   let frameCount = 0;
   let attributeUploadCount = 0;
   let componentUploadCount = 0;
+  let evidenceTraversalCount = 0;
+  let completedEvidenceCount = 0;
+  let evidenceFrameSequence = 0;
 
   const activeAttributeLength = (object, attribute, sourceLength) => {
     const count = Number.isSafeInteger(object?.count) && object.count >= 0
@@ -620,23 +754,53 @@ export function createRendererGpuAttributeMirror() {
 
   const captureFrame = ({ scene = null, frameSequence = null } = {}) => {
     if (pendingFrame) throw new Error('a renderer GPU mirror frame is already pending');
+    if (evidenceFrameSequence >= Number.MAX_SAFE_INTEGER) {
+      throw new RangeError('renderer GPU evidence frame sequence exhausted');
+    }
+    const currentEvidenceFrameSequence = ++evidenceFrameSequence;
     const captures = [];
     const observed = new Map();
+    let evidenceObjectCount = 0;
+    let evidenceDrawableCount = 0;
+    evidenceTraversalCount += 1;
     visitSceneObject(scene, object => {
-      for (const attribute of drawableAttributes(object)) {
+      evidenceRegistry.markSceneObject(object, currentEvidenceFrameSequence);
+      evidenceObjectCount += 1;
+      let drawableAttributeCount = 0;
+      visitDrawableAttributes(object, attribute => {
+        drawableAttributeCount += 1;
+        evidenceRegistry.markObjectAttribute(
+          object,
+          attribute,
+          currentEvidenceFrameSequence,
+        );
         const source = attributeArray(attribute);
-        if (!source) continue;
-        const activeLength = activeAttributeLength(object, attribute, source.length);
+        const activeLength = source
+          ? activeAttributeLength(object, attribute, source.length) : 0;
         const previous = observed.get(attribute);
         if (previous) {
           previous.activeLength = Math.max(previous.activeLength, activeLength);
-          continue;
+          return;
         }
-        observed.set(attribute, { source, activeLength });
+        observed.set(attribute, {
+          source,
+          activeLength,
+        });
+      });
+      if (drawableAttributeCount > 0) {
+        evidenceRegistry.markDrawableCount(
+          object,
+          currentEvidenceFrameSequence,
+          drawableAttributeCount,
+        );
+        evidenceDrawableCount += 1;
       }
     });
+    let visitedAttributeCount = 0;
     for (const [attribute, observation] of observed) {
         const { source, activeLength } = observation;
+        if (!source) continue;
+        visitedAttributeCount += 1;
         const version = attributeVersion(attribute);
         const target = mirrored.get(attribute);
         const initial = !target || target.values.length !== source.length;
@@ -669,15 +833,17 @@ export function createRendererGpuAttributeMirror() {
     }
     pendingFrame = Object.freeze({
       frameSequence,
+      evidenceFrameSequence: currentEvidenceFrameSequence,
       captures: Object.freeze(captures),
-      activeLengths: Object.freeze([...observed].map(([attribute, value]) => (
-        Object.freeze({ attribute, activeLength: value.activeLength })
-      ))),
+      observed,
+      evidenceObjectCount,
+      evidenceDrawableCount,
     });
     return Object.freeze({
       frameSequence,
-      visitedAttributeCount: observed.size,
+      visitedAttributeCount,
       capturedAttributeCount: captures.length,
+      evidenceTraversalCount,
     });
   };
 
@@ -727,7 +893,7 @@ export function createRendererGpuAttributeMirror() {
       committedAttributeCount += 1;
       attributeUploadCount += 1;
     }
-    for (const { attribute, activeLength } of pendingFrame.activeLengths) {
+    for (const [attribute, { activeLength }] of pendingFrame.observed) {
       const target = mirrored.get(attribute);
       if (!target) continue;
       const uploadedVersion = rendererAttributeVersion(renderer, attribute);
@@ -741,13 +907,34 @@ export function createRendererGpuAttributeMirror() {
         target.matchedAtFrame = -1;
       }
     }
+    let attributeProofCount = 0;
+    for (const [attribute] of pendingFrame.observed) {
+      const version = attributeVersion(attribute);
+      const target = mirrored.get(attribute);
+      evidenceRegistry.markAttributeResidency(
+        attribute,
+        pendingFrame.evidenceFrameSequence,
+        version,
+        target?.version === version,
+      );
+      attributeProofCount += 1;
+    }
     const capturedAttributeCount = pendingFrame.captures.length;
+    const completedEvidenceFrameSequence = pendingFrame.evidenceFrameSequence;
+    const evidenceObjectCount = pendingFrame.evidenceObjectCount;
+    const evidenceDrawableCount = pendingFrame.evidenceDrawableCount;
     pendingFrame = null;
+    completedEvidenceCount += 1;
     return Object.freeze({
       frameCount,
       capturedAttributeCount,
       committedAttributeCount,
       rejectedAttributeCount,
+      evidenceObjectCount,
+      evidenceDrawableCount,
+      attributeProofCount,
+      [GPU_FRAME_EVIDENCE]: evidenceRegistry,
+      [GPU_FRAME_EVIDENCE_SEQUENCE]: completedEvidenceFrameSequence,
     });
   };
 
@@ -755,6 +942,45 @@ export function createRendererGpuAttributeMirror() {
     if (!pendingFrame) return false;
     for (const capture of pendingFrame.captures) capture.restoreUploadProbe?.();
     pendingFrame = null;
+    return true;
+  };
+
+  // Private upload staging uses the same WebGLRenderer outside the ordinary
+  // world-frame capture. Three r160 keeps WebGLAttributes private, so a later
+  // world frame may correctly skip onUploadCallback for an already-resident
+  // attribute while the mirror would otherwise remain permanently unaware of
+  // that upload. Only the upload stager calls this after an actual renderer
+  // onUpload callback for the exact attribute version.
+  const recordExternalUpload = ({ object = null, attribute = null, version = null } = {}) => {
+    const source = attributeArray(attribute);
+    if (!source) throw new TypeError('external renderer upload requires an attribute array');
+    const currentVersion = attributeVersion(attribute);
+    if (version !== null && version !== currentVersion) {
+      throw new Error('external renderer upload version changed before mirror commit');
+    }
+    const activeLength = activeAttributeLength(object, attribute, source.length);
+    let target = mirrored.get(attribute);
+    if (!target || target.values.length !== source.length
+      || target.values.constructor !== source.constructor) {
+      target = {
+        values: new source.constructor(source.length),
+        version: -1,
+        uploadedAtFrame: 0,
+        activeLength: 0,
+        matchedAtFrame: -1,
+        matchResult: false,
+      };
+    }
+    if (typeof target.values.set === 'function') target.values.set(source);
+    else {
+      for (let index = 0; index < source.length; index += 1) target.values[index] = source[index];
+    }
+    target.version = currentVersion;
+    target.uploadedAtFrame = frameCount;
+    target.activeLength = activeLength;
+    target.matchedAtFrame = -1;
+    target.matchResult = false;
+    mirrored.set(attribute, target);
     return true;
   };
 
@@ -787,7 +1013,13 @@ export function createRendererGpuAttributeMirror() {
     captureFrame,
     completeFrame,
     abortFrame,
+    recordExternalUpload,
     matches,
+    residentVersion: attribute => {
+      const target = mirrored.get(attribute);
+      return Number.isSafeInteger(target?.version) && target.version >= 0
+        ? target.version : null;
+    },
     read: attribute => {
       const target = mirrored.get(attribute);
       return target?.values ?? null;
@@ -798,6 +1030,9 @@ export function createRendererGpuAttributeMirror() {
       pending: pendingFrame !== null,
       attributeUploadCount,
       componentUploadCount,
+      evidenceTraversalCount,
+      completedEvidenceCount,
+      evidenceRegistry: evidenceRegistry.snapshot(),
     }),
   });
 }
@@ -820,6 +1055,11 @@ export function createRenderFrameAcknowledger({
   let sequence = 0;
   let active = null;
   let completedFrameCount = 0;
+  let stagedEvidenceCaptureCount = 0;
+  let fallbackEvidenceCaptureCount = 0;
+  const fallbackEvidenceRegistry = stagedGpuMirror
+    ? null : createCompletedFrameEvidenceRegistry();
+  let fallbackEvidenceFrameSequence = 0;
 
   const beginFrame = ({ frameSequence = ++sequence, scene = null } = {}) => {
     if (!Number.isSafeInteger(frameSequence) || frameSequence < 1) {
@@ -851,6 +1091,32 @@ export function createRenderFrameAcknowledger({
     const gpuFrame = stagedGpuMirror
       ? gpuMirror.completeFrame({ scene, renderer, frameSequence: token.frameSequence })
       : gpuMirror?.uploadFrame({ scene, renderer, frameSequence: token.frameSequence }) ?? null;
+    // Do not retain the mutable Scene as receipt evidence. Persistent weak
+    // registries stamp exact membership, relationship, and residency with an
+    // internal monotonic sequence. A later frame may conservatively invalidate
+    // an older receipt, but can never backfill it with a post-receipt object.
+    if (!stagedGpuMirror && fallbackEvidenceFrameSequence >= Number.MAX_SAFE_INTEGER) {
+      active = null;
+      throw new RangeError('fallback GPU evidence frame sequence exhausted');
+    }
+    const frameEvidence = stagedGpuMirror
+      ? gpuFrame?.[GPU_FRAME_EVIDENCE] ?? null
+      : captureCompletedFrameEvidence(
+        scene,
+        gpuMirror,
+        fallbackEvidenceRegistry,
+        ++fallbackEvidenceFrameSequence,
+      );
+    const frameEvidenceSequence = stagedGpuMirror
+      ? gpuFrame?.[GPU_FRAME_EVIDENCE_SEQUENCE] ?? null
+      : fallbackEvidenceFrameSequence;
+    if (!frameEvidence || !Number.isSafeInteger(frameEvidenceSequence)
+      || frameEvidenceSequence < 1) {
+      active = null;
+      throw new Error('staged GPU mirror did not return completed-frame evidence');
+    }
+    if (stagedGpuMirror) stagedEvidenceCaptureCount += 1;
+    else fallbackEvidenceCaptureCount += 1;
     active = null;
     completedFrameCount += 1;
     return Object.freeze({
@@ -860,7 +1126,8 @@ export function createRenderFrameAcknowledger({
       startedAtMs: token.startedAtMs,
       completedAtMs,
       rendererFrameCompleted: true,
-      [FRAME_SCENE]: scene,
+      [FRAME_EVIDENCE]: frameEvidence,
+      [FRAME_EVIDENCE_SEQUENCE]: frameEvidenceSequence,
       gpuMirror,
       gpuFrame,
     });
@@ -881,6 +1148,8 @@ export function createRenderFrameAcknowledger({
       active: active !== null,
       completedFrameCount,
       lastSequence: sequence,
+      stagedEvidenceCaptureCount,
+      fallbackEvidenceCaptureCount,
     }),
   });
 }
@@ -893,12 +1162,50 @@ export function isCompletedRenderFrameReceipt(value) {
 }
 
 function objectBelongsToCompletedFrame(object, receipt) {
-  const scene = receipt?.[FRAME_SCENE] ?? null;
-  if (!scene) return false;
-  for (let current = object; current; current = current.parent) {
-    if (current === scene) return true;
-  }
-  return false;
+  const registry = receipt?.[FRAME_EVIDENCE] ?? null;
+  const frameSequence = receipt?.[FRAME_EVIDENCE_SEQUENCE] ?? null;
+  return registry?.objectSceneFrame?.get(object) === frameSequence;
+}
+
+function objectAttributeProofInCompletedFrame(object, attribute, receipt) {
+  if (!objectBelongsToCompletedFrame(object, receipt) || !attribute) return null;
+  const registry = receipt?.[FRAME_EVIDENCE] ?? null;
+  const frameSequence = receipt?.[FRAME_EVIDENCE_SEQUENCE] ?? null;
+  const relationFrame = registry?.objectAttributeFrames
+    ?.get(object)?.get(attribute) ?? null;
+  if (relationFrame !== frameSequence) return null;
+  const residency = registry?.attributeResidency?.get(attribute) ?? null;
+  return residency?.frameSequence === frameSequence ? residency : null;
+}
+
+function objectAttributeResidentInCompletedFrame(object, attribute, receipt) {
+  const proof = objectAttributeProofInCompletedFrame(object, attribute, receipt);
+  if (!proof || proof.gpuResident !== true
+    || proof.version !== attributeVersion(attribute)) return false;
+  return !receipt.gpuMirror || receipt.gpuMirror.matches(attribute) === true;
+}
+
+// Publication admission needs proof that an owner belonged to the completed
+// renderer scene without conflating that proof with visibility. A culled or
+// behind-camera owner is safely published when its resources are resident;
+// visual replacement barriers still use isDrawableInCompletedFrame below.
+export function isObjectInCompletedFrameScene({ object, receipt } = {}) {
+  return isCompletedRenderFrameReceipt(receipt)
+    && objectBelongsToCompletedFrame(object, receipt);
+}
+
+// Upload admission proves the exact drawable/BufferAttribute relationship
+// captured at frame completion. Merely finding the attribute somewhere in the
+// owner's current subtree is insufficient because geometry can be attached or
+// replaced after an older receipt was issued.
+export function isObjectUploadTargetInCompletedFrame({
+  object,
+  attribute,
+  receipt,
+} = {}) {
+  return isCompletedRenderFrameReceipt(receipt)
+    && drawableOwnsAttribute(object, attribute)
+    && objectAttributeResidentInCompletedFrame(object, attribute, receipt);
 }
 
 function matrixElements(matrix) {
@@ -956,33 +1263,48 @@ function effectiveMaterialOpacity(material) {
   return Number.isFinite(material.opacity) ? material.opacity : 1;
 }
 
-function drawableAttributeMatchesReceipt(attribute, receipt) {
-  if (!attributeArray(attribute)) return false;
-  return !receipt.gpuMirror || receipt.gpuMirror.matches(attribute);
+function drawableAttributeMatchesReceipt(mesh, attribute, receipt) {
+  return Boolean(attributeArray(attribute))
+    && objectAttributeResidentInCompletedFrame(mesh, attribute, receipt);
 }
 
 function drawableAttributesMatchReceipt(mesh, receipt, requiredAttributes = null) {
   if (requiredAttributes !== null) {
     for (const attribute of requiredAttributes) {
-      if (!drawableAttributeMatchesReceipt(attribute, receipt)) return false;
+      if (!drawableOwnsAttribute(mesh, attribute)
+        || !drawableAttributeMatchesReceipt(mesh, attribute, receipt)) return false;
     }
     return true;
   }
+  const registry = receipt?.[FRAME_EVIDENCE] ?? null;
+  const frameSequence = receipt?.[FRAME_EVIDENCE_SEQUENCE] ?? null;
+  const completedCountRecord = registry?.drawableCounts?.get(mesh) ?? null;
+  const completedAttributeCount = completedCountRecord?.frameSequence === frameSequence
+    ? completedCountRecord.count : 0;
+  let currentAttributeCount = 0;
   const attributes = mesh?.geometry?.attributes ?? null;
   if (attributes) {
     for (const name in attributes) {
       if (!Object.prototype.hasOwnProperty.call(attributes, name)) continue;
       const attribute = attributes[name];
-      if (attribute && !drawableAttributeMatchesReceipt(attribute, receipt)) return false;
+      if (!attribute) continue;
+      currentAttributeCount += 1;
+      if (!drawableAttributeMatchesReceipt(mesh, attribute, receipt)) return false;
     }
   }
-  if (mesh?.geometry?.index
-    && !drawableAttributeMatchesReceipt(mesh.geometry.index, receipt)) return false;
-  if (mesh?.instanceMatrix
-    && !drawableAttributeMatchesReceipt(mesh.instanceMatrix, receipt)) return false;
-  if (mesh?.instanceColor
-    && !drawableAttributeMatchesReceipt(mesh.instanceColor, receipt)) return false;
-  return true;
+  if (mesh?.geometry?.index) {
+    currentAttributeCount += 1;
+    if (!drawableAttributeMatchesReceipt(mesh, mesh.geometry.index, receipt)) return false;
+  }
+  if (mesh?.instanceMatrix) {
+    currentAttributeCount += 1;
+    if (!drawableAttributeMatchesReceipt(mesh, mesh.instanceMatrix, receipt)) return false;
+  }
+  if (mesh?.instanceColor) {
+    currentAttributeCount += 1;
+    if (!drawableAttributeMatchesReceipt(mesh, mesh.instanceColor, receipt)) return false;
+  }
+  return completedAttributeCount === currentAttributeCount;
 }
 
 function drawableInCompletedFrame(

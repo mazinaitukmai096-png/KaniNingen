@@ -6,9 +6,25 @@ const DEFAULT_EVENT_LIMIT = 2_048;
 const DEFAULT_CONTEXT_RADIUS = 5;
 const HITCH_THRESHOLDS_MS = Object.freeze([33, 50, 100]);
 
+export const BROWSER_FRAME_DIAGNOSTIC_MODE = Object.freeze({
+  OFF: 'off',
+  LIGHT: 'light',
+  DEEP_ATTRIBUTION: 'deep-attribution',
+});
+
+function resolveDiagnosticMode(mode, enabled) {
+  const resolved = mode ?? (enabled === true
+    ? BROWSER_FRAME_DIAGNOSTIC_MODE.LIGHT : BROWSER_FRAME_DIAGNOSTIC_MODE.OFF);
+  if (!Object.values(BROWSER_FRAME_DIAGNOSTIC_MODE).includes(resolved)) {
+    throw new RangeError('Browser frame diagnostic mode must be off, light, or deep-attribution');
+  }
+  return resolved;
+}
+
 const EMPTY_SNAPSHOT = Object.freeze({
   schemaVersion: 'w8-browser-frame-attribution-1',
   enabled: false,
+  mode: BROWSER_FRAME_DIAGNOSTIC_MODE.OFF,
   measurementSource: 'disabled',
   frameWindowCapacity: DEFAULT_FRAME_LIMIT,
   frame: Object.freeze({ count: 0, p50: 0, p95: 0, max: 0 }),
@@ -55,6 +71,7 @@ const EMPTY_SNAPSHOT = Object.freeze({
 const noop = () => null;
 const DISABLED_COLLECTOR = Object.freeze({
   enabled: false,
+  mode: BROWSER_FRAME_DIAGNOSTIC_MODE.OFF,
   startFrame: noop,
   recordStage: noop,
   recordWork: noop,
@@ -67,8 +84,9 @@ const DISABLED_COLLECTOR = Object.freeze({
 });
 
 function percentile(values, fraction) {
-  if (!values.length) return 0;
-  const ordered = [...values].sort((left, right) => left - right);
+  const samples = typeof values?.toArray === 'function' ? values.toArray() : values;
+  if (!samples.length) return 0;
+  const ordered = [...samples].sort((left, right) => left - right);
   return ordered[Math.max(0, Math.min(
     ordered.length - 1,
     Math.ceil(ordered.length * fraction) - 1,
@@ -76,17 +94,92 @@ function percentile(values, fraction) {
 }
 
 function summarize(values) {
+  const samples = typeof values?.toArray === 'function' ? values.toArray() : values;
   return Object.freeze({
-    count: values.length,
-    p50: percentile(values, 0.5),
-    p95: percentile(values, 0.95),
-    max: values.length ? Math.max(...values) : 0,
+    count: samples.length,
+    p50: percentile(samples, 0.5),
+    p95: percentile(samples, 0.95),
+    max: samples.length ? Math.max(...samples) : 0,
   });
 }
 
-function pushBounded(target, value, limit) {
-  target.push(value);
-  if (target.length > limit) target.splice(0, target.length - limit);
+function createCircularBuffer(capacity) {
+  const storage = new Array(capacity);
+  let start = 0;
+  let size = 0;
+  return Object.freeze({
+    get length() { return size; },
+    get full() { return size === capacity; },
+    first() {
+      return size > 0 ? storage[start] : undefined;
+    },
+    push(value) {
+      const index = (start + size) % capacity;
+      if (size < capacity) size += 1;
+      else start = (start + 1) % capacity;
+      storage[index] = value;
+      return value;
+    },
+    toArray() {
+      return Array.from(
+        { length: size },
+        (_, index) => storage[(start + index) % capacity],
+      );
+    },
+    last(count) {
+      const resultLength = Math.min(size, Math.max(0, count));
+      const offset = size - resultLength;
+      return Array.from(
+        { length: resultLength },
+        (_, index) => storage[(start + offset + index) % capacity],
+      );
+    },
+    clear() {
+      storage.fill(undefined);
+      start = 0;
+      size = 0;
+    },
+  });
+}
+
+function createNumericCircularBuffer(capacity) {
+  const storage = new Float64Array(capacity);
+  let start = 0;
+  let size = 0;
+  let total = 0;
+  let latest = 0;
+  return Object.freeze({
+    get length() { return size; },
+    get sum() { return total; },
+    get latest() { return size > 0 ? latest : 0; },
+    push(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return false;
+      const index = (start + size) % capacity;
+      if (size < capacity) size += 1;
+      else {
+        total -= storage[index];
+        start = (start + 1) % capacity;
+      }
+      storage[index] = numeric;
+      total += numeric;
+      latest = numeric;
+      return true;
+    },
+    toArray() {
+      return Array.from(
+        { length: size },
+        (_, index) => storage[(start + index) % capacity],
+      );
+    },
+    clear() {
+      storage.fill(0);
+      start = 0;
+      size = 0;
+      total = 0;
+      latest = 0;
+    },
+  });
 }
 
 function freezeMetrics(metrics) {
@@ -706,6 +799,7 @@ function publicationTransitionTimeline(events) {
 
 export function createBrowserFrameDiagnostics({
   enabled = false,
+  mode = null,
   globalObject = globalThis,
   clock = () => globalObject.performance?.now?.() ?? Date.now(),
   environment = {},
@@ -713,7 +807,9 @@ export function createBrowserFrameDiagnostics({
   hitchLimit = DEFAULT_HITCH_LIMIT,
   contextRadius = DEFAULT_CONTEXT_RADIUS,
 } = {}) {
-  if (!enabled) return DISABLED_COLLECTOR;
+  const diagnosticMode = resolveDiagnosticMode(mode, enabled);
+  if (diagnosticMode === BROWSER_FRAME_DIAGNOSTIC_MODE.OFF) return DISABLED_COLLECTOR;
+  const detailed = diagnosticMode === BROWSER_FRAME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION;
   if (!Number.isSafeInteger(frameLimit) || frameLimit < 11) {
     throw new RangeError('Browser frame diagnostics frameLimit must be at least 11');
   }
@@ -725,10 +821,21 @@ export function createBrowserFrameDiagnostics({
   }
 
   const performanceObject = globalObject.performance ?? null;
-  const frames = [];
-  const hitchWindows = [];
+  const frames = createCircularBuffer(frameLimit);
+  const frameTotals = createNumericCircularBuffer(frameLimit);
+  const callbackDurations = createNumericCircularBuffer(frameLimit);
+  const lightOver33Flags = createNumericCircularBuffer(frameLimit);
+  const lightOver50Flags = createNumericCircularBuffer(frameLimit);
+  const lightOver100Flags = createNumericCircularBuffer(frameLimit);
+  const lightGpuWaitFlags = createNumericCircularBuffer(frameLimit);
+  const lightGpuWaitDurations = createNumericCircularBuffer(frameLimit);
+  const lightAllocationFlags = createNumericCircularBuffer(frameLimit);
+  const lightGarbageCollectionFlags = createNumericCircularBuffer(frameLimit);
+  const lightPositiveHeapDeltas = createNumericCircularBuffer(frameLimit);
+  const lightNegativeHeapDeltas = createNumericCircularBuffer(frameLimit);
+  const hitchWindows = createCircularBuffer(hitchLimit);
   const pendingHitchWindows = [];
-  const timeline = [];
+  const timeline = createCircularBuffer(DEFAULT_EVENT_LIMIT);
   const measurementSource = classifyMeasurementSource(environment);
   let currentFrame = null;
   let sequence = 0;
@@ -738,6 +845,48 @@ export function createBrowserFrameDiagnostics({
   let terrainBlockedFrameCount = 0;
   let terrainBlockedDurationMs = 0;
   let longestTerrainBlockedDurationMs = 0;
+  let over33Count = 0;
+  let over50Count = 0;
+  let over100Count = 0;
+  let gpuWaitCount = 0;
+  let allocationSpikeCount = 0;
+  let garbageCollectionCount = 0;
+  const lightFrameState = {
+    sequence: 0,
+    rafTimestampMs: 0,
+    callbackStartedAtMs: 0,
+    callbackEndedAtMs: null,
+    callbackDurationMs: 0,
+    frameTotalMs: 0,
+    heapStartBytes: null,
+    heapDeltaFromPreviousFrameBytes: null,
+    callbackHeapDeltaBytes: null,
+    allocationSpikeSuspected: false,
+    garbageCollectionSuspected: false,
+    terrainReadyGateBlocked: false,
+    visibilityHidden: false,
+    gpuOrCompositorWaitMs: 0,
+    gpuOrCompositorWaitSuspected: false,
+  };
+
+  const removeFrameCounters = frame => {
+    if (!frame) return;
+    if (frame.frameTotalMs > 33) over33Count -= 1;
+    if (frame.frameTotalMs > 50) over50Count -= 1;
+    if (frame.frameTotalMs > 100) over100Count -= 1;
+    if (frame.gpuOrCompositorWaitSuspected) gpuWaitCount -= 1;
+    if (frame.memory.allocationSpikeSuspected) allocationSpikeCount -= 1;
+    if (frame.memory.garbageCollectionSuspected) garbageCollectionCount -= 1;
+  };
+
+  const addFrameCounters = frame => {
+    if (frame.frameTotalMs > 33) over33Count += 1;
+    if (frame.frameTotalMs > 50) over50Count += 1;
+    if (frame.frameTotalMs > 100) over100Count += 1;
+    if (frame.gpuOrCompositorWaitSuspected) gpuWaitCount += 1;
+    if (frame.memory.allocationSpikeSuspected) allocationSpikeCount += 1;
+    if (frame.memory.garbageCollectionSuspected) garbageCollectionCount += 1;
+  };
 
   const recordEvent = (type, details = {}) => {
     const event = Object.freeze({
@@ -747,7 +896,7 @@ export function createBrowserFrameDiagnostics({
       frameSequence: currentFrame?.sequence ?? sequence,
       ...details,
     });
-    pushBounded(timeline, event, DEFAULT_EVENT_LIMIT);
+    timeline.push(event);
     return event;
   };
 
@@ -774,6 +923,22 @@ export function createBrowserFrameDiagnostics({
       0,
       endedAtMs - currentFrame.callbackStartedAtMs,
     );
+    if (!detailed) {
+      currentFrame.callbackHeapDeltaBytes = heapEndBytes !== null
+        && currentFrame.heapStartBytes !== null
+        ? heapEndBytes - currentFrame.heapStartBytes : null;
+      const largestPositiveDelta = Math.max(
+        currentFrame.callbackHeapDeltaBytes ?? 0,
+        currentFrame.heapDeltaFromPreviousFrameBytes ?? 0,
+      );
+      const largestNegativeDelta = Math.min(
+        currentFrame.callbackHeapDeltaBytes ?? 0,
+        currentFrame.heapDeltaFromPreviousFrameBytes ?? 0,
+      );
+      currentFrame.allocationSpikeSuspected = largestPositiveDelta >= 2 * 1024 * 1024;
+      currentFrame.garbageCollectionSuspected = largestNegativeDelta <= -2 * 1024 * 1024;
+      return currentFrame.sequence;
+    }
     currentFrame.renderer = rendererSnapshot(rendererInfo);
     currentFrame.memory.heapEndBytes = heapEndBytes;
     currentFrame.memory.callbackHeapDeltaBytes = heapEndBytes !== null
@@ -794,9 +959,28 @@ export function createBrowserFrameDiagnostics({
 
   return Object.freeze({
     enabled: true,
+    mode: diagnosticMode,
     startFrame(rafTimestampMs = clock()) {
       const heapBytes = readHeapBytes(performanceObject);
-      currentFrame = {
+      if (!detailed) {
+        lightFrameState.sequence = ++sequence;
+        lightFrameState.rafTimestampMs = rafTimestampMs;
+        lightFrameState.callbackStartedAtMs = clock();
+        lightFrameState.callbackEndedAtMs = null;
+        lightFrameState.callbackDurationMs = 0;
+        lightFrameState.frameTotalMs = 0;
+        lightFrameState.heapStartBytes = heapBytes;
+        lightFrameState.heapDeltaFromPreviousFrameBytes = heapBytes !== null
+          && previousHeapBytes !== null ? heapBytes - previousHeapBytes : null;
+        lightFrameState.callbackHeapDeltaBytes = null;
+        lightFrameState.allocationSpikeSuspected = false;
+        lightFrameState.garbageCollectionSuspected = false;
+        lightFrameState.terrainReadyGateBlocked = false;
+        lightFrameState.visibilityHidden = globalObject.document?.visibilityState === 'hidden';
+        lightFrameState.gpuOrCompositorWaitMs = 0;
+        lightFrameState.gpuOrCompositorWaitSuspected = false;
+        currentFrame = lightFrameState;
+      } else currentFrame = {
         sequence: ++sequence,
         rafTimestampMs,
         callbackStartedAtMs: clock(),
@@ -827,6 +1011,7 @@ export function createBrowserFrameDiagnostics({
     },
     recordStage(stage, durationMs, { async = false } = {}) {
       if (!currentFrame || !Number.isFinite(durationMs)) return null;
+      if (!detailed) return currentFrame.sequence;
       const target = async ? currentFrame.asyncStages : currentFrame.stages;
       target[stage] = (target[stage] ?? 0) + Math.max(0, durationMs);
       if (!async) currentFrame.stageCalls[stage] = (currentFrame.stageCalls[stage] ?? 0) + 1;
@@ -834,6 +1019,7 @@ export function createBrowserFrameDiagnostics({
     },
     recordWork(route, values = {}) {
       if (!currentFrame) return null;
+      if (!detailed) return currentFrame.sequence;
       const target = currentFrame.work[route] ??= {};
       for (const [metric, value] of Object.entries(values)) {
         if (Number.isFinite(value)) target[metric] = (target[metric] ?? 0) + value;
@@ -844,7 +1030,10 @@ export function createBrowserFrameDiagnostics({
     recordTerrainGate({ blocked, ownerKey = null } = {}) {
       if (!currentFrame) return null;
       if (blocked === true) {
-        if (currentFrame.terrainReadyGate?.blocked !== true) terrainBlockedFrameCount += 1;
+        const alreadyBlocked = detailed
+          ? currentFrame.terrainReadyGate?.blocked === true
+          : currentFrame.terrainReadyGateBlocked === true;
+        if (!alreadyBlocked) terrainBlockedFrameCount += 1;
         if (!activeTerrainGate) {
           activeTerrainGate = {
             ownerKey,
@@ -858,9 +1047,11 @@ export function createBrowserFrameDiagnostics({
           activeTerrainGate.blockedFrameCount += 1;
           activeTerrainGate.lastFrameSequence = currentFrame.sequence;
         }
-        currentFrame.terrainReadyGate = { blocked: true, ownerKey };
+        if (detailed) currentFrame.terrainReadyGate = { blocked: true, ownerKey };
+        else currentFrame.terrainReadyGateBlocked = true;
       } else {
-        currentFrame.terrainReadyGate = { blocked: false, ownerKey };
+        if (detailed) currentFrame.terrainReadyGate = { blocked: false, ownerKey };
+        else currentFrame.terrainReadyGateBlocked = false;
         closeTerrainGate(clock());
       }
       return currentFrame.sequence;
@@ -877,9 +1068,33 @@ export function createBrowserFrameDiagnostics({
       );
       currentFrame.gpuOrCompositorWaitSuspected = currentFrame.frameTotalMs > 33
         && currentFrame.callbackDurationMs < currentFrame.frameTotalMs * 0.5
-        && currentFrame.visibilityState !== 'hidden';
+        && (detailed ? currentFrame.visibilityState !== 'hidden' : !currentFrame.visibilityHidden);
       currentFrame.gpuOrCompositorWaitMs = currentFrame.gpuOrCompositorWaitSuspected
         ? unoccupiedIntervalMs : 0;
+      if (!detailed) {
+        frameTotals.push(currentFrame.frameTotalMs);
+        callbackDurations.push(currentFrame.callbackDurationMs);
+        lightOver33Flags.push(Number(currentFrame.frameTotalMs > 33));
+        lightOver50Flags.push(Number(currentFrame.frameTotalMs > 50));
+        lightOver100Flags.push(Number(currentFrame.frameTotalMs > 100));
+        lightGpuWaitFlags.push(Number(currentFrame.gpuOrCompositorWaitSuspected));
+        lightGpuWaitDurations.push(currentFrame.gpuOrCompositorWaitMs);
+        lightAllocationFlags.push(Number(currentFrame.allocationSpikeSuspected));
+        lightGarbageCollectionFlags.push(Number(currentFrame.garbageCollectionSuspected));
+        lightPositiveHeapDeltas.push(Math.max(
+          0,
+          currentFrame.heapDeltaFromPreviousFrameBytes ?? 0,
+          currentFrame.callbackHeapDeltaBytes ?? 0,
+        ));
+        lightNegativeHeapDeltas.push(Math.min(
+          0,
+          currentFrame.heapDeltaFromPreviousFrameBytes ?? 0,
+          currentFrame.callbackHeapDeltaBytes ?? 0,
+        ));
+        const completedSequence = currentFrame.sequence;
+        currentFrame = null;
+        return completedSequence;
+      }
       currentFrame.finishedAtMs = frameNow;
       const record = cloneFrame(currentFrame);
 
@@ -887,13 +1102,15 @@ export function createBrowserFrameDiagnostics({
         const pending = pendingHitchWindows[index];
         pending.after.push(record);
         if (pending.after.length >= contextRadius) {
-          pushBounded(hitchWindows, Object.freeze({
+          hitchWindows.push(Object.freeze({
             thresholdMs: pending.thresholdMs,
             hitch: pending.hitch,
             before: Object.freeze(pending.before),
             after: Object.freeze(pending.after),
-          }), hitchLimit);
-          pendingHitchWindows.splice(index, 1);
+          }));
+          const finalIndex = pendingHitchWindows.length - 1;
+          if (index !== finalIndex) pendingHitchWindows[index] = pendingHitchWindows[finalIndex];
+          pendingHitchWindows.pop();
         }
       }
 
@@ -902,19 +1119,34 @@ export function createBrowserFrameDiagnostics({
         pendingHitchWindows.push({
           thresholdMs,
           hitch: record,
-          before: frames.slice(-contextRadius),
+          before: frames.last(contextRadius),
           after: [],
         });
       }
-      pushBounded(frames, record, frameLimit);
+      if (frames.full) removeFrameCounters(frames.first());
+      frames.push(record);
+      frameTotals.push(record.frameTotalMs);
+      callbackDurations.push(record.callbackDurationMs);
+      addFrameCounters(record);
       currentFrame = null;
       return record;
     },
     reset() {
-      frames.length = 0;
-      hitchWindows.length = 0;
+      frames.clear();
+      frameTotals.clear();
+      callbackDurations.clear();
+      lightOver33Flags.clear();
+      lightOver50Flags.clear();
+      lightOver100Flags.clear();
+      lightGpuWaitFlags.clear();
+      lightGpuWaitDurations.clear();
+      lightAllocationFlags.clear();
+      lightGarbageCollectionFlags.clear();
+      lightPositiveHeapDeltas.clear();
+      lightNegativeHeapDeltas.clear();
+      hitchWindows.clear();
       pendingHitchWindows.length = 0;
-      timeline.length = 0;
+      timeline.clear();
       currentFrame = null;
       sequence = 0;
       eventSequence = 0;
@@ -923,81 +1155,94 @@ export function createBrowserFrameDiagnostics({
       terrainBlockedFrameCount = 0;
       terrainBlockedDurationMs = 0;
       longestTerrainBlockedDurationMs = 0;
+      over33Count = 0;
+      over50Count = 0;
+      over100Count = 0;
+      gpuWaitCount = 0;
+      allocationSpikeCount = 0;
+      garbageCollectionCount = 0;
     },
     snapshot() {
-      const frameTotals = frames.map(frame => frame.frameTotalMs);
-      const callbackDurations = frames.map(frame => frame.callbackDurationMs);
+      const frameRecords = frames.toArray();
+      const eventRecords = timeline.toArray();
       const activeGateDurationMs = activeTerrainGate
         ? Math.max(0, clock() - activeTerrainGate.startedAtMs) : 0;
       const allHitchWindows = [
-        ...hitchWindows,
+        ...hitchWindows.toArray(),
         ...pendingHitchWindows.map(pending => Object.freeze({
           thresholdMs: pending.thresholdMs,
           hitch: pending.hitch,
           before: Object.freeze([...pending.before]),
           after: Object.freeze([...pending.after]),
         })),
-      ].slice(-hitchLimit);
-      const heaviestFrames = [...frames]
+      ].sort((left, right) => (
+        left.hitch.sequence - right.hitch.sequence
+      )).slice(-hitchLimit);
+      const heaviestFrames = [...frameRecords]
         .sort((left, right) => right.frameTotalMs - left.frameTotalMs
           || left.sequence - right.sequence)
         .slice(0, 10);
-      const gpuWaitFrames = frames.filter(frame => frame.gpuOrCompositorWaitSuspected);
-      const allocationSpikeFrames = frames.filter(
-        frame => frame.memory.allocationSpikeSuspected,
-      );
-      const garbageCollectionFrames = frames.filter(
-        frame => frame.memory.garbageCollectionSuspected,
-      );
+      const gpuWaitFrames = frameRecords.filter(frame => frame.gpuOrCompositorWaitSuspected);
+      const numericFrameCount = frameTotals.length;
+      const lightGpuWaitValues = detailed ? null : lightGpuWaitDurations.toArray();
+      const lightPositiveHeapValues = detailed ? null : lightPositiveHeapDeltas.toArray();
+      const lightNegativeHeapValues = detailed ? null : lightNegativeHeapDeltas.toArray();
       return Object.freeze({
         schemaVersion: 'w8-browser-frame-attribution-1',
         enabled: true,
+        mode: diagnosticMode,
         measurementSource,
         frameWindowCapacity: frameLimit,
         environment: Object.freeze({ ...environment }),
         frame: summarize(frameTotals),
         callback: summarize(callbackDurations),
-        over33Ratio: frames.length
-          ? frames.filter(frame => frame.frameTotalMs > 33).length / frames.length : 0,
-        over50Ratio: frames.length
-          ? frames.filter(frame => frame.frameTotalMs > 50).length / frames.length : 0,
-        over100Ratio: frames.length
-          ? frames.filter(frame => frame.frameTotalMs > 100).length / frames.length : 0,
+        over33Ratio: numericFrameCount ? (detailed
+          ? over33Count : lightOver33Flags.sum) / numericFrameCount : 0,
+        over50Ratio: numericFrameCount ? (detailed
+          ? over50Count : lightOver50Flags.sum) / numericFrameCount : 0,
+        over100Ratio: numericFrameCount ? (detailed
+          ? over100Count : lightOver100Flags.sum) / numericFrameCount : 0,
         gpuOrCompositorWait: Object.freeze({
-          suspectedFrameCount: gpuWaitFrames.length,
-          suspectedFrameRatio: frames.length ? gpuWaitFrames.length / frames.length : 0,
-          maximumSuspectedWaitMs: gpuWaitFrames.length
-            ? Math.max(...gpuWaitFrames.map(frame => frame.gpuOrCompositorWaitMs)) : 0,
+          suspectedFrameCount: detailed ? gpuWaitCount : lightGpuWaitFlags.sum,
+          suspectedFrameRatio: numericFrameCount
+            ? (detailed ? gpuWaitCount : lightGpuWaitFlags.sum) / numericFrameCount : 0,
+          maximumSuspectedWaitMs: detailed
+            ? gpuWaitFrames.length
+              ? Math.max(...gpuWaitFrames.map(frame => frame.gpuOrCompositorWaitMs)) : 0
+            : lightGpuWaitValues.length ? Math.max(...lightGpuWaitValues) : 0,
           inferenceOnly: true,
         }),
         memorySignals: Object.freeze({
-          allocationSpikeFrameCount: allocationSpikeFrames.length,
-          garbageCollectionSuspectedFrameCount: garbageCollectionFrames.length,
-          maximumPositiveHeapDeltaBytes: frames.length ? Math.max(
+          allocationSpikeFrameCount: detailed ? allocationSpikeCount : lightAllocationFlags.sum,
+          garbageCollectionSuspectedFrameCount: detailed
+            ? garbageCollectionCount : lightGarbageCollectionFlags.sum,
+          maximumPositiveHeapDeltaBytes: detailed && frames.length ? Math.max(
             0,
-            ...frames.flatMap(frame => [
+            ...frameRecords.flatMap(frame => [
               frame.memory.heapDeltaFromPreviousFrameBytes ?? 0,
               frame.memory.callbackHeapDeltaBytes ?? 0,
             ]),
-          ) : 0,
-          maximumNegativeHeapDeltaBytes: frames.length ? Math.min(
+          ) : !detailed && lightPositiveHeapValues.length
+            ? Math.max(0, ...lightPositiveHeapValues) : 0,
+          maximumNegativeHeapDeltaBytes: detailed && frames.length ? Math.min(
             0,
-            ...frames.flatMap(frame => [
+            ...frameRecords.flatMap(frame => [
               frame.memory.heapDeltaFromPreviousFrameBytes ?? 0,
               frame.memory.callbackHeapDeltaBytes ?? 0,
             ]),
-          ) : 0,
+          ) : !detailed && lightNegativeHeapValues.length
+            ? Math.min(0, ...lightNegativeHeapValues) : 0,
           source: performanceObject?.memory ? 'performance.memory' : 'unavailable',
         }),
-        frames: Object.freeze([...frames]),
+        frames: Object.freeze(frameRecords),
         heaviestFrames: Object.freeze(heaviestFrames),
         hitchWindows: Object.freeze(allHitchWindows),
-        timeline: Object.freeze([...timeline]),
-        chunkSupply: chunkSupplyTimeline(timeline),
-        coverageMisses: coverageMissTimeline(timeline),
-        publicationTransitions: publicationTransitionTimeline(timeline),
-        terrainTransitions: terrainTransitionTimeline(timeline),
-        workerRequests: workerRequestTimeline(timeline),
+        timeline: Object.freeze(eventRecords),
+        chunkSupply: chunkSupplyTimeline(eventRecords),
+        coverageMisses: coverageMissTimeline(eventRecords),
+        publicationTransitions: publicationTransitionTimeline(eventRecords),
+        terrainTransitions: terrainTransitionTimeline(eventRecords),
+        workerRequests: workerRequestTimeline(eventRecords),
         terrainReadyGate: Object.freeze({
           blockedFrameCount: terrainBlockedFrameCount,
           blockedDurationMs: terrainBlockedDurationMs + activeGateDurationMs,
@@ -1007,6 +1252,18 @@ export function createBrowserFrameDiagnostics({
           ),
           active: activeTerrainGate !== null,
           activeOwnerKey: activeTerrainGate?.ownerKey ?? null,
+        }),
+        storage: Object.freeze({
+          frameCount: numericFrameCount,
+          detailedFrameCount: frames.length,
+          frameCapacity: frameLimit,
+          numericFrameCount: frameTotals.length,
+          numericCallbackCount: callbackDurations.length,
+          hitchWindowCount: hitchWindows.length,
+          hitchWindowCapacity: hitchLimit,
+          timelineCount: timeline.length,
+          timelineCapacity: DEFAULT_EVENT_LIMIT,
+          numericOnlyLightPath: !detailed,
         }),
         notes: EMPTY_SNAPSHOT.notes,
       });

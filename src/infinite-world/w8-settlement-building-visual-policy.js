@@ -5,6 +5,47 @@ import {
 } from '../settlement-building-visuals.js';
 
 const EPSILON = 1e-9;
+const buildingGenerationCheckpointLeases = new Map();
+
+export async function acquireW8SettlementBuildingGenerationCheckpoint({
+  townId,
+  checkpoint,
+} = {}) {
+  if (typeof townId !== 'string' || townId.length === 0) {
+    throw new TypeError('Settlement Building checkpoint townId is required');
+  }
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('Settlement Building checkpoint must be a function or null');
+  }
+  let leaseState = buildingGenerationCheckpointLeases.get(townId);
+  if (!leaseState) {
+    leaseState = {
+      active: null,
+      pendingCount: 0,
+      tail: Promise.resolve(),
+    };
+    buildingGenerationCheckpointLeases.set(townId, leaseState);
+  }
+  const previous = leaseState.tail;
+  let releaseTurn;
+  leaseState.tail = new Promise(resolve => { releaseTurn = resolve; });
+  leaseState.pendingCount += 1;
+  await previous;
+  const registration = Object.freeze({ checkpoint });
+  leaseState.active = registration;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    if (leaseState.active === registration) leaseState.active = null;
+    leaseState.pendingCount -= 1;
+    releaseTurn();
+    if (leaseState.pendingCount === 0
+      && buildingGenerationCheckpointLeases.get(townId) === leaseState) {
+      buildingGenerationCheckpointLeases.delete(townId);
+    }
+  };
+}
 
 function stableCompositionHash(parts) {
   const text = parts.join('|');
@@ -23,10 +64,15 @@ function stableCompositionHash(parts) {
  */
 export function createW8SettlementBuildingTypeSelector({ settlementType, townId }) {
   const composition = SETTLEMENT_BUILDING_COMPOSITIONS[settlementType];
+  const generationCheckpoint = buildingGenerationCheckpointLeases
+    .get(townId)?.active?.checkpoint ?? null;
   const sequence = [];
   const counts = composition
     ? Object.fromEntries(SETTLEMENT_BUILDING_TYPES.map(type => [type, 0])) : null;
   return buildingIndex => {
+    generationCheckpoint?.({
+      site: `cooperative-migrated-settlement-building:${townId}:${buildingIndex}`,
+    });
     if (!composition || !Number.isInteger(buildingIndex) || buildingIndex < 1) {
       return selectSettlementBuildingType({ settlementType, townId, buildingIndex });
     }

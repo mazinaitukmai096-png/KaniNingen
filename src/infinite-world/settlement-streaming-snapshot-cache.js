@@ -17,28 +17,35 @@ export function createSettlementStreamingSnapshotCache() {
   return Object.freeze({
     read({
       frameSequence,
-      presentationRevision,
+      generationEpoch = null,
+      presentationRevision = null,
       renderDistanceRevision,
-      stateRevision,
+      featureDamageRevision = null,
+      stateRevision = null,
+      ownerRevision = 0,
       materialize,
     } = {}) {
       const frame = nonNegativeInteger(frameSequence, 'frameSequence');
-      const presentation = nonNegativeInteger(
-        presentationRevision,
-        'presentationRevision',
+      const generation = nonNegativeInteger(
+        generationEpoch ?? presentationRevision,
+        'generationEpoch',
       );
       const renderDistance = nonNegativeInteger(
         renderDistanceRevision,
         'renderDistanceRevision',
       );
-      const state = nonNegativeInteger(stateRevision, 'stateRevision');
+      const featureDamage = nonNegativeInteger(
+        featureDamageRevision ?? stateRevision,
+        'featureDamageRevision',
+      );
+      const owner = nonNegativeInteger(ownerRevision, 'ownerRevision');
       if (typeof materialize !== 'function') throw new TypeError('materialize is required');
       counts.requests += 1;
       if (entry
-        && entry.frameSequence === frame
-        && entry.presentationRevision === presentation
+        && entry.generationEpoch === generation
         && entry.renderDistanceRevision === renderDistance
-        && entry.stateRevision === state) {
+        && entry.featureDamageRevision === featureDamage
+        && entry.ownerRevision === owner) {
         counts.reused += 1;
         lastReadReused = true;
         return entry.value;
@@ -49,10 +56,15 @@ export function createSettlementStreamingSnapshotCache() {
         throw new Error('Settlement streaming snapshot must be immutable');
       }
       entry = Object.freeze({
+        // frameSequence is evidence about when the immutable snapshot was
+        // first materialized. It is deliberately not part of the cache key:
+        // generation, render-distance, canonical-owner and feature-damage
+        // revisions are the complete content-affecting inputs.
         frameSequence: frame,
-        presentationRevision: presentation,
+        generationEpoch: generation,
         renderDistanceRevision: renderDistance,
-        stateRevision: state,
+        featureDamageRevision: featureDamage,
+        ownerRevision: owner,
         value,
       });
       counts.materialized += 1;
@@ -67,9 +79,14 @@ export function createSettlementStreamingSnapshotCache() {
         schemaVersion: 'settlement-streaming-snapshot-cache-1',
         cached: entry !== null,
         frameSequence: entry?.frameSequence ?? null,
-        presentationRevision: entry?.presentationRevision ?? null,
+        generationEpoch: entry?.generationEpoch ?? null,
+        // Compatibility diagnostic aliases; cache identity is named after
+        // the exact content source above rather than the general World state.
+        presentationRevision: entry?.generationEpoch ?? null,
         renderDistanceRevision: entry?.renderDistanceRevision ?? null,
-        stateRevision: entry?.stateRevision ?? null,
+        featureDamageRevision: entry?.featureDamageRevision ?? null,
+        stateRevision: entry?.featureDamageRevision ?? null,
+        ownerRevision: entry?.ownerRevision ?? null,
         counts: Object.freeze({ ...counts }),
       });
     },
@@ -78,12 +95,18 @@ export function createSettlementStreamingSnapshotCache() {
 }
 
 export function isSettlementStreamingSnapshotCurrent(snapshot, {
-  presentationRevision,
+  generationEpoch = null,
+  presentationRevision = null,
   renderDistanceRevision,
-  stateRevision,
+  featureDamageRevision = null,
+  stateRevision = null,
+  ownerRevision = 0,
 } = {}) {
   if (!snapshot || typeof snapshot !== 'object') return false;
-  return snapshot.presentationRevision === presentationRevision
+  const generation = generationEpoch ?? presentationRevision;
+  const featureDamage = featureDamageRevision ?? stateRevision;
+  return (snapshot.generationEpoch ?? snapshot.presentationRevision) === generation
     && snapshot.renderDistanceRevision === renderDistanceRevision
-    && snapshot.stateRevision === stateRevision;
+    && (snapshot.featureDamageRevision ?? snapshot.stateRevision) === featureDamage
+    && (snapshot.ownerRevision ?? 0) === ownerRevision;
 }

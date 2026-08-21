@@ -500,6 +500,9 @@ export class InfiniteWorldState {
     this.activeScaleStageId = W6_STATE_BOOTSTRAP_SCALE_STAGE_ID;
     this.player = { ...cloneRecord(createW6PlayerState(playerSpawn)), acidDebuffSeconds: 0 };
     this.featureDamage = new Map();
+    this._featureDamageRevision = 0;
+    this._destroyedFeatureStableIds = new Set();
+    this._featureDestructionSnapshot = null;
     this.entityStates = new Map();
     this.manualBossStableId = null;
     this.manualBossSequence = 0;
@@ -510,6 +513,49 @@ export class InfiniteWorldState {
     this.gameplayTimeMs = 0;
     this.experience = validateExperience(DEFAULT_EXPERIENCE_STATE);
     this.revision = 0;
+  }
+
+  #setFeatureDestructionMembership(stableId, destroyed) {
+    const wasDestroyed = this._destroyedFeatureStableIds.has(stableId);
+    if (wasDestroyed === destroyed) return false;
+    if (destroyed) this._destroyedFeatureStableIds.add(stableId);
+    else this._destroyedFeatureStableIds.delete(stableId);
+    this._featureDamageRevision += 1;
+    this._featureDestructionSnapshot = null;
+    return true;
+  }
+
+  #replaceFeatureDestructionMembership(featureDamage) {
+    const destroyedStableIds = new Set([...featureDamage.values()]
+      .filter(record => record.destroyed === true)
+      .map(record => record.stableId));
+    if (destroyedStableIds.size === this._destroyedFeatureStableIds.size
+      && [...destroyedStableIds].every(stableId => (
+        this._destroyedFeatureStableIds.has(stableId)
+      ))) return false;
+    this._destroyedFeatureStableIds = destroyedStableIds;
+    this._featureDamageRevision += 1;
+    this._featureDestructionSnapshot = null;
+    return true;
+  }
+
+  get featureDamageRevision() {
+    return this._featureDamageRevision;
+  }
+
+  featureDestructionSnapshot() {
+    if (this._featureDestructionSnapshot !== null) return this._featureDestructionSnapshot;
+    const destroyedStableIds = Object.freeze([...this._destroyedFeatureStableIds]
+      .sort((left, right) => left.localeCompare(right)));
+    this._featureDestructionSnapshot = Object.freeze({
+      schemaVersion: 'feature-destruction-snapshot-1',
+      revision: this._featureDamageRevision,
+      destroyedStableIds,
+      // JSON length/escaping makes the revision signature collision-free even
+      // for a corrupt legacy Stable ID containing a delimiter character.
+      signature: JSON.stringify(destroyedStableIds),
+    });
+    return this._featureDestructionSnapshot;
   }
 
   setScaleStage(stageId) {
@@ -594,6 +640,11 @@ export class InfiniteWorldState {
     this.activeScaleStageId = scaleStageId;
     Object.assign(this.player, createW6PlayerState(spawn), { acidDebuffSeconds: 0 });
     this.featureDamage.clear();
+    if (this._destroyedFeatureStableIds.size > 0) {
+      this._destroyedFeatureStableIds.clear();
+      this._featureDamageRevision += 1;
+      this._featureDestructionSnapshot = null;
+    }
     this.entityStates.clear();
     this.manualBossStableId = null;
     this.manualBossSequence = 0;
@@ -737,6 +788,7 @@ export class InfiniteWorldState {
     const damage = existing.destroyed ? maxHp : Math.min(existing.damage, maxHp);
     const record = { stableId, maxHp, damage, destroyed: damage >= maxHp };
     this.featureDamage.set(stableId, record);
+    this.#setFeatureDestructionMembership(stableId, record.destroyed);
     this.revision += 1;
     return Object.freeze({ ...record });
   }
@@ -753,9 +805,23 @@ export class InfiniteWorldState {
     const existing = this.featureDamage.get(stableId);
     const damage = Math.min(maxHp, (existing?.damage ?? 0) + damageAmount);
     const record = { stableId, maxHp, damage, destroyed: damage >= maxHp };
-    if (damage > 0) this.featureDamage.set(stableId, record);
+    if (damage > 0) {
+      this.featureDamage.set(stableId, record);
+      this.#setFeatureDestructionMembership(stableId, record.destroyed);
+    }
     this.revision += 1;
     return Object.freeze({ ...record });
+  }
+
+  forgetFeatureDamage(stableId) {
+    const featureStableId = requiredString(stableId, 'feature stableId');
+    const existing = this.featureDamage.get(featureStableId);
+    if (!existing || !this.featureDamage.delete(featureStableId)) return false;
+    if (existing.destroyed === true) {
+      this.#setFeatureDestructionMembership(featureStableId, false);
+    }
+    this.revision += 1;
+    return true;
   }
 
   isFeatureDestroyed(stableId) {
@@ -846,6 +912,7 @@ export class InfiniteWorldState {
     this.activeScaleStageId = candidate.activeScaleStageId;
     Object.assign(this.player, player);
     this.featureDamage = featureDamage;
+    this.#replaceFeatureDestructionMembership(featureDamage);
     this.entityStates = entityStates;
     this.manualBossStableId = manualBossStableId;
     this.manualBossSequence = manualBossSequence;
@@ -867,7 +934,7 @@ export class InfiniteWorldState {
       activeScaleStageId: this.activeScaleStageId,
       player: Object.freeze({ ...this.player }),
       featureDamageCount: this.featureDamage.size,
-      destroyedFeatureCount: [...this.featureDamage.values()].filter(value => value.destroyed).length,
+      destroyedFeatureCount: this.featureDestructionSnapshot().destroyedStableIds.length,
       entityStateCount: this.entityStates.size,
       destroyedEntityCount: [...this.entityStates.values()].filter(value => !value.alive
         && !(value.type === 'tank'

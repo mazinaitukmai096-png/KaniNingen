@@ -377,6 +377,7 @@ class PerspectiveCamera extends NodeObject {
       ? { ...targetOrX } : { x: targetOrX, y, z };
   }
 }
+class OrthographicCamera extends PerspectiveCamera {}
 class HemisphereLight extends NodeObject {}
 class DirectionalLight extends NodeObject {}
 class Fog {
@@ -405,10 +406,20 @@ class FakeCanvas {
   getContext() { return null; }
 }
 
+class WebGLRenderTarget {
+  constructor() {
+    this.texture = {};
+    this.disposed = false;
+  }
+  dispose() { this.disposed = true; }
+}
+
 class WebGLRenderer {
   static instances = [];
   constructor() {
     this.renderCount = 0;
+    this.worldRenderCount = 0;
+    this.stagingRenderCount = 0;
     this.domElement = new FakeCanvas();
     this.shadowMap = {};
     this.info = {
@@ -417,12 +428,24 @@ class WebGLRenderer {
     };
     this.gpuAttributes = new WeakMap();
     this.attributes = { get: attribute => this.gpuAttributes.get(attribute) };
+    this.renderTarget = null;
+    this.activeCubeFace = 0;
+    this.activeMipmapLevel = 0;
+    this.xr = { enabled: false };
     WebGLRenderer.instances.push(this);
   }
   setPixelRatio(value) { this.pixelRatio = value; }
   setSize(width, height) {
     this.domElement.width = width;
     this.domElement.height = height;
+  }
+  getRenderTarget() { return this.renderTarget; }
+  getActiveCubeFace() { return this.activeCubeFace; }
+  getActiveMipmapLevel() { return this.activeMipmapLevel; }
+  setRenderTarget(target, cubeFace = 0, mipmapLevel = 0) {
+    this.renderTarget = target;
+    this.activeCubeFace = cubeFace;
+    this.activeMipmapLevel = mipmapLevel;
   }
   syncAttribute(attribute) {
     const source = attribute?.array
@@ -483,6 +506,8 @@ class WebGLRenderer {
     };
     visit(scene, true);
     this.renderCount += 1;
+    if (this.renderTarget === null) this.worldRenderCount += 1;
+    else this.stagingRenderCount += 1;
     this.info.render.calls = drawCalls;
     this.info.render.instances = instances;
     this.info.render.triangles = triangles;
@@ -616,11 +641,13 @@ export const ProductionHarnessThree = Object.freeze({
   LineSegments,
   Object3D,
   PerspectiveCamera,
+  OrthographicCamera,
   HemisphereLight,
   DirectionalLight,
   Color,
   Fog,
   WebGLRenderer,
+  WebGLRenderTarget,
   DynamicDrawUsage: 'dynamic-draw',
   PCFSoftShadowMap: 'pcf-soft',
   SRGBColorSpace: 'srgb',
@@ -1297,6 +1324,8 @@ export async function bootProductionSchedulingHarness({
         queueDepth: snapshot.runtime.terrainReady?.queueDepth ?? null,
         oldestWaitMs: snapshot.runtime.terrainReady?.oldestWaitMs ?? null,
       },
+      renderUploadAdmission: snapshot.runtime.renderUploadAdmission ?? null,
+      renderCoverage: snapshot.runtime.renderCoverage ?? null,
       staticBacklog: snapshot.staticObjectStreaming?.backlog ?? null,
       staticVisual: {
         required: snapshot.staticObjectStreaming?.visualRequiredOwnerCount ?? null,

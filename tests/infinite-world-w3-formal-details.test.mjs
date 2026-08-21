@@ -10,7 +10,12 @@ import {
   createFormalNaturalChunkGenerator,
   validateW3FormalChunkData,
 } from '../src/infinite-world/formal-natural-chunk-generator.js';
-import { vegetationBoundsOverlap } from '../src/infinite-world/legacy-core/g6/rock-redistribution.js';
+import { createFormalRockCandidate } from '../src/infinite-world/formal-rock-candidate.js';
+import {
+  createG6DRockProfile,
+  createRockCandidateG6D,
+  vegetationBoundsOverlap,
+} from '../src/infinite-world/legacy-core/g6/rock-redistribution.js';
 import { createNaturalChunkGenerator } from '../src/infinite-world/natural-chunk-generator.js';
 import { PersistentChunkIndex } from '../src/infinite-world/persistent-chunk-index.js';
 import { ChunkRenderAdapter } from '../src/infinite-world/render/chunk-render-adapter.js';
@@ -32,16 +37,49 @@ test('W3 Legacy formal-detail dependencies match the fixed source commit byte-fo
   assert.equal(provenance.importsAdjusted, false);
   assert.equal(provenance.files.length, 7);
   for (const file of provenance.files) {
-    const bytes = execFileSync('git', ['show', `HEAD:${file.destination}`], {
-      cwd: repoRoot,
-      encoding: null,
-    });
+    const bytes = readFileSync(resolve(repoRoot, file.destination));
     assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256);
-    assert.equal(execFileSync('git', ['rev-parse', `HEAD:${file.destination}`], {
+    assert.equal(execFileSync('git', ['hash-object', file.destination], {
       cwd: repoRoot,
       encoding: 'utf8',
     }).trim(), file.gitBlob);
     verifyOptionalLegacySource({ provenance, file, repoRoot });
+  }
+});
+
+test('the non-legacy Rock fast path stays record-identical to protected G6-D', async () => {
+  const worldSeedHash = 'sha256:0ddef8e7d5e91010ef4139e7e0512578d450a964b40137c436036f3adf4e0870';
+  const [legacyProfile, optimizedProfile] = await Promise.all([
+    createG6DRockProfile({ worldSeedHash }),
+    createG6DRockProfile({ worldSeedHash }),
+  ]);
+  for (let index = 0; index < 96; index += 1) {
+    const x = (index % 12) * 0.5 - 2.75;
+    const z = Math.floor(index / 12) * 0.5 - 1.75;
+    const input = {
+      worldSeedHash,
+      quantizedWorldCell: { x: Math.floor(x * 2), z: Math.floor(z * 2) },
+      point: { x, z },
+      terrain: {
+        height: 2 + index * 0.01,
+        slope: (index % 9) * 0.019,
+        rockiness: (index % 7) / 6,
+        rockMaterial: (index % 11) / 10,
+      },
+      macro: {
+        ridge: (index % 13) / 12,
+        curvature: ((index % 5) - 2) * 0.025,
+      },
+      river: { distance: index % 8 === 0 ? 1.5 : Infinity, width: 0 },
+      vegetationCandidates: [],
+      sourceBiomeWeights: [{ biome: 'fixture', weight: 1 }],
+      sourceFeatureIds: [`fixture:${index % 3}`],
+    };
+    const [legacy, optimized] = await Promise.all([
+      createRockCandidateG6D({ ...input, profile: legacyProfile }),
+      createFormalRockCandidate({ ...input, profile: optimizedProfile }),
+    ]);
+    assert.deepEqual(optimized, legacy);
   }
 });
 

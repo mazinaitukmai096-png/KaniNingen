@@ -44,6 +44,7 @@ import {
   decodeInfiniteWorldSave,
 } from '../src/infinite-world/world-state-store.js';
 import { createRuntimeTransitionContract } from '../src/infinite-world/runtime-transition-contract.js';
+import { FINITE_WORLD_UNITS_PER_METER } from '../src/infinite-world/single-rural-settlement.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 
@@ -95,10 +96,12 @@ class FakeGameplayRenderer {
 function fakeFeatureRenderer() {
   return {
     destroyed: new Set(),
+    destructionDeltas: [],
     refreshCount: 0,
     setFeatureDestroyed(stableId, destroyed) {
       if (destroyed) this.destroyed.add(stableId);
       else this.destroyed.delete(stableId);
+      this.destructionDeltas.push(Object.freeze({ stableId, destroyed: destroyed === true }));
       return true;
     },
     refreshFeatureStates() { this.refreshCount += 1; },
@@ -165,9 +168,14 @@ test('W6 imports the protected Tiny/Mid/Max contracts with Tiny as the New Game 
   assert.equal(W6_ENTITY_CONTRACTS.boss.maxHp, BOSS_HP);
   assert.equal(W6_ENTITY_CONTRACTS.boss.radius, BOSS_RADIUS);
   assert.equal(W6_ENTITY_CONTRACTS.boss.scoreValue, BOSS_SCORE_VALUE);
-  assert.equal(getW6ScaleProfile('MAX').stage, SCALE_STAGES.MAX);
-  assert.equal(getW6ScaleProfile('MAX').movementMetersPerSecond, 33);
-  assert.equal(getW6ScaleProfile('MAX').singleAttackRadiusMeters, 8.75);
+  const maximum = getW6ScaleProfile('MAX');
+  assert.equal(maximum.stage, SCALE_STAGES.MAX);
+  assert.equal(maximum.sprintMetersPerSecond, 30,
+    'the production maximum remains the protected 30m/s Sprint contract');
+  assert.equal(maximum.sprintMetersPerSecond,
+    maximum.movementMetersPerSecond * maximum.sprintMultiplier);
+  assert.equal(maximum.singleAttackRadiusMeters,
+    SCALE_STAGES.MAX.singleAttackRadius / FINITE_WORLD_UNITS_PER_METER);
 });
 
 test('W6 deterministic Chunk gameplay preserves W5 ChunkData, hash, and Stable IDs', async () => {
@@ -219,6 +227,11 @@ test('only the rendered 3x3 Chunk set simulates and unload/revisit restores dest
   const target = model.staticTargets[0];
   runtime.damageStableId(target.stableId, target.maxHp);
   assert.equal(state.isFeatureDestroyed(target.stableId), true);
+  assert.deepEqual(featureRenderer.destructionDeltas, [{
+    stableId: target.stableId,
+    destroyed: true,
+  }], 'one membership change must publish one renderer delta');
+  assert.equal(featureRenderer.refreshCount, 0);
   const entityDescriptor = [...runtime.activeChunks.values()].flatMap(value => value.entityDescriptors)[0];
   assert.ok(entityDescriptor, 'review Settlement must materialize a Human');
   runtime.damageStableId(entityDescriptor.stableId, 10);
@@ -231,7 +244,21 @@ test('only the rendered 3x3 Chunk set simulates and unload/revisit restores dest
   assert.equal(state.isFeatureDestroyed(target.stableId), true);
   assert.deepEqual(state.entityStates.get(entityDescriptor.stableId), savedEntity);
   assert.equal(renderer.snapshot().liveChunkGroups, 9);
-  assert.equal(featureRenderer.refreshCount, 3);
+  assert.equal(featureRenderer.refreshCount, 0,
+    'ordinary Chunk sync/revisit must not rescan every resident feature');
+
+  await runtime.refreshFromState({
+    renderOrigin: { renderOriginChunkX: centerX, renderOriginChunkZ: centerZ },
+  });
+  assert.equal(featureRenderer.refreshCount, 1,
+    'explicit save hydration retains a full feature reconcile');
+  await runtime.restart({
+    playerSpawn: generator.reviewSpawn,
+    renderOrigin: { renderOriginChunkX: centerX, renderOriginChunkZ: centerZ },
+    scaleStageId: 'TINY',
+  });
+  assert.equal(featureRenderer.refreshCount, 2,
+    'explicit restart retains a full feature reconcile');
 
   await runtime.shutdown();
   assert.equal(renderer.snapshot().liveChunkGroups, 0);
@@ -810,6 +837,10 @@ test('Tiny/Mid/Max damage gates and legacy attack values drive active W6 gamepla
   state.setScaleStage('TINY');
   assert.deepEqual(runtime.attack('single', 0).hits, []);
   state.setScaleStage('MID');
+  const midProfile = getW6ScaleProfile('MID');
+  const human = state.entityStates.get(byType.human.stableId);
+  human.x = state.player.x + midProfile.attackOffsetXMeters;
+  human.z = state.player.z + midProfile.attackOffsetZMeters;
   const mid = runtime.attack('single', ATTACK_COOLDOWN);
   assert.equal(mid.hits.some(value => value.type === 'human' && value.destroyed), true);
   assert.equal(mid.hits.some(value => value.type === 'house' && value.destroyed), true);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   NEW_GAME_PLAYER_SCALE_STAGE_ID,
+  PLAYER_MAX_SPRINT_METERS_PER_SECOND,
   PLAYER_MODEL_VERTICAL_BOUNDS_UNITS,
   PLAYER_SCALE_PROFILES,
   resolvePlayerScaleProfile,
@@ -14,7 +15,8 @@ test('Player Scale resolver owns the complete Tiny, Mid, and Max physical profil
   assert.equal(NEW_GAME_PLAYER_SCALE_STAGE_ID, 'TINY');
   assert.deepEqual(
     Object.values(PLAYER_SCALE_PROFILES).map(profile => profile.visualScale),
-    [0.05, 0.45, 1],
+    [0.04, 0.2, 0.45],
+    'the resolver must expose the current bounded streaming scale progression',
   );
   for (const stageId of ['TINY', 'MID', 'MAX']) {
     const profile = resolvePlayerScaleProfile(stageId);
@@ -52,32 +54,38 @@ test('meter profile derives camera, movement, attack, vertical collision, and hi
     assert.ok(Math.abs(actual - expected) < 1e-12, `${actual} != ${expected}`);
   };
   const tiny = getW6ScaleProfile('TINY');
-  assert.equal(tiny.visualScale, 0.05);
-  assert.equal(tiny.collision.radiusMeters, 0.08125);
+  assert.equal(tiny.visualScale, 0.04);
+  assert.equal(tiny.collision.radiusMeters, 0.065);
   assert.equal(tiny.collision.heightMeters, tiny.stage.collisionHeight / 40);
   assert.equal(tiny.collision.footOffsetMeters, tiny.stage.footOffset / 40);
-  assertNear(tiny.movementMetersPerSecond, 4);
-  assert.equal(tiny.sprintMultiplier, 1.35);
-  assertNear(tiny.sprintMetersPerSecond, 5.4);
-  assertNear(tiny.jumpVelocityMetersPerSecond, 4.32);
-  assertNear(tiny.gravityMetersPerSecondSquared, 18);
-  assert.equal(tiny.cameraDistanceMeters, 1.328125);
-  assert.equal(tiny.cameraHeightMeters, 0.5);
-  assert.equal(tiny.cameraTargetHeightMeters, 0.125);
-  assert.equal(tiny.cameraNearMeters, 0.0078125);
-  assert.equal(tiny.singleAttackRadiusMeters, 0.28125);
-  assert.equal(tiny.doubleAttackRadiusMeters, 0.34375);
-  assert.equal(tiny.landingRadiusMeters, 0.4375);
-  assert.equal(tiny.landingPushRadiusMeters, 0.75);
-  assert.equal(tiny.windArcRadiusMeters, 0.3125);
+  assertNear(tiny.movementMetersPerSecond, 3.5);
+  assert.equal(tiny.sprintMultiplier, 1.3);
+  assertNear(tiny.sprintMetersPerSecond, 4.55);
+  assertNear(tiny.jumpVelocityMetersPerSecond, 3.6);
+  assertNear(tiny.gravityMetersPerSecondSquared, 15.75);
+  assert.equal(tiny.cameraDistanceMeters, 1.0625);
+  assert.equal(tiny.cameraHeightMeters, 0.4);
+  assert.equal(tiny.cameraTargetHeightMeters, 0.1);
+  assert.equal(tiny.cameraNearMeters, 0.00625);
+  assert.equal(tiny.singleAttackRadiusMeters, 0.225);
+  assert.equal(tiny.doubleAttackRadiusMeters, 0.275);
+  assert.equal(tiny.landingRadiusMeters, 0.35);
+  assert.equal(tiny.landingPushRadiusMeters, 0.6);
+  assert.equal(tiny.windArcRadiusMeters, 0.25);
   assert.equal(tiny.playerHitBounds.shape, 'vertical-ellipsoid');
   assert.equal(tiny.playerHitBounds.radiusMeters, tiny.collision.radiusMeters);
   assert.equal(tiny.playerHitBounds.halfHeightMeters, tiny.collision.heightMeters / 2);
+
+  const maximum = getW6ScaleProfile('MAX');
+  assert.equal(PLAYER_MAX_SPRINT_METERS_PER_SECOND, 30,
+    'the protected production Sprint contract must remain 30m/s');
+  assert.equal(maximum.sprintMetersPerSecond, PLAYER_MAX_SPRINT_METERS_PER_SECOND,
+    'the Infinite World meter profile must derive the canonical Player profile');
 });
 
-test('Tiny linear bounds derive from the 0.05 to 0.08 visual ratio', () => {
+test('Tiny linear bounds derive from the 0.04 to 0.08 visual ratio', () => {
   const tiny = resolvePlayerScaleProfile('TINY');
-  const ratio = 0.05 / 0.08;
+  const ratio = tiny.visualScale / 0.08;
   const reference = {
     attackOffsetX: 8,
     attackOffsetZ: 10,

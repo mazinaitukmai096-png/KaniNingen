@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import {
+  RUNTIME_DIAGNOSTIC_MODE,
   W8_DIAGNOSTIC_PROFILES,
   correlateW8HitchStages,
   createW8RuntimeDiagnostics,
@@ -253,6 +254,7 @@ const DISTANT_TEST_THREE = Object.freeze({
   PlaneGeometry: DistantTestPlaneGeometry,
   BufferGeometry: DistantTestBufferGeometry,
   Float32BufferAttribute: DistantTestFloat32BufferAttribute,
+  Uint32BufferAttribute: DistantTestFloat32BufferAttribute,
   InstancedBufferAttribute: DistantTestInstancedBufferAttribute,
   Color: DistantTestColor,
   MeshLambertMaterial: DistantTestMaterial,
@@ -1130,7 +1132,7 @@ test('diagnostic profiles isolate one W8 subsystem without changing baseline def
 test('MeasurementReport correlates stage samples with hitch frames and reports percentiles', async () => {
   let now = 0;
   const diagnostics = createW8RuntimeDiagnostics({
-    enabled: true,
+    mode: RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION,
     clock: () => now,
     globalObject: {},
     profile: parseW8DiagnosticProfile('baseline'),
@@ -2194,7 +2196,20 @@ test('MAX Sprint 60-second clipmap throughput stays ahead of straight and diagon
   const percentile = (values, ratio) => [...values]
     .sort((left, right) => left - right)[Math.max(0, Math.ceil(values.length * ratio) - 1)];
   const run = async diagonal => {
-    const presentation = await createLocalTerrainTestPresentation();
+    // Cooperative scheduling correctness must not depend on host load or the
+    // platform timer quantum. Advance a monotonic test clock by a fixed amount
+    // per observation, while retaining real wall time below as benchmark-only
+    // evidence for the 334ms arrival model.
+    let presentationNow = 0;
+    const presentationClockQuantumMs = 0.001;
+    const presentation = await createLocalTerrainTestPresentation(undefined, {
+      presentationClock: () => {
+        const value = presentationNow;
+        presentationNow += presentationClockQuantumMs;
+        return value;
+      },
+      yieldToMainThread: () => Promise.resolve(),
+    });
     presentation.syncLocalTerrain({
       coverageEpoch: 1,
       ...localTerrainCoverageFixture(0, 0),
@@ -2285,6 +2300,8 @@ test('MAX Sprint 60-second clipmap throughput stays ahead of straight and diagon
       movementBlockedByTerrain: 0,
     });
     const snapshot = presentation.snapshot();
+    result.presentationSliceBudgetMs = snapshot.presentationSliceBudgetMs;
+    result.presentationClockQuantumMs = presentationClockQuantumMs;
     assert.equal(snapshot.clipmapGeometryPoolSize, 2);
     assert.equal(snapshot.clipmapGeometryPoolInUseCount, 1);
     presentation.dispose();
@@ -2298,8 +2315,15 @@ test('MAX Sprint 60-second clipmap throughput stays ahead of straight and diagon
       `${result.path} incremental clipmap p95 ${result.clipmapP95Ms}ms`);
     assert.equal(result.totalP95Ms < 334, true,
       `${result.path} complete generation p95 must beat MAX arrival`);
-    assert.equal(result.sliceP95Ms <= 4, true,
-      `${result.path} incremental slice p95 ${result.sliceP95Ms}ms`);
+    assert.equal(
+      result.maximumSliceMs
+        <= result.presentationSliceBudgetMs + result.presentationClockQuantumMs * 4,
+      true,
+      `${result.path} cooperative slice ${result.maximumSliceMs}ms must honor the ${
+        result.presentationSliceBudgetMs}ms production budget`,
+    );
+    assert.equal(result.sliceCountP95 > 0, true,
+      `${result.path} incremental generation must cross a cooperative yield boundary`);
     assert.equal(result.geometryAllocations <= 1, true);
     assert.equal(result.indexAllocations <= 1, true);
     assert.equal(result.sixtySecond.latestGenerationLagChunks <= 2, true);
@@ -2829,6 +2853,7 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
     .composedInstanceCount, 0);
   assert.equal(before.find(value => value.identity.stableId === road.stableId)
     .composedInstanceCount, 0);
+  const beforeBarrierRoad = presentation.snapshot();
 
   const distant = coverage(3);
   nearHold.hold('5,0', handoffDescriptors);
@@ -2903,6 +2928,29 @@ test('Near to Distant coverage barrier publishes Building and Road sources befor
   assert.equal(afterRoadPublish.roadPresentationStarvationCount, 0);
   assert.equal(afterRoadPublish.roadPresentationOrphanGeometryCount, 0);
   assert.equal(afterRoadPublish.roadPresentationDoubleDisposeCount, 0);
+  assert.equal(
+    afterRoadPublish.roadPresentationBucketComposeCount
+      - beforeBarrierRoad.roadPresentationBucketComposeCount,
+    1,
+    'dirty queue, handoff and coverage barrier must share one Road bucket compose',
+  );
+  assert.equal(
+    afterRoadPublish.roadPresentationOwnerWorkCount
+      - beforeBarrierRoad.roadPresentationOwnerWorkCount,
+    1,
+    'shared Road consumers must not rebuild the same owner',
+  );
+  assert.equal(
+    afterRoadPublish.roadPresentationRecordComposeCount
+      - beforeBarrierRoad.roadPresentationRecordComposeCount,
+    1,
+  );
+  assert.equal(
+    afterRoadPublish.roadPresentationSupersededDiscardCount
+      - beforeBarrierRoad.roadPresentationSupersededDiscardCount,
+    0,
+    'consumer attachment must not invalidate an otherwise current Road replacement',
+  );
 
   assert.equal(await presentation.sync({
     ...distant,
@@ -3124,6 +3172,7 @@ test('Road presentation queue discards superseded owner work without stale publi
     playerLogicalX: 72,
     playerLogicalZ: 8,
   }), true);
+  const beforeFirstDistant = presentation.snapshot();
   nearHold.hold('5,0', handoffDescriptors);
   assert.equal(presentation.commitRuntimeState({
     activeDataKeys: distant.activeDataKeys,
@@ -3152,7 +3201,7 @@ test('Road presentation queue discards superseded owner work without stale publi
   const queued = presentation.snapshot();
   assert.ok(queued.roadPresentationOwnerWorkCount > 0);
   assert.ok(queued.roadPresentationQueueLength > 0,
-    'an over-budget owner unit must yield before Road publish');
+    'the 192-road dirty queue and coverage barrier must share pending yielded work');
   assert.equal(queued.runtimePresentationCoverageBarrierPending, true);
 
   nearHold.returnNear('5,0', handoffDescriptors);
@@ -3164,8 +3213,6 @@ test('Road presentation queue discards superseded owner work without stale publi
     playerLogicalX: 72,
     playerLogicalZ: 8,
   }), true);
-  const superseded = presentation.snapshot();
-  assert.ok(superseded.roadPresentationSupersededDiscardCount > 0);
   for (let frame = 0; frame < 128
     && presentation.snapshot().runtimePresentationHandoffPending; frame += 1) {
     presentation.update(72, 8, near.renderOrigin);
@@ -3180,30 +3227,210 @@ test('Road presentation queue discards superseded owner work without stale publi
   assert.equal(completed.roadPresentationStarvationCount, 0);
   assert.equal(completed.roadPresentationOrphanGeometryCount, 0);
   assert.equal(completed.roadPresentationDoubleDisposeCount, 0);
+  assert.ok(completed.roadPresentationSupersededDiscardCount
+    > beforeFirstDistant.roadPresentationSupersededDiscardCount,
+  'the obsolete revision must be discarded only after the visibility reversal');
   assert.equal(completed.duplicateVisibleStableIdCount, 0);
   assert.equal(completed.canonicalRoadRecordCount, roads.length);
   assert.equal(new Set(presentation.canonicalAuditSnapshot()
     .filter(value => value.identity.featureType === 'settlement-road')
     .map(value => value.identity.stableId)).size, roads.length);
+
+  const beforeRepublish = presentation.snapshot();
+  nearHold.hold('5,0', handoffDescriptors);
+  assert.equal(presentation.commitRuntimeState({
+    activeDataKeys: distant.activeDataKeys,
+    renderedKeys: distant.renderedKeys,
+    renderOrigin: distant.renderOrigin,
+    quality: 'high',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  }), true);
+  for (let frame = 0; frame < 256
+    && presentation.snapshot().runtimePresentationHandoffPending; frame += 1) {
+    presentation.update(56, 8, distant.renderOrigin);
+    presentation.markFirstDraw();
+  }
+  const published = presentation.snapshot();
+  assert.equal(published.runtimePresentationHandoffPending, false);
+  assert.equal(
+    published.roadPresentationBucketComposeCount
+      - beforeRepublish.roadPresentationBucketComposeCount,
+    1,
+    '192-road dirty queue and coverage barrier must publish one shared bucket work',
+  );
+  assert.equal(
+    published.roadPresentationOwnerWorkCount - beforeRepublish.roadPresentationOwnerWorkCount,
+    1,
+    '192-road shared work must build its canonical owner once',
+  );
+  assert.equal(
+    published.roadPresentationRecordComposeCount
+      - beforeRepublish.roadPresentationRecordComposeCount,
+    roads.length,
+  );
+  assert.ok(published.roadPresentationMaximumUnitMs <= 4,
+    `Road presentation unit ${published.roadPresentationMaximumUnitMs}ms exceeds 4ms`);
+  assert.ok(published.roadPresentationMaximumSliceMs <= 8,
+    `Road presentation slice ${published.roadPresentationMaximumSliceMs}ms exceeds 8ms`);
+  assert.equal(published.runtimePresentationCoverageBarrierBlankFrameCount, 0);
+  assert.equal(published.runtimePresentationCoverageBarrierDuplicateFrameCount, 0);
   t.diagnostic(JSON.stringify({
     roadQueue: {
-      budgetMs: completed.roadPresentationFrameBudgetMs,
-      maximumLength: completed.roadPresentationMaximumQueueLength,
-      maximumWaitFrames: completed.roadPresentationMaximumWaitFrames,
-      maximumSliceMs: completed.roadPresentationMaximumSliceMs,
-      maximumUnitMs: completed.roadPresentationMaximumUnitMs,
-      ownerWorkCount: completed.roadPresentationOwnerWorkCount,
-      bucketComposeCount: completed.roadPresentationBucketComposeCount,
-      recordComposeCount: completed.roadPresentationRecordComposeCount,
-      supersededDiscardCount: completed.roadPresentationSupersededDiscardCount,
+      budgetMs: published.roadPresentationFrameBudgetMs,
+      maximumLength: published.roadPresentationMaximumQueueLength,
+      maximumWaitFrames: published.roadPresentationMaximumWaitFrames,
+      maximumSliceMs: published.roadPresentationMaximumSliceMs,
+      maximumUnitMs: published.roadPresentationMaximumUnitMs,
+      ownerWorkCount: published.roadPresentationOwnerWorkCount,
+      bucketComposeCount: published.roadPresentationBucketComposeCount,
+      recordComposeCount: published.roadPresentationRecordComposeCount,
+      supersededDiscardCount: published.roadPresentationSupersededDiscardCount,
     },
     coverage: {
-      blankFrames: completed.runtimePresentationCoverageBarrierBlankFrameCount,
-      duplicateFrames: completed.runtimePresentationCoverageBarrierDuplicateFrameCount,
+      blankFrames: published.runtimePresentationCoverageBarrierBlankFrameCount,
+      duplicateFrames: published.runtimePresentationCoverageBarrierDuplicateFrameCount,
     },
   }));
   presentation.dispose();
   nearHold.dispose();
+});
+
+test('runtime Road visibility bypass retains OLD geometry and uses bounded resumable slices', async t => {
+  const roads = Object.freeze(Array.from({ length: 192 }, (_, index) => {
+    const lane = index % 12;
+    const row = Math.floor(index / 12);
+    return Object.freeze({
+      schemaVersion: 'w8-canonical-major-road-chunk-feature-1',
+      stableId: `major-road-v1:visibility-bypass:${index}:chunk:5:0`,
+      sourceStableId: `major-road-v1:visibility-bypass:${index}`,
+      sourceSegmentStableId: `major-road-v1:visibility-bypass:${index}:segment:0`,
+      featureType: 'settlement-road',
+      canonicalMajorRoad: true,
+      settlementId: CANONICAL_SETTLEMENT_ID,
+      settlementIds: Object.freeze([CANONICAL_SETTLEMENT_ID]),
+      roadKind: 'MAJOR',
+      routeId: `visibility-bypass-route:${row}`,
+      widthMeters: 1.75 + row * 0.1,
+      start: Object.freeze({ x: 80 + lane, y: 0, z: 2 + row * 3 }),
+      end: Object.freeze({ x: 84 + lane, y: 0, z: 2.5 + row * 3 }),
+      worldPosition: Object.freeze({ x: 82 + lane, y: 0, z: 2.25 + row * 3 }),
+      owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    });
+  }));
+  const source = canonicalChunk(5, 0, roads);
+  const coverage = localTerrainCoverageFixture(3, 0);
+  coverage.chunks.set('5,0', source);
+  const hiddenNearIds = new Set(roads.slice(0, roads.length / 2).map(road => road.stableId));
+  const findRoadMesh = scene => {
+    const pending = [scene];
+    while (pending.length > 0) {
+      const node = pending.shift();
+      if (typeof node?.userData?.roadRibbonHash === 'string') return node;
+      pending.push(...(node?.children ?? []));
+    }
+    return null;
+  };
+  const geometrySnapshot = mesh => Object.freeze({
+    hash: mesh?.userData?.roadRibbonHash ?? null,
+    attributes: Object.freeze(Object.fromEntries(
+      Object.entries(mesh?.geometry?.attributes ?? {})
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, attribute]) => [
+          name,
+          Object.freeze(Array.from(attribute?.array ?? attribute?.values ?? [])),
+        ]),
+    )),
+    index: Object.freeze(Array.from(
+      mesh?.geometry?.index?.array ?? mesh?.geometry?.index ?? [],
+    )),
+    groups: Object.freeze((mesh?.geometry?.groups ?? []).map(group => Object.freeze({
+      start: group.start,
+      count: group.count,
+      materialIndex: group.materialIndex,
+    }))),
+  });
+  const createPresentation = async (scene, nearIds) => createLocalTerrainTestPresentation(scene, {
+    incrementalStaticTreePages: true,
+    getNearVisibleStableIds: () => [...nearIds],
+    getCanonicalChunkData: async (chunkX, chunkZ) => (
+      chunkX === 5 && chunkZ === 0 ? source : canonicalChunk(chunkX, chunkZ, [])
+    ),
+  });
+  const syncInput = {
+    ...coverage,
+    quality: 'high',
+    renderDistancePreset: 'current',
+    playerLogicalX: 56,
+    playerLogicalZ: 8,
+  };
+
+  const referenceScene = new DistantTestGroup();
+  const reference = await createPresentation(referenceScene, hiddenNearIds);
+  assert.equal(await reference.sync(syncInput), true);
+  const expectedHalfVisible = geometrySnapshot(findRoadMesh(referenceScene));
+  reference.dispose();
+
+  const nearIds = new Set();
+  const scene = new DistantTestGroup();
+  const presentation = await createPresentation(scene, nearIds);
+  assert.equal(await presentation.sync(syncInput), true);
+  const roadMesh = findRoadMesh(scene);
+  assert.ok(roadMesh);
+  assert.equal(roadMesh.geometry.index instanceof DistantTestFloat32BufferAttribute, true,
+    'typed Road indices must be wrapped in a BufferAttribute before WebGL publication');
+  assert.equal(ArrayBuffer.isView(roadMesh.geometry.index.array), true);
+  const originalGeometry = roadMesh.geometry;
+  const original = geometrySnapshot(roadMesh);
+  assert.notDeepEqual(expectedHalfVisible, original);
+
+  for (const stableId of hiddenNearIds) nearIds.add(stableId);
+  presentation.update(56, 8, coverage.renderOrigin);
+  const queued = presentation.snapshot();
+  assert.ok(queued.roadPresentationQueueLength > 0,
+    'the direct visibility path must retain resumable Road work across frames');
+  assert.equal(roadMesh.geometry, originalGeometry,
+    'OLD Road geometry must remain attached while replacement work is incomplete');
+  assert.deepEqual(geometrySnapshot(roadMesh), original);
+
+  // Reverse before publication. The obsolete half-visible work must not swap
+  // into the scene, and the all-visible canonical typed buffers stay exact.
+  nearIds.clear();
+  for (let frame = 0; frame < 256
+    && presentation.snapshot().roadPresentationQueueLength > 0; frame += 1) {
+    presentation.update(56, 8, coverage.renderOrigin);
+  }
+  const reversed = presentation.snapshot();
+  assert.equal(reversed.roadPresentationQueueLength, 0);
+  assert.ok(reversed.roadPresentationSupersededDiscardCount > 0);
+  assert.deepEqual(geometrySnapshot(roadMesh), original);
+
+  for (const stableId of hiddenNearIds) nearIds.add(stableId);
+  presentation.update(56, 8, coverage.renderOrigin);
+  assert.equal(roadMesh.geometry, originalGeometry);
+  for (let frame = 0; frame < 256
+    && presentation.snapshot().roadPresentationQueueLength > 0; frame += 1) {
+    presentation.update(56, 8, coverage.renderOrigin);
+  }
+  const completed = presentation.snapshot();
+  assert.equal(completed.roadPresentationQueueLength, 0);
+  assert.deepEqual(geometrySnapshot(roadMesh), expectedHalfVisible,
+    'runtime bypass output must be bit-identical to a fresh canonical compose');
+  assert.ok(completed.roadPresentationMaximumUnitMs <= 4,
+    `Road visibility unit ${completed.roadPresentationMaximumUnitMs}ms exceeds 4ms`);
+  assert.ok(completed.roadPresentationMaximumSliceMs <= 8,
+    `Road visibility slice ${completed.roadPresentationMaximumSliceMs}ms exceeds 8ms`);
+  assert.equal(completed.roadPresentationStalePublishCount, 0);
+  assert.equal(completed.roadPresentationOrphanGeometryCount, 0);
+  assert.equal(completed.roadPresentationDoubleDisposeCount, 0);
+  t.diagnostic(JSON.stringify({
+    maximumUnitMs: completed.roadPresentationMaximumUnitMs,
+    maximumSliceMs: completed.roadPresentationMaximumSliceMs,
+    supersededDiscardCount: completed.roadPresentationSupersededDiscardCount,
+    originalHash: original.hash,
+    halfVisibleHash: expectedHalfVisible.hash,
+  }));
+  presentation.dispose();
 });
 
 test('persistent Distant reuses Settlement slots while Natural remains on Static Stream', async t => {
@@ -6432,6 +6659,84 @@ test('incremental Tree pages publish per owner within dirty-range frame budgets'
   presentation.dispose();
 });
 
+test('failed detached Natural owner work is reported and retried without an unhandled rejection', async () => {
+  const candidate = Object.freeze({
+    candidateId: 'detail-v1:vegetation:retry-tree',
+    subtype: 'broadleaf-tree',
+    variationSeed: 0.75,
+    orientationSeed: 0.25,
+    worldPosition: Object.freeze({ x: 88, y: 0.4, z: 8 }),
+    owningChunkCoordinate: Object.freeze({ x: 5, z: 0 }),
+    metadata: Object.freeze({ candidateRadiusMeters: 0.32 }),
+  });
+  const chunk = canonicalChunk(5, 0, []);
+  chunk.vegetationCandidates = [candidate];
+  chunk.presentationLayers.natural = { vegetation: [candidate], rocks: [] };
+  const page = Object.freeze({
+    ownerKey: '5,0',
+    resourceKind: 'presentation',
+    value: Object.freeze(chunk),
+    readyAtMs: performance.now(),
+  });
+  const events = [];
+  const unhandled = [];
+  const onUnhandled = error => unhandled.push(error);
+  let yields = 0;
+  process.on('unhandledRejection', onUnhandled);
+  const scene = new DistantTestGroup();
+  const presentation = await createW8DistantPresentation({
+    THREE: DISTANT_TEST_THREE,
+    scene,
+    worldSeedHash: CANONICAL_WORLD_SEED_HASH,
+    visualAssets: createSilhouetteTestVisualAssets(),
+    findSettlementsNear: async () => [],
+    resolveTemplate: async () => null,
+    getCanonicalChunkData: async () => null,
+    incrementalStaticTreePages: true,
+    yieldToMainThread: () => {
+      yields += 1;
+      if (yields === 1) return Promise.reject(new Error('injected detached build failure'));
+      return new Promise(resolve => setImmediate(resolve));
+    },
+    recordDiagnosticEvent: (name, details) => events.push({ name, details }),
+  });
+  try {
+    const plan = {
+      coverageGeneration: 1,
+      planRevision: 1,
+      planId: 'retry-tree-plan:1',
+      destructionRevision: 'none',
+      quality: 'high',
+      renderDistancePreset: 'current',
+      renderOrigin: { renderOriginChunkX: 0, renderOriginChunkZ: 0 },
+      playerLogicalX: 8,
+      playerLogicalZ: 8,
+      activeDataKeys: [],
+      renderedKeys: [],
+      retainedOwnerKeys: ['5,0'],
+      readyPages: [page],
+    };
+    presentation.applyStaticTreePlan(plan);
+    presentation.update(8, 8, plan.renderOrigin);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].name, 'persistent-natural-owner-build-failed');
+    assert.equal(events[0].details.retryScheduled, true);
+    assert.equal(presentation.snapshot().staticTreePendingOwnerCount, 1);
+
+    for (let frame = 0; frame < 50
+      && presentation.snapshot().staticTreeResidentOwnerCount === 0; frame += 1) {
+      presentation.update(8, 8, plan.renderOrigin);
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(presentation.snapshot().staticTreeResidentOwnerCount, 1);
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    presentation.dispose();
+  }
+});
+
 test('clipmap topology and terrain sampling remain Float32-identical to the pre-refactor path', () => {
   const legacyTopology = legacyClipmapTopology();
   const topology = createW8ClipmapTopology();
@@ -8120,6 +8425,7 @@ test('canonical settlement identity hands off exclusively and destruction surviv
       }),
     },
   ];
+  let cachedSettlementObservation = null;
 
   for (const state of states) {
     nearVisibleStableIds = state.lod === 'near' ? [CANONICAL_BUILDING_ID] : [];
@@ -8155,6 +8461,81 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     assert.equal(snapshot.rootAttached, true);
     assert.equal(snapshot.duplicateVisibleStableIdCount, 0);
     assert.equal(scene.children[0].children.length, 1);
+    if (cachedSettlementObservation === null) {
+      const firstObservation = presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 1,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      });
+      const nextFrameObservation = presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 2,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      });
+      assert.equal(nextFrameObservation, firstObservation,
+        'frame sequence is not a Settlement content revision');
+      assert.equal(firstObservation.generationEpoch, firstObservation.presentationRevision);
+      assert.equal(firstObservation.featureDamageRevision, activeState.featureDamageRevision);
+      assert.equal(firstObservation.stateRevision, activeState.featureDamageRevision);
+      assert.equal(firstObservation.ownerRevision > 0, true);
+      const publicationKinds = Object.freeze([
+        'building', 'settlement-road', 'metadata-remote',
+      ]);
+      const stage = observation => Object.freeze({
+        observation,
+        contentHash: observation.contentHash,
+        originGeneration: presentation.snapshot().runtimeTransitionGeneration ?? undefined,
+        renderDistancePreset: observation.renderDistancePreset,
+        renderDistanceRevision: observation.renderDistanceRevision,
+        planId: 'settlement-publication-cache-test',
+      });
+      assert.equal(presentation.claimBuildingSettlementPublication(stage(firstObservation), {
+        publicationKinds,
+        observation: firstObservation,
+        currentObservation: firstObservation,
+        stateRevision: activeState.featureDamageRevision,
+        renderDistanceRevision: 0,
+      }), true, 'the canonical observation must be claimable by the shared publication plan');
+      const sharedObservation = presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 3,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      });
+      assert.notEqual(sharedObservation, firstObservation);
+      assert.notEqual(sharedObservation.contentHash, firstObservation.contentHash);
+      assert.equal(sharedObservation.publicationSource, 'shared-streaming-plan');
+      assert.equal(sharedObservation.publicationPlanId, 'settlement-publication-cache-test');
+      assert.equal(presentation.claimBuildingSettlementPublication(stage(sharedObservation), {
+        publicationKinds,
+        observation: sharedObservation,
+        currentObservation: sharedObservation,
+        stateRevision: activeState.featureDamageRevision,
+        renderDistanceRevision: 0,
+      }), true);
+      assert.equal(presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 4,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      }), sharedObservation, 'an idempotent publication claim must retain snapshot reuse');
+
+      assert.equal(presentation.useLegacyBuildingSettlementPublication(), true);
+      const legacyObservation = presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 5,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      });
+      assert.notEqual(legacyObservation, sharedObservation);
+      assert.notEqual(legacyObservation.contentHash, sharedObservation.contentHash);
+      assert.equal(legacyObservation.publicationSource, 'legacy-distant-root');
+      assert.equal(legacyObservation.publicationPlanId, null);
+      assert.equal(presentation.useLegacyBuildingSettlementPublication(), true);
+      assert.equal(presentation.settlementStreamingShadowSnapshot({
+        frameSequence: 6,
+        renderDistanceRevision: 0,
+        stateRevision: activeState.featureDamageRevision,
+      }), legacyObservation, 'an idempotent legacy selection must retain snapshot reuse');
+      cachedSettlementObservation = firstObservation;
+    }
   }
 
   presentation.update(1_000, 1_000, {
@@ -8220,6 +8601,17 @@ test('canonical settlement identity hands off exclusively and destruction surviv
     renderOriginChunkX: 0,
     renderOriginChunkZ: 0,
   });
+  const destroyedSettlementObservation = presentation.settlementStreamingShadowSnapshot({
+    frameSequence: 100,
+    renderDistanceRevision: 0,
+    stateRevision: activeState.featureDamageRevision,
+  });
+  assert.notEqual(destroyedSettlementObservation, cachedSettlementObservation);
+  assert.ok(destroyedSettlementObservation.featureDamageRevision
+    > cachedSettlementObservation.featureDamageRevision);
+  assert.equal(destroyedSettlementObservation.damageStates.find(
+    state => state.stableId === CANONICAL_BUILDING_ID,
+  )?.destroyed, true);
   assert.equal(presentation.canonicalAuditSnapshot()[0].visibleLod, 'destroyed');
   assert.equal(presentation.snapshot().visibleCanonicalObjectCount, 0);
   assert.equal(await presentation.sync(canonicalSyncInput({

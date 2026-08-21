@@ -221,6 +221,7 @@ export function createWorldGenerationScheduler({
   agingIntervalMs = 250,
   terminalRetentionMs = 5_000,
   terminalCapacity = 512,
+  shutdownDrainTimeoutMs = 1_000,
   onEvent = null,
 } = {}) {
   if (typeof clock !== 'function') throw new TypeError('World generation scheduler clock is required');
@@ -233,6 +234,9 @@ export function createWorldGenerationScheduler({
   if (!Number.isSafeInteger(terminalCapacity) || terminalCapacity < 1) {
     throw new RangeError('terminalCapacity must be a positive safe integer');
   }
+  if (!Number.isFinite(shutdownDrainTimeoutMs) || shutdownDrainTimeoutMs < 0) {
+    throw new RangeError('shutdownDrainTimeoutMs must be a finite non-negative number');
+  }
   if (onEvent !== null && typeof onEvent !== 'function') throw new TypeError('onEvent must be a function');
 
   const queued = [];
@@ -242,8 +246,11 @@ export function createWorldGenerationScheduler({
   let sequence = 0;
   let dispatchScheduled = false;
   let isShutdown = false;
+  let shutdownPromise = null;
   let drainResolve = null;
   let maximumBacklog = 0;
+  let observerDisabled = false;
+  let lastObserverFailure = null;
   const counts = {
     scheduled: 0,
     started: 0,
@@ -255,12 +262,27 @@ export function createWorldGenerationScheduler({
     deadlineMisses: 0,
     agedStarts: 0,
     agingSteps: 0,
+    cancelRequests: 0,
+    checkpointCancelAcknowledgements: 0,
+    cancellationsSettledWithoutCheckpoint: 0,
+    preemptionRequests: 0,
+    preemptionAcknowledgements: 0,
+    shutdownDrainTimeouts: 0,
   };
 
   const now = () => finiteTime(Number(clock()), 'scheduler clock');
   const emit = event => {
-    if (!onEvent) return;
-    try { onEvent(Object.freeze(event)); } catch { /* diagnostics must not affect generation */ }
+    if (!onEvent || observerDisabled) return;
+    try {
+      onEvent(Object.freeze(event));
+    } catch (error) {
+      observerDisabled = true;
+      lastObserverFailure = Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        observedAtMs: now(),
+      });
+    }
   };
   const pruneTerminal = timestamp => {
     for (const [key, value] of terminal) {
@@ -282,6 +304,12 @@ export function createWorldGenerationScheduler({
   } = {}) => {
     if (TERMINAL_STATES.has(entry.state)) return;
     const terminalAtMs = now();
+    if (state === WORLD_GENERATION_STATE.CANCELLED
+      && entry.cancellationRequestedAtMs !== null
+      && entry.cancellationAcknowledgedAtMs === null) {
+      entry.cancellationAcknowledgedAtMs = terminalAtMs;
+      counts.cancellationsSettledWithoutCheckpoint += 1;
+    }
     entry.state = state;
     entry.terminalAtMs = terminalAtMs;
     entry.cancellationReason = reason;
@@ -299,6 +327,15 @@ export function createWorldGenerationScheduler({
       value: state === WORLD_GENERATION_STATE.COMPLETED ? value : null,
       error: state === WORLD_GENERATION_STATE.FAILED ? error : null,
       cancellationReason: state === WORLD_GENERATION_STATE.CANCELLED ? reason : null,
+      cancellationRequestedAtMs: entry.cancellationRequestedAtMs,
+      cancellationAcknowledgedAtMs: entry.cancellationAcknowledgedAtMs,
+      cancellationAcknowledgementMs: entry.cancellationRequestedAtMs !== null
+        && entry.cancellationAcknowledgedAtMs !== null
+        ? Math.max(0, entry.cancellationAcknowledgedAtMs - entry.cancellationRequestedAtMs)
+        : null,
+      cancellationAcknowledgedAtCheckpoint: entry.cancellationAcknowledgedAtCheckpoint,
+      cancellationCheckpointSite: entry.cancellationCheckpointSite,
+      preemptedByRequestId: entry.preemptedByRequestId,
       queuedAtMs: entry.queuedAtMs,
       startedAtMs: entry.startedAtMs,
       terminalAtMs,
@@ -312,6 +349,12 @@ export function createWorldGenerationScheduler({
       operationKind: result.operationKind,
       state: result.state,
       cancellationReason: result.cancellationReason,
+      cancellationRequestedAtMs: result.cancellationRequestedAtMs,
+      cancellationAcknowledgedAtMs: result.cancellationAcknowledgedAtMs,
+      cancellationAcknowledgementMs: result.cancellationAcknowledgementMs,
+      cancellationAcknowledgedAtCheckpoint: result.cancellationAcknowledgedAtCheckpoint,
+      cancellationCheckpointSite: result.cancellationCheckpointSite,
+      preemptedByRequestId: result.preemptedByRequestId,
       errorName: error?.name ?? null,
       errorMessage: error?.message ?? null,
       queuedAtMs: result.queuedAtMs,
@@ -362,8 +405,34 @@ export function createWorldGenerationScheduler({
       get aborted() { return entry.cancelRequested; },
       get reason() { return entry.cancellationReason; },
     });
-    const checkpoint = () => {
-      if (entry.cancelRequested) throw new WorldGenerationCancellationError(entry.cancellationReason);
+    const acknowledgeCancellationAtCheckpoint = details => {
+      if (entry.cancellationAcknowledgedAtMs !== null) return;
+      const acknowledgedAtMs = now();
+      entry.cancellationAcknowledgedAtMs = acknowledgedAtMs;
+      entry.cancellationAcknowledgedAtCheckpoint = true;
+      entry.cancellationCheckpointSite = details?.site ?? null;
+      counts.checkpointCancelAcknowledgements += 1;
+      if (entry.preemptedByRequestId !== null) counts.preemptionAcknowledgements += 1;
+      emit({
+        type: 'cancel-acknowledged',
+        envelope: entry.envelope,
+        state: entry.state,
+        cancellationReason: entry.cancellationReason,
+        cancellationRequestedAtMs: entry.cancellationRequestedAtMs,
+        cancellationAcknowledgedAtMs: acknowledgedAtMs,
+        cancellationAcknowledgementMs: entry.cancellationRequestedAtMs === null
+          ? null : Math.max(0, acknowledgedAtMs - entry.cancellationRequestedAtMs),
+        cancellationAcknowledgedAtCheckpoint: true,
+        cancellationCheckpointSite: entry.cancellationCheckpointSite,
+        preemptedByRequestId: entry.preemptedByRequestId,
+        backlog: backlog(),
+      });
+    };
+    const checkpoint = (details = null) => {
+      if (entry.cancelRequested) {
+        acknowledgeCancellationAtCheckpoint(details);
+        throw new WorldGenerationCancellationError(entry.cancellationReason);
+      }
     };
     const executionContext = Object.freeze({
       signal,
@@ -380,7 +449,11 @@ export function createWorldGenerationScheduler({
       .then(() => { checkpoint(); return entry.execute(executionContext); })
       .then(value => { checkpoint(); transitionTerminal(entry, WORLD_GENERATION_STATE.COMPLETED, { value }); })
       .catch(error => {
-        if (isWorldGenerationCancellation(error) || entry.cancelRequested) {
+        if (entry.cancellationCallbackError) {
+          transitionTerminal(entry, WORLD_GENERATION_STATE.FAILED, {
+            error: entry.cancellationCallbackError,
+          });
+        } else if (isWorldGenerationCancellation(error) && entry.cancelRequested) {
           transitionTerminal(entry, WORLD_GENERATION_STATE.CANCELLED, {
             reason: entry.cancellationReason ?? error?.reason ?? 'cancelled',
           });
@@ -408,10 +481,24 @@ export function createWorldGenerationScheduler({
     dispatchScheduled = true;
     scheduleMicrotask(dispatch);
   }
-  const cancelEntry = (entry, reason) => {
+  const cancelEntry = (entry, reason, { preemptedByRequestId = null } = {}) => {
     if (!entry || TERMINAL_STATES.has(entry.state) || entry.cancelRequested) return false;
+    const cancellationRequestedAtMs = now();
     entry.cancelRequested = true;
     entry.cancellationReason = reason;
+    entry.cancellationRequestedAtMs = cancellationRequestedAtMs;
+    entry.preemptedByRequestId = preemptedByRequestId;
+    counts.cancelRequests += 1;
+    if (preemptedByRequestId !== null) counts.preemptionRequests += 1;
+    emit({
+      type: 'cancel-requested',
+      envelope: entry.envelope,
+      state: entry.state,
+      cancellationReason: reason,
+      cancellationRequestedAtMs,
+      preemptedByRequestId,
+      backlog: backlog(),
+    });
     if (entry.state === WORLD_GENERATION_STATE.QUEUED) {
       const index = queued.indexOf(entry);
       if (index >= 0) queued.splice(index, 1);
@@ -419,9 +506,39 @@ export function createWorldGenerationScheduler({
       transitionTerminal(entry, WORLD_GENERATION_STATE.CANCELLED, { reason });
     } else {
       counts.inFlightCancelled += 1;
-      try { entry.onCancel?.(reason, entry.envelope); } catch { /* cancellation is best-effort */ }
+      try {
+        entry.onCancel?.(reason, entry.envelope);
+      } catch (error) {
+        entry.cancellationCallbackError = error instanceof Error
+          ? error : new Error(String(error));
+        emit({
+          type: 'cancel-callback-failed',
+          envelope: entry.envelope,
+          state: entry.state,
+          cancellationReason: reason,
+          cancellationRequestedAtMs,
+          error: entry.cancellationCallbackError,
+          backlog: backlog(),
+        });
+      }
     }
     return true;
+  };
+  const preemptActiveFor = contender => {
+    if (!inFlight || inFlight.cancelRequested || inFlight.envelope.required
+      || !contender.envelope.required) return false;
+    const timestamp = now();
+    if (compareWorldGenerationRequests(
+      contender,
+      inFlight,
+      timestamp,
+      { agingIntervalMs },
+    ) >= 0) return false;
+    return cancelEntry(
+      inFlight,
+      `preempted-by-higher-priority:${contender.envelope.requestId}`,
+      { preemptedByRequestId: contender.envelope.requestId },
+    );
   };
 
   const schedule = ({ envelope, execute, onCancel = null } = {}) => {
@@ -449,6 +566,12 @@ export function createWorldGenerationScheduler({
       terminalAtMs: null,
       cancelRequested: false,
       cancellationReason: null,
+      cancellationRequestedAtMs: null,
+      cancellationAcknowledgedAtMs: null,
+      cancellationAcknowledgedAtCheckpoint: false,
+      cancellationCheckpointSite: null,
+      preemptedByRequestId: null,
+      cancellationCallbackError: null,
       priorityAgingSteps: 0,
       backlogAtStart: null,
     };
@@ -460,6 +583,7 @@ export function createWorldGenerationScheduler({
       type: 'queued', envelope: normalized, state: entry.state,
       queuedAtMs, backlog: backlog(),
     });
+    preemptActiveFor(entry);
     scheduleDispatch();
     return Object.freeze({
       requestId: normalized.requestId,
@@ -469,8 +593,12 @@ export function createWorldGenerationScheduler({
     });
   };
 
-  const cancel = ({ requestId, reason = 'cancelled' } = {}) => (
-    cancelEntry(active.get(requestKey(requestId)), reason)
+  const cancel = ({
+    requestId,
+    reason = 'cancelled',
+    preemptedByRequestId = null,
+  } = {}) => (
+    cancelEntry(active.get(requestKey(requestId)), reason, { preemptedByRequestId })
   );
   const cancelWhere = (predicate, reason = 'cancelled') => {
     if (typeof predicate !== 'function') throw new TypeError('cancelWhere predicate is required');
@@ -496,11 +624,28 @@ export function createWorldGenerationScheduler({
       agingIntervalMs,
       terminalRetentionMs,
       terminalCapacity,
+      shutdownDrainTimeoutMs,
       queuedCount: queued.length,
       inFlightCount: inFlight ? 1 : 0,
       inFlightRequestId: inFlight?.envelope.requestId ?? null,
+      inFlight: inFlight ? Object.freeze({
+        requestId: inFlight.envelope.requestId,
+        operationKind: inFlight.envelope.operationKind,
+        priority: inFlight.envelope.priority,
+        priorityClass: inFlight.envelope.priorityClass,
+        required: inFlight.envelope.required,
+        startedAtMs: inFlight.startedAtMs,
+        cancelRequested: inFlight.cancelRequested,
+        cancellationReason: inFlight.cancellationReason,
+        cancellationRequestedAtMs: inFlight.cancellationRequestedAtMs,
+        cancellationAcknowledgedAtMs: inFlight.cancellationAcknowledgedAtMs,
+        preemptedByRequestId: inFlight.preemptedByRequestId,
+      }) : null,
       backlog: backlog(),
       maximumBacklog,
+      observerFailureCount: lastObserverFailure ? 1 : 0,
+      observerCircuitBreaker: observerDisabled,
+      lastObserverFailure,
       queued: Object.freeze(ranked.map(entry => Object.freeze({
         requestId: entry.envelope.requestId,
         operationKind: entry.envelope.operationKind,
@@ -512,7 +657,15 @@ export function createWorldGenerationScheduler({
       counts: Object.freeze({ ...counts }),
     });
   };
-  const shutdown = async ({ reason = 'shutdown', cancelInFlight = true } = {}) => {
+  const shutdown = ({
+    reason = 'shutdown',
+    cancelInFlight = true,
+    drainTimeoutMs = shutdownDrainTimeoutMs,
+  } = {}) => {
+    if (!Number.isFinite(drainTimeoutMs) || drainTimeoutMs < 0) {
+      throw new RangeError('shutdown drainTimeoutMs must be a finite non-negative number');
+    }
+    if (shutdownPromise) return shutdownPromise;
     if (!isShutdown) {
       isShutdown = true;
       for (const entry of [...active.values()]) {
@@ -521,8 +674,24 @@ export function createWorldGenerationScheduler({
         }
       }
     }
-    if (active.size === 0 && !inFlight) return;
-    await new Promise(resolve => { drainResolve = resolve; resolveDrainIfIdle(); });
+    shutdownPromise = (async () => {
+      if (active.size === 0 && !inFlight) return true;
+      let timeoutId = null;
+      const drained = await Promise.race([
+        new Promise(resolve => {
+          drainResolve = () => resolve(true);
+          resolveDrainIfIdle();
+        }),
+        new Promise(resolve => {
+          timeoutId = globalThis.setTimeout?.(() => resolve(false), drainTimeoutMs) ?? null;
+          if (timeoutId === null) resolve(false);
+        }),
+      ]);
+      if (timeoutId !== null) globalThis.clearTimeout?.(timeoutId);
+      if (!drained) counts.shutdownDrainTimeouts += 1;
+      return drained;
+    })();
+    return shutdownPromise;
   };
 
   return Object.freeze({ schedule, cancel, cancelWhere, snapshot, shutdown });

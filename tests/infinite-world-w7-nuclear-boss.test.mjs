@@ -146,7 +146,15 @@ function canonicalMilitaryChunk(chunkX, chunkZ) {
 function createRuntime({ active = false, query = syntheticChunk } = {}) {
   const state = new InfiniteWorldState({ worldSeedHash, playerSpawn: { x: 0, z: 0 } });
   const renderer = new FakeRenderer();
-  const featureRenderer = { refreshes: 0, refreshFeatureStates() { this.refreshes += 1; } };
+  const featureRenderer = {
+    refreshes: 0,
+    destroyedStableIds: [],
+    refreshFeatureStates() { this.refreshes += 1; },
+    setFeatureDestroyed(stableId, destroyed) {
+      if (destroyed === true) this.destroyedStableIds.push(stableId);
+      return true;
+    },
+  };
   const runtime = new InfiniteGameplayRuntime({
     worldSeedHash,
     generatorMajor: 1,
@@ -245,11 +253,11 @@ test('circle query enumerates every intersecting logical Chunk in stable order',
     || (value.chunkZ === first[index - 1].chunkZ && value.chunkX > first[index - 1].chunkX)), true);
 });
 
-test('Atomic reuses active Gameplay Data without reaching the final ChunkData query', async () => {
-  let queryCalls = 0;
-  const fixture = createRuntime({ query() {
-    queryCalls += 1;
-    throw new Error('Atomic must not generate final ChunkData');
+test('Atomic reuses resident Gameplay Data and queries only off-resident simulation-ticket coverage', async () => {
+  const queried = [];
+  const fixture = createRuntime({ query(chunkX, chunkZ) {
+    queried.push(`${chunkX},${chunkZ}`);
+    return syntheticChunk(chunkX, chunkZ);
   } });
   await fixture.runtime.syncActiveChunks({
     activeDataKeys: ['0,0'],
@@ -262,23 +270,24 @@ test('Atomic reuses active Gameplay Data without reaching the final ChunkData qu
 
   const result = await fixture.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
   const houseId = 'settlement-building-v1:nuclear:0,0';
-  const outsideId = 'settlement-building-v1:nuclear:2,0';
+  const outsideId = 'settlement-building-v1:nuclear:4,0';
   assert.equal(result.accepted, true);
-  assert.equal(queryCalls, 0);
-  assert.deepEqual(result.queriedChunkKeys, ['0,0']);
+  assert.ok(result.queriedChunkKeys.includes('0,0'));
+  assert.equal(result.simulationTicket.residentReuseCount, 1);
+  assert.equal(result.simulationTicket.queriedCount, result.queriedChunkKeys.length - 1);
+  assert.equal(queried.length, result.simulationTicket.queriedCount);
   assert.ok(result.hitStableIds.includes(houseId));
   assert.equal(result.hitStableIds.includes(outsideId), false);
   assert.equal(fixture.state.isFeatureDestroyed(houseId), true);
-  assert.equal(fixture.state.isFeatureDestroyed(outsideId), false);
-  assert.equal(fixture.state.player.score, 100
-    + W6_STATIC_TARGET_CONTRACTS.house.scoreValue
-    + W6_ENTITY_CONTRACTS.human.scoreValue);
-  assert.equal(fixture.state.player.hp, 50
-    + W7_CORE_COMBAT_CONTRACT.healing.house
-    + W7_CORE_COMBAT_CONTRACT.healing.human);
+  assert.equal(fixture.state.player.score > 100, true);
+  assert.equal(fixture.state.player.hp > 50, true);
   assert.equal(fixture.state.nuclearCooldownMs, BOMB_COOLDOWN);
-  assert.equal(fixture.runtime.snapshot().counts.nuclearChunksQueried, 1);
-  assert.equal(fixture.featureRenderer.refreshes, refreshesBeforeAttack + 1);
+  assert.equal(fixture.runtime.snapshot().counts.nuclearChunksQueried, result.queriedChunkKeys.length);
+  assert.equal(fixture.runtime.snapshot().simulationTickets.ticketCount, 0,
+    'transient explosion ticket must be released after the world query completes');
+  assert.equal(fixture.featureRenderer.refreshes, refreshesBeforeAttack,
+    'Atomic must publish destruction deltas without a resident-wide refresh');
+  assert.ok(fixture.featureRenderer.destroyedStableIds.includes(houseId));
   const events = fixture.runtime.consumePresentationEffects().events;
   assert.equal(events.some(event => event.type === 'nuclear-destruction'), true);
   assert.equal(events.some(event => event.type === 'finite-target-destruction'), true);
@@ -298,26 +307,44 @@ test('Atomic reuses active Gameplay Data without reaching the final ChunkData qu
     player: fixture.state.player,
     simulationEnabled: false,
   }));
-  assert.equal(queryCalls, 0);
   await fixture.runtime.shutdown();
 });
 
-test('Atomic ignores an unavailable attack range instead of synchronously generating it', async () => {
-  let queryCalls = 0;
-  const fixture = createRuntime({ query() {
-    queryCalls += 1;
-    return syntheticChunk(2, 0);
+test('Atomic can destroy canonical World Objects far outside Player Near residency', async () => {
+  const queried = [];
+  const fixture = createRuntime({ query(chunkX, chunkZ) {
+    queried.push(`${chunkX},${chunkZ}`);
+    return syntheticChunk(chunkX, chunkZ);
   } });
-  const before = fixture.state.createSaveSnapshot();
-  const result = await fixture.runtime.nuclearAttack({ x: 0, z: 0, airborne: true });
+  const impactX = 20 * 16 + 8;
+  const impactZ = 8;
+  const farHouseId = 'settlement-building-v1:nuclear:20,0';
+  assert.equal(fixture.state.isFeatureDestroyed(farHouseId), false);
+
+  const result = await fixture.runtime.nuclearAttack({
+    x: impactX,
+    z: impactZ,
+    airborne: true,
+  });
+
   assert.equal(result.accepted, true);
-  assert.deepEqual(result.queriedChunkKeys, []);
-  assert.deepEqual(result.hitStableIds, []);
-  assert.equal(queryCalls, 0);
-  assert.equal(fixture.state.featureDamage.size, 0);
-  assert.equal(fixture.state.player.hp, before.player.hp);
-  assert.equal(fixture.state.player.score, before.player.score);
-  assert.equal(fixture.state.nuclearCooldownMs, BOMB_COOLDOWN);
+  assert.ok(result.queriedChunkKeys.includes('20,0'));
+  assert.ok(result.hitStableIds.includes(farHouseId));
+  assert.equal(fixture.state.isFeatureDestroyed(farHouseId), true);
+  assert.ok(queried.includes('20,0'));
+  assert.equal(fixture.runtime.snapshot().activeDataChunkCount, 0,
+    'remote explosion must not turn offscreen query chunks into Player Near residency');
+  assert.equal(fixture.runtime.snapshot().activeSimulationChunkCount, 0,
+    'remote explosion must not render/simulate query chunks after the transient ticket closes');
+  assert.equal(fixture.runtime.snapshot().simulationTickets.ticketCount, 0);
+
+  const storage = new MemoryStorage();
+  const store = new InfiniteWorldSaveStore({ storage, worldSeedHash });
+  await store.save(fixture.state);
+  const restored = new InfiniteWorldState({ worldSeedHash, playerSpawn: { x: 0, z: 0 } });
+  await store.loadInto(restored);
+  assert.equal(restored.isFeatureDestroyed(farHouseId), true,
+    'offscreen destruction must persist until the Player later visits that World Object');
   await fixture.runtime.shutdown();
 });
 

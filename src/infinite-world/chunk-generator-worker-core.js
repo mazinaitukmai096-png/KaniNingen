@@ -13,9 +13,53 @@ import {
   createWorldGenerationScheduler,
   isWorldGenerationCancellation,
   normalizeWorldGenerationRequestEnvelope,
+  WORLD_GENERATION_STATE,
 } from './world-generation-scheduler.js';
 
 const WORKER_SCHEDULER_CLOCK_SCHEMA = 'worker-scheduler-clock-1';
+const SHARED_CANCELLATION_FLAG_INDEX = 0;
+const SHARED_CANCELLATION_PREEMPTOR_INDEX = 1;
+const SHARED_CANCELLATION_WORD_COUNT = 2;
+
+function createWorkerMacrotaskYielder() {
+  let channel = null;
+  const pending = [];
+  const yieldMacrotask = () => {
+    if (typeof globalThis.scheduler?.yield === 'function') return globalThis.scheduler.yield();
+    if (typeof globalThis.MessageChannel === 'function') {
+      if (!channel) {
+        channel = new globalThis.MessageChannel();
+        channel.port1.onmessage = () => pending.shift()?.();
+        channel.port1.start?.();
+      }
+      return new Promise(resolve => {
+        pending.push(resolve);
+        channel.port2.postMessage(null);
+      });
+    }
+    return new Promise(resolve => globalThis.setTimeout(resolve, 0));
+  };
+  const close = () => {
+    channel?.port1?.close?.();
+    channel?.port2?.close?.();
+    channel = null;
+    for (const resolve of pending.splice(0)) resolve();
+  };
+  return Object.freeze({ yieldMacrotask, close });
+}
+
+function sharedCancellationView(request) {
+  if (typeof globalThis.SharedArrayBuffer !== 'function'
+    || typeof globalThis.Atomics?.load !== 'function'
+    || !(request?.sharedCancellationBuffer instanceof globalThis.SharedArrayBuffer)
+    || request.sharedCancellationBuffer.byteLength
+      < Int32Array.BYTES_PER_ELEMENT * SHARED_CANCELLATION_WORD_COUNT) return null;
+  return new Int32Array(
+    request.sharedCancellationBuffer,
+    0,
+    SHARED_CANCELLATION_WORD_COUNT,
+  );
+}
 
 function clock() {
   return globalThis.performance?.now?.() ?? Date.now();
@@ -88,6 +132,40 @@ function errorResponse(error, request) {
   };
 }
 
+function cancellationResponse(result, request) {
+  const responseSentAtMs = clock();
+  return {
+    type: CHUNK_GENERATOR_MESSAGE.ERROR,
+    protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
+    requestId: request?.requestId ?? result?.requestId ?? null,
+    serviceGeneration: request?.serviceGeneration ?? null,
+    name: 'WorldGenerationCancellationError',
+    code: 'WORLD_GENERATION_CANCELLED',
+    message: `World generation cancelled: ${result?.cancellationReason ?? 'cancelled'}`,
+    recoverable: true,
+    cancelled: true,
+    cancellationReason: result?.cancellationReason ?? 'cancelled',
+    workerTimeOriginMs: clockOrigin(),
+    responseSentAtMs,
+    scheduler: Object.freeze({
+      operationKind: result?.operationKind ?? request?.scheduler?.operationKind ?? null,
+      queuedAtMs: result?.queuedAtMs ?? null,
+      startedAtMs: result?.startedAtMs ?? null,
+      terminalAtMs: result?.terminalAtMs ?? null,
+      queueTimeMs: result?.queueTimeMs ?? null,
+      deadlineMiss: result?.deadlineMiss === true,
+      backlogAtStart: result?.backlogAtStart ?? null,
+      cancellationRequestedAtMs: result?.cancellationRequestedAtMs ?? null,
+      cancellationAcknowledgedAtMs: result?.cancellationAcknowledgedAtMs ?? null,
+      cancellationAcknowledgementMs: result?.cancellationAcknowledgementMs ?? null,
+      cancellationAcknowledgedAtCheckpoint:
+        result?.cancellationAcknowledgedAtCheckpoint === true,
+      cancellationCheckpointSite: result?.cancellationCheckpointSite ?? null,
+      preemptedByRequestId: result?.preemptedByRequestId ?? null,
+    }),
+  };
+}
+
 function generationRequestKey(request) {
   if (request?.type === CHUNK_GENERATOR_MESSAGE.GENERATE_CANONICAL_TREE_CELL) {
     return createCanonicalTreeCellRequestKey(request.macroX, request.macroZ);
@@ -106,6 +184,7 @@ export function createChunkGeneratorWorkerCore({
   let isShutdown = false;
   let roadTimingRecorder = null;
   const forestHorizonCancelledBeforeEpoch = new Map();
+  const macrotaskYielder = createWorkerMacrotaskYielder();
   const schedulerClock = schedulerOptions?.clock ?? clock;
   const scheduler = createWorldGenerationScheduler({
     ...(schedulerOptions ?? {}),
@@ -307,6 +386,38 @@ export function createChunkGeneratorWorkerCore({
     schedulerReceivedAtMs = requestReceivedAtMs,
   ) => {
     if (isShutdown) return;
+    const cancellationView = execution ? sharedCancellationView(request) : null;
+    const synchronizeSharedCancellation = () => {
+      if (!execution || !cancellationView || execution.signal.aborted
+        || Atomics.load(cancellationView, SHARED_CANCELLATION_FLAG_INDEX) === 0) return;
+      const encodedPreemptor = Atomics.load(
+        cancellationView,
+        SHARED_CANCELLATION_PREEMPTOR_INDEX,
+      );
+      const preemptedByRequestId = encodedPreemptor > 0 ? encodedPreemptor : null;
+      scheduler.cancel({
+        requestId: execution.envelope.requestId,
+        reason: preemptedByRequestId === null
+          ? 'shared-control-cancelled'
+          : `preempted-by-higher-priority:${preemptedByRequestId}`,
+        preemptedByRequestId,
+      });
+    };
+    const synchronousCheckpoint = execution ? (details = null) => {
+      synchronizeSharedCancellation();
+      execution.checkpoint(details);
+    } : null;
+    const cooperativeCheckpoint = execution ? async () => {
+      const checkpointDetails = () => execution.signal.aborted ? {
+        site: new Error('Worker cancellation checkpoint').stack ?? null,
+      } : null;
+      synchronousCheckpoint(checkpointDetails());
+      // A synchronous checkpoint cannot observe a cancel message while the
+      // Worker is running one long JavaScript turn. Yield at explicit phase
+      // boundaries, then check again after the Worker message queue advances.
+      await macrotaskYielder.yieldMacrotask();
+      synchronousCheckpoint(checkpointDetails());
+    } : null;
     try {
       if (request?.protocolVersion !== CHUNK_GENERATOR_PROTOCOL_VERSION) {
         throw new Error(`unsupported Chunk generator protocol: ${request?.protocolVersion}`);
@@ -331,6 +442,7 @@ export function createChunkGeneratorWorkerCore({
         return;
       }
       if (!generator || request.serviceGeneration !== serviceGeneration) return;
+      synchronizeSharedCancellation();
       execution?.checkpoint();
       if (request.type === CHUNK_GENERATOR_MESSAGE.GENERATE) {
         const stageRecorder = request.pipelineDiagnostics === true
@@ -339,7 +451,8 @@ export function createChunkGeneratorWorkerCore({
         const startedAt = clock();
         const chunkData = await generator.generateChunk(request.chunkX, request.chunkZ, {
           scheduler: execution?.envelope ?? null,
-          checkpoint: execution?.checkpoint ?? null,
+          checkpoint: synchronousCheckpoint,
+          cooperativeCheckpoint,
           ...(stageRecorder ? { stageRecorder } : {}),
           ...(roadTimingContext ? { roadTimingContext } : {}),
         });
@@ -385,14 +498,16 @@ export function createChunkGeneratorWorkerCore({
         const manifest = typeof generator.generateForestHorizonManifest === 'function'
           ? await generator.generateForestHorizonManifest(request.chunkX, request.chunkZ, {
             scheduler: execution?.envelope ?? null,
-            checkpoint: execution?.checkpoint ?? null,
+            checkpoint: synchronousCheckpoint,
+            cooperativeCheckpoint,
             ...(stageRecorder ? { stageRecorder } : {}),
             ...(roadTimingContext ? { roadTimingContext } : {}),
           })
           : createW8ForestHorizonManifest(
             await generator.generateChunk(request.chunkX, request.chunkZ, {
               scheduler: execution?.envelope ?? null,
-              checkpoint: execution?.checkpoint ?? null,
+              checkpoint: synchronousCheckpoint,
+              cooperativeCheckpoint,
               ...(stageRecorder ? { stageRecorder } : {}),
               ...(roadTimingContext ? { roadTimingContext } : {}),
             }),
@@ -436,6 +551,11 @@ export function createChunkGeneratorWorkerCore({
         const presentationOwner = await generator.generatePresentationOwner(
           request.chunkX,
           request.chunkZ,
+          {
+            scheduler: execution?.envelope ?? null,
+            checkpoint: synchronousCheckpoint,
+            cooperativeCheckpoint,
+          },
         );
         execution?.checkpoint();
         const completedAt = clock();
@@ -478,7 +598,8 @@ export function createChunkGeneratorWorkerCore({
           request.macroZ,
           {
             scheduler: execution?.envelope ?? null,
-            checkpoint: execution?.checkpoint ?? null,
+            checkpoint: synchronousCheckpoint,
+            cooperativeCheckpoint,
           },
         );
         execution?.checkpoint();
@@ -513,11 +634,17 @@ export function createChunkGeneratorWorkerCore({
       }
       if (request.type === CHUNK_GENERATOR_MESSAGE.FIND_SETTLEMENTS) {
         const startedAt = clock();
+        await cooperativeCheckpoint?.();
         const settlements = await generator.distributor.findSettlementsNear(
           request.centerWorldX,
           request.centerWorldZ,
           request.radiusMeters,
+          {
+            checkpoint: synchronousCheckpoint,
+            cooperativeCheckpoint,
+          },
         );
+        await cooperativeCheckpoint?.();
         execution?.checkpoint();
         const completedAt = clock();
         postMessage({
@@ -544,6 +671,8 @@ export function createChunkGeneratorWorkerCore({
         const startedAt = clock();
         const template = await generator.resolveSettlementPresentationTemplate({
           candidate: request.candidate,
+          checkpoint: synchronousCheckpoint,
+          cooperativeCheckpoint,
         });
         execution?.checkpoint();
         const completedAt = clock();
@@ -573,6 +702,8 @@ export function createChunkGeneratorWorkerCore({
           centerWorldX: request.centerWorldX,
           centerWorldZ: request.centerWorldZ,
           radiusMeters: request.radiusMeters,
+          checkpoint: synchronousCheckpoint,
+          cooperativeCheckpoint,
         });
         execution?.checkpoint();
         const completedAt = clock();
@@ -618,8 +749,24 @@ export function createChunkGeneratorWorkerCore({
       }
       throw new Error(`unknown Chunk generator message: ${request.type}`);
     } catch (error) {
-      if (isWorldGenerationCancellation(error)) throw error;
+      if (isWorldGenerationCancellation(error) && execution?.signal.aborted) {
+        // Do not publish the CANCELLED terminal until every nested loader from
+        // this single active request has settled and removed its pending-cache
+        // entry. The successor can then never subscribe to cancelled work.
+        try {
+          await generator?.settleCancelledGeneration?.();
+        } catch (settleError) {
+          postMessage(errorResponse(settleError, request));
+          throw settleError;
+        }
+        throw error;
+      }
       postMessage(errorResponse(error, request));
+      // Scheduled operations must reject back into the Worker scheduler so its
+      // terminal state agrees with the ERROR already sent to the transport.
+      // INITIALIZE and malformed unscheduled messages retain their response-only
+      // behavior because no scheduler lifecycle owns those requests.
+      if (execution) throw error;
     }
   };
 
@@ -675,14 +822,29 @@ export function createChunkGeneratorWorkerCore({
           schedulerReceivedAtMs,
         ),
       });
-      return handle.promise.then(() => undefined);
+      return handle.promise.then(result => {
+        if (result.state === WORLD_GENERATION_STATE.CANCELLED) {
+          postMessage(cancellationResponse(result, request));
+        }
+        return undefined;
+      });
     },
     async shutdown() {
       isShutdown = true;
-      await scheduler.shutdown({ reason: 'worker-core-shutdown', cancelInFlight: false });
-      await generator?.shutdown?.();
-      generator = null;
-      forestHorizonCancelledBeforeEpoch.clear();
+      try {
+        const drained = await scheduler.shutdown({
+          reason: 'worker-core-shutdown',
+          cancelInFlight: true,
+        });
+        if (!drained) {
+          throw new Error('Worker core generation drain timed out');
+        }
+        await generator?.shutdown?.();
+      } finally {
+        generator = null;
+        forestHorizonCancelledBeforeEpoch.clear();
+        macrotaskYielder.close();
+      }
     },
   });
 }

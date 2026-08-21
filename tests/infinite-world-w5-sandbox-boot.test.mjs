@@ -6,6 +6,9 @@ import vm from 'node:vm';
 
 import {
   bootInfiniteWorldSandbox,
+  classifyRuntimeTransitionFault,
+  createRuntimeTransitionFault,
+  createRuntimeTransitionRetryController,
   createOriginTransformDiagnosticRing,
   createTerrainLagSpikeDiagnosticCapture,
   createSandboxBootState,
@@ -14,9 +17,12 @@ import {
   gatePlayerMovementByTerrainCoverage,
   isW8GameplaySimulationEnabled,
   recordSandboxBootFailure,
+  shutdownRuntimeBeforeProjectedUploadStager,
   terrainPresentationWorldCoverageComplete,
+  RUNTIME_TRANSITION_FAULT_CODE,
   w8CloudDeltaSeconds,
 } from '../src/infinite-world/sandbox-boot.js';
+import { createRuntimeFrameSupervisor } from '../src/infinite-world/runtime-frame-supervisor.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
 import { RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY } from '../src/infinite-world/chunk-streaming-plan.js';
 import {
@@ -93,6 +99,38 @@ test('Terrain lag spike diagnostics freeze a bounded five-second window at 4/8/1
   assert.equal(snapshot.preFrames.at(-1).timestampMs, 6_000);
   assert.equal(snapshot.postFrames.at(-1).timestampMs, 11_000);
   assert.equal(snapshot.frameCount, 101);
+});
+
+test('runtime drains before upload stager disposal on shutdown and boot failure', async () => {
+  const events = [];
+  await shutdownRuntimeBeforeProjectedUploadStager({
+    runtime: {
+      async shutdown() {
+        events.push('runtime-start');
+        await Promise.resolve();
+        events.push('runtime-complete');
+      },
+    },
+    projectedUploadStager: {
+      dispose() { events.push('stager-dispose'); },
+    },
+  });
+  assert.deepEqual(events, ['runtime-start', 'runtime-complete', 'stager-dispose']);
+
+  const failureEvents = [];
+  await assert.rejects(shutdownRuntimeBeforeProjectedUploadStager({
+    runtime: {
+      async shutdown() {
+        failureEvents.push('runtime-start');
+        throw new Error('injected runtime shutdown failure');
+      },
+    },
+    projectedUploadStager: {
+      dispose() { failureEvents.push('stager-dispose'); },
+    },
+  }), /injected runtime shutdown failure/);
+  assert.deepEqual(failureEvents, ['runtime-start', 'stager-dispose'],
+    'boot-failure cleanup cannot leak the staging render target');
 });
 
 test('Player terrain coverage fallback preserves movement and retains a safe height until ready', () => {
@@ -248,12 +286,32 @@ class NodeObject {
     this.rotation = new Triple();
     this.scale = new Triple().set(1, 1, 1);
     this.userData = {};
-    this.matrix = {};
+    this.matrix = { elements: new Float32Array([
+      1, 0, 0, 0,
+      0, 1, 0, 0,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    ]) };
   }
   add(child) { this.children.push(child); child.parent = this; }
   remove(child) { this.children = this.children.filter(value => value !== child); child.parent = null; }
-  clear() { this.children = []; }
-  updateMatrix() { this.matrix = { position: { ...this.position }, scale: { ...this.scale } }; }
+  clear() { for (const child of this.children) child.parent = null; this.children = []; }
+  traverse(visitor) {
+    visitor(this);
+    for (const child of this.children) child.traverse(visitor);
+  }
+  updateMatrix() {
+    this.matrix = {
+      position: { ...this.position },
+      scale: { ...this.scale },
+      elements: new Float32Array([
+        this.scale.x, 0, 0, 0,
+        0, this.scale.y, 0, 0,
+        0, 0, this.scale.z, 0,
+        this.position.x, this.position.y, this.position.z, 1,
+      ]),
+    };
+  }
 }
 class Group extends NodeObject {}
 class Scene extends Group {
@@ -275,7 +333,15 @@ class SphereGeometry extends Geometry {}
 class DodecahedronGeometry extends Geometry {}
 class BufferGeometry extends Geometry {}
 class CylinderGeometry extends Geometry {}
-class Float32BufferAttribute { constructor(values, size) { this.values = values; this.size = size; } }
+class Float32BufferAttribute {
+  constructor(values, size) {
+    this.values = values;
+    this.array = values;
+    this.size = size;
+    this.itemSize = size;
+    this.version = 0;
+  }
+}
 class Uint32BufferAttribute { constructor(values, size) { this.values = values; this.size = size; } }
 class InstancedBufferAttribute extends Float32BufferAttribute {}
 class Material {
@@ -292,13 +358,32 @@ class InstancedMesh extends Mesh {
   constructor(geometry, material, capacity) {
     super(geometry, material);
     this.capacity = capacity;
-    this.instanceMatrix = {};
-    this.instanceColor = {};
+    this.count = capacity;
+    this.instanceMatrix = {
+      array: new Float32Array(capacity * 16),
+      itemSize: 16,
+      version: 0,
+    };
+    this.instanceColor = null;
     this.matrices = [];
     this.colors = [];
   }
-  setMatrixAt(index, matrix) { this.matrices[index] = structuredClone(matrix); }
-  setColorAt(index, color) { this.colors[index] = color; }
+  setMatrixAt(index, matrix) {
+    this.matrices[index] = structuredClone(matrix);
+    if (matrix?.elements) this.instanceMatrix.array.set(matrix.elements, index * 16);
+  }
+  setColorAt(index, color) {
+    this.colors[index] = color;
+    if (!this.instanceColor) {
+      this.instanceColor = {
+        array: new Float32Array(this.capacity * 3),
+        itemSize: 3,
+        version: 0,
+      };
+    }
+    const value = Number(color?.value ?? color ?? 0);
+    this.instanceColor.array.set([value, value, value], index * 3);
+  }
 }
 class LineSegments extends Mesh {}
 class Object3D extends NodeObject {}
@@ -311,6 +396,11 @@ class PerspectiveCamera extends NodeObject {
   }
   updateProjectionMatrix() {}
   lookAt() {}
+}
+class OrthographicCamera extends PerspectiveCamera {}
+class WebGLRenderTarget {
+  constructor() { this.texture = {}; }
+  dispose() { this.disposed = true; }
 }
 class HemisphereLight extends NodeObject {}
 class DirectionalLight extends NodeObject {}
@@ -325,6 +415,12 @@ class WebGLRenderer {
     this.renderCount = 0;
     this.compileCount = 0;
     this.domElement = { removed: false, remove() { this.removed = true; } };
+    this.renderTarget = null;
+    this.xr = { enabled: true };
+    this.attributeVersions = new WeakMap();
+    this.attributes = {
+      get: attribute => this.attributeVersions.get(attribute) ?? null,
+    };
     WebGLRenderer.instances.push(this);
   }
   setPixelRatio() {}
@@ -334,7 +430,34 @@ class WebGLRenderer {
     this.compiledScene = scene;
     this.compiledCamera = camera;
   }
-  render() { this.renderCount += 1; }
+  getRenderTarget() { return this.renderTarget; }
+  getActiveCubeFace() { return 0; }
+  getActiveMipmapLevel() { return 0; }
+  setRenderTarget(target) { this.renderTarget = target; }
+  render(scene, camera) {
+    this.renderCount += 1;
+    scene?.traverse?.(object => {
+      for (let current = object; current; current = current.parent) {
+        if (current.visible === false) return;
+      }
+      if (!object?.geometry || !object?.material) return;
+      const attributes = [
+        ...Object.values(object.geometry.attributes ?? {}),
+        object.geometry.index,
+        object.instanceMatrix,
+        object.instanceColor,
+      ];
+      for (const attribute of attributes) {
+        if (!attribute) continue;
+        this.attributeVersions.set(attribute, {
+          version: Number.isSafeInteger(attribute.version) ? attribute.version : 0,
+        });
+        attribute.onUploadCallback?.();
+      }
+      object.onBeforeRender?.(this, scene, camera, object.geometry, object.material, null);
+      object.onAfterRender?.(this, scene, camera, object.geometry, object.material, null);
+    });
+  }
   dispose() { this.disposed = true; }
 }
 
@@ -358,11 +481,13 @@ const FakeThree = {
   LineSegments,
   Object3D,
   PerspectiveCamera,
+  OrthographicCamera,
   HemisphereLight,
   DirectionalLight,
   Color,
   Fog,
   WebGLRenderer,
+  WebGLRenderTarget,
   SRGBColorSpace: 'srgb',
 };
 
@@ -577,6 +702,61 @@ function installBrowserEquivalentEnvironment() {
   };
 }
 
+test('deep beginFrame failure quarantines one observer while 600 renderer frames stay live', async () => {
+  const environment = installBrowserEquivalentEnvironment();
+  globalThis.location.search = '?deepWebglDiagnostics=1&disablePersistentTreePublication=1';
+  let beginFrameCalls = 0;
+  let sandbox = null;
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      webglRenderDiagnosticsFactory() {
+        return Object.freeze({
+          enabled: true,
+          beginFrame() {
+            beginFrameCalls += 1;
+            throw new Error('injected deep beginFrame failure');
+          },
+          finishFrame() {
+            throw new Error('finishFrame cannot run without a capture token');
+          },
+          snapshot: () => Object.freeze({
+            schemaVersion: 'webgl-render-diagnostics-1',
+            enabled: true,
+            supported: true,
+            captureCount: 0,
+          }),
+        });
+      },
+    });
+    let frameNow = performance.now();
+    for (let frame = 0; frame < 600; frame += 1) {
+      const callback = environment.rafCallbacks.at(-1);
+      assert.equal(typeof callback, 'function');
+      callback(frameNow += 16.7);
+    }
+    const snapshot = sandbox.snapshot();
+    assert.equal(beginFrameCalls, 1);
+    assert.equal(snapshot.frameSupervisor.faulted, false);
+    assert.equal(snapshot.frameSupervisor.completedFrameCount, 600);
+    assert.equal(snapshot.frameSupervisor.pending, true);
+    assert.deepEqual(snapshot.runtimeFaults.quarantinedSubsystems,
+      ['webgl-render-diagnostics']);
+    assert.equal(snapshot.runtimeFaults.count, 1);
+    assert.equal(snapshot.runtimeFaults.records[0].subsystem, 'webgl-render-diagnostics');
+    assert.equal(snapshot.runtimeFaults.records[0].stage, 'begin-frame');
+    assert.match(snapshot.runtimeFaults.records[0].error.message,
+      /injected deep beginFrame failure/);
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
+
 function createDeferredValue() {
   let resolvePromise;
   const promise = new Promise(resolveValue => { resolvePromise = resolveValue; });
@@ -631,6 +811,371 @@ function createHeldBootTimers() {
   };
 }
 
+function dispatchHeldTimer(timers, delayMs) {
+  const entry = timers.entries.find(candidate => candidate.active && candidate.delayMs === delayMs);
+  assert.ok(entry, `an active ${delayMs}ms timer is required`);
+  entry.active = false;
+  entry.callback();
+}
+
+function runTransitionRetryFrameHarness({ provisional }) {
+  const timers = createHeldBootTimers();
+  const animationFrames = [];
+  const cancelledFrames = [];
+  const controller = createRuntimeTransitionRetryController({
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  const target = Object.freeze({ ownerKey: '10,20', generation: 8 });
+  let attempts = 0;
+  let publications = 0;
+  let playerDistance = 0;
+  let renderCount = 0;
+
+  const request = () => {
+    const token = controller.beginAttempt(target);
+    if (!token) return false;
+    attempts += 1;
+    const failure = createRuntimeTransitionFault({
+      code: provisional
+        ? RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING
+        : RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+      message: provisional
+        ? 'injected provisional streaming failure'
+        : 'injected committed presentation failure',
+      stage: provisional ? 'provisional-terrain' : 'near-publication',
+    });
+    const outcome = controller.fail(token, failure, { onRetry: request });
+    if (!outcome.terminal) return true;
+    assert.equal(outcome.classification.kind, 'retryable');
+    return true;
+  };
+
+  const supervisor = createRuntimeFrameSupervisor({
+    requestAnimationFrame(callback) {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    },
+    cancelAnimationFrame(id) { cancelledFrames.push(id); },
+    onFrame() {
+      playerDistance += 0.5;
+      renderCount += 1;
+      request();
+    },
+    onFault(error) { assert.fail(error); },
+  });
+  supervisor.start();
+  for (let frame = 0; frame < 600; frame += 1) {
+    const callback = animationFrames.shift();
+    assert.equal(typeof callback, 'function');
+    callback((frame + 1) * 16.7);
+    if (frame === 199 || frame === 399) dispatchHeldTimer(timers, 250);
+  }
+
+  const exhausted = controller.snapshot();
+  assert.equal(attempts, 3, 'initial request plus two retries is the hard maximum');
+  assert.equal(publications, 0, 'a failed attempt cannot publish World state');
+  assert.equal(exhausted.status, 'retry-exhausted');
+  assert.equal(exhausted.attempts, 3);
+  assert.equal(exhausted.scheduledRetryCount, 2);
+  assert.equal(exhausted.timerCount, 0);
+  assert.equal(exhausted.maximumConcurrentTimerCount, 1);
+  assert.equal(supervisor.snapshot().completedFrameCount, 600);
+  assert.equal(supervisor.snapshot().pending, true);
+  assert.equal(renderCount, 600);
+  assert.equal(playerDistance, 300);
+
+  const nextTarget = Object.freeze({ ownerKey: '11,20', generation: 8 });
+  const nextToken = controller.beginAttempt(nextTarget);
+  assert.notEqual(nextToken, null, 'a new owner starts a fresh retry epoch');
+  assert.equal(nextToken.attempt, 1);
+  assert.ok(nextToken.epoch > exhausted.epoch);
+  publications += 1;
+  assert.equal(controller.succeed(nextToken), true);
+  assert.equal(controller.snapshot().status, 'idle');
+  assert.equal(controller.snapshot().timerCount, 0);
+
+  const shutdownToken = controller.beginAttempt({ ownerKey: '12,20', generation: 9 });
+  const shutdownFailure = createRuntimeTransitionFault({
+    code: RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING,
+    message: 'injected pending shutdown retry',
+    stage: 'streaming-shutdown',
+  });
+  controller.fail(shutdownToken, shutdownFailure, { onRetry: request });
+  assert.equal(controller.snapshot().timerCount, 1);
+  controller.shutdown();
+  assert.equal(controller.snapshot().timerCount, 0);
+  assert.equal(controller.snapshot().status, 'shutdown');
+  assert.equal(timers.entries.filter(entry => entry.active && entry.delayMs === 250).length, 0);
+  supervisor.stop();
+  assert.equal(cancelledFrames.length, 1);
+}
+
+for (const provisional of [true, false]) {
+  test(`${provisional ? 'provisional' : 'ordinary'} permanent transition faults are bounded across 600 live frames`, () => {
+    runTransitionRetryFrameHarness({ provisional });
+  });
+}
+
+test('runtime transition classification never infers retryability from error text', () => {
+  const generic = new Error('temporary streaming retryable collision text');
+  assert.deepEqual(classifyRuntimeTransitionFault(generic), {
+    kind: 'fatal',
+    code: 'UNCLASSIFIED_RUNTIME_TRANSITION_FAULT',
+    stage: null,
+  });
+  generic.retryable = true;
+  generic.faultDomain = 'streaming';
+  assert.equal(classifyRuntimeTransitionFault(generic).kind, 'fatal',
+    'retryable metadata without an approved code is not sufficient');
+  const explicitlyNonRetryable = new Error('presentation stage veto');
+  explicitlyNonRetryable.retryable = false;
+  assert.equal(classifyRuntimeTransitionFault(explicitlyNonRetryable).kind, 'fatal');
+  const renderInvariant = createRuntimeTransitionFault({
+    code: RUNTIME_TRANSITION_FAULT_CODE.RUNTIME_INVARIANT,
+    message: 'injected render publication contract violation',
+    stage: 'near-upload-manifest-invariant',
+  });
+  assert.deepEqual(classifyRuntimeTransitionFault(renderInvariant), {
+    kind: 'fatal',
+    code: RUNTIME_TRANSITION_FAULT_CODE.RUNTIME_INVARIANT,
+    stage: 'near-upload-manifest-invariant',
+  });
+});
+
+test('a cleared stale retry callback cannot orphan the new target timer', () => {
+  const timers = createHeldBootTimers();
+  const controller = createRuntimeTransitionRetryController({
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  const failure = createRuntimeTransitionFault({
+    code: RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING,
+    message: 'injected retry timer race',
+    stage: 'streaming-race',
+  });
+  const first = controller.beginAttempt({ ownerKey: '1,0', generation: 2 });
+  controller.fail(first, failure);
+  const staleTimer = timers.entries.at(-1);
+  const second = controller.beginAttempt({ ownerKey: '2,0', generation: 2 });
+  controller.fail(second, failure);
+  const currentTimer = timers.entries.at(-1);
+  assert.notEqual(staleTimer.id, currentTimer.id);
+  assert.equal(staleTimer.active, false);
+  assert.equal(currentTimer.active, true);
+
+  // clearTimeout cannot retract a callback that the host has already queued.
+  // Its stale closure must not clear the handle owned by the newer epoch.
+  staleTimer.callback();
+  assert.equal(controller.snapshot().timerCount, 1);
+  assert.equal(controller.snapshot().status, 'backoff');
+  controller.shutdown();
+  assert.equal(currentTimer.active, false);
+  assert.equal(controller.snapshot().timerCount, 0);
+});
+
+test('canonical collision is fatal-degraded without retry while 600 overlay frames stay live', () => {
+  const timers = createHeldBootTimers();
+  const animationFrames = [];
+  const controller = createRuntimeTransitionRetryController({
+    setTimeoutFn: timers.setTimeoutFn,
+    clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  let attempts = 0;
+  let worldMutationStopped = false;
+  let renderCount = 0;
+  const collision = new Error('injected collision text is not used for classification');
+  collision.name = 'CanonicalWorldInvariantError';
+  collision.code = RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT;
+  collision.faultDomain = 'canonical-world';
+  collision.stage = 'render-registry-preflight';
+  collision.retryable = false;
+  const request = ownerKey => {
+    const token = controller.beginAttempt({ ownerKey, generation: 17 });
+    if (!token) return;
+    attempts += 1;
+    const outcome = controller.fail(token, collision);
+    worldMutationStopped = outcome.terminal && outcome.classification.kind === 'fatal';
+  };
+  const supervisor = createRuntimeFrameSupervisor({
+    requestAnimationFrame(callback) {
+      animationFrames.push(callback);
+      return animationFrames.length;
+    },
+    onFrame() {
+      if (!worldMutationStopped) request('4,-3');
+      renderCount += 1;
+    },
+    onFault(error) { assert.fail(error); },
+  });
+  supervisor.start();
+  for (let frame = 0; frame < 600; frame += 1) {
+    const callback = animationFrames.shift();
+    assert.equal(typeof callback, 'function');
+    callback((frame + 1) * 16.7);
+  }
+  const snapshot = controller.snapshot();
+  assert.equal(attempts, 1);
+  assert.equal(worldMutationStopped, true);
+  assert.equal(snapshot.status, 'fatal-degraded');
+  assert.equal(snapshot.fatal, true);
+  assert.equal(snapshot.scheduledRetryCount, 0);
+  assert.equal(snapshot.timerCount, 0);
+  assert.equal(controller.beginAttempt({ ownerKey: '5,-3', generation: 17 }), null,
+    'target changes cannot resume mutation after a canonical invariant');
+  assert.equal(supervisor.snapshot().completedFrameCount, 600);
+  assert.equal(supervisor.snapshot().pending, true);
+  assert.equal(renderCount, 600);
+  controller.shutdown();
+  supervisor.stop();
+  assert.equal(controller.snapshot().timerCount, 0);
+});
+
+test('sandbox bounds transition retries and renders 600 frames after a fatal collision', async () => {
+  const environment = installBrowserEquivalentEnvironment();
+  globalThis.location.search = '?disablePersistentTreePublication=1';
+  const timers = createHeldBootTimers();
+  const attemptsByOwner = new Map();
+  let injectedFaultKind = null;
+  let injectedProvisional = false;
+  let runtime = null;
+  let sandbox = null;
+  const settleFailure = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+    await new Promise(resolveValue => setImmediate(resolveValue));
+  };
+  try {
+    sandbox = await bootInfiniteWorldSandbox({
+      globalObject: globalThis,
+      THREE: FakeThree,
+      viewport: environment.viewport,
+      hud: environment.hud,
+      requestedSeed: 'KaniNingen Infinite Natural World',
+      setTimeoutFn: timers.setTimeoutFn,
+      clearTimeoutFn: timers.clearTimeoutFn,
+      runtimeFactory(options) {
+        runtime = new ChunkRuntimeManager(options);
+        const transitionToChunk = runtime.transitionToChunk.bind(runtime);
+        const isTerrainCoverageProvisional = runtime.isTerrainCoverageProvisional.bind(runtime);
+        runtime.updateTerrainReadySet = async () => null;
+        runtime.prepareTransition = async () => null;
+        runtime.isTerrainCoverageProvisional = (chunkX, chunkZ) => (
+          injectedFaultKind !== null
+            ? injectedProvisional
+            : isTerrainCoverageProvisional(chunkX, chunkZ)
+        );
+        runtime.transitionToChunk = (chunkX, chunkZ, options) => {
+          if (injectedFaultKind === null) return transitionToChunk(chunkX, chunkZ, options);
+          const ownerKey = `${chunkX},${chunkZ}`;
+          attemptsByOwner.set(ownerKey, (attemptsByOwner.get(ownerKey) ?? 0) + 1);
+          if (injectedFaultKind === 'collision') {
+            return Promise.reject(createRuntimeTransitionFault({
+              code: RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT,
+              message: 'injected Stable ID collision',
+              stage: 'render-registry-preflight',
+            }));
+          }
+          return Promise.reject(createRuntimeTransitionFault({
+            code: injectedProvisional
+              ? RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING
+              : RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+            message: 'injected permanent transition failure',
+            stage: injectedProvisional ? 'provisional-terrain' : 'near-publication',
+          }));
+        };
+        return runtime;
+      },
+    });
+    const initial = sandbox.snapshot();
+    const centerChunkX = initial.runtime.centerChunkX;
+    const centerChunkZ = initial.runtime.centerChunkZ;
+    let frameNow = performance.now();
+    const runFrame = async () => {
+      const callback = environment.rafCallbacks.at(-1);
+      assert.equal(typeof callback, 'function');
+      callback(frameNow += 16.7);
+      await settleFailure();
+    };
+    const exhaustOwner = async ({ chunkX, provisional }) => {
+      const ownerKey = `${chunkX},${centerChunkZ}`;
+      injectedFaultKind = 'retryable';
+      injectedProvisional = provisional;
+      sandbox.logicalPlayer.x = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      sandbox.logicalPlayer.z = (centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      await runFrame();
+      assert.equal(attemptsByOwner.get(ownerKey), 1);
+      assert.equal(sandbox.snapshot().runtimeTransitionFault.retry.timerCount, 1);
+      dispatchHeldTimer(timers, 250);
+      await settleFailure();
+      assert.equal(attemptsByOwner.get(ownerKey), 2);
+      dispatchHeldTimer(timers, 250);
+      await settleFailure();
+      assert.equal(attemptsByOwner.get(ownerKey), 3);
+      const exhausted = sandbox.snapshot();
+      assert.equal(exhausted.runtimeTransitionFault.mutationStopped, false);
+      assert.equal(exhausted.runtimeTransitionFault.retry.status, 'retry-exhausted');
+      assert.equal(exhausted.runtimeTransitionFault.retry.attempts, 3);
+      assert.equal(exhausted.runtimeTransitionFault.retry.timerCount, 0);
+      assert.equal(exhausted.runtimeFaults.records.at(-1).action,
+        'retain-last-known-good-retry-exhausted');
+      for (let frame = 0; frame < 20; frame += 1) await runFrame();
+      assert.equal(attemptsByOwner.get(ownerKey), 3,
+        'per-frame coverage requests remain suppressed after retry exhaustion');
+      assert.equal(sandbox.logicalPlayer.x,
+        (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
+        'retry exhaustion cannot move the Player back to the old owner');
+    };
+
+    await exhaustOwner({ chunkX: centerChunkX + 1, provisional: true });
+    const firstEpoch = sandbox.snapshot().runtimeTransitionFault.retry.epoch;
+    await exhaustOwner({ chunkX: centerChunkX + 2, provisional: false });
+    assert.ok(sandbox.snapshot().runtimeTransitionFault.retry.epoch > firstEpoch,
+      'changing target owner starts a new retry epoch');
+
+    const collisionChunkX = centerChunkX + 3;
+    const collisionOwnerKey = `${collisionChunkX},${centerChunkZ}`;
+    injectedFaultKind = 'collision';
+    sandbox.logicalPlayer.x = (collisionChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    await runFrame();
+    const fatal = sandbox.snapshot();
+    assert.equal(attemptsByOwner.get(collisionOwnerKey), 1);
+    assert.equal(fatal.runtimeTransitionFault.mutationStopped, true);
+    assert.equal(fatal.runtimeTransitionFault.retry.status, 'fatal-degraded');
+    assert.equal(fatal.runtimeTransitionFault.retry.scheduledRetryCount, 4,
+      'the collision itself does not schedule a retry');
+    assert.equal(fatal.runtimeTransitionFault.retry.timerCount, 0);
+    assert.equal(fatal.runtimeTransitionFault.fatal.code,
+      RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT);
+    assert.equal(fatal.runtimeFaults.records.at(-1).action,
+      'rollback-stop-world-mutation-rAF-retained');
+    assert.equal(fatal.runtime.centerChunkX, centerChunkX);
+    assert.equal(fatal.runtime.centerChunkZ, centerChunkZ);
+
+    const renderer = WebGLRenderer.instances.at(-1);
+    const rendersBeforeFatalFrames = renderer.renderCount;
+    const completedBeforeFatalFrames = fatal.frameSupervisor.completedFrameCount;
+    for (let frame = 0; frame < 600; frame += 1) await runFrame();
+    const afterFatalFrames = sandbox.snapshot();
+    assert.equal(afterFatalFrames.frameSupervisor.faulted, false);
+    assert.equal(afterFatalFrames.frameSupervisor.completedFrameCount,
+      completedBeforeFatalFrames + 600);
+    assert.equal(renderer.renderCount, rendersBeforeFatalFrames + 600);
+    assert.equal(attemptsByOwner.get(collisionOwnerKey), 1);
+    assert.equal(afterFatalFrames.runtime.centerChunkX, centerChunkX);
+    assert.equal(afterFatalFrames.runtime.centerChunkZ, centerChunkZ);
+    assert.equal(afterFatalFrames.runtimeTransitionFault.retry.timerCount, 0);
+
+    await sandbox.shutdown();
+    assert.equal(sandbox.snapshot().runtimeTransitionFault.retry.status, 'shutdown');
+    assert.equal(sandbox.snapshot().runtimeTransitionFault.retry.timerCount, 0);
+    sandbox = null;
+  } finally {
+    if (sandbox) await sandbox.shutdown();
+    environment.restore();
+  }
+});
+
 function installExperienceControls() {
   const createElement = () => {
     const listeners = new Map();
@@ -673,6 +1218,18 @@ async function waitForSaveCondition(condition, message) {
 
 async function waitForLifeCycleCondition(condition, message) {
   for (let attempt = 0; attempt < 2_000 && !condition(); attempt += 1) {
+    await new Promise(resolveValue => setTimeout(resolveValue, 10));
+  }
+  assert.equal(condition(), true, typeof message === 'function' ? message() : message);
+}
+
+async function waitForRenderedLifeCycleCondition(environment, condition, message, {
+  startAtMs = performance.now(),
+  frameStepMs = 16.7,
+} = {}) {
+  for (let attempt = 0; attempt < 2_000 && !condition(); attempt += 1) {
+    const callback = environment.rafCallbacks.at(-1);
+    if (typeof callback === 'function') callback(startAtMs + (attempt + 1) * frameStepMs);
     await new Promise(resolveValue => setTimeout(resolveValue, 10));
   }
   assert.equal(condition(), true, typeof message === 'function' ? message() : message);
@@ -841,8 +1398,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
   PerspectiveCamera.instances.length = 0;
   Fog.instances.length = 0;
   const environment = installBrowserEquivalentEnvironment();
+  let sandbox = null;
   try {
-    globalThis.location.search = '?diagnostics=1&streamingTelemetry=1';
+    globalThis.location.search = '?diagnostics=1&deepWebglDiagnostics=1&streamingTelemetry=1';
     const startedAt = performance.now();
     const entryUrl = new URL(`../src/infinite-world/sandbox-main.js?boot-smoke=${Date.now()}`, import.meta.url);
     let importTimeout = null;
@@ -858,6 +1416,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       if (importTimeout !== null) clearTimeout(importTimeout);
     }
     const outcome = await globalThis.__infiniteWorldBoot.promise;
+    sandbox = outcome.sandbox ?? null;
     const elapsedMs = performance.now() - startedAt;
     assert.equal(outcome.ok, true);
     const snapshot = outcome.sandbox.snapshot();
@@ -869,8 +1428,19 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     t.diagnostic(`active Chunk generation ${snapshot.boot.chunkGenerationMs.toFixed(3)}ms; Settlement generation ${snapshot.boot.settlementGenerationMs.toFixed(3)}ms; projection ${snapshot.boot.renderProjectionMs.toFixed(3)}ms; tracked feature instances ${snapshot.resources.trackedFeatureInstanceCount}`);
     t.diagnostic(`MAJOR Road ${JSON.stringify(snapshot.generator.canonicalMajorRoad)}`);
     t.diagnostic(`Worker ${JSON.stringify({ ...snapshot.chunkDataService.transport, generatorSnapshot: undefined })}`);
-    assert.equal(snapshot.chunkDataService.transport.counts.diagnosticQueries, 1,
-      'boot requests one explicit generator diagnostic snapshot');
+    assert.equal(snapshot.chunkDataService.transport.kind, 'worker-fixed-lanes');
+    assert.equal(
+      snapshot.chunkDataService.transport.lanes.critical.counts.diagnosticQueries,
+      1,
+      'boot requests one explicit Critical-lane generator diagnostic snapshot',
+    );
+    assert.equal(
+      snapshot.chunkDataService.transport.lanes.background.counts.diagnosticQueries,
+      1,
+      'boot requests one explicit Background-lane generator diagnostic snapshot',
+    );
+    assert.equal(snapshot.chunkDataService.transport.counts.diagnosticQueries, 2,
+      'fixed-lane aggregate counts both explicit generator diagnostic snapshots');
     // This wall-clock gate intentionally runs only in a separately invoked
     // single-file process. In the repository-wide parallel run it measures
     // unrelated test-process scheduling contention rather than W5 boot work.
@@ -997,7 +1567,12 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     const gameplayCamera = PerspectiveCamera.instances[0];
     const gameplayFog = Fog.instances[0];
     assert.equal(gameplayCamera.fov, 70);
-    assert.equal(gameplayCamera.near, 64);
+    assert.equal(
+      gameplayCamera.near,
+      getW6ScaleProfile(snapshot.gameplay.state.activeScaleStageId).cameraNearMeters
+        * UNITS_PER_METER,
+      'the boot Camera near plane must derive the active canonical scale profile',
+    );
     assert.equal(gameplayCamera.far, 224000);
     assert.deepEqual(gameplayFog.values, [0x5dade2, 19200, 76800]);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-cyclic-scene-clouds'), false);
@@ -1423,7 +1998,9 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     assert.equal(distantWorld.parent, null);
     assert.equal(WebGLRenderer.instances[0].disposed, true);
     assert.deepEqual(environment.cancelledFrames, [expectedCancelledFrameId]);
+    sandbox = null;
   } finally {
+    if (sandbox) await sandbox.shutdown();
     environment.restore();
   }
 });
@@ -1692,19 +2269,36 @@ test('MAX Player movement continues while destination Terrain presentation is pe
       assert.equal(environment.rafCallbacks.length, frameCountBeforeBlockedMove + 1,
         'a blocked Terrain candidate must not stop the animation loop');
 
+      // Stop at the first requested owner while its publication catches up.
+      // Keeping movement pressed here lets a slow machine cross into a second
+      // owner and permanently supersede the fixed predicate below, turning a
+      // liveness check into a 2,000-frame catch-up loop.
+      environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
+      environment.listeners.get('keyup')({ code: 'ShiftLeft', preventDefault() {} });
       holdDestination = false;
       transitionGate.resolve();
-      await waitForLifeCycleCondition(() => (
+      const frameCountBeforeReadyWait = environment.rafCallbacks.length;
+      await waitForRenderedLifeCycleCondition(environment, () => (
         runtime.isCenteredAt(candidateChunkX, candidateChunkZ)
-      ), 'destination transition must complete after canonical Terrain becomes ready');
+      ), 'destination transition must complete after canonical Terrain becomes ready', {
+        startAtMs: frameNow,
+        frameStepMs: 50,
+      });
+      frameNow += (environment.rafCallbacks.length - frameCountBeforeReadyWait) * 50;
+      const readyPosition = Object.freeze({
+        x: sandbox.logicalPlayer.x,
+        z: sandbox.logicalPlayer.z,
+      });
+      environment.listeners.get('keydown')({ code: 'KeyD', preventDefault() {} });
+      environment.listeners.get('keydown')({ code: 'ShiftLeft', preventDefault() {} });
       frameNow += 50;
       environment.rafCallbacks.at(-1)(frameNow);
       environment.listeners.get('keyup')({ code: 'KeyD', preventDefault() {} });
       environment.listeners.get('keyup')({ code: 'ShiftLeft', preventDefault() {} });
       assert.equal(
         Math.hypot(
-          sandbox.logicalPlayer.x - retainedPosition.x,
-          sandbox.logicalPlayer.z - retainedPosition.z,
+          sandbox.logicalPlayer.x - readyPosition.x,
+          sandbox.logicalPlayer.z - readyPosition.z,
         ) > 0,
         true,
         'MAX movement remains continuous after destination Terrain becomes current',
@@ -1815,7 +2409,8 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
     assert.deepEqual(pagehideSnapshot, interrupted);
 
     controls.get('continue-button').dispatch('click');
-    await waitForLifeCycleCondition(
+    await waitForRenderedLifeCycleCondition(
+      environment,
       () => sandbox.snapshot().runStart?.startMode === 'continue',
       () => `Continue must load the title-flushed Save: ${JSON.stringify({
         boot: sandbox.snapshot().boot,
@@ -1841,7 +2436,7 @@ test('GP-LIFE-01 title preserves the interrupted World while home reset alone re
     const spawnBeforeReset = sandbox.snapshot().spatial.spawn;
     const terrainBeforeHomeReset = sandbox.snapshot().experience.playerVertical.terrainHeightMeters;
     controls.get('set-reset-btn').dispatch('click');
-    await waitForLifeCycleCondition(() => (
+    await waitForRenderedLifeCycleCondition(environment, () => (
       sandbox.logicalPlayer.x === spawnBeforeReset.x
       && sandbox.logicalPlayer.z === spawnBeforeReset.z
       && sandbox.snapshot().runtime.centerChunkX === Math.floor(spawnBeforeReset.x / 16)
@@ -1897,9 +2492,10 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
   const results = [];
   for (const preset of ['current', 'standard', 'short']) {
     const environment = installBrowserEquivalentEnvironment();
+    let sandbox = null;
     try {
       const bootStartedAt = performance.now();
-      const sandbox = await bootInfiniteWorldSandbox({
+      sandbox = await bootInfiniteWorldSandbox({
         globalObject: globalThis,
         THREE: FakeThree,
         viewport: environment.viewport,
@@ -1964,7 +2560,9 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
       });
 
       await sandbox.shutdown();
+      sandbox = null;
     } finally {
+      if (sandbox) await sandbox.shutdown();
       environment.restore();
     }
   }
@@ -1973,8 +2571,9 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
   // its complete Far/Local rebuild and subsequent GC cannot contaminate a
   // later preset's cold-boot gate.
   const environment = installBrowserEquivalentEnvironment();
+  let sandbox = null;
   try {
-    const sandbox = await bootInfiniteWorldSandbox({
+    sandbox = await bootInfiniteWorldSandbox({
       globalObject: globalThis,
       THREE: FakeThree,
       viewport: environment.viewport,
@@ -2054,7 +2653,9 @@ test('Render Distance presets keep fixed gameplay coverage and resync Distant ro
     currentResult.presetMaximumMainThreadSliceMs =
       switched.presentation.localTerrainLastMaximumSliceMs;
     await sandbox.shutdown();
+    sandbox = null;
   } finally {
+    if (sandbox) await sandbox.shutdown();
     environment.restore();
   }
   for (const result of results) t.diagnostic(JSON.stringify(result));
@@ -2075,8 +2676,9 @@ test('measurement frames pass strict boolean simulation state into Gameplay Runt
   for (const measurementMode of ['steady', 'crossing']) {
     const environment = installBrowserEquivalentEnvironment();
     const simulationEnabledValues = [];
+    let sandbox = null;
     try {
-      const sandbox = await bootInfiniteWorldSandbox({
+      sandbox = await bootInfiniteWorldSandbox({
         globalObject: globalThis,
         THREE: FakeThree,
         viewport: environment.viewport,
@@ -2096,7 +2698,9 @@ test('measurement frames pass strict boolean simulation state into Gameplay Runt
       environment.rafCallbacks[0](performance.now() + 100);
       assert.deepEqual(simulationEnabledValues, [true], measurementMode);
       await sandbox.shutdown();
+      sandbox = null;
     } finally {
+      if (sandbox) await sandbox.shutdown();
       environment.restore();
     }
   }
@@ -2105,8 +2709,9 @@ test('measurement frames pass strict boolean simulation state into Gameplay Runt
 test('normal play skips detailed runtime snapshots and debug HUD writes while diagnostics are off', async () => {
   const environment = installBrowserEquivalentEnvironment();
   let snapshotCalls = 0;
+  let sandbox = null;
   try {
-    const sandbox = await bootInfiniteWorldSandbox({
+    sandbox = await bootInfiniteWorldSandbox({
       globalObject: globalThis,
       THREE: FakeThree,
       viewport: environment.viewport,
@@ -2122,24 +2727,37 @@ test('normal play skips detailed runtime snapshots and debug HUD writes while di
         return runtime;
       },
     });
+    // The boot fixture does not execute rAF automatically. Prime the first
+    // canonical observation and allow the shared publication stage to settle
+    // before measuring an unchanged frame; otherwise this assertion measures
+    // the cache's required first materialization rather than steady-state
+    // reuse.
+    environment.rafCallbacks[0](performance.now() + 100);
+    await new Promise(resolve => setImmediate(resolve));
+    environment.rafCallbacks.at(-1)(performance.now() + 116);
+    await new Promise(resolve => setImmediate(resolve));
     const settlementCacheBeforeFrame = sandbox.snapshot().presentation
       .settlementStreamingSnapshotCache.counts;
     const snapshotsBeforeFrame = snapshotCalls;
     const hudBeforeFrame = environment.hud.innerHTML;
-    environment.rafCallbacks[0](performance.now() + 100);
+    environment.rafCallbacks.at(-1)(performance.now() + 132);
     assert.equal(snapshotCalls, snapshotsBeforeFrame);
     assert.equal(environment.hud.innerHTML, hudBeforeFrame);
     const afterFrame = sandbox.snapshot();
     const settlementCacheAfterFrame = afterFrame.presentation
       .settlementStreamingSnapshotCache.counts;
     assert.equal(settlementCacheAfterFrame.materialized
-      - settlementCacheBeforeFrame.materialized, 1);
-    assert.equal(settlementCacheAfterFrame.reused - settlementCacheBeforeFrame.reused, 0,
-      'fast-path frames must not re-read Building/Settlement policy snapshots');
+      - settlementCacheBeforeFrame.materialized, 0,
+      'unchanged frames must not rematerialize the canonical Settlement observation');
+    assert.equal(settlementCacheAfterFrame.requests - settlementCacheBeforeFrame.requests, 1);
+    assert.equal(settlementCacheAfterFrame.reused - settlementCacheBeforeFrame.reused, 1,
+      'the frame must reuse the immutable Building/Settlement observation exactly once');
     assert.equal(afterFrame.diagnostics.work['settlement-shadow-observation'], undefined,
       'diagnostics-off play must not allocate Settlement diagnostic aggregates');
     await sandbox.shutdown();
+    sandbox = null;
   } finally {
+    if (sandbox) await sandbox.shutdown();
     environment.restore();
   }
 });
@@ -2173,34 +2791,77 @@ test('a newly visible full Chunk object is damage-queryable before deferred pres
       },
     });
     const initial = sandbox.snapshot();
-    // Move west through three boundaries toward the deterministic Settlement around x=32.
-    // Three transitions are required to expose a rendered Chunk outside the old 5x5 Gameplay set.
-    const targetChunkX = initial.runtime.centerChunkX - 3;
-    const targetChunkZ = initial.runtime.centerChunkZ;
-    for (let offset = 1; offset <= 3; offset += 1) {
-      const nextChunkX = initial.runtime.centerChunkX - offset;
-      sandbox.logicalPlayer.x = (nextChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-      sandbox.logicalPlayer.z = (targetChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
-      environment.rafCallbacks.at(-1)(performance.now() + offset * 100);
-      await waitForLifeCycleCondition(() => {
+    // Resolve the fixture from canonical generated content instead of assuming
+    // that a Settlement remains west of this seed's evolving safe spawn. Radius
+    // three is the first ring outside the initial 5x5 resident data coverage.
+    let transitionFixture = null;
+    const fixtureRadius = 3;
+    const settlementCandidates = await sandbox.generator.distributor.findSettlementsNear(
+      initial.spatial.playerLogical.x,
+      initial.spatial.playerLogical.z,
+      200,
+    );
+    for (const candidate of settlementCandidates) {
+      const template = await sandbox.generator.resolveSettlementPresentationTemplate({ candidate });
+      for (const building of template.buildings ?? []) {
+        const chunkX = building.owningChunkCoordinate?.x;
+        const chunkZ = building.owningChunkCoordinate?.z;
+        if (!Number.isSafeInteger(chunkX) || !Number.isSafeInteger(chunkZ)) continue;
+        if (Math.max(
+          Math.abs(chunkX - initial.runtime.centerChunkX),
+          Math.abs(chunkZ - initial.runtime.centerChunkZ),
+        ) !== fixtureRadius) continue;
+        const settlementBuildingStableIds = template.buildings
+          .filter(entry => entry.owningChunkCoordinate?.x === chunkX
+            && entry.owningChunkCoordinate?.z === chunkZ)
+          .map(entry => entry.stableId)
+          .sort((left, right) => left.localeCompare(right));
+        transitionFixture = Object.freeze({
+          chunkX,
+          chunkZ,
+          settlementBuildingStableIds: Object.freeze(settlementBuildingStableIds),
+        });
+        break;
+      }
+      if (transitionFixture) break;
+    }
+    assert.notEqual(transitionFixture, null,
+      'canonical ring three must contain a Settlement Building transition fixture');
+
+    const route = [];
+    let nextChunkX = initial.runtime.centerChunkX;
+    let nextChunkZ = initial.runtime.centerChunkZ;
+    while (nextChunkX !== transitionFixture.chunkX || nextChunkZ !== transitionFixture.chunkZ) {
+      nextChunkX += Math.sign(transitionFixture.chunkX - nextChunkX);
+      nextChunkZ += Math.sign(transitionFixture.chunkZ - nextChunkZ);
+      route.push(Object.freeze({ chunkX: nextChunkX, chunkZ: nextChunkZ }));
+    }
+    assert.equal(route.length, fixtureRadius,
+      'the canonical fixture must exercise three continuous boundary transitions');
+    const frameClockBase = performance.now();
+    for (const [routeIndex, owner] of route.entries()) {
+      sandbox.logicalPlayer.x = (owner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      sandbox.logicalPlayer.z = (owner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+      environment.rafCallbacks.at(-1)(frameClockBase + (routeIndex + 1) * 100);
+      await waitForRenderedLifeCycleCondition(environment, () => {
         const snapshot = sandbox.snapshot();
-        return snapshot.runtime.centerChunkX === nextChunkX
-          && snapshot.runtime.centerChunkZ === targetChunkZ
+        return snapshot.runtime.centerChunkX === owner.chunkX
+          && snapshot.runtime.centerChunkZ === owner.chunkZ
           && timers.entries.some(entry => entry.active && entry.delayMs === 0);
       }, () => JSON.stringify({
-        nextChunkX,
-        targetChunkZ,
+        owner,
+        transitionFixture,
         runtime: sandbox.snapshot().runtime,
         spatial: sandbox.snapshot().spatial,
         timers: timers.entries.map(entry => ({
           active: entry.active,
           delayMs: entry.delayMs,
         })),
-      }));
+      }), { startAtMs: frameClockBase + (routeIndex + 1) * 100 });
     }
-    environment.rafCallbacks.at(-1)(performance.now() + 400);
+    environment.rafCallbacks.at(-1)(frameClockBase + (route.length + 1) * 100);
 
-    await waitForLifeCycleCondition(() => {
+    await waitForRenderedLifeCycleCondition(environment, () => {
       const snapshot = sandbox.snapshot();
       return snapshot.gameplay.transitionGeneration
         === snapshot.runtime.transitionContract.generation
@@ -2209,7 +2870,7 @@ test('a newly visible full Chunk object is damage-queryable before deferred pres
     }, () => JSON.stringify({
       runtime: sandbox.snapshot().runtime.transitionContract,
       gameplay: sandbox.snapshot().gameplay,
-    }));
+    }), { startAtMs: frameClockBase + (route.length + 1) * 100 });
 
     const moved = sandbox.snapshot();
     assert.deepEqual(moved.originTransformDiagnostics.latest.anomalyCodes, [],
@@ -2248,6 +2909,9 @@ test('a newly visible full Chunk object is damage-queryable before deferred pres
       'the transition fixture must expose at least one full destructible Object');
     assert.ok(visibleSettlementBuildingIds.length > 0,
       'the continuous boundary route must finish while approaching a visible Settlement');
+    assert.equal(transitionFixture.settlementBuildingStableIds.some(
+      stableId => visibleSettlementBuildingIds.includes(stableId),
+    ), true, 'the canonical target Building must be visible at the end of the route');
     const mismatchedDamageTargets = visibleTargets
       .filter(target => {
         const resolved = gameplay.resolveCombatTarget(target.stableId);
@@ -2478,7 +3142,11 @@ test('production startup contains no distribution survey, golden generation, or 
   assert.doesNotMatch(sources, /runW1BChunkSizeBenchmark|golden|performance benchmark/i);
   assert.match(boot, /benchmarkExecuted:\s*false/);
   assert.match(boot, /startupSurveyExecuted:\s*false/);
-  assert.match(boot, /initializationComplete\s*=\s*true[\s\S]*requestAnimationFrameFn\(frame\)/);
+  assert.match(
+    boot,
+    /initializationComplete\s*=\s*true[\s\S]*createRuntimeFrameSupervisor\([\s\S]*frameSupervisor\.start\(\)/,
+    'the supervised Animation Loop must start only after initialization completes',
+  );
   assert.match(boot, /diagnosticMeasure\(\s*'diagnostics-hud-summary',[\s\S]*diagnostics\.hudSnapshot\(/,
     'HUD reads only the bounded diagnostics summary');
   assert.equal((boot.match(/diagnostics\.snapshot\(/g) ?? []).length, 2,
@@ -2489,8 +3157,11 @@ test('production startup contains no distribution survey, golden generation, or 
     'moving Chunk transitions start Gameplay staging before the deferred Local/Far pump');
   assert.match(boot, /const gameplayWork = gameplaySyncWorkByEpoch[\s\S]*distant-local-terrain-sync[\s\S]*distant-sync[\s\S]*await gameplayWork/,
     'the pump joins the already-started Gameplay staging after Local/Far compose');
-  assert.match(boot, /async function shutdown\(\) \{[\s\S]*running = false;\s*\n\s*distantPresentation\.invalidatePendingLocalTerrainSync\?\.\(\);\s*\n\s*distantPresentation\.invalidatePendingFarSync\?\.\(\);/,
-    'shutdown invalidates detached Local and Far builds before awaiting Save or subsystem disposal');
+  assert.match(
+    boot,
+    /async function shutdown\(\) \{[\s\S]*running = false;\s*\n\s*frameSupervisor\?\.stop\(\);\s*\n\s*distantPresentation\.invalidatePendingLocalTerrainSync\?\.\(\);\s*\n\s*distantPresentation\.invalidatePendingFarSync\?\.\(\);/,
+    'shutdown stops the supervised loop and invalidates detached Local/Far builds before awaits',
+  );
   assert.doesNotMatch(boot, /distantPresentation\.rebase\(runtimeState\.renderOrigin\)[\s\S]*synchronizeLocalTerrain\(runtimeState\)/,
     'delayed work cannot reapply an origin or rebuild Local terrain from an older snapshot');
   assert.match(html, /<script type="module" src="\.\/src\/infinite-world\/sandbox-entry\.js\?v=w8-finite-parity"><\/script>/);
@@ -2504,10 +3175,14 @@ test('production startup contains no distribution survey, golden generation, or 
     'normal rendering captures dirty attribute ranges before renderer.render clears them');
   assert.doesNotMatch(boot, /gpu\?\.array\s*\?\?|gpu\?\.data\?\.array/,
     'normal drawable proof cannot depend on private WebGLAttributes buffer contents');
-  assert.match(boot, /ownerGenerationCoordinator = createOwnerGenerationCoordinator\(/,
-    'Full and Presentation must enter one main-side owner generation queue');
+  assert.match(boot, /ownerGenerationCoordinator = createFixedLaneOwnerGenerationCoordinator\(/,
+    'Full and Presentation must enter the fixed Critical/Background coordinator');
   assert.equal((boot.match(/coordinator:\s*ownerGenerationCoordinator/g) ?? []).length, 2,
-    'both resource services must share the same global coordinator');
+    'both resource services must share the same fixed-lane coordinator');
+  assert.match(boot, /onCancel:\s*\(reason, envelope\)[\s\S]{0,300}?cancelGenerationRequestBySchedulerRequestId\(\{/,
+    'shared Worker control preemption must reach the hidden Worker request');
+  assert.match(boot, /epoch:\s*execution\.envelope\.epoch/,
+    'shared Worker controls must preserve coordinator epoch ownership');
   assert.doesNotMatch(boot, /presentationResidentRequests|requestKind:\s*'resident'/,
     'boot must not enqueue all 1,757 Presentation resources as required work');
   assert.doesNotMatch(boot, /invalidateNaturalStreamingCoverage\(`start-run:/,

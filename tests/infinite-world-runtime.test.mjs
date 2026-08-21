@@ -7,6 +7,11 @@ import { pathToFileURL } from 'node:url';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
 import { FloatingOrigin } from '../src/infinite-world/floating-origin.js';
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
+import {
+  createProjectedUploadManifest,
+  createRenderUploadAdmissionController,
+} from '../src/infinite-world/render-upload-admission.js';
+import { createRenderFrameAcknowledger } from '../src/infinite-world/visual-continuity.js';
 
 class RecordingAdapter {
   constructor() {
@@ -26,6 +31,13 @@ class RecordingAdapter {
     this.projectGate = null;
     this.origin = null;
     this.shutdownCalled = false;
+    this.publicationBatch = null;
+    this.publicationBatchCommits = 0;
+    this.publicationBatchRollbacks = 0;
+    this.drawnOwnerKeysByReceipt = new WeakMap();
+    this.completedReceipts = new WeakSet();
+    this.stagedUploadBucketsByOwner = new Map();
+    this.culledOwnerKeys = new Set();
   }
 
   #recordCoverage(stage) {
@@ -113,6 +125,52 @@ class RecordingAdapter {
     this.staged.delete(projected);
     this.#recordCoverage('discard');
   }
+  async finalizeProjectedUploadManifest(projected, { generation }) {
+    projected.uploadManifest = createProjectedUploadManifest({
+      ownerKey: projected.key,
+      generation,
+      root: projected.testUploadRoot,
+      budgetBytes: projected.testUploadBudgetBytes,
+    });
+    return projected.uploadManifest;
+  }
+  projectedOwnerUploadProof(ownerKey, receipt, manifest) {
+    const stagedBuckets = this.stagedUploadBucketsByOwner.get(ownerKey) ?? new Set();
+    return this.loaded.has(ownerKey)
+      && this.completedReceipts.has(receipt)
+      && manifest === this.loaded.get(ownerKey)?.uploadManifest
+      && stagedBuckets.size === manifest.resourceBuckets.length;
+  }
+  cancelPendingProjectedUploadManifestWaiters() { return 0; }
+  stageProjectedUpload({ manifest, bucket }) {
+    const staged = this.stagedUploadBucketsByOwner.get(manifest.ownerKey) ?? new Set();
+    staged.add(bucket.bucketIndex);
+    this.stagedUploadBucketsByOwner.set(manifest.ownerKey, staged);
+  }
+  recordRenderedOwners(receipt) {
+    this.completedReceipts.add(receipt);
+    this.drawnOwnerKeysByReceipt.set(receipt, new Set(
+      [...this.loaded.keys()].filter(ownerKey => !this.culledOwnerKeys.has(ownerKey)),
+    ));
+  }
+  beginProjectedPublicationBatch({ batchId, ownerKeys }) {
+    if (this.publicationBatch) throw new Error('duplicate publication batch');
+    const token = Object.freeze({ batchId, ownerKeys: Object.freeze([...ownerKeys]) });
+    this.publicationBatch = token;
+    return token;
+  }
+  commitProjectedPublicationBatch(token) {
+    if (this.publicationBatch !== token) throw new Error('invalid publication batch commit');
+    this.publicationBatch = null;
+    this.publicationBatchCommits += 1;
+    return true;
+  }
+  rollbackProjectedPublicationBatch(token) {
+    if (this.publicationBatch !== token) return false;
+    this.publicationBatch = null;
+    this.publicationBatchRollbacks += 1;
+    return true;
+  }
   renderCoverageSnapshot() {
     const keys = [...this.loaded.keys()].sort();
     return {
@@ -141,8 +199,319 @@ class RecordingAdapter {
     this.loaded.clear();
     this.provisionalTerrain.clear();
     this.staged.clear();
+    this.stagedUploadBucketsByOwner.clear();
+    this.publicationBatch = null;
   }
 }
+
+async function waitForRuntime(predicate, label, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+}
+
+function attachTestUploadManifest(adapter, { budgetBytes = 100, bytes = 80 } = {}) {
+  const original = adapter.projectChunk.bind(adapter);
+  adapter.projectChunk = async data => {
+    const projected = await original(data);
+    const drawableBytes = Array.isArray(bytes) ? bytes : [bytes];
+    projected.testUploadRoot = {
+      children: drawableBytes.map((byteLength, index) => ({
+        name: `owner-${projected.key}-${index}`,
+        geometry: { attributes: {} },
+        material: { type: 'RuntimeTestMaterial' },
+        instanceMatrix: { array: new Uint8Array(byteLength) },
+        children: [],
+      })),
+    };
+    projected.testUploadBudgetBytes = budgetBytes;
+    projected.uploadManifest = createProjectedUploadManifest({
+      ownerKey: projected.key,
+      root: projected.testUploadRoot,
+      budgetBytes,
+    });
+    return projected;
+  };
+}
+
+function runtimeReceiptSource(adapter) {
+  let now = 0;
+  let sequence = 0;
+  const frames = createRenderFrameAcknowledger({ clock: () => ++now });
+  return () => {
+    const token = frames.beginFrame({ frameSequence: ++sequence });
+    const receipt = frames.completeFrame(token);
+    adapter.recordRenderedOwners(receipt);
+    return receipt;
+  };
+}
+
+test('Near admission pre-uploads one owner per receipt and retains OLD coverage through final resource proof', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-admission' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter);
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: request => adapter.stageProjectedUpload(request),
+  });
+  await runtime.initialize(0, 0);
+  const initialLoads = adapter.loadAttempts;
+  const initialUnloads = adapter.unloadHistory.length;
+  const receipt = runtimeReceiptSource(adapter);
+  const transition = runtime.transitionToChunk(1, 0, { required: true });
+
+  await waitForRuntime(() => adapter.loadAttempts === initialLoads + 1, 'first owner admission');
+  assert.equal(adapter.unloadHistory.length, initialUnloads,
+    'OLD owners remain until every NEW owner has a complete renderer resource receipt');
+  assert.equal(admission.snapshot().pendingPublicationOwnerKey !== null, true);
+
+  assert.equal(runtime.acknowledgeRenderReceipt(receipt()), true);
+  await waitForRuntime(() => adapter.loadAttempts === initialLoads + 2, 'second owner admission');
+  assert.equal(adapter.unloadHistory.length, initialUnloads);
+
+  assert.equal(runtime.acknowledgeRenderReceipt(receipt()), true);
+  await waitForRuntime(() => adapter.loadAttempts === initialLoads + 3, 'third owner admission');
+  assert.equal(adapter.unloadHistory.length, initialUnloads,
+    'publication alone is not renderer proof for the final owner');
+
+  assert.equal(runtime.acknowledgeRenderReceipt(receipt()), true);
+  await transition;
+  assert.equal(adapter.unloadHistory.length, initialUnloads + 3);
+  const snapshot = runtime.snapshot();
+  assert.equal(snapshot.renderUploadAdmission.counts.published, 3);
+  assert.equal(snapshot.renderUploadAdmission.counts.maximumFrameBytes, 80);
+  assert.equal(snapshot.renderUploadAdmission.queueDepth, 0);
+  assert.equal(snapshot.renderedCount, 9);
+  assert.equal(adapter.publicationBatchCommits, 1);
+  assert.equal(adapter.publicationBatchRollbacks, 0);
+  await runtime.shutdown();
+});
+
+test('shutdown cancels receipt-waiting Near admission and rolls back the partial replacement', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-shutdown' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter);
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: request => adapter.stageProjectedUpload(request),
+  });
+  await runtime.initialize(0, 0);
+  const initialLoads = adapter.loadAttempts;
+  const transition = runtime.transitionToChunk(1, 0, { required: true });
+  await waitForRuntime(() => adapter.loadAttempts === initialLoads + 1,
+    'receipt-waiting owner before shutdown');
+
+  const shutdown = runtime.shutdown();
+  const [transitionResult, shutdownResult] = await Promise.allSettled([transition, shutdown]);
+  assert.equal(transitionResult.status, 'rejected');
+  assert.match(transitionResult.reason.message, /render upload admission shut down/);
+  assert.equal(shutdownResult.status, 'fulfilled');
+  assert.equal(adapter.loaded.size, 0);
+  assert.equal(adapter.staged.size, 0);
+  assert.equal(adapter.shutdownCalled, true);
+  assert.equal(adapter.publicationBatchCommits, 0);
+  assert.equal(adapter.publicationBatchRollbacks, 1);
+});
+
+test('shutdown rejects a pre-admission provisional manifest waiter before joining transitionChain', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-manifest-shutdown' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter);
+  let manifestWaitStarted;
+  const manifestStarted = new Promise(resolve => { manifestWaitStarted = resolve; });
+  let rejectManifestWaiter = null;
+  adapter.finalizeProjectedUploadManifest = async () => new Promise((resolve, reject) => {
+    rejectManifestWaiter = reject;
+    manifestWaitStarted();
+  });
+  let cancelledWaiters = 0;
+  adapter.cancelPendingProjectedUploadManifestWaiters = reason => {
+    if (!rejectManifestWaiter) return 0;
+    const reject = rejectManifestWaiter;
+    rejectManifestWaiter = null;
+    cancelledWaiters += 1;
+    reject(reason);
+    return 1;
+  };
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: request => adapter.stageProjectedUpload(request),
+  });
+  await runtime.initialize(0, 0);
+  const transition = runtime.transitionToChunk(1, 0, { required: true });
+  await manifestStarted;
+  assert.equal(admission.snapshot().queueDepth, 0,
+    'the transition is blocked before admission owns a cancellable job');
+
+  const shutdownAndTransition = Promise.allSettled([transition, runtime.shutdown()]);
+  let timeoutId;
+  const results = await Promise.race([
+    shutdownAndTransition,
+    new Promise((_, reject) => {
+      timeoutId = setTimeout(
+        () => reject(new Error('runtime shutdown deadlocked on manifest waiter')),
+        1_000,
+      );
+    }),
+  ]);
+  clearTimeout(timeoutId);
+  assert.equal(results[0].status, 'rejected');
+  assert.match(results[0].reason.message,
+    /chunk runtime shut down before projected upload manifest finalized/);
+  assert.equal(results[1].status, 'fulfilled');
+  assert.equal(cancelledWaiters, 1);
+  assert.equal(adapter.loaded.size, 0);
+  assert.equal(adapter.staged.size, 0);
+  assert.equal(adapter.publicationBatchCommits, 0);
+  assert.equal(adapter.publicationBatchRollbacks, 1);
+});
+
+test('culled replacement owners pre-upload every resource and allow a queued reversal to finish', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-culled-reversal' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter);
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: request => adapter.stageProjectedUpload(request),
+  });
+  await runtime.initialize(0, 0);
+  const receipt = runtimeReceiptSource(adapter);
+  let outboundSettled = false;
+  let reversalSettled = false;
+  const outbound = runtime.transitionToChunk(1, 0, { required: true })
+    .finally(() => { outboundSettled = true; });
+  const reversal = runtime.transitionToChunk(0, 0, { required: true })
+    .finally(() => { reversalSettled = true; });
+  const coverageMinimum = adapter.loaded.size;
+
+  for (let frame = 0; frame < 16 && !reversalSettled; frame += 1) {
+    await waitForRuntime(() => admission.snapshot().awaitingReceipt,
+      `culled reversal receipt ${frame}`);
+    const pendingOwnerKey = admission.snapshot().pendingPublicationOwnerKey;
+    if (pendingOwnerKey) adapter.culledOwnerKeys.add(pendingOwnerKey);
+    const completedReceipt = receipt();
+    if (pendingOwnerKey) {
+      assert.equal(adapter.drawnOwnerKeysByReceipt.get(completedReceipt).has(pendingOwnerKey), false,
+        'fixture owner is not visible and cannot produce onBeforeRender evidence');
+    }
+    runtime.acknowledgeRenderReceipt(completedReceipt);
+    assert.equal(adapter.loaded.size >= coverageMinimum, true,
+      'OLD or NEW owner coverage remains published throughout the reversal');
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await Promise.all([outbound, reversal]);
+  assert.equal(outboundSettled, true);
+  assert.equal(reversalSettled, true);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().centerChunkZ, 0);
+  assert.equal(admission.snapshot().queueDepth, 0);
+  assert.equal(admission.snapshot().counts.maximumFrameBytes <= 100, true);
+  assert.equal(adapter.publicationBatchCommits, 2);
+  assert.equal(adapter.publicationBatchRollbacks, 0);
+  await runtime.shutdown();
+});
+
+test('runtime oversized owner staging advances by bounded buckets and publishes no partial owner', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-oversized' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter, { budgetBytes: 100, bytes: [80, 80] });
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  const staged = [];
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: ({ projected, bucket }) => {
+      adapter.stageProjectedUpload({
+        manifest: projected.uploadManifest,
+        bucket,
+      });
+      staged.push({ ownerKey: projected.key, bucket: bucket.bucketIndex, bytes: bucket.byteLength });
+    },
+  });
+  await runtime.initialize(0, 0);
+  const initialLoads = adapter.loadAttempts;
+  const receipt = runtimeReceiptSource(adapter);
+  let transitionSettled = false;
+  const transition = runtime.transitionToChunk(1, 0, { required: true })
+    .finally(() => { transitionSettled = true; });
+
+  for (let frame = 0; frame < 8 && !transitionSettled; frame += 1) {
+    await waitForRuntime(() => admission.snapshot().awaitingReceipt,
+      `oversized upload frame ${frame}`);
+    const loadsBeforeReceipt = adapter.loadAttempts;
+    const active = admission.snapshot().activeOwnerKey;
+    const stagedForActive = staged.filter(value => value.ownerKey === active).length;
+    if (stagedForActive < 2) {
+      assert.equal(loadsBeforeReceipt, initialLoads + Math.floor(staged.length / 2),
+        'a partial oversized owner is staged off-world and not published');
+    }
+    runtime.acknowledgeRenderReceipt(receipt());
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  await transition;
+  assert.equal(adapter.loadAttempts, initialLoads + 3);
+  assert.equal(staged.length, 6);
+  assert.ok(staged.every(value => value.bytes <= 100));
+  assert.equal(admission.snapshot().counts.maximumFrameBytes, 80);
+  assert.equal(adapter.publicationBatchCommits, 1);
+  await runtime.shutdown();
+});
+
+test('runtime rejects an indivisible over-budget owner without releasing OLD coverage', async () => {
+  const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-upload-indivisible-budget' });
+  const adapter = new RecordingAdapter();
+  attachTestUploadManifest(adapter, { budgetBytes: 100, bytes: 160 });
+  const admission = createRenderUploadAdmissionController({ budgetBytes: 100 });
+  let staged = 0;
+  const runtime = new ChunkRuntimeManager({
+    generator,
+    renderAdapter: adapter,
+    cacheCapacity: 81,
+    renderUploadAdmission: admission,
+    stageProjectedUpload: request => {
+      staged += 1;
+      adapter.stageProjectedUpload(request);
+    },
+  });
+  await runtime.initialize(0, 0);
+  const oldOwnerKeys = [...adapter.loaded.keys()].sort();
+  const oldUnloadCount = adapter.unloadHistory.length;
+  await assert.rejects(
+    runtime.transitionToChunk(1, 0, { required: true }),
+    /upload resource exceeds per-frame budget/,
+  );
+  assert.equal(staged, 0, 'over-budget resource never reaches the renderer stager');
+  assert.deepEqual([...adapter.loaded.keys()].sort(), oldOwnerKeys,
+    'the complete OLD publication remains intact');
+  assert.equal(adapter.unloadHistory.length, oldUnloadCount);
+  assert.equal(adapter.publicationBatchCommits, 0);
+  assert.equal(adapter.publicationBatchRollbacks, 1);
+  assert.equal(admission.snapshot().counts.overBudgetManifestRejects, 1);
+  assert.equal(admission.snapshot().counts.maximumFrameBytes, 0);
+  assert.equal(runtime.snapshot().centerChunkX, 0);
+  assert.equal(runtime.snapshot().centerChunkZ, 0);
+  await runtime.shutdown();
+});
 
 test('required traversal yields between expensive replacement projections instead of batching them in one task', async () => {
   const generator = await createSandboxChunkGenerator({ worldSeed: 'runtime-required-projection-yield' });

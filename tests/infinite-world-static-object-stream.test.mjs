@@ -74,6 +74,19 @@ async function waitFor(predicate, message) {
   assert.fail(message);
 }
 
+function assertControlMatchesDiagnostics(stream, expectedIdentity = stream.controlState()) {
+  const control = stream.controlState();
+  const diagnostics = stream.diagnostics();
+  assert.equal(control, expectedIdentity);
+  assert.equal(control.coverageGeneration, diagnostics.coverageGeneration);
+  assert.equal(control.planRevision, diagnostics.planRevision);
+  assert.equal(control.readyPageCount, diagnostics.readyPageCount);
+  assert.equal(control.readyRequiredOwnerCount, diagnostics.readyRequiredOwnerCount);
+  assert.equal(control.missingRequiredOwnerCount, diagnostics.missingRequiredOwnerCount);
+  assert.equal(control.backlog, diagnostics.backlog);
+  return control;
+}
+
 test('velocity corridor creates a generic ahead ready-set without changing required coverage', () => {
   const runtime = createPolicyRuntime();
   const plan = createPlanner(runtime.policy);
@@ -103,6 +116,43 @@ test('a high-speed turn replaces the prefetched corridor while retaining current
   assert.notDeepEqual(east.prefetchedOwnerKeys, north.prefetchedOwnerKeys);
   assert.ok(east.prefetchedOwnerKeys.some(key => Number(key.split(',')[0]) > 1));
   assert.ok(north.prefetchedOwnerKeys.some(key => Number(key.split(',')[1]) < -1));
+});
+
+test('allocation-free control state remains an exact oracle of full diagnostics', async t => {
+  const runtime = createPolicyRuntime({ horizon: false });
+  const planner = createPlanner(runtime.policy);
+  const first = planner({ player: { x: 0, z: 0 }, velocity: { x: 0, z: 0 } });
+  const stream = createStaticObjectStream({
+    policyKind: POLICY_KIND,
+    classifyOwner: runtime.classifyOwner,
+    maximumConcurrentRequests: 2048,
+    requestOwner: request => Promise.resolve(Object.freeze({ ownerKey: request.ownerKey })),
+  });
+  t.after(() => stream.dispose());
+  const identity = stream.controlState();
+
+  assertControlMatchesDiagnostics(stream, identity);
+  stream.applyPlan({ plan: first, policyPlan: policyPlan(first) });
+  assertControlMatchesDiagnostics(stream, identity);
+  await waitFor(() => stream.controlState().backlog === 0, 'control-state fixture did not settle');
+  assertControlMatchesDiagnostics(stream, identity);
+  assert.equal(identity.readyRequiredOwnerCount, policyPlan(first).requiredOwnerKeys.length);
+  assert.equal(identity.missingRequiredOwnerCount, 0);
+
+  const moved = planner({ player: { x: 48, z: 0 }, velocity: { x: 24, z: 0 } });
+  stream.applyPlan({ plan: moved, policyPlan: policyPlan(moved) });
+  assertControlMatchesDiagnostics(stream, identity);
+  await waitFor(() => stream.controlState().backlog === 0,
+    'replacement control-state fixture did not settle');
+  assertControlMatchesDiagnostics(stream, identity);
+
+  for (let index = 0; index < 100_000; index += 1) {
+    assert.equal(stream.controlState(), identity);
+  }
+  stream.invalidate('control-oracle-test');
+  assertControlMatchesDiagnostics(stream, identity);
+  assert.equal(identity.readyRequiredOwnerCount, 0);
+  assert.equal(identity.missingRequiredOwnerCount, 0);
 });
 
 test('resource prewarm margin stays outside the true visual Expected boot cohort', async t => {
@@ -144,6 +194,15 @@ test('resource prewarm margin stays outside the true visual Expected boot cohort
   t.after(() => stream.dispose());
   stream.applyPlan({ plan, policyPlan: member });
   const control = stream.snapshot();
+  const diagnosticControl = stream.diagnostics();
+  const hotControl = stream.controlState();
+  assert.equal(stream.controlState(), hotControl,
+    'frame control must reuse one allocation-free primitive view');
+  assert.equal(hotControl.coverageGeneration, control.coverageGeneration);
+  assert.equal(hotControl.planRevision, control.planRevision);
+  assert.equal(hotControl.readyRequiredOwnerCount, diagnosticControl.readyRequiredOwnerCount);
+  assert.equal(hotControl.missingRequiredOwnerCount, diagnosticControl.missingRequiredOwnerCount);
+  assert.equal(hotControl.backlog, control.backlog);
   assert.equal(control.requiredOwnerCount, member.requiredOwnerKeys.length);
   assert.equal(control.visualRequiredOwnerCount, source.visualRequired.length);
   assert.equal(control.visualExpectedOwnerCount, source.visualExpected.length);

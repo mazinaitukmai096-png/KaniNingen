@@ -127,6 +127,49 @@ test('presentation manifest cache deduplicates a pending derived build', async (
   assert.equal(cache.snapshot().counts.pendingDedupeHits, 1);
 });
 
+test('cache settlePending owns canonical loads and the full presentation request lifetime', async () => {
+  const owners = createCanonicalOwnerCache({ capacity: 2 });
+  const manifests = createPresentationManifestCache({ capacity: 2 });
+  const sourceGate = deferred();
+  const manifestGate = deferred();
+  let manifestBuilds = 0;
+  const request = manifests.getOrCreate({
+    manifestKind: 'forest-horizon',
+    ownerKey: '0,0',
+    sourceRevision: 'world:800',
+    loadCanonical: () => owners.getOrCreate({
+      ownerKey: '0,0',
+      sourceRevision: 'world:800',
+      load: () => sourceGate.promise,
+    }),
+    build: source => {
+      manifestBuilds += 1;
+      return manifestGate.promise.then(() => source.records);
+    },
+  });
+  let ownersSettled = false;
+  let manifestsSettled = false;
+  const ownersDrain = owners.settlePending().then(() => { ownersSettled = true; });
+  const manifestsDrain = manifests.settlePending().then(() => { manifestsSettled = true; });
+
+  await Promise.resolve();
+  assert.equal(ownersSettled, false);
+  assert.equal(manifestsSettled, false);
+  assert.equal(manifests.snapshot().inFlightRequestCount, 1);
+  sourceGate.resolve(canonical('0,0'));
+  await ownersDrain;
+  await Promise.resolve();
+  assert.equal(ownersSettled, true);
+  assert.equal(manifestBuilds, 1);
+  assert.equal(manifestsSettled, false);
+  manifestGate.resolve();
+  await manifestsDrain;
+
+  assert.deepEqual(await request, canonical('0,0').records);
+  assert.equal(manifests.snapshot().inFlightRequestCount, 0);
+  assert.equal(manifests.snapshot().pendingCount, 0);
+});
+
 test('presentation manifest eviction rebuilds from the retained canonical owner', async () => {
   const owners = createCanonicalOwnerCache({ capacity: 2 });
   const manifests = createPresentationManifestCache({ capacity: 1 });

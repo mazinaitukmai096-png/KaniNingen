@@ -3,6 +3,54 @@ const DEFAULT_POST_FRAME_CAPACITY = 30;
 const DEFAULT_INCIDENT_CAPACITY = 4;
 const ID_SAMPLE_LIMIT = 64;
 
+export const WEBGL_RENDER_DIAGNOSTIC_MODE = Object.freeze({
+  OFF: 'off',
+  LIGHT: 'light',
+  DEEP_ATTRIBUTION: 'deep-attribution',
+});
+
+function resolveDiagnosticMode(mode, enabled) {
+  const resolved = mode ?? (enabled === true
+    ? WEBGL_RENDER_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION
+    : WEBGL_RENDER_DIAGNOSTIC_MODE.OFF);
+  if (!Object.values(WEBGL_RENDER_DIAGNOSTIC_MODE).includes(resolved)) {
+    throw new RangeError('WebGL render diagnostic mode must be off, light, or deep-attribution');
+  }
+  return resolved;
+}
+
+function errorSummary(stage, error) {
+  return Object.freeze({
+    stage,
+    name: String(error?.name ?? 'Error'),
+    message: String(error?.message ?? error),
+  });
+}
+
+function bufferViewBytes(value, sourceOffset = 0, sourceLength = null) {
+  if (Number.isFinite(value)) return Math.max(0, Number(value));
+  if (value instanceof ArrayBuffer) {
+    const offsetBytes = Math.max(0, Number(sourceOffset) || 0);
+    const availableBytes = Math.max(0, value.byteLength - offsetBytes);
+    return sourceLength === null || sourceLength === undefined || sourceLength === 0
+      ? availableBytes : Math.min(availableBytes, Math.max(0, Number(sourceLength) || 0));
+  }
+  if (!ArrayBuffer.isView(value)) return Number(value?.byteLength ?? 0);
+  const bytesPerElement = Number(value.BYTES_PER_ELEMENT ?? 1);
+  const offsetElements = Math.max(0, Number(sourceOffset) || 0);
+  const availableElements = Math.max(0, (value.byteLength / bytesPerElement) - offsetElements);
+  const selectedElements = sourceLength === null || sourceLength === undefined || sourceLength === 0
+    ? availableElements : Math.min(availableElements, Math.max(0, Number(sourceLength) || 0));
+  return selectedElements * bytesPerElement;
+}
+
+function uploadedByteLength(methodName, args) {
+  if (methodName === 'bufferSubData') {
+    return bufferViewBytes(args[2], args[3] ?? 0, args[4] ?? null);
+  }
+  return bufferViewBytes(args[1], args[3] ?? 0, args[4] ?? null);
+}
+
 function boundedUnique(values, limit = ID_SAMPLE_LIMIT) {
   const result = [];
   const seen = new Set();
@@ -275,14 +323,9 @@ function rendererInfoSnapshot(renderer) {
   });
 }
 
-function attributeSnapshot(renderer, observedGpuVersions, name, attribute) {
+function attributeSnapshot(readGpuVersion, observedGpuVersions, name, attribute) {
   if (!attribute) return null;
-  let gpuVersion = null;
-  try {
-    gpuVersion = renderer.attributes?.get?.(attribute)?.version ?? null;
-  } catch {
-    gpuVersion = null;
-  }
+  const gpuVersion = readGpuVersion(attribute);
   const observedGpuVersion = observedGpuVersions.get(attribute);
   return Object.freeze({
     name,
@@ -296,7 +339,7 @@ function attributeSnapshot(renderer, observedGpuVersions, name, attribute) {
   });
 }
 
-function attributeSnapshots(renderer, observedGpuVersions, mesh) {
+function attributeSnapshots(readGpuVersion, observedGpuVersions, mesh) {
   const entries = [];
   if (mesh.instanceMatrix) entries.push(['instanceMatrix', mesh.instanceMatrix]);
   if (mesh.instanceColor) entries.push(['instanceColor', mesh.instanceColor]);
@@ -304,7 +347,7 @@ function attributeSnapshots(renderer, observedGpuVersions, mesh) {
     if (!entries.some(entry => entry[1] === attribute)) entries.push([name, attribute]);
   }
   return Object.freeze(Object.fromEntries(entries.map(([name, attribute]) => (
-    [name, attributeSnapshot(renderer, observedGpuVersions, name, attribute)]
+    [name, attributeSnapshot(readGpuVersion, observedGpuVersions, name, attribute)]
   ))));
 }
 
@@ -350,6 +393,7 @@ function captureCanvas(canvas) {
 
 export function createWebGLRenderDiagnostics({
   enabled = false,
+  mode = null,
   THREE,
   renderer,
   scene,
@@ -360,104 +404,253 @@ export function createWebGLRenderDiagnostics({
   ring = createWebGLRenderIncidentRing(),
   forceFirstIncident = false,
   publishProof = null,
+  sampleIntervalMs = 1_000,
+  captureFirstFrame = true,
+  onObserverError = null,
 } = {}) {
+  if (!Number.isFinite(sampleIntervalMs) || sampleIntervalMs < 0) {
+    throw new TypeError('sampleIntervalMs must be non-negative');
+  }
+  if (onObserverError !== null && typeof onObserverError !== 'function') {
+    throw new TypeError('onObserverError must be a function or null');
+  }
+  const diagnosticMode = resolveDiagnosticMode(mode, enabled);
   const supported = renderer?.isWebGLRenderer === true
     && scene?.isScene === true
     && camera?.isCamera === true
     && typeof scene.traverse === 'function';
-  const active = enabled === true && supported;
-  const previousAttributeVersions = new WeakMap();
-  const observedGpuVersions = new WeakMap();
+  const active = diagnosticMode === WEBGL_RENDER_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION
+    && supported;
+  let previousAttributeVersions = new WeakMap();
+  let observedGpuVersions = new WeakMap();
   let captureCount = 0;
   let latestRendererInfo = null;
   let latestSceneDrawState = null;
   let latestMeshDrawState = null;
+  let lastCaptureStartedAtMs = Number.NEGATIVE_INFINITY;
+  let skippedFrameCount = 0;
+  let pendingCaptureReason = null;
+  let hookInstallFailureCount = 0;
+  let frustumIntersectionFailureCount = 0;
+  let observerErrorCount = 0;
+  let observerLastError = null;
+  let proofPublisherQuarantined = false;
+  let rendererAttributeLookupQuarantined = false;
+  let uploadHookQuarantined = false;
+  let frustumProbeQuarantined = false;
+  let deepCaptureQuarantined = false;
+
+  const reportObserverError = (stage, error) => {
+    observerErrorCount += 1;
+    observerLastError = errorSummary(stage, error);
+    if (typeof onObserverError === 'function') {
+      try {
+        onObserverError(Object.freeze({
+          subsystem: 'webgl-render-diagnostics',
+          ...observerLastError,
+        }));
+      } catch (callbackError) {
+        observerErrorCount += 1;
+        observerLastError = errorSummary('observer-error-reporter', callbackError);
+      }
+    }
+  };
+
+  const selectCaptureReason = (context, nowMs) => {
+    if (context?.forceDeepAttribution === true) return 'manual';
+    if (context?.hitch === true || context?.longTask === true) return 'hitch';
+    if (pendingCaptureReason) return pendingCaptureReason;
+    if (captureCount === 0 && forceFirstIncident) return 'forced-incident';
+    if (captureCount === 0 && captureFirstFrame) return 'first-draw';
+    if (nowMs - lastCaptureStartedAtMs >= sampleIntervalMs) return 'cadence';
+    return null;
+  };
+
+  const readGpuVersion = attribute => {
+    if (rendererAttributeLookupQuarantined) return null;
+    try {
+      return renderer.attributes?.get?.(attribute)?.version ?? null;
+    } catch (error) {
+      rendererAttributeLookupQuarantined = true;
+      reportObserverError('renderer-attribute-lookup', error);
+      return null;
+    }
+  };
+
+  const restoreCaptureHooks = capture => {
+    if (!capture || capture.restored === true) return;
+    capture.restored = true;
+    let firstError = null;
+    for (let index = capture.restorers.length - 1; index >= 0; index -= 1) {
+      try {
+        capture.restorers[index]();
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (firstError) throw firstError;
+  };
 
   const beginFrame = context => {
     if (!active) return null;
+    if (deepCaptureQuarantined) {
+      skippedFrameCount += 1;
+      return null;
+    }
+    const startedAtMs = Number(clock());
+    const captureReason = selectCaptureReason(context, startedAtMs);
+    if (!captureReason) {
+      skippedFrameCount += 1;
+      return null;
+    }
+    pendingCaptureReason = null;
+    lastCaptureStartedAtMs = startedAtMs;
     const drawn = new Map();
     const gpuUploads = new Map();
     const preRenderLogicalState = new Map();
     const restorers = [];
+    const frameGpuUploads = {
+      calls: 0,
+      bytes: 0,
+      unattributedCalls: 0,
+      unattributedBytes: 0,
+    };
     let currentDrawObject = null;
+    let webglContext = null;
     try {
-      const context = renderer.getContext?.();
-      for (const methodName of ['bufferData', 'bufferSubData']) {
-        const original = context?.[methodName];
+      webglContext = renderer.getContext?.();
+      for (const methodName of uploadHookQuarantined ? [] : ['bufferData', 'bufferSubData']) {
+        const original = webglContext?.[methodName];
         if (typeof original !== 'function') continue;
         const wrapped = function webglDiagnosticBufferUpload(...args) {
+          const bytes = uploadedByteLength(methodName, args);
+          frameGpuUploads.calls += 1;
+          frameGpuUploads.bytes += bytes;
           if (currentDrawObject) {
             const current = gpuUploads.get(currentDrawObject) ?? { calls: 0, bytes: 0 };
             current.calls += 1;
-            const payload = methodName === 'bufferData' ? args[1] : args[2];
-            current.bytes += Number.isFinite(payload) ? payload : Number(payload?.byteLength ?? 0);
+            current.bytes += bytes;
             gpuUploads.set(currentDrawObject, current);
+          } else {
+            // Three uploads BufferAttributes before Object3D.onBeforeRender.
+            // Preserve exact frame totals without falsely attributing those
+            // calls to whichever object happened to draw previously.
+            frameGpuUploads.unattributedCalls += 1;
+            frameGpuUploads.unattributedBytes += bytes;
           }
           return original.apply(this, args);
         };
-        context[methodName] = wrapped;
-        restorers.push(() => { context[methodName] = original; });
+        webglContext[methodName] = wrapped;
+        restorers.push(() => { webglContext[methodName] = original; });
       }
-    } catch {
+    } catch (error) {
       // Some WebGL implementations expose non-writable context methods. Attribute
       // versions remain available when WebGLRenderer exposes its attribute cache.
-    }
-    scene.traverse(object => {
-      if (!renderable(object)) return;
-      const role = classifyMesh(object);
-      if (role) {
-        preRenderLogicalState.set(object, Object.freeze({
-          role,
-          visible: object.visible !== false,
-          visibleInHierarchy: visibleInHierarchy(object),
-          count: object.isInstancedMesh === true ? Number(object.count ?? 0) : 1,
-          instanceMatrixVersion: Number.isFinite(object.instanceMatrix?.version)
-            ? object.instanceMatrix.version : null,
-          instanceColorVersion: Number.isFinite(object.instanceColor?.version)
-            ? object.instanceColor.version : null,
-          matrixWorld: matrixSnapshot(object.matrixWorld),
-          ownerKeys: meshOwnerKeys(object),
-          stableIds: meshStableIds(object),
-        }));
+      uploadHookQuarantined = true;
+      hookInstallFailureCount += 1;
+      reportObserverError('webgl-upload-hook-install', error);
+      const partialCapture = { restorers, restored: false };
+      try { restoreCaptureHooks(partialCapture); } catch (restoreError) {
+        reportObserverError('webgl-upload-hook-rollback', restoreError);
       }
-      const previous = object.onBeforeRender;
-      object.onBeforeRender = function webglDiagnosticDrawHook(
-        renderInstance, renderScene, renderCamera, geometry, material, group,
-      ) {
-        currentDrawObject = object;
-        const record = drawn.get(object) ?? {
-          totalDrawCount: 0,
-          mainDrawCount: 0,
-          shadowDrawCount: 0,
-          materialIds: new Set(),
-        };
-        record.totalDrawCount += 1;
-        if (renderCamera === camera) record.mainDrawCount += 1;
-        else record.shadowDrawCount += 1;
-        record.materialIds.add(objectIdentity(material));
-        drawn.set(object, record);
-        if (typeof previous === 'function') {
-          previous.call(this, renderInstance, renderScene, renderCamera, geometry, material, group);
+      restorers.length = 0;
+    }
+    try {
+      scene.traverse(object => {
+        if (!renderable(object)) return;
+        const role = classifyMesh(object);
+        if (role) {
+          preRenderLogicalState.set(object, Object.freeze({
+            role,
+            visible: object.visible !== false,
+            visibleInHierarchy: visibleInHierarchy(object),
+            count: object.isInstancedMesh === true ? Number(object.count ?? 0) : 1,
+            instanceMatrixVersion: Number.isFinite(object.instanceMatrix?.version)
+              ? object.instanceMatrix.version : null,
+            instanceColorVersion: Number.isFinite(object.instanceColor?.version)
+              ? object.instanceColor.version : null,
+            matrixWorld: matrixSnapshot(object.matrixWorld),
+            ownerKeys: meshOwnerKeys(object),
+            stableIds: meshStableIds(object),
+          }));
         }
-      };
-      restorers.push(() => { object.onBeforeRender = previous; });
-    });
+        const previousBeforeRender = object.onBeforeRender;
+        const previousAfterRender = object.onAfterRender;
+        object.onBeforeRender = function webglDiagnosticDrawHook(
+          renderInstance, renderScene, renderCamera, geometry, material, group,
+        ) {
+          currentDrawObject = object;
+          const record = drawn.get(object) ?? {
+            totalDrawCount: 0,
+            mainDrawCount: 0,
+            shadowDrawCount: 0,
+            materialIds: new Set(),
+          };
+          record.totalDrawCount += 1;
+          if (renderCamera === camera) record.mainDrawCount += 1;
+          else record.shadowDrawCount += 1;
+          record.materialIds.add(objectIdentity(material));
+          drawn.set(object, record);
+          if (typeof previousBeforeRender === 'function') {
+            previousBeforeRender.call(
+              this, renderInstance, renderScene, renderCamera, geometry, material, group,
+            );
+          }
+        };
+        object.onAfterRender = function webglDiagnosticAfterDrawHook(...args) {
+          try {
+            if (typeof previousAfterRender === 'function') previousAfterRender.apply(this, args);
+          } finally {
+            currentDrawObject = null;
+          }
+        };
+        restorers.push(() => {
+          object.onBeforeRender = previousBeforeRender;
+          object.onAfterRender = previousAfterRender;
+        });
+      });
+    } catch (error) {
+      const capture = { restorers, restored: false };
+      try { restoreCaptureHooks(capture); } catch (restoreError) {
+        reportObserverError('draw-hook-rollback', restoreError);
+      }
+      deepCaptureQuarantined = true;
+      reportObserverError('scene-traversal', error);
+      return null;
+    }
     captureCount += 1;
     return {
       context,
+      captureReason,
+      webglContext,
       drawn,
       gpuUploads,
+      frameGpuUploads,
       preRenderLogicalState,
       restorers,
-      startedAtMs: clock(),
+      restored: false,
+      startedAtMs,
     };
   };
 
   const finishFrame = capture => {
     if (!active || !capture) return null;
-    for (const restore of capture.restorers) restore();
+    try {
+      restoreCaptureHooks(capture);
+    } catch (error) {
+      reportObserverError('draw-hook-restore', error);
+    }
     const frameContext = capture.context ?? {};
-    const currentFrustum = frustumState(THREE, camera);
+    let currentFrustum = null;
+    if (!frustumProbeQuarantined) {
+      try {
+        currentFrustum = frustumState(THREE, camera);
+      } catch (error) {
+        frustumProbeQuarantined = true;
+        frustumIntersectionFailureCount += 1;
+        reportObserverError('frustum-state', error);
+      }
+    }
     const roots = [];
     const meshStates = [];
     const drawnOwnerKeys = [];
@@ -474,7 +667,8 @@ export function createWebGLRenderDiagnostics({
       natural: 0,
     };
 
-    scene.traverse(object => {
+    try {
+      scene.traverse(object => {
       const role = rootRole(object);
       if (role) {
         roots.push(Object.freeze({
@@ -511,11 +705,19 @@ export function createWebGLRenderDiagnostics({
           }
         }
       }
-      const attributes = attributeSnapshots(renderer, observedGpuVersions, object);
+      const attributes = attributeSnapshots(readGpuVersion, observedGpuVersions, object);
       let frustumIntersects = null;
       if (object.frustumCulled === false) frustumIntersects = true;
-      else if (currentFrustum?.frustum && typeof currentFrustum.frustum.intersectsObject === 'function') {
-        try { frustumIntersects = currentFrustum.frustum.intersectsObject(object); } catch { frustumIntersects = null; }
+      else if (!frustumProbeQuarantined && currentFrustum?.frustum
+        && typeof currentFrustum.frustum.intersectsObject === 'function') {
+        try {
+          frustumIntersects = currentFrustum.frustum.intersectsObject(object);
+        } catch (error) {
+          frustumIntersects = null;
+          frustumProbeQuarantined = true;
+          frustumIntersectionFailureCount += 1;
+          reportObserverError('frustum-intersection', error);
+        }
       }
       const logicalVisible = visibleInHierarchy(object);
       const count = object.isInstancedMesh === true ? Number(object.count ?? 0) : 1;
@@ -533,6 +735,7 @@ export function createWebGLRenderDiagnostics({
         }
       }
       let staleGpuAttribute = false;
+      const staleGpuAttributeNames = [];
       for (const attribute of Object.values(attributes)) {
         if (!attribute) continue;
         const source = attribute.name === 'instanceMatrix' ? object.instanceMatrix
@@ -540,10 +743,16 @@ export function createWebGLRenderDiagnostics({
             : object.geometry?.attributes?.[attribute.name];
         if (!source) continue;
         const previous = previousAttributeVersions.get(source);
-        if (previous && attribute.logicalVersion !== null
-            && attribute.logicalVersion > previous.logicalVersion
-            && attribute.gpuVersion !== null && attribute.gpuVersion <= previous.gpuVersion) {
+        const logicalVersionIncreased = previous && attribute.logicalVersion !== null
+          && previous.logicalVersion !== null
+          && attribute.logicalVersion > previous.logicalVersion;
+        const gpuVersionDidNotAdvance = previous && attribute.gpuVersion !== null
+          && previous.gpuVersion !== null
+          && attribute.gpuVersion <= previous.gpuVersion;
+        if (logicalVisible && count > 0 && frustumIntersects === true
+            && draw.mainDrawCount > 0 && logicalVersionIncreased && gpuVersionDidNotAdvance) {
           staleGpuAttribute = true;
+          staleGpuAttributeNames.push(attribute.name);
         }
         previousAttributeVersions.set(source, {
           logicalVersion: attribute.logicalVersion,
@@ -593,9 +802,16 @@ export function createWebGLRenderDiagnostics({
         shadowDrawCount: draw.shadowDrawCount,
         gpuBufferUploadCount: upload.calls,
         gpuBufferUploadBytes: upload.bytes,
+        staleGpuAttribute,
+        staleGpuAttributeNames: Object.freeze(staleGpuAttributeNames),
         drawnMaterialIdentities: Object.freeze([...draw.materialIds]),
       }));
-    });
+      });
+    } catch (error) {
+      deepCaptureQuarantined = true;
+      reportObserverError('scene-traversal-finish', error);
+      return null;
+    }
 
     const terrainStates = meshStates.filter(state => state.role.startsWith('terrain-'));
     const visibleTerrain = terrainStates.filter(state => state.visibleInHierarchy);
@@ -654,12 +870,17 @@ export function createWebGLRenderDiagnostics({
     const frame = Object.freeze({
       schemaVersion: 'webgl-render-frame-diagnostic-1',
       buildIdentity,
+      captureReason: capture.captureReason,
       frameSequence: frameContext.frameSequence ?? null,
       timeMs: Number(clock()),
       transitionGeneration: frameContext.transitionGeneration ?? null,
       renderOriginRevision: frameContext.renderOriginRevision ?? null,
       playerLogicalPosition: frameContext.playerLogicalPosition ?? null,
       rendererInfo,
+      gpuBufferUploadCount: capture.frameGpuUploads.calls,
+      gpuBufferUploadBytes: capture.frameGpuUploads.bytes,
+      unattributedGpuBufferUploadCount: capture.frameGpuUploads.unattributedCalls,
+      unattributedGpuBufferUploadBytes: capture.frameGpuUploads.unattributedBytes,
       camera: Object.freeze({
         identity: objectIdentity(camera),
         matrixWorld: matrixSnapshot(camera.matrixWorld),
@@ -687,32 +908,65 @@ export function createWebGLRenderDiagnostics({
     latestRendererInfo = rendererInfo;
     latestSceneDrawState = frame.sceneDrawState;
     latestMeshDrawState = frame.meshDrawState;
-    if (typeof publishProof === 'function' && (captureCount === 1 || frame.anomalyCodes.length > 0)) {
-      try { publishProof(frame, ring.snapshot()); } catch { /* proof export is best-effort */ }
+    if (!proofPublisherQuarantined && typeof publishProof === 'function'
+        && (captureCount === 1 || frame.anomalyCodes.length > 0)) {
+      try {
+        publishProof(frame, ring.snapshot());
+      } catch (error) {
+        proofPublisherQuarantined = true;
+        reportObserverError('proof-publisher', error);
+      }
     }
     return frame;
   };
 
   return Object.freeze({
     enabled: active,
+    mode: diagnosticMode,
     supported,
     beginFrame,
     finishFrame,
+    requestCapture(reason = 'manual') {
+      if (!active) return false;
+      pendingCaptureReason = String(reason || 'manual');
+      return true;
+    },
     reset() {
       ring.reset();
+      previousAttributeVersions = new WeakMap();
+      observedGpuVersions = new WeakMap();
+      captureCount = 0;
       latestRendererInfo = null;
       latestSceneDrawState = null;
       latestMeshDrawState = null;
+      lastCaptureStartedAtMs = Number.NEGATIVE_INFINITY;
+      skippedFrameCount = 0;
+      pendingCaptureReason = null;
     },
     snapshot() {
       const ringSnapshot = ring.snapshot();
       return Object.freeze({
         schemaVersion: 'webgl-render-diagnostics-1',
         buildIdentity,
+        mode: diagnosticMode,
         enabled: active,
         supported,
         realWebGLRenderer: renderer?.isWebGLRenderer === true,
         captureCount,
+        skippedFrameCount,
+        sampleIntervalMs,
+        lastCaptureStartedAtMs: Number.isFinite(lastCaptureStartedAtMs)
+          ? lastCaptureStartedAtMs : null,
+        pendingCaptureReason,
+        hookInstallFailureCount,
+        frustumIntersectionFailureCount,
+        observerErrorCount,
+        observerLastError,
+        proofPublisherQuarantined,
+        rendererAttributeLookupQuarantined,
+        uploadHookQuarantined,
+        frustumProbeQuarantined,
+        deepCaptureQuarantined,
         latest: ringSnapshot.latest,
         incidents: ringSnapshot.incidents,
         pendingIncident: ringSnapshot.pendingIncident,

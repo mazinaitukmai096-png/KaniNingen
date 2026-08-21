@@ -3,6 +3,7 @@ import {
   createChunkKey,
   logicalWorldToOwnedChunk,
   parseChunkKey,
+  squareChunkCoordinates,
 } from './chunk-coordinates.js';
 import { sampleW8SurfaceHeightMeters } from './w8-surface-policy.js';
 import {
@@ -39,6 +40,7 @@ import {
   isRuntimeTransitionContract,
   sameRuntimeTransitionContract,
 } from './runtime-transition-contract.js';
+import { SimulationTicketRegistry } from './simulation-ticket-registry.js';
 
 const EPSILON_METERS = 0.05;
 const BUILDING_TYPES = new Set(['house', 'tower', 'church', 'school', 'barn', 'factory']);
@@ -51,6 +53,11 @@ const TANK_PROJECTILE_TERRAIN_SWEEP_STEP_METERS =
 const BOSS_TAIL_DIRECTION_EPSILON_METERS_SQUARED = finiteWorldUnitsToMeters(
   Math.sqrt(0.001),
 ) ** 2;
+const PLAYER_SIMULATION_TICKET_ID = 'player:primary';
+const PLAYER_SIMULATION_ACTIVE_RADIUS_CHUNKS = 1;
+const PLAYER_SIMULATION_DATA_RADIUS_CHUNKS = 2;
+const PLAYER_SIMULATION_DATA_RADIUS_METERS =
+  (PLAYER_SIMULATION_DATA_RADIUS_CHUNKS + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
 
 function finitePresentationProfile(target, destroyed) {
   const contract = W8_DESTRUCTION_PRESENTATION_CONTRACT;
@@ -644,8 +651,23 @@ export class InfiniteGameplayRuntime {
     this.cancelChunkDataQueries = cancelChunkDataQueries;
     this.sampleTerrainHeight = sampleTerrainHeight;
     this.clock = clock;
+    this.simulationTickets = new SimulationTicketRegistry({
+      coverageResolver: chunksIntersectingLogicalCircle,
+    });
+    this.simulationTicketSequence = 0;
     this.activeChunks = new Map();
     this.spatialChunks = new Map();
+    // Player Simulation residency is intentionally independent from the rendered Near transition.
+    // The legacy maps above continue to own renderer lifecycle; these maps are the authoritative
+    // gameplay/query window once the first player ticket commits.
+    this.playerSimulationSpatialChunks = new Map();
+    this.playerSimulationActiveChunks = new Map();
+    this.playerSimulationCommittedOwnerKey = null;
+    this.playerSimulationRequestedOwnerKey = null;
+    this.playerSimulationRequestRevision = 0;
+    this.playerSimulationRequest = null;
+    this.playerSimulationPump = null;
+    this.pendingPlayerSimulationRuntimeError = null;
     this.chunkSyncGeneration = 0;
     this.stagingChunkSyncGeneration = null;
     this.committedChunkSyncGeneration = 0;
@@ -705,8 +727,196 @@ export class InfiniteGameplayRuntime {
       nuclearChunksQueried: 0,
       nuclearTargetsHit: 0,
       manualBossSpawns: 0,
+      playerSimulationCommits: 0,
     };
     this.#rebuildTankOccurrences({ sync: false });
+  }
+
+  #authoritativeSpatialChunks() {
+    return this.playerSimulationCommittedOwnerKey !== null
+      ? this.playerSimulationSpatialChunks
+      : this.spatialChunks;
+  }
+
+  #authoritativeActiveChunks() {
+    return this.playerSimulationCommittedOwnerKey !== null
+      ? this.playerSimulationActiveChunks
+      : this.activeChunks;
+  }
+
+  #playerSimulationRequestIsCurrent(request) {
+    if (!request || this.isShutdown) return false;
+    const current = this.simulationTickets.get(PLAYER_SIMULATION_TICKET_ID);
+    return current?.revision === request.revision
+      && this.playerSimulationRequest?.revision === request.revision;
+  }
+
+  async #buildPlayerSimulationResidency(request) {
+    const spatialCoordinates = squareChunkCoordinates(
+      request.centerChunkX,
+      request.centerChunkZ,
+      PLAYER_SIMULATION_DATA_RADIUS_CHUNKS,
+    );
+    const activeCoordinates = squareChunkCoordinates(
+      request.centerChunkX,
+      request.centerChunkZ,
+      PLAYER_SIMULATION_ACTIVE_RADIUS_CHUNKS,
+    );
+    const activeKeys = new Set(activeCoordinates.map(value => value.key));
+    const stagedSpatialChunks = new Map();
+    const consumerId = `gameplay-simulation-ticket:${PLAYER_SIMULATION_TICKET_ID}`;
+
+    for (const coordinate of spatialCoordinates) {
+      if (!this.#playerSimulationRequestIsCurrent(request)) return null;
+      let model = this.playerSimulationSpatialChunks.get(coordinate.key)
+        ?? this.spatialChunks.get(coordinate.key)
+        ?? null;
+      if (!model) {
+        if (this.getChunkDataForQuery === null) {
+          throw new Error('Player Simulation residency requires getChunkDataForQuery');
+        }
+        const chunkData = await this.getChunkDataForQuery(coordinate.chunkX, coordinate.chunkZ, {
+          consumerId,
+          epoch: request.revision,
+        });
+        if (!this.#playerSimulationRequestIsCurrent(request)) return null;
+        if (!chunkData
+          || chunkData.chunkX !== coordinate.chunkX
+          || chunkData.chunkZ !== coordinate.chunkZ) {
+          const error = new Error(
+            `Player Simulation residency returned wrong ChunkData for ${coordinate.key}`,
+          );
+          error.code = 'ERR_PLAYER_SIMULATION_CHUNK_INTEGRITY';
+          throw error;
+        }
+        model = await createW6ChunkGameplay({
+          chunkData,
+          worldSeedHash: this.worldSeedHash,
+          generatorMajor: this.generatorMajor,
+        });
+        if (!this.#playerSimulationRequestIsCurrent(request)) return null;
+      }
+      stagedSpatialChunks.set(coordinate.key, model);
+    }
+
+    const stagedActiveChunks = new Map();
+    for (const coordinate of activeCoordinates) {
+      const model = stagedSpatialChunks.get(coordinate.key);
+      if (!model) throw new Error(
+        `Player Simulation residency missing model ${coordinate.key}`,
+      );
+      stagedActiveChunks.set(coordinate.key, model);
+    }
+    if (!this.#playerSimulationRequestIsCurrent(request)) return null;
+
+    const previousSpatial = this.playerSimulationSpatialChunks;
+    this.playerSimulationSpatialChunks = stagedSpatialChunks;
+    this.playerSimulationActiveChunks = stagedActiveChunks;
+    this.playerSimulationCommittedOwnerKey = request.ownerKey;
+
+    for (const [key, model] of stagedSpatialChunks) {
+      if (previousSpatial.has(key)) continue;
+      this.#registerSpatialGameplayModel(key, model, {
+        startOccurrences: activeKeys.has(key),
+      });
+    }
+    this.#reconcileSpatialHumanOwnership();
+    this.#refreshSpatialBroadphaseBounds();
+    this.counts.playerSimulationCommits += 1;
+    return this.snapshot();
+  }
+
+  async #pumpPlayerSimulationResidency() {
+    while (!this.isShutdown) {
+      const request = this.playerSimulationRequest;
+      if (!request
+        || request.ownerKey === this.playerSimulationCommittedOwnerKey) return;
+      const result = await this.#buildPlayerSimulationResidency(request);
+      if (result === null) continue;
+      if (this.playerSimulationRequest?.revision === request.revision) return;
+    }
+  }
+
+  requestPlayerSimulationResidency({ x = this.state.player.x, z = this.state.player.z } = {}) {
+    if (this.isShutdown || this.getChunkDataForQuery === null) return null;
+    if (![x, z].every(Number.isFinite)) {
+      throw new TypeError('Player Simulation residency requires finite x/z');
+    }
+    const owner = logicalWorldToOwnedChunk(x, z);
+    const ownerKey = owner.key;
+    if (ownerKey === this.playerSimulationRequestedOwnerKey
+      && (this.playerSimulationPump || ownerKey === this.playerSimulationCommittedOwnerKey)) {
+      return this.simulationTickets.get(PLAYER_SIMULATION_TICKET_ID);
+    }
+
+    const previousTicket = this.simulationTickets.get(PLAYER_SIMULATION_TICKET_ID);
+    const centerX = (owner.chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const centerZ = (owner.chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
+    const ticket = this.simulationTickets.acquire({
+      ticketId: PLAYER_SIMULATION_TICKET_ID,
+      kind: 'player',
+      centerX,
+      centerZ,
+      radiusMeters: PLAYER_SIMULATION_DATA_RADIUS_METERS,
+      priority: 'critical',
+      ownerStableId: null,
+      persistent: true,
+      metadata: {
+        coverageShape: 'square',
+        activeRadiusChunks: PLAYER_SIMULATION_ACTIVE_RADIUS_CHUNKS,
+        dataRadiusChunks: PLAYER_SIMULATION_DATA_RADIUS_CHUNKS,
+        ownerKey,
+      },
+    });
+    this.playerSimulationRequestedOwnerKey = ownerKey;
+    this.playerSimulationRequestRevision += 1;
+    this.playerSimulationRequest = Object.freeze({
+      ownerKey,
+      centerChunkX: owner.chunkX,
+      centerChunkZ: owner.chunkZ,
+      revision: ticket.revision,
+      requestRevision: this.playerSimulationRequestRevision,
+    });
+    if (previousTicket && previousTicket.revision !== ticket.revision) {
+      this.cancelChunkDataQueries?.({
+        consumerId: `gameplay-simulation-ticket:${PLAYER_SIMULATION_TICKET_ID}`,
+        beforeEpoch: ticket.revision,
+      });
+    }
+    if (!this.playerSimulationPump) {
+      const pump = this.#pumpPlayerSimulationResidency()
+        .catch(error => {
+          if (!this.isShutdown) this.pendingPlayerSimulationRuntimeError = error;
+        })
+        .finally(() => {
+          if (this.playerSimulationPump === pump) this.playerSimulationPump = null;
+          if (!this.isShutdown
+            && this.playerSimulationRequest
+            && this.playerSimulationRequest.ownerKey !== this.playerSimulationCommittedOwnerKey
+            && this.pendingPlayerSimulationRuntimeError === null) {
+            this.requestPlayerSimulationResidency({
+              x: (this.playerSimulationRequest.centerChunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
+              z: (this.playerSimulationRequest.centerChunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS,
+            });
+          }
+        });
+      this.playerSimulationPump = pump;
+    }
+    return ticket;
+  }
+
+  async flushPlayerSimulationResidency() {
+    while (this.playerSimulationPump) {
+      const pump = this.playerSimulationPump;
+      await pump;
+      if (this.playerSimulationPump === pump) break;
+    }
+    if (this.pendingPlayerSimulationRuntimeError) {
+      const error = this.pendingPlayerSimulationRuntimeError;
+      this.pendingPlayerSimulationRuntimeError = null;
+      throw error;
+    }
+    return this.snapshot();
   }
 
   #emitPresentationEvent({
@@ -1061,7 +1271,7 @@ export class InfiniteGameplayRuntime {
 
   *#spatialStaticTargets() {
     const seen = new Set();
-    for (const model of this.spatialChunks.values()) {
+    for (const model of this.#authoritativeSpatialChunks().values()) {
       for (const target of model.staticTargets) {
         if (seen.has(target.stableId)) continue;
         seen.add(target.stableId);
@@ -1081,7 +1291,7 @@ export class InfiniteGameplayRuntime {
     );
     for (let chunkZ = minimumOwner.chunkZ; chunkZ <= maximumOwner.chunkZ; chunkZ += 1) {
       for (let chunkX = minimumOwner.chunkX; chunkX <= maximumOwner.chunkX; chunkX += 1) {
-        const model = this.spatialChunks.get(createChunkKey(chunkX, chunkZ));
+        const model = this.#authoritativeSpatialChunks().get(createChunkKey(chunkX, chunkZ));
         if (model) yield model;
       }
     }
@@ -1092,7 +1302,7 @@ export class InfiniteGameplayRuntime {
     let maximumPlayerBlockingRadiusMeters = 0;
     let playerBlockingColliderCount = 0;
     const seenPlayerBlockingStableIds = new Set();
-    for (const model of this.spatialChunks.values()) {
+    for (const model of this.#authoritativeSpatialChunks().values()) {
       for (const target of model.staticTargets) {
         maximumRadius = Math.max(maximumRadius, finiteWorldUnitsToMeters(target.radius));
         const collision = target.canonicalObject?.collision;
@@ -1236,7 +1446,7 @@ export class InfiniteGameplayRuntime {
 
   #reconcileSpatialHumanOwnership() {
     const descriptors = new Map();
-    for (const [chunkKey, model] of this.spatialChunks) {
+    for (const [chunkKey, model] of this.#authoritativeSpatialChunks()) {
       for (const descriptor of model.entityDescriptors) {
         if (descriptor.type !== 'human') continue;
         const existingDescriptor = descriptors.get(descriptor.stableId);
@@ -1732,7 +1942,7 @@ export class InfiniteGameplayRuntime {
       if (!presentationState) return false;
       const binding = this.tankBindings.get(entity.stableId) ?? this.#bindTank(entity);
       const usesOccurrenceRenderer = binding.kind === 'fallback'
-        || !this.activeChunks.has(binding.baseOwnerChunkKey);
+        || !this.#authoritativeActiveChunks().has(binding.baseOwnerChunkKey);
       if (usesOccurrenceRenderer) {
         return this.renderAdapter.syncReinforcement?.(presentationState) ?? false;
       }
@@ -2217,7 +2427,7 @@ export class InfiniteGameplayRuntime {
     const playerY = Number.isFinite(player.y)
       ? player.y
       : this.#terrainHeightAt(player.x, player.z);
-    for (const model of this.spatialChunks.values()) {
+    for (const model of this.#authoritativeSpatialChunks().values()) {
       for (const descriptor of model.entityDescriptors) {
         if (descriptor.type !== 'tank') continue;
         const binding = this.tankBindings.get(descriptor.stableId);
@@ -2268,7 +2478,7 @@ export class InfiniteGameplayRuntime {
         target,
       });
     }
-    for (const model of this.spatialChunks.values()) {
+    for (const model of this.#authoritativeSpatialChunks().values()) {
       for (const descriptor of model.entityDescriptors) {
         if (descriptor.type !== 'human') continue;
         this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
@@ -2283,7 +2493,7 @@ export class InfiniteGameplayRuntime {
         });
       }
     }
-    for (const model of this.activeChunks.values()) {
+    for (const model of this.#authoritativeActiveChunks().values()) {
       for (const descriptor of model.entityDescriptors) {
         if (descriptor.type === 'human') continue;
         const entity = this.state.entityStates.get(descriptor.stableId);
@@ -2809,7 +3019,6 @@ export class InfiniteGameplayRuntime {
           : null,
       );
       this.#syncTransientCombat();
-      this.featureRenderAdapter?.refreshFeatureStates?.();
       if (this.stagingChunkSyncGeneration === syncGeneration) {
         this.stagingChunkSyncGeneration = null;
       }
@@ -3078,7 +3287,16 @@ export class InfiniteGameplayRuntime {
       this.pendingTankRuntimeError = null;
       throw error;
     }
+    if (this.pendingPlayerSimulationRuntimeError) {
+      const error = this.pendingPlayerSimulationRuntimeError;
+      this.pendingPlayerSimulationRuntimeError = null;
+      throw error;
+    }
     if (!Number.isFinite(deltaSeconds) || deltaSeconds < 0) throw new TypeError('deltaSeconds must be non-negative');
+    if (!player || !Number.isFinite(player.x) || !Number.isFinite(player.z)) {
+      throw new TypeError('gameplay update requires a finite player position');
+    }
+    this.requestPlayerSimulationResidency({ x: player.x, z: player.z });
     const boundedDelta = Math.min(deltaSeconds, 0.05);
     if (simulationEnabled !== true) {
       this.previousPlayerPosition = { x: player.x, z: player.z };
@@ -3118,7 +3336,7 @@ export class InfiniteGameplayRuntime {
     this.state.tickNuclearCooldown(boundedDelta * 1000);
     this.#syncTankSandboxState();
     this.#advanceEntityKnockbacks(boundedDelta);
-    for (const model of this.activeChunks.values()) {
+    for (const model of this.#authoritativeActiveChunks().values()) {
       for (const descriptor of model.entityDescriptors) {
         const entity = this.state.entityStates.get(descriptor.stableId);
         if (!entity?.alive) continue;
@@ -3813,6 +4031,124 @@ export class InfiniteGameplayRuntime {
     });
   }
 
+  #resetPlayerSimulationResidency() {
+    this.playerSimulationSpatialChunks = new Map();
+    this.playerSimulationActiveChunks = new Map();
+    this.playerSimulationCommittedOwnerKey = null;
+    this.playerSimulationRequestedOwnerKey = null;
+    this.playerSimulationRequest = null;
+    this.pendingPlayerSimulationRuntimeError = null;
+  }
+
+  acquireSimulationTicket({
+    ticketId,
+    kind = 'generic',
+    centerX,
+    centerZ,
+    radiusMeters,
+    priority = 'required',
+    ownerStableId = null,
+    persistent = false,
+    metadata = null,
+  } = {}) {
+    if (this.isShutdown) throw new Error('gameplay runtime is shut down');
+    return this.simulationTickets.acquire({
+      ticketId,
+      kind,
+      centerX,
+      centerZ,
+      radiusMeters,
+      priority,
+      ownerStableId,
+      persistent,
+      metadata,
+    });
+  }
+
+  releaseSimulationTicket(ticketId) {
+    const ticket = this.simulationTickets.get(ticketId);
+    if (!ticket) return false;
+    this.cancelChunkDataQueries?.({
+      consumerId: `gameplay-simulation-ticket:${ticket.ticketId}`,
+      beforeEpoch: ticket.revision + 1,
+    });
+    const released = this.simulationTickets.release(ticketId);
+    if (released && ticketId === PLAYER_SIMULATION_TICKET_ID) {
+      this.#resetPlayerSimulationResidency();
+    }
+    return released;
+  }
+
+  clearSimulationTickets() {
+    const snapshot = this.simulationTickets.snapshot();
+    for (const ticket of snapshot.tickets) {
+      this.cancelChunkDataQueries?.({
+        consumerId: `gameplay-simulation-ticket:${ticket.ticketId}`,
+        beforeEpoch: ticket.revision + 1,
+      });
+    }
+    const cleared = this.simulationTickets.clear();
+    this.#resetPlayerSimulationResidency();
+    return cleared;
+  }
+
+  async querySimulationTicket(ticketId) {
+    if (this.isShutdown) throw new Error('gameplay runtime is shut down');
+    const coverage = this.simulationTickets.coverage(ticketId);
+    if (!coverage) return null;
+    const { ticket, coordinates } = coverage;
+    const consumerId = `gameplay-simulation-ticket:${ticket.ticketId}`;
+    const modelByKey = new Map();
+    const missing = [];
+    for (const coordinate of coordinates) {
+      const resident = this.playerSimulationSpatialChunks.get(coordinate.key)
+        ?? this.spatialChunks.get(coordinate.key);
+      if (resident) modelByKey.set(coordinate.key, resident);
+      else missing.push(coordinate);
+    }
+    if (missing.length > 0 && this.getChunkDataForQuery === null) {
+      throw new Error(`simulation ticket ${ticket.ticketId} requires off-resident ChunkData queries`);
+    }
+    const loaded = await Promise.all(missing.map(async coordinate => {
+      const chunkData = await this.getChunkDataForQuery(coordinate.chunkX, coordinate.chunkZ, {
+        consumerId,
+        epoch: ticket.revision,
+      });
+      const current = this.simulationTickets.get(ticket.ticketId);
+      if (!current || current.revision !== ticket.revision || this.isShutdown) return null;
+      if (!chunkData || chunkData.chunkX !== coordinate.chunkX || chunkData.chunkZ !== coordinate.chunkZ) {
+        const error = new Error(`Simulation ticket returned wrong ChunkData for ${coordinate.key}`);
+        error.code = 'ERR_SIMULATION_TICKET_CHUNK_INTEGRITY';
+        throw error;
+      }
+      const model = await createW6ChunkGameplay({
+        chunkData,
+        worldSeedHash: this.worldSeedHash,
+        generatorMajor: this.generatorMajor,
+      });
+      const latest = this.simulationTickets.get(ticket.ticketId);
+      if (!latest || latest.revision !== ticket.revision || this.isShutdown) return null;
+      return Object.freeze({ key: coordinate.key, model });
+    }));
+    const current = this.simulationTickets.get(ticket.ticketId);
+    if (!current || current.revision !== ticket.revision || this.isShutdown) return null;
+    for (const result of loaded) {
+      if (result) modelByKey.set(result.key, result.model);
+    }
+    return Object.freeze({
+      schemaVersion: 'simulation-ticket-query-result-1',
+      ticket: current,
+      chunkKeys: Object.freeze(coordinates.map(value => value.key)),
+      models: Object.freeze(coordinates.map(value => {
+        const model = modelByKey.get(value.key);
+        if (!model) throw new Error(`Simulation ticket model missing after query: ${value.key}`);
+        return model;
+      })),
+      residentReuseCount: coordinates.length - missing.length,
+      queriedCount: missing.length,
+    });
+  }
+
   async nuclearAttack({
     x = this.state.player.x, y = 0, z = this.state.player.z, airborne = false,
   } = {}) {
@@ -3831,9 +4167,27 @@ export class InfiniteGameplayRuntime {
       });
     }
     const radiusMeters = finiteWorldUnitsToMeters(W7_NUCLEAR_CONTRACT.damageRadius);
-    const coordinates = chunksIntersectingLogicalCircle(x, z, radiusMeters);
-    const availableCoordinates = coordinates.filter(coordinate => this.spatialChunks.has(coordinate.key));
-    const models = availableCoordinates.map(coordinate => this.spatialChunks.get(coordinate.key));
+    const ticketId = `nuclear:${++this.simulationTicketSequence}`;
+    this.acquireSimulationTicket({
+      ticketId,
+      kind: 'explosion',
+      centerX: x,
+      centerZ: z,
+      radiusMeters,
+      priority: 'required',
+      persistent: false,
+      metadata: { source: 'nuclear-attack' },
+    });
+    let simulationQuery;
+    try {
+      simulationQuery = await this.querySimulationTicket(ticketId);
+      if (!simulationQuery) {
+        throw new Error(`nuclear simulation ticket was superseded: ${ticketId}`);
+      }
+    } finally {
+      this.releaseSimulationTicket(ticketId);
+    }
+    const models = simulationQuery.models;
     const staticTargets = new Map();
     const entityDescriptors = new Map();
     for (const model of models) {
@@ -3843,7 +4197,10 @@ export class InfiniteGameplayRuntime {
           throw new Error(`Stable ID collision in nuclear query: ${target.stableId}`);
         }
         staticTargets.set(target.stableId, target);
-        this.#registerStableId(target.stableId, target.ownerChunkKey);
+        if (this.#authoritativeSpatialChunks().has(target.ownerChunkKey)
+          || this.spatialChunks.has(target.ownerChunkKey)) {
+          this.#registerStableId(target.stableId, target.ownerChunkKey);
+        }
       }
       for (const descriptor of model.entityDescriptors) {
         const existing = entityDescriptors.get(descriptor.stableId);
@@ -3851,7 +4208,10 @@ export class InfiniteGameplayRuntime {
           throw new Error(`Stable ID collision in nuclear query: ${descriptor.stableId}`);
         }
         entityDescriptors.set(descriptor.stableId, descriptor);
-        this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+        if (this.#authoritativeSpatialChunks().has(descriptor.ownerChunkKey)
+          || this.spatialChunks.has(descriptor.ownerChunkKey)) {
+          this.#registerStableId(descriptor.stableId, descriptor.ownerChunkKey);
+        }
       }
     }
     const inside = target => distanceSquared(target, { x, z }) <= radiusMeters ** 2;
@@ -3871,9 +4231,12 @@ export class InfiniteGameplayRuntime {
       hitStableIds.push(target.stableId);
     }
     for (const descriptor of [...entityDescriptors.values()].sort((a, b) => a.stableId.localeCompare(b.stableId))) {
-      const entity = this.state.ensureEntity(descriptor);
+      const existingEntity = this.state.entityStates.get(descriptor.stableId) ?? null;
+      const queryPosition = existingEntity ?? descriptor;
+      if (!inside(queryPosition)) continue;
+      const entity = existingEntity ?? this.state.ensureEntity(descriptor);
       if (entity.type === 'tank') this.#bindTank(entity, descriptor);
-      if (!entity.alive || (entity.type === 'tank' && entity.spawned !== true) || !inside(entity)) continue;
+      if (!entity.alive || (entity.type === 'tank' && entity.spawned !== true)) continue;
       this.applyCombatDamage(
         {
           kind: entity.type === 'boss' ? 'boss' : 'entity',
@@ -3929,16 +4292,19 @@ export class InfiniteGameplayRuntime {
       cameraShake: W7_NUCLEAR_CONTRACT.cameraShake,
       intensity: 4, soundCue: 'atomic',
     });
-    this.featureRenderAdapter?.refreshFeatureStates?.();
     this.#syncTransientCombat();
     this.counts.nuclearAttacks += 1;
-    this.counts.nuclearChunksQueried += availableCoordinates.length;
+    this.counts.nuclearChunksQueried += simulationQuery.chunkKeys.length;
     this.counts.nuclearTargetsHit += hitStableIds.length;
     return Object.freeze({
       accepted: true,
       radiusMeters,
       damage: W7_NUCLEAR_CONTRACT.damageAmount,
-      queriedChunkKeys: Object.freeze(availableCoordinates.map(value => value.key)),
+      queriedChunkKeys: simulationQuery.chunkKeys,
+      simulationTicket: Object.freeze({
+        queriedCount: simulationQuery.queriedCount,
+        residentReuseCount: simulationQuery.residentReuseCount,
+      }),
       hitStableIds: Object.freeze(hitStableIds),
     });
   }
@@ -4023,6 +4389,7 @@ export class InfiniteGameplayRuntime {
   }
 
   async restart({ playerSpawn, renderOrigin, scaleStageId } = {}) {
+    this.clearSimulationTickets();
     this.tankSpawnEpoch += 1;
     this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
@@ -4060,6 +4427,7 @@ export class InfiniteGameplayRuntime {
   }
 
   async refreshFromState({ renderOrigin } = {}) {
+    this.clearSimulationTickets();
     this.tankSpawnEpoch += 1;
     this.#cancelPendingTankTerrainQueries();
     this.pendingTankReinforcement = null;
@@ -4110,10 +4478,12 @@ export class InfiniteGameplayRuntime {
   }
 
   snapshot() {
-    const simulatedEntityCount = [...this.activeChunks.values()].reduce(
+    const authoritativeActiveChunks = this.#authoritativeActiveChunks();
+    const authoritativeSpatialChunks = this.#authoritativeSpatialChunks();
+    const simulatedEntityCount = [...authoritativeActiveChunks.values()].reduce(
       (sum, model) => sum + model.entityDescriptors.length, 0,
     );
-    const simulatedStaticTargetCount = [...this.activeChunks.values()].reduce(
+    const simulatedStaticTargetCount = [...authoritativeActiveChunks.values()].reduce(
       (sum, model) => sum + model.staticTargets.length, 0,
     );
     const activeTankCount = this.activeTankOccurrences.size;
@@ -4126,10 +4496,15 @@ export class InfiniteGameplayRuntime {
       coverageSignature: this.committedTransitionContract?.coverageSignature ?? null,
       renderedSignature: this.committedTransitionContract?.renderedSignature ?? null,
       activeDataSignature: this.committedTransitionContract?.activeDataSignature ?? null,
-      activeSimulationChunkCount: this.activeChunks.size,
-      activeSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
-      activeDataChunkCount: this.spatialChunks.size,
-      activeDataChunkKeys: Object.freeze(sorted(this.spatialChunks.keys())),
+      activeSimulationChunkCount: authoritativeActiveChunks.size,
+      activeSimulationChunkKeys: Object.freeze(sorted(authoritativeActiveChunks.keys())),
+      activeDataChunkCount: authoritativeSpatialChunks.size,
+      activeDataChunkKeys: Object.freeze(sorted(authoritativeSpatialChunks.keys())),
+      playerSimulationOwnerKey: this.playerSimulationCommittedOwnerKey,
+      playerSimulationRequestedOwnerKey: this.playerSimulationRequestedOwnerKey,
+      playerSimulationPending: this.playerSimulationPump !== null,
+      presentationSimulationChunkKeys: Object.freeze(sorted(this.activeChunks.keys())),
+      presentationDataChunkKeys: Object.freeze(sorted(this.spatialChunks.keys())),
       playerBlockingColliderCount: this.playerBlockingColliderCount,
       maximumPlayerBlockingRadiusMeters: this.maximumPlayerBlockingRadiusMeters,
       simulatedEntityCount,
@@ -4153,6 +4528,7 @@ export class InfiniteGameplayRuntime {
       tankTerrainPendingQueryCount: this.pendingTankTerrainChunks.size,
       activeProjectileCount: this.projectiles.length,
       activeCombatEffectCount: this.combatEffects.length,
+      simulationTickets: this.simulationTickets.snapshot(),
       playerAcidDebuffSeconds: this.state.player.acidDebuffSeconds ?? 0,
       playerMovementMultiplier: this.getPlayerMovementMultiplier(),
       hitStopped: this.isHitStopped(),
@@ -4182,6 +4558,7 @@ export class InfiniteGameplayRuntime {
       }
     }
     await this.renderAdapter.shutdown();
+    this.clearSimulationTickets();
     this.activeChunks.clear();
     this.spatialChunks.clear();
     this.committedTransitionContract = null;

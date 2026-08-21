@@ -18,10 +18,10 @@ import {
 import { createMacroTerrainEvaluator, G5_MACRO_TERRAIN } from './legacy-core/g5/macro-terrain.js';
 import {
   createG6DRockProfile,
-  createRockCandidateG6D,
   G6_D_ROCK,
   vegetationBoundsOverlap,
 } from './legacy-core/g6/rock-redistribution.js';
+import { createFormalRockCandidate } from './formal-rock-candidate.js';
 import { LOGICAL_CHUNK_SIZE_METERS, RENDER_CHUNK_SIZE } from './chunk-coordinates.js';
 import { createNaturalChunkGenerator } from './natural-chunk-generator.js';
 import {
@@ -51,6 +51,23 @@ const q6 = value => {
   return Object.is(rounded, -0) ? 0 : rounded;
 };
 const clamp = value => Math.max(0, Math.min(1, value));
+
+function createGenerationControl(checkpoint = null, cooperativeCheckpoint = null) {
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('Formal Natural checkpoint must be a function when provided');
+  }
+  if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+    throw new TypeError('Formal Natural cooperative checkpoint must be a function when provided');
+  }
+  return checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
+}
+
+async function reachGenerationCheckpoint(control) {
+  if (!control) return;
+  if (control.cooperativeCheckpoint) await control.cooperativeCheckpoint();
+  else control.checkpoint?.();
+}
 
 function mix32(value) {
   let result = value >>> 0;
@@ -137,6 +154,7 @@ async function createVegetationCandidates(
   placementSeed,
   sampleTerrainAt = sampleTerrain,
   sampleBiomeWeightsAt = sampleBiomeWeights,
+  generationControl = null,
 ) {
   const size = W3_FORMAL_DETAILS.vegetationCellSizeMeters;
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
@@ -213,6 +231,7 @@ async function createVegetationCandidates(
         }),
       })));
     }
+    await reachGenerationCheckpoint(generationControl);
   }
   const output = await Promise.all(candidateTasks);
   return output.sort(compareFormalDetailCandidates).slice(0, W3_FORMAL_DETAILS.maximumVegetationPerChunk);
@@ -228,6 +247,7 @@ async function createRockCandidates(
   sampleBiomeWeightsAt = sampleBiomeWeights,
   proposalSampleRate = 1,
   sharedFieldCache = null,
+  generationControl = null,
 ) {
   const size = W3_FORMAL_DETAILS.rockProposalCellSizeMeters;
   const cellsPerChunk = LOGICAL_CHUNK_SIZE_METERS / size;
@@ -274,7 +294,7 @@ async function createRockCandidates(
           + macroEvaluator.evaluate(point.x, point.z - step).offsetMm
           - 4 * macro.offsetMm
         ) * 0.001 / 4);
-        const candidate = await createRockCandidateG6D({
+        const candidate = await createFormalRockCandidate({
           profile,
           worldSeedHash: chunk.worldSeedHash,
           quantizedWorldCell,
@@ -306,6 +326,7 @@ async function createRockCandidates(
         return Object.freeze(candidate);
       }));
     }
+    await reachGenerationCheckpoint(generationControl);
   }
   const output = (await Promise.all(candidateTasks)).filter(Boolean);
   return output.sort(compareFormalDetailCandidates).slice(0, W3_FORMAL_DETAILS.maximumRocksPerChunk);
@@ -407,7 +428,10 @@ export async function createFormalNaturalCandidateKernel({
     chunk,
     sampleTerrainAt = sampleTerrain,
     sampleBiomeWeightsAt = sampleBiomeWeights,
+    checkpoint = null,
+    cooperativeCheckpoint = null,
   } = {}) => {
+    const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
     const candidateInput = candidateInputFor(chunk);
     const startedAt = globalThis.performance?.now?.() ?? Date.now();
     const vegetationCandidates = await createVegetationCandidates(
@@ -415,6 +439,7 @@ export async function createFormalNaturalCandidateKernel({
       placementSeed,
       sampleTerrainAt,
       sampleBiomeWeightsAt,
+      generationControl,
     );
     const completedAt = globalThis.performance?.now?.() ?? Date.now();
     return Object.freeze({
@@ -429,7 +454,10 @@ export async function createFormalNaturalCandidateKernel({
     sampleBiomeWeightsAt = sampleBiomeWeights,
     proposalSampleRate = 1,
     sharedFieldCache = null,
+    checkpoint = null,
+    cooperativeCheckpoint = null,
   } = {}) => {
+    const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
     const candidateInput = candidateInputFor(chunk);
     if (!Array.isArray(vegetationCandidates)) {
       throw new TypeError('canonical vegetation candidates are required for Rock conflicts');
@@ -451,6 +479,7 @@ export async function createFormalNaturalCandidateKernel({
       sampleBiomeWeightsAt,
       proposalSampleRate,
       sharedFieldCache,
+      generationControl,
     );
     const completedAt = globalThis.performance?.now?.() ?? Date.now();
     return Object.freeze({
@@ -467,17 +496,23 @@ export async function createFormalNaturalCandidateKernel({
       chunk,
       sampleTerrainAt = sampleTerrain,
       sampleBiomeWeightsAt = sampleBiomeWeights,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
     } = {}) {
       const vegetation = await generateVegetation({
         chunk,
         sampleTerrainAt,
         sampleBiomeWeightsAt,
+        checkpoint,
+        cooperativeCheckpoint,
       });
       const rocks = await generateRocks({
         chunk,
         vegetationCandidates: vegetation.vegetationCandidates,
         sampleTerrainAt,
         sampleBiomeWeightsAt,
+        checkpoint,
+        cooperativeCheckpoint,
       });
       return Object.freeze({
         vegetationCandidates: vegetation.vegetationCandidates,
@@ -504,21 +539,29 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
     async generateChunk(chunkX, chunkZ, {
       stageRecorder = null,
       canonicalJsonContext = null,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
     } = {}) {
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
       const serializationContext = canonicalJsonContext
         ?? createCanonicalJsonSerializationContext();
       const natural = stageRecorder
         ? await naturalGenerator.generateChunk(chunkX, chunkZ, {
           stageRecorder,
           canonicalJsonContext: serializationContext,
+          ...(generationControl ?? {}),
         })
         : await naturalGenerator.generateChunk(chunkX, chunkZ, {
           canonicalJsonContext: serializationContext,
+          ...(generationControl ?? {}),
         });
+      await reachGenerationCheckpoint(generationControl);
       const naturalToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.NATURAL);
       const { vegetationCandidates, rockCandidates } = await candidateKernel.generate({
         chunk: natural,
+        ...(generationControl ?? {}),
       });
+      await reachGenerationCheckpoint(generationControl);
       if (stageRecorder) stageRecorder.end(naturalToken);
       const chunkId = createChunkId({
         worldSeedHash: naturalGenerator.worldSeedHash,
@@ -558,6 +601,7 @@ export async function createFormalNaturalChunkGenerator({ worldSeed = 'KaniNinge
         : await hashW3ChunkContent(content, {
           canonicalJsonContext: serializationContext,
         });
+      await reachGenerationCheckpoint(generationControl);
       const chunkData = { ...content, contentHash };
       const validation = validateW3FormalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W3 ChunkData: ${validation.errors.join('; ')}`);

@@ -366,7 +366,30 @@ async function createEdgeData(terrain) {
   return Object.fromEntries(entries);
 }
 
-function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator }) {
+function createGenerationControl(checkpoint = null, cooperativeCheckpoint = null) {
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('Natural generation checkpoint must be a function when provided');
+  }
+  if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+    throw new TypeError('Natural cooperative checkpoint must be a function when provided');
+  }
+  return checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
+}
+
+async function reachGenerationCheckpoint(control) {
+  if (!control) return;
+  if (control.cooperativeCheckpoint) await control.cooperativeCheckpoint();
+  else control.checkpoint?.();
+}
+
+async function generateNaturalTerrain({
+  chunkX,
+  chunkZ,
+  macroEvaluator,
+  biomeEvaluator,
+  generationControl = null,
+}) {
   const originX = chunkX * LOGICAL_CHUNK_SIZE_METERS;
   const originZ = chunkZ * LOGICAL_CHUNK_SIZE_METERS;
   const extended = new Array(EXTENDED_RESOLUTION * EXTENDED_RESOLUTION);
@@ -376,7 +399,9 @@ function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator
         originX + x * TERRAIN_STEP_METERS,
         originZ + z * TERRAIN_STEP_METERS,
       );
+      if ((x + 2) % 8 === 0) await reachGenerationCheckpoint(generationControl);
     }
+    await reachGenerationCheckpoint(generationControl);
   }
 
   const heights = [];
@@ -426,7 +451,9 @@ function generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator
           climate: biome.climate,
         }));
       }
+      if ((x + 1) % 8 === 0) await reachGenerationCheckpoint(generationControl);
     }
+    await reachGenerationCheckpoint(generationControl);
   }
 
   return {
@@ -530,6 +557,8 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
     async generateChunk(chunkXInput, chunkZInput, {
       stageRecorder = null,
       canonicalJsonContext = null,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
     } = {}) {
       const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'chunkX');
       const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'chunkZ');
@@ -538,13 +567,22 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
         generatorMajor: W2_GENERATOR_VERSION.major,
         chunkCoordinate: { x: chunkX, z: chunkZ },
       });
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
+      const generateTerrain = () => generateNaturalTerrain({
+        chunkX,
+        chunkZ,
+        macroEvaluator,
+        biomeEvaluator,
+        generationControl,
+      });
       const natural = stageRecorder
-        ? measureChunkGenerationStageSync(
+        ? await measureChunkGenerationStage(
           stageRecorder,
           CHUNK_GENERATION_STAGE.TERRAIN,
-          () => generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator }),
+          generateTerrain,
         )
-        : generateNaturalTerrain({ chunkX, chunkZ, macroEvaluator, biomeEvaluator });
+        : await generateTerrain();
+      await reachGenerationCheckpoint(generationControl);
       const edgeData = stageRecorder
         ? await measureChunkGenerationStage(
           stageRecorder,
@@ -552,6 +590,7 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
           () => createEdgeData(natural.terrain),
         )
         : await createEdgeData(natural.terrain);
+      await reachGenerationCheckpoint(generationControl);
       const content = {
         schemaVersion: W2_CHUNK_DATA_SCHEMA,
         chunkId,
@@ -578,6 +617,7 @@ export async function createNaturalChunkGenerator({ worldSeed = 'KaniNingen Infi
       const contentHash = stageRecorder
         ? await hashW2ChunkContent(content, { stageRecorder, canonicalJsonContext })
         : await hashW2ChunkContent(content, { canonicalJsonContext });
+      await reachGenerationCheckpoint(generationControl);
       const chunkData = { ...content, contentHash };
       const validation = validateW2NaturalChunkData(chunkData);
       if (!validation.valid) throw new Error(`invalid W2 ChunkData: ${validation.errors.join('; ')}`);

@@ -158,6 +158,15 @@ export function createCanonicalOwnerCache({
       return entries.delete(compositeKey(ownerKey, sourceRevision));
     },
     clear() { entries.clear(); },
+    async settlePending() {
+      while (true) {
+        const pending = [...entries.values()]
+          .filter(entry => entry.pending)
+          .map(entry => entry.promise);
+        if (pending.length === 0) return;
+        await Promise.allSettled(pending);
+      }
+    },
     close() {
       if (closed) return;
       closed = true;

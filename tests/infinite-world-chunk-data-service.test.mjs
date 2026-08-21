@@ -259,6 +259,195 @@ test('one global owner queue orders Full and Presentation by deadline and semant
   await full.shutdown();
 });
 
+test('global owner admission preempts only optional lower-rank active work', async () => {
+  let now = 0;
+  let releaseOptional;
+  const optionalGate = new Promise(resolve => { releaseOptional = resolve; });
+  const order = [];
+  const events = [];
+  const coordinator = createOwnerGenerationCoordinator({
+    clock: () => now,
+    maximumConcurrentRequests: 1,
+    onEvent: event => events.push(event),
+  });
+  const optional = coordinator.schedule({
+    ownerKey: 'optional-background',
+    resourceKind: 'control',
+    operationKind: 'optional-background',
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    priorityClass: 5,
+    required: false,
+    representationClass: 'detail',
+    execute: async () => {
+      order.push('optional-start');
+      return optionalGate;
+    },
+    onCancel: reason => {
+      order.push(`optional-cancel:${reason}`);
+      releaseOptional(null);
+    },
+  });
+  await nextDispatch();
+  now = 4;
+  const required = coordinator.schedule({
+    ownerKey: 'required-current',
+    resourceKind: 'full',
+    operationKind: 'chunk',
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    priorityClass: 1,
+    required: true,
+    representationClass: 'detail',
+    execute: async () => {
+      order.push('required');
+      return 'current';
+    },
+  });
+  assert.equal(optional.state, 'in-flight');
+  assert.equal(optional.envelope.required, false);
+  now = 9;
+  assert.equal(await optional.promise, null);
+  assert.equal(await required.promise, 'current');
+  assert.deepEqual(order, [
+    'optional-start',
+    'optional-cancel:preempted-by-higher-priority:2',
+    'required',
+  ]);
+  const snapshot = coordinator.snapshot();
+  assert.equal(snapshot.counts.preemptionRequests, 1);
+  assert.equal(snapshot.counts.preemptionAcknowledgements, 1);
+  assert.equal(snapshot.counts.cancelRequests, 1);
+  assert.equal(snapshot.counts.cancelAcknowledgements, 1);
+  assert.equal(events.filter(event => event.type === 'cancel-requested').length, 1);
+  assert.equal(events.filter(event => event.type === 'cancel-acknowledged').length, 1);
+  await coordinator.shutdown();
+});
+
+test('owner cancellation callback failures are surfaced as failed terminals', async () => {
+  let releaseOptional;
+  const optionalGate = new Promise(resolve => { releaseOptional = resolve; });
+  const events = [];
+  const coordinator = createOwnerGenerationCoordinator({
+    clock: () => 0,
+    maximumConcurrentRequests: 1,
+    onEvent: event => events.push(event),
+  });
+  const optional = coordinator.schedule({
+    ownerKey: 'optional-callback-failure',
+    resourceKind: 'control',
+    operationKind: 'optional-callback-failure',
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    priorityClass: 5,
+    required: false,
+    representationClass: 'detail',
+    execute: async () => optionalGate,
+    onCancel: () => {
+      releaseOptional('must-not-publish');
+      throw new Error('injected-cancel-callback-failure');
+    },
+  });
+  await nextDispatch();
+  const optionalOutcome = assert.rejects(
+    optional.promise,
+    /injected-cancel-callback-failure/,
+  );
+  const required = coordinator.schedule({
+    ownerKey: 'required-after-callback-failure',
+    resourceKind: 'full',
+    operationKind: 'chunk',
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    priorityClass: 1,
+    required: true,
+    representationClass: 'detail',
+    execute: async () => 'required-result',
+  });
+  await optionalOutcome;
+  assert.equal(await required.promise, 'required-result');
+  assert.equal(optional.state, 'failed');
+  assert.equal(events.filter(event => event.type === 'cancel-callback-failed').length, 1);
+  const terminal = events.find(event => (
+    event.type === 'terminal' && event.envelope.requestId === optional.requestId
+  ));
+  assert.equal(terminal.state, 'failed');
+  assert.match(terminal.error.message, /injected-cancel-callback-failure/);
+  assert.equal(coordinator.snapshot().counts.cancelCallbackFailures, 1);
+  await coordinator.shutdown();
+});
+
+test('owner execution ERROR wins a cancellation race and emits one failed terminal', async () => {
+  let rejectOptional;
+  const optionalGate = new Promise((resolve, reject) => { rejectOptional = reject; });
+  const events = [];
+  const coordinator = createOwnerGenerationCoordinator({
+    clock: () => 0,
+    maximumConcurrentRequests: 1,
+    onEvent: event => events.push(event),
+  });
+  const optional = coordinator.schedule({
+    ownerKey: 'optional-error-race',
+    resourceKind: 'presentation',
+    operationKind: 'presentation-owner',
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    priorityClass: 5,
+    required: false,
+    representationClass: 'coarse',
+    execute: () => optionalGate,
+  });
+  await nextDispatch();
+  const optionalOutcome = assert.rejects(optional.promise, /authoritative-owner-error/);
+  const required = coordinator.schedule({
+    ownerKey: 'required-after-error-race',
+    resourceKind: 'full',
+    operationKind: 'chunk',
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    priorityClass: 1,
+    required: true,
+    representationClass: 'detail',
+    execute: async () => 'required-result',
+  });
+  rejectOptional(new Error('authoritative-owner-error'));
+
+  await optionalOutcome;
+  assert.equal(await required.promise, 'required-result');
+  assert.equal(optional.state, 'failed');
+  assert.deepEqual(
+    events.filter(event => (
+      event.type === 'terminal' && event.envelope.requestId === optional.requestId
+    )).map(event => event.state),
+    ['failed'],
+  );
+  assert.equal(events.filter(event => (
+    event.type === 'cancel-acknowledged' && event.envelope.requestId === optional.requestId
+  )).length, 0);
+  assert.equal(coordinator.snapshot().counts.failed, 1);
+  assert.equal(coordinator.snapshot().counts.cancelled, 0);
+  await coordinator.shutdown();
+});
+
+test('owner shutdown cancels active work and bounds the acknowledgement drain', async () => {
+  let releaseActive;
+  const activeGate = new Promise(resolve => { releaseActive = resolve; });
+  const coordinator = createOwnerGenerationCoordinator({
+    maximumConcurrentRequests: 1,
+    shutdownDrainTimeoutMs: 5,
+  });
+  const active = coordinator.schedule({
+    ownerKey: 'shutdown-owner',
+    resourceKind: 'presentation',
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    priorityClass: 5,
+    required: false,
+    representationClass: 'coarse',
+    execute: () => activeGate,
+  });
+  await nextDispatch();
+
+  assert.equal(await coordinator.shutdown({ reason: 'bounded-owner-shutdown' }), false);
+  assert.equal(coordinator.snapshot().counts.shutdownDrainTimeouts, 1);
+  assert.equal(coordinator.snapshot().inFlight[0].cancelRequested, true);
+  releaseActive('completed-after-cancel-timeout');
+  assert.equal(await active.promise, 'completed-after-cancel-timeout');
+});
+
 test('deadline-bound required Full coverage remains in the Terrain safety class', () => {
   assert.equal(defaultOwnerGenerationPriorityClass({
     resourceKind: 'full',
@@ -537,6 +726,85 @@ test('ChunkDataService dedupes Runtime, Gameplay, and Distant consumers, promote
   assert.equal(service.snapshot().counts.transportCalls, 2);
   assert.equal(service.snapshot().counts.pendingDedupeHits, 2);
   await active.promise;
+});
+
+test('same-owner required subscriber promotes an active future-Full request in place', async () => {
+  const transport = deferredTransport();
+  const service = new ChunkDataService({ transport });
+  const future = service.requestChunk({
+    chunkX: 14,
+    chunkZ: 9,
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    required: false,
+    consumerId: 'future-full',
+  });
+  await nextDispatch();
+  assert.equal(transport.calls.length, 1);
+  const required = service.requestChunk({
+    chunkX: 14,
+    chunkZ: 9,
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    required: true,
+    deadlineAtMs: 250,
+    consumerId: 'runtime-required',
+  });
+  const active = service.snapshot().coordinator.inFlight[0];
+  assert.equal(active.ownerKey, '14,9');
+  assert.equal(active.priority, CHUNK_DATA_PRIORITY.PLAYER_DATA);
+  assert.equal(active.required, true);
+  assert.equal(active.firstVisibleDeadlineMs, 250);
+  assert.equal(transport.calls.length, 1,
+    'same canonical owner must not be cancelled or regenerated for promotion');
+  resolvePending(transport, 14, 9);
+  const [futureResult, requiredResult] = await Promise.all([future.promise, required.promise]);
+  assert.equal(futureResult, requiredResult);
+  assert.equal(service.snapshot().counts.priorityPromotions, 1);
+  await service.shutdown();
+});
+
+test('an existing owner handle promotes queued or in-flight metadata monotonically without changing request identity', async () => {
+  const transport = deferredTransport();
+  const service = new ChunkDataService({ transport });
+  const future = service.requestChunk({
+    chunkX: 15,
+    chunkZ: 9,
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    required: false,
+    deadlineAtMs: 900,
+    consumerId: 'future-full',
+    epoch: 7,
+  });
+  await nextDispatch();
+  const before = service.snapshot().coordinator.inFlight[0];
+
+  assert.equal(future.promote({
+    priority: CHUNK_DATA_PRIORITY.PLAYER_DATA,
+    required: true,
+    deadlineAtMs: 250,
+  }), true);
+  let active = service.snapshot().coordinator.inFlight[0];
+  assert.equal(active.requestId, before.requestId);
+  assert.deepEqual(active.subscriberIdentities, before.subscriberIdentities);
+  assert.deepEqual(active.subscriberIdentities, ['full:future-full:7']);
+  assert.equal(active.priority, CHUNK_DATA_PRIORITY.PLAYER_DATA);
+  assert.equal(active.required, true);
+  assert.equal(active.firstVisibleDeadlineMs, 250);
+
+  assert.equal(future.promote({
+    priority: CHUNK_DATA_PRIORITY.ULTRA_WARM,
+    required: false,
+    deadlineAtMs: 1_200,
+  }), true);
+  active = service.snapshot().coordinator.inFlight[0];
+  assert.equal(active.requestId, before.requestId);
+  assert.equal(active.priority, CHUNK_DATA_PRIORITY.PLAYER_DATA);
+  assert.equal(active.required, true);
+  assert.equal(active.firstVisibleDeadlineMs, 250);
+  assert.equal(transport.calls.length, 1);
+
+  resolvePending(transport, 15, 9);
+  assert.equal((await future.promise).chunkX, 15);
+  await service.shutdown();
 });
 
 test('ChunkDataService reports subscriber-only cancellation while another consumer keeps the Worker request alive', async () => {

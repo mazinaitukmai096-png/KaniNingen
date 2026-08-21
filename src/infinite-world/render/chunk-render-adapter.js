@@ -37,13 +37,56 @@ import {
   hasDrawableInCompletedFrame,
   isDrawableInCompletedFrame,
   isCompletedRenderFrameReceipt,
+  isObjectInCompletedFrameScene,
+  isObjectUploadTargetInCompletedFrame,
 } from '../visual-continuity.js';
 import { resolveW8LowPolyTreePresentationParts } from '../vegetation-lod-policy.js';
+import {
+  createProjectedUploadManifest,
+  projectedUploadDrawableObjects,
+} from '../render-upload-admission.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 // projectChunk remains fully staged while yielding; this only bounds one main-thread task.
 const CHUNK_PROJECTION_COOPERATIVE_SLICE_MS = 4;
 const CAMERA_COLLISION_EPSILON = 1e-7;
+
+function canonicalRenderRegistryError(message, stage) {
+  const error = new Error(message);
+  error.name = 'CanonicalWorldInvariantError';
+  error.code = 'CANONICAL_WORLD_INVARIANT';
+  error.faultDomain = 'canonical-world';
+  error.stage = stage;
+  error.retryable = false;
+  return error;
+}
+
+function runtimeRenderInvariantError(message, stage) {
+  const error = new Error(message);
+  error.name = 'RuntimeWorldInvariantError';
+  error.code = 'RUNTIME_WORLD_INVARIANT';
+  error.faultDomain = 'render-invariant';
+  error.stage = stage;
+  error.retryable = false;
+  return error;
+}
+
+function projectionCancelledError(ownerKey) {
+  const error = new Error(`chunk projection was superseded: ${ownerKey}`);
+  error.name = 'ChunkProjectionCancelledError';
+  error.code = 'CHUNK_PROJECTION_CANCELLED';
+  error.faultDomain = 'presentation';
+  error.stage = 'chunk-projection-cooperative-cancel';
+  error.retryable = true;
+  error.cancelled = true;
+  return error;
+}
+
+function visitObjectTree(root, visitor) {
+  if (!root) return;
+  visitor(root);
+  for (const child of root.children ?? []) visitObjectTree(child, visitor);
+}
 
 function cameraBoundLocalPoint(point, centerX, centerZ, rotationY) {
   const dx = point.x - centerX;
@@ -132,10 +175,14 @@ export class ChunkRenderAdapter {
     this.loaded = new Map();
     this.provisionalTerrain = new Map();
     this.settlementPresentationHolds = new Map();
+    this.settlementReplacementBarrierLeases = new Map();
     this.disposedChunkGeometries = new WeakSet();
     if (typeof isFeatureDestroyed !== 'function') throw new TypeError('isFeatureDestroyed must be a function');
     this.isFeatureDestroyed = isFeatureDestroyed;
     this.telemetry = telemetry?.enabled === true ? telemetry : null;
+    this.telemetryObserverEnabled = this.telemetry !== null;
+    this.telemetryObserverFailureCount = 0;
+    this.lastTelemetryObserverFailure = null;
     this.visualRegistry = visualRegistry;
     this.settlementReplacementBarrier = visualRegistry
       ? createDrawableReplacementBarrier({
@@ -144,14 +191,24 @@ export class ChunkRenderAdapter {
         // drawable retained after Near gameplay/collision ownership leaves.
         // Disposal means releasing that hold only after the returning Near
         // detail has crossed an actual completed renderer receipt.
-        disposeDrawable: held => this.releaseSettlementPresentationHolds({
-          ownerKeys: [held.key],
-          descriptors: held.descriptors,
-          reason: 'near-detail-drawn',
-        }),
+        disposeDrawable: lease => {
+          if (lease?.cancelled === true) return;
+          const held = lease?.held ?? lease;
+          const released = this.releaseSettlementPresentationHolds({
+            ownerKeys: [held.key],
+            descriptors: held.descriptors,
+            reason: 'near-detail-drawn',
+          });
+          this.settlementReplacementBarrierLeases.delete(held.key);
+          return released;
+        },
       })
       : null;
     this.pendingFirstDrawByChunk = new Map();
+    this.pendingProvisionalManifestWaiters = new Map();
+    this.projectedUploadManifestFinalizationCancellation = null;
+    this.activeProjectedDrawFrameSequence = null;
+    this.projectedPublicationBatch = null;
     this.featureInstances = new Map();
     this.chunkFeatureIds = new Map();
     this.visibleStableIdsRevision = 0;
@@ -162,6 +219,14 @@ export class ChunkRenderAdapter {
     this.drawableStableIds = new Set();
     this.drawableStableIdsCache = Object.freeze([]);
     this.drawableStableIdsFrameSequence = 0;
+    this.drawableStableIdsByOwner = new Map();
+    this.drawableReceiptDirtyOwners = new Set();
+    this.drawableReceiptIndexCounts = {
+      ownerRecomputes: 0,
+      ownerFastProofs: 0,
+      fullOracleScans: 0,
+      stableSnapshotRebuilds: 0,
+    };
     this.validatedRoadGeometry = new WeakMap();
     this.occlusionMeshes = [];
     this.cameraCollisionBounds = [];
@@ -182,6 +247,10 @@ export class ChunkRenderAdapter {
       rebased: 0,
       chunkOwnedGeometriesCreated: 0,
       chunkOwnedGeometriesDisposed: 0,
+      projectedOwnerDrawProofs: 0,
+      projectedOwnerUploadProofs: 0,
+      projectedUploadManifestWaiterCancellations: 0,
+      provisionalTerrainResidentProofs: 0,
     };
     this.treePathAudit = {
       pathId: 'near-tree',
@@ -230,9 +299,89 @@ export class ChunkRenderAdapter {
     return matrix.clone?.() ?? structuredClone(matrix);
   }
 
+  #installProjectedDrawProbe(projected, kind) {
+    this.#releaseProjectedDrawProbe(projected);
+    const proof = {
+      kind,
+      drawnFrameByObject: new Map(),
+      restorers: [],
+      residentReceipt: null,
+    };
+    visitObjectTree(projected?.group, object => {
+      if (!object?.geometry || !object?.material) return;
+      const hadOwn = Object.hasOwn(object, 'onBeforeRender');
+      const previous = object.onBeforeRender;
+      const adapter = this;
+      const wrapper = function projectedOwnerDrawProbe(...args) {
+        if (Number.isSafeInteger(adapter.activeProjectedDrawFrameSequence)) {
+          proof.drawnFrameByObject.set(object, adapter.activeProjectedDrawFrameSequence);
+        }
+        if (typeof previous === 'function') return previous.apply(this, args);
+        return undefined;
+      };
+      object.onBeforeRender = wrapper;
+      proof.restorers.push(() => {
+        if (object.onBeforeRender !== wrapper) return;
+        if (hadOwn) object.onBeforeRender = previous;
+        else delete object.onBeforeRender;
+      });
+    });
+    projected.drawProof = proof;
+    return proof;
+  }
+
+  #releaseProjectedDrawProbe(projected) {
+    const proof = projected?.drawProof ?? null;
+    if (!proof) return false;
+    let firstError = null;
+    for (let index = proof.restorers.length - 1; index >= 0; index -= 1) {
+      try { proof.restorers[index](); } catch (error) { firstError ??= error; }
+    }
+    proof.restorers.length = 0;
+    delete projected.drawProof;
+    if (firstError) throw firstError;
+    return true;
+  }
+
+  #projectedDrawProof(projected, receipt) {
+    if (!projected?.drawProof || !isCompletedRenderFrameReceipt(receipt)) return false;
+    for (const [object, frameSequence] of projected.drawProof.drawnFrameByObject) {
+      if (frameSequence !== receipt.frameSequence) continue;
+      if (isDrawableInCompletedFrame({ mesh: object, receipt })) return true;
+    }
+    return false;
+  }
+
+  #settleProvisionalManifestWaiters(ownerKey, { value, error } = {}) {
+    const waiters = this.pendingProvisionalManifestWaiters.get(ownerKey) ?? [];
+    this.pendingProvisionalManifestWaiters.delete(ownerKey);
+    for (const waiter of waiters) {
+      if (error) waiter.reject(error);
+      else waiter.resolve(value);
+    }
+  }
+
+  cancelPendingProjectedUploadManifestWaiters(
+    reason = new Error('projected upload manifest finalization cancelled'),
+  ) {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    this.projectedUploadManifestFinalizationCancellation ??= error;
+    let cancelled = 0;
+    for (const ownerKey of [...this.pendingProvisionalManifestWaiters.keys()]) {
+      cancelled += this.pendingProvisionalManifestWaiters.get(ownerKey)?.length ?? 0;
+      this.#settleProvisionalManifestWaiters(ownerKey, { error });
+    }
+    this.counts.projectedUploadManifestWaiterCancellations += cancelled;
+    return cancelled;
+  }
+
   #invalidateVisibleStableIds() {
     this.visibleStableIdsRevision += 1;
     this.visibleStableIdsCache = null;
+  }
+
+  #invalidateDrawableReceiptOwner(ownerKey) {
+    if (typeof ownerKey === 'string' && ownerKey) this.drawableReceiptDirtyOwners.add(ownerKey);
   }
 
   #instanceMatrixAt(mesh, slot) {
@@ -366,7 +515,7 @@ export class ChunkRenderAdapter {
     return null;
   }
 
-  #recordDrawableMergedRoads(presentation, receipt, drawable) {
+  #recordDrawableMergedRoads(presentation, receipt, drawable, { acknowledge = true } = {}) {
     const declared = new Set((presentation?.descriptors ?? [])
       .filter(descriptor => descriptor.kind === 'road')
       .map(descriptor => descriptor.projectionIdentity));
@@ -379,7 +528,7 @@ export class ChunkRenderAdapter {
         declared.has(stableId) && !this.isFeatureDestroyed(stableId)
       ));
       for (const stableId of stableIds) drawable.add(stableId);
-      if (stableIds.length > 0) {
+      if (acknowledge && stableIds.length > 0) {
         this.visualRegistry?.acknowledgeCoarseComponent?.({
           ownerKey: presentation.ownerKey,
           component: 'structure',
@@ -391,10 +540,59 @@ export class ChunkRenderAdapter {
     }
   }
 
-  #acknowledgeSettlementReplacements(receipt) {
-    if (!this.settlementReplacementBarrier) return 0;
+  #retainSettlementReplacementHold(ownerKey, held) {
+    const barrier = this.settlementReplacementBarrier;
+    if (!barrier || !held) return null;
+    const previousLease = this.settlementReplacementBarrierLeases.get(ownerKey) ?? null;
+    const lease = { ownerKey, held, cancelled: false };
+    try {
+      barrier.retain({ ownerKey, drawable: lease });
+      this.settlementReplacementBarrierLeases.set(ownerKey, lease);
+    } catch (error) {
+      lease.cancelled = true;
+      try {
+        if (previousLease) {
+          barrier.retain({ ownerKey, drawable: previousLease });
+        } else {
+          barrier.release(ownerKey);
+        }
+      } catch (rollbackError) {
+        throw new AggregateError(
+          [error, rollbackError],
+          `Settlement replacement retain failed and rollback was incomplete: ${ownerKey}`,
+        );
+      }
+      throw error;
+    }
+    return {
+      barrier,
+      ownerKey,
+      lease,
+      previousLease,
+      started: true,
+    };
+  }
+
+  #rollbackSettlementReplacementHold(transaction) {
+    if (!transaction?.started) return;
+    const {
+      barrier, ownerKey, lease, previousLease,
+    } = transaction;
+    lease.cancelled = true;
+    if (previousLease) {
+      barrier.retain({ ownerKey, drawable: previousLease });
+      this.settlementReplacementBarrierLeases.set(ownerKey, previousLease);
+    } else {
+      barrier.release(ownerKey);
+      this.settlementReplacementBarrierLeases.delete(ownerKey);
+    }
+    transaction.started = false;
+  }
+
+  #acknowledgeSettlementReplacements(receipt, { skipOwnerKeys = null } = {}) {
     let released = 0;
     for (const projected of this.loaded.values()) {
+      if (skipOwnerKeys?.has(projected.key)) continue;
       const held = projected.settlementReplacementHold ?? null;
       if (!held) continue;
       const evidence = [];
@@ -417,7 +615,24 @@ export class ChunkRenderAdapter {
       // release it explicitly instead of manufacturing renderer evidence for
       // an invisible slot.
       if (evidence.length === 0) {
-        this.settlementReplacementBarrier.release(projected.key);
+        if (this.settlementReplacementBarrierLeases.has(projected.key)) {
+          this.settlementReplacementBarrier.release(projected.key);
+        } else {
+          this.releaseSettlementPresentationHolds({
+            ownerKeys: [projected.key],
+            reason: 'near-detail-drawn',
+          });
+        }
+        projected.settlementReplacementHold = null;
+        released += 1;
+        continue;
+      }
+      if (!this.settlementReplacementBarrier) {
+        this.releaseSettlementPresentationHolds({
+          ownerKeys: [projected.key],
+          descriptors: held.descriptors,
+          reason: 'near-detail-drawn',
+        });
         projected.settlementReplacementHold = null;
         released += 1;
         continue;
@@ -427,7 +642,15 @@ export class ChunkRenderAdapter {
         // The lifecycle denominator may retire while a returning Near owner
         // is waiting. The completed receipt above still proves NEW before OLD
         // is released, without leaving an unacknowledgeable retained entry.
-        this.settlementReplacementBarrier.release(projected.key);
+        if (this.settlementReplacementBarrierLeases.has(projected.key)) {
+          this.settlementReplacementBarrier.release(projected.key);
+        } else {
+          this.releaseSettlementPresentationHolds({
+            ownerKeys: [projected.key],
+            descriptors: held.descriptors,
+            reason: 'near-detail-drawn',
+          });
+        }
         projected.settlementReplacementHold = null;
         released += 1;
         continue;
@@ -445,7 +668,19 @@ export class ChunkRenderAdapter {
     return released;
   }
 
-  #recordDrawableStableIds(receipt) {
+  #cancelSettlementReplacementLease(projected) {
+    if (!projected?.key || !projected.settlementReplacementHold) return false;
+    const lease = this.settlementReplacementBarrierLeases.get(projected.key) ?? null;
+    if (lease) {
+      lease.cancelled = true;
+      this.settlementReplacementBarrier?.release(projected.key);
+      this.settlementReplacementBarrierLeases.delete(projected.key);
+    }
+    projected.settlementReplacementHold = null;
+    return true;
+  }
+
+  #fullDrawableStableIds(receipt, { acknowledge = false } = {}) {
     const drawable = new Set();
     for (const [stableId, entry] of this.featureInstances) {
       if (entry.destroyed === true || this.isFeatureDestroyed(stableId)) continue;
@@ -464,19 +699,114 @@ export class ChunkRenderAdapter {
         ownerKey: held.key,
         descriptors: held.descriptors,
         components: [...held.components.values()],
-      }, receipt, drawable);
+      }, receipt, drawable, { acknowledge });
     }
     for (const projected of this.loaded.values()) {
       this.#recordDrawableMergedRoads({
         ...projected.settlementPresentation,
         ownerKey: projected.key,
+      }, receipt, drawable, { acknowledge });
+    }
+    return drawable;
+  }
+
+  #drawableReceiptOwnerRoots(ownerKey) {
+    const roots = [];
+    const projected = this.loaded.get(ownerKey);
+    const held = this.settlementPresentationHolds.get(ownerKey);
+    if (projected?.group) roots.push(projected.group);
+    if (held?.group && held.group !== projected?.group) roots.push(held.group);
+    return roots;
+  }
+
+  #recordDrawableOwnerStableIds(ownerKey, receipt) {
+    const drawable = new Set();
+    for (const stableId of this.chunkFeatureIds.get(ownerKey) ?? []) {
+      const entry = this.featureInstances.get(stableId);
+      if (!entry || entry.destroyed === true || this.isFeatureDestroyed(stableId)) continue;
+      if (entry.parts.some(part => this.#drawableInstancePart(part, receipt))) {
+        drawable.add(stableId);
+      }
+    }
+    const held = this.settlementPresentationHolds.get(ownerKey);
+    for (const [stableId, entry] of held?.featureEntries ?? []) {
+      if (!entry || entry.destroyed === true || this.isFeatureDestroyed(stableId)) continue;
+      if (entry.parts.some(part => this.#drawableInstancePart(part, receipt))) {
+        drawable.add(stableId);
+      }
+    }
+    if (held) {
+      this.#recordDrawableMergedRoads({
+        ownerKey: held.key,
+        descriptors: held.descriptors,
+        components: [...held.components.values()],
       }, receipt, drawable);
     }
-    this.drawableStableIds = drawable;
-    this.drawableStableIdsCache = Object.freeze([...drawable]
-      .sort((left, right) => left.localeCompare(right)));
+    const projected = this.loaded.get(ownerKey);
+    if (projected) {
+      this.#recordDrawableMergedRoads({
+        ...projected.settlementPresentation,
+        ownerKey: projected.key,
+      }, receipt, drawable);
+    }
+    return Object.freeze([...drawable].sort((left, right) => left.localeCompare(right)));
+  }
+
+  #recordDrawableStableIds(receipt) {
+    const activeOwnerKeys = new Set([
+      ...this.loaded.keys(),
+      ...this.settlementPresentationHolds.keys(),
+    ]);
+    let snapshotChanged = false;
+    for (const ownerKey of [...this.drawableStableIdsByOwner.keys()]) {
+      if (activeOwnerKeys.has(ownerKey)) continue;
+      this.drawableStableIdsByOwner.delete(ownerKey);
+      this.drawableReceiptDirtyOwners.delete(ownerKey);
+      snapshotChanged = true;
+    }
+    for (const ownerKey of activeOwnerKeys) {
+      const previous = this.drawableStableIdsByOwner.get(ownerKey) ?? null;
+      const roots = this.#drawableReceiptOwnerRoots(ownerKey);
+      const dirty = this.drawableReceiptDirtyOwners.has(ownerKey) || previous === null;
+      let next = previous;
+      if (dirty) {
+        next = this.#recordDrawableOwnerStableIds(ownerKey, receipt);
+        this.drawableReceiptIndexCounts.ownerRecomputes += 1;
+        this.drawableReceiptDirtyOwners.delete(ownerKey);
+      } else {
+        const rootsProven = roots.length > 0 && roots.every(root => (
+          hasDrawableInCompletedFrame({ root, receipt })
+        ));
+        this.drawableReceiptIndexCounts.ownerFastProofs += 1;
+        if (!rootsProven) {
+          next = Object.freeze([]);
+          this.drawableReceiptDirtyOwners.add(ownerKey);
+        }
+      }
+      const equal = previous !== null && previous.length === next.length
+        && previous.every((stableId, index) => stableId === next[index]);
+      if (!equal) snapshotChanged = true;
+      this.drawableStableIdsByOwner.set(ownerKey, equal ? previous : next);
+    }
+    if (snapshotChanged) {
+      const drawable = new Set();
+      for (const stableIds of this.drawableStableIdsByOwner.values()) {
+        for (const stableId of stableIds) drawable.add(stableId);
+      }
+      this.drawableStableIds = drawable;
+      this.drawableStableIdsCache = Object.freeze([...drawable]
+        .sort((left, right) => left.localeCompare(right)));
+      this.drawableReceiptIndexCounts.stableSnapshotRebuilds += 1;
+    }
     this.drawableStableIdsFrameSequence = receipt.frameSequence;
-    return drawable;
+    return this.drawableStableIds;
+  }
+
+  drawableStableIdsFullScanSnapshot(receipt) {
+    if (!isCompletedRenderFrameReceipt(receipt)) return Object.freeze([]);
+    this.drawableReceiptIndexCounts.fullOracleScans += 1;
+    return Object.freeze([...this.#fullDrawableStableIds(receipt)]
+      .sort((left, right) => left.localeCompare(right)));
   }
 
   #registry() {
@@ -499,14 +829,51 @@ export class ChunkRenderAdapter {
     };
   }
 
-  #commitProjectedRegistry(projected) {
+  #preflightProjectedRegistry(projected) {
     const registry = projected?.registry;
-    if (!registry) return;
+    if (!registry) return null;
+    const featureInstances = [];
     for (const [stableId, entry] of registry.featureInstances) {
       const existing = this.featureInstances.get(stableId);
       if (existing && existing.chunkKey !== entry.chunkKey) {
-        throw new Error(`Stable ID collision in render adapter: ${stableId}`);
+        throw canonicalRenderRegistryError(
+          `Stable ID collision in render adapter: ${stableId}`,
+          'render-registry-preflight',
+        );
       }
+      featureInstances.push(Object.freeze({
+        stableId,
+        hadPrevious: existing !== undefined,
+        previous: existing,
+      }));
+    }
+    const chunkFeatureIds = [];
+    for (const [chunkKey] of registry.chunkFeatureIds) {
+      chunkFeatureIds.push(Object.freeze({
+        chunkKey,
+        hadPrevious: this.chunkFeatureIds.has(chunkKey),
+        previous: this.chunkFeatureIds.get(chunkKey),
+      }));
+    }
+    return {
+      registry,
+      featureInstances,
+      chunkFeatureIds,
+      occlusionMeshCount: this.occlusionMeshes.length,
+      cameraCollisionBoundCount: this.cameraCollisionBounds.length,
+      transparentMeshes: [...registry.transparentMeshes].map(mesh => Object.freeze({
+        mesh,
+        wasPresent: this.transparentMeshes.has(mesh),
+      })),
+      started: false,
+    };
+  }
+
+  #commitProjectedRegistry(transaction) {
+    if (!transaction) return null;
+    const { registry } = transaction;
+    transaction.started = true;
+    for (const [stableId, entry] of registry.featureInstances) {
       this.featureInstances.set(stableId, entry);
     }
     for (const [chunkKey, stableIds] of registry.chunkFeatureIds) {
@@ -515,10 +882,49 @@ export class ChunkRenderAdapter {
     this.occlusionMeshes.push(...registry.occlusionMeshes);
     this.cameraCollisionBounds.push(...registry.cameraCollisionBounds);
     for (const mesh of registry.transparentMeshes) this.transparentMeshes.add(mesh);
+    return transaction;
+  }
+
+  #rollbackProjectedRegistry(transaction) {
+    if (!transaction?.started) return;
+    for (const { stableId, hadPrevious, previous } of transaction.featureInstances) {
+      if (hadPrevious) this.featureInstances.set(stableId, previous);
+      else this.featureInstances.delete(stableId);
+    }
+    for (const { chunkKey, hadPrevious, previous } of transaction.chunkFeatureIds) {
+      if (hadPrevious) this.chunkFeatureIds.set(chunkKey, previous);
+      else this.chunkFeatureIds.delete(chunkKey);
+    }
+    this.occlusionMeshes.length = transaction.occlusionMeshCount;
+    this.cameraCollisionBounds.length = transaction.cameraCollisionBoundCount;
+    for (const { mesh, wasPresent } of transaction.transparentMeshes) {
+      if (wasPresent) this.transparentMeshes.add(mesh);
+      else this.transparentMeshes.delete(mesh);
+    }
+    transaction.started = false;
+  }
+
+  #restoreGroupChildren(group, expectedChildren) {
+    if (!group || !Array.isArray(expectedChildren)) return;
+    const expected = new Set(expectedChildren);
+    for (const child of [...(group.children ?? [])]) {
+      if (!expected.has(child)) group.remove(child);
+    }
+    for (const child of expectedChildren) {
+      if (child.parent !== group || !(group.children ?? []).includes(child)) {
+        child.parent?.remove?.(child);
+        group.add(child);
+      }
+    }
+    if (Array.isArray(group.children)) {
+      group.children.splice(0, group.children.length, ...expectedChildren);
+    }
+    for (const child of expectedChildren) child.parent = group;
   }
 
   #removeProjectedRegistry(projected) {
     const key = projected.key;
+    this.#invalidateDrawableReceiptOwner(key);
     const groupMeshes = new Set(projected.group.children ?? []);
     this.occlusionMeshes = this.occlusionMeshes.filter(mesh => !groupMeshes.has(mesh));
     this.cameraCollisionBounds = this.cameraCollisionBounds.filter(bound => bound.chunkKey !== key);
@@ -532,16 +938,28 @@ export class ChunkRenderAdapter {
   }
 
   #registerFeatureInstance({
-    stableId, chunkKey, mesh, fadeMesh = null, index, matrix, group, canonicalObject = null,
+    stableId, chunkKey, mesh, fadeMesh = null, fadeState = null,
+    index, matrix, group, canonicalObject = null,
     treePathId = null,
   }) {
-    if (typeof stableId !== 'string' || !stableId) throw new Error(`invalid render feature Stable ID: ${chunkKey}`);
+    if (typeof stableId !== 'string' || !stableId) {
+      throw canonicalRenderRegistryError(
+        `invalid render feature Stable ID: ${chunkKey}`,
+        'render-registry-projection',
+      );
+    }
     const registry = this.#registry();
     let existing = registry.featureInstances.get(stableId) ?? this.featureInstances.get(stableId);
     if (existing && existing.chunkKey !== chunkKey) {
-      throw new Error(`Stable ID collision in render adapter: ${stableId}`);
+      throw canonicalRenderRegistryError(
+        `Stable ID collision in render adapter: ${stableId}`,
+        'render-registry-projection',
+      );
     }
-    const part = { mesh, fadeMesh, index, originalMatrix: this.#cloneMatrix(matrix) };
+    const part = {
+      stableId, mesh, fadeMesh, fadeState, index, originalMatrix: this.#cloneMatrix(matrix),
+    };
+    fadeState?.parts.push(part);
     if (!existing) {
       existing = {
         stableId, chunkKey, mesh, index, originalMatrix: part.originalMatrix,
@@ -554,6 +972,7 @@ export class ChunkRenderAdapter {
     registry.chunkFeatureIds.get(chunkKey).add(stableId);
     const destroyed = this.isFeatureDestroyed(stableId);
     existing.destroyed = destroyed;
+    existing.occluded ??= false;
     mesh.setMatrixAt(index, destroyed ? this.hiddenFeatureMatrix : part.originalMatrix);
     fadeMesh?.setMatrixAt(index, this.hiddenFeatureMatrix);
   }
@@ -565,12 +984,21 @@ export class ChunkRenderAdapter {
         .find(Boolean);
     if (!entry) return false;
     const nextDestroyed = destroyed === true;
-    const visibilityChanged = entry.destroyed !== nextDestroyed;
-    if (entry.destroyed !== nextDestroyed) {
-      entry.destroyed = nextDestroyed;
-      this.#invalidateVisibleStableIds();
-    }
     const occluded = this.occludedFeatureIds.has(stableId);
+    const destructionPresentation = entry.canonicalObject?.destruction?.presentation ?? 'rubble';
+    const rubbleStateMatches = nextDestroyed && destructionPresentation === 'rubble'
+      ? entry.rubbleMesh !== null
+      : entry.rubbleMesh === null;
+    if (entry.destroyed === nextDestroyed
+      && entry.occluded === occluded
+      && rubbleStateMatches) return true;
+    const visibilityChanged = entry.destroyed !== nextDestroyed;
+    entry.destroyed = nextDestroyed;
+    entry.occluded = occluded;
+    if (visibilityChanged) {
+      this.#invalidateVisibleStableIds();
+      this.#invalidateDrawableReceiptOwner(entry.chunkKey);
+    }
     for (const part of entry.parts) {
       part.mesh.setMatrixAt(part.index, nextDestroyed || occluded
         ? this.hiddenFeatureMatrix : part.originalMatrix);
@@ -589,7 +1017,6 @@ export class ChunkRenderAdapter {
       this.treePathAudit.visibilityChangeCount += Number(visibilityChanged);
       this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
     }
-    const destructionPresentation = entry.canonicalObject?.destruction?.presentation ?? 'rubble';
     if (nextDestroyed && destructionPresentation === 'rubble' && !entry.rubbleMesh) {
       const Mesh = requireConstructor(this.THREE, 'Mesh');
       const rubble = new Mesh(
@@ -612,8 +1039,16 @@ export class ChunkRenderAdapter {
 
   setFeatureOccluded(stableId, occluded = true) {
     const entry = this.featureInstances.get(stableId);
-    if (!entry || !entry.parts.some(part => part.fadeMesh)) return false;
-    if (occluded) this.occludedFeatureIds.add(stableId);
+    if (!entry || !entry.parts.some(part => part.fadeMesh || part.fadeState)) return false;
+    const nextOccluded = occluded === true;
+    const currentOccluded = this.occludedFeatureIds.has(stableId);
+    if (currentOccluded === nextOccluded) return true;
+    if (nextOccluded) {
+      for (const part of entry.parts) {
+        if (!part.fadeMesh && part.fadeState) this.#materializeFadeMesh(part.fadeState);
+      }
+    }
+    if (nextOccluded) this.occludedFeatureIds.add(stableId);
     else this.occludedFeatureIds.delete(stableId);
     return this.setFeatureDestroyed(stableId, this.isFeatureDestroyed(stableId));
   }
@@ -856,6 +1291,7 @@ export class ChunkRenderAdapter {
         this.settlementPresentationHolds.delete(ownerKey);
         releasedOwnerKeys.push(ownerKey);
       }
+      this.#invalidateDrawableReceiptOwner(ownerKey);
     }
     const remainingDescriptorKeys = new Set(
       [...this.settlementPresentationHolds.values()]
@@ -925,6 +1361,7 @@ export class ChunkRenderAdapter {
       lifecycle: 'held',
     };
     this.settlementPresentationHolds.set(projected.key, held);
+    this.#invalidateDrawableReceiptOwner(projected.key);
     this.loaded.delete(projected.key);
     projected.lifecycle = 'presentation-held';
     this.pendingFirstDrawByChunk.delete(projected.key);
@@ -1028,6 +1465,126 @@ export class ChunkRenderAdapter {
     return geometry;
   }
 
+  beginProjectedOwnerDrawFrame(frameSequence) {
+    if (!Number.isSafeInteger(frameSequence) || frameSequence < 1) {
+      throw new RangeError('projected owner draw frameSequence must be a positive safe integer');
+    }
+    if (this.activeProjectedDrawFrameSequence !== null) {
+      throw new Error('a projected owner draw frame is already active');
+    }
+    this.activeProjectedDrawFrameSequence = frameSequence;
+    return frameSequence;
+  }
+
+  completeProjectedOwnerDrawFrame(frameSequence) {
+    if (this.activeProjectedDrawFrameSequence !== frameSequence) {
+      throw new Error('projected owner draw frame is not active');
+    }
+    this.activeProjectedDrawFrameSequence = null;
+    return true;
+  }
+
+  abortProjectedOwnerDrawFrame(frameSequence) {
+    if (this.activeProjectedDrawFrameSequence !== frameSequence) return false;
+    this.activeProjectedDrawFrameSequence = null;
+    return true;
+  }
+
+  projectedOwnerUploadProof(ownerKey, receipt, manifest = null) {
+    const projected = this.loaded.get(ownerKey) ?? null;
+    const activeManifest = manifest ?? projected?.uploadManifest ?? null;
+    if (!projected || projected.lifecycle !== 'loaded'
+      || activeManifest !== projected.uploadManifest
+      || activeManifest?.ownerKey !== ownerKey
+      || !isObjectInCompletedFrameScene({ object: projected.group, receipt })
+      || typeof receipt?.gpuMirror?.matches !== 'function') return false;
+    const drawables = projected.uploadManifestDrawableObjects
+      ?? projectedUploadDrawableObjects(projected.group);
+    if (drawables.length !== activeManifest.meshCount) return false;
+    for (const target of activeManifest.uploadTargets ?? []) {
+      const drawable = drawables[target.drawableIndex] ?? null;
+      if (!isObjectUploadTargetInCompletedFrame({
+        object: drawable,
+        attribute: target.attribute,
+        receipt,
+      })) return false;
+    }
+    projected.uploadCompleteReceipt = receipt;
+    this.counts.projectedOwnerUploadProofs += 1;
+    return true;
+  }
+
+  // Retained for isolated callers while the runtime uses the accurately named
+  // upload proof. This no longer claims visibility or releases continuity holds.
+  projectedOwnerDrawProof(ownerKey, receipt, manifest = null) {
+    return this.projectedOwnerUploadProof(ownerKey, receipt, manifest);
+  }
+
+  async finalizeProjectedUploadManifest(projected, { generation } = {}) {
+    if (!projected?.key || !projected.group || projected.lifecycle !== 'staged') {
+      throw new TypeError('a staged projected owner is required to finalize upload resources');
+    }
+    if (!Number.isSafeInteger(generation) || generation < 0) {
+      throw new RangeError('projected upload generation must be a non-negative safe integer');
+    }
+    if (this.projectedUploadManifestFinalizationCancellation) {
+      throw this.projectedUploadManifestFinalizationCancellation;
+    }
+    const provisional = this.provisionalTerrain.get(projected.key) ?? null;
+    if (this.disposed) throw new Error('render adapter is shut down');
+    if (this.projectedUploadManifestFinalizationCancellation) {
+      throw this.projectedUploadManifestFinalizationCancellation;
+    }
+    if (projected.lifecycle !== 'staged') {
+      throw new Error(`projected owner changed while finalizing upload: ${projected.key}`);
+    }
+    if (provisional && this.provisionalTerrain.get(projected.key) !== provisional) {
+      throw new Error(`provisional Terrain changed while finalizing upload: ${projected.key}`);
+    }
+
+    const projectedTerrain = (projected.group.children ?? []).find(child => (
+      child.name === 'w2-natural-terrain' || child.name === 'w1a-terrain'
+    )) ?? null;
+    const effectiveChildren = provisional
+      ? (projected.group.children ?? []).map(child => (
+        child === projectedTerrain ? provisional.terrain : child
+      ))
+      : [...(projected.group.children ?? [])];
+    const effectiveOwnedGeometries = new Set(projected.ownedGeometries ?? []);
+    if (provisional && projectedTerrain?.geometry) {
+      effectiveOwnedGeometries.delete(projectedTerrain.geometry);
+      // A prior world-frame receipt proves the exact provisional geometry
+      // resident. If it has never drawn (for example, it is behind camera),
+      // the same Mesh becomes an explicit private-staging upload target.
+      if (!provisional.residentRenderReceipt && provisional.terrain?.geometry) {
+        effectiveOwnedGeometries.add(provisional.terrain.geometry);
+      }
+    }
+    const residentResourceProofs = provisional?.residentRenderReceipt ? [Object.freeze({
+      ownerKey: projected.key,
+      resourceKind: 'provisional-terrain',
+      frameSequence: provisional.residentRenderReceipt.frameSequence,
+      completedAtMs: provisional.residentRenderReceipt.completedAtMs,
+    })] : [];
+    const manifest = createProjectedUploadManifest({
+      ownerKey: projected.key,
+      generation,
+      root: { children: effectiveChildren },
+      ownedGeometries: effectiveOwnedGeometries,
+      residentResourceProofs,
+    });
+    projected.uploadManifest = manifest;
+    projected.uploadManifestDrawableObjects = projectedUploadDrawableObjects({
+      children: effectiveChildren,
+    });
+    projected.uploadManifestEffectiveTerrain = provisional?.terrain ?? projectedTerrain;
+    projected.uploadManifestEffectiveTerrainRequiresUpload = Boolean(
+      provisional && !provisional.residentRenderReceipt,
+    );
+    projected.uploadManifestFinalized = true;
+    return manifest;
+  }
+
   async projectTerrainChunk(chunkData, origin = null) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
@@ -1091,6 +1648,7 @@ export class ChunkRenderAdapter {
       throw new Error(`Terrain owner is already published: ${projected.key}`);
     }
     this.#positionGroup(projected);
+    this.#installProjectedDrawProbe(projected, 'provisional-terrain');
     this.worldRoot.add(projected.group);
     this.provisionalTerrain.set(projected.key, projected);
     projected.lifecycle = 'provisional';
@@ -1125,6 +1683,32 @@ export class ChunkRenderAdapter {
     return faded;
   }
 
+  #materializeFadeMesh(state) {
+    if (!state || state.fadeMesh) return state?.fadeMesh ?? null;
+    const InstancedMesh = requireConstructor(this.THREE, 'InstancedMesh');
+    const fadeMesh = new InstancedMesh(
+      state.geometry,
+      this.#fadeMaterialFor(state.materialKey),
+      Math.max(1, state.capacity),
+    );
+    fadeMesh.name = `${state.mesh.name}-camera-faded`;
+    fadeMesh.castShadow = false;
+    fadeMesh.receiveShadow = false;
+    fadeMesh.count = state.capacity;
+    fadeMesh.userData.featureStableIds = [];
+    for (const part of state.parts) {
+      part.fadeMesh = fadeMesh;
+      fadeMesh.userData.featureStableIds[part.index] = part.stableId;
+      fadeMesh.setMatrixAt(part.index, this.hiddenFeatureMatrix);
+    }
+    fadeMesh.instanceMatrix.needsUpdate = true;
+    fadeMesh.visible = this.transparencyEnabled;
+    state.group.add(fadeMesh);
+    this.transparentMeshes.add(fadeMesh);
+    state.fadeMesh = fadeMesh;
+    return fadeMesh;
+  }
+
   #createProductionPartMeshes({
     group, chunkKey, name, items, castShadow = true, cameraOccludable = false,
     attach = true,
@@ -1153,29 +1737,24 @@ export class ChunkRenderAdapter {
       mesh.userData.treePathId = resourceItems.some(item => item.treePathId === 'near-tree')
         ? 'near-tree' : null;
       mesh.userData.treeStableIds = [];
-      let fadeMesh = null;
-      if (cameraOccludable) {
-        fadeMesh = new InstancedMesh(
-          this.visualAssets.geometries[descriptor.geometry],
-          this.#fadeMaterialFor(descriptor.material),
-          Math.max(1, resourceItems.length),
-        );
-        fadeMesh.name = `${mesh.name}-camera-faded`;
-        fadeMesh.castShadow = false;
-        fadeMesh.receiveShadow = false;
-        fadeMesh.count = resourceItems.length;
-        fadeMesh.userData.featureStableIds = [];
-      }
+      const fadeState = cameraOccludable ? {
+        mesh,
+        group,
+        geometry: this.visualAssets.geometries[descriptor.geometry],
+        materialKey: descriptor.material,
+        capacity: resourceItems.length,
+        parts: [],
+        fadeMesh: null,
+      } : null;
       resourceItems.forEach((item, index) => {
         mesh.setMatrixAt(index, item.matrix);
         mesh.userData.featureStableIds[index] = item.stableId;
         if (item.treePathId === 'near-tree') mesh.userData.treeStableIds.push(item.stableId);
-        if (fadeMesh) fadeMesh.userData.featureStableIds[index] = item.stableId;
         this.#registerFeatureInstance({
           stableId: item.stableId,
           chunkKey,
           mesh,
-          fadeMesh,
+          fadeState,
           index,
           matrix: item.matrix,
           group,
@@ -1191,14 +1770,7 @@ export class ChunkRenderAdapter {
       }
       if (attach) group.add(mesh);
       meshes.push(mesh);
-      if (fadeMesh) {
-        fadeMesh.instanceMatrix.needsUpdate = true;
-        if (attach) group.add(fadeMesh);
-        fadeMesh.visible = this.transparencyEnabled;
-        this.#registry().transparentMeshes.add(fadeMesh);
-        meshes.push(fadeMesh);
-        this.#registry().occlusionMeshes.push(mesh, fadeMesh);
-      }
+      if (fadeState) this.#registry().occlusionMeshes.push(mesh);
     }
     return meshes;
   }
@@ -1207,6 +1779,7 @@ export class ChunkRenderAdapter {
     deferredRegistration = false,
     yieldToHost = null,
     cooperativeSliceMs = CHUNK_PROJECTION_COOPERATIVE_SLICE_MS,
+    shouldCancel = null,
   } = {}) {
     if (this.disposed) throw new Error('render adapter is shut down');
     if (!chunkData) throw new TypeError('ChunkData is required for rendering');
@@ -1215,6 +1788,9 @@ export class ChunkRenderAdapter {
     }
     if (!Number.isFinite(cooperativeSliceMs) || cooperativeSliceMs < 0) {
       throw new RangeError('cooperativeSliceMs must be a non-negative finite number');
+    }
+    if (shouldCancel !== null && typeof shouldCancel !== 'function') {
+      throw new TypeError('shouldCancel must be a function when provided');
     }
     if (deferredRegistration && this.projectionStaging !== null) {
       throw new Error('Chunk projection is already in progress');
@@ -1228,15 +1804,23 @@ export class ChunkRenderAdapter {
     const cooperativeYieldEnabled = deferredRegistration && yieldToHost !== null;
     const projectionClock = () => globalThis.performance?.now?.() ?? Date.now();
     let projectionSliceStartedAtMs = projectionClock();
+    let projectionGroup = null;
+    const projectionOwnedGeometries = new Set();
+    const throwIfProjectionCancelled = () => {
+      if (shouldCancel?.() === true) throw projectionCancelledError(key);
+    };
     const yieldProjectionIfNeeded = async () => {
+      throwIfProjectionCancelled();
       if (!cooperativeYieldEnabled) return false;
       const now = projectionClock();
       if (now - projectionSliceStartedAtMs < cooperativeSliceMs) return false;
       await yieldToHost();
       projectionSliceStartedAtMs = projectionClock();
+      throwIfProjectionCancelled();
       return true;
     };
     try {
+    throwIfProjectionCancelled();
     const layers = chunkData.presentationLayers;
     const usesW8CanonicalObjects = (chunkData.generatorVersion?.major ?? 0) >= 800;
     const canonicalCandidates = resolveW8CanonicalCandidateSet(chunkData);
@@ -1247,6 +1831,7 @@ export class ChunkRenderAdapter {
     const settlementLandmarks = layers?.landmarks ?? chunkData.settlementLandmarks ?? [];
     const streetDetails = layers?.streetDetails ?? chunkData.streetDetails ?? [];
     const group = new Group();
+    projectionGroup = group;
     group.name = `w1a-chunk-${key}`;
     group.userData = { chunkKey: key, chunkId: chunkData.chunkId, contentHash: chunkData.contentHash };
     const layerMeshes = {
@@ -1263,6 +1848,7 @@ export class ChunkRenderAdapter {
         cooperativeYieldEnabled ? yieldProjectionIfNeeded : null,
       )
       : this.geometries.terrain;
+    if (naturalTerrain) projectionOwnedGeometries.add(terrainGeometry);
     const terrain = new Mesh(
       terrainGeometry,
       naturalTerrain ? this.materials.naturalTerrain : this.materials.terrain,
@@ -1427,6 +2013,7 @@ export class ChunkRenderAdapter {
       const buildings = settlementFeatures.filter(feature => feature.featureType === 'settlement-building');
       if (roads.length) {
         roadRibbonGeometry = this.#createSettlementRoadGeometry(chunkData, roads);
+        projectionOwnedGeometries.add(roadRibbonGeometry);
         const roadMesh = new Mesh(roadRibbonGeometry, resources.materials.road);
         roadMesh.name = chunkData.generatorVersion?.major >= 500
           ? 'infinite-settlement-roads' : 'w4-rural-roads';
@@ -1745,10 +2332,7 @@ export class ChunkRenderAdapter {
       chunkX: chunkData.chunkX,
       chunkZ: chunkData.chunkZ,
       group,
-      ownedGeometries: [
-        ...(naturalTerrain ? [terrainGeometry] : []),
-        ...(roadRibbonGeometry ? [roadRibbonGeometry] : []),
-      ],
+      ownedGeometries: [...projectionOwnedGeometries],
       settlementPresentation: Object.freeze({
         descriptors: Object.freeze(settlementPresentationDescriptors),
         meshes: Object.freeze([
@@ -1776,37 +2360,116 @@ export class ChunkRenderAdapter {
       registry: this.projectionStaging,
       lifecycle: 'staged',
     };
+    projected.uploadManifest = createProjectedUploadManifest({
+      ownerKey: key,
+      root: group,
+      ownedGeometries: projected.ownedGeometries,
+    });
     this.#positionGroup(projected, origin);
+    throwIfProjectionCancelled();
     this.counts.projected += 1;
     return projected;
+    } catch (error) {
+      if (deferredRegistration && projectionGroup) {
+        for (const geometry of projectionOwnedGeometries) {
+          if (this.disposedChunkGeometries.has(geometry)) continue;
+          geometry.dispose?.();
+          this.disposedChunkGeometries.add(geometry);
+          this.counts.chunkOwnedGeometriesDisposed += 1;
+        }
+        for (const child of projectionGroup.children ?? []) child.dispose?.();
+        projectionGroup.clear?.();
+      }
+      throw error;
     } finally {
       if (deferredRegistration) this.projectionStaging = null;
     }
   }
 
   async loadProjected(projected) {
-    if (!projected?.key || !projected.group) throw new TypeError('invalid projected chunk');
+    if (!projected?.key || !projected.group) {
+      throw runtimeRenderInvariantError(
+        'invalid projected chunk',
+        'near-publication-contract',
+      );
+    }
     if (projected.lifecycle !== 'staged') {
-      throw new Error(`render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`);
+      throw runtimeRenderInvariantError(
+        `render chunk is not staged for load: ${projected.key}:${projected.lifecycle}`,
+        'near-publication-lifecycle',
+      );
     }
-    const replacementOwner = this.visualRegistry?.get?.(projected.key) ?? null;
-    const replacementHold = replacementOwner && replacementOwner.retiringAt === null
-      ? this.settlementPresentationHolds.get(projected.key) ?? null : null;
-    if (!replacementHold || !this.settlementReplacementBarrier) {
-      this.releaseSettlementPresentationHolds({
-        ownerKeys: [projected.key],
-        reason: 'owner-returned-near',
-      });
+    if (this.loaded.has(projected.key)) {
+      throw runtimeRenderInvariantError(
+        `render chunk already loaded: ${projected.key}`,
+        'near-publication-lifecycle',
+      );
     }
-    if (this.loaded.has(projected.key)) throw new Error(`render chunk already loaded: ${projected.key}`);
+    // Validate every Stable ID before the first global registry write. A
+    // collision late in iteration must not publish the preceding entries.
+    const registryTransaction = this.#preflightProjectedRegistry(projected);
+    const replacementHold = this.settlementPresentationHolds.get(projected.key) ?? null;
     const provisional = this.provisionalTerrain.get(projected.key) ?? null;
     const projectedTerrain = (projected.group.children ?? []).find(child => (
       child.name === 'w2-natural-terrain' || child.name === 'w1a-terrain'
     ));
+    if (provisional && Object.hasOwn(projected, 'uploadManifestEffectiveTerrain')
+      && projected.uploadManifestEffectiveTerrain !== provisional.terrain) {
+      throw runtimeRenderInvariantError(
+        `projected upload manifest does not match promoted Terrain: ${projected.key}`,
+        'near-upload-manifest-invariant',
+      );
+    }
+    if (projected.uploadManifestFinalized === true
+      && projected.uploadManifest.resourceBuckets.length > 0) {
+      const staged = projected.uploadStagingProof;
+      if (staged?.manifest !== projected.uploadManifest
+        || staged.bucketIndices.size !== projected.uploadManifest.resourceBuckets.length
+        || projected.uploadManifest.resourceBuckets.some(
+          bucket => !staged.bucketIndices.has(bucket.bucketIndex),
+        )) {
+        throw runtimeRenderInvariantError(
+          `projected owner resources were not fully staged: ${projected.key}`,
+          'near-upload-manifest-invariant',
+        );
+      }
+    }
+    if (provisional && projected.uploadManifestFinalized === true
+      && !provisional.residentRenderReceipt
+      && projected.uploadManifestEffectiveTerrainRequiresUpload !== true) {
+      throw runtimeRenderInvariantError(
+        `promoted Terrain has neither resident nor staging proof: ${projected.key}`,
+        'near-upload-manifest-invariant',
+      );
+    }
+    const publicationState = {
+      projectedLifecycle: projected.lifecycle,
+      projectedGroupChildren: [...(projected.group.children ?? [])],
+      projectedPosition: Object.freeze({
+        x: projected.group.position.x,
+        y: projected.group.position.y,
+        z: projected.group.position.z,
+      }),
+      projectedOwnedGeometries: projected.ownedGeometries,
+      projectedPromotedTerrainHad: Object.hasOwn(projected, 'promotedTerrain'),
+      projectedPromotedTerrain: projected.promotedTerrain,
+      projectedReplacementHoldHad: Object.hasOwn(projected, 'settlementReplacementHold'),
+      projectedReplacementHold: projected.settlementReplacementHold,
+      provisionalLifecycle: provisional?.lifecycle,
+      provisionalGroupChildren: provisional ? [...(provisional.group.children ?? [])] : null,
+      worldRootChildren: [...(this.worldRoot.children ?? [])],
+      pendingFirstDrawHad: this.pendingFirstDrawByChunk.has(projected.key),
+      pendingFirstDraw: this.pendingFirstDrawByChunk.get(projected.key),
+      visibleStableIdsRevision: this.visibleStableIdsRevision,
+      visibleStableIdsCache: this.visibleStableIdsCache,
+      loadedCount: this.counts.loaded,
+      treePathLastUpdateAtMs: this.treePathAudit.lastUpdateAtMs,
+    };
+    let replacementBarrierTransaction = null;
     projected.lifecycle = 'loading';
     try {
       this.#positionGroup(projected);
-      this.#commitProjectedRegistry(projected);
+      this.#commitProjectedRegistry(registryTransaction);
       if (provisional) {
         this.worldRoot.remove(provisional.group);
         provisional.group.remove(provisional.terrain);
@@ -1818,17 +2481,13 @@ export class ChunkRenderAdapter {
       if (provisional) {
         this.provisionalTerrain.delete(projected.key);
         projected.promotedTerrain = provisional;
-        projected.ownedGeometries = [
-          ...(projected.ownedGeometries ?? []).filter(geometry => geometry !== projectedTerrain?.geometry),
+        // Keep the detached full-projection Terrain geometry in the owner's
+        // disposal set. loadProjected must remain reversible, so it is
+        // reclaimed exactly once by normal unload/retain after publication.
+        projected.ownedGeometries = [...new Set([
+          ...(projected.ownedGeometries ?? []),
           ...(provisional.ownedGeometries ?? []),
-        ];
-        if (projectedTerrain && projectedTerrain.geometry !== provisional.terrain.geometry
-          && projectedTerrain.geometry !== this.geometries.terrain) {
-          projectedTerrain.geometry.dispose?.();
-          this.disposedChunkGeometries.add(projectedTerrain.geometry);
-          this.counts.chunkOwnedGeometriesDisposed += 1;
-        }
-        projectedTerrain?.dispose?.();
+        ])];
         provisional.lifecycle = 'promoted';
       }
       projected.lifecycle = 'loaded';
@@ -1836,34 +2495,81 @@ export class ChunkRenderAdapter {
       if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
         this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
       }
-      this.#recordPublishedChunk(projected.key);
       this.#invalidateVisibleStableIds();
-      if (replacementHold && this.settlementReplacementBarrier) {
+      if (replacementHold) {
         projected.settlementReplacementHold = replacementHold;
-        this.settlementReplacementBarrier.retain({
-          ownerKey: projected.key,
-          drawable: replacementHold,
-        });
+        replacementBarrierTransaction = this.#retainSettlementReplacementHold(
+          projected.key,
+          replacementHold,
+        );
       }
+      // Telemetry is observer-only and is published after every transactional
+      // mutation that can still reject. Its circuit breaker cannot roll the
+      // world back or leave a phantom publication on a failed retain.
+      this.#recordPublishedChunk(projected.key);
+      this.#invalidateDrawableReceiptOwner(projected.key);
     } catch (error) {
-      this.worldRoot.remove(projected.group);
-      this.loaded.delete(projected.key);
+      const rollbackErrors = [];
+      const rollback = operation => {
+        try { operation(); } catch (rollbackError) { rollbackErrors.push(rollbackError); }
+      };
+      rollback(() => this.#rollbackSettlementReplacementHold(replacementBarrierTransaction));
+      rollback(() => this.#rollbackProjectedRegistry(registryTransaction));
+      rollback(() => this.#restoreGroupChildren(
+        projected.group,
+        publicationState.projectedGroupChildren,
+      ));
       if (provisional) {
-        projected.group.remove(provisional.terrain);
-        if (projectedTerrain) projected.group.add(projectedTerrain);
-        provisional.group.add(provisional.terrain);
-        this.#positionGroup(provisional);
-        this.worldRoot.add(provisional.group);
-        this.provisionalTerrain.set(projected.key, provisional);
-        provisional.lifecycle = 'provisional';
+        rollback(() => this.#restoreGroupChildren(
+          provisional.group,
+          publicationState.provisionalGroupChildren,
+        ));
       }
-      projected.lifecycle = 'staged';
+      rollback(() => this.#restoreGroupChildren(
+        this.worldRoot,
+        publicationState.worldRootChildren,
+      ));
+      rollback(() => projected.group.position.set(
+        publicationState.projectedPosition.x,
+        publicationState.projectedPosition.y,
+        publicationState.projectedPosition.z,
+      ));
+      this.loaded.delete(projected.key);
+      if (provisional) this.provisionalTerrain.set(projected.key, provisional);
+      projected.ownedGeometries = publicationState.projectedOwnedGeometries;
+      if (publicationState.projectedPromotedTerrainHad) {
+        projected.promotedTerrain = publicationState.projectedPromotedTerrain;
+      } else {
+        delete projected.promotedTerrain;
+      }
+      if (publicationState.projectedReplacementHoldHad) {
+        projected.settlementReplacementHold = publicationState.projectedReplacementHold;
+      } else {
+        delete projected.settlementReplacementHold;
+      }
+      projected.lifecycle = publicationState.projectedLifecycle;
+      if (provisional) provisional.lifecycle = publicationState.provisionalLifecycle;
+      if (publicationState.pendingFirstDrawHad) {
+        this.pendingFirstDrawByChunk.set(projected.key, publicationState.pendingFirstDraw);
+      } else {
+        this.pendingFirstDrawByChunk.delete(projected.key);
+      }
+      this.visibleStableIdsRevision = publicationState.visibleStableIdsRevision;
+      this.visibleStableIdsCache = publicationState.visibleStableIdsCache;
+      this.counts.loaded = publicationState.loadedCount;
+      this.treePathAudit.lastUpdateAtMs = publicationState.treePathLastUpdateAtMs;
+      if (rollbackErrors.length > 0) {
+        throw new AggregateError(
+          [error, ...rollbackErrors],
+          `render chunk publication failed and rollback was incomplete: ${projected.key}`,
+        );
+      }
       throw error;
     }
   }
 
   #recordPublishedChunk(key) {
-    if (!this.telemetry) return;
+    if (!this.telemetryObserverEnabled) return;
     const summaries = new Map([
       [WORLD_STREAMING_TARGET.NEAR, { count: 1, stableId: null }],
     ]);
@@ -1896,16 +2602,80 @@ export class ChunkRenderAdapter {
         stableId: summary.stableId,
         metadata: { instanceCount: summary.count },
       };
-      const published = this.telemetry.record(WORLD_STREAMING_EVENT.PUBLISH, details);
+      const published = this.#recordTelemetry(WORLD_STREAMING_EVENT.PUBLISH, details);
       pending.push({ ...details, correlationId: published?.correlationId ?? null });
     }
     this.pendingFirstDrawByChunk.set(key, pending);
   }
 
+  #recordTelemetry(type, details) {
+    if (!this.telemetryObserverEnabled) return null;
+    try {
+      return this.telemetry.record(type, details);
+    } catch (error) {
+      this.telemetryObserverEnabled = false;
+      this.telemetryObserverFailureCount += 1;
+      this.lastTelemetryObserverFailure = Object.freeze({
+        type,
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+      });
+      return null;
+    }
+  }
+
+  beginProjectedPublicationBatch({ batchId, ownerKeys } = {}) {
+    if (this.projectedPublicationBatch !== null) {
+      throw new Error('a projected publication batch is already active');
+    }
+    if (typeof batchId !== 'string' || !batchId) {
+      throw new TypeError('projected publication batchId must be a non-empty string');
+    }
+    if (typeof ownerKeys?.[Symbol.iterator] !== 'function') {
+      throw new TypeError('projected publication ownerKeys must be iterable');
+    }
+    const keys = new Set(ownerKeys);
+    if ([...keys].some(key => typeof key !== 'string' || !key)) {
+      throw new TypeError('projected publication ownerKeys must be non-empty strings');
+    }
+    const token = Object.freeze({ batchId, ownerKeys: Object.freeze([...keys].sort()) });
+    this.projectedPublicationBatch = { token, ownerKeys: keys };
+    return token;
+  }
+
+  commitProjectedPublicationBatch(token) {
+    if (this.projectedPublicationBatch?.token !== token) {
+      throw new Error('projected publication batch token is not active');
+    }
+    this.projectedPublicationBatch = null;
+    return true;
+  }
+
+  rollbackProjectedPublicationBatch(token) {
+    if (this.projectedPublicationBatch?.token !== token) return false;
+    const ownerKeys = this.projectedPublicationBatch.ownerKeys;
+    for (const ownerKey of ownerKeys) {
+      this.#cancelSettlementReplacementLease(this.loaded.get(ownerKey));
+      this.#invalidateDrawableReceiptOwner(ownerKey);
+    }
+    this.projectedPublicationBatch = null;
+    return true;
+  }
+
   markFirstDraw(receipt) {
     if (!isCompletedRenderFrameReceipt(receipt)) return 0;
+    for (const provisional of this.provisionalTerrain.values()) {
+      if (provisional.residentRenderReceipt) continue;
+      if (!this.#projectedDrawProof(provisional, receipt)) continue;
+      provisional.residentRenderReceipt = receipt;
+      this.#releaseProjectedDrawProbe(provisional);
+      this.#settleProvisionalManifestWaiters(provisional.key, { value: receipt });
+      this.counts.provisionalTerrainResidentProofs += 1;
+    }
     this.#recordDrawableStableIds(receipt);
-    this.#acknowledgeSettlementReplacements(receipt);
+    this.#acknowledgeSettlementReplacements(receipt, {
+      skipOwnerKeys: this.projectedPublicationBatch?.ownerKeys ?? null,
+    });
     if (this.treePathAudit.firstDrawAtMs === null && [...this.loaded.values()].some(projected => (
       hasDrawableInCompletedFrame({
         root: projected.group,
@@ -1916,13 +2686,13 @@ export class ChunkRenderAdapter {
     ))) {
       this.treePathAudit.firstDrawAtMs = receipt.completedAtMs;
     }
-    if (!this.telemetry || this.pendingFirstDrawByChunk.size === 0) return 0;
+    if (!this.telemetryObserverEnabled || this.pendingFirstDrawByChunk.size === 0) return 0;
     let recorded = 0;
     for (const [key, pending] of this.pendingFirstDrawByChunk) {
       const projected = this.loaded.get(key);
       if (!projected || !hasDrawableInCompletedFrame({ root: projected.group, receipt })) continue;
       for (const details of pending) {
-        this.telemetry.record(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
+        this.#recordTelemetry(WORLD_STREAMING_EVENT.FIRST_DRAW, details);
         recorded += 1;
       }
       this.pendingFirstDrawByChunk.delete(key);
@@ -1943,6 +2713,7 @@ export class ChunkRenderAdapter {
     const projected = this.loaded.get(key);
     if (!projected) throw new Error(`render chunk is not loaded: ${key}`);
     if (deferSettlementPresentation && this.#holdSettlementPresentation(projected)) return;
+    this.#releaseProjectedDrawProbe(projected);
     this.worldRoot.remove(projected.group);
     if (projected.group.children?.some(child => child.userData?.treePathId === 'near-tree')) {
       this.treePathAudit.disposeCount += 1;
@@ -1970,6 +2741,7 @@ export class ChunkRenderAdapter {
       throw new Error(`render chunk has no promoted Terrain to retain: ${key}`);
     }
     const terrain = provisional.terrain;
+    this.#releaseProjectedDrawProbe(projected);
     this.worldRoot.remove(projected.group);
     projected.group.remove(terrain);
     this.#removeProjectedRegistry(projected);
@@ -1996,6 +2768,10 @@ export class ChunkRenderAdapter {
   async unloadProvisionalTerrain(key) {
     const projected = this.provisionalTerrain.get(key);
     if (!projected) throw new Error(`provisional Terrain is not loaded: ${key}`);
+    this.#settleProvisionalManifestWaiters(key, {
+      error: new Error(`provisional Terrain was unloaded before renderer proof: ${key}`),
+    });
+    this.#releaseProjectedDrawProbe(projected);
     this.worldRoot.remove(projected.group);
     for (const geometry of projected.ownedGeometries ?? []) {
       geometry.dispose?.();
@@ -2018,6 +2794,7 @@ export class ChunkRenderAdapter {
       throw new Error(`cannot discard loaded chunk: ${projected.key}`);
     }
     if (projected.lifecycle === 'discarded' || projected.lifecycle === 'unloaded') return false;
+    this.#releaseProjectedDrawProbe(projected);
     for (const geometry of projected.ownedGeometries ?? []) {
       geometry.dispose?.();
       this.disposedChunkGeometries.add(geometry);
@@ -2203,11 +2980,20 @@ export class ChunkRenderAdapter {
         - this.counts.chunkOwnedGeometriesDisposed,
       chunkOwnedGeometriesCreated: this.counts.chunkOwnedGeometriesCreated,
       chunkOwnedGeometriesDisposed: this.counts.chunkOwnedGeometriesDisposed,
+      projectedOwnerUploadProofCount: this.counts.projectedOwnerUploadProofs,
+      projectedUploadManifestWaiterCancellationCount:
+        this.counts.projectedUploadManifestWaiterCancellations,
       trackedFeatureInstanceCount: this.featureInstances.size,
       visibleStableIdsRevision: this.visibleStableIdsRevision,
+      drawableReceiptOwnerCount: this.drawableStableIdsByOwner.size,
+      drawableReceiptDirtyOwnerCount: this.drawableReceiptDirtyOwners.size,
+      drawableReceiptIndexCounts: Object.freeze({ ...this.drawableReceiptIndexCounts }),
       cameraOccludableMeshCount: this.occlusionMeshes.length,
       cameraCollisionBoundCount: this.cameraCollisionBounds.length,
       cameraOccludedFeatureCount: this.occludedFeatureIds.size,
+      telemetryObserverEnabled: this.telemetryObserverEnabled,
+      telemetryObserverFailureCount: this.telemetryObserverFailureCount,
+      lastTelemetryObserverFailure: this.lastTelemetryObserverFailure,
       chunkRenderables: Object.freeze(Object.fromEntries(
         [...this.loaded].map(([key, projected]) => [key, projected.group.children.length]),
       )),
@@ -2217,6 +3003,17 @@ export class ChunkRenderAdapter {
 
   async shutdown() {
     if (this.disposed) return;
+    this.cancelPendingProjectedUploadManifestWaiters(
+      new Error('render adapter shut down before Terrain renderer proof'),
+    );
+    this.activeProjectedDrawFrameSequence = null;
+    if (this.projectedPublicationBatch) {
+      this.rollbackProjectedPublicationBatch(this.projectedPublicationBatch.token);
+    }
+    for (const ownerKey of [...this.settlementReplacementBarrierLeases.keys()]) {
+      this.settlementReplacementBarrier?.release(ownerKey);
+    }
+    this.settlementReplacementBarrierLeases.clear();
     this.releaseSettlementPresentationHolds({
       ownerKeys: [...this.settlementPresentationHolds.keys()],
       reason: 'shutdown',
@@ -2234,6 +3031,8 @@ export class ChunkRenderAdapter {
     this.featureInstances.clear();
     this.pendingFirstDrawByChunk.clear();
     this.visibleStableIdsCache = null;
+    this.drawableStableIdsByOwner.clear();
+    this.drawableReceiptDirtyOwners.clear();
     this.chunkFeatureIds.clear();
     this.occlusionMeshes.length = 0;
     this.cameraCollisionBounds.length = 0;

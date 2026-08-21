@@ -12,12 +12,42 @@ import {
 } from './chunk-data-service-protocol.js';
 import { createW8ForestHorizonManifest } from './forest-horizon-manifest.js';
 import { MetricSeries } from './runtime-timing.js';
+import { compareWorldGenerationRequests } from './world-generation-scheduler.js';
 
 const TRANSPORT_TIMING_SAMPLE_CAPACITY = 4096;
 const WORKER_SCHEDULER_CLOCK_SCHEMA = 'worker-scheduler-clock-1';
+const SHARED_CANCELLATION_FLAG_INDEX = 0;
+const SHARED_CANCELLATION_PREEMPTOR_INDEX = 1;
+const SHARED_CANCELLATION_WORD_COUNT = 2;
+const DEFAULT_WORKER_SHUTDOWN_DRAIN_TIMEOUT_MS = 1_000;
+export const FIXED_WORKER_LANE_TRANSPORT_SCHEMA = 'worker-fixed-lanes-1';
+export const WORKER_GENERATION_LANE = Object.freeze({
+  CRITICAL: 'critical',
+  BACKGROUND: 'background',
+});
+const SUCCESS_RESPONSE_TYPES = new Set([
+  CHUNK_GENERATOR_MESSAGE.GENERATED,
+  CHUNK_GENERATOR_MESSAGE.GENERATED_FOREST_HORIZON,
+  CHUNK_GENERATOR_MESSAGE.GENERATED_PRESENTATION_OWNER,
+  CHUNK_GENERATOR_MESSAGE.GENERATED_CANONICAL_TREE_CELL,
+  CHUNK_GENERATOR_MESSAGE.SETTLEMENTS,
+  CHUNK_GENERATOR_MESSAGE.SETTLEMENT_TEMPLATE,
+  CHUNK_GENERATOR_MESSAGE.CANONICAL_MAJOR_ROAD_OWNERS,
+  CHUNK_GENERATOR_MESSAGE.DIAGNOSTICS,
+]);
 
 function defaultClock() {
   return globalThis.performance?.now?.() ?? Date.now();
+}
+
+function createSharedCancellationBuffer() {
+  if (typeof globalThis.crossOriginIsolated === 'boolean'
+    && globalThis.crossOriginIsolated !== true) return null;
+  if (typeof globalThis.SharedArrayBuffer !== 'function'
+    || typeof globalThis.Atomics?.store !== 'function') return null;
+  return new globalThis.SharedArrayBuffer(
+    Int32Array.BYTES_PER_ELEMENT * SHARED_CANCELLATION_WORD_COUNT,
+  );
 }
 
 function browserWorkerFactory(globalObject = globalThis) {
@@ -48,6 +78,12 @@ function transportError(message) {
   return error;
 }
 
+function isCancellationAcknowledgement(message) {
+  return message?.type === CHUNK_GENERATOR_MESSAGE.ERROR
+    && message.cancelled === true
+    && message.code === 'WORLD_GENERATION_CANCELLED';
+}
+
 export function createWorkerChunkGeneratorTransport({
   worldSeed,
   settlementRoadGraphGeneratorId = null,
@@ -56,6 +92,8 @@ export function createWorkerChunkGeneratorTransport({
   workerFactory = () => browserWorkerFactory(globalThis),
   fallbackTransportFactory = null,
   clock = defaultClock,
+  sharedCancellationBufferFactory = createSharedCancellationBuffer,
+  shutdownDrainTimeoutMs = DEFAULT_WORKER_SHUTDOWN_DRAIN_TIMEOUT_MS,
   onSchedulerEvent = null,
   onPipelineEvent = null,
 } = {}) {
@@ -76,6 +114,12 @@ export function createWorkerChunkGeneratorTransport({
     throw new TypeError('fallbackTransportFactory must be a function when provided');
   }
   if (typeof clock !== 'function') throw new TypeError('clock must be a function');
+  if (typeof sharedCancellationBufferFactory !== 'function') {
+    throw new TypeError('sharedCancellationBufferFactory must be a function');
+  }
+  if (!Number.isFinite(shutdownDrainTimeoutMs) || shutdownDrainTimeoutMs < 0) {
+    throw new RangeError('shutdownDrainTimeoutMs must be a finite non-negative number');
+  }
   if (onSchedulerEvent !== null && typeof onSchedulerEvent !== 'function') {
     throw new TypeError('onSchedulerEvent must be a function when provided');
   }
@@ -88,6 +132,8 @@ export function createWorkerChunkGeneratorTransport({
   let mode = 'pending';
   let initialized = false;
   let isShutdown = false;
+  let shutdownDraining = false;
+  let shutdownPromise = null;
   let metadata = null;
   let initializeResolve = null;
   let initializeReject = null;
@@ -95,10 +141,13 @@ export function createWorkerChunkGeneratorTransport({
   let fallbackActivationPromise = null;
   let recoveryPromise = null;
   let runtimeFailure = null;
+  let lastRecoveryFailure = null;
   let controlRequestId = 1_000_000_000;
   const pending = new Map();
+  const cancelledAwaitingAcknowledgement = new Map();
   const pipelineReceipts = onPipelineEvent ? new Map() : null;
   const forestHorizonCancelledBeforeEpoch = new Map();
+  let drainResolve = null;
   const removers = [];
   const generationTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const receiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
@@ -116,6 +165,7 @@ export function createWorkerChunkGeneratorTransport({
   const canonicalMajorRoadOwnerQueryReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const diagnosticTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const diagnosticReceiveTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
+  const cancellationAcknowledgementTimes = new MetricSeries(TRANSPORT_TIMING_SAMPLE_CAPACITY);
   const counts = {
     generated: 0,
     forestHorizonGenerated: 0,
@@ -131,20 +181,190 @@ export function createWorkerChunkGeneratorTransport({
     pipelineTimingOrphans: 0,
     workerErrors: 0,
     fallbackCount: 0,
+    cancelRequests: 0,
+    cancellationAcknowledgements: 0,
+    cancellationAcknowledgementOrphans: 0,
+    cancellationAcknowledgementsAbandoned: 0,
+    preemptionAcknowledgements: 0,
+    sharedCancellationSignals: 0,
+    sharedCancellationUnavailable: 0,
+    shutdownDrainTimeouts: 0,
+    schedulerObserverFailures: 0,
+    pipelineObserverFailures: 0,
   };
   let fallbackReason = null;
   let lastGeneratorSnapshot = null;
   let lastWorkerSchedulerSnapshot = null;
+  let lastObserverFailure = null;
+  let schedulerObserverDisabled = false;
+  let pipelineObserverDisabled = false;
   const mainTimeOriginMs = Number.isFinite(globalThis.performance?.timeOrigin)
     ? globalThis.performance.timeOrigin : Date.now() - clock();
 
   const emitSchedulerEvent = event => {
-    if (!onSchedulerEvent) return;
-    try { onSchedulerEvent(Object.freeze(event)); } catch { /* diagnostics are isolated */ }
+    if (!onSchedulerEvent || schedulerObserverDisabled) return;
+    try {
+      onSchedulerEvent(Object.freeze(event));
+    } catch (error) {
+      schedulerObserverDisabled = true;
+      counts.schedulerObserverFailures += 1;
+      lastObserverFailure = Object.freeze({
+        observer: 'scheduler',
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        observedAtMs: clock(),
+      });
+    }
   };
   const emitPipelineEvent = (type, details) => {
-    if (!onPipelineEvent) return;
-    try { onPipelineEvent(type, details); } catch { /* diagnostics are isolated */ }
+    if (!onPipelineEvent || pipelineObserverDisabled) return;
+    try {
+      onPipelineEvent(type, details);
+    } catch (error) {
+      pipelineObserverDisabled = true;
+      counts.pipelineObserverFailures += 1;
+      lastObserverFailure = Object.freeze({
+        observer: 'pipeline',
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        observedAtMs: clock(),
+      });
+    }
+  };
+  const resolveDrainIfIdle = () => {
+    if (pending.size !== 0 || cancelledAwaitingAcknowledgement.size !== 0) return;
+    drainResolve?.(true);
+    drainResolve = null;
+  };
+  const recordCancellationAcknowledgement = (
+    message,
+    operation,
+    receivedAtMs,
+    acknowledgementSource = 'worker-cancellation-response',
+  ) => {
+    const requestedAtMs = operation.cancellationRequestedAtMs
+      ?? operation.cancelRequestedAtMs ?? null;
+    const cancellationReason = operation.sharedCancellationReason
+      ?? message.cancellationReason ?? operation.cancellationReason ?? 'cancelled';
+    const preemptedByRequestId = operation.sharedPreemptedByRequestId
+      ?? message.scheduler?.preemptedByRequestId ?? null;
+    const workerAcknowledgementMs = Number.isFinite(
+      message.scheduler?.cancellationAcknowledgementMs,
+    ) ? Math.max(0, message.scheduler.cancellationAcknowledgementMs) : null;
+    const workerToMainTime = value => Number.isFinite(message.workerTimeOriginMs)
+      && Number.isFinite(value)
+      ? message.workerTimeOriginMs + value - mainTimeOriginMs : null;
+    const workerCancellationRequestedAtMainMs = workerToMainTime(
+      message.scheduler?.cancellationRequestedAtMs,
+    );
+    const workerCancellationAcknowledgedAtMainMs = workerToMainTime(
+      message.scheduler?.cancellationAcknowledgedAtMs,
+    );
+    const workerTerminalAtMainMs = workerToMainTime(message.scheduler?.terminalAtMs);
+    const workerResponseSentAtMainMs = workerToMainTime(message.responseSentAtMs);
+    const signalToWorkerObservationMs = requestedAtMs === null
+      || workerCancellationRequestedAtMainMs === null ? null
+      : Math.max(0, workerCancellationRequestedAtMainMs - requestedAtMs);
+    const workerTerminalDrainMs = workerCancellationAcknowledgedAtMainMs === null
+      || workerTerminalAtMainMs === null ? null
+      : Math.max(0, workerTerminalAtMainMs - workerCancellationAcknowledgedAtMainMs);
+    const workerResponseQueueMs = workerTerminalAtMainMs === null
+      || workerResponseSentAtMainMs === null ? null
+      : Math.max(0, workerResponseSentAtMainMs - workerTerminalAtMainMs);
+    const responseDeliveryMs = workerResponseSentAtMainMs === null
+      ? null : Math.max(0, receivedAtMs - workerResponseSentAtMainMs);
+    // Automatic in-Worker preemption has no main-side cancel timestamp. Do
+    // not mislabel the request's entire execution age as cancel latency.
+    const acknowledgementMs = requestedAtMs === null
+      ? workerAcknowledgementMs ?? 0
+      : Math.max(0, receivedAtMs - requestedAtMs);
+    cancellationAcknowledgementTimes.record(acknowledgementMs);
+    counts.cancellationAcknowledgements += 1;
+    if (preemptedByRequestId !== null) {
+      counts.preemptionAcknowledgements += 1;
+    }
+    emitSchedulerEvent({
+      type: 'cancel-acknowledged',
+      envelope: operation.request.scheduler ?? null,
+      state: 'cancelled',
+      cancellationReason,
+      cancellationRequestedAtMs: requestedAtMs,
+      cancellationAcknowledgedAtMs: receivedAtMs,
+      cancellationAcknowledgementMs: acknowledgementMs,
+      workerCancellationAcknowledgementMs:
+        workerAcknowledgementMs,
+      cancellationAcknowledgedAtCheckpoint:
+        message.scheduler?.cancellationAcknowledgedAtCheckpoint === true,
+      cancellationCheckpointSite: message.scheduler?.cancellationCheckpointSite ?? null,
+      preemptedByRequestId,
+      acknowledgementSource,
+      signalToWorkerObservationMs,
+      workerTerminalDrainMs,
+      workerResponseQueueMs,
+      responseDeliveryMs,
+      backlog: pending.size,
+    });
+    emitPipelineEvent('worker-cancel-acknowledged', {
+      requestId: message.requestId,
+      ownerKey: operation.request.scheduler?.ownerKey ?? null,
+      correlationId: operation.request.scheduler?.correlationId ?? null,
+      operationKind: operation.request.scheduler?.operationKind ?? null,
+      target: operation.request.scheduler?.target ?? null,
+      stream: operation.request.scheduler?.stream ?? null,
+      cancellationReason,
+      cancellationRequestedAtMs: requestedAtMs,
+      receivedAtMs,
+      cancellationAcknowledgementMs: acknowledgementMs,
+      workerCancellationAcknowledgementMs:
+        workerAcknowledgementMs,
+      cancellationAcknowledgedAtCheckpoint:
+        message.scheduler?.cancellationAcknowledgedAtCheckpoint === true,
+      preemptedByRequestId,
+      acknowledgementSource,
+      signalToWorkerObservationMs,
+      workerTerminalDrainMs,
+      workerResponseQueueMs,
+      responseDeliveryMs,
+      pendingCount: pending.size,
+    });
+  };
+
+  const emitCancelledTerminal = (
+    message,
+    operation,
+    receivedAtMs,
+    acknowledgementSource = 'worker-cancellation-response',
+  ) => {
+    recordCancellationAcknowledgement(
+      message,
+      operation,
+      receivedAtMs,
+      acknowledgementSource,
+    );
+    const cancellationReason = operation.sharedCancellationReason
+      ?? message.cancellationReason ?? operation.cancellationReason ?? 'cancelled';
+    const preemptedByRequestId = operation.sharedPreemptedByRequestId
+      ?? message.scheduler?.preemptedByRequestId ?? null;
+    emitSchedulerEvent({
+      type: 'terminal',
+      envelope: operation.request.scheduler ?? null,
+      state: 'cancelled',
+      terminalAtMs: receivedAtMs,
+      cancellationReason,
+      cancellationRequestedAtMs: operation.cancellationRequestedAtMs
+        ?? message.scheduler?.cancellationRequestedAtMs ?? null,
+      cancellationAcknowledgedAtMs: receivedAtMs,
+      cancellationAcknowledgementMs: operation.cancellationRequestedAtMs === null
+        || operation.cancellationRequestedAtMs === undefined
+        ? message.scheduler?.cancellationAcknowledgementMs ?? null
+        : Math.max(0, receivedAtMs - operation.cancellationRequestedAtMs),
+      cancellationAcknowledgedAtCheckpoint:
+        message.scheduler?.cancellationAcknowledgedAtCheckpoint === true,
+      preemptedByRequestId,
+      acknowledgementSource,
+      scheduler: message.scheduler ?? null,
+      backlog: pending.size,
+    });
   };
 
   const terminateWorker = async () => {
@@ -168,7 +388,28 @@ export function createWorkerChunkGeneratorTransport({
       operation.reject(error);
     }
     pending.clear();
+    for (const operation of cancelledAwaitingAcknowledgement.values()) {
+      counts.cancellationAcknowledgementsAbandoned += 1;
+      emitSchedulerEvent({
+        type: 'terminal',
+        envelope: operation.request.scheduler ?? null,
+        state: 'failed',
+        terminalAtMs: clock(),
+        cancellationReason: null,
+        error,
+        backlog: Math.max(0, cancelledAwaitingAcknowledgement.size - 1),
+      });
+      emitPipelineEvent('worker-cancel-acknowledgement-abandoned', {
+        requestId: operation.request.requestId,
+        ownerKey: operation.request.scheduler?.ownerKey ?? null,
+        cancellationReason: operation.cancellationReason,
+        error,
+      });
+      operation.reject(error);
+    }
+    cancelledAwaitingAcknowledgement.clear();
     pipelineReceipts?.clear();
+    resolveDrainIfIdle();
   };
 
   const shutdownError = () => new Error('Worker ChunkData transport is shut down');
@@ -181,7 +422,12 @@ export function createWorkerChunkGeneratorTransport({
       counts.staleGenerationResponses += 1;
       return;
     }
-    if (isShutdown) {
+    if (isShutdown && !shutdownDraining) {
+      counts.lateResponses += 1;
+      return;
+    }
+    if (isShutdown && shutdownDraining
+      && (!Number.isSafeInteger(message.requestId) || message.requestId < 1)) {
       counts.lateResponses += 1;
       return;
     }
@@ -252,8 +498,70 @@ export function createWorkerChunkGeneratorTransport({
       });
       return;
     }
+    const cancelledOperation = cancelledAwaitingAcknowledgement.get(message.requestId);
+    if (cancelledOperation) {
+      cancelledAwaitingAcknowledgement.delete(message.requestId);
+      if (isCancellationAcknowledgement(message)) {
+        emitCancelledTerminal(message, cancelledOperation, receivedAtMs);
+        cancelledOperation.resolve(null);
+        resolveDrainIfIdle();
+        return;
+      }
+      if (message.type === CHUNK_GENERATOR_MESSAGE.ERROR) {
+        const error = transportError(message);
+        emitSchedulerEvent({
+          type: 'terminal',
+          envelope: cancelledOperation.request.scheduler ?? null,
+          state: 'failed',
+          terminalAtMs: receivedAtMs,
+          cancellationReason: null,
+          error,
+          backlog: pending.size,
+        });
+        cancelledOperation.reject(error);
+        resolveDrainIfIdle();
+        return;
+      }
+      if (!SUCCESS_RESPONSE_TYPES.has(message.type)) {
+        const error = new Error(`unexpected Chunk generator Worker response: ${message.type}`);
+        emitSchedulerEvent({
+          type: 'terminal',
+          envelope: cancelledOperation.request.scheduler ?? null,
+          state: 'failed',
+          terminalAtMs: receivedAtMs,
+          cancellationReason: null,
+          error,
+          backlog: pending.size,
+        });
+        cancelledOperation.reject(error);
+        resolveDrainIfIdle();
+        return;
+      }
+      counts.lateResponses += 1;
+      emitPipelineEvent('worker-late-response', {
+        requestId: message.requestId,
+        ownerKey: message.macroKey ?? message.chunkKey
+          ?? cancelledOperation.request.scheduler?.ownerKey ?? null,
+        responseType: message.type,
+        receivedAtMs,
+        cancellationReason: cancelledOperation.cancellationReason,
+        cancellationAcknowledged: false,
+      });
+      emitCancelledTerminal(
+        message,
+        cancelledOperation,
+        receivedAtMs,
+        'worker-completion-after-cancel',
+      );
+      cancelledOperation.resolve(null);
+      resolveDrainIfIdle();
+      return;
+    }
     const operation = pending.get(message.requestId);
     if (!operation) {
+      if (isCancellationAcknowledgement(message)) {
+        counts.cancellationAcknowledgementOrphans += 1;
+      }
       counts.lateResponses += 1;
       emitPipelineEvent('worker-late-response', {
         requestId: message.requestId,
@@ -327,6 +635,7 @@ export function createWorkerChunkGeneratorTransport({
       }
     }
     pending.delete(message.requestId);
+    resolveDrainIfIdle();
     const resolveOperation = value => {
       emitPipelineEvent('worker-response-resolved', {
         ownerKey,
@@ -339,6 +648,20 @@ export function createWorkerChunkGeneratorTransport({
       });
       operation.resolve(value);
     };
+    if (isCancellationAcknowledgement(message)) {
+      if (message.scheduler) {
+        emitSchedulerEvent({
+          type: 'started',
+          envelope: operation.request.scheduler ?? null,
+          state: 'in-flight',
+          ...message.scheduler,
+          backlog: message.scheduler.backlogAtStart,
+        });
+      }
+      emitCancelledTerminal(message, operation, receivedAtMs);
+      operation.resolve(null);
+      return;
+    }
     if (message.type === CHUNK_GENERATOR_MESSAGE.ERROR) {
       emitSchedulerEvent({
         type: 'terminal',
@@ -350,6 +673,20 @@ export function createWorkerChunkGeneratorTransport({
         backlog: pending.size,
       });
       operation.reject(transportError(message));
+      return;
+    }
+    if (!SUCCESS_RESPONSE_TYPES.has(message.type)) {
+      const error = new Error(`unexpected Chunk generator Worker response: ${message.type}`);
+      emitSchedulerEvent({
+        type: 'terminal',
+        envelope: operation.request.scheduler ?? null,
+        state: 'failed',
+        terminalAtMs: clock(),
+        cancellationReason: null,
+        error,
+        backlog: pending.size,
+      });
+      operation.reject(error);
       return;
     }
     if (message.scheduler) {
@@ -456,7 +793,16 @@ export function createWorkerChunkGeneratorTransport({
       mode = fallbackTransportFactory === null ? 'failed' : 'recovering';
       if (fallbackTransportFactory !== null) {
         recoveryPromise = activateFallback(normalized);
-        void recoveryPromise.catch(() => {});
+        void recoveryPromise.catch(recoveryError => {
+          runtimeFailure = recoveryError instanceof Error
+            ? recoveryError : new Error(String(recoveryError));
+          lastRecoveryFailure = Object.freeze({
+            name: runtimeFailure.name,
+            message: runtimeFailure.message,
+            observedAtMs: clock(),
+          });
+          if (!isShutdown) mode = 'failed';
+        });
       }
     }
   };
@@ -467,33 +813,51 @@ export function createWorkerChunkGeneratorTransport({
     fallbackActivationPromise = (async () => {
       await terminateWorker();
       if (isShutdown) throw shutdownError();
-      const candidate = await fallbackTransportFactory();
-      if (isShutdown) {
-        await candidate?.shutdown?.();
-        throw shutdownError();
+      let candidate = null;
+      try {
+        candidate = await fallbackTransportFactory();
+        if (isShutdown) throw shutdownError();
+        if (typeof candidate?.generateChunk !== 'function') {
+          throw new TypeError('fallback transport must provide generateChunk');
+        }
+        const candidateMetadata = await candidate.initialize?.() ?? null;
+        if (isShutdown) throw shutdownError();
+        fallbackReason = Object.freeze({ name: error?.name ?? 'Error', message: error?.message ?? String(error) });
+        fallbackTransport = candidate;
+        candidate = null;
+        metadata = candidateMetadata;
+        lastGeneratorSnapshot = null;
+        lastWorkerSchedulerSnapshot = null;
+        pipelineReceipts?.clear();
+        runtimeFailure = null;
+        mode = 'inline-fallback';
+        initialized = true;
+        counts.fallbackCount += 1;
+        return metadata;
+      } catch (fallbackError) {
+        if (candidate) {
+          try {
+            await candidate.shutdown?.();
+          } catch (cleanupError) {
+            throw new AggregateError(
+              [fallbackError, cleanupError],
+              'Fallback activation failed and candidate cleanup was incomplete',
+            );
+          }
+        }
+        throw fallbackError;
       }
-      if (typeof candidate?.generateChunk !== 'function') {
-        await candidate?.shutdown?.();
-        throw new TypeError('fallback transport must provide generateChunk');
-      }
-      const candidateMetadata = await candidate.initialize?.() ?? null;
-      if (isShutdown) {
-        await candidate.shutdown?.();
-        throw shutdownError();
-      }
-      fallbackReason = Object.freeze({ name: error?.name ?? 'Error', message: error?.message ?? String(error) });
-      fallbackTransport = candidate;
-      metadata = candidateMetadata;
-      lastGeneratorSnapshot = null;
-      lastWorkerSchedulerSnapshot = null;
-      pipelineReceipts?.clear();
-      runtimeFailure = null;
-      mode = 'inline-fallback';
-      initialized = true;
-      counts.fallbackCount += 1;
-      return metadata;
     })();
-    void fallbackActivationPromise.catch(() => {});
+    void fallbackActivationPromise.catch(recoveryError => {
+      runtimeFailure = recoveryError instanceof Error
+        ? recoveryError : new Error(String(recoveryError));
+      lastRecoveryFailure = Object.freeze({
+        name: runtimeFailure.name,
+        message: runtimeFailure.message,
+        observedAtMs: clock(),
+      });
+      if (!isShutdown) mode = 'failed';
+    });
     return fallbackActivationPromise;
   };
 
@@ -526,6 +890,72 @@ export function createWorkerChunkGeneratorTransport({
     return initializePromise;
   };
 
+  const createRequestCancellationState = request => {
+    if (request.scheduler?.required !== false) return null;
+    const buffer = sharedCancellationBufferFactory();
+    if (buffer === null) {
+      counts.sharedCancellationUnavailable += 1;
+      return null;
+    }
+    if (typeof globalThis.SharedArrayBuffer !== 'function'
+      || !(buffer instanceof globalThis.SharedArrayBuffer)
+      || buffer.byteLength
+        < Int32Array.BYTES_PER_ELEMENT * SHARED_CANCELLATION_WORD_COUNT) {
+      throw new TypeError('sharedCancellationBufferFactory must return SharedArrayBuffer or null');
+    }
+    return Object.freeze({
+      buffer,
+      view: new Int32Array(buffer, 0, SHARED_CANCELLATION_WORD_COUNT),
+    });
+  };
+  const numericSharedPreemptor = requestId => (
+    Number.isSafeInteger(requestId) && requestId > 0 && requestId <= 0x7fffffff
+      ? requestId : 0
+  );
+  const preemptorFromReason = reason => {
+    const match = /^preempted-by-higher-priority:(\d+)$/.exec(reason ?? '');
+    if (!match) return null;
+    const requestId = Number(match[1]);
+    return Number.isSafeInteger(requestId) && requestId > 0 ? requestId : null;
+  };
+  const signalSharedCancellation = (operation, {
+    reason,
+    preemptedByRequestId = null,
+  }) => {
+    if (!operation?.sharedCancellationState) return false;
+    operation.sharedCancellationReason = reason;
+    operation.sharedPreemptedByRequestId = preemptedByRequestId;
+    Atomics.store(
+      operation.sharedCancellationState.view,
+      SHARED_CANCELLATION_PREEMPTOR_INDEX,
+      numericSharedPreemptor(preemptedByRequestId),
+    );
+    const previous = Atomics.compareExchange(
+      operation.sharedCancellationState.view,
+      SHARED_CANCELLATION_FLAG_INDEX,
+      0,
+      1,
+    );
+    if (previous === 0) counts.sharedCancellationSignals += 1;
+    return previous === 0;
+  };
+  const signalPreemptiblePendingFor = (request, timestamp) => {
+    if (request.scheduler?.required !== true) return;
+    for (const operation of pending.values()) {
+      if (operation.request.scheduler?.required !== false
+        || !operation.sharedCancellationState
+        || compareWorldGenerationRequests(
+          request.scheduler,
+          operation.request.scheduler,
+          timestamp,
+        ) >= 0) continue;
+      signalSharedCancellation(operation, {
+        reason: `preempted-by-higher-priority:${request.scheduler.requestId}`,
+        preemptedByRequestId: request.scheduler.requestId,
+      });
+    }
+  };
+
   const requestWorker = request => new Promise((resolve, reject) => {
     const target = worker;
     if (!target) {
@@ -535,7 +965,16 @@ export function createWorkerChunkGeneratorTransport({
       return;
     }
     const sentAt = clock();
-    pending.set(request.requestId, { resolve, reject, sentAt, request });
+    const sharedCancellationState = createRequestCancellationState(request);
+    pending.set(request.requestId, {
+      resolve,
+      reject,
+      sentAt,
+      request,
+      sharedCancellationState,
+      sharedCancellationReason: null,
+      sharedPreemptedByRequestId: null,
+    });
     emitSchedulerEvent({
       type: 'queued',
       envelope: request.scheduler ?? null,
@@ -549,13 +988,18 @@ export function createWorkerChunkGeneratorTransport({
       // Worker owns a different performance.now() origin, so carry a boundary
       // sample that lets the Worker translate the whole envelope by one
       // offset before it performs deadline or aging comparisons.
-      const wireRequest = request.scheduler ? {
+      const scheduledRequest = request.scheduler ? {
         ...request,
         schedulerClock: Object.freeze({
           schemaVersion: WORKER_SCHEDULER_CLOCK_SCHEMA,
           sentAtMs: sentAt,
         }),
       } : request;
+      const wireRequest = sharedCancellationState ? {
+        ...scheduledRequest,
+        sharedCancellationBuffer: sharedCancellationState.buffer,
+      } : scheduledRequest;
+      signalPreemptiblePendingFor(request, sentAt);
       target.postMessage(wireRequest);
       emitPipelineEvent('worker-message-sent', {
         ownerKey: request.scheduler?.ownerKey
@@ -580,6 +1024,45 @@ export function createWorkerChunkGeneratorTransport({
       reject(error);
     }
   });
+
+  const cancelPendingWorkerRequest = ({ requestId, reason }) => {
+    const operation = pending.get(requestId);
+    let cancelled = false;
+    const workerSchedulerRequestId = operation?.request.scheduler?.requestId ?? requestId;
+    if (operation) {
+      signalSharedCancellation(operation, {
+        reason,
+        preemptedByRequestId: preemptorFromReason(reason),
+      });
+      const cancellationRequestedAtMs = clock();
+      pending.delete(requestId);
+      cancelledAwaitingAcknowledgement.set(requestId, {
+        ...operation,
+        cancellationRequestedAtMs,
+        cancellationReason: reason,
+        awaitCancellationAcknowledgement:
+          operation.request.scheduler?.resourceKind != null,
+      });
+      counts.cancelRequests += 1;
+      emitSchedulerEvent({
+        type: 'cancel-requested',
+        envelope: operation.request.scheduler ?? null,
+        state: 'in-flight',
+        cancellationReason: reason,
+        cancellationRequestedAtMs,
+        backlog: pending.size,
+      });
+      cancelled = true;
+    }
+    if (worker && (!isShutdown || shutdownDraining)) {
+      worker.postMessage(createChunkGeneratorCancelRequest({
+        requestId: workerSchedulerRequestId,
+        serviceGeneration,
+        reason,
+      }));
+    }
+    return cancelled;
+  };
 
   return Object.freeze({
     initialize,
@@ -796,19 +1279,30 @@ export function createWorkerChunkGeneratorTransport({
         const request = operation.request;
         if (request?.type !== CHUNK_GENERATOR_MESSAGE.GENERATE_FOREST_HORIZON
           || request.consumerId !== consumerId || request.epoch >= cutoff) continue;
+        signalSharedCancellation(operation, {
+          reason: 'stale-forest-horizon-epoch',
+        });
+        const cancellationRequestedAtMs = clock();
         pending.delete(requestId);
-        emitSchedulerEvent({
-          type: 'terminal',
-          envelope: request.scheduler ?? null,
-          state: 'cancelled',
-          terminalAtMs: clock(),
+        cancelledAwaitingAcknowledgement.set(requestId, {
+          ...operation,
+          cancellationRequestedAtMs,
           cancellationReason: 'stale-forest-horizon-epoch',
+          awaitCancellationAcknowledgement:
+            operation.request.scheduler?.resourceKind != null,
+        });
+        counts.cancelRequests += 1;
+        emitSchedulerEvent({
+          type: 'cancel-requested',
+          envelope: request.scheduler ?? null,
+          state: 'in-flight',
+          cancellationReason: 'stale-forest-horizon-epoch',
+          cancellationRequestedAtMs,
           backlog: pending.size,
         });
-        operation.resolve(null);
         cancelled += 1;
       }
-      if (worker && !isShutdown) {
+      if (worker && (!isShutdown || shutdownDraining)) {
         worker.postMessage({
           type: CHUNK_GENERATOR_MESSAGE.CANCEL_FOREST_HORIZON,
           protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
@@ -824,29 +1318,23 @@ export function createWorkerChunkGeneratorTransport({
       return cancelled;
     },
     cancelGenerationRequest({ requestId, reason = 'consumer-cancelled' } = {}) {
-      const operation = pending.get(requestId);
-      let cancelled = false;
-      if (operation) {
-        pending.delete(requestId);
-        emitSchedulerEvent({
-          type: 'terminal',
-          envelope: operation.request.scheduler ?? null,
-          state: 'cancelled',
-          terminalAtMs: clock(),
-          cancellationReason: reason,
-          backlog: pending.size,
-        });
-        operation.resolve(null);
-        cancelled = true;
-      }
+      let cancelled = cancelPendingWorkerRequest({ requestId, reason });
       if (fallbackTransport?.cancelGenerationRequest?.({ requestId, reason })) cancelled = true;
-      if (worker && !isShutdown) {
-        worker.postMessage(createChunkGeneratorCancelRequest({
-          requestId,
-          serviceGeneration,
-          reason,
-        }));
+      return cancelled;
+    },
+    cancelGenerationRequestBySchedulerRequestId({
+      requestId,
+      reason = 'consumer-cancelled',
+    } = {}) {
+      let cancelled = false;
+      for (const [workerRequestId, operation] of [...pending]) {
+        if (operation.request.scheduler?.requestId !== requestId) continue;
+        if (cancelPendingWorkerRequest({ requestId: workerRequestId, reason })) cancelled = true;
       }
+      if (fallbackTransport?.cancelGenerationRequestBySchedulerRequestId?.({
+        requestId,
+        reason,
+      })) cancelled = true;
       return cancelled;
     },
     async findSettlementsNear(centerWorldX, centerWorldZ, radiusMeters, options = {}) {
@@ -1009,12 +1497,22 @@ export function createWorkerChunkGeneratorTransport({
         canonicalMajorRoadOwnerQueryReceiveTimes.snapshot();
       const diagnosticTiming = diagnosticTimes.snapshot();
       const diagnosticReceiveTiming = diagnosticReceiveTimes.snapshot();
+      const cancellationAcknowledgementTiming = cancellationAcknowledgementTimes.snapshot();
       return Object.freeze({
-        kind: 'worker', mode, initialized, isShutdown, serviceGeneration,
+        kind: 'worker', mode, initialized, isShutdown, shutdownDraining, serviceGeneration,
         protocolVersion: CHUNK_GENERATOR_PROTOCOL_VERSION,
         pendingCount: pending.size,
+        cancelledAwaitingAcknowledgementCount: cancelledAwaitingAcknowledgement.size,
         fallbackOccurred: fallbackTransport !== null,
         fallbackReason,
+        lastRecoveryFailure,
+        observerFailureCount:
+          counts.schedulerObserverFailures + counts.pipelineObserverFailures,
+        lastObserverFailure,
+        observerCircuitBreakers: Object.freeze({
+          scheduler: schedulerObserverDisabled,
+          pipeline: pipelineObserverDisabled,
+        }),
         timingSampleCapacity: TRANSPORT_TIMING_SAMPLE_CAPACITY,
         timingSampleCount: generationTiming.sampleCount,
         generationMsP50: generationTiming.p50,
@@ -1043,42 +1541,348 @@ export function createWorkerChunkGeneratorTransport({
         diagnosticMsP50: diagnosticTiming.p50,
         diagnosticMsMaximum: diagnosticTiming.max,
         diagnosticReceiveMsMaximum: diagnosticReceiveTiming.max,
+        cancellationAcknowledgementMsP50: cancellationAcknowledgementTiming.p50,
+        cancellationAcknowledgementMsP95: cancellationAcknowledgementTiming.p95,
+        cancellationAcknowledgementMsMaximum: cancellationAcknowledgementTiming.max,
         generatorSnapshot: lastGeneratorSnapshot,
         workerSchedulerSnapshot: lastWorkerSchedulerSnapshot,
         counts: Object.freeze({ ...counts }),
       });
     },
     get metadata() { return metadata; },
-    async shutdown() {
-      if (isShutdown) return;
+    shutdown() {
+      if (shutdownPromise) return shutdownPromise;
+      shutdownDraining = true;
       isShutdown = true;
-      mode = 'shutdown';
-      const error = new Error('Worker ChunkData transport shut down before response');
-      initializeReject?.(error);
-      rejectPending(error);
-      await terminateWorker();
-      await fallbackTransport?.shutdown?.();
-      lastGeneratorSnapshot = null;
-      lastWorkerSchedulerSnapshot = null;
-      forestHorizonCancelledBeforeEpoch.clear();
-      for (const series of [
-        generationTimes,
-        receiveTimes,
-        forestHorizonGenerationTimes,
-        forestHorizonReceiveTimes,
-        presentationOwnerGenerationTimes,
-        presentationOwnerReceiveTimes,
-        canonicalTreeCellGenerationTimes,
-        canonicalTreeCellReceiveTimes,
-        settlementQueryTimes,
-        settlementQueryReceiveTimes,
-        settlementTemplateTimes,
-        settlementTemplateReceiveTimes,
-        canonicalMajorRoadOwnerQueryTimes,
-        canonicalMajorRoadOwnerQueryReceiveTimes,
-        diagnosticTimes,
-        diagnosticReceiveTimes,
-      ]) series.reset();
+      mode = 'shutdown-draining';
+      const shutdownFailure = new Error('Worker ChunkData transport shut down before response');
+      initializeReject?.(shutdownFailure);
+      shutdownPromise = (async () => {
+        const cancellationErrors = [];
+        for (const requestId of [...pending.keys()]) {
+          try {
+            cancelPendingWorkerRequest({ requestId, reason: 'transport-shutdown' });
+          } catch (error) {
+            cancellationErrors.push(error);
+          }
+        }
+        let drained = pending.size === 0 && cancelledAwaitingAcknowledgement.size === 0;
+        if (!drained && cancellationErrors.length === 0) {
+          let timeoutId = null;
+          drained = await Promise.race([
+            new Promise(resolve => {
+              drainResolve = resolve;
+              resolveDrainIfIdle();
+            }),
+            new Promise(resolve => {
+              timeoutId = globalThis.setTimeout?.(
+                () => resolve(false),
+                shutdownDrainTimeoutMs,
+              ) ?? null;
+              if (timeoutId === null) resolve(false);
+            }),
+          ]);
+          if (timeoutId !== null) globalThis.clearTimeout?.(timeoutId);
+        }
+        if (!drained) {
+          counts.shutdownDrainTimeouts += 1;
+          rejectPending(cancellationErrors.length > 0
+            ? new AggregateError(
+              [shutdownFailure, ...cancellationErrors],
+              'Worker cancellation dispatch failed during shutdown',
+            )
+            : shutdownFailure);
+        }
+        const cleanupResults = await Promise.allSettled([
+          terminateWorker(),
+          fallbackTransport?.shutdown?.(),
+        ]);
+        shutdownDraining = false;
+        mode = 'shutdown';
+        lastGeneratorSnapshot = null;
+        lastWorkerSchedulerSnapshot = null;
+        forestHorizonCancelledBeforeEpoch.clear();
+        for (const series of [
+          generationTimes,
+          receiveTimes,
+          forestHorizonGenerationTimes,
+          forestHorizonReceiveTimes,
+          presentationOwnerGenerationTimes,
+          presentationOwnerReceiveTimes,
+          canonicalTreeCellGenerationTimes,
+          canonicalTreeCellReceiveTimes,
+          settlementQueryTimes,
+          settlementQueryReceiveTimes,
+          settlementTemplateTimes,
+          settlementTemplateReceiveTimes,
+          canonicalMajorRoadOwnerQueryTimes,
+          canonicalMajorRoadOwnerQueryReceiveTimes,
+          diagnosticTimes,
+          diagnosticReceiveTimes,
+          cancellationAcknowledgementTimes,
+        ]) series.reset();
+        const cleanupErrors = cleanupResults
+          .filter(result => result.status === 'rejected')
+          .map(result => result.reason);
+        if (cleanupErrors.length > 0) {
+          throw new AggregateError(cleanupErrors, 'Worker transport shutdown cleanup failed');
+        }
+        return drained;
+      })();
+      return shutdownPromise;
     },
+  });
+}
+
+function stableMetadataIdentity(metadata) {
+  const normalize = value => {
+    if (Array.isArray(value)) return value.map(normalize);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(Object.keys(value).sort().map(key => [key, normalize(value[key])]));
+  };
+  return JSON.stringify(normalize(metadata));
+}
+
+function sumTransportCounts(left, right) {
+  const keys = new Set([
+    ...Object.keys(left ?? {}),
+    ...Object.keys(right ?? {}),
+  ]);
+  return Object.freeze(Object.fromEntries([...keys].map(key => [
+    key,
+    (Number(left?.[key]) || 0) + (Number(right?.[key]) || 0),
+  ])));
+}
+
+/**
+ * Exactly two independently scheduled Workers. Full ChunkData is always sent
+ * to Critical (including optional future-Full prefetch); every coarse/control
+ * resource is always sent to Background. This fixed routing intentionally
+ * exposes no pool size or arbitrary lane selection.
+ */
+export function createFixedLaneWorkerChunkGeneratorTransport({
+  workerFactory = null,
+  fallbackTransportFactory = null,
+  onSchedulerEvent = null,
+  onPipelineEvent = null,
+  ...sharedOptions
+} = {}) {
+  if (workerFactory !== null && typeof workerFactory !== 'function') {
+    throw new TypeError('fixed-lane workerFactory must be a function when provided');
+  }
+  if (fallbackTransportFactory !== null && typeof fallbackTransportFactory !== 'function') {
+    throw new TypeError('fixed-lane fallbackTransportFactory must be a function when provided');
+  }
+  if (onSchedulerEvent !== null && typeof onSchedulerEvent !== 'function') {
+    throw new TypeError('fixed-lane onSchedulerEvent must be a function when provided');
+  }
+  if (onPipelineEvent !== null && typeof onPipelineEvent !== 'function') {
+    throw new TypeError('fixed-lane onPipelineEvent must be a function when provided');
+  }
+
+  let isShutdown = false;
+  let initializationPromise = null;
+  let shutdownPromise = null;
+  let metadata = null;
+  let lastCombinedDiagnostics = null;
+  const createLane = lane => createWorkerChunkGeneratorTransport({
+    ...sharedOptions,
+    ...(workerFactory ? { workerFactory: () => workerFactory({ lane }) } : {}),
+    ...(fallbackTransportFactory ? {
+      fallbackTransportFactory: () => fallbackTransportFactory({ lane }),
+    } : {}),
+    ...(onSchedulerEvent ? {
+      onSchedulerEvent: event => onSchedulerEvent(Object.freeze({ ...event, lane })),
+    } : {}),
+    ...(onPipelineEvent ? {
+      onPipelineEvent: (type, details) => onPipelineEvent(
+        type,
+        Object.freeze({ ...details, lane }),
+      ),
+    } : {}),
+  });
+  const critical = createLane(WORKER_GENERATION_LANE.CRITICAL);
+  const background = createLane(WORKER_GENERATION_LANE.BACKGROUND);
+
+  const failLaneMetadataIdentity = async (criticalMetadata, backgroundMetadata) => {
+    await shutdown();
+    throw new Error(
+      `Critical/Background Worker metadata identity mismatch: ${
+        stableMetadataIdentity(criticalMetadata)}:${stableMetadataIdentity(backgroundMetadata)}`,
+    );
+  };
+  const refreshLaneMetadataIdentity = async () => {
+    const [criticalMetadata, backgroundMetadata] = await Promise.all([
+      critical.initialize(),
+      background.initialize(),
+    ]);
+    if (stableMetadataIdentity(criticalMetadata) !== stableMetadataIdentity(backgroundMetadata)) {
+      return failLaneMetadataIdentity(criticalMetadata, backgroundMetadata);
+    }
+    metadata = criticalMetadata;
+    return metadata;
+  };
+
+  const initialize = () => {
+    if (isShutdown) return Promise.reject(new Error('Fixed-lane Worker transport is shut down'));
+    if (initializationPromise) return initializationPromise;
+    initializationPromise = (async () => {
+      let criticalMetadata;
+      let backgroundMetadata;
+      try {
+        [criticalMetadata, backgroundMetadata] = await Promise.all([
+          critical.initialize(),
+          background.initialize(),
+        ]);
+      } catch (error) {
+        await shutdown();
+        throw error;
+      }
+      if (stableMetadataIdentity(criticalMetadata) !== stableMetadataIdentity(backgroundMetadata)) {
+        return failLaneMetadataIdentity(criticalMetadata, backgroundMetadata);
+      }
+      metadata = criticalMetadata;
+      return metadata;
+    })();
+    return initializationPromise;
+  };
+  const laneFromOptions = options => options?.lane === WORKER_GENERATION_LANE.CRITICAL
+    ? critical : options?.lane === WORKER_GENERATION_LANE.BACKGROUND
+      ? background : null;
+  const cancelBySchedulerRequestId = options => {
+    const lane = laneFromOptions(options);
+    if (lane) return lane.cancelGenerationRequestBySchedulerRequestId(options);
+    const criticalCancelled = critical.cancelGenerationRequestBySchedulerRequestId(options);
+    const backgroundCancelled = background.cancelGenerationRequestBySchedulerRequestId(options);
+    return criticalCancelled || backgroundCancelled;
+  };
+  const runOnLane = async (lane, operation) => {
+    await initialize();
+    await refreshLaneMetadataIdentity();
+    const result = await operation(lane);
+    await refreshLaneMetadataIdentity();
+    return result;
+  };
+  const requestDiagnostics = async options => {
+    await initialize();
+    await refreshLaneMetadataIdentity();
+    const [criticalDiagnostics, backgroundDiagnostics] = await Promise.all([
+      critical.requestDiagnostics(options),
+      background.requestDiagnostics(options),
+    ]);
+    await refreshLaneMetadataIdentity();
+    lastCombinedDiagnostics = Object.freeze({
+      ...(backgroundDiagnostics ?? {}),
+      fixedWorkerLanes: Object.freeze({
+        schemaVersion: FIXED_WORKER_LANE_TRANSPORT_SCHEMA,
+        critical: criticalDiagnostics,
+        background: backgroundDiagnostics,
+      }),
+    });
+    return lastCombinedDiagnostics;
+  };
+  const snapshot = () => {
+    const criticalSnapshot = critical.snapshot();
+    const backgroundSnapshot = background.snapshot();
+    const modes = new Set([criticalSnapshot.mode, backgroundSnapshot.mode]);
+    return Object.freeze({
+      ...backgroundSnapshot,
+      kind: 'worker-fixed-lanes',
+      schemaVersion: FIXED_WORKER_LANE_TRANSPORT_SCHEMA,
+      mode: modes.size === 1 ? criticalSnapshot.mode : 'mixed',
+      initialized: criticalSnapshot.initialized && backgroundSnapshot.initialized,
+      isShutdown,
+      pendingCount: criticalSnapshot.pendingCount + backgroundSnapshot.pendingCount,
+      cancelledAwaitingAcknowledgementCount:
+        criticalSnapshot.cancelledAwaitingAcknowledgementCount
+          + backgroundSnapshot.cancelledAwaitingAcknowledgementCount,
+      fallbackOccurred:
+        criticalSnapshot.fallbackOccurred || backgroundSnapshot.fallbackOccurred,
+      metadataIdentityConsistent: stableMetadataIdentity(critical.metadata)
+        === stableMetadataIdentity(background.metadata),
+      timingSampleCount:
+        criticalSnapshot.timingSampleCount + backgroundSnapshot.timingSampleCount,
+      generationMsP50: criticalSnapshot.generationMsP50,
+      generationMsMaximum: criticalSnapshot.generationMsMaximum,
+      mainThreadReceiveMsP50: criticalSnapshot.mainThreadReceiveMsP50,
+      mainThreadReceiveMsMaximum: criticalSnapshot.mainThreadReceiveMsMaximum,
+      cancellationAcknowledgementMsP50: Math.max(
+        criticalSnapshot.cancellationAcknowledgementMsP50 ?? 0,
+        backgroundSnapshot.cancellationAcknowledgementMsP50 ?? 0,
+      ),
+      cancellationAcknowledgementMsP95: Math.max(
+        criticalSnapshot.cancellationAcknowledgementMsP95 ?? 0,
+        backgroundSnapshot.cancellationAcknowledgementMsP95 ?? 0,
+      ),
+      cancellationAcknowledgementMsMaximum: Math.max(
+        criticalSnapshot.cancellationAcknowledgementMsMaximum ?? 0,
+        backgroundSnapshot.cancellationAcknowledgementMsMaximum ?? 0,
+      ),
+      generatorSnapshot: lastCombinedDiagnostics,
+      workerSchedulerSnapshot: Object.freeze({
+        schemaVersion: FIXED_WORKER_LANE_TRANSPORT_SCHEMA,
+        critical: criticalSnapshot.workerSchedulerSnapshot,
+        background: backgroundSnapshot.workerSchedulerSnapshot,
+      }),
+      counts: sumTransportCounts(criticalSnapshot.counts, backgroundSnapshot.counts),
+      lanes: Object.freeze({
+        [WORKER_GENERATION_LANE.CRITICAL]: criticalSnapshot,
+        [WORKER_GENERATION_LANE.BACKGROUND]: backgroundSnapshot,
+      }),
+    });
+  };
+  const shutdown = () => {
+    if (shutdownPromise) return shutdownPromise;
+    isShutdown = true;
+    shutdownPromise = (async () => {
+      const results = await Promise.allSettled([critical.shutdown(), background.shutdown()]);
+      lastCombinedDiagnostics = null;
+      const failures = results.filter(result => result.status === 'rejected')
+        .map(result => result.reason);
+      if (failures.length > 0) {
+        throw new AggregateError(failures, 'Fixed-lane Worker shutdown failed');
+      }
+      return results.every(result => result.value !== false);
+    })();
+    return shutdownPromise;
+  };
+
+  return Object.freeze({
+    initialize,
+    generateChunk: request => runOnLane(
+      critical,
+      lane => lane.generateChunk(request),
+    ),
+    generateForestHorizonManifest: request => runOnLane(
+      background,
+      lane => lane.generateForestHorizonManifest(request),
+    ),
+    generatePresentationOwner: request => runOnLane(
+      background,
+      lane => lane.generatePresentationOwner(request),
+    ),
+    generateCanonicalTreeCell: request => runOnLane(
+      background,
+      lane => lane.generateCanonicalTreeCell(request),
+    ),
+    cancelForestHorizonRequests: options => background.cancelForestHorizonRequests(options),
+    cancelGenerationRequest: options => critical.cancelGenerationRequest(options),
+    cancelGenerationRequestBySchedulerRequestId: cancelBySchedulerRequestId,
+    findSettlementsNear: (...args) => runOnLane(
+      background,
+      lane => lane.findSettlementsNear(...args),
+    ),
+    resolveSettlementPresentationTemplate: request => runOnLane(
+      background,
+      lane => lane.resolveSettlementPresentationTemplate(request),
+    ),
+    resolveCanonicalMajorRoadOwnerCoverage: request => runOnLane(
+      background,
+      lane => lane.resolveCanonicalMajorRoadOwnerCoverage(request),
+    ),
+    requestDiagnostics,
+    snapshot,
+    shutdown,
+    get metadata() { return metadata; },
   });
 }

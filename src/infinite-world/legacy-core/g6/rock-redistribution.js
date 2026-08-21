@@ -158,27 +158,17 @@ export function selectRockSubtypeG6D({ eligibility, riverShoreDistance }) {
   return mediumSignals >= 2 ? 'medium-rock' : 'small-stone';
 }
 
-export async function createRockCandidateG6D({ profile, worldSeedHash, quantizedWorldCell, point, terrain, macro, river, vegetationCandidates, sourceBiomeWeights = [], sourceFeatureIds = [], occupancyRoll = null }) {
-  const preliminaryRadius = G6_D_ROCK.candidateRadiusMeters['small-stone'];
+export async function createRockCandidateG6D({ profile, worldSeedHash, quantizedWorldCell, point, terrain, macro, river, vegetationCandidates, sourceBiomeWeights = [], sourceFeatureIds = [] }) {
   const preliminary = await classifyRockTerrainContext({ profile, worldPosition: point, finalSlope: terrain.slope, ridge: macro.ridge, curvature: macro.curvature,
-    rockiness: terrain.rockiness, rockMaterial: terrain.rockMaterial, rockRadiusMeters: preliminaryRadius,
+    rockiness: terrain.rockiness, rockMaterial: terrain.rockMaterial, rockRadiusMeters: G6_D_ROCK.candidateRadiusMeters['small-stone'],
     riverDistance: river?.distance ?? Infinity, riverHalfWidth: river?.width / 2 ?? 0, vegetationCandidates });
   if (!preliminary.eligible || preliminary.score < G6_D_ROCK.proposal.minimumScore) return null;
   const riverShoreDistance = river ? river.distance - river.width / 2 : Infinity; const subtype = selectRockSubtypeG6D({ eligibility: preliminary, riverShoreDistance }); const radius = G6_D_ROCK.candidateRadiusMeters[subtype];
-  // Small-stone is evaluated at the same radius as the preliminary pass, so
-  // running the identical field/feature/vegetation classification twice only
-  // repeats work. Larger/smaller subtypes still receive the exact second pass.
-  const eligibility = radius === preliminaryRadius ? preliminary : await classifyRockTerrainContext({ profile, worldPosition: point, finalSlope: terrain.slope, ridge: macro.ridge, curvature: macro.curvature,
+  const eligibility = await classifyRockTerrainContext({ profile, worldPosition: point, finalSlope: terrain.slope, ridge: macro.ridge, curvature: macro.curvature,
     rockiness: terrain.rockiness, rockMaterial: terrain.rockMaterial, rockRadiusMeters: radius, riverDistance: river?.distance ?? Infinity, riverHalfWidth: river?.width / 2 ?? 0, vegetationCandidates });
   if (!eligibility.eligible || eligibility.score < G6_D_ROCK.proposal.minimumScore) return null;
   const random = createDeterministicRandom(profile.fieldSeed); const key = `${quantizedWorldCell.x}:${quantizedWorldCell.z}`;
-  const resolvedOccupancyRoll = occupancyRoll === null
-    ? await random.float01(`occupancy:${key}`)
-    : occupancyRoll;
-  if (!Number.isFinite(resolvedOccupancyRoll) || resolvedOccupancyRoll < 0 || resolvedOccupancyRoll >= 1) {
-    throw new RangeError('Rock occupancyRoll must be in [0, 1)');
-  }
-  if (resolvedOccupancyRoll >= eligibility.score * G6_D_ROCK.proposal.subtypeOccupancy[subtype] * G6_D_ROCK.proposal.occupancyScale) return null;
+  if (await random.float01(`occupancy:${key}`) >= eligibility.score * G6_D_ROCK.proposal.subtypeOccupancy[subtype] * G6_D_ROCK.proposal.occupancyScale) return null;
   const identity = await createG6DRockCandidateId({ worldSeedHash, subtype, quantizedWorldCell, semanticSlot: G6_D_ROCK.semanticSlot });
   const orientationSeed = q6(await random.float01(`orientation:${key}`)); const variationSeed = q6(await random.float01(`variation:${key}`));
   return { schemaVersion: 'detail-candidate-1', ...identity, candidateType: 'rock', subtype, worldPosition: { x: q6(point.x), y: q6(terrain.height), z: q6(point.z) },

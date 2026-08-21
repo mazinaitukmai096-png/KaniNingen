@@ -5,6 +5,28 @@ const DEFAULT_HITCH_LIMIT = 256;
 const DEFAULT_FRAME_DETAIL_LIMIT = 512;
 const DEFAULT_EVENT_LIMIT = 2_048;
 
+export const RUNTIME_DIAGNOSTIC_MODE = Object.freeze({
+  OFF: 'off',
+  LIGHT: 'light',
+  DEEP_ATTRIBUTION: 'deep-attribution',
+});
+
+function resolveRuntimeDiagnosticMode(mode, enabled) {
+  const resolved = mode ?? (enabled === true
+    ? RUNTIME_DIAGNOSTIC_MODE.LIGHT : RUNTIME_DIAGNOSTIC_MODE.OFF);
+  if (!Object.values(RUNTIME_DIAGNOSTIC_MODE).includes(resolved)) {
+    throw new RangeError('Runtime diagnostic mode must be off, light, or deep-attribution');
+  }
+  return resolved;
+}
+
+function errorSummary(error) {
+  return Object.freeze({
+    name: String(error?.name ?? 'Error'),
+    message: String(error?.message ?? error),
+  });
+}
+
 /**
  * @typedef {object} MeasurementReport
  * @property {'w8-measurement-report-1'} schemaVersion
@@ -43,15 +65,86 @@ const clampIndex = (length, fraction) => Math.max(0, Math.min(
   Math.ceil(length * fraction) - 1,
 ));
 
+function createCircularBuffer(capacity) {
+  const storage = new Array(capacity);
+  let start = 0;
+  let size = 0;
+  return Object.freeze({
+    get length() { return size; },
+    push(value) {
+      const index = (start + size) % capacity;
+      if (size < capacity) size += 1;
+      else start = (start + 1) % capacity;
+      storage[index] = value;
+      return value;
+    },
+    at(index) {
+      const normalized = index < 0 ? size + index : index;
+      if (normalized < 0 || normalized >= size) return undefined;
+      return storage[(start + normalized) % capacity];
+    },
+    toArray() {
+      return Array.from({ length: size }, (_, index) => storage[(start + index) % capacity]);
+    },
+    clear() {
+      storage.fill(undefined);
+      start = 0;
+      size = 0;
+    },
+  });
+}
+
+function createNumericCircularBuffer(capacity) {
+  const storage = new Float64Array(capacity);
+  let start = 0;
+  let size = 0;
+  let total = 0;
+  let latest = 0;
+  return Object.freeze({
+    get length() { return size; },
+    get sum() { return total; },
+    get latest() { return size > 0 ? latest : 0; },
+    push(value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) return false;
+      const index = (start + size) % capacity;
+      if (size < capacity) size += 1;
+      else {
+        total -= storage[index];
+        start = (start + 1) % capacity;
+      }
+      storage[index] = numeric;
+      total += numeric;
+      latest = numeric;
+      return true;
+    },
+    toArray() {
+      return Array.from(
+        { length: size },
+        (_, index) => storage[(start + index) % capacity],
+      );
+    },
+    clear() {
+      storage.fill(0);
+      start = 0;
+      size = 0;
+      total = 0;
+      latest = 0;
+    },
+  });
+}
+
 function distribution(values) {
-  if (!values.length) {
+  const samples = typeof values?.toArray === 'function' ? values.toArray() : values;
+  if (!samples.length) {
     return Object.freeze({ count: 0, latest: 0, p50: 0, p95: 0, p99: 0, max: 0, mean: 0 });
   }
-  const ordered = [...values].sort((a, b) => a - b);
-  const sum = ordered.reduce((total, value) => total + value, 0);
+  const ordered = [...samples].sort((a, b) => a - b);
+  const sum = typeof values?.sum === 'number'
+    ? values.sum : ordered.reduce((total, value) => total + value, 0);
   return Object.freeze({
     count: ordered.length,
-    latest: values.at(-1),
+    latest: typeof values?.latest === 'number' ? values.latest : samples.at(-1),
     p50: ordered[clampIndex(ordered.length, 0.5)],
     p95: ordered[clampIndex(ordered.length, 0.95)],
     p99: ordered[clampIndex(ordered.length, 0.99)],
@@ -62,7 +155,9 @@ function distribution(values) {
 
 function workDistributions(frameRecords) {
   const samples = new Map();
-  for (const frame of frameRecords) {
+  const records = typeof frameRecords?.toArray === 'function'
+    ? frameRecords.toArray() : frameRecords;
+  for (const frame of records) {
     for (const [route, metrics] of Object.entries(frame.work ?? {})) {
       for (const [metric, value] of Object.entries(metrics)) {
         if (!Number.isFinite(value)) continue;
@@ -83,6 +178,19 @@ function workDistributions(frameRecords) {
   return Object.freeze(Object.fromEntries(Object.entries(result).map(([route, metrics]) => (
     [route, Object.freeze(metrics)]
   ))));
+}
+
+function sampledWorkDistributions(sampleMaps) {
+  const result = {};
+  for (const [route, metrics] of [...sampleMaps].sort(([left], [right]) => (
+    left.localeCompare(right)
+  ))) {
+    result[route] = Object.freeze(Object.fromEntries(
+      [...metrics].sort(([left], [right]) => left.localeCompare(right))
+        .map(([metric, samples]) => [metric, distribution(samples)]),
+    ));
+  }
+  return Object.freeze(result);
 }
 
 function median(values) {
@@ -206,11 +314,14 @@ export function createW8RuntimeDiagnostics({
   clock = () => globalObject.performance?.now?.() ?? Date.now(),
   profile = parseW8DiagnosticProfile('baseline'),
   enabled = false,
+  mode = null,
   runNumber = 1,
   environment = {},
   sampleLimit = DEFAULT_SAMPLE_LIMIT,
   hitchLimit = DEFAULT_HITCH_LIMIT,
   hitchThresholdMs = 50,
+  hudRefreshIntervalMs = 1_000,
+  onObserverError = null,
 } = {}) {
   if (!Number.isSafeInteger(runNumber) || runNumber < 1) throw new TypeError('runNumber must be positive');
   if (!Number.isSafeInteger(sampleLimit) || sampleLimit < 1) throw new TypeError('sampleLimit must be positive');
@@ -218,148 +329,296 @@ export function createW8RuntimeDiagnostics({
   if (!Number.isFinite(hitchThresholdMs) || hitchThresholdMs <= 0) {
     throw new TypeError('hitchThresholdMs must be positive');
   }
+  if (!Number.isFinite(hudRefreshIntervalMs) || hudRefreshIntervalMs < 0) {
+    throw new TypeError('hudRefreshIntervalMs must be non-negative');
+  }
+  if (onObserverError !== null && typeof onObserverError !== 'function') {
+    throw new TypeError('onObserverError must be a function or null');
+  }
+  const diagnosticMode = resolveRuntimeDiagnosticMode(mode, enabled);
+  const active = diagnosticMode !== RUNTIME_DIAGNOSTIC_MODE.OFF;
+  const detailed = diagnosticMode === RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION;
   const performanceObject = globalObject.performance ?? null;
+  const userTimingSupported = [
+    'mark', 'measure', 'clearMarks', 'clearMeasures',
+  ].every(method => typeof performanceObject?.[method] === 'function');
+  let userTimingActive = diagnosticMode === RUNTIME_DIAGNOSTIC_MODE.DEEP_ATTRIBUTION
+    && userTimingSupported;
   const browserFrames = createBrowserFrameDiagnostics({
-    enabled,
+    mode: diagnosticMode,
     globalObject,
     clock,
     environment,
   });
   const stageSamples = new Map();
-  const frameSamples = [];
-  const frameRecords = [];
-  const hitches = [];
-  const longTasks = [];
-  const events = [];
+  const frameSamples = createNumericCircularBuffer(sampleLimit);
+  const frameHitchFlags = createNumericCircularBuffer(sampleLimit);
+  const frameRecords = createCircularBuffer(DEFAULT_FRAME_DETAIL_LIMIT);
+  const hitches = createCircularBuffer(hitchLimit);
+  const longTasks = createCircularBuffer(hitchLimit);
+  const events = createCircularBuffer(DEFAULT_EVENT_LIMIT);
+  const lightWorkTotals = new Map();
+  const lightActiveWorkRoutes = new Set();
+  const lightWorkSamples = new Map();
+  const lightFrameState = { sequence: 0, startedAt: 0 };
   let currentFrame = null;
   let frameSequence = 0;
+  let eventSequence = 0;
   let markSequence = 0;
   let observer = null;
+  let observerErrorCount = 0;
+  let observerLastError = null;
+  let longTaskObserverQuarantined = false;
+  let userTimingQuarantined = false;
+  let hudCache = null;
+  let hudCacheAtMs = Number.NEGATIVE_INFINITY;
+  let hudCacheStageNames = null;
 
-  const pushBounded = (target, value, limit) => {
-    target.push(value);
-    if (target.length > limit) target.splice(0, target.length - limit);
+  const reportObserverError = (stage, error) => {
+    observerErrorCount += 1;
+    observerLastError = Object.freeze({ stage, ...errorSummary(error) });
+    if (typeof onObserverError === 'function') {
+      try {
+        onObserverError(Object.freeze({ subsystem: 'runtime-diagnostics', ...observerLastError }));
+      } catch (callbackError) {
+        observerErrorCount += 1;
+        observerLastError = Object.freeze({
+          stage: 'observer-error-reporter',
+          ...errorSummary(callbackError),
+        });
+      }
+    }
   };
+
   const recordStage = (stage, durationMs, { async = false } = {}) => {
-    if (!enabled) return durationMs;
-    if (!stageSamples.has(stage)) stageSamples.set(stage, []);
-    pushBounded(stageSamples.get(stage), durationMs, sampleLimit);
-    if (currentFrame) {
+    if (!active) return durationMs;
+    if (!stageSamples.has(stage)) {
+      stageSamples.set(stage, createNumericCircularBuffer(sampleLimit));
+    }
+    stageSamples.get(stage).push(durationMs);
+    if (detailed && currentFrame) {
       currentFrame.stages[stage] = (currentFrame.stages[stage] ?? 0) + durationMs;
     }
     browserFrames.recordStage(stage, durationMs, { async });
     return durationMs;
   };
   const begin = (stage, { async = false } = {}) => {
-    if (!enabled) return Object.freeze({ stage, disabled: true, async });
+    if (!active) return Object.freeze({ stage, disabled: true, async });
     const startedAt = clock();
+    if (!userTimingActive) return Object.freeze({ stage, startedAt, async, userTiming: false });
     const sequence = ++markSequence;
     const startMark = `w8:${stage}:${sequence}:start`;
     const endMark = `w8:${stage}:${sequence}:end`;
-    if (enabled) performanceObject?.mark?.(startMark);
-    return Object.freeze({ stage, startedAt, sequence, startMark, endMark, async });
+    try {
+      performanceObject.mark(startMark);
+    } catch (error) {
+      userTimingActive = false;
+      userTimingQuarantined = true;
+      reportObserverError('user-timing-begin', error);
+      return Object.freeze({ stage, startedAt, async, userTiming: false });
+    }
+    return Object.freeze({
+      stage, startedAt, sequence, startMark, endMark, async, userTiming: true,
+    });
   };
   const end = token => {
     if (token?.disabled) return 0;
     const durationMs = Math.max(0, clock() - token.startedAt);
-    if (enabled) {
-      performanceObject?.mark?.(token.endMark);
+    if (token.userTiming === true && userTimingActive) {
+      const measureName = `w8:${token.stage}`;
+      let timingError = null;
       try {
-        performanceObject?.measure?.(`w8:${token.stage}`, token.startMark, token.endMark);
-      } catch { /* Performance mark buffers are optional diagnostics. */ }
-      performanceObject?.clearMarks?.(token.startMark);
-      performanceObject?.clearMarks?.(token.endMark);
+        performanceObject.mark(token.endMark);
+        performanceObject.measure(measureName, token.startMark, token.endMark);
+      } catch (error) {
+        timingError = error;
+      } finally {
+        try {
+          performanceObject.clearMarks(token.startMark);
+          performanceObject.clearMarks(token.endMark);
+          performanceObject.clearMeasures(measureName);
+        } catch (error) {
+          timingError ??= error;
+        }
+      }
+      if (timingError) {
+        userTimingActive = false;
+        userTimingQuarantined = true;
+        reportObserverError('user-timing-end', timingError);
+      }
     }
     return recordStage(token.stage, durationMs, { async: token.async });
   };
 
-  if (enabled && typeof globalObject.PerformanceObserver === 'function') {
+  if (active && typeof globalObject.PerformanceObserver === 'function') {
     try {
       observer = new globalObject.PerformanceObserver(list => {
-        for (const entry of list.getEntries()) {
-          pushBounded(longTasks, Object.freeze({
-            name: String(entry.name ?? 'longtask'),
-            startTime: Number(entry.startTime ?? 0),
-            durationMs: Number(entry.duration ?? 0),
-          }), hitchLimit);
+        if (longTaskObserverQuarantined) return;
+        try {
+          for (const entry of list.getEntries()) {
+            longTasks.push(Object.freeze({
+              name: String(entry.name ?? 'longtask'),
+              startTime: Number(entry.startTime ?? 0),
+              durationMs: Number(entry.duration ?? 0),
+            }));
+          }
+        } catch (error) {
+          longTaskObserverQuarantined = true;
+          reportObserverError('long-task-callback', error);
+          const failedObserver = observer;
+          observer = null;
+          try {
+            failedObserver?.disconnect?.();
+          } catch (disconnectError) {
+            reportObserverError('long-task-disconnect', disconnectError);
+          }
         }
       });
       observer.observe({ type: 'longtask', buffered: true });
-    } catch { observer = null; }
+    } catch (error) {
+      longTaskObserverQuarantined = true;
+      reportObserverError('long-task-observe', error);
+      const failedObserver = observer;
+      observer = null;
+      try {
+        failedObserver?.disconnect?.();
+      } catch (disconnectError) {
+        reportObserverError('long-task-disconnect', disconnectError);
+      }
+    }
   }
 
   return Object.freeze({
     profile,
-    enabled,
+    enabled: active,
+    mode: diagnosticMode,
     begin,
     end,
     measure(stage, operation) {
-      if (!enabled) return operation();
+      if (!active) return operation();
+      if (!detailed) {
+        const startedAt = clock();
+        try { return operation(); }
+        finally { recordStage(stage, Math.max(0, clock() - startedAt)); }
+      }
       const token = begin(stage);
       try { return operation(); }
       finally { end(token); }
     },
     async measureAsync(stage, operation) {
-      if (!enabled) return operation();
+      if (!active) return operation();
+      if (!detailed) {
+        const startedAt = clock();
+        try { return await operation(); }
+        finally { recordStage(stage, Math.max(0, clock() - startedAt), { async: true }); }
+      }
       const token = begin(stage, { async: true });
       try { return await operation(); }
       finally { end(token); }
     },
     startFrame(frameNow = clock()) {
-      if (!enabled) return null;
-      currentFrame = {
-        sequence: ++frameSequence,
-        startedAt: frameNow,
-        stages: {},
-        work: {},
-      };
+      if (!active) return null;
+      lightActiveWorkRoutes.clear();
+      if (detailed) {
+        currentFrame = {
+          sequence: ++frameSequence,
+          startedAt: frameNow,
+          stages: {},
+          work: {},
+        };
+      } else {
+        lightFrameState.sequence = ++frameSequence;
+        lightFrameState.startedAt = frameNow;
+        currentFrame = lightFrameState;
+      }
       browserFrames.startFrame(frameNow);
       return currentFrame.sequence;
     },
     currentFrameSequence() {
-      return enabled ? currentFrame?.sequence ?? frameSequence : null;
+      return active ? currentFrame?.sequence ?? frameSequence : null;
     },
     recordWork(route, values = { count: 1 }) {
-      if (!enabled || !currentFrame) return null;
+      if (!active || !currentFrame) return null;
       if (typeof route !== 'string' || !route) throw new TypeError('diagnostic work route is required');
       if (!values || typeof values !== 'object' || Array.isArray(values)) {
         throw new TypeError('diagnostic work values must be an object');
       }
-      const target = currentFrame.work[route] ??= {};
-      for (const [metric, value] of Object.entries(values)) {
-        if (!Number.isFinite(value)) continue;
-        target[metric] = (target[metric] ?? 0) + value;
+      if (detailed) {
+        const target = currentFrame.work[route] ??= {};
+        for (const [metric, value] of Object.entries(values)) {
+          if (!Number.isFinite(value)) continue;
+          target[metric] = (target[metric] ?? 0) + value;
+        }
+      } else {
+        let target = lightWorkTotals.get(route);
+        if (!target) {
+          target = new Map();
+          lightWorkTotals.set(route, target);
+        }
+        if (!lightActiveWorkRoutes.has(route)) {
+          for (const metric of target.keys()) target.set(metric, 0);
+          lightActiveWorkRoutes.add(route);
+        }
+        for (const [metric, value] of Object.entries(values)) {
+          if (!Number.isFinite(value)) continue;
+          target.set(metric, (target.get(metric) ?? 0) + value);
+        }
       }
       browserFrames.recordWork(route, values);
-      return Object.freeze({ frameSequence: currentFrame.sequence, route });
+      return detailed
+        ? Object.freeze({ frameSequence: currentFrame.sequence, route })
+        : currentFrame.sequence;
     },
     recordEvent(type, details = {}) {
-      if (!enabled) return null;
+      if (!active) return null;
       if (typeof type !== 'string' || !type) throw new TypeError('diagnostic event type is required');
       if (!details || typeof details !== 'object' || Array.isArray(details)) {
         throw new TypeError('diagnostic event details must be an object');
       }
       const event = Object.freeze({
-        sequence: events.length ? events.at(-1).sequence + 1 : 1,
+        sequence: ++eventSequence,
         type,
         timestampMs: clock(),
         frameSequence: currentFrame?.sequence ?? frameSequence,
         ...details,
       });
-      pushBounded(events, event, DEFAULT_EVENT_LIMIT);
+      events.push(event);
       browserFrames.recordEvent(type, details);
       return event;
     },
     recordTerrainGate(details) {
-      if (!enabled) return null;
+      if (!active) return null;
       return browserFrames.recordTerrainGate(details);
     },
     sealFrame({ rendererInfo = null } = {}) {
-      if (!enabled) return null;
+      if (!active) return null;
       return browserFrames.sealFrame({ rendererInfo });
     },
     finishFrame(durationMs, frameNow = clock()) {
-      if (!enabled) return null;
+      if (!active) return null;
+      frameSamples.push(durationMs);
+      const hitch = durationMs > hitchThresholdMs;
+      frameHitchFlags.push(Number(hitch));
+      if (!detailed) {
+        for (const route of lightActiveWorkRoutes) {
+          const totals = lightWorkTotals.get(route);
+          let samples = lightWorkSamples.get(route);
+          if (!samples) {
+            samples = new Map();
+            lightWorkSamples.set(route, samples);
+          }
+          for (const [metric, value] of totals) {
+            if (!samples.has(metric)) {
+              samples.set(metric, createNumericCircularBuffer(sampleLimit));
+            }
+            samples.get(metric).push(value);
+          }
+        }
+        browserFrames.finishFrame(durationMs, frameNow);
+        const completedSequence = currentFrame?.sequence ?? ++frameSequence;
+        currentFrame = null;
+        return completedSequence;
+      }
       const record = Object.freeze({
         sequence: currentFrame?.sequence ?? ++frameSequence,
         startedAt: currentFrame?.startedAt ?? frameNow - durationMs,
@@ -369,21 +628,28 @@ export function createW8RuntimeDiagnostics({
           ([route, values]) => [route, Object.freeze({ ...values })],
         ))),
       });
-      pushBounded(frameSamples, durationMs, sampleLimit);
-      pushBounded(frameRecords, record, DEFAULT_FRAME_DETAIL_LIMIT);
-      if (durationMs > hitchThresholdMs) pushBounded(hitches, record, hitchLimit);
+      frameRecords.push(record);
+      if (hitch) hitches.push(record);
       browserFrames.finishFrame(durationMs, frameNow);
       currentFrame = null;
       return record;
     },
     reset() {
       stageSamples.clear();
-      frameSamples.length = 0;
-      frameRecords.length = 0;
-      hitches.length = 0;
-      longTasks.length = 0;
-      events.length = 0;
+      frameSamples.clear();
+      frameHitchFlags.clear();
+      frameRecords.clear();
+      hitches.clear();
+      longTasks.clear();
+      events.clear();
+      lightWorkTotals.clear();
+      lightActiveWorkRoutes.clear();
+      lightWorkSamples.clear();
       currentFrame = null;
+      eventSequence = 0;
+      hudCache = null;
+      hudCacheAtMs = Number.NEGATIVE_INFINITY;
+      hudCacheStageNames = null;
       browserFrames.reset();
     },
     snapshot(resources = {}) {
@@ -392,54 +658,94 @@ export function createW8RuntimeDiagnostics({
         stages[stage] = distribution(values);
       }
       const frame = distribution(frameSamples);
+      const hitchRecords = hitches.toArray();
+      const detailedFrames = frameRecords.toArray();
+      const longTaskRecords = longTasks.toArray();
       return Object.freeze({
         schemaVersion: 'w8-measurement-report-1',
-        enabled,
+        enabled: active,
+        mode: diagnosticMode,
         runNumber,
         profile: Object.freeze({ ...profile }),
         environment: Object.freeze({ ...environment }),
         frame,
         hitchThresholdMs,
-        hitchRatio: frame.count ? hitches.length / frame.count : 0,
-        hitches: Object.freeze(hitches.map(value => Object.freeze({
+        hitchRatio: frameHitchFlags.length
+          ? frameHitchFlags.sum / frameHitchFlags.length : 0,
+        hitches: Object.freeze(hitchRecords.map(value => Object.freeze({
           ...value,
           stages: Object.freeze({ ...value.stages }),
           work: Object.freeze({ ...value.work }),
         }))),
-        frames: Object.freeze(frameRecords.map(value => Object.freeze({
+        frames: Object.freeze(detailedFrames.map(value => Object.freeze({
           ...value,
           stages: Object.freeze({ ...value.stages }),
           work: Object.freeze({ ...value.work }),
         }))),
-        work: workDistributions(frameRecords),
-        events: Object.freeze([...events]),
+        work: detailed
+          ? workDistributions(frameRecords) : sampledWorkDistributions(lightWorkSamples),
+        events: Object.freeze(events.toArray()),
         stages: Object.freeze(stages),
-        longTasks: Object.freeze([...longTasks]),
+        longTasks: Object.freeze(longTaskRecords),
         resources: Object.freeze({ ...resources }),
         browserFrameAttribution: browserFrames.snapshot(),
+        observers: Object.freeze({
+          longTaskSupported: typeof globalObject.PerformanceObserver === 'function',
+          longTaskActive: observer !== null && !longTaskObserverQuarantined,
+          longTaskQuarantined: longTaskObserverQuarantined,
+          userTimingSupported,
+          userTimingActive,
+          userTimingQuarantined,
+          errorCount: observerErrorCount,
+          lastError: observerLastError,
+        }),
+        storage: Object.freeze({
+          numericFrameSampleCount: frameSamples.length,
+          numericFrameSampleCapacity: sampleLimit,
+          numericHitchFlagCount: frameHitchFlags.length,
+          frameDetailCount: frameRecords.length,
+          frameDetailCapacity: DEFAULT_FRAME_DETAIL_LIMIT,
+          numericOnlyLightPath: active && !detailed,
+          eventCount: events.length,
+          eventCapacity: DEFAULT_EVENT_LIMIT,
+          longTaskCount: longTasks.length,
+          longTaskCapacity: hitchLimit,
+        }),
       });
     },
     hudSnapshot(resources = {}, stageNames = []) {
+      const snapshotAtMs = clock();
+      if (hudCache && hudCacheStageNames === stageNames
+          && snapshotAtMs - hudCacheAtMs < hudRefreshIntervalMs) return hudCache;
       const stages = {};
       for (const stage of stageNames) {
         if (typeof stage !== 'string' || !stage || stages[stage]) continue;
         stages[stage] = distribution(stageSamples.get(stage) ?? []);
       }
       const frame = distribution(frameSamples);
-      return Object.freeze({
+      const longTaskRecords = longTasks.toArray();
+      hudCache = Object.freeze({
         schemaVersion: 'w8-hud-measurement-summary-1',
         frame,
-        hitchRatio: frame.count ? hitches.length / frame.count : 0,
+        hitchRatio: frameHitchFlags.length
+          ? frameHitchFlags.sum / frameHitchFlags.length : 0,
         stages: Object.freeze(stages),
         longTaskCount: longTasks.length,
-        longTaskMaximumMs: longTasks.reduce(
+        longTaskMaximumMs: longTaskRecords.reduce(
           (maximum, entry) => Math.max(maximum, entry.durationMs), 0,
         ),
         resources: Object.freeze({ ...resources }),
       });
+      hudCacheAtMs = snapshotAtMs;
+      hudCacheStageNames = stageNames;
+      return hudCache;
     },
     dispose() {
-      observer?.disconnect?.();
+      try {
+        observer?.disconnect?.();
+      } catch (error) {
+        reportObserverError('long-task-disconnect', error);
+      }
       observer = null;
     },
   });

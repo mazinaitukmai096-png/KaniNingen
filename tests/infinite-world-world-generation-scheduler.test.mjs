@@ -12,8 +12,12 @@ import {
 
 function deferred() {
   let resolve;
-  const promise = new Promise(nextResolve => { resolve = nextResolve; });
-  return { promise, resolve };
+  let reject;
+  const promise = new Promise((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
 }
 
 async function drain() {
@@ -322,8 +326,13 @@ test('queued cancellation never executes and reaches a bounded terminal state', 
 });
 
 test('in-flight cancellation is observed at a cooperative checkpoint', async () => {
+  let now = 0;
   const gate = deferred();
-  const scheduler = createWorldGenerationScheduler({ clock: () => 0 });
+  const events = [];
+  const scheduler = createWorldGenerationScheduler({
+    clock: () => now,
+    onEvent: event => events.push(event),
+  });
   let cancelReason = null;
   const active = scheduler.schedule({
     envelope: envelope(1),
@@ -338,11 +347,156 @@ test('in-flight cancellation is observed at a cooperative checkpoint', async () 
   assert.equal(active.state, WORLD_GENERATION_STATE.IN_FLIGHT);
   assert.equal(active.cancel('owner-superseded'), true);
   assert.equal(cancelReason, 'owner-superseded');
+  now = 7;
   gate.resolve();
   const result = await active.promise;
   assert.equal(result.state, WORLD_GENERATION_STATE.CANCELLED);
   assert.equal(result.value, null);
+  assert.equal(result.cancellationAcknowledgedAtCheckpoint, true);
+  assert.equal(result.cancellationAcknowledgementMs, 7);
+  assert.equal(events.filter(event => event.type === 'cancel-requested').length, 1);
+  assert.equal(events.filter(event => event.type === 'cancel-acknowledged').length, 1);
   assert.equal(scheduler.snapshot().counts.inFlightCancelled, 1);
+  await scheduler.shutdown();
+});
+
+test('a real execution ERROR wins a simultaneous cancellation and emits one failed terminal', async () => {
+  const gate = deferred();
+  const events = [];
+  const scheduler = createWorldGenerationScheduler({
+    clock: () => 10,
+    onEvent: event => events.push(event),
+  });
+  const active = scheduler.schedule({
+    envelope: envelope(1),
+    execute: async () => gate.promise,
+  });
+  await drain();
+  assert.equal(active.cancel('cancel-raced-error'), true);
+  gate.reject(new Error('authoritative-generation-error'));
+
+  const result = await active.promise;
+  assert.equal(result.state, WORLD_GENERATION_STATE.FAILED);
+  assert.match(result.error.message, /authoritative-generation-error/);
+  assert.deepEqual(
+    events.filter(event => event.type === 'terminal').map(event => event.state),
+    [WORLD_GENERATION_STATE.FAILED],
+  );
+  assert.equal(events.filter(event => event.type === 'cancel-acknowledged').length, 0);
+  assert.equal(scheduler.snapshot().counts.failed, 1);
+  assert.equal(scheduler.snapshot().counts.cancelled, 0);
+  await scheduler.shutdown();
+});
+
+test('scheduler shutdown requests cancellation and reports a bounded drain timeout', async () => {
+  const gate = deferred();
+  const scheduler = createWorldGenerationScheduler({
+    clock: () => 0,
+    shutdownDrainTimeoutMs: 5,
+  });
+  const active = scheduler.schedule({
+    envelope: envelope(1),
+    execute: async ({ checkpoint }) => {
+      await gate.promise;
+      checkpoint();
+    },
+  });
+  await drain();
+  assert.equal(await scheduler.shutdown({ reason: 'bounded-test-shutdown' }), false);
+  assert.equal(scheduler.snapshot().counts.shutdownDrainTimeouts, 1);
+  assert.equal(scheduler.snapshot().inFlight.cancelRequested, true);
+  gate.resolve();
+  assert.equal((await active.promise).state, WORLD_GENERATION_STATE.CANCELLED);
+});
+
+test('a required higher-rank request preempts optional active work at its next checkpoint', async () => {
+  let now = 0;
+  const gate = deferred();
+  const events = [];
+  const order = [];
+  const scheduler = createWorldGenerationScheduler({
+    clock: () => now,
+    onEvent: event => events.push(event),
+  });
+  const optional = scheduler.schedule({
+    envelope: envelope(1, {
+      priority: 5,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.PREFETCH,
+      required: false,
+    }),
+    execute: async ({ checkpoint }) => {
+      order.push('optional-start');
+      await gate.promise;
+      checkpoint();
+      order.push('optional-after-checkpoint');
+    },
+  });
+  await drain();
+  now = 3;
+  const required = scheduler.schedule({
+    envelope: envelope(2, {
+      priority: 1,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.DEADLINE_SAFETY,
+      required: true,
+      createdAtMs: now,
+    }),
+    execute: async () => { order.push('required'); return 'current'; },
+  });
+  assert.equal(scheduler.snapshot().inFlight.cancelRequested, true);
+  assert.equal(scheduler.snapshot().inFlight.preemptedByRequestId, 2);
+  now = 11;
+  gate.resolve();
+  const [optionalResult, requiredResult] = await Promise.all([
+    optional.promise,
+    required.promise,
+  ]);
+  assert.equal(optionalResult.state, WORLD_GENERATION_STATE.CANCELLED);
+  assert.equal(optionalResult.preemptedByRequestId, 2);
+  assert.equal(optionalResult.cancellationAcknowledgementMs, 8);
+  assert.equal(optionalResult.cancellationAcknowledgedAtCheckpoint, true);
+  assert.equal(requiredResult.state, WORLD_GENERATION_STATE.COMPLETED);
+  assert.equal(requiredResult.value, 'current');
+  assert.deepEqual(order, ['optional-start', 'required']);
+  assert.equal(events.filter(event => event.type === 'cancel-requested').length, 1);
+  assert.equal(events.filter(event => event.type === 'cancel-acknowledged').length, 1);
+  const snapshot = scheduler.snapshot();
+  assert.equal(snapshot.counts.preemptionRequests, 1);
+  assert.equal(snapshot.counts.preemptionAcknowledgements, 1);
+  await scheduler.shutdown();
+});
+
+test('required active work is never auto-preempted by another required request', async () => {
+  const gate = deferred();
+  const order = [];
+  const scheduler = createWorldGenerationScheduler({ clock: () => 0 });
+  const active = scheduler.schedule({
+    envelope: envelope(1, {
+      priority: 4,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.DETAIL,
+      required: true,
+    }),
+    execute: async ({ checkpoint }) => {
+      order.push('resident-start');
+      await gate.promise;
+      checkpoint();
+      order.push('resident-finish');
+    },
+  });
+  await drain();
+  const safety = scheduler.schedule({
+    envelope: envelope(2, {
+      priority: 1,
+      priorityClass: WORLD_GENERATION_PRIORITY_CLASS.DEADLINE_SAFETY,
+      required: true,
+    }),
+    execute: async () => { order.push('safety'); },
+  });
+  assert.equal(scheduler.snapshot().inFlight.cancelRequested, false);
+  gate.resolve();
+  assert.equal((await active.promise).state, WORLD_GENERATION_STATE.COMPLETED);
+  assert.equal((await safety.promise).state, WORLD_GENERATION_STATE.COMPLETED);
+  assert.deepEqual(order, ['resident-start', 'resident-finish', 'safety']);
+  assert.equal(scheduler.snapshot().counts.preemptionRequests, 0);
   await scheduler.shutdown();
 });
 
@@ -385,6 +539,12 @@ test('failed, completed, and shutdown-cancelled operations have explicit termina
     deadlineMisses: 0,
     agedStarts: 0,
     agingSteps: 0,
+    cancelRequests: 1,
+    checkpointCancelAcknowledgements: 1,
+    cancellationsSettledWithoutCheckpoint: 0,
+    preemptionRequests: 0,
+    preemptionAcknowledgements: 0,
+    shutdownDrainTimeouts: 0,
   });
 });
 

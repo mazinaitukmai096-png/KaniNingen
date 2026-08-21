@@ -34,10 +34,53 @@ export const ROAD_GRAPH_V3_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v3-road-o
 export const ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v3-lot-v1-template-1';
 export const ROAD_GRAPH_V3_LOT_V2_SETTLEMENT_TEMPLATE_SCHEMA = 'w5-road-graph-v3-lot-v2-template-1';
 
+const TEMPLATE_CANONICALIZATION_CHECKPOINT_BATCH_SIZE = 8;
+
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
   return Object.is(rounded, -0) ? 0 : rounded;
 };
+
+async function reachGenerationCheckpoint(generationControl) {
+  if (!generationControl) return;
+  if (generationControl.cooperativeCheckpoint) {
+    await generationControl.cooperativeCheckpoint();
+    return;
+  }
+  generationControl.checkpoint?.();
+}
+
+async function reachCanonicalizationBatchCheckpoint(
+  generationControl,
+  completedCount,
+  totalCount,
+) {
+  if (!generationControl) return;
+  if (completedCount % TEMPLATE_CANONICALIZATION_CHECKPOINT_BATCH_SIZE !== 0
+    && completedCount !== totalCount) return;
+  await reachGenerationCheckpoint(generationControl);
+}
+
+function buildScatterBuildingsAtSynchronousCheckpoints({
+  town,
+  hierarchy,
+  settlementId,
+  roadTimingRun,
+  generationControl,
+}) {
+  // Keep the protected finite-world implementation byte-identical. Cancellation
+  // is observed at the call boundary; the production Critical lane is isolated
+  // from this Background-only synchronous unit.
+  generationControl?.checkpoint?.({ site: 'road-v3-settlement-building-boundary' });
+  const result = buildDeterministicBuildings({
+    town,
+    hierarchy,
+    settlementId,
+    roadTimingRun,
+  });
+  generationControl?.checkpoint?.({ site: 'road-v3-settlement-building-boundary' });
+  return result;
+}
 
 const LEGACY_KIND_BY_CLASS = Object.freeze({
   [ROAD_GRAPH_CLASSES.ARTERIAL]: ROAD_KINDS.MAJOR,
@@ -148,7 +191,11 @@ export async function createRoadGraphV3SettlementTemplate({
   connectivityGraph,
   roadTimingRun = null,
   settlementLotMode = null,
+  checkpoint = null,
+  cooperativeCheckpoint = null,
 } = {}) {
+  const generationControl = checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
   if (settlementLotMode !== null
     && settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID
     && settlementLotMode !== SETTLEMENT_LOT_V2_GENERATOR_ID) {
@@ -173,6 +220,7 @@ export async function createRoadGraphV3SettlementTemplate({
     },
     gateways,
   });
+  await reachGenerationCheckpoint(generationControl);
   const town = Object.freeze({
     id: candidate.settlementId,
     x: 0,
@@ -183,12 +231,15 @@ export async function createRoadGraphV3SettlementTemplate({
     settlementType: candidate.settlementType,
   });
   const hierarchy = adaptRoadGraphToLegacyHierarchy({ graph, candidate, town });
-  const scatterBuildingResult = await buildDeterministicBuildings({
+  await reachGenerationCheckpoint(generationControl);
+  const scatterBuildingResult = await buildScatterBuildingsAtSynchronousCheckpoints({
     town,
     hierarchy,
     settlementId: candidate.settlementId,
     roadTimingRun,
+    generationControl,
   });
+  await reachGenerationCheckpoint(generationControl);
   let blocks = Object.freeze([]);
   let lots = Object.freeze([]);
   let blockResults = Object.freeze([]);
@@ -196,7 +247,9 @@ export async function createRoadGraphV3SettlementTemplate({
   let lotSummary = null;
   if (settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID) {
     blocks = await createRoadGraphV3Blocks({ worldSeedHash, roadGraph: graph });
+    await reachGenerationCheckpoint(generationControl);
     const generatedLots = await createSettlementLotsV1({ worldSeedHash, roadGraph: graph, blocks });
+    await reachGenerationCheckpoint(generationControl);
     lots = generatedLots.lots;
     blockResults = generatedLots.blockResults;
     const lotBuildings = await buildDeterministicBuildingsFromLots({
@@ -206,6 +259,7 @@ export async function createRoadGraphV3SettlementTemplate({
       candidate,
       lots,
     });
+    await reachGenerationCheckpoint(generationControl);
     if (!generatedLots.validation.valid || !lotBuildings.validation.valid) {
       lots = Object.freeze([]);
       blockResults = Object.freeze(blockResults.map(result => Object.freeze({
@@ -272,7 +326,9 @@ export async function createRoadGraphV3SettlementTemplate({
     }
   } else if (settlementLotMode === SETTLEMENT_LOT_V2_GENERATOR_ID) {
     blocks = await createRoadGraphV3Blocks({ worldSeedHash, roadGraph: graph });
+    await reachGenerationCheckpoint(generationControl);
     const generatedLots = await createSettlementLotsV1({ worldSeedHash, roadGraph: graph, blocks });
+    await reachGenerationCheckpoint(generationControl);
     lots = generatedLots.validation.valid ? generatedLots.lots : Object.freeze([]);
     blockResults = Object.freeze(generatedLots.blockResults.map(result => Object.freeze({
       ...result,
@@ -285,6 +341,7 @@ export async function createRoadGraphV3SettlementTemplate({
       candidate,
       lots,
     });
+    await reachGenerationCheckpoint(generationControl);
     const lotBuildings = generatedLotBuildings.validation.valid
       ? decorateLotV2Buildings(generatedLotBuildings.buildings)
       : Object.freeze([]);
@@ -312,6 +369,7 @@ export async function createRoadGraphV3SettlementTemplate({
         lots,
         lotBuildings,
       });
+      await reachGenerationCheckpoint(generationControl);
       frontageFallbackBuildings = fallback.buildings;
       fallbackValidation = fallback.validation;
     } else if (closedBlockCount === 0) {
@@ -326,6 +384,7 @@ export async function createRoadGraphV3SettlementTemplate({
         lots,
         lotBuildings,
       });
+      await reachGenerationCheckpoint(generationControl);
       frontageFallbackBuildings = fallback.buildings;
       fallbackValidation = fallback.validation;
     }
@@ -333,10 +392,17 @@ export async function createRoadGraphV3SettlementTemplate({
       .sort((left, right) => left.stableId.localeCompare(right.stableId));
     const unique = [];
     const buildingIds = new Set();
-    for (const building of combined) {
-      if (buildingIds.has(building.stableId)) continue;
-      buildingIds.add(building.stableId);
-      unique.push(building);
+    for (let buildingIndex = 0; buildingIndex < combined.length; buildingIndex += 1) {
+      const building = combined[buildingIndex];
+      if (!buildingIds.has(building.stableId)) {
+        buildingIds.add(building.stableId);
+        unique.push(building);
+      }
+      await reachCanonicalizationBatchCheckpoint(
+        generationControl,
+        buildingIndex + 1,
+        combined.length,
+      );
     }
     buildingResult = Object.freeze({
       requestedBuildingCount: scatterBuildingResult.requestedBuildingCount,
@@ -363,51 +429,85 @@ export async function createRoadGraphV3SettlementTemplate({
       fallbackValidation,
     });
   }
-  const buildings = buildingResult.buildings.map(building => Object.freeze({
-    ...building,
-    x: q6(building.x + candidate.center.x),
-    z: q6(building.z + candidate.center.z),
-    lot: Object.freeze({
-      ...building.lot,
-      centerX: q6(building.lot.centerX + candidate.center.x),
-      centerZ: q6(building.lot.centerZ + candidate.center.z),
-      entranceX: q6(building.lot.entranceX + candidate.center.x),
-      entranceZ: q6(building.lot.entranceZ + candidate.center.z),
-      roadAccessX: q6(building.lot.roadAccessX + candidate.center.x),
-      roadAccessZ: q6(building.lot.roadAccessZ + candidate.center.z),
-      path: translateRectangle(building.lot.path, candidate.center),
-      forecourt: translateRectangle(building.lot.forecourt, candidate.center),
-    }),
-  }));
-  const roads = graph.segments.map(segment => Object.freeze({
-    stableId: segment.stableId,
-    featureType: 'settlement-road',
-    settlementId: candidate.settlementId,
-    sourceRoadId: segment.stableId,
-    routeId: segment.flags.routeId,
-    routeOrder: segment.flags.routeOrder,
-    roadKind: LEGACY_KIND_BY_CLASS[segment.class],
-    roadClass: segment.class,
-    widthMeters: segment.widthMeters,
-    start: segment.start,
-    end: segment.end,
-    sourceOwner: segment.sourceOwner,
-    purpose: segment.purpose,
-    flags: segment.flags,
-  })).sort((left, right) => left.stableId.localeCompare(right.stableId));
-  const maximumRoadDistance = roads.reduce((maximum, road) => Math.max(
-    maximum,
-    Math.hypot(road.start.x - candidate.center.x, road.start.z - candidate.center.z),
-    Math.hypot(road.end.x - candidate.center.x, road.end.z - candidate.center.z),
-  ), 0);
+  const buildings = [];
+  for (let buildingIndex = 0;
+    buildingIndex < buildingResult.buildings.length;
+    buildingIndex += 1) {
+    const building = buildingResult.buildings[buildingIndex];
+    buildings.push(Object.freeze({
+      ...building,
+      x: q6(building.x + candidate.center.x),
+      z: q6(building.z + candidate.center.z),
+      lot: Object.freeze({
+        ...building.lot,
+        centerX: q6(building.lot.centerX + candidate.center.x),
+        centerZ: q6(building.lot.centerZ + candidate.center.z),
+        entranceX: q6(building.lot.entranceX + candidate.center.x),
+        entranceZ: q6(building.lot.entranceZ + candidate.center.z),
+        roadAccessX: q6(building.lot.roadAccessX + candidate.center.x),
+        roadAccessZ: q6(building.lot.roadAccessZ + candidate.center.z),
+        path: translateRectangle(building.lot.path, candidate.center),
+        forecourt: translateRectangle(building.lot.forecourt, candidate.center),
+      }),
+    }));
+    await reachCanonicalizationBatchCheckpoint(
+      generationControl,
+      buildingIndex + 1,
+      buildingResult.buildings.length,
+    );
+  }
+  await reachGenerationCheckpoint(generationControl);
+  const roads = [];
+  for (let segmentIndex = 0; segmentIndex < graph.segments.length; segmentIndex += 1) {
+    const segment = graph.segments[segmentIndex];
+    roads.push(Object.freeze({
+      stableId: segment.stableId,
+      featureType: 'settlement-road',
+      settlementId: candidate.settlementId,
+      sourceRoadId: segment.stableId,
+      routeId: segment.flags.routeId,
+      routeOrder: segment.flags.routeOrder,
+      roadKind: LEGACY_KIND_BY_CLASS[segment.class],
+      roadClass: segment.class,
+      widthMeters: segment.widthMeters,
+      start: segment.start,
+      end: segment.end,
+      sourceOwner: segment.sourceOwner,
+      purpose: segment.purpose,
+      flags: segment.flags,
+    }));
+    await reachCanonicalizationBatchCheckpoint(
+      generationControl,
+      segmentIndex + 1,
+      graph.segments.length,
+    );
+  }
+  roads.sort((left, right) => left.stableId.localeCompare(right.stableId));
+  await reachGenerationCheckpoint(generationControl);
+  let maximumRoadDistance = 0;
+  for (let roadIndex = 0; roadIndex < roads.length; roadIndex += 1) {
+    const road = roads[roadIndex];
+    maximumRoadDistance = Math.max(
+      maximumRoadDistance,
+      Math.hypot(road.start.x - candidate.center.x, road.start.z - candidate.center.z),
+      Math.hypot(road.end.x - candidate.center.x, road.end.z - candidate.center.z),
+    );
+    await reachCanonicalizationBatchCheckpoint(
+      generationControl,
+      roadIndex + 1,
+      roads.length,
+    );
+  }
   const radiusMeters = q6(profile.radius / FINITE_WORLD_UNITS_PER_METER);
   const gatewayHandoffs = createGatewayHandoffs(graph, candidate);
+  await reachGenerationCheckpoint(generationControl);
   const roadClassCounts = Object.freeze(Object.fromEntries(
     Object.values(ROAD_GRAPH_CLASSES).map(roadClass => [
       roadClass,
       roads.filter(road => road.roadClass === roadClass).length,
     ]),
   ));
+  await reachGenerationCheckpoint(generationControl);
   return Object.freeze({
     schemaVersion: settlementLotMode === SETTLEMENT_LOT_V1_GENERATOR_ID
       ? ROAD_GRAPH_V3_LOT_V1_SETTLEMENT_TEMPLATE_SCHEMA

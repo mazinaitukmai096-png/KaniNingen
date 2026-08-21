@@ -825,6 +825,7 @@ export function createStaticObjectStream({
   const queue = [];
   const tickets = new Map();
   let activeCount = 0;
+  let readyRequiredCount = 0;
   let epoch = 0;
   let coverageGeneration = 0;
   let planRevision = 0;
@@ -1119,6 +1120,18 @@ export function createStaticObjectStream({
     counts.queuedPromotions += 1;
     return true;
   };
+  const readyEntryIsCurrentlyRequired = (key, entry = ready.get(key)) => Boolean(
+    entry
+      && latestRequiredOwnerKeys.has(entry.ownerKey)
+      && latestResourceKindByOwner.get(entry.ownerKey) === entry.resourceKind
+      && key === taskKey(entry.ownerKey, entry.resourceKind),
+  );
+  const recountReadyRequired = () => {
+    let count = 0;
+    for (const [key, entry] of ready) count += Number(readyEntryIsCurrentlyRequired(key, entry));
+    readyRequiredCount = count;
+    return count;
+  };
   const touchReady = key => {
     const value = ready.get(key);
     if (!value) return null;
@@ -1128,7 +1141,9 @@ export function createStaticObjectStream({
   };
   const trimReady = () => {
     while (ready.size > readyCapacity) {
-      ready.delete(ready.keys().next().value);
+      const key = ready.keys().next().value;
+      if (readyEntryIsCurrentlyRequired(key)) readyRequiredCount -= 1;
+      ready.delete(key);
       counts.readyEvictions += 1;
     }
   };
@@ -1234,14 +1249,18 @@ export function createStaticObjectStream({
       const readyAtMs = clock();
       const retainedByLatestCoverage = latestRequestedOwnerKeys.has(task.ownerKey)
         && latestResourceKindByOwner.get(task.ownerKey) === task.resourceKind;
-      ready.set(task.key, Object.freeze({
+      const previousReady = ready.get(task.key);
+      if (readyEntryIsCurrentlyRequired(task.key, previousReady)) readyRequiredCount -= 1;
+      const readyEntry = Object.freeze({
         ownerKey: task.ownerKey,
         resourceKind: task.resourceKind,
         value,
         readyAtMs,
         sourcePlanId: task.planId,
-      }));
-      if (retainedByLatestCoverage) queueReadyPage(ready.get(task.key));
+      });
+      ready.set(task.key, readyEntry);
+      if (readyEntryIsCurrentlyRequired(task.key, readyEntry)) readyRequiredCount += 1;
+      if (retainedByLatestCoverage) queueReadyPage(readyEntry);
       else counts.staleResultDiscards += 1;
       trimReady();
       if (retainedByLatestCoverage) {
@@ -1827,6 +1846,7 @@ export function createStaticObjectStream({
       latestResourceKindEntryByOwner = nextResourceKindEntryByOwner;
       latestPolicyResourceKindEntries = nextPolicyResourceKindEntries;
       latestSourceCoverageSignature = sourceCoverageSignature;
+      recountReadyRequired();
       planRevision += 1;
       counts.unchangedPlans += 1;
       counts.coverageMerges += 1;
@@ -1986,6 +2006,7 @@ export function createStaticObjectStream({
     latestRequestedOwnerKeys = nextRequestedOwnerKeys;
     latestRequiredOwnerKeys = required;
     latestAllOwnerKeys = retained;
+    recountReadyRequired();
     if (bootCohortOwnerKeys === null) {
       bootCohortOwnerKeys = stagedBootCohortOwnerKeys;
       bootCohortStartedAtMs = plan.generatedAtMs;
@@ -2400,6 +2421,20 @@ export function createStaticObjectStream({
       invalidationCount: counts.invalidations,
     });
   };
+  // Frame control needs only primitive counters. Keeping one immutable view
+  // with live getters avoids rebuilding the full diagnostic policy/owner
+  // graph on every animation frame.
+  const controlState = Object.freeze({
+    get coverageGeneration() { return coverageGeneration; },
+    get planRevision() { return planRevision; },
+    get readyPageCount() { return readyPageQueue.size; },
+    get readyRequiredOwnerCount() { return readyRequiredCount; },
+    get missingRequiredOwnerCount() {
+      return (latestPolicyPlan?.requiredOwnerKeys?.length ?? 0)
+        - this.readyRequiredOwnerCount;
+    },
+    get backlog() { return queue.length + activeCount; },
+  });
   const invalidate = (reason = 'static-stream-invalidated') => {
     if (disposed) return 0;
     epoch += 1;
@@ -2441,6 +2476,7 @@ export function createStaticObjectStream({
     staleTaskKeys.clear();
     tickets.clear();
     ready.clear();
+    readyRequiredCount = 0;
     readyPageQueue.clear();
     staleTaskKeys.clear();
     counts.invalidations += 1;
@@ -2477,6 +2513,7 @@ export function createStaticObjectStream({
     tasks.clear();
     taskKeysByOwner.clear();
     ready.clear();
+    readyRequiredCount = 0;
     tickets.clear();
     readyPageQueue.clear();
   };
@@ -2501,6 +2538,7 @@ export function createStaticObjectStream({
       ownerTimingByOwner.get(ownerKey)
     )).filter(Boolean)),
     invalidate,
+    controlState: () => controlState,
     diagnostics,
     snapshot,
     dispose,

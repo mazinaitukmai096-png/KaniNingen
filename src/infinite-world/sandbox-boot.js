@@ -5,7 +5,7 @@ import {
   createCanonicalTreeCellRequestKey,
 } from './chunk-data-service-protocol.js';
 import {
-  createOwnerGenerationCoordinator,
+  createFixedLaneOwnerGenerationCoordinator,
   defaultOwnerGenerationPriorityClass,
 } from './owner-generation-coordinator.js';
 import {
@@ -19,7 +19,9 @@ import {
   createVisualContinuityRegistry,
 } from './visual-continuity.js';
 import { createInlineChunkGeneratorTransport } from './inline-chunk-generator-transport.js';
-import { createWorkerChunkGeneratorTransport } from './worker-chunk-generator-transport.js';
+import {
+  createFixedLaneWorkerChunkGeneratorTransport,
+} from './worker-chunk-generator-transport.js';
 import {
   W1B_SELECTED_RENDER_CHUNK_SIZE,
   describeRenderChunkCandidate,
@@ -125,6 +127,12 @@ import {
 } from './building-settlement-stream.js';
 import { createWebGLRenderDiagnostics } from './webgl-render-diagnostics.js';
 import {
+  createRenderUploadAdmissionController,
+  createThreeProjectedUploadStager,
+} from './render-upload-admission.js';
+import { createRuntimeFrameSupervisor } from './runtime-frame-supervisor.js';
+import { createRuntimeFaultLedger } from './runtime-fault-ledger.js';
+import {
   PRESENTATION_OWNER_SCHEMA,
   PRESENTATION_OWNER_SHARED_CORE_REVISION,
   W8_CANONICAL_NATURAL_PRESENCE_SCHEMA,
@@ -133,6 +141,332 @@ import {
 } from './presentation-owner-generator.js';
 
 export const SANDBOX_BOOT_TIMEOUT_MS = 30_000;
+export const RUNTIME_TRANSITION_FAULT_CODE = Object.freeze({
+  RETRYABLE_STREAMING: 'RUNTIME_TRANSITION_RETRYABLE_STREAMING',
+  RETRYABLE_PRESENTATION: 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION',
+  CANONICAL_INVARIANT: 'CANONICAL_WORLD_INVARIANT',
+  RUNTIME_INVARIANT: 'RUNTIME_WORLD_INVARIANT',
+});
+const RETRYABLE_RUNTIME_TRANSITION_FAULT_CODES = new Set([
+  RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING,
+  RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+]);
+const FATAL_RUNTIME_TRANSITION_FAULT_CODES = new Set([
+  RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT,
+  RUNTIME_TRANSITION_FAULT_CODE.RUNTIME_INVARIANT,
+]);
+
+export function createRuntimeTransitionFault({
+  code,
+  message,
+  stage,
+  cause = null,
+} = {}) {
+  if (!RETRYABLE_RUNTIME_TRANSITION_FAULT_CODES.has(code)
+    && !FATAL_RUNTIME_TRANSITION_FAULT_CODES.has(code)) {
+    throw new TypeError('runtime transition fault code is not recognized');
+  }
+  if (typeof message !== 'string' || !message
+    || typeof stage !== 'string' || !stage) {
+    throw new TypeError('runtime transition fault message and stage are required');
+  }
+  const fatal = FATAL_RUNTIME_TRANSITION_FAULT_CODES.has(code);
+  const error = new Error(message);
+  error.name = code === RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT
+    ? 'CanonicalWorldInvariantError'
+    : fatal ? 'RuntimeWorldInvariantError' : 'RuntimeTransitionRetryableError';
+  error.code = code;
+  error.faultDomain = code === RUNTIME_TRANSITION_FAULT_CODE.CANONICAL_INVARIANT
+    ? 'canonical-world'
+    : fatal ? 'world-invariant'
+      : code === RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_STREAMING
+        ? 'streaming' : 'presentation';
+  error.stage = stage;
+  error.retryable = !fatal;
+  if (cause !== null) error.cause = cause;
+  return error;
+}
+
+export function classifyRuntimeTransitionFault(error) {
+  const code = error?.code;
+  if (FATAL_RUNTIME_TRANSITION_FAULT_CODES.has(code)) {
+    return Object.freeze({ kind: 'fatal', code, stage: error?.stage ?? null });
+  }
+  if (RETRYABLE_RUNTIME_TRANSITION_FAULT_CODES.has(code)
+    && error?.retryable !== false) {
+    return Object.freeze({ kind: 'retryable', code, stage: error?.stage ?? null });
+  }
+  return Object.freeze({
+    kind: 'fatal',
+    code: 'UNCLASSIFIED_RUNTIME_TRANSITION_FAULT',
+    stage: error?.stage ?? null,
+  });
+}
+
+function retryableRuntimeTransitionStageFault(error, code, stage) {
+  const classification = classifyRuntimeTransitionFault(error);
+  if (classification.code !== 'UNCLASSIFIED_RUNTIME_TRANSITION_FAULT'
+    || error?.retryable === false) return error;
+  return createRuntimeTransitionFault({
+    code,
+    message: error?.message ?? String(error),
+    stage,
+    cause: error,
+  });
+}
+
+export function createRuntimeTransitionLatestTargetQueue() {
+  let queued = null;
+  let targetUpdateCount = 0;
+  let drainCount = 0;
+
+  const freezeOwner = owner => Object.freeze({
+    key: owner.key,
+    chunkX: owner.chunkX,
+    chunkZ: owner.chunkZ,
+  });
+  const freezeMovement = movement => {
+    if (!movement) return null;
+    return Object.freeze({
+      speedMetersPerSecond: movement.speedMetersPerSecond ?? null,
+      velocityX: movement.velocityX ?? null,
+      velocityZ: movement.velocityZ ?? null,
+      scaleStageId: movement.scaleStageId ?? null,
+    });
+  };
+
+  return Object.freeze({
+    queue(owner, movement = null, { required = false, activeOwnerKey = null } = {}) {
+      if (!owner?.key) return false;
+      if (owner.key === activeOwnerKey) {
+        queued = null;
+        return false;
+      }
+      if (queued?.owner.key === owner.key) {
+        if (required && queued.required !== true) {
+          queued = Object.freeze({ ...queued, required: true });
+        }
+        return false;
+      }
+      queued = Object.freeze({
+        owner: freezeOwner(owner),
+        movement: freezeMovement(movement),
+        required: required === true,
+      });
+      targetUpdateCount += 1;
+      return true;
+    },
+    clear() {
+      const hadQueued = queued !== null;
+      queued = null;
+      return hadQueued;
+    },
+    consume(playerOwner, { centered = false } = {}) {
+      const pending = queued;
+      queued = null;
+      if (!playerOwner?.key || centered) return null;
+      drainCount += 1;
+      return Object.freeze({
+        owner: freezeOwner(playerOwner),
+        movement: pending?.owner.key === playerOwner.key ? pending.movement : null,
+        required: pending?.owner.key === playerOwner.key && pending.required === true,
+      });
+    },
+    snapshot(activeOwnerKey = null) {
+      return Object.freeze({
+        activeOwnerKey,
+        queuedOwnerKey: queued?.owner.key ?? null,
+        targetUpdateCount,
+        drainCount,
+      });
+    },
+  });
+}
+
+export function createRuntimeTransitionRetryController({
+  setTimeoutFn = globalThis.setTimeout.bind(globalThis),
+  clearTimeoutFn = globalThis.clearTimeout.bind(globalThis),
+  retryDelayMs = 250,
+  maximumAttempts = 3,
+} = {}) {
+  if (typeof setTimeoutFn !== 'function' || typeof clearTimeoutFn !== 'function') {
+    throw new TypeError('runtime transition retry timers are required');
+  }
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) {
+    throw new RangeError('runtime transition retry delay must be non-negative');
+  }
+  if (!Number.isSafeInteger(maximumAttempts) || maximumAttempts < 1) {
+    throw new RangeError('runtime transition maximum attempts must be a positive safe integer');
+  }
+
+  let epoch = 0;
+  let target = null;
+  let attempts = 0;
+  let totalAttempts = 0;
+  let scheduledRetryCount = 0;
+  let timer = null;
+  let maximumConcurrentTimerCount = 0;
+  let status = 'idle';
+  let lastFault = null;
+  let shutdown = false;
+  let fatal = false;
+
+  const sameIdentity = identity => target !== null
+    && target.ownerKey === identity.ownerKey
+    && target.generation === identity.generation;
+  const clearRetryTimer = () => {
+    if (timer === null) return false;
+    clearTimeoutFn(timer);
+    timer = null;
+    return true;
+  };
+  const resetForIdentity = identity => {
+    clearRetryTimer();
+    epoch += 1;
+    target = Object.freeze({
+      ownerKey: identity.ownerKey,
+      generation: identity.generation,
+    });
+    attempts = 0;
+    lastFault = null;
+    status = 'ready';
+  };
+  const tokenCurrent = token => token !== null
+    && target !== null
+    && token.epoch === epoch
+    && token.ownerKey === target.ownerKey
+    && token.generation === target.generation;
+
+  const beginAttempt = ({ ownerKey, generation }) => {
+    if (shutdown || fatal) return null;
+    if (typeof ownerKey !== 'string' || !ownerKey
+      || !Number.isSafeInteger(generation) || generation < 0) {
+      throw new TypeError('runtime transition retry identity requires ownerKey and generation');
+    }
+    const identity = { ownerKey, generation };
+    if (!sameIdentity(identity)) resetForIdentity(identity);
+    if (status === 'in-flight' || status === 'backoff' || status === 'retry-exhausted') {
+      return null;
+    }
+    attempts += 1;
+    totalAttempts += 1;
+    status = 'in-flight';
+    return Object.freeze({
+      ownerKey,
+      generation,
+      epoch,
+      attempt: attempts,
+    });
+  };
+
+  const succeed = token => {
+    if (!tokenCurrent(token) || status !== 'in-flight') return false;
+    clearRetryTimer();
+    target = null;
+    attempts = 0;
+    lastFault = null;
+    status = 'idle';
+    return true;
+  };
+
+  const fail = (token, error, { onRetry = null } = {}) => {
+    if (!tokenCurrent(token) || status !== 'in-flight' || shutdown) {
+      return Object.freeze({ accepted: false, terminal: false, classification: null });
+    }
+    const classification = classifyRuntimeTransitionFault(error);
+    lastFault = Object.freeze({
+      name: error?.name ?? 'Error',
+      message: error?.message ?? String(error),
+      code: classification.code,
+      stage: classification.stage,
+    });
+    if (classification.kind === 'fatal') {
+      clearRetryTimer();
+      fatal = true;
+      status = 'fatal-degraded';
+      return Object.freeze({ accepted: true, terminal: true, classification });
+    }
+    if (attempts >= maximumAttempts) {
+      clearRetryTimer();
+      status = 'retry-exhausted';
+      return Object.freeze({ accepted: true, terminal: true, classification });
+    }
+    if (onRetry !== null && typeof onRetry !== 'function') {
+      throw new TypeError('runtime transition retry callback must be a function');
+    }
+    status = 'backoff';
+    scheduledRetryCount += 1;
+    const scheduledEpoch = epoch;
+    let scheduledTimer = null;
+    scheduledTimer = setTimeoutFn(() => {
+      if (timer === scheduledTimer) timer = null;
+      if (shutdown || fatal || status !== 'backoff' || epoch !== scheduledEpoch) return;
+      status = 'ready';
+      onRetry?.();
+    }, retryDelayMs);
+    timer = scheduledTimer;
+    maximumConcurrentTimerCount = Math.max(maximumConcurrentTimerCount, Number(timer !== null));
+    return Object.freeze({ accepted: true, terminal: false, classification });
+  };
+
+  const haltFatal = error => {
+    if (shutdown || fatal) return false;
+    clearRetryTimer();
+    fatal = true;
+    status = 'fatal-degraded';
+    const classification = classifyRuntimeTransitionFault(error);
+    lastFault = Object.freeze({
+      name: error?.name ?? 'Error',
+      message: error?.message ?? String(error),
+      code: classification.code,
+      stage: classification.stage,
+    });
+    return true;
+  };
+
+  return Object.freeze({
+    beginAttempt,
+    succeed,
+    fail,
+    haltFatal,
+    isCurrent: tokenCurrent,
+    suppressesIdentity({ ownerKey, generation }) {
+      if (shutdown || fatal) return true;
+      return sameIdentity({ ownerKey, generation })
+        && (status === 'in-flight'
+          || status === 'backoff'
+          || status === 'retry-exhausted');
+    },
+    shutdown() {
+      if (shutdown) return false;
+      shutdown = true;
+      clearRetryTimer();
+      target = null;
+      status = 'shutdown';
+      return true;
+    },
+    snapshot() {
+      return Object.freeze({
+        schemaVersion: 'runtime-transition-retry-state-1',
+        status,
+        epoch,
+        ownerKey: target?.ownerKey ?? null,
+        generation: target?.generation ?? null,
+        attempts,
+        maximumAttempts,
+        totalAttempts,
+        scheduledRetryCount,
+        retryDelayMs,
+        timerCount: Number(timer !== null),
+        maximumConcurrentTimerCount,
+        fatal,
+        shutdown,
+        lastFault,
+      });
+    },
+  });
+}
+
 const HUD_DIAGNOSTIC_STAGE_NAMES = Object.freeze([
   'chunk-transition',
   'chunk-prefetch',
@@ -877,6 +1211,19 @@ export function recordSandboxBootFailure({ state, hud, error, clock = defaultClo
   return error;
 }
 
+export async function shutdownRuntimeBeforeProjectedUploadStager({
+  runtime = null,
+  renderAdapter = null,
+  projectedUploadStager = null,
+} = {}) {
+  try {
+    if (runtime) await runtime.shutdown();
+    else if (renderAdapter) await renderAdapter.shutdown();
+  } finally {
+    projectedUploadStager?.dispose?.();
+  }
+}
+
 export function createSandboxEntryController({
   documentObject,
   state,
@@ -1351,11 +1698,21 @@ export async function bootInfiniteWorldSandbox({
   ).get('terrainLagSpikeDiagnostics') === '1',
   diagnosticsEnabled = measurementMode !== null
     || new globalObject.URLSearchParams(globalObject.location?.search ?? '').get('diagnostics') === '1'
+    || new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('deepWebglDiagnostics') === '1'
+    || new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('webglDiagnosticForceIncident') === '1'
     || terrainLagSpikeDiagnosticsEnabled
     || diagnosticProfile.profileId !== 'baseline',
   forceFirstWebGLDiagnosticIncident = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('webglDiagnosticForceIncident') === '1',
+  deepWebglDiagnosticsEnabled = forceFirstWebGLDiagnosticIncident
+    || new globalObject.URLSearchParams(
+      globalObject.location?.search ?? '',
+    ).get('deepWebglDiagnostics') === '1',
   streamingTelemetryEnabled = new globalObject.URLSearchParams(
     globalObject.location?.search ?? '',
   ).get('streamingTelemetry') === '1',
@@ -1384,6 +1741,9 @@ export async function bootInfiniteWorldSandbox({
   chunkGeneratorWorkerFactory = null,
   renderAdapterFactory = options => new ChunkRenderAdapter(options),
   runtimeFactory = options => new ChunkRuntimeManager(options),
+  renderUploadAdmissionFactory = options => createRenderUploadAdmissionController(options),
+  projectedUploadStagerFactory = options => createThreeProjectedUploadStager(options),
+  webglRenderDiagnosticsFactory = options => createWebGLRenderDiagnostics(options),
   chunkIndexFactory = options => new PersistentChunkIndex(options),
   worldStateFactory = options => new InfiniteWorldState(options),
   saveStoreFactory = options => new InfiniteWorldSaveStore(options),
@@ -1442,7 +1802,9 @@ export async function bootInfiniteWorldSandbox({
   let audioDirector = null;
   let diagnostics = null;
   let webglRenderDiagnostics = null;
+  let projectedUploadStager = null;
   const originTransformDiagnostics = createOriginTransformDiagnosticRing();
+  const runtimeFaultLedger = createRuntimeFaultLedger({ clock });
   const terrainLagSpikeDiagnostics = createTerrainLagSpikeDiagnosticCapture({
     enabled: terrainLagSpikeDiagnosticsEnabled,
   });
@@ -1464,7 +1826,8 @@ export async function bootInfiniteWorldSandbox({
   let availableSaveSnapshot = null;
   let experienceSpawn = null;
   let running = false;
-  let animationFrameId = null;
+  let frameSupervisor = null;
+  let runtimeFrameStage = 'not-started';
   let currentStageStartedAt = null;
   const staticTreeActivationTimeline = {
     schemaVersion: 'static-tree-activation-timeline-1',
@@ -1499,7 +1862,7 @@ export async function bootInfiniteWorldSandbox({
       includePrepared: true,
       frameSequence: settlementStreamingFrameSequence,
       renderDistanceRevision: renderDistanceRequestRevision,
-      stateRevision: worldState?.revision ?? 0,
+      stateRevision: worldState?.featureDamageRevision ?? 0,
     }) ?? null
   );
   const activateNaturalStaticStream = source => {
@@ -1516,10 +1879,18 @@ export async function bootInfiniteWorldSandbox({
     worldStreamingCoordinator?.invalidateCoverage?.(reason);
     return naturalStaticStream?.invalidate?.(reason) ?? 0;
   };
-  const destroyedFeatureStableIds = () => [...(worldState?.featureDamage?.entries?.() ?? [])]
-    .filter(([, value]) => value?.destroyed === true)
-    .map(([stableId]) => stableId)
-    .sort((left, right) => left.localeCompare(right));
+  const emptyFeatureDestructionSnapshot = Object.freeze({
+    schemaVersion: 'feature-destruction-snapshot-1',
+    revision: 0,
+    destroyedStableIds: Object.freeze([]),
+    signature: '[]',
+  });
+  const featureDestructionSnapshot = () => (
+    worldState?.featureDestructionSnapshot?.() ?? emptyFeatureDestructionSnapshot
+  );
+  const destroyedFeatureStableIds = () => (
+    featureDestructionSnapshot().destroyedStableIds
+  );
   const resetVisualContinuityForRestoredFeatures = () => {
     if (!worldState || !visualContinuity) return false;
     const destroyed = new Set(destroyedFeatureStableIds());
@@ -1540,8 +1911,9 @@ export async function bootInfiniteWorldSandbox({
   };
   const synchronizeDestroyedVisualRequirements = () => {
     if (!worldState || !visualContinuity) return 0;
-    const destroyedStableIds = destroyedFeatureStableIds();
-    const revision = destroyedStableIds.join('\n');
+    const destructionSnapshot = featureDestructionSnapshot();
+    const destroyedStableIds = destructionSnapshot.destroyedStableIds;
+    const revision = destructionSnapshot.signature;
     if (revision === lastVisualDestructionRevision) return 0;
     lastVisualDestructionRevision = revision;
     if (destroyedStableIds.length === 0) return 0;
@@ -1635,6 +2007,8 @@ export async function bootInfiniteWorldSandbox({
       clock,
       profile: diagnosticProfile,
       enabled: diagnosticsEnabled,
+      mode: deepWebglDiagnosticsEnabled
+        ? 'deep-attribution' : diagnosticsEnabled ? 'light' : 'off',
       runNumber: diagnosticRunNumber,
       environment: {
         viewport: `${measurementViewport?.width ?? globalObject.innerWidth}x${measurementViewport?.height ?? globalObject.innerHeight}`,
@@ -1642,8 +2016,17 @@ export async function bootInfiniteWorldSandbox({
         userAgent: globalObject.navigator?.userAgent ?? 'unknown',
         worldSeed: requestedSeed,
         settlementStreamingMode,
-        diagnosticsMode: diagnosticsEnabled ? 'on' : 'off',
+        diagnosticsMode: deepWebglDiagnosticsEnabled
+          ? 'deep-attribution' : diagnosticsEnabled ? 'light' : 'off',
       },
+      onObserverError: event => runtimeFaultLedger.record({
+        subsystem: event.subsystem ?? 'runtime-diagnostics',
+        stage: event.stage ?? 'observer',
+        error: new Error(`${event.name ?? 'Error'}: ${event.message ?? 'observer failed'}`),
+        action: 'observer-circuit-open',
+        frameSequence: settlementStreamingFrameSequence,
+        quarantine: true,
+      }),
     });
     const diagnosticMeasure = diagnostics.enabled
       ? (stage, operation) => diagnostics.measure(stage, operation)
@@ -1669,21 +2052,23 @@ export async function bootInfiniteWorldSandbox({
       const ownerKey = typeof details.ownerKey === 'string' && details.ownerKey
         ? details.ownerKey : null;
       if (stage && ownerKey) {
-        try {
+        runtimeFaultLedger.runObserver({
+          subsystem: 'visual-continuity-pipeline-observer',
+          stage: type,
+          frameSequence: settlementStreamingFrameSequence,
+          ownerKey,
+        }, () => {
           // Expected coverage owns lifecycle creation. Resource requests—most
           // importantly optional prefetch—must not enlarge the visual
           // denominator or leave immortal normal-URL records behind.
-          if (!visualContinuity.get(ownerKey)) return diagnostics.enabled
-            ? diagnostics.recordEvent(type, details) : null;
+          if (!visualContinuity.get(ownerKey)) return;
           visualContinuity.recordPipelineStage({ ownerKey, stage, at: clock() });
           if (stage === VISUAL_PIPELINE_STAGE.RESOURCE_READY) {
             const representation = details.resourceKind === 'presentation'
               || details.operationKind === 'presentation-owner' ? 'coarse' : 'detail';
             visualContinuity.markRepresentationAvailable({ ownerKey, representation, at: clock() });
           }
-        } catch {
-          // Observability can never become a generation/publication gate.
-        }
+        });
       }
       return diagnostics.enabled ? diagnostics.recordEvent(type, details) : null;
     };
@@ -1905,7 +2290,7 @@ export async function bootInfiniteWorldSandbox({
       }
     };
     const generatorMetadata = await runStage('Legacy Core', async () => {
-      const workerTransport = createWorkerChunkGeneratorTransport({
+      const workerTransport = createFixedLaneWorkerChunkGeneratorTransport({
         worldSeed: requestedSeed,
         ...(settlementRoadGraphGeneratorId ? { settlementRoadGraphGeneratorId } : {}),
         ...(settlementLotMode ? { settlementLotMode } : {}),
@@ -1939,6 +2324,8 @@ export async function bootInfiniteWorldSandbox({
         },
         cancelGenerationRequest: options =>
           workerTransport.cancelGenerationRequest(options),
+        cancelGenerationRequestBySchedulerRequestId: options =>
+          workerTransport.cancelGenerationRequestBySchedulerRequestId(options),
         generatePresentationOwner: request =>
           workerTransport.generatePresentationOwner(request),
         generateCanonicalTreeCell: request =>
@@ -1952,12 +2339,11 @@ export async function bootInfiniteWorldSandbox({
         snapshot: () => workerTransport.snapshot(),
         shutdown: () => workerTransport.shutdown(),
       });
-      ownerGenerationCoordinator = createOwnerGenerationCoordinator({
+      ownerGenerationCoordinator = createFixedLaneOwnerGenerationCoordinator({
         clock,
-        // The coordinator is the sole owner-priority queue. Exactly one owner
-        // crosses the transport boundary at a time; the Worker scheduler is an
-        // execution gate, not a second 25-entry feeder.
-        maximumConcurrentRequests: 1,
+        // Full/future-Full owns the fixed Critical admission lane. Every
+        // Presentation/control resource owns one fixed Background lane.
+        // Neither lane is a configurable pool.
       });
       scheduleSharedWorkerControl = ({
         ownerKey,
@@ -1970,6 +2356,7 @@ export async function bootInfiniteWorldSandbox({
         target,
         stream = WORLD_STREAMING_STREAM.DISTANT,
         correlationId = null,
+        epoch = 0,
         execute,
       }) => {
         const createdAtMs = clock();
@@ -1989,7 +2376,7 @@ export async function bootInfiniteWorldSandbox({
           representationClass,
           subscriberIdentity: `${resourceKind}:${consumerId}:${ownerKey}`,
           consumerId,
-          epoch: 0,
+          epoch,
           correlationId,
           target,
           stream,
@@ -2001,9 +2388,16 @@ export async function bootInfiniteWorldSandbox({
               createdAtMs: execution.envelope.createdAtMs,
               deadlineAtMs: execution.envelope.firstVisibleDeadlineMs,
               consumerId: execution.envelope.consumerId,
+              epoch: execution.envelope.epoch,
               scheduler: execution.envelope,
             });
           },
+          onCancel: (reason, envelope) => (
+            chunkGeneratorTransport.cancelGenerationRequestBySchedulerRequestId({
+              requestId: envelope.requestId,
+              reason,
+            })
+          ),
         });
         return handle.promise;
       };
@@ -2025,7 +2419,7 @@ export async function bootInfiniteWorldSandbox({
           // remain reusable in the evictable Presentation cache.
           cancelGenerationRequest: () => false,
           snapshot: () => workerTransport.snapshot(),
-          // The Full service owns the shared Worker lifetime.
+          // The Full service owns both fixed Worker-lane lifetimes.
           shutdown: () => Promise.resolve(),
         }),
         cacheCapacity: PRESENTATION_OWNER_CACHE_CAPACITY,
@@ -2088,6 +2482,7 @@ export async function bootInfiniteWorldSandbox({
           required: request?.required ?? true,
           representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.DETAIL,
           consumerId: request?.consumerId ?? 'settlement-template',
+          epoch: request?.epoch ?? 0,
           target: WORLD_STREAMING_TARGET.BUILDING,
           correlationId: telemetryOptions.telemetryCorrelationId ?? null,
           execute: schedulerOptions => chunkGeneratorTransport.resolveSettlementPresentationTemplate({
@@ -2114,6 +2509,7 @@ export async function bootInfiniteWorldSandbox({
           required: request?.required ?? true,
           representationClass: WORLD_GENERATION_REPRESENTATION_CLASS.COARSE,
           consumerId: request?.consumerId ?? 'canonical-major-road-owner-query',
+          epoch: request?.epoch ?? 0,
           target: WORLD_STREAMING_TARGET.ROAD,
           correlationId: telemetryOptions.telemetryCorrelationId ?? null,
           execute: schedulerOptions => chunkGeneratorTransport.resolveCanonicalMajorRoadOwnerCoverage({
@@ -2323,7 +2719,19 @@ export async function bootInfiniteWorldSandbox({
         };
       };
       const measuredRenderAdapter = {
-        rebase: origin => diagnostics.measure('chunk-rebase', () => renderAdapter.rebase(origin)),
+        async rebase(origin) {
+          try {
+            return await diagnostics.measureAsync(
+              'chunk-rebase', () => renderAdapter.rebase(origin),
+            );
+          } catch (error) {
+            throw retryableRuntimeTransitionStageFault(
+              error,
+              RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+              'near-rebase',
+            );
+          }
+        },
         async projectChunk(chunkData, origin, options) {
           const startedAt = clock();
           try {
@@ -2338,6 +2746,12 @@ export async function bootInfiniteWorldSandbox({
               sceneAttached: projected?.group?.parent !== null,
             });
             return projected;
+          } catch (error) {
+            throw retryableRuntimeTransitionStageFault(
+              error,
+              RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+              'near-projection',
+            );
           }
           finally { renderProjectionMs += Math.max(0, clock() - startedAt); }
         },
@@ -2345,17 +2759,25 @@ export async function bootInfiniteWorldSandbox({
           renderAdapter.projectTerrainChunk?.(chunkData, origin)
         ),
         loadProjectedTerrain: projected => renderAdapter.loadProjectedTerrain?.(projected),
-        loadProjected: projected => {
-          const result = diagnostics.measure(
-            'chunk-load', () => renderAdapter.loadProjected(projected),
-          );
-          diagnostics.recordEvent('near-terrain-replacement-attached', {
-            ...nearTerrainDiagnosticContext(),
-            ownerKey: projected?.key ?? null,
-            rootName: projected?.group?.name ?? null,
-            sceneAttached: projected?.group?.parent !== null,
-          });
-          return result;
+        async loadProjected(projected) {
+          try {
+            const result = await diagnostics.measureAsync(
+              'chunk-load', () => renderAdapter.loadProjected(projected),
+            );
+            diagnostics.recordEvent('near-terrain-replacement-attached', {
+              ...nearTerrainDiagnosticContext(),
+              ownerKey: projected?.key ?? null,
+              rootName: projected?.group?.name ?? null,
+              sceneAttached: projected?.group?.parent !== null,
+            });
+            return result;
+          } catch (error) {
+            throw retryableRuntimeTransitionStageFault(
+              error,
+              RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+              'near-publication',
+            );
+          }
         },
         unloadChunk: key => {
           diagnostics.recordEvent('near-terrain-old-release-requested', {
@@ -2376,17 +2798,55 @@ export async function bootInfiniteWorldSandbox({
         discardProjected: projected => diagnostics.measure(
           'chunk-discard', () => renderAdapter.discardProjected?.(projected),
         ),
+        beginProjectedPublicationBatch: options => (
+          renderAdapter.beginProjectedPublicationBatch(options)
+        ),
+        commitProjectedPublicationBatch: transaction => (
+          renderAdapter.commitProjectedPublicationBatch(transaction)
+        ),
+        rollbackProjectedPublicationBatch: transaction => (
+          renderAdapter.rollbackProjectedPublicationBatch(transaction)
+        ),
+        finalizeProjectedUploadManifest: (projected, options) => (
+          renderAdapter.finalizeProjectedUploadManifest(projected, options)
+        ),
+        projectedOwnerUploadProof: (ownerKey, receipt, manifest) => (
+          renderAdapter.projectedOwnerUploadProof(ownerKey, receipt, manifest)
+        ),
+        cancelPendingProjectedUploadManifestWaiters: reason => (
+          renderAdapter.cancelPendingProjectedUploadManifestWaiters(reason)
+        ),
         retainTerrainChunk: key => renderAdapter.retainTerrainChunk?.(key),
         unloadProvisionalTerrain: key => renderAdapter.unloadProvisionalTerrain?.(key),
         renderCoverageSnapshot: () => renderAdapter.renderCoverageSnapshot?.() ?? null,
         shutdown: () => renderAdapter.shutdown(),
       };
+      const renderUploadAdmission = renderUploadAdmissionFactory({ clock });
       runtime = runtimeFactory({
         chunkDataService,
         renderAdapter: measuredRenderAdapter,
         cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
         chunkIndex,
         onPipelineEvent: recordPipelineDiagnosticEvent,
+        renderUploadAdmission,
+        stageProjectedUpload: request => {
+          try {
+            return diagnostics.measure('chunk-upload-stage', () => {
+              if (!projectedUploadStager) {
+                projectedUploadStager = projectedUploadStagerFactory({
+                  THREE, renderer, gpuMirror: rendererGpuAttributeState,
+                });
+              }
+              return projectedUploadStager.stage(request);
+            });
+          } catch (error) {
+            throw retryableRuntimeTransitionStageFault(
+              error,
+              RUNTIME_TRANSITION_FAULT_CODE.RETRYABLE_PRESENTATION,
+              'near-upload-staging',
+            );
+          }
+        },
       });
       return {
         logicalPlayer,
@@ -2766,8 +3226,10 @@ export async function bootInfiniteWorldSandbox({
     if (settlementStreamingMode === BUILDING_SETTLEMENT_STREAM_MODE.LEGACY) {
       distantPresentation.useLegacyBuildingSettlementPublication?.();
     }
-    webglRenderDiagnostics = createWebGLRenderDiagnostics({
-      enabled: diagnostics.enabled,
+    webglRenderDiagnostics = webglRenderDiagnosticsFactory({
+      enabled: diagnostics.enabled && deepWebglDiagnosticsEnabled,
+      mode: diagnostics.enabled && deepWebglDiagnosticsEnabled
+        ? 'deep-attribution' : 'off',
       THREE,
       renderer,
       scene,
@@ -2776,6 +3238,14 @@ export async function bootInfiniteWorldSandbox({
       buildIdentity: SANDBOX_RUNTIME_BUILD_IDENTITY,
       clock,
       forceFirstIncident: forceFirstWebGLDiagnosticIncident,
+      onObserverError: event => runtimeFaultLedger.record({
+        subsystem: event.subsystem ?? 'webgl-render-diagnostics',
+        stage: event.stage ?? 'observer',
+        error: new Error(`${event.name ?? 'Error'}: ${event.message ?? 'observer failed'}`),
+        action: 'observer-circuit-open',
+        frameSequence: settlementStreamingFrameSequence,
+        quarantine: true,
+      }),
       publishProof(frame, ringSnapshot) {
         const dataset = globalObject.document?.documentElement?.dataset;
         if (!dataset) return;
@@ -2884,7 +3354,16 @@ export async function bootInfiniteWorldSandbox({
     });
 
     let transitionTargetKey = null;
-    let transitionRetryTimer = null;
+    let transitionTargetToken = null;
+    const transitionLatestTargetQueue = createRuntimeTransitionLatestTargetQueue();
+    const transitionRetryController = createRuntimeTransitionRetryController({
+      setTimeoutFn,
+      clearTimeoutFn,
+      retryDelayMs: 250,
+      maximumAttempts: 3,
+    });
+    let runtimeWorldMutationStopped = false;
+    let runtimeFatalTransitionFault = null;
     const directionalPrefetchPending = new Set();
     let terrainReadyRequestedSignature = null;
     let transitionError = null;
@@ -3257,7 +3736,8 @@ export async function bootInfiniteWorldSandbox({
     }
 
     const isSameCommittedRuntimeState = (workEpoch, runtimeSnapshot) => {
-      if (!running || workEpoch !== postCommitRequestedEpoch) return false;
+      if (!running || runtimeWorldMutationStopped
+        || workEpoch !== postCommitRequestedEpoch) return false;
       const current = runtime.getCommittedChunkState();
       return sameRuntimeTransitionContract(
         current.transitionContract,
@@ -3301,7 +3781,7 @@ export async function bootInfiniteWorldSandbox({
     };
 
     function schedulePostCommitPump(delayMs = 0) {
-      if (postCommitPumpActive || postCommitTimer !== null) return;
+      if (runtimeWorldMutationStopped || postCommitPumpActive || postCommitTimer !== null) return;
       postCommitTimer = setTimeoutFn(() => {
         postCommitTimer = null;
         postCommitPumpActive = true;
@@ -3385,7 +3865,7 @@ export async function bootInfiniteWorldSandbox({
             }
           } finally {
             postCommitPumpActive = false;
-            if (running
+            if (running && !runtimeWorldMutationStopped
               && postCommitCompletedEpoch < postCommitRequestedEpoch) {
               const retryDelayMs = postCommitFailureCount > 0
                 ? Math.min(1_000, 16 * (2 ** Math.min(6, postCommitFailureCount - 1)))
@@ -3398,6 +3878,7 @@ export async function bootInfiniteWorldSandbox({
     }
 
     function schedulePostCommitWork(runtimeSnapshot = runtime.getCommittedChunkState()) {
+      if (runtimeWorldMutationStopped) return;
       const workEpoch = ++postCommitRequestedEpoch;
       postCommitFailureCount = 0;
       if (postCommitTimer !== null) {
@@ -3822,7 +4303,7 @@ export async function bootInfiniteWorldSandbox({
       if (!pending || pending.revision !== renderDistanceRequestRevision
         || pending.preset !== requestedDistantRenderDistance
         || !pending.distantPrepared || !pending.localTerrainPrepared) return false;
-      const streamControl = naturalStaticStream.diagnostics();
+      const streamControl = naturalStaticStream.controlState();
       if (streamControl.missingRequiredOwnerCount > 0
         || !distantPresentation.isStaticNaturalCoverageReady?.(
           pending.requiredNaturalOwnerKeys,
@@ -4124,14 +4605,109 @@ export async function bootInfiniteWorldSandbox({
     addWindowListener('resize', resize);
     addWindowListener('pagehide', handlePageHide);
 
+    const transitionGenerationForRequest = () => {
+      const generation = runtime.getCommittedChunkState?.()?.transitionContract?.generation;
+      return Number.isSafeInteger(generation) && generation >= 0 ? generation + 1 : 0;
+    };
+
+    function enterFatalDegradedRuntime(error, {
+      subsystem = 'runtime-transition',
+      stage = 'transition-fatal',
+      ownerKey = null,
+      generation = null,
+    } = {}) {
+      if (runtimeWorldMutationStopped) return false;
+      runtimeWorldMutationStopped = true;
+      postCommitRequestedEpoch += 1;
+      if (postCommitTimer !== null) {
+        clearTimeoutFn(postCommitTimer);
+        postCommitTimer = null;
+      }
+      transitionError = error;
+      transitionRetryController.haltFatal(error);
+      const classification = classifyRuntimeTransitionFault(error);
+      runtimeFatalTransitionFault = Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        code: classification.code,
+        stage: classification.stage ?? stage,
+        ownerKey,
+        generation: Number.isSafeInteger(generation) ? generation : null,
+      });
+      state.status = 'failed';
+      state.stage = 'Runtime degraded';
+      state.bootError = {
+        name: runtimeFatalTransitionFault.name,
+        message: runtimeFatalTransitionFault.message,
+        stage: state.stage,
+      };
+      renderSandboxBootStatus(hud, state);
+      runtimeFaultLedger.record({
+        subsystem,
+        stage: classification.stage ?? stage,
+        error,
+        action: 'rollback-stop-world-mutation-rAF-retained',
+        frameSequence: settlementStreamingFrameSequence,
+        generation,
+        ownerKey,
+      });
+      runtimeFaultLedger.runObserver({
+        subsystem: 'runtime-fault-cleanup',
+        stage: 'invalidate-pending-presentation',
+        frameSequence: settlementStreamingFrameSequence,
+        generation,
+        ownerKey,
+        action: 'cleanup-quarantined',
+      }, () => {
+        localTerrainCoverageEpoch = Math.max(
+          localTerrainCoverageEpoch,
+          distantPresentation.invalidatePendingLocalTerrainSync?.()
+            ?? localTerrainCoverageEpoch,
+        );
+        distantPresentation.invalidatePendingFarSync?.();
+      });
+      return true;
+    }
+
+    function drainLatestTransitionRequest() {
+      if (runtimeWorldMutationStopped || transitionTargetKey) return false;
+      const playerOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
+      const queued = transitionLatestTargetQueue.consume(playerOwner, {
+        centered: runtime.isCenteredAt(playerOwner.chunkX, playerOwner.chunkZ),
+      });
+      if (!queued) return false;
+      requestTransition(queued.owner, queued.movement, { required: queued.required });
+      return true;
+    }
+
     function requestTransition(owner, movement = null, { required = false } = {}) {
-      if (transitionTargetKey
-        || runtime.isCenteredAt(owner.chunkX, owner.chunkZ)) return;
+      if (runtimeWorldMutationStopped || !owner) return;
+      if (transitionTargetKey) {
+        transitionLatestTargetQueue.queue(owner, movement, {
+          required,
+          activeOwnerKey: transitionTargetKey,
+        });
+        return;
+      }
+      if (runtime.isCenteredAt(owner.chunkX, owner.chunkZ)) {
+        transitionLatestTargetQueue.clear();
+        return;
+      }
+      const generation = transitionGenerationForRequest();
+      const retryToken = transitionRetryController.beginAttempt({
+        ownerKey: owner.key,
+        generation,
+      });
+      if (!retryToken) return;
       transitionTargetKey = owner.key;
+      transitionTargetToken = retryToken;
       if (diagnostics.enabled) diagnostics.recordEvent('chunk-transition-started', {
         ownerKey: owner.key,
         chunkX: owner.chunkX,
         chunkZ: owner.chunkZ,
+        transitionGeneration: generation,
+        retryEpoch: retryToken.epoch,
+        attempt: retryToken.attempt,
         playerLogicalX: logicalPlayer.x,
         playerLogicalZ: logicalPlayer.z,
         speedMetersPerSecond: movement?.speedMetersPerSecond ?? null,
@@ -4168,27 +4744,57 @@ export async function bootInfiniteWorldSandbox({
             },
           );
           await gameplayRebase;
+          transitionError = null;
+          transitionRetryController.succeed(retryToken);
         })
         .catch(error => {
+          if (!running) return;
           transitionError = error;
-          if (runtime.isTerrainCoverageProvisional?.(owner.chunkX, owner.chunkZ)) {
-            if (transitionRetryTimer !== null) clearTimeoutFn(transitionRetryTimer);
-            transitionRetryTimer = setTimeoutFn(() => {
-              transitionRetryTimer = null;
+          const outcome = transitionRetryController.fail(retryToken, error, {
+            onRetry: () => {
               const playerOwner = decomposeLogicalWorldPosition(logicalPlayer.x, logicalPlayer.z);
-              if (playerOwner.key === owner.key
-                && runtime.isTerrainCoverageProvisional?.(owner.chunkX, owner.chunkZ)) {
+              if (playerOwner.key === owner.key && !runtimeWorldMutationStopped) {
                 requestTransition(owner, movement, { required: true });
               }
-            }, 250);
+            },
+          });
+          if (!outcome.accepted || !outcome.terminal) return;
+          if (outcome.classification.kind === 'fatal') {
+            enterFatalDegradedRuntime(error, {
+              stage: outcome.classification.stage ?? 'transition-fatal',
+              ownerKey: owner.key,
+              generation,
+            });
+            return;
           }
+          runtimeFaultLedger.record({
+            subsystem: 'runtime-transition',
+            stage: outcome.classification.stage ?? 'transition-retry-exhausted',
+            error,
+            action: 'retain-last-known-good-retry-exhausted',
+            frameSequence: settlementStreamingFrameSequence,
+            generation,
+            ownerKey: owner.key,
+          });
         })
-        .finally(() => { transitionTargetKey = null; });
+        .finally(() => {
+          if (transitionTargetToken !== retryToken) return;
+          transitionTargetKey = null;
+          transitionTargetToken = null;
+          drainLatestTransitionRequest();
+        });
     }
 
     function requestPlayerTerrainCoverage(owner, movement = null) {
       if (!owner || (transitionTargetKey && transitionTargetKey !== owner.key)) return;
-      if (transitionTargetKey !== owner.key && !directionalPrefetchPending.has(owner.key)) {
+      const generation = transitionGenerationForRequest();
+      const retrySuppressed = transitionRetryController.suppressesIdentity({
+        ownerKey: owner.key,
+        generation,
+      });
+      if (!retrySuppressed
+        && transitionTargetKey !== owner.key
+        && !directionalPrefetchPending.has(owner.key)) {
         if (diagnostics.enabled) diagnostics.recordEvent('terrain-fallback-prefetch-requested', {
           ownerKey: owner.key,
           chunkX: owner.chunkX,
@@ -4464,11 +5070,8 @@ export async function bootInfiniteWorldSandbox({
         () => readSettlementStreamingObservation(requestedDistantRenderDistance),
       );
       latestSettlementStreamingObservation = settlementStreamingObservation;
-      const destructionRevision = [...(worldState.featureDamage?.entries?.() ?? [])]
-        .filter(([, value]) => value?.destroyed === true)
-        .map(([stableId]) => stableId)
-        .sort((left, right) => left.localeCompare(right))
-        .join('\n');
+      const destructionSnapshot = worldState.featureDestructionSnapshot();
+      const destructionRevision = destructionSnapshot.signature;
       const publicationContext = worldStreamingCoordinator.createPublicationContext({
         generatedAtMs: clock(),
         stateRevision: worldState.revision,
@@ -4726,7 +5329,7 @@ export async function bootInfiniteWorldSandbox({
           visualContinuity.pruneRetired({ maximumRecords: 4096 });
           recordStaticTreeActivationTime('firstStaticPlanAppliedAtMs');
         } else naturalStaticStream.updatePublicationContext(publicationContext);
-        const streamControl = naturalStaticStream.diagnostics();
+        const streamControl = naturalStaticStream.controlState();
         if (coverageNeedsApply) {
           latestNaturalCoverageState = Object.freeze({
             ...latestNaturalCoverageState,
@@ -4790,15 +5393,18 @@ export async function bootInfiniteWorldSandbox({
             // remains useful to the resource cache, but must not reopen or
             // resolve the retired visual lifecycle.
             if (!visualOwner || visualOwner.state === 'Retiring') continue;
-            try {
+            runtimeFaultLedger.runObserver({
+              subsystem: 'visual-continuity-work-observer',
+              stage: 'visual-work-start',
+              frameSequence: settlementStreamingFrameSequence,
+              ownerKey: page.ownerKey,
+            }, () => {
               visualContinuity.recordPipelineStage({
                 ownerKey: page.ownerKey,
                 stage: VISUAL_PIPELINE_STAGE.VISUAL_WORK_START,
                 at: clock(),
               });
-            } catch {
-              // Visual timing observation cannot stop publication.
-            }
+            });
           }
           if (coverageNeedsApply) {
             distantPresentation.applyStaticNaturalPlan?.({
@@ -4993,17 +5599,49 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     }
 
     function failRuntimeLoop(error) {
-      running = false;
-      localTerrainCoverageEpoch = Math.max(
-        localTerrainCoverageEpoch,
-        distantPresentation.invalidatePendingLocalTerrainSync?.()
-          ?? localTerrainCoverageEpoch,
-      );
-      distantPresentation.invalidatePendingFarSync?.();
+      // Establish the terminal world-mutation state before invoking any
+      // cleanup/observer hook.  The frame supervisor keeps one rAF pending so
+      // this error state remains inspectable even if secondary cleanup fails.
+      if (!runtimeWorldMutationStopped) postCommitRequestedEpoch += 1;
+      runtimeWorldMutationStopped = true;
+      if (postCommitTimer !== null) {
+        clearTimeoutFn(postCommitTimer);
+        postCommitTimer = null;
+      }
+      transitionRetryController.haltFatal(error);
+      const classification = classifyRuntimeTransitionFault(error);
+      runtimeFatalTransitionFault ??= Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        code: classification.code,
+        stage: classification.stage ?? runtimeFrameStage,
+        ownerKey: transitionTargetKey,
+        generation: transitionTargetToken?.generation ?? null,
+      });
       state.status = 'failed';
       state.stage = 'Animation Loop';
       state.bootError = { name: error?.name ?? 'Error', message: error?.message ?? String(error), stage: state.stage };
       renderSandboxBootStatus(hud, state);
+      runtimeFaultLedger.record({
+        subsystem: 'runtime-frame',
+        stage: runtimeFrameStage,
+        error,
+        action: 'fatal-overlay-rAF-retained',
+        frameSequence: settlementStreamingFrameSequence,
+      });
+      runtimeFaultLedger.runObserver({
+        subsystem: 'runtime-fault-cleanup',
+        stage: 'invalidate-pending-presentation',
+        frameSequence: settlementStreamingFrameSequence,
+        action: 'cleanup-quarantined',
+      }, () => {
+        localTerrainCoverageEpoch = Math.max(
+          localTerrainCoverageEpoch,
+          distantPresentation.invalidatePendingLocalTerrainSync?.()
+            ?? localTerrainCoverageEpoch,
+        );
+        distantPresentation.invalidatePendingFarSync?.();
+      });
     }
 
     function updateScenePresentation(deltaSeconds, frameNow, cloudDeltaSeconds, renderOrigin) {
@@ -5197,16 +5835,22 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           );
         }
         let webglCapture = null;
-        if (webglRenderDiagnostics?.enabled) {
+        if (webglRenderDiagnostics?.enabled
+          && !runtimeFaultLedger.isQuarantined('webgl-render-diagnostics')) {
           const runtimeState = runtime.getCommittedChunkState();
-          webglCapture = webglRenderDiagnostics.beginFrame({
+          webglCapture = runtimeFaultLedger.runObserver({
+            subsystem: 'webgl-render-diagnostics',
+            stage: 'begin-frame',
             frameSequence: settlementStreamingFrameSequence,
-            transitionGeneration: runtimeState.transitionContract?.generation ?? null,
-            renderOriginRevision: runtimeState.renderOrigin?.rebaseCount ?? null,
-            playerLogicalPosition: Object.freeze({ x: logicalPlayer.x, z: logicalPlayer.z }),
-            currentOwnerKey: `${runtimeState.centerChunkX},${runtimeState.centerChunkZ}`,
-            worldExpected: !titleActive && runtimeState.renderedKeys.length > 0,
-          });
+          }, () => webglRenderDiagnostics.beginFrame({
+              frameSequence: settlementStreamingFrameSequence,
+              transitionGeneration: runtimeState.transitionContract?.generation ?? null,
+              renderOriginRevision: runtimeState.renderOrigin?.rebaseCount ?? null,
+              playerLogicalPosition: Object.freeze({ x: logicalPlayer.x, z: logicalPlayer.z }),
+              currentOwnerKey: `${runtimeState.centerChunkX},${runtimeState.centerChunkZ}`,
+              worldExpected: !titleActive && runtimeState.renderedKeys.length > 0,
+              hitch: latestFrameDurationMs > 50,
+            }), null);
         }
         const visualFrameToken = renderFrameAcknowledger.beginFrame({
           frameSequence: ++completedRenderFrameSequence,
@@ -5214,12 +5858,15 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         });
         let completedRenderReceipt = null;
         try {
+          renderAdapter.beginProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
           renderer.render(scene, camera);
+          renderAdapter.completeProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
           completedRenderReceipt = renderFrameAcknowledger.completeFrame(
             visualFrameToken,
             { scene, renderer },
           );
         } catch (error) {
+          renderAdapter.abortProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
           renderFrameAcknowledger.abortFrame(visualFrameToken);
           throw error;
         } finally {
@@ -5227,9 +5874,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             try {
               webglRenderDiagnostics.finishFrame(webglCapture);
             } catch (error) {
-              diagnostics.recordEvent('webgl-render-diagnostic-failed', {
-                name: error?.name ?? 'Error',
-                message: error?.message ?? String(error),
+              runtimeFaultLedger.record({
+                subsystem: 'webgl-render-diagnostics',
+                stage: 'finish-frame',
+                error,
+                action: 'observer-quarantined',
+                frameSequence: settlementStreamingFrameSequence,
+                quarantine: true,
               });
             }
           }
@@ -5263,15 +5914,28 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
               } : null,
             },
           });
-        } catch {
-          // Lifecycle observation cannot invalidate an otherwise valid frame.
+        } catch (error) {
+          // Preserve the previous presenter set. A failed observation must be
+          // visible in diagnostics without invalidating an otherwise valid draw.
+          runtimeFaultLedger.record({
+            subsystem: 'visual-continuity-receipt',
+            stage: 'acknowledge-scene',
+            error,
+            action: 'retain-last-known-good',
+            frameSequence: settlementStreamingFrameSequence,
+          });
         }
+        runtime.acknowledgeRenderReceipt?.(completedRenderReceipt);
         if (staticTreeActivationTimeline.firstPersistentTreePublishAtMs !== null
           && actualDrawableCount > 0) {
           recordStaticTreeActivationTime('firstPersistentTreeDrawAtMs');
         }
         if (titleActive) scheduleRendererProgramWarmup();
-        recordOriginTransformDiagnosticFrame();
+        runtimeFaultLedger.runObserver({
+          subsystem: 'origin-transform-diagnostics',
+          stage: 'record-frame',
+          frameSequence: settlementStreamingFrameSequence,
+        }, recordOriginTransformDiagnosticFrame);
       });
     }
 
@@ -5283,6 +5947,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     function frame(now) {
       if (!running) return;
       try {
+        runtimeFrameStage = 'frame-start';
         settlementStreamingFrameSequence += 1;
         streamingOwnerMetadataCache?.beginFrame(settlementStreamingFrameSequence);
         const frameNow = Number.isFinite(now) ? now : clock();
@@ -5291,6 +5956,18 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         if (diagnosticFrameStarted) diagnostics.finishFrame(rawFrameMs, frameNow);
         diagnostics.startFrame(frameNow);
         diagnosticFrameStarted = diagnostics.enabled;
+        lastFrameAt = frameNow;
+        if (runtimeWorldMutationStopped) {
+          // A canonical/runtime invariant freezes world mutation after the
+          // transition transaction has rolled back. Keep rendering the last
+          // known-good scene and the DOM error overlay without acknowledging
+          // receipts or releasing any retained ownership.
+          runtimeFrameStage = 'fatal-degraded-render';
+          renderer.render(scene, camera);
+          runtimeFrameStage = 'idle';
+          return;
+        }
+        runtimeFrameStage = 'terrain-presentation-scheduler';
         const terrainSchedulerFrame = distantPresentation
           .pumpTerrainPresentationScheduler?.() ?? null;
         if (diagnostics.enabled && terrainSchedulerFrame) {
@@ -5303,7 +5980,6 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           });
         }
         const deltaSeconds = Math.min(rawFrameMs / 1000, 0.05);
-        lastFrameAt = frameNow;
         if (measurement.protocolStartedAt === null) measurement.protocolStartedAt = frameNow;
         const measurementElapsed = frameNow - measurement.protocolStartedAt;
         if (measurement.mode && measurement.status === 'warmup'
@@ -5362,6 +6038,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           hitStopped,
         });
         const frameRenderOrigin = runtime.getRenderOrigin();
+        runtimeFrameStage = 'scene-presentation';
         diagnostics.measure('scene-presentation', () => updateScenePresentation(
           deltaSeconds,
           frameNow,
@@ -5369,16 +6046,19 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           frameRenderOrigin,
         ));
         if (playerRelocationInProgress) {
+          runtimeFrameStage = 'relocation-render';
           renderActiveScene();
           sealDiagnosticFrame();
           recordTerrainLagSpikeFrame({ frameNow, rawFrameMs, schedulerFrame: terrainSchedulerFrame });
-          animationFrameId = requestAnimationFrameFn(frame);
+          runtimeFrameStage = 'idle';
           return;
         }
+        runtimeFrameStage = 'player-update';
         const owner = diagnostics.measure(
           'player-update',
           () => updatePlayer(effectiveDeltaSeconds, frameRenderOrigin, deltaSeconds),
         );
+        runtimeFrameStage = 'gameplay-update';
         diagnostics.measure('gameplay-update', () => gameplay.update({
             deltaSeconds: effectiveDeltaSeconds,
             player: logicalPlayer,
@@ -5393,12 +6073,14 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         // Destruction changes the immutable coarse requirement domain; it is
         // not a substitute for a renderer receipt. Synchronize it before W8
         // hides the destroyed slot so an Expected owner cannot be stranded.
+        runtimeFrameStage = 'visual-destruction-sync';
         diagnostics.measure('visual-destruction-sync', () => (
           synchronizeDestroyedVisualRequirements()
         ));
         // Gameplay owns feature damage. Refresh every canonical distant tier
         // after simulation so a Tree destroyed this frame cannot survive for
         // one extra rendered frame as a Forest/Horizon silhouette.
+        runtimeFrameStage = 'distant-update';
         diagnostics.measure('distant-update', () => distantPresentation.update(
           logicalPlayer.x,
           logicalPlayer.z,
@@ -5408,11 +6090,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
             velocityZ: latestDistantVelocityZ,
           },
         ));
+        runtimeFrameStage = 'render-distance-publication';
         diagnostics.measure('render-distance-publication', () => (
           tryCommitRenderDistancePublication()
         ));
         recordDistantTreeVisibility();
         if (runStarted && worldState.revision !== lastSavedRevision) scheduleSave();
+        runtimeFrameStage = 'presentation-effects';
         const presentation = diagnostics.measure(
           'presentation-effects', () => gameplay.consumePresentationEffects(),
         );
@@ -5421,24 +6105,40 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
         }
         gameplayRenderAdapter.consumePresentationEvents?.(presentation.events, { playerMarker });
         audioDirector.consume(presentation.events);
+        runtimeFrameStage = 'render';
         renderActiveScene();
+        runtimeFrameStage = 'player-arrival';
         recordPlayerArrival(owner, frameNow);
-        if (frameNow - lastHudAt > 120) {
-          diagnostics.measure('hud', () => updateHud(owner));
+        const performanceCaptureActive = measurement.status === 'sampling'
+          || globalObject.__KANI_PERFORMANCE_CAPTURE_ACTIVE === true;
+        if (!performanceCaptureActive && frameNow - lastHudAt >= 1_000) {
+          runtimeFrameStage = 'hud';
+          diagnostics.measure('hud', () => runtimeFaultLedger.runObserver({
+            subsystem: 'runtime-hud',
+            stage: 'update',
+            frameSequence: settlementStreamingFrameSequence,
+          }, () => updateHud(owner)));
           lastHudAt = frameNow;
         }
+        runtimeFrameStage = 'diagnostic-frame-seal';
         sealDiagnosticFrame();
+        runtimeFrameStage = 'terrain-lag-observation';
         recordTerrainLagSpikeFrame({ frameNow, rawFrameMs, schedulerFrame: terrainSchedulerFrame });
-        animationFrameId = requestAnimationFrameFn(frame);
+        runtimeFrameStage = 'idle';
       } catch (error) {
-        if (diagnostics.enabled) {
+        runtimeFaultLedger.runObserver({
+          subsystem: 'runtime-diagnostics',
+          stage: 'frame-failed',
+          frameSequence: settlementStreamingFrameSequence,
+        }, () => {
+          if (!diagnostics.enabled) return;
           diagnostics.recordEvent('runtime-frame-failed', {
             name: error?.name ?? 'Error',
             message: error?.message ?? String(error),
           });
           sealDiagnosticFrame();
-        }
-        failRuntimeLoop(error);
+        });
+        throw error;
       }
     }
 
@@ -5452,23 +6152,30 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       state.stage = 'Ready';
       state.bootCompletedAt = clock();
       state.bootDurationMs = state.bootCompletedAt - state.bootStartedAt;
-      updateHud(owner);
+      runtimeFaultLedger.runObserver({
+        subsystem: 'runtime-hud',
+        stage: 'initial-update',
+        frameSequence: settlementStreamingFrameSequence,
+      }, () => updateHud(owner));
     });
 
-    animationFrameId = requestAnimationFrameFn(frame);
+    frameSupervisor = createRuntimeFrameSupervisor({
+      requestAnimationFrame: requestAnimationFrameFn,
+      cancelAnimationFrame: cancelAnimationFrameFn,
+      onFrame: frame,
+      onFault: failRuntimeLoop,
+    });
+    frameSupervisor.start();
     state.loopStarted = true;
 
     async function shutdown() {
       if (!running && runtime?.snapshot().activeDataCount === 0) return;
       running = false;
+      frameSupervisor?.stop();
       distantPresentation.invalidatePendingLocalTerrainSync?.();
       distantPresentation.invalidatePendingFarSync?.();
-      if (animationFrameId !== null) cancelAnimationFrameFn(animationFrameId);
       if (postCommitTimer !== null) { clearTimeoutFn(postCommitTimer); postCommitTimer = null; }
-      if (transitionRetryTimer !== null) {
-        clearTimeoutFn(transitionRetryTimer);
-        transitionRetryTimer = null;
-      }
+      transitionRetryController.shutdown();
       if (rendererProgramWarmupTimer !== null) {
         clearTimeoutFn(rendererProgramWarmupTimer);
         rendererProgramWarmupTimer = null;
@@ -5482,7 +6189,12 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       streamingTelemetry.dispose();
       await audioDirector.dispose();
       await gameplay.shutdown();
-      await runtime.shutdown();
+      // The runtime rejects/drains every staged publication before its
+      // private render target can be disposed.
+      await shutdownRuntimeBeforeProjectedUploadStager({
+        runtime,
+        projectedUploadStager,
+      });
       distantPresentation.dispose();
       await naturalStaticStream.dispose();
       canonicalTreeOwnerViewBroker.dispose();
@@ -5553,6 +6265,14 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
           );
         return {
           boot: snapshotSandboxBootState(state),
+          frameSupervisor: frameSupervisor?.snapshot() ?? null,
+          runtimeFaults: runtimeFaultLedger.snapshot(),
+          runtimeTransitionFault: Object.freeze({
+            mutationStopped: runtimeWorldMutationStopped,
+            fatal: runtimeFatalTransitionFault,
+            retry: transitionRetryController.snapshot(),
+            coalescing: transitionLatestTargetQueue.snapshot(transitionTargetKey),
+          }),
           runtime: runtimeSnapshot,
           resources: renderAdapter.resourceSnapshot(),
           generator: generator.snapshot(),
@@ -5724,8 +6444,11 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
     try {
       if (gameplay) await gameplay.shutdown();
       experienceShell?.dispose?.();
-      if (runtime && state.stage !== 'Terrain') await runtime.shutdown();
-      else if (renderAdapter && !runtime) await renderAdapter.shutdown();
+      await shutdownRuntimeBeforeProjectedUploadStager({
+        runtime,
+        renderAdapter,
+        projectedUploadStager,
+      });
       distantPresentation?.dispose?.();
       await naturalStaticStream?.dispose?.();
       canonicalTreeOwnerViewBroker?.dispose?.();
@@ -5739,8 +6462,13 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
       diagnostics?.dispose?.();
       renderer?.dispose?.();
       renderer?.domElement?.remove?.();
-    } catch {
-      // The original boot error remains authoritative.
+    } catch (cleanupError) {
+      runtimeFaultLedger.record({
+        subsystem: 'sandbox-boot-cleanup',
+        stage: state.stage ?? 'boot-failure',
+        error: cleanupError,
+        action: 'cleanup-failed-original-error-preserved',
+      });
     }
     throw error;
   }

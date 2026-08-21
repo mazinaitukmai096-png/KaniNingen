@@ -365,18 +365,17 @@ export function planRuntimeTerrainReadySet({
     return lastResidentReadyPlan;
   }
   const residentKeySet = new Set(residentCoordinates.map(value => value.key));
-  const futureResidentCoverage = residentCoverage !== null
+  const futureFullCoordinates = residentCoverage !== null
     && endpoint.key !== residentCoverage.centerOwnerKey
-    ? createResidentWorldCoverage({
-      centerChunkX: endpoint.chunkX,
-      centerChunkZ: endpoint.chunkZ,
-      renderDistancePreset: residentCoverage.renderDistancePreset,
-      radiusMeters: residentCoverage.radiusMeters,
-    })
+    ? collectResidentCoordinates(
+      endpoint.chunkX,
+      endpoint.chunkZ,
+      Math.min(FULL_RESIDENT_RADIUS_METERS, residentCoverage.radiusMeters),
+    )
     : null;
-  const velocityPrefetchCoordinates = futureResidentCoverage === null
+  const velocityPrefetchCoordinates = futureFullCoordinates === null
     ? Object.freeze([])
-    : Object.freeze(futureResidentCoverage.fullView.ownerCoordinates.filter(
+    : Object.freeze(futureFullCoordinates.filter(
       coordinate => !residentKeySet.has(coordinate.key),
     ));
   const dataByKey = new Map();

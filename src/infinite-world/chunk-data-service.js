@@ -299,11 +299,13 @@ export class ChunkDataService {
         entryState: entry.state,
         backlog: this.coordinator.backlog,
       });
-      if (entry.coordinatorHandle?.state === 'queued' && priority < entry.priority) {
+      if ((entry.coordinatorHandle?.state === 'queued'
+        || entry.coordinatorHandle?.state === 'in-flight') && priority < entry.priority) {
         entry.priority = priority;
         this.counts.priorityPromotions += 1;
       }
-      if (entry.coordinatorHandle?.state === 'queued') {
+      if (entry.coordinatorHandle?.state === 'queued'
+        || entry.coordinatorHandle?.state === 'in-flight') {
         entry.required ||= required;
         if (deadlineAtMs !== null
           && (entry.deadlineAtMs === null || deadlineAtMs < entry.deadlineAtMs)) {
@@ -345,7 +347,8 @@ export class ChunkDataService {
         this.counts.maximumBacklog,
         this.coordinator.backlog,
       );
-    } else if (entry.coordinatorHandle?.state === 'queued') {
+    } else if (entry.coordinatorHandle?.state === 'queued'
+      || entry.coordinatorHandle?.state === 'in-flight') {
       entry.coordinatorHandle.update({
         priority: entry.priority,
         priorityClass: defaultOwnerGenerationPriorityClass({
@@ -486,6 +489,7 @@ export class ChunkDataService {
       promise,
       cancel: () => this.#cancelSubscriber(entry, subscriber),
       cancelWithDetails: () => this.#cancelSubscriberDetailed(entry, subscriber),
+      promote: options => this.#promoteSubscriberRequest(entry, subscriber, options),
     });
   }
 
@@ -500,8 +504,56 @@ export class ChunkDataService {
         underlyingRequestCancelled: false,
         workerCancelRequested: false,
       }),
+      promote: () => false,
       promise: Promise.resolve(null),
     });
+  }
+
+  #promoteSubscriberRequest(entry, subscriber, {
+    priority = entry.priority,
+    required = entry.required,
+    deadlineAtMs = entry.deadlineAtMs,
+  } = {}) {
+    assertChunkDataPriority(priority);
+    if (typeof required !== 'boolean') throw new TypeError('required must be boolean');
+    if (deadlineAtMs !== null && !Number.isFinite(deadlineAtMs)) {
+      throw new TypeError('deadlineAtMs must be finite or null');
+    }
+    if (subscriber.cancelled || !entry.subscribers.has(subscriber.id)
+      || entry.cancelRequested
+      || (entry.coordinatorHandle?.state !== 'queued'
+        && entry.coordinatorHandle?.state !== 'in-flight')) return false;
+
+    const promotedPriority = Math.min(entry.priority, priority);
+    const promotedRequired = entry.required || required;
+    const promotedDeadlineAtMs = deadlineAtMs === null
+      ? entry.deadlineAtMs
+      : entry.deadlineAtMs === null
+        ? deadlineAtMs : Math.min(entry.deadlineAtMs, deadlineAtMs);
+    const changed = promotedPriority !== entry.priority
+      || promotedRequired !== entry.required
+      || promotedDeadlineAtMs !== entry.deadlineAtMs;
+    if (!changed) return true;
+
+    const updated = entry.coordinatorHandle.update({
+      priority: promotedPriority,
+      priorityClass: defaultOwnerGenerationPriorityClass({
+        resourceKind: this.resourceKind,
+        priority: promotedPriority,
+        required: promotedRequired,
+        firstVisibleDeadlineMs: promotedDeadlineAtMs,
+      }),
+      required: promotedRequired,
+      firstVisibleDeadlineMs: promotedDeadlineAtMs,
+      representationClass: this.representationClass,
+    });
+    if (!updated) return false;
+    if (promotedPriority < entry.priority) this.counts.priorityPromotions += 1;
+    entry.priority = promotedPriority;
+    entry.required = promotedRequired;
+    entry.deadlineAtMs = promotedDeadlineAtMs;
+    entry.scheduler = entry.coordinatorHandle.envelope;
+    return true;
   }
 
   #cancelSubscriberDetailed(entry, subscriber) {

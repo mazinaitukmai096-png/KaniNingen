@@ -19,11 +19,20 @@ import {
   resolvePresentationResidentRadiusMeters,
   planRuntimeTerrainReadySet,
 } from '../src/infinite-world/chunk-streaming-plan.js';
+import {
+  LOGICAL_CHUNK_SIZE_METERS,
+  logicalWorldToOwnedChunk,
+  squareChunkCoordinates,
+} from '../src/infinite-world/chunk-coordinates.js';
 import { ChunkDataService } from '../src/infinite-world/chunk-data-service.js';
 import { ChunkRuntimeManager } from '../src/infinite-world/chunk-runtime-manager.js';
+import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 import { createNodeChunkGeneratorWorker } from '../src/infinite-world/node-worker-chunk-generator-adapter.js';
 import { createWorkerChunkGeneratorTransport } from '../src/infinite-world/worker-chunk-generator-transport.js';
 import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
+import {
+  createFixedLaneOwnerGenerationCoordinator,
+} from '../src/infinite-world/owner-generation-coordinator.js';
 import {
   createCircularStaticStreamingPolicy,
   STATIC_OBJECT_STREAM_VELOCITY_PREFETCH,
@@ -159,6 +168,75 @@ test('Resident World is one 360-degree player-Chunk set independent of camera an
   const firstPlan = planRuntimeTerrainReadySet(repeatedInput);
   const sameChunkPlan = planRuntimeTerrainReadySet({ ...repeatedInput, logicalX: 9 });
   assert.strictEqual(sameChunkPlan, firstPlan);
+});
+
+test('direct future Full footprint is exactly equivalent to materialized Presentation coverage', t => {
+  const speed = getW6ScaleProfile('MAX').sprintMetersPerSecond;
+  const cases = [
+    { centerChunkX: 0, centerChunkZ: 0, velocityX: speed, velocityZ: 0 },
+    { centerChunkX: -7, centerChunkZ: 5, velocityX: 0, velocityZ: -speed },
+    {
+      centerChunkX: 11,
+      centerChunkZ: -9,
+      velocityX: -speed / Math.SQRT2,
+      velocityZ: speed / Math.SQRT2,
+    },
+  ];
+  const timings = [];
+  for (const renderDistancePreset of ['short', 'standard', 'current']) {
+    for (const fixture of cases) {
+      const coverage = createResidentWorldCoverage({
+        centerChunkX: fixture.centerChunkX,
+        centerChunkZ: fixture.centerChunkZ,
+        renderDistancePreset,
+      });
+      const startedAt = performance.now();
+      const planned = planRuntimeTerrainReadySet({
+        ...fixture,
+        logicalX: fixture.centerChunkX * 16 + 8,
+        logicalZ: fixture.centerChunkZ * 16 + 8,
+        speedMetersPerSecond: speed,
+        scaleStageId: 'MAX',
+        sprint: true,
+        residentCoverage: coverage,
+      });
+      timings.push(performance.now() - startedAt);
+      const endpoint = planned.corridorCenters.at(-1);
+      const materializedOracle = createResidentWorldCoverage({
+        centerChunkX: endpoint.chunkX,
+        centerChunkZ: endpoint.chunkZ,
+        renderDistancePreset,
+        radiusMeters: coverage.radiusMeters,
+      });
+      const expectedKeys = new Set([
+        ...coverage.fullView.ownerKeys,
+        ...materializedOracle.fullView.ownerKeys,
+      ]);
+      for (const center of planned.corridorCenters) {
+        for (const coordinate of squareChunkCoordinates(center.chunkX, center.chunkZ, 2)) {
+          expectedKeys.add(coordinate.key);
+        }
+      }
+      assert.deepEqual(
+        planned.dataCoordinates.map(coordinate => coordinate.key).sort(),
+        [...expectedKeys].sort(),
+        `${renderDistancePreset}:${fixture.centerChunkX},${fixture.centerChunkZ}`,
+      );
+      assert.deepEqual(
+        planned.velocityPrefetchOwnerKeys,
+        planned.dataCoordinates
+          .filter(coordinate => coordinate.residentRequired === false)
+          .map(coordinate => coordinate.key),
+      );
+      assert.equal(planned.residentFullOwnerKeys, coverage.fullView.ownerKeys,
+        'the canonical current Full owner identity must be retained');
+    }
+  }
+  t.diagnostic(JSON.stringify({
+    samples: timings.length,
+    maximumPlanMs: Math.max(...timings),
+    averagePlanMs: timings.reduce((sum, value) => sum + value, 0) / timings.length,
+  }));
 });
 
 test('Resident master coverage scales Presentation by preset while Full remains 100m', t => {
@@ -327,6 +405,265 @@ test('Resident overlap update requests only the straight/diagonal entering diffe
   }));
   await runtime.shutdown();
   await chunkDataService.shutdown();
+});
+
+test('latest Player 3x3 bypasses an in-flight outer Resident Full background fill', async () => {
+  const source = await createSandboxChunkGenerator({
+    worldSeed: 'resident-latest-spatial-demand-priority',
+  });
+  let heldOptional = null;
+  let notifyOptionalStarted;
+  const optionalStarted = new Promise(resolve => { notifyOptionalStarted = resolve; });
+  const requests = [];
+  const transport = {
+    initialize: async () => Object.freeze({
+      worldSeed: source.worldSeed,
+      worldSeedHash: source.worldSeedHash,
+      generatorVersion: source.generatorVersion,
+      experienceSpawn: source.experienceSpawn,
+      reviewSpawn: source.reviewSpawn,
+    }),
+    generateChunk: request => {
+      requests.push(Object.freeze({
+        key: `${request.chunkX},${request.chunkZ}`,
+        priority: request.priority,
+        required: request.required,
+        deadlineAtMs: request.deadlineAtMs,
+      }));
+      if (request.required === false && heldOptional === null) {
+        let resolveHeld;
+        const promise = new Promise(resolve => { resolveHeld = resolve; });
+        heldOptional = {
+          requestId: request.requestId,
+          key: `${request.chunkX},${request.chunkZ}`,
+          resolve: value => resolveHeld(value),
+        };
+        notifyOptionalStarted(heldOptional);
+        return promise;
+      }
+      return source.generateChunk(request.chunkX, request.chunkZ);
+    },
+    cancelGenerationRequest: ({ requestId }) => {
+      if (requestId !== heldOptional?.requestId) return false;
+      heldOptional.resolve(null);
+      return true;
+    },
+    snapshot: () => Object.freeze({ kind: 'resident-latest-demand-priority-fixture' }),
+    shutdown: async () => { heldOptional?.resolve(null); },
+  };
+  const coordinator = createFixedLaneOwnerGenerationCoordinator();
+  const chunkDataService = new ChunkDataService({
+    transport,
+    cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+    coordinator,
+  });
+  await chunkDataService.initialize();
+  const runtime = new ChunkRuntimeManager({
+    chunkDataService,
+    renderAdapter: new ResidentAdapter(),
+    cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+    yieldToHost: () => Promise.resolve(),
+  });
+  await runtime.initialize(0, 0);
+
+  const firstCoverage = createResidentWorldCoverage({ centerChunkX: 0, centerChunkZ: 0 });
+  const firstPlan = planRuntimeTerrainReadySet({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+    logicalX: 8,
+    logicalZ: 8,
+    velocityX: 0,
+    velocityZ: 0,
+    speedMetersPerSecond: 0,
+    scaleStageId: 'MAX',
+    sprint: false,
+    residentCoverage: firstCoverage,
+  });
+  const firstReady = runtime.updateTerrainReadySet(firstPlan);
+  firstReady.catch(() => {});
+  let optionalTimeoutId = null;
+  const held = await Promise.race([
+    optionalStarted,
+    new Promise(resolve => {
+      optionalTimeoutId = setTimeout(() => resolve(null), 2_000);
+    }),
+  ]);
+  if (optionalTimeoutId !== null) clearTimeout(optionalTimeoutId);
+  assert.ok(held, 'outer Resident fill must enter the optional Full lane');
+  const heldRequest = requests.find(request => request.key === held.key);
+  assert.equal(heldRequest?.required, false,
+    'outer 100m Resident fill must be optional scheduler work');
+  assert.equal(heldRequest?.deadlineAtMs, null,
+    'outer Resident fill must not inherit a first-visible deadline');
+
+  const secondCoverage = createResidentWorldCoverage({ centerChunkX: 1, centerChunkZ: 0 });
+  const speed = getW6ScaleProfile('MAX').sprintMetersPerSecond;
+  const secondPlan = planRuntimeTerrainReadySet({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+    logicalX: 24,
+    logicalZ: 8,
+    velocityX: speed,
+    velocityZ: 0,
+    speedMetersPerSecond: speed,
+    scaleStageId: 'MAX',
+    sprint: true,
+    residentCoverage: secondCoverage,
+  });
+  const secondReady = runtime.updateTerrainReadySet(secondPlan);
+  secondReady.catch(() => {});
+
+  let caughtUp = false;
+  for (let turn = 0; turn < 4_000; turn += 1) {
+    const sliding = runtime.snapshot().presentationSliding;
+    if (sliding.publishedKeys.includes('2,0')) {
+      caughtUp = true;
+      break;
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(caughtUp, true,
+    'latest Player-side owner must publish while an outer Resident fill remains in flight');
+  const duringHold = runtime.snapshot();
+  assert.equal(duringHold.presentationSliding.target.key, '1,0');
+  assert.ok(duringHold.presentationSliding.publishedKeys.includes('2,0'));
+  assert.equal(duringHold.centerChunkX, 0,
+    'continuous presentation must not depend on compatibility center commit');
+
+  heldOptional.resolve(null);
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+  await coordinator.shutdown();
+  await source.shutdown?.();
+});
+
+test('latest Player 3x3 bypasses stale compatibility transition preparation', async () => {
+  const source = await createSandboxChunkGenerator({
+    worldSeed: 'resident-compatibility-transition-background-priority',
+  });
+  let holdCompatibility = false;
+  let heldCompatibility = null;
+  let notifyCompatibilityStarted;
+  const compatibilityStarted = new Promise(resolve => { notifyCompatibilityStarted = resolve; });
+  const requests = [];
+  const transport = {
+    initialize: async () => Object.freeze({
+      worldSeed: source.worldSeed,
+      worldSeedHash: source.worldSeedHash,
+      generatorVersion: source.generatorVersion,
+      experienceSpawn: source.experienceSpawn,
+      reviewSpawn: source.reviewSpawn,
+    }),
+    generateChunk: request => {
+      requests.push(Object.freeze({
+        key: `${request.chunkX},${request.chunkZ}`,
+        consumerId: request.consumerId,
+        priority: request.priority,
+        required: request.required,
+      }));
+      if (holdCompatibility
+        && request.consumerId?.startsWith('runtime-prepared:')
+        && heldCompatibility === null) {
+        let resolveHeld;
+        const promise = new Promise(resolve => { resolveHeld = resolve; });
+        heldCompatibility = Object.freeze({
+          requestId: request.requestId,
+          key: `${request.chunkX},${request.chunkZ}`,
+          resolve: value => resolveHeld(value),
+        });
+        notifyCompatibilityStarted(heldCompatibility);
+        return promise;
+      }
+      return source.generateChunk(request.chunkX, request.chunkZ);
+    },
+    cancelGenerationRequest: ({ requestId }) => {
+      if (requestId !== heldCompatibility?.requestId) return false;
+      heldCompatibility.resolve(null);
+      return true;
+    },
+    snapshot: () => Object.freeze({ kind: 'compatibility-transition-background-priority-fixture' }),
+    shutdown: async () => { heldCompatibility?.resolve(null); },
+  };
+  const coordinator = createFixedLaneOwnerGenerationCoordinator();
+  const chunkDataService = new ChunkDataService({
+    transport,
+    cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+    coordinator,
+  });
+  await chunkDataService.initialize();
+  const runtime = new ChunkRuntimeManager({
+    chunkDataService,
+    renderAdapter: new ResidentAdapter(),
+    cacheCapacity: RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY,
+    yieldToHost: () => Promise.resolve(),
+  });
+  await runtime.initialize(0, 0);
+
+  holdCompatibility = true;
+  const compatibilityPreparation = runtime.prepareTransition(1, 0);
+  compatibilityPreparation.catch(() => {});
+  let compatibilityTimeoutId = null;
+  const held = await Promise.race([
+    compatibilityStarted,
+    new Promise(resolve => {
+      compatibilityTimeoutId = setTimeout(() => resolve(null), 2_000);
+    }),
+  ]);
+  if (compatibilityTimeoutId !== null) clearTimeout(compatibilityTimeoutId);
+  assert.ok(held, 'compatibility transition preparation must issue missing Full data');
+  const heldRequest = requests.find(request => (
+    request.key === held.key && request.consumerId?.startsWith('runtime-prepared:')
+  ));
+  assert.equal(heldRequest?.required, false,
+    'non-initial compatibility transition preparation must stay off the required Full lane');
+
+  const latestCenterChunkX = 8;
+  const latestCenterChunkZ = 0;
+  const latestCoverage = createResidentWorldCoverage({
+    centerChunkX: latestCenterChunkX,
+    centerChunkZ: latestCenterChunkZ,
+  });
+  const speed = getW6ScaleProfile('MAX').sprintMetersPerSecond;
+  const latestPlan = planRuntimeTerrainReadySet({
+    centerChunkX: 0,
+    centerChunkZ: 0,
+    logicalX: latestCenterChunkX * LOGICAL_CHUNK_SIZE_METERS + 8,
+    logicalZ: latestCenterChunkZ * LOGICAL_CHUNK_SIZE_METERS + 8,
+    velocityX: speed,
+    velocityZ: 0,
+    speedMetersPerSecond: speed,
+    scaleStageId: 'MAX',
+    sprint: true,
+    residentCoverage: latestCoverage,
+  });
+  const latestReady = runtime.updateTerrainReadySet(latestPlan);
+  latestReady.catch(() => {});
+
+  const catchupDeadline = Date.now() + 3_000;
+  let caughtUp = false;
+  while (Date.now() < catchupDeadline) {
+    const sliding = runtime.snapshot().presentationSliding;
+    if (sliding.publishedKeys.includes(`${latestCenterChunkX},${latestCenterChunkZ}`)) {
+      caughtUp = true;
+      break;
+    }
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(caughtUp, true,
+    'latest Player center must publish while stale compatibility Full preparation is held');
+  const duringHold = runtime.snapshot();
+  assert.equal(duringHold.presentationSliding.target.key, `${latestCenterChunkX},${latestCenterChunkZ}`);
+  assert.ok(duringHold.presentationSliding.publishedKeys.includes(
+    `${latestCenterChunkX},${latestCenterChunkZ}`,
+  ));
+  assert.equal(duringHold.centerChunkX, 0,
+    'compatibility center may lag without blocking current owner-level Presentation');
+
+  heldCompatibility.resolve(null);
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+  await coordinator.shutdown();
+  await source.shutdown?.();
 });
 
 test('Resident protection survives prefetch reversal while evicting only non-resident data', async () => {
@@ -708,8 +1045,9 @@ test('60-second MAX Sprint nested windows retain Presentation and Full coverage 
     const direction = directionAt(elapsed);
     logicalX += direction.x * speed * deltaSeconds;
     logicalZ += direction.z * speed * deltaSeconds;
-    const centerChunkX = Math.floor(logicalX / 16);
-    const centerChunkZ = Math.floor(logicalZ / 16);
+    const centerOwner = logicalWorldToOwnedChunk(logicalX, logicalZ);
+    const centerChunkX = centerOwner.chunkX;
+    const centerChunkZ = centerOwner.chunkZ;
     const centerKey = `${centerChunkX},${centerChunkZ}`;
     if (centerKey === lastCenterKey) continue;
     lastCenterKey = centerKey;

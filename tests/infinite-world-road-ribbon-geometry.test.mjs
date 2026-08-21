@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  advanceSettlementRoadRibbonMeshWork,
   buildSettlementRoadRibbonMeshData,
+  createSettlementRoadRibbonMeshWork,
   createRoadRibbonHeightSampler,
 } from '../src/infinite-world/render/settlement-road-ribbon-geometry.js';
 import { SETTLEMENT_TYPES } from '../src/settlement-type.js';
@@ -149,6 +151,111 @@ test('vertex and index output ignores road, route, and asynchronous completion o
     assert.deepEqual([...variant.positions], [...expected.positions]);
     assert.deepEqual([...variant.indices], [...expected.indices]);
   }
+});
+
+test('resumable Road phases are bit-identical across randomized cursor schedules', () => {
+  let randomState = 0x35a911cd;
+  const random = () => {
+    randomState = (Math.imul(randomState, 1_664_525) + 1_013_904_223) >>> 0;
+    return randomState / 2 ** 32;
+  };
+  const schedules = [[1], [7, 2, 31, 3], [64, 1, 5]];
+  for (let sample = 0; sample < 32; sample += 1) {
+    const count = 8 + Math.floor(random() * 56);
+    const roads = Array.from({ length: count }, (_, index) => {
+      const startX = Math.round((random() * 120 - 60) * 1e6) / 1e6;
+      const startZ = Math.round((random() * 120 - 60) * 1e6) / 1e6;
+      return road({
+        id: `random:${sample}:${index}`,
+        route: `random-route:${index % 9}`,
+        order: index,
+        width: 1.5 + random() * 5,
+        start: { x: startX, z: startZ },
+        end: {
+          x: startX + 1 + random() * 24,
+          z: startZ - 12 + random() * 24,
+        },
+      });
+    });
+    const options = {
+      roads,
+      heightAt: (x, z) => Math.round((x * 0.01 + z * 0.005) * 1e6) / 1e6,
+      originX: -64,
+      originZ: -64,
+      clipBounds: { minX: -64, minZ: -64, maxX: 64, maxZ: 64 },
+    };
+    const expected = buildSettlementRoadRibbonMeshData(options);
+    for (const schedule of schedules) {
+      const work = createSettlementRoadRibbonMeshWork(options);
+      let cursor = 0;
+      while (!work.done) {
+        advanceSettlementRoadRibbonMeshWork(work, {
+          unitLimit: schedule[cursor % schedule.length],
+        });
+        cursor += 1;
+      }
+      assert.equal(work.result.hash, expected.hash, `hash sample=${sample}`);
+      assert.deepEqual(work.result.stats, expected.stats, `stats sample=${sample}`);
+      assert.deepEqual(work.result.positions, expected.positions, `positions sample=${sample}`);
+      assert.deepEqual(work.result.normals, expected.normals, `normals sample=${sample}`);
+      assert.deepEqual(work.result.indices, expected.indices, `indices sample=${sample}`);
+    }
+  }
+});
+
+test('192-road resumable stress keeps canonical output and bounded units/slices', t => {
+  const roads = Array.from({ length: 192 }, (_, index) => {
+    const lane = index % 12;
+    const row = Math.floor(index / 12);
+    return road({
+      id: `stress:${index}`,
+      route: `route:${row}`,
+      order: lane,
+      width: 1.75 + row * 0.1,
+      start: { x: 80 + lane, z: 2 + row * 3 },
+      end: { x: 84 + lane, z: 2.5 + row * 3 },
+    });
+  });
+  const options = {
+    roads,
+    heightAt: (x, z) => Math.round((x * 0.01 + z * 0.005) * 1e6) / 1e6,
+    originX: 80,
+    originZ: 0,
+    clipBounds: { minX: 80, minZ: 0, maxX: 96, maxZ: 64 },
+  };
+  const work = createSettlementRoadRibbonMeshWork(options);
+  let maximumUnitMs = 0;
+  let maximumSliceMs = 0;
+  let unitCount = 0;
+  while (!work.done) {
+    const sliceStartedAt = performance.now();
+    do {
+      const unitStartedAt = performance.now();
+      advanceSettlementRoadRibbonMeshWork(work, { unitLimit: 1 });
+      maximumUnitMs = Math.max(maximumUnitMs, performance.now() - unitStartedAt);
+      unitCount += 1;
+    } while (!work.done && performance.now() - sliceStartedAt < 2);
+    maximumSliceMs = Math.max(maximumSliceMs, performance.now() - sliceStartedAt);
+  }
+  assert.equal(work.result.hash, 'a2516fb6');
+  assert.deepEqual(work.result.stats, {
+    roadRecordCount: 192,
+    routeCount: 16,
+    polylineCount: 192,
+    nodeCount: 384,
+    junctionCount: 0,
+    miterJoinCount: 0,
+    bevelJoinCount: 0,
+    vertexCount: 770,
+    indexCount: 1200,
+    triangleCount: 400,
+    duplicateFaceCount: 0,
+    degenerateTriangleCount: 0,
+    uploadBytes: 23280,
+  });
+  assert.ok(maximumUnitMs <= 4, `Road unit ${maximumUnitMs.toFixed(3)}ms exceeds 4ms`);
+  assert.ok(maximumSliceMs <= 8, `Road slice ${maximumSliceMs.toFixed(3)}ms exceeds 8ms`);
+  t.diagnostic(JSON.stringify({ maximumUnitMs, maximumSliceMs, unitCount }));
 });
 
 function properSegmentsIntersect(firstStart, firstEnd, secondStart, secondEnd) {

@@ -118,6 +118,25 @@ export const W8_PARITY_CACHE_CAPACITIES = Object.freeze({
 const EXPERIENCE_SPAWN_CACHE_CAPACITY = 1;
 const EXPERIENCE_SPAWN_CACHE = new Map();
 
+function createGenerationControl(checkpoint = null, cooperativeCheckpoint = null) {
+  if (checkpoint !== null && typeof checkpoint !== 'function') {
+    throw new TypeError('generation checkpoint must be a function when provided');
+  }
+  if (cooperativeCheckpoint !== null && typeof cooperativeCheckpoint !== 'function') {
+    throw new TypeError('cooperative generation checkpoint must be a function when provided');
+  }
+  // The Worker core already performs synchronous start/end checks. Internal
+  // phase boundaries are enabled only when they can also yield the Worker
+  return checkpoint || cooperativeCheckpoint
+    ? Object.freeze({ checkpoint, cooperativeCheckpoint }) : null;
+}
+
+async function reachGenerationCheckpoint(control) {
+  if (!control) return;
+  if (control.cooperativeCheckpoint) await control.cooperativeCheckpoint();
+  else control.checkpoint?.();
+}
+
 function setLruValue(map, key, value, capacity) {
   if (map.has(key)) map.delete(key);
   map.set(key, value);
@@ -204,6 +223,15 @@ export function createPendingSafeLruCache({ capacity, onRemove = null } = {}) {
     get,
     has: key => entries.has(key),
     delete: key => removeEntry(key, 'deleted'),
+    async settlePending() {
+      while (true) {
+        const pending = [...entries.values()]
+          .filter(entry => entry.pending)
+          .map(entry => entry.promise);
+        if (pending.length === 0) return;
+        await Promise.allSettled(pending);
+      }
+    },
     close() {
       if (closed) return;
       closed = true;
@@ -1269,7 +1297,12 @@ export async function createW8ParityChunkGenerator({
       warmSourceChunks.delete(warmSourceChunks.keys().next().value);
     }
   };
-  const getSourceChunk = async (chunkX, chunkZ, stageRecorder = null) => {
+  const getSourceChunk = async (
+    chunkX,
+    chunkZ,
+    stageRecorder = null,
+    generationControl = null,
+  ) => {
     if (isShutdown) throw new Error('W8 parity Chunk generator is shut down');
     const key = createChunkKey(chunkX, chunkZ);
     if (warmSourceChunks.has(key)) {
@@ -1279,9 +1312,10 @@ export async function createW8ParityChunkGenerator({
       return cached;
     }
     if (pendingSourceChunks.has(key)) return pendingSourceChunks.get(key);
-    const source = stageRecorder
-      ? base.generateChunk(chunkX, chunkZ, { stageRecorder })
-      : base.generateChunk(chunkX, chunkZ);
+    const source = base.generateChunk(chunkX, chunkZ, {
+      ...(stageRecorder ? { stageRecorder } : {}),
+      ...(generationControl ?? {}),
+    });
     const pending = Promise.resolve(source).then(
       chunk => {
         pendingSourceChunks.delete(key);
@@ -1413,7 +1447,11 @@ export async function createW8ParityChunkGenerator({
     }
     return candidate;
   };
-  const getCanonicalSettlementOverlay = async (candidate, roadTimingContext = null) => {
+  const getCanonicalSettlementOverlay = async (
+    candidate,
+    roadTimingContext = null,
+    generationControl = null,
+  ) => {
     if (!candidate) return null;
     candidate = snapshotSettlementTemplateCandidate(candidate);
     const roadTimingRun = roadTimingContext?.run ?? null;
@@ -1442,7 +1480,9 @@ export async function createW8ParityChunkGenerator({
     const sourceTemplate = await base.resolveSettlementTemplate({
       candidate,
       roadTimingRun,
+      ...(generationControl ?? {}),
     });
+    await reachGenerationCheckpoint(generationControl);
     majorRoadDiagnostics.settlementSourceTemplateResolutionMs += nowMs() - sourceStartedAt;
     recordRoadFunction(roadTimingRun, 'settlement-template-resolution', sourceStartedAt);
     const overlayCacheLookupStartedAt = roadTimingRun ? nowMs() : null;
@@ -1487,12 +1527,19 @@ export async function createW8ParityChunkGenerator({
       },
     );
     settlementOverlayCandidateIdentities.set(candidate.settlementId, candidateIdentity);
-    return overlayPromise;
+    const overlay = await overlayPromise;
+    await reachGenerationCheckpoint(generationControl);
+    return overlay;
   };
-  const getSettlementOverlay = async (reference, roadTimingContext = null) => (
+  const getSettlementOverlay = async (
+    reference,
+    roadTimingContext = null,
+    generationControl = null,
+  ) => (
     getCanonicalSettlementOverlay(
       await resolveSettlementTemplateCandidate(reference),
       roadTimingContext,
+      generationControl,
     )
   );
   const majorRoadSurfacePolicyVersion = 'w8-settlement-surface-policy-1';
@@ -1576,7 +1623,12 @@ export async function createW8ParityChunkGenerator({
     }
     return Object.freeze(landmarks.map(value => Object.freeze(value)));
   };
-  const getMajorRoadObstacles = async (node, sourceContentHash, roadTimingContext = null) => {
+  const getMajorRoadObstacles = async (
+    node,
+    sourceContentHash,
+    roadTimingContext = null,
+    generationControl = null,
+  ) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     majorRoadDiagnostics.obstacleRequests += 1;
     const cacheKey = canonicalizeJson({
@@ -1604,7 +1656,11 @@ export async function createW8ParityChunkGenerator({
     return majorRoadObstacleCache.getOrCreate(cacheKey, async () => {
       const sourceStartedAt = nowMs();
       const candidate = await resolveCanonicalCandidateFromGraphNode(node);
-      const overlay = await getCanonicalSettlementOverlay(candidate, roadTimingContext);
+      const overlay = await getCanonicalSettlementOverlay(
+        candidate,
+        roadTimingContext,
+        generationControl,
+      );
       majorRoadDiagnostics.obstacleSourceMs += nowMs() - sourceStartedAt;
       recordRoadFunction(roadTimingRun, 'road-obstacle-settlement-source', sourceStartedAt);
       const boundsStartedAt = nowMs();
@@ -1632,7 +1688,12 @@ export async function createW8ParityChunkGenerator({
       });
     }, node.stableId);
   };
-  const prepareMajorRoadSource = async ({ edge, graph, roadTimingContext = null }) => {
+  const prepareMajorRoadSource = async ({
+    edge,
+    graph,
+    roadTimingContext = null,
+    generationControl = null,
+  }) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     const cacheLookupStartedAt = roadTimingRun ? nowMs() : null;
     const preparationKey = canonicalizeJson({
@@ -1670,7 +1731,9 @@ export async function createW8ParityChunkGenerator({
         midpoint.z,
         endpointDistance / 2 + maximumEndpointRadius * 3
           + W8_CANONICAL_MAJOR_ROAD.widthMeters * 8,
+        generationControl,
       );
+      await reachGenerationCheckpoint(generationControl);
       majorRoadDiagnostics.settlementCandidateQueryMs += nowMs() - queryStartedAt;
       recordRoadFunction(roadTimingRun, 'road-settlement-corridor-query', queryStartedAt);
       const relevantFilterStartedAt = roadTimingRun ? nowMs() : null;
@@ -1691,8 +1754,14 @@ export async function createW8ParityChunkGenerator({
         relevantNodes.map(node => getMajorRoadSourceContentHash(node, roadTimingContext)),
       );
       const resolved = await Promise.all(relevantNodes.map((node, index) => (
-        getMajorRoadObstacles(node, sourceHashes[index], roadTimingContext)
+        getMajorRoadObstacles(
+          node,
+          sourceHashes[index],
+          roadTimingContext,
+          generationControl,
+        )
       )));
+      await reachGenerationCheckpoint(generationControl);
       const sourceContentHashes = relevantNodes.map((node, index) => Object.freeze({
         settlementStableId: node.stableId,
         contentHash: sourceHashes[index],
@@ -1732,6 +1801,7 @@ export async function createW8ParityChunkGenerator({
     graph,
     preparedSource = null,
     roadTimingContext = null,
+    generationControl = null,
   ) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     majorRoadDiagnostics.routeRequests += 1;
@@ -1739,6 +1809,7 @@ export async function createW8ParityChunkGenerator({
       edge,
       graph,
       roadTimingContext,
+      generationControl,
     });
     const previousKey = majorRoadRouteKeyByEdge.get(edge.stableId);
     if (previousKey && previousKey !== prepared.cacheKey) {
@@ -1794,7 +1865,12 @@ export async function createW8ParityChunkGenerator({
       return road;
     }, edge.stableId);
   };
-  const getMajorRoads = async (edges, graph, roadTimingContext = null) => {
+  const getMajorRoads = async (
+    edges,
+    graph,
+    roadTimingContext = null,
+    generationControl = null,
+  ) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     const preparationStartedAt = nowMs();
     let preparationMissCount = 0;
@@ -1817,7 +1893,12 @@ export async function createW8ParityChunkGenerator({
       preparationMissCount += 1;
       return Object.freeze({
         cachedRoadPromise: null,
-        prepared: await prepareMajorRoadSource({ edge, graph, roadTimingContext }),
+        prepared: await prepareMajorRoadSource({
+          edge,
+          graph,
+          roadTimingContext,
+          generationControl,
+        }),
       });
     });
     const preparedSources = preparationMissCount > 0
@@ -1827,6 +1908,7 @@ export async function createW8ParityChunkGenerator({
         () => Promise.all(pendingPreparedSources),
       )
       : await Promise.all(pendingPreparedSources);
+    await reachGenerationCheckpoint(generationControl);
     if (preparationMissCount > 0) {
       const durationMs = nowMs() - preparationStartedAt;
       majorRoadDiagnostics.preparationBatchCount += 1;
@@ -1850,17 +1932,29 @@ export async function createW8ParityChunkGenerator({
         roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.SEGMENTS, road.segments.length);
         roads.push(road);
       } else {
-        const road = await getMajorRoadForEdge(edge, graph, source.prepared, roadTimingContext);
+        const road = await getMajorRoadForEdge(
+          edge,
+          graph,
+          source.prepared,
+          roadTimingContext,
+          generationControl,
+        );
         roadTimingRun?.addCounter(ROAD_GENERATION_COUNTER.SEGMENTS, road.segments.length);
         roads.push(road);
       }
+      await reachGenerationCheckpoint(generationControl);
     }
     return roads;
   };
   const majorRoadGraphRadiusMeters = W5_SETTLEMENT_DISTRIBUTION
     .connectivity.queryRadiusMeters
       + W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters * Math.SQRT2 / 2;
-  const getMajorRoadGraph = async (chunkX, chunkZ, roadTimingContext = null) => {
+  const getMajorRoadGraph = async (
+    chunkX,
+    chunkZ,
+    roadTimingContext = null,
+    generationControl = null,
+  ) => {
     const roadTimingRun = roadTimingContext?.run ?? null;
     majorRoadDiagnostics.graphRequests += 1;
     const graphInput = measureRoadSpanSync(
@@ -1901,6 +1995,7 @@ export async function createW8ParityChunkGenerator({
           (graphInput.regionX + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
           (graphInput.regionZ + 0.5) * W5_SETTLEMENT_DISTRIBUTION.macroRegionSizeMeters,
           majorRoadGraphRadiusMeters,
+          generationControl,
         ),
       );
       majorRoadDiagnostics.graphsBuilt += 1;
@@ -1949,7 +2044,10 @@ export async function createW8ParityChunkGenerator({
     chunkZ,
     surfaceBackedChunk,
     roadTimingContext = null,
-    { sampleGroundHeight: sampleGroundHeightOverride = null } = {},
+    {
+      sampleGroundHeight: sampleGroundHeightOverride = null,
+      generationControl = null,
+    } = {},
   ) => {
     const roadTimingRun = roadTimingContext?.recorder?.beginRun({
       owner: { x: chunkX, z: chunkZ },
@@ -1974,7 +2072,13 @@ export async function createW8ParityChunkGenerator({
     };
     try {
       const resolutionStartedAt = nowMs();
-      const graph = await getMajorRoadGraph(chunkX, chunkZ, roadTimingContext);
+      const graph = await getMajorRoadGraph(
+        chunkX,
+        chunkZ,
+        roadTimingContext,
+        generationControl,
+      );
+      await reachGenerationCheckpoint(generationControl);
       roadTimingRun?.setCounter(ROAD_GENERATION_COUNTER.NODES, graph.nodes.length);
       roadTimingRun?.setSettlementTypes(graph.nodes.map(node => (
         node.settlementType ?? node.townType
@@ -1986,7 +2090,13 @@ export async function createW8ParityChunkGenerator({
         () => graphEdgesPotentiallyIntersectChunk({ graph, chunkX, chunkZ }),
       );
       recordRoadFunction(roadTimingRun, 'road-graph-segment-filter', graphSegmentsStartedAt);
-      const roads = await getMajorRoads(edges, graph, roadTimingContext);
+      const roads = await getMajorRoads(
+        edges,
+        graph,
+        roadTimingContext,
+        generationControl,
+      );
+      await reachGenerationCheckpoint(generationControl);
       majorRoadDiagnostics.chunkRoadResolutionMs += nowMs() - resolutionStartedAt;
       const features = projectMajorRoadFeaturesToOwner({
         chunkX,
@@ -2263,6 +2373,7 @@ export async function createW8ParityChunkGenerator({
     centerWorldX,
     centerWorldZ,
     radiusMeters,
+    generationControl = null,
   } = {}) => {
     if (![centerWorldX, centerWorldZ, radiusMeters].every(Number.isFinite)
       || radiusMeters < 0) throw new TypeError('valid MAJOR Road owner query is required');
@@ -2298,7 +2409,10 @@ export async function createW8ParityChunkGenerator({
       const graph = await getMajorRoadGraph(
         region.regionX * chunksPerRegion,
         region.regionZ * chunksPerRegion,
+        null,
+        generationControl,
       );
+      await reachGenerationCheckpoint(generationControl);
       const requiredEdgeIds = new Set();
       const regionMinimumChunkX = Math.max(
         minimumChunkX,
@@ -2332,7 +2446,8 @@ export async function createW8ParityChunkGenerator({
         }
       }
       const edges = graph.edges.filter(edge => requiredEdgeIds.has(edge.stableId));
-      const roads = await getMajorRoads(edges, graph);
+      const roads = await getMajorRoads(edges, graph, null, generationControl);
+      await reachGenerationCheckpoint(generationControl);
       const ownerCoordinates = enumerateCanonicalMajorRoadOwnerCoordinates({
         roads,
         centerWorldX,
@@ -2343,6 +2458,7 @@ export async function createW8ParityChunkGenerator({
           && Math.floor(coordinate.chunkZ / chunksPerRegion) === region.regionZ
       ));
       resolvedRegions.push({ graph, edges, roads, ownerCoordinates });
+      await reachGenerationCheckpoint(generationControl);
     }
     const graphEdgeIds = new Set();
     const roadIds = new Set();
@@ -2470,25 +2586,34 @@ export async function createW8ParityChunkGenerator({
     chunkZ,
     stageRecorder = null,
     roadTimingContext = null,
+    generationControl = null,
   ) => {
     assertGeneratorActive();
-    const sourceChunkData = stageRecorder
-      ? await getSourceChunk(chunkX, chunkZ, stageRecorder)
-      : await getSourceChunk(chunkX, chunkZ);
+    const sourceChunkData = await getSourceChunk(
+      chunkX,
+      chunkZ,
+      stageRecorder,
+      generationControl,
+    );
+    await reachGenerationCheckpoint(generationControl);
     const settlementToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.SETTLEMENT);
     const ownerCenterX = (chunkX + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const ownerCenterZ = (chunkZ + 0.5) * LOGICAL_CHUNK_SIZE_METERS;
     const ownerHalfDiagonal = Math.SQRT2 * LOGICAL_CHUNK_SIZE_METERS / 2;
     const [overlayTemplates, naturalDensityCandidates] = await Promise.all([
-      Promise.all((sourceChunkData.settlementReferences ?? []).map(getSettlementOverlay)),
+      Promise.all((sourceChunkData.settlementReferences ?? []).map(reference => (
+        getSettlementOverlay(reference, null, generationControl)
+      ))),
       base.distributor.findSettlementsNear(
         ownerCenterX,
         ownerCenterZ,
         ownerHalfDiagonal,
+        generationControl,
       ).then(candidates => candidates.filter(candidate => (
         settlementInfluencesNaturalOwner(candidate, { chunkX, chunkZ })
       ))),
     ]);
+    await reachGenerationCheckpoint(generationControl);
     const naturalDensityReferences = Object.freeze(
       naturalDensityCandidates.map(compactNaturalSettlementReference),
     );
@@ -2546,6 +2671,7 @@ export async function createW8ParityChunkGenerator({
           chunkZ,
           localSurfaceBackedChunk,
           roadTimingContext,
+          { generationControl },
         ),
       )
       : await createMajorRoadFeatures(
@@ -2553,7 +2679,9 @@ export async function createW8ParityChunkGenerator({
         chunkZ,
         localSurfaceBackedChunk,
         roadTimingContext,
+        { generationControl },
       );
+    await reachGenerationCheckpoint(generationControl);
     const canonicalBeforeRiverToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.CANONICAL);
     const settlementFeatures = [
       ...localSettlementFeatures,
@@ -2589,6 +2717,7 @@ export async function createW8ParityChunkGenerator({
           worldZ,
         ),
       });
+    await reachGenerationCheckpoint(generationControl);
     const canonicalToken = stageRecorder?.start(CHUNK_GENERATION_STAGE.CANONICAL);
     const canonicalSurfacePolicy = createSettlementSurfacePolicy(
       settlementReferences,
@@ -2656,6 +2785,7 @@ export async function createW8ParityChunkGenerator({
       parityGameplayChunk,
     });
     if (stageRecorder) stageRecorder.end(canonicalToken);
+    await reachGenerationCheckpoint(generationControl);
     return context;
   };
 
@@ -2664,6 +2794,7 @@ export async function createW8ParityChunkGenerator({
     chunkZ,
     stageRecorder = null,
     roadTimingContext = null,
+    generationControl = null,
   ) => canonicalOwnerCache.getOrCreate({
     ownerKey: createChunkKey(chunkX, chunkZ),
     sourceRevision: canonicalSourceRevision,
@@ -2672,6 +2803,7 @@ export async function createW8ParityChunkGenerator({
       chunkZ,
       stageRecorder,
       roadTimingContext,
+      generationControl,
     ),
   });
 
@@ -2779,6 +2911,7 @@ export async function createW8ParityChunkGenerator({
     chunkZ,
     stageRecorder = null,
     roadTimingContext = null,
+    generationControl = null,
   ) => {
     assertGeneratorActive();
     resourceGenerationCounts.fullChunkRequests += 1;
@@ -2792,6 +2925,7 @@ export async function createW8ParityChunkGenerator({
         chunkZ,
         stageRecorder,
         roadTimingContext,
+        generationControl,
       ),
       build: async context => {
         const preparePresentation = () => prepareW8NaturalPresentation(context, {
@@ -2804,6 +2938,7 @@ export async function createW8ParityChunkGenerator({
             preparePresentation,
           )
           : await preparePresentation();
+        await reachGenerationCheckpoint(generationControl);
         const buildContent = () => {
           const presentationLayers = createPresentationLayers(
             context.parityGameplayChunk,
@@ -2848,6 +2983,7 @@ export async function createW8ParityChunkGenerator({
         const contentHash = stageRecorder
           ? await hashW8ParityChunkContent(content, { stageRecorder })
           : await hashW8ParityChunkContent(content);
+        await reachGenerationCheckpoint(generationControl);
         const nextChunk = Object.freeze({ ...content, contentHash });
         const validate = () => validateW8ParityChunkData(nextChunk);
         const validation = stageRecorder
@@ -2872,6 +3008,7 @@ export async function createW8ParityChunkGenerator({
     chunkZ,
     stageRecorder = null,
     roadTimingContext = null,
+    generationControl = null,
   ) => {
     assertGeneratorActive();
     resourceGenerationCounts.forestHorizonManifestRequests += 1;
@@ -2884,6 +3021,7 @@ export async function createW8ParityChunkGenerator({
         chunkZ,
         stageRecorder,
         roadTimingContext,
+        generationControl,
       ),
       build: async context => {
         const preparePresentation = () => prepareW8NaturalPresentation(context);
@@ -2894,6 +3032,7 @@ export async function createW8ParityChunkGenerator({
             preparePresentation,
           )
           : await preparePresentation();
+        await reachGenerationCheckpoint(generationControl);
         const manifestInput = {
           chunkId: context.chunkId,
           chunkX,
@@ -2906,9 +3045,11 @@ export async function createW8ParityChunkGenerator({
             natural: presentation.natural,
           }),
         };
-        return stageRecorder
-          ? createHashedW8ForestHorizonManifest(manifestInput, { stageRecorder })
-          : createHashedW8ForestHorizonManifest(manifestInput);
+        const manifest = stageRecorder
+          ? await createHashedW8ForestHorizonManifest(manifestInput, { stageRecorder })
+          : await createHashedW8ForestHorizonManifest(manifestInput);
+        await reachGenerationCheckpoint(generationControl);
+        return manifest;
       },
     });
     resourceGenerationCounts.forestHorizonManifestCompleted += 1;
@@ -2954,16 +3095,29 @@ export async function createW8ParityChunkGenerator({
         });
       }));
     },
-    async resolveSettlementPresentationTemplate({ candidate } = {}) {
+    async resolveSettlementPresentationTemplate({
+      candidate,
+      checkpoint = null,
+      cooperativeCheckpoint = null,
+    } = {}) {
       assertGeneratorActive();
-      return composeW8SettlementPresentationTemplate(await getSettlementOverlay(candidate));
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
+      return composeW8SettlementPresentationTemplate(
+        await getSettlementOverlay(candidate, null, generationControl),
+      );
     },
-    async generatePresentationOwner(chunkX, chunkZ) {
+    async generatePresentationOwner(
+      chunkX,
+      chunkZ,
+      { checkpoint = null, cooperativeCheckpoint = null } = {},
+    ) {
       assertGeneratorActive();
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
       resourceGenerationCounts.presentationOwnerRequests += 1;
       const generated = await (await getPresentationOwnerGenerator()).generateOwner(
         chunkX,
         chunkZ,
+        generationControl ?? {},
       );
       // Sampling functions stay inside the Worker. The compact resource,
       // surface policy, and already-grounded canonical records are cloneable.
@@ -2981,17 +3135,26 @@ export async function createW8ParityChunkGenerator({
       resourceGenerationCounts.presentationOwnerCompleted += 1;
       return result;
     },
-    async generateCanonicalTreeCell(macroX, macroZ) {
+    async generateCanonicalTreeCell(
+      macroX,
+      macroZ,
+      { checkpoint = null, cooperativeCheckpoint = null } = {},
+    ) {
       assertGeneratorActive();
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
       resourceGenerationCounts.canonicalTreeCellRequests += 1;
       const generated = await (await getPresentationOwnerGenerator())
-        .generateCanonicalTreeCell(macroX, macroZ);
+        .generateCanonicalTreeCell(macroX, macroZ, generationControl ?? {});
       resourceGenerationCounts.canonicalTreeCellCompleted += 1;
       return generated;
     },
     async resolveCanonicalMajorRoadOwnerCoverage(query = {}) {
       assertGeneratorActive();
-      return resolveCanonicalMajorRoadOwnerCoverage(query);
+      const generationControl = createGenerationControl(
+        query.checkpoint ?? null,
+        query.cooperativeCheckpoint ?? null,
+      );
+      return resolveCanonicalMajorRoadOwnerCoverage({ ...query, generationControl });
     },
     async resolveCanonicalMajorRoadNetwork({
       centerWorldX,
@@ -3018,21 +3181,55 @@ export async function createW8ParityChunkGenerator({
     async generateChunk(
       chunkX,
       chunkZ,
-      { stageRecorder = null, roadTimingContext = null } = {},
+      {
+        stageRecorder = null,
+        roadTimingContext = null,
+        checkpoint = null,
+        cooperativeCheckpoint = null,
+      } = {},
     ) {
-      return generateW8ParityChunk(chunkX, chunkZ, stageRecorder, roadTimingContext);
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
+      return generateW8ParityChunk(
+        chunkX,
+        chunkZ,
+        stageRecorder,
+        roadTimingContext,
+        generationControl,
+      );
     },
     async generateForestHorizonManifest(
       chunkX,
       chunkZ,
-      { stageRecorder = null, roadTimingContext = null } = {},
+      {
+        stageRecorder = null,
+        roadTimingContext = null,
+        checkpoint = null,
+        cooperativeCheckpoint = null,
+      } = {},
     ) {
+      const generationControl = createGenerationControl(checkpoint, cooperativeCheckpoint);
       return generateW8ForestHorizonManifest(
         chunkX,
         chunkZ,
         stageRecorder,
         roadTimingContext,
+        generationControl,
       );
+    },
+    async settleCancelledGeneration() {
+      const sourceChunks = [...pendingSourceChunks.values()];
+      await Promise.allSettled([
+        ...sourceChunks,
+        settlementOverlayTemplates.settlePending(),
+        majorRoadGraphCache.settlePending(),
+        majorRoadRouteCache.settlePending(),
+        majorRoadObstacleCache.settlePending(),
+        majorRoadPreparationCache.settlePending(),
+        majorRoadSourceHashCache.settlePending(),
+        canonicalOwnerCache.settlePending(),
+        presentationManifestCache.settlePending(),
+        base.settleCancelledGeneration?.(),
+      ]);
     },
     async shutdown() {
       if (isShutdown) return;

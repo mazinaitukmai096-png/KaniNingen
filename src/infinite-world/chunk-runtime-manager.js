@@ -33,6 +33,72 @@ function percentile(values, ratio) {
 const TERRAIN_PRESENTATION_STAGED_CENTER_LIMIT = 3;
 const TERRAIN_READY_CHUNK_DATA_DIAGNOSTIC_OWNER_LIMIT = 256;
 const TERRAIN_DEPENDENCY_WAIT_SAMPLE_LIMIT = 512;
+const PRESENTATION_SLIDING_LIFECYCLE_HISTORY_LIMIT = 256;
+const PRESENTATION_SLIDING_OWNER_STATE_LIMIT = 512;
+const PROJECTION_SCHEDULER_LIFECYCLE_HISTORY_LIMIT = 256;
+const PRESENTATION_OWNER_TRACE_OWNER_LIMIT = 256;
+const PRESENTATION_OWNER_TRACE_EVENT_LIMIT = 96;
+const PRESENTATION_OWNER_TRACE_SAMPLE_KEY_LIMIT = 32;
+const PROJECTION_PRIORITY = Object.freeze({
+  PLAYER_VISIBLE_CENTER: 0,
+  PLAYER_VISIBLE_NEAR: 1,
+  PLAYER_VISIBLE_CORNER: 2,
+  TERRAIN_READY_VISIBLE: 8,
+  COMPATIBILITY_CURRENT: 16,
+  COMPATIBILITY_BACKGROUND: 32,
+  PREFETCH_BACKGROUND: 48,
+});
+
+function projectionSchedulerSupersededError(ownerKey, reason = 'superseded') {
+  const error = new Error(`projection superseded for ${ownerKey}: ${reason}`);
+  error.name = 'ProjectionSchedulerSupersededError';
+  error.code = 'RUNTIME_PROJECTION_SUPERSEDED';
+  error.faultDomain = 'presentation';
+  error.stage = 'projection-scheduler';
+  error.retryable = true;
+  error.cancelled = true;
+  error.reason = reason;
+  return error;
+}
+
+function isProjectionSupersededError(error) {
+  return error?.code === 'RUNTIME_PROJECTION_SUPERSEDED'
+    || error?.code === 'CHUNK_PROJECTION_CANCELLED';
+}
+
+function runtimeWorldInvariantError(error, stage, {
+  code = 'RUNTIME_WORLD_INVARIANT',
+  faultDomain = 'world-invariant',
+} = {}) {
+  if (error?.code === 'CANONICAL_WORLD_INVARIANT'
+    || error?.code === 'RUNTIME_WORLD_INVARIANT') return error;
+  const wrapped = new Error(error?.message ?? String(error), { cause: error });
+  wrapped.name = code === 'CANONICAL_WORLD_INVARIANT'
+    ? 'CanonicalWorldInvariantError' : 'RuntimeWorldInvariantError';
+  wrapped.code = code;
+  wrapped.faultDomain = faultDomain;
+  wrapped.stage = stage;
+  wrapped.retryable = false;
+  return wrapped;
+}
+
+function runtimeTransitionRetryableError(error, stage, {
+  code = 'RUNTIME_TRANSITION_RETRYABLE_STREAMING',
+  faultDomain = 'streaming',
+} = {}) {
+  if (error?.code === 'CANONICAL_WORLD_INVARIANT'
+    || error?.code === 'RUNTIME_WORLD_INVARIANT'
+    || error?.code === 'RUNTIME_TRANSITION_RETRYABLE_STREAMING'
+    || error?.code === 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION'
+    || error?.retryable === false) return error;
+  const wrapped = new Error(error?.message ?? String(error), { cause: error });
+  wrapped.name = 'RuntimeTransitionRetryableError';
+  wrapped.code = code;
+  wrapped.faultDomain = faultDomain;
+  wrapped.stage = stage;
+  wrapped.retryable = true;
+  return wrapped;
+}
 
 export class ChunkRuntimeManager {
   constructor({
@@ -47,6 +113,8 @@ export class ChunkRuntimeManager {
     clock = defaultClock,
     yieldToHost = defaultYieldToHost,
     onPipelineEvent = null,
+    renderUploadAdmission = null,
+    stageProjectedUpload = null,
   } = {}) {
     if (chunkDataService === null && generator === null) {
       throw new TypeError('chunkDataService is required');
@@ -56,6 +124,18 @@ export class ChunkRuntimeManager {
     }
     for (const method of ['rebase', 'projectChunk', 'loadProjected', 'unloadChunk', 'shutdown']) {
       if (typeof renderAdapter?.[method] !== 'function') throw new TypeError(`renderAdapter.${method} is required`);
+    }
+    const publicationBatchMethods = [
+      'beginProjectedPublicationBatch',
+      'commitProjectedPublicationBatch',
+      'rollbackProjectedPublicationBatch',
+    ];
+    const publicationBatchMethodCount = publicationBatchMethods.reduce(
+      (count, method) => count + Number(typeof renderAdapter?.[method] === 'function'), 0,
+    );
+    if (publicationBatchMethodCount !== 0
+      && publicationBatchMethodCount !== publicationBatchMethods.length) {
+      throw new TypeError('renderAdapter projected publication batch methods must be provided together');
     }
     if (!Number.isSafeInteger(cacheCapacity) || cacheCapacity < 25) {
       throw new RangeError('cacheCapacity must retain at least the active 5x5 data set');
@@ -72,6 +152,29 @@ export class ChunkRuntimeManager {
     if (onPipelineEvent !== null && typeof onPipelineEvent !== 'function') {
       throw new TypeError('onPipelineEvent must be a function when provided');
     }
+    if (renderUploadAdmission !== null && (
+      typeof renderUploadAdmission.admit !== 'function'
+      || typeof renderUploadAdmission.acknowledgeRenderReceipt !== 'function'
+      || typeof renderUploadAdmission.snapshot !== 'function'
+      || typeof renderUploadAdmission.shutdown !== 'function'
+    )) {
+      throw new TypeError('renderUploadAdmission must provide admit, acknowledgeRenderReceipt, snapshot, and shutdown');
+    }
+    if (renderUploadAdmission !== null && (
+      typeof renderAdapter?.finalizeProjectedUploadManifest !== 'function'
+      || typeof renderAdapter?.projectedOwnerUploadProof !== 'function'
+      || typeof renderAdapter?.cancelPendingProjectedUploadManifestWaiters !== 'function'
+    )) {
+      throw new TypeError(
+        'renderAdapter must finalize/cancel upload manifests and prove projected owner resources when admission is enabled',
+      );
+    }
+    if (stageProjectedUpload !== null && typeof stageProjectedUpload !== 'function') {
+      throw new TypeError('stageProjectedUpload must be a function when provided');
+    }
+    if (renderUploadAdmission !== null && typeof stageProjectedUpload !== 'function') {
+      throw new TypeError('stageProjectedUpload is required when render upload admission is enabled');
+    }
     this.chunkDataService = chunkDataService ?? new ChunkDataService({
       transport: createInlineChunkGeneratorTransport({ generator }),
       cacheCapacity,
@@ -84,16 +187,49 @@ export class ChunkRuntimeManager {
     this.clock = clock;
     this.yieldToHost = yieldToHost;
     this.onPipelineEvent = onPipelineEvent;
+    this.renderUploadAdmission = renderUploadAdmission;
+    this.stageProjectedUpload = stageProjectedUpload;
     this.floatingOrigin = new FloatingOrigin();
     this.performance = new PerformanceLedger();
     this.cache = new Map();
     this.identityAudit = new Map();
     this.activeDataKeys = new Set();
     this.renderedKeys = new Set();
+    // Phase 3: full Near owners may be published ahead of the legacy
+    // committed 3x3 transition. These owners are real canonical render
+    // owners, not proxies; they are promoted into renderedKeys when the
+    // compatibility transition catches up to the Player center.
+    this.presentationSlidingPublishedKeys = new Set();
+    this.presentationSlidingDesiredKeys = new Set();
+    this.presentationSlidingTarget = null;
+    this.presentationSlidingOwnerStates = new Map();
+    this.presentationSlidingOwnerJobs = new Map();
+    this.presentationSlidingActiveJobPromises = new Set();
+    this.presentationSlidingLifecycleHistory = [];
+    this.presentationSlidingPublicationChain = Promise.resolve();
+    this.presentationSlidingRetirementQueued = false;
+    // Projection must stay single-flight because ChunkRenderAdapter owns one
+    // transactional projectionStaging registry. Scheduling, however, is not
+    // FIFO: the latest Player-visible owners outrank obsolete compatibility
+    // work, and stale in-flight work is cooperatively cancelled at safe slice
+    // boundaries inside projectChunk().
+    this.projectionQueue = [];
+    this.projectionActiveJob = null;
+    this.projectionSchedulerSequence = 0;
+    this.projectionDrainPromise = null;
+    this.projectionLifecycleHistory = [];
+    this.projectionChain = Promise.resolve();
+    // Phase A diagnostics only. This bounded event ledger follows canonical owner
+    // keys across demand, ChunkData, projection, upload admission, publication,
+    // and draw without changing scheduling or residency behavior.
+    this.presentationOwnerTraceByKey = new Map();
+    this.presentationOwnerTraceSequence = 0;
+    this.residencyIntentSequence = 0;
     this.provisionalTerrainKeys = new Set();
     this.provisionalTerrainPromises = new Map();
     this.deferredRenderReleaseKeys = new Set();
     this.transitionProtectedDataKeys = new Set();
+    this.transitionProtectedRenderKeys = new Set();
     this.centerChunkX = null;
     this.centerChunkZ = null;
     this.accessTick = 0;
@@ -240,6 +376,28 @@ export class ChunkRuntimeManager {
       terrainSchedulerIdleWithPendingMs: 0,
       terrainPresentationMaximumPendingWaitMs: 0,
       terrainPresentationCompletedUnclaimedDiscards: 0,
+      presentationSlidingTargets: 0,
+      presentationSlidingOwnersNeeded: 0,
+      presentationSlidingOwnersRequested: 0,
+      presentationSlidingOwnersReady: 0,
+      presentationSlidingOwnersAdmitted: 0,
+      presentationSlidingOwnersDrawn: 0,
+      presentationSlidingOwnersRetired: 0,
+      presentationSlidingOwnersReused: 0,
+      presentationSlidingOwnersSuperseded: 0,
+      presentationSlidingOwnerFailures: 0,
+      presentationSlidingRetirementRequests: 0,
+      presentationSlidingRetirementCoalesces: 0,
+      presentationSlidingMaximumPendingCount: 0,
+      presentationSlidingMaximumPublishedCount: 0,
+      presentationSlidingMaximumPhysicalRenderCount: 0,
+      projectionJobsQueued: 0,
+      projectionJobsStarted: 0,
+      projectionJobsCompleted: 0,
+      projectionJobsSupersededBeforeStart: 0,
+      projectionJobsCancelledInFlight: 0,
+      projectionMaximumQueueDepth: 0,
+      projectionLatestDemandMaximumWaitMs: 0,
     };
   }
 
@@ -285,6 +443,7 @@ export class ChunkRuntimeManager {
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'centerChunkZ');
     if (typeof required !== 'boolean') throw new TypeError('required must be a boolean');
     const key = createChunkKey(chunkX, chunkZ);
+    const intentSequence = ++this.residencyIntentSequence;
     if (required) {
       const prepared = this.preparedTransitions.get(key);
       if (prepared && !prepared.discarded) prepared.required = true;
@@ -294,6 +453,7 @@ export class ChunkRuntimeManager {
       ownerKey: createChunkKey(chunkX, chunkZ),
       chunkX,
       chunkZ,
+      intentSequence,
       fromChunkX: this.centerChunkX,
       fromChunkZ: this.centerChunkZ,
       transitionPendingCount: this.transitionPendingCount,
@@ -303,7 +463,7 @@ export class ChunkRuntimeManager {
     const operation = this.transitionChain.then(() => this.#performTransition(
       chunkX,
       chunkZ,
-      { required },
+      { required, intentSequence },
     ))
       .finally(() => { this.transitionPendingCount -= 1; });
     this.transitionChain = operation.catch(() => {});
@@ -319,7 +479,10 @@ export class ChunkRuntimeManager {
     this.pendingPrefetchKeys.add(key);
     this.preparationPendingCount += 1;
     const operation = this.preparationChain.then(async () => {
-      const result = await this.#ensureChunkData({ chunkX, chunkZ, key });
+      const result = await this.#ensureChunkData(
+        { chunkX, chunkZ, key },
+        { priority: CHUNK_DATA_PRIORITY.PLAYER_DATA, required: false },
+      );
       if (result.generated) this.counts.prefetched += 1;
       return result.generated;
     }).finally(() => {
@@ -517,12 +680,19 @@ export class ChunkRuntimeManager {
       failed: false,
       ready: false,
       terrainDependencyBatch: null,
+      presentationSlidingPromise: null,
       promise: null,
       startedAtMs: now,
       workCoordinates,
     };
     this.terrainReadyPlan = plan;
     plan.terrainDependencyBatch = this.#registerTerrainDependencyBatch(plan);
+    this.#updatePresentationSlidingTarget(plan);
+    plan.presentationSlidingPromise = this.#startPresentationSliding(plan);
+    // The serialized READY preparation joins this promise below, but attach a
+    // handler immediately so a canonical invariant rejection cannot surface as
+    // an unhandled rejection while the rest of the 5x5 batch is still running.
+    plan.presentationSlidingPromise.catch(() => {});
     this.preparationPendingCount += 1;
     const operation = this.preparationChain.then(() => this.#prepareTerrainReadyPlan(plan))
       .catch(error => {
@@ -552,6 +722,800 @@ export class ChunkRuntimeManager {
       queueDepth: this.#terrainReadyQueueDepth(),
     });
     return operation;
+  }
+
+  #presentationSlidingVisibleCoordinates(plan) {
+    const centerChunkX = plan.input.visibleCenterChunkX;
+    const centerChunkZ = plan.input.visibleCenterChunkZ;
+    const coordinates = [...squareChunkCoordinates(centerChunkX, centerChunkZ, 1)]
+      .sort((left, right) => {
+        const leftDistance = (left.chunkX - centerChunkX) ** 2
+          + (left.chunkZ - centerChunkZ) ** 2;
+        const rightDistance = (right.chunkX - centerChunkX) ** 2
+          + (right.chunkZ - centerChunkZ) ** 2;
+        return leftDistance - rightDistance
+          || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+      });
+    const readyRenderKeys = new Set(plan.input.renderCoordinates.map(value => value.key));
+    for (const coordinate of coordinates) {
+      if (!readyRenderKeys.has(coordinate.key)) {
+        throw new Error(`Presentation sliding target is outside READY render coverage: ${coordinate.key}`);
+      }
+    }
+    return Object.freeze(coordinates);
+  }
+
+  #isFullNearOwnerPublished(key) {
+    return this.renderedKeys.has(key)
+      || this.presentationSlidingPublishedKeys.has(key)
+      || this.deferredRenderReleaseKeys.has(key);
+  }
+
+  #prunePresentationOwnerTraceEntries() {
+    if (this.presentationOwnerTraceByKey.size <= PRESENTATION_OWNER_TRACE_OWNER_LIMIT) return;
+    const protectedKeys = new Set([
+      ...this.presentationSlidingDesiredKeys,
+      ...this.presentationSlidingPublishedKeys,
+      ...this.presentationSlidingOwnerJobs.keys(),
+      ...this.renderedKeys,
+      ...this.transitionProtectedRenderKeys,
+      ...(this.projectionActiveJob ? [this.projectionActiveJob.ownerKey] : []),
+      ...this.projectionQueue.map(job => job.ownerKey),
+    ]);
+    for (const key of [...this.presentationOwnerTraceByKey.keys()]) {
+      if (this.presentationOwnerTraceByKey.size <= PRESENTATION_OWNER_TRACE_OWNER_LIMIT) break;
+      if (protectedKeys.has(key)) continue;
+      this.presentationOwnerTraceByKey.delete(key);
+    }
+  }
+
+  #recordPresentationOwnerTrace(ownerKey, stage, details = null) {
+    if (typeof ownerKey !== 'string' || ownerKey.length === 0) return null;
+    const now = this.clock();
+    let trace = this.presentationOwnerTraceByKey.get(ownerKey);
+    if (!trace) {
+      trace = {
+        ownerKey,
+        firstAtMs: now,
+        lastAtMs: now,
+        events: [],
+      };
+      this.presentationOwnerTraceByKey.set(ownerKey, trace);
+    } else {
+      // Preserve insertion order as recency order so bounded pruning is stable.
+      this.presentationOwnerTraceByKey.delete(ownerKey);
+      this.presentationOwnerTraceByKey.set(ownerKey, trace);
+      trace.lastAtMs = now;
+    }
+    const runtimeCenterKey = this.centerChunkX === null
+      ? null : createChunkKey(this.centerChunkX, this.centerChunkZ);
+    const event = Object.freeze({
+      sequence: ++this.presentationOwnerTraceSequence,
+      stage,
+      atMs: now,
+      targetKey: this.presentationSlidingTarget?.key ?? null,
+      runtimeCenterKey,
+      ...(details ? { details: Object.freeze({ ...details }) } : {}),
+    });
+    trace.events.push(event);
+    while (trace.events.length > PRESENTATION_OWNER_TRACE_EVENT_LIMIT) trace.events.shift();
+    this.#prunePresentationOwnerTraceEntries();
+    return event;
+  }
+
+  #recordPresentationSlidingLifecycle(entry, event, details = null) {
+    const record = Object.freeze({
+      ownerKey: entry.key,
+      chunkX: entry.chunkX,
+      chunkZ: entry.chunkZ,
+      state: entry.state,
+      event,
+      targetKey: entry.targetKey,
+      planEpoch: entry.planEpoch,
+      atMs: this.clock(),
+      ...(details ? { details: Object.freeze({ ...details }) } : {}),
+    });
+    this.presentationSlidingLifecycleHistory.push(record);
+    this.#recordPresentationOwnerTrace(entry.key, `presentation:${event}`, {
+      state: entry.state,
+      targetKey: entry.targetKey,
+      planEpoch: entry.planEpoch,
+      ...(details ? { lifecycleDetails: details } : {}),
+    });
+    while (this.presentationSlidingLifecycleHistory.length
+      > PRESENTATION_SLIDING_LIFECYCLE_HISTORY_LIMIT) {
+      this.presentationSlidingLifecycleHistory.shift();
+    }
+    return record;
+  }
+
+  #prunePresentationSlidingOwnerStates() {
+    if (this.presentationSlidingOwnerStates.size <= PRESENTATION_SLIDING_OWNER_STATE_LIMIT) return;
+    const protectedKeys = new Set([
+      ...this.renderedKeys,
+      ...this.presentationSlidingDesiredKeys,
+      ...this.presentationSlidingPublishedKeys,
+      ...this.presentationSlidingOwnerJobs.keys(),
+      ...this.transitionProtectedRenderKeys,
+    ]);
+    for (const key of [...this.presentationSlidingOwnerStates.keys()]) {
+      if (this.presentationSlidingOwnerStates.size <= PRESENTATION_SLIDING_OWNER_STATE_LIMIT) break;
+      if (protectedKeys.has(key)) continue;
+      this.presentationSlidingOwnerStates.delete(key);
+    }
+  }
+
+  #presentationSlidingOwnerState(coordinate, plan, state = 'needed') {
+    let entry = this.presentationSlidingOwnerStates.get(coordinate.key);
+    if (!entry) {
+      const now = this.clock();
+      entry = {
+        key: coordinate.key,
+        chunkX: coordinate.chunkX,
+        chunkZ: coordinate.chunkZ,
+        state,
+        targetKey: createChunkKey(
+          plan.input.visibleCenterChunkX,
+          plan.input.visibleCenterChunkZ,
+        ),
+        planEpoch: plan.epoch,
+        neededAtMs: state === 'needed' ? now : null,
+        requestedAtMs: null,
+        readyAtMs: null,
+        admittedAtMs: null,
+        drawnAtMs: state === 'drawn' ? now : null,
+        retiredAtMs: null,
+        frameSequence: null,
+        failure: null,
+      };
+      this.presentationSlidingOwnerStates.set(coordinate.key, entry);
+      this.#recordPresentationSlidingLifecycle(entry, state === 'drawn' ? 'reused' : 'needed');
+      this.#prunePresentationSlidingOwnerStates();
+      return entry;
+    }
+    entry.chunkX = coordinate.chunkX;
+    entry.chunkZ = coordinate.chunkZ;
+    entry.targetKey = createChunkKey(
+      plan.input.visibleCenterChunkX,
+      plan.input.visibleCenterChunkZ,
+    );
+    entry.planEpoch = plan.epoch;
+    return entry;
+  }
+
+  #setPresentationSlidingOwnerState(entry, state, {
+    frameSequence = null,
+    error = null,
+    event = state,
+  } = {}) {
+    const now = this.clock();
+    entry.state = state;
+    if (state === 'needed' && entry.neededAtMs === null) entry.neededAtMs = now;
+    if (state === 'requested' && entry.requestedAtMs === null) entry.requestedAtMs = now;
+    if (state === 'ready' && entry.readyAtMs === null) entry.readyAtMs = now;
+    if (state === 'admitted' && entry.admittedAtMs === null) entry.admittedAtMs = now;
+    if (state === 'drawn') {
+      entry.drawnAtMs = now;
+      if (Number.isSafeInteger(frameSequence)) entry.frameSequence = frameSequence;
+    }
+    if (state === 'retire') entry.retiredAtMs = now;
+    if (error) {
+      entry.failure = Object.freeze({
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        code: error?.code ?? null,
+      });
+    }
+    this.#recordPresentationSlidingLifecycle(entry, event, error ? {
+      name: error?.name ?? 'Error',
+      message: error?.message ?? String(error),
+      code: error?.code ?? null,
+    } : null);
+    return entry;
+  }
+
+  #isPresentationSlidingJobCurrent(job) {
+    return !this.isShutdown
+      && job?.superseded !== true
+      && this.presentationSlidingOwnerJobs.get(job?.key) === job
+      && this.presentationSlidingDesiredKeys.has(job?.key);
+  }
+
+  #supersedePresentationSlidingOwnerJob(job, reason = 'target-superseded') {
+    if (!job || job.superseded) return false;
+    job.superseded = true;
+    job.supersedeReason = reason;
+    if (this.presentationSlidingOwnerJobs.get(job.key) === job) {
+      this.presentationSlidingOwnerJobs.delete(job.key);
+    }
+    job.resolveSuperseded?.(reason);
+    this.counts.presentationSlidingOwnersSuperseded += 1;
+    const entry = this.presentationSlidingOwnerStates.get(job.key) ?? null;
+    if (entry && entry.state !== 'retire') {
+      this.#setPresentationSlidingOwnerState(entry, 'retire', { event: reason });
+    } else if (entry) {
+      this.#recordPresentationSlidingLifecycle(entry, reason);
+    }
+    return true;
+  }
+
+  #supersedeObsoletePresentationSlidingOwnerJobs(desiredKeys) {
+    let superseded = 0;
+    for (const job of [...this.presentationSlidingOwnerJobs.values()]) {
+      if (desiredKeys.has(job.key)) continue;
+      superseded += Number(this.#supersedePresentationSlidingOwnerJob(
+        job,
+        'superseded-before-dependency-ready',
+      ));
+    }
+    return superseded;
+  }
+
+  #hasObsoletePresentationSlidingPhysicalOwners() {
+    const retained = new Set([
+      ...this.renderedKeys,
+      ...this.presentationSlidingDesiredKeys,
+      ...this.transitionProtectedRenderKeys,
+    ]);
+    for (const key of this.presentationSlidingPublishedKeys) {
+      if (!retained.has(key)) return true;
+    }
+    for (const key of this.deferredRenderReleaseKeys) {
+      if (!retained.has(key)) return true;
+    }
+    return false;
+  }
+
+  #schedulePresentationSlidingRetirement(reason) {
+    if (!this.#hasObsoletePresentationSlidingPhysicalOwners()) return null;
+    this.counts.presentationSlidingRetirementRequests += 1;
+    if (this.presentationSlidingRetirementQueued) {
+      this.counts.presentationSlidingRetirementCoalesces += 1;
+      return this.presentationSlidingPublicationChain;
+    }
+    this.presentationSlidingRetirementQueued = true;
+    const task = this.#queuePresentationSlidingPublication(async () => {
+      await this.#retireObsoletePresentationSlidingOwners(reason);
+    });
+    task.catch(() => {}).finally(() => {
+      this.presentationSlidingRetirementQueued = false;
+      if (this.#hasObsoletePresentationSlidingPhysicalOwners()) {
+        this.#schedulePresentationSlidingRetirement('target-superseded-coalesced');
+      }
+    });
+    return task;
+  }
+
+  #updatePresentationSlidingTarget(plan) {
+    const coordinates = this.#presentationSlidingVisibleCoordinates(plan);
+    const desiredKeys = new Set(coordinates.map(value => value.key));
+    const previousKeys = this.presentationSlidingDesiredKeys;
+    const targetKey = createChunkKey(
+      plan.input.visibleCenterChunkX,
+      plan.input.visibleCenterChunkZ,
+    );
+    const targetChanged = this.presentationSlidingTarget?.key !== targetKey;
+    const intentSequence = ++this.residencyIntentSequence;
+    this.presentationSlidingDesiredKeys = desiredKeys;
+    this.presentationSlidingTarget = Object.freeze({
+      key: targetKey,
+      chunkX: plan.input.visibleCenterChunkX,
+      chunkZ: plan.input.visibleCenterChunkZ,
+      planEpoch: plan.epoch,
+      intentSequence,
+      desiredKeys: Object.freeze(sortedKeys(desiredKeys)),
+      requestedAtMs: this.clock(),
+    });
+    if (targetChanged) this.counts.presentationSlidingTargets += 1;
+    this.#supersedeObsoletePresentationSlidingOwnerJobs(desiredKeys);
+    // A superseded sliding job may already be inside the single-flight render
+    // projection. Tell the cooperative projection scheduler immediately so it
+    // can abandon the old owner at the next safe slice boundary instead of
+    // making the latest 3x3 wait behind historical movement.
+    this.#pruneObsoleteProjectionJobs('player-target-superseded');
+
+    for (const coordinate of coordinates) {
+      if (this.deferredRenderReleaseKeys.has(coordinate.key)
+        && !this.renderedKeys.has(coordinate.key)) {
+        this.deferredRenderReleaseKeys.delete(coordinate.key);
+        this.presentationSlidingPublishedKeys.add(coordinate.key);
+      }
+      const published = this.#isFullNearOwnerPublished(coordinate.key);
+      const entry = this.#presentationSlidingOwnerState(
+        coordinate,
+        plan,
+        published ? 'drawn' : 'needed',
+      );
+      if (!previousKeys.has(coordinate.key)) {
+        if (published) {
+          this.counts.presentationSlidingOwnersReused += 1;
+          if (entry.state !== 'drawn') {
+            this.#setPresentationSlidingOwnerState(entry, 'drawn', { event: 'reused' });
+          } else {
+            this.#recordPresentationSlidingLifecycle(entry, 'reused');
+          }
+        } else {
+          this.counts.presentationSlidingOwnersNeeded += 1;
+          if (entry.state === 'retire' || entry.state === 'failed') {
+            entry.neededAtMs = this.clock();
+            entry.requestedAtMs = null;
+            entry.readyAtMs = null;
+            entry.admittedAtMs = null;
+            entry.drawnAtMs = null;
+            entry.retiredAtMs = null;
+            entry.failure = null;
+            this.#setPresentationSlidingOwnerState(entry, 'needed');
+          }
+        }
+      }
+    }
+
+    // Published speculative owners that fell out of the latest Player 3x3 are
+    // no longer useful. Retire only those speculative owners; the committed
+    // 3x3 remains the rollback-safe floor until the compatibility transition
+    // promotes the new set.
+    this.#schedulePresentationSlidingRetirement('target-superseded');
+    this.#prunePresentationSlidingOwnerStates();
+    return this.presentationSlidingTarget;
+  }
+
+  #queuePresentationSlidingPublication(operation) {
+    const queued = this.presentationSlidingPublicationChain.then(operation);
+    this.presentationSlidingPublicationChain = queued.catch(() => {});
+    return queued;
+  }
+
+  #recordProjectionLifecycle(job, event, details = null) {
+    const record = Object.freeze({
+      ownerKey: job.ownerKey,
+      intent: job.intent,
+      priority: job.priority,
+      intentSequence: job.intentSequence,
+      sequence: job.sequence,
+      event,
+      atMs: this.clock(),
+      ...(details ? { details: Object.freeze({ ...details }) } : {}),
+    });
+    this.projectionLifecycleHistory.push(record);
+    this.#recordPresentationOwnerTrace(job.ownerKey, `projection:${event}`, {
+      intent: job.intent,
+      priority: job.priority,
+      intentSequence: job.intentSequence,
+      ...(details ? { lifecycleDetails: details } : {}),
+    });
+    while (this.projectionLifecycleHistory.length
+      > PROJECTION_SCHEDULER_LIFECYCLE_HISTORY_LIMIT) {
+      this.projectionLifecycleHistory.shift();
+    }
+    return record;
+  }
+
+  #projectionJobIsCurrent(job) {
+    if (!job || this.isShutdown || job.cancelRequested) return false;
+    try {
+      return job.isCurrent?.() !== false;
+    } catch {
+      return false;
+    }
+  }
+
+  #cancelQueuedProjectionJob(job, reason) {
+    if (!job || job.settled) return false;
+    job.cancelRequested = true;
+    job.cancelReason = reason;
+    job.settled = true;
+    this.counts.projectionJobsSupersededBeforeStart += 1;
+    this.#recordProjectionLifecycle(job, 'superseded-before-start', { reason });
+    job.reject(projectionSchedulerSupersededError(job.ownerKey, reason));
+    return true;
+  }
+
+  #pruneObsoleteProjectionJobs(reason = 'latest-spatial-demand') {
+    if (this.projectionQueue.length > 0) {
+      const retained = [];
+      for (const job of this.projectionQueue) {
+        if (this.#projectionJobIsCurrent(job)) retained.push(job);
+        else this.#cancelQueuedProjectionJob(job, reason);
+      }
+      this.projectionQueue = retained;
+    }
+    const active = this.projectionActiveJob;
+    if (active && !active.cancelRequested && !this.#projectionJobIsCurrent(active)) {
+      active.cancelRequested = true;
+      active.cancelReason = reason;
+      this.#recordProjectionLifecycle(active, 'cancel-requested-in-flight', { reason });
+    }
+  }
+
+  #projectionPriorityForPlayerOwner(_coordinate) {
+    // All owners in the current Player 3x3 share the Critical projection lane.
+    // Intent sequence, not geometric micro-ordering, is the supersession key;
+    // this preserves deterministic dependency/publication order within one target.
+    return PROJECTION_PRIORITY.PLAYER_VISIBLE_CENTER;
+  }
+
+  #compatibilityProjectionIsCurrent(targetKey, { initial = false } = {}) {
+    if (this.isShutdown) return false;
+    if (initial || this.presentationSlidingTarget === null) return true;
+    return this.presentationSlidingTarget.key === targetKey;
+  }
+
+  #ensureProjectionDrain() {
+    if (this.projectionDrainPromise) return this.projectionDrainPromise;
+    const drain = (async () => {
+      while (this.projectionQueue.length > 0) {
+        this.#pruneObsoleteProjectionJobs('queue-prune');
+        if (this.projectionQueue.length === 0) break;
+        this.projectionQueue.sort((left, right) => (
+          left.priority - right.priority
+          || right.intentSequence - left.intentSequence
+          || left.sequence - right.sequence
+        ));
+        const job = this.projectionQueue.shift();
+        if (!this.#projectionJobIsCurrent(job)) {
+          this.#cancelQueuedProjectionJob(job, 'superseded-before-start');
+          continue;
+        }
+        this.projectionActiveJob = job;
+        job.startedAtMs = this.clock();
+        this.counts.projectionJobsStarted += 1;
+        if (job.intent === 'player-visible') {
+          this.counts.projectionLatestDemandMaximumWaitMs = Math.max(
+            this.counts.projectionLatestDemandMaximumWaitMs,
+            Math.max(0, job.startedAtMs - job.queuedAtMs),
+          );
+        }
+        this.#recordProjectionLifecycle(job, 'started');
+        try {
+          const projected = await this.renderAdapter.projectChunk(job.chunkData, job.origin, {
+            ...job.options,
+            shouldCancel: () => !this.#projectionJobIsCurrent(job),
+          });
+          if (!this.#projectionJobIsCurrent(job)) {
+            await this.renderAdapter.discardProjected?.(projected);
+            throw projectionSchedulerSupersededError(
+              job.ownerKey,
+              job.cancelReason ?? 'superseded-after-projection',
+            );
+          }
+          job.settled = true;
+          this.counts.projectionJobsCompleted += 1;
+          this.#recordProjectionLifecycle(job, 'completed', {
+            durationMs: Math.max(0, this.clock() - job.startedAtMs),
+          });
+          job.resolve(projected);
+        } catch (error) {
+          const cancelled = isProjectionSupersededError(error)
+            || job.cancelRequested
+            || !this.#projectionJobIsCurrent(job);
+          job.settled = true;
+          if (cancelled) {
+            this.counts.projectionJobsCancelledInFlight += 1;
+            const reason = job.cancelReason ?? error?.reason ?? 'superseded-in-flight';
+            this.#recordProjectionLifecycle(job, 'cancelled-in-flight', { reason });
+            job.reject(projectionSchedulerSupersededError(job.ownerKey, reason));
+          } else {
+            this.#recordProjectionLifecycle(job, 'failed', {
+              name: error?.name ?? 'Error',
+              message: error?.message ?? String(error),
+              code: error?.code ?? null,
+            });
+            job.reject(error);
+          }
+        } finally {
+          if (this.projectionActiveJob === job) this.projectionActiveJob = null;
+        }
+      }
+    })().finally(() => {
+      this.projectionDrainPromise = null;
+      if (this.projectionQueue.length > 0 && !this.isShutdown) this.#ensureProjectionDrain();
+    });
+    this.projectionDrainPromise = drain;
+    this.projectionChain = drain.catch(() => {});
+    return drain;
+  }
+
+  #queueProjectedChunk(chunkData, origin, options, {
+    intent = 'background',
+    priority = PROJECTION_PRIORITY.PREFETCH_BACKGROUND,
+    intentSequence = this.residencyIntentSequence,
+    isCurrent = () => !this.isShutdown,
+  } = {}) {
+    const ownerKey = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    const job = {
+      ownerKey,
+      chunkData,
+      origin,
+      options,
+      intent,
+      priority,
+      intentSequence,
+      isCurrent,
+      sequence: ++this.projectionSchedulerSequence,
+      queuedAtMs: this.clock(),
+      startedAtMs: null,
+      cancelRequested: false,
+      cancelReason: null,
+      settled: false,
+      resolve,
+      reject,
+      promise,
+    };
+    this.projectionQueue.push(job);
+    this.counts.projectionJobsQueued += 1;
+    this.counts.projectionMaximumQueueDepth = Math.max(
+      this.counts.projectionMaximumQueueDepth,
+      this.projectionQueue.length,
+    );
+    this.#recordProjectionLifecycle(job, 'queued');
+    this.#pruneObsoleteProjectionJobs('latest-spatial-demand');
+    this.#ensureProjectionDrain();
+    return promise;
+  }
+
+  #startPresentationSliding(plan) {
+    const coordinates = this.#presentationSlidingVisibleCoordinates(plan);
+    const jobs = coordinates.map(coordinate => {
+      if (this.#isFullNearOwnerPublished(coordinate.key)) return Promise.resolve(true);
+      const completion = plan.terrainDependencyBatch.completionsByKey.get(coordinate.key);
+      if (!completion) {
+        return Promise.reject(new Error(
+          `Presentation sliding owner has no registered dependency: ${coordinate.key}`,
+        ));
+      }
+      return this.#ensurePresentationSlidingOwner(plan, coordinate, completion);
+    });
+    return Promise.all(jobs).then(results => Object.freeze(results));
+  }
+
+  #ensurePresentationSlidingOwner(plan, coordinate, dependencyCompletion) {
+    if (this.#isFullNearOwnerPublished(coordinate.key)) return Promise.resolve(true);
+    const existing = this.presentationSlidingOwnerJobs.get(coordinate.key);
+    if (existing && !existing.superseded) {
+      // The same canonical owner can remain in the Player-visible 3x3 while the
+      // center advances. Transfer the live job to the newest intent instead of
+      // restarting generation/projection or leaving its admission tagged to an
+      // obsolete plan epoch.
+      existing.plan = plan;
+      existing.planEpoch = plan.epoch;
+      existing.intentSequence = this.presentationSlidingTarget?.intentSequence ?? 0;
+      return existing.promise;
+    }
+    const entry = this.#presentationSlidingOwnerState(coordinate, plan);
+    this.#setPresentationSlidingOwnerState(entry, 'requested');
+    this.counts.presentationSlidingOwnersRequested += 1;
+    let resolveSuperseded;
+    const supersededPromise = new Promise(resolve => { resolveSuperseded = resolve; });
+    const job = {
+      key: coordinate.key,
+      plan,
+      planEpoch: plan.epoch,
+      intentSequence: this.presentationSlidingTarget?.intentSequence ?? 0,
+      promise: null,
+      superseded: false,
+      supersedeReason: null,
+      supersededPromise,
+      resolveSuperseded,
+    };
+    const operation = (async () => {
+      try {
+        this.#recordPresentationOwnerTrace(coordinate.key, 'dependency:wait-start', {
+          planEpoch: job.planEpoch,
+          targetKey: this.presentationSlidingTarget?.key ?? null,
+        });
+        const wait = await Promise.race([
+          dependencyCompletion.then(dependency => Object.freeze({ dependency })),
+          supersededPromise.then(reason => Object.freeze({ superseded: true, reason })),
+        ]);
+        if (wait.superseded) {
+          this.#recordPresentationOwnerTrace(coordinate.key, 'dependency:superseded', {
+            reason: wait.reason ?? 'superseded',
+          });
+          return false;
+        }
+        const dependency = wait.dependency;
+        if (!this.#isPresentationSlidingJobCurrent(job)) {
+          this.#supersedePresentationSlidingOwnerJob(job, 'superseded-before-ready');
+          return false;
+        }
+        if (dependency?.result?.cancelled || !dependency?.result?.data) {
+          this.#recordPresentationOwnerTrace(coordinate.key, 'dependency:cancelled');
+          this.#supersedePresentationSlidingOwnerJob(job, 'dependency-cancelled');
+          return false;
+        }
+        this.#recordPresentationOwnerTrace(coordinate.key, 'dependency:ready', {
+          generated: dependency?.result?.generated === true,
+          cacheHit: dependency?.cacheHit === true,
+        });
+        this.#setPresentationSlidingOwnerState(entry, 'ready');
+        this.counts.presentationSlidingOwnersReady += 1;
+        return await this.#queuePresentationSlidingPublication(() => (
+          this.#publishPresentationSlidingOwner(job, coordinate, entry)
+        ));
+      } catch (error) {
+        if (job.superseded) return false;
+        this.counts.presentationSlidingOwnerFailures += 1;
+        this.#setPresentationSlidingOwnerState(entry, 'failed', { error });
+        if (error?.retryable === false
+          || error?.code === 'CANONICAL_WORLD_INVARIANT'
+          || error?.code === 'RUNTIME_WORLD_INVARIANT') throw error;
+        return false;
+      }
+    })().finally(() => {
+      if (this.presentationSlidingOwnerJobs.get(coordinate.key) === job) {
+        this.presentationSlidingOwnerJobs.delete(coordinate.key);
+      }
+      this.presentationSlidingActiveJobPromises.delete(operation);
+    });
+    job.promise = operation;
+    this.presentationSlidingOwnerJobs.set(coordinate.key, job);
+    this.presentationSlidingActiveJobPromises.add(operation);
+    this.counts.presentationSlidingMaximumPendingCount = Math.max(
+      this.counts.presentationSlidingMaximumPendingCount,
+      this.presentationSlidingOwnerJobs.size,
+    );
+    return operation;
+  }
+
+  async #publishPresentationSlidingOwner(job, coordinate, entry) {
+    this.#recordPresentationOwnerTrace(coordinate.key, 'publication:owner-start', {
+      planEpoch: job.planEpoch,
+      intentSequence: job.intentSequence,
+    });
+    if (!this.#isPresentationSlidingJobCurrent(job)) {
+      this.#supersedePresentationSlidingOwnerJob(job, 'superseded-before-admission');
+      return false;
+    }
+    if (this.#isFullNearOwnerPublished(coordinate.key)) {
+      this.counts.presentationSlidingOwnersReused += 1;
+      this.#setPresentationSlidingOwnerState(entry, 'drawn', { event: 'reused-before-admission' });
+      return true;
+    }
+
+    let projected = this.terrainReadyProjectedByKey.get(coordinate.key) ?? null;
+    if (projected?.lifecycle === 'staged') {
+      this.#recordPresentationOwnerTrace(coordinate.key, 'projection:reused-terrain-ready-staged');
+      this.terrainReadyProjectedByKey.delete(coordinate.key);
+    } else {
+      projected = null;
+    }
+    const promotedTerrain = this.provisionalTerrainKeys.has(coordinate.key);
+    try {
+      if (!projected) {
+        const chunkData = this.cache.get(coordinate.key)?.data ?? null;
+        if (!chunkData) throw new Error(`Presentation sliding ChunkData is undefined: ${coordinate.key}`);
+        const projectionStartedAt = this.clock();
+        projected = await this.#queueProjectedChunk(chunkData, this.renderOrigin, {
+          deferredRegistration: true,
+          yieldToHost: this.yieldToHost,
+        }, {
+          intent: 'player-visible',
+          priority: this.#projectionPriorityForPlayerOwner(coordinate),
+          intentSequence: job.intentSequence,
+          isCurrent: () => this.#isPresentationSlidingJobCurrent(job),
+        });
+        this.performance.record('projection', this.clock() - projectionStartedAt);
+        this.counts.preparedProjections += 1;
+        this.counts.terrainReadyOwnersProjected += 1;
+      }
+      if (!this.#isPresentationSlidingJobCurrent(job)) {
+        await this.renderAdapter.discardProjected?.(projected);
+        this.#supersedePresentationSlidingOwnerJob(job, 'superseded-after-projection');
+        return false;
+      }
+      let publicationApplied = false;
+      const result = await this.#publishProjectedOwnerWithAdmission(projected, {
+        initial: this.centerChunkX === null,
+        generation: job.plan.epoch,
+        isCurrent: () => this.#isPresentationSlidingJobCurrent(job),
+        onPublished: () => {
+          publicationApplied = true;
+          if (promotedTerrain) this.provisionalTerrainKeys.delete(coordinate.key);
+          if (!this.renderedKeys.has(coordinate.key)) {
+            this.presentationSlidingPublishedKeys.add(coordinate.key);
+          }
+          this.deferredRenderReleaseKeys.delete(coordinate.key);
+          this.#setPresentationSlidingOwnerState(entry, 'admitted');
+          this.counts.presentationSlidingOwnersAdmitted += 1;
+          this.counts.renderLoaded += 1;
+          this.counts.presentationSlidingMaximumPublishedCount = Math.max(
+            this.counts.presentationSlidingMaximumPublishedCount,
+            this.presentationSlidingPublishedKeys.size,
+          );
+          this.counts.presentationSlidingMaximumPhysicalRenderCount = Math.max(
+            this.counts.presentationSlidingMaximumPhysicalRenderCount,
+            this.#physicalRenderKeys().size,
+          );
+          if (this.onPipelineEvent) this.#recordPipelineEvent(
+            'runtime-presentation-sliding-owner-admitted',
+            {
+              ownerKey: coordinate.key,
+              targetOwnerKey: this.presentationSlidingTarget?.key ?? null,
+              planEpoch: job.plan.epoch,
+              physicalRenderOwnerCount: this.#physicalRenderKeys().size,
+            },
+          );
+        },
+      });
+      if (!publicationApplied) {
+        throw new Error(`Presentation sliding admission completed without publication: ${coordinate.key}`);
+      }
+      if (!this.#isPresentationSlidingJobCurrent(job)) {
+        await this.#retireObsoletePresentationSlidingOwners('superseded-after-admission');
+        this.#supersedePresentationSlidingOwnerJob(job, 'superseded-after-admission');
+        return false;
+      }
+      this.#setPresentationSlidingOwnerState(entry, 'drawn', {
+        frameSequence: result?.frameSequence ?? null,
+      });
+      this.counts.presentationSlidingOwnersDrawn += 1;
+      this.terrainReadyReadyKeys.add(coordinate.key);
+      this.#completeTerrainReadyQueueOwner(coordinate.key);
+      if (this.onPipelineEvent) this.#recordPipelineEvent(
+        'runtime-presentation-sliding-owner-drawn',
+        {
+          ownerKey: coordinate.key,
+          targetOwnerKey: this.presentationSlidingTarget?.key ?? null,
+          planEpoch: job.plan.epoch,
+          frameSequence: result?.frameSequence ?? null,
+        },
+      );
+      await this.#retireObsoletePresentationSlidingOwners('owner-drawn');
+      return true;
+    } catch (error) {
+      const loaded = this.presentationSlidingPublishedKeys.has(coordinate.key)
+        || this.deferredRenderReleaseKeys.has(coordinate.key);
+      if (loaded && !this.renderedKeys.has(coordinate.key)) {
+        try {
+          if (promotedTerrain) {
+            await this.renderAdapter.retainTerrainChunk(coordinate.key);
+            this.provisionalTerrainKeys.add(coordinate.key);
+          } else {
+            await this.renderAdapter.unloadChunk(coordinate.key);
+          }
+          this.presentationSlidingPublishedKeys.delete(coordinate.key);
+          this.deferredRenderReleaseKeys.delete(coordinate.key);
+          this.counts.renderUnloaded += 1;
+        } catch (rollbackError) {
+          this.deferredRenderReleaseKeys.add(coordinate.key);
+          throw new AggregateError(
+            [error, rollbackError],
+            `Presentation sliding owner failed and rollback was incomplete: ${coordinate.key}`,
+          );
+        }
+      } else if (projected?.lifecycle === 'staged') {
+        await this.renderAdapter.discardProjected?.(projected);
+      }
+      throw error;
+    }
+  }
+
+  async #retireObsoletePresentationSlidingOwners(reason) {
+    const retained = new Set([
+      ...this.renderedKeys,
+      ...this.presentationSlidingDesiredKeys,
+      ...this.transitionProtectedRenderKeys,
+    ]);
+    const publicationSequence = [];
+    await this.#releaseObsoleteRenderOwners(retained, publicationSequence, {
+      slidingReason: reason,
+    });
+    this.#prunePresentationSlidingOwnerStates();
+    return publicationSequence;
+  }
+
+  async #awaitPresentationSlidingOwners(keys) {
+    const pending = [...keys]
+      .map(key => this.presentationSlidingOwnerJobs.get(key)?.promise ?? null)
+      .filter(Boolean);
+    if (pending.length === 0) return;
+    await Promise.all(pending);
   }
 
   #terrainPresentationRevision() {
@@ -916,7 +1880,10 @@ export class ChunkRuntimeManager {
       });
       if (!result?.presentationGeneration) {
         if (this.#isTerrainPresentationEntryCurrent(entry)) {
-          throw new Error(`Terrain presentation generation was not prepared: ${entry.identity}`);
+          throw runtimeWorldInvariantError(
+            new Error(`Terrain presentation generation was not prepared: ${entry.identity}`),
+            'terrain-presentation-prepare-result',
+          );
         }
         return null;
       }
@@ -1016,7 +1983,14 @@ export class ChunkRuntimeManager {
       return entry;
     }).catch(error => {
       if (this.#isTerrainPresentationEntryCurrent(entry)) entry.state = 'failed';
-      throw error;
+      throw runtimeTransitionRetryableError(
+        error,
+        'terrain-presentation-generation',
+        {
+          code: 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION',
+          faultDomain: 'presentation',
+        },
+      );
     }).finally(() => {
       if (this.terrainPresentationInFlightIdentity === entry.identity) {
         this.terrainPresentationInFlightIdentity = null;
@@ -1188,6 +2162,21 @@ export class ChunkRuntimeManager {
     if (renderOwnerCount !== 9) {
       throw new Error(`latest Terrain dependency render set must contain 9 owners, got ${renderOwnerCount}`);
     }
+    // Promote every shared dependency before admitting any new required owner.
+    // Otherwise coordinate iteration order can let the first new contender
+    // preempt an active future-Full request that is also required by this batch.
+    for (const coordinate of coordinates) {
+      const operation = this.terrainReadyChunkDataOperations.get(coordinate.key);
+      if (!operation) continue;
+      operation.boundPlanEpoch = plan.epoch;
+      operation.request.promote?.({
+        priority: this.#terrainReadyRequestPriority(coordinate, plan, {
+          terrainDependency: true,
+        }),
+        required: true,
+        deadlineAtMs: plan.startedAtMs,
+      });
+    }
     const registrationStartedAtMs = this.clock();
     const batch = {
       planEpoch: plan.epoch,
@@ -1211,6 +2200,7 @@ export class ChunkRuntimeManager {
       waitMs: null,
       lastOwnerWaitMs: 0,
       waitSamples: [],
+      completionsByKey: new Map(),
       promise: null,
     };
     this.terrainDependencyLatestBatch = batch;
@@ -1220,10 +2210,12 @@ export class ChunkRuntimeManager {
         batch.cacheHitCount += 1;
         batch.completedCount += 1;
         this.counts.terrainDependencyCacheHits += 1;
-        return Promise.resolve(Object.freeze({ coordinate, result: Object.freeze({
+        const completion = Promise.resolve(Object.freeze({ coordinate, result: Object.freeze({
           data: cached,
           generated: false,
         }) }));
+        batch.completionsByKey.set(coordinate.key, completion);
+        return completion;
       }
       const registeredAtMs = this.clock();
       if (batch.firstRegisteredAtMs === null) batch.firstRegisteredAtMs = registeredAtMs;
@@ -1241,7 +2233,7 @@ export class ChunkRuntimeManager {
           requiresRender: this.#isLatestTerrainRenderDependency(coordinate, plan),
         });
       }
-      return this.#ensureTerrainReadyChunkData(coordinate, {
+      const completion = this.#ensureTerrainReadyChunkData(coordinate, {
         priority: this.#terrainReadyRequestPriority(coordinate, plan, {
           terrainDependency: true,
         }),
@@ -1261,6 +2253,8 @@ export class ChunkRuntimeManager {
         }
         return Object.freeze({ coordinate, result });
       });
+      batch.completionsByKey.set(coordinate.key, completion);
+      return completion;
     });
     batch.allRegisteredAtMs = this.clock();
     batch.registrationDurationMs = Math.max(0, batch.allRegisteredAtMs - registrationStartedAtMs);
@@ -1299,6 +2293,11 @@ export class ChunkRuntimeManager {
     const dependencyOutcome = await plan.terrainDependencyBatch.promise;
     if (dependencyOutcome.error) throw dependencyOutcome.error;
     if (plan.discarded || dependencyOutcome.cancelled) return null;
+    // Phase 3 publishes the Player-visible 3x3 owner-by-owner as soon as each
+    // dependency resolves. Once the full READY dependency batch catches up,
+    // join those publications before staging any fallback projection so the
+    // same canonical owner cannot be projected twice by the two paths.
+    if (plan.presentationSlidingPromise) await plan.presentationSlidingPromise;
     for (const coordinate of plan.workCoordinates) {
       if (coordinate.visibleRequired === true && !this.cache.has(coordinate.key)) {
         throw new Error(`latest Terrain dependency is unresolved: ${coordinate.key}`);
@@ -1315,11 +2314,19 @@ export class ChunkRuntimeManager {
           priority,
           requiresRender,
         });
+        // Resident membership protects canonical Full data from eviction; it
+        // must not make the entire 100m window a deadline-safety generation
+        // request. Only the latest Player-visible 5x5 is scheduler-required.
+        // The remaining resident window is background fill and may be
+        // superseded while staying protected once materialized.
+        const schedulerRequired = coordinate.visibleRequired === true;
         result = await this.#ensureTerrainReadyChunkData(coordinate, {
           priority,
           plan,
-          deadlineAtMs: plan.startedAtMs + coordinate.arrivalSeconds * 1000,
-          required: coordinate.residentRequired === true,
+          deadlineAtMs: schedulerRequired
+            ? plan.startedAtMs + coordinate.arrivalSeconds * 1000
+            : null,
+          required: schedulerRequired,
         });
         if (result.generated) {
           this.counts.terrainReadyOwnersGenerated += 1;
@@ -1345,10 +2352,24 @@ export class ChunkRuntimeManager {
       const entry = this.cache.get(coordinate.key);
       if (!entry?.data) throw new Error(`READY ChunkData is undefined: ${coordinate.key}`);
       const projectionStartedAt = this.clock();
-      const projected = await this.renderAdapter.projectChunk(entry.data, this.renderOrigin, {
-        deferredRegistration: true,
-        yieldToHost: this.yieldToHost,
-      });
+      let projected;
+      try {
+        projected = await this.#queueProjectedChunk(entry.data, this.renderOrigin, {
+          deferredRegistration: true,
+          yieldToHost: this.yieldToHost,
+        }, {
+          intent: 'terrain-ready-visible',
+          priority: PROJECTION_PRIORITY.TERRAIN_READY_VISIBLE,
+          intentSequence: this.presentationSlidingTarget?.intentSequence ?? plan.epoch,
+          isCurrent: () => !this.isShutdown && !plan.discarded,
+        });
+      } catch (error) {
+        if (isProjectionSupersededError(error)) {
+          this.counts.terrainReadyStaleCompletions += 1;
+          return null;
+        }
+        throw error;
+      }
       this.performance.record('projection', this.clock() - projectionStartedAt);
       this.counts.preparedProjections += 1;
       this.counts.terrainReadyOwnersProjected += 1;
@@ -1404,7 +2425,7 @@ export class ChunkRuntimeManager {
   }
 
   #isTerrainRenderReady(key) {
-    if (this.renderedKeys.has(key) || this.deferredRenderReleaseKeys.has(key)
+    if (this.#isFullNearOwnerPublished(key)
       || this.terrainReadyProjectedByKey.has(key)) return true;
     for (const plan of this.preparedPlanRegistry) {
       if (!plan.discarded && plan.projectedByKey.has(key)) return true;
@@ -1446,7 +2467,7 @@ export class ChunkRuntimeManager {
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'traversalTerrainChunkZ');
     const key = createChunkKey(chunkX, chunkZ);
     if (this.isShutdown) return Promise.resolve(false);
-    if (this.renderedKeys.has(key) || this.provisionalTerrainKeys.has(key)) {
+    if (this.#isFullNearOwnerPublished(key) || this.provisionalTerrainKeys.has(key)) {
       return Promise.resolve(true);
     }
     if (!this.activeDataKeys.has(key)) return Promise.resolve(false);
@@ -1464,9 +2485,9 @@ export class ChunkRuntimeManager {
         const entry = this.cache.get(key);
         if (!entry?.data || !this.activeDataKeys.has(key)) return false;
         projected = await this.renderAdapter.projectTerrainChunk(entry.data, this.renderOrigin);
-        if (this.renderedKeys.has(key) || !this.activeDataKeys.has(key)) {
+        if (this.#isFullNearOwnerPublished(key) || !this.activeDataKeys.has(key)) {
           await this.renderAdapter.discardProjected?.(projected);
-          return this.renderedKeys.has(key);
+          return this.#isFullNearOwnerPublished(key);
         }
         this.provisionalTerrainKeys.add(key);
         await this.renderAdapter.loadProjectedTerrain(projected);
@@ -1487,7 +2508,7 @@ export class ChunkRuntimeManager {
     const chunkX = assertLogicalChunkCoordinate(chunkXInput, 'terrainCoverageChunkX');
     const chunkZ = assertLogicalChunkCoordinate(chunkZInput, 'terrainCoverageChunkZ');
     const key = createChunkKey(chunkX, chunkZ);
-    return this.renderedKeys.has(key) || this.provisionalTerrainKeys.has(key);
+    return this.#isFullNearOwnerPublished(key) || this.provisionalTerrainKeys.has(key);
   }
 
   isTerrainCoverageProvisional(chunkXInput, chunkZInput) {
@@ -1518,6 +2539,10 @@ export class ChunkRuntimeManager {
       startedAtMs: this.clock(),
     };
     for (const coordinate of plan.renderCoordinates) {
+      // The latest Player-visible 3x3 is owned by continuous sliding. Do not
+      // steal its staged projection into a legacy whole-window plan.
+      if (this.presentationSlidingDesiredKeys.has(coordinate.key)
+        || this.presentationSlidingOwnerJobs.has(coordinate.key)) continue;
       const projected = this.terrainReadyProjectedByKey.get(coordinate.key);
       if (!projected || projected.lifecycle !== 'staged') continue;
       this.terrainReadyProjectedByKey.delete(coordinate.key);
@@ -1540,8 +2565,8 @@ export class ChunkRuntimeManager {
   #markPreparedPlanReadyFromExistingWork(plan) {
     if (plan.dataCoordinates.some(coordinate => !this.cache.has(coordinate.key))) return false;
     if (plan.renderCoordinates.some(coordinate => (
-      !this.renderedKeys.has(coordinate.key)
-        && !this.deferredRenderReleaseKeys.has(coordinate.key)
+      !this.#isFullNearOwnerPublished(coordinate.key)
+        && !this.presentationSlidingOwnerJobs.has(coordinate.key)
         && !plan.projectedByKey.has(coordinate.key)
     ))) return false;
     plan.ready = true;
@@ -1564,6 +2589,13 @@ export class ChunkRuntimeManager {
     priority, consumerId, epoch, deadlineAtMs = null, required = undefined,
   }) {
     const generationStartedAt = this.clock();
+    this.#recordPresentationOwnerTrace(coordinate.key, 'chunk-data:request-start', {
+      priority,
+      consumerId,
+      epoch,
+      deadlineAtMs,
+      ...(required === undefined ? {} : { required }),
+    });
     if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-request-started', {
       ownerKey: coordinate.key,
       chunkX: coordinate.chunkX,
@@ -1586,6 +2618,13 @@ export class ChunkRuntimeManager {
     const promise = request.promise.then(chunkData => {
       const requestDurationMs = this.clock() - generationStartedAt;
       this.performance.record('generation', requestDurationMs);
+      this.#recordPresentationOwnerTrace(coordinate.key, 'chunk-data:request-complete', {
+        priority,
+        consumerId,
+        epoch,
+        requestDurationMs,
+        result: chunkData === null ? 'cancelled' : 'ready',
+      });
       if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-request-complete', {
         ownerKey: coordinate.key,
         chunkX: coordinate.chunkX,
@@ -1669,11 +2708,18 @@ export class ChunkRuntimeManager {
 
   #acceptChunkData(coordinate, chunkData) {
     if (!chunkData || chunkData.chunkX !== coordinate.chunkX || chunkData.chunkZ !== coordinate.chunkZ) {
-      throw new Error(`generator returned invalid prefetched ChunkData for ${coordinate.key}`);
+      throw runtimeWorldInvariantError(
+        new Error(`generator returned invalid prefetched ChunkData for ${coordinate.key}`),
+        'prefetched-chunk-contract',
+      );
     }
     const prior = this.cache.get(coordinate.key);
     if (prior && (prior.data.chunkId !== chunkData.chunkId || prior.data.contentHash !== chunkData.contentHash)) {
-      throw new Error(`same chunk key produced differing identity/content: ${coordinate.key}`);
+      throw runtimeWorldInvariantError(
+        new Error(`same chunk key produced differing identity/content: ${coordinate.key}`),
+        'prefetched-chunk-identity',
+        { code: 'CANONICAL_WORLD_INVARIANT', faultDomain: 'canonical-world' },
+      );
     }
     this.#registerIdentity(coordinate.key, chunkData);
     this.chunkIndex?.registerChunk(chunkData);
@@ -1696,6 +2742,9 @@ export class ChunkRuntimeManager {
     const existing = this.cache.get(coordinate.key);
     if (existing?.data) {
       existing.lastUsed = ++this.accessTick;
+      this.#recordPresentationOwnerTrace(coordinate.key, 'chunk-data:cache-hit', {
+        priority,
+      });
       if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-cache-hit', {
         ownerKey: coordinate.key,
         chunkX: coordinate.chunkX,
@@ -1773,6 +2822,9 @@ export class ChunkRuntimeManager {
     const existing = this.cache.get(coordinate.key);
     if (existing?.data) {
       existing.lastUsed = ++this.accessTick;
+      this.#recordPresentationOwnerTrace(coordinate.key, 'chunk-data:cache-hit', {
+        priority,
+      });
       if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-owner-cache-hit', {
         ownerKey: coordinate.key,
         chunkX: coordinate.chunkX,
@@ -1855,11 +2907,16 @@ export class ChunkRuntimeManager {
           return null;
         }
         const isRenderCoordinate = plan.renderCoordinates.some(value => value.key === coordinate.key);
+        const schedulerRequired = this.#compatibilityTransitionGenerationRequired(
+          plan.key,
+          plan.required,
+        );
         const result = await this.#ensureChunkData(coordinate, {
           priority: isRenderCoordinate
             ? CHUNK_DATA_PRIORITY.PLAYER_RENDER : CHUNK_DATA_PRIORITY.PLAYER_DATA,
           consumerId: plan.consumerId,
           epoch: plan.epoch,
+          required: schedulerRequired,
         });
         if (this.onPipelineEvent && result.generated) {
           this.#recordPipelineEvent('runtime-prefetch-owner-ready', {
@@ -1877,7 +2934,6 @@ export class ChunkRuntimeManager {
         }
         if (yieldBetweenUnits && result.generated) await this.yieldToHost();
       }
-      const targetOrigin = this.#targetRenderOrigin(plan.chunkX, plan.chunkZ);
       for (const coordinate of plan.renderCoordinates) {
         if (plan.key !== this.preferredPreparationKey && this.centerChunkX !== null) {
           await this.#discardPreparedTransition(plan);
@@ -1886,11 +2942,25 @@ export class ChunkRuntimeManager {
         if (plan.projectedByKey.has(coordinate.key)) continue;
         const entry = this.cache.get(coordinate.key);
         if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
-        if (this.renderedKeys.has(coordinate.key) || this.deferredRenderReleaseKeys.has(coordinate.key)) continue;
+        if (this.#isFullNearOwnerPublished(coordinate.key)) continue;
+        // A live sliding job is already preparing this exact canonical owner.
+        // The commit path joins it after the terrain-presentation generation
+        // has been claim-protected, then falls back to projection if needed.
+        if (this.presentationSlidingOwnerJobs.has(coordinate.key)) continue;
         const projectionStartedAt = this.clock();
-        const projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
+        const projected = await this.#queueProjectedChunk(entry.data, this.renderOrigin, {
           deferredRegistration: true,
           yieldToHost: yieldBetweenUnits ? this.yieldToHost : null,
+        }, {
+          intent: 'compatibility-prefetch',
+          priority: this.#compatibilityProjectionIsCurrent(plan.key)
+            ? PROJECTION_PRIORITY.COMPATIBILITY_CURRENT
+            : PROJECTION_PRIORITY.COMPATIBILITY_BACKGROUND,
+          intentSequence: plan.epoch,
+          isCurrent: () => !this.isShutdown
+            && !plan.discarded
+            && !plan.released
+            && this.preparedTransitions.get(plan.key) === plan,
         });
         this.performance.record('projection', this.clock() - projectionStartedAt);
         plan.projectedByKey.set(coordinate.key, projected);
@@ -1928,8 +2998,26 @@ export class ChunkRuntimeManager {
       return plan;
     } catch (error) {
       await this.#discardPreparedTransition(plan, { force: true });
+      if (isProjectionSupersededError(error)) {
+        throw runtimeTransitionRetryableError(
+          new Error(`transition preparation was superseded for ${plan.key}`),
+          'transition-preparation-superseded',
+        );
+      }
       throw error;
     }
+  }
+
+  #compatibilityTransitionGenerationRequired(targetKey, explicitRequired = false) {
+    // The owner-level Terrain dependency batch is the authoritative latest
+    // Player demand after boot. Compatibility transition/prefetch work must
+    // not occupy the required Full lane merely because it uses PLAYER_* data
+    // priorities; otherwise an old 5x5 can serialize the current 3x3 behind
+    // every intermediate center. Initial boot is the only unconditional case.
+    if (this.centerChunkX === null) return true;
+    if (explicitRequired !== true) return false;
+    const latestPlayerTargetKey = this.presentationSlidingTarget?.key ?? null;
+    return latestPlayerTargetKey === null || latestPlayerTargetKey === targetKey;
   }
 
   #canPrepareTransition(chunkX, chunkZ) {
@@ -1939,20 +3027,26 @@ export class ChunkRuntimeManager {
     return this.cacheCapacity >= protectedKeys.size;
   }
 
-  async #materializeMissingData(coordinates, { chunkX, chunkZ }) {
+  async #materializeMissingData(coordinates, { chunkX, chunkZ, required = false }) {
     const missing = coordinates.filter(coordinate => !this.cache.has(coordinate.key));
     const epoch = ++this.transitionEpoch;
     this.chunkDataService.cancelConsumer({ consumerId: 'runtime-transition', beforeEpoch: epoch });
+    const targetKey = createChunkKey(chunkX, chunkZ);
     const renderKeys = new Set(squareChunkCoordinates(chunkX, chunkZ, 1).map(coordinate => coordinate.key));
+    const schedulerRequired = this.#compatibilityTransitionGenerationRequired(targetKey, required);
     const generated = await Promise.all(missing.map(async coordinate => {
       const chunkData = await this.#requestChunkData(coordinate, {
         priority: renderKeys.has(coordinate.key)
           ? CHUNK_DATA_PRIORITY.PLAYER_RENDER : CHUNK_DATA_PRIORITY.PLAYER_DATA,
         consumerId: 'runtime-transition',
         epoch,
+        required: schedulerRequired,
       });
       if (!chunkData || chunkData.chunkX !== coordinate.chunkX || chunkData.chunkZ !== coordinate.chunkZ) {
-        throw new Error(`ChunkDataService returned invalid ChunkData for ${coordinate.key}`);
+        throw runtimeWorldInvariantError(
+          new Error(`ChunkDataService returned invalid ChunkData for ${coordinate.key}`),
+          'transition-chunk-contract',
+        );
       }
       return chunkData;
     }));
@@ -1995,7 +3089,10 @@ export class ChunkRuntimeManager {
     const prepared = await plan.promise;
     for (const stale of stalePlans) await this.#discardPreparedTransition(stale);
     if (!prepared || prepared.discarded || !prepared.ready) {
-      throw new Error(`transition preparation was superseded for ${key}`);
+      throw runtimeTransitionRetryableError(
+        new Error(`transition preparation was superseded for ${key}`),
+        'transition-preparation-superseded',
+      );
     }
     return prepared;
   }
@@ -2034,7 +3131,14 @@ export class ChunkRuntimeManager {
         this.counts.terrainPresentationRequiredClipmapBuilds += 1;
       }
       if (!this.#terrainPresentationDependenciesReady(entry)) {
-        throw new Error(`Terrain presentation dependencies are not READY: ${identity}`);
+        throw runtimeTransitionRetryableError(
+          new Error(`Terrain presentation dependencies are not READY: ${identity}`),
+          'terrain-presentation-dependencies',
+          {
+            code: 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION',
+            faultDomain: 'presentation',
+          },
+        );
       }
       while (entry.state !== 'ready') {
         if (entry.state === 'failed' || entry.state === 'discarded') break;
@@ -2047,17 +3151,141 @@ export class ChunkRuntimeManager {
       }
     }
     if (entry.state !== 'ready' || !entry.presentationGeneration) {
-      throw new Error(`Terrain presentation generation was superseded: ${identity}`);
+      throw runtimeTransitionRetryableError(
+        new Error(`Terrain presentation generation was superseded: ${identity}`),
+        'terrain-presentation-superseded',
+        {
+          code: 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION',
+          faultDomain: 'presentation',
+        },
+      );
     }
     entry.lastUsedAtMs = this.clock();
     return entry;
   }
 
-  async #performTransition(chunkX, chunkZ, { required = false } = {}) {
+  async #publishProjectedOwnerWithAdmission(projected, {
+    initial,
+    generation,
+    isCurrent,
+    onPublished,
+  }) {
+    if (typeof onPublished !== 'function') {
+      throw new TypeError('Near publication acknowledgement callback is required');
+    }
+    const ownerKey = projected?.key ?? null;
+    const publish = async () => {
+      const loadStartedAt = this.clock();
+      this.#recordPresentationOwnerTrace(ownerKey, 'publication:load-start', { generation });
+      await this.renderAdapter.loadProjected(projected);
+      const loadDurationMs = this.clock() - loadStartedAt;
+      this.performance.record('load', loadDurationMs);
+      this.#recordPresentationOwnerTrace(ownerKey, 'publication:load-complete', {
+        generation,
+        loadDurationMs,
+      });
+      onPublished();
+      this.#recordPresentationOwnerTrace(ownerKey, 'publication:callback-applied', { generation });
+    };
+    if (initial || !this.renderUploadAdmission) {
+      this.#recordPresentationOwnerTrace(ownerKey, 'admission:bypassed', {
+        initial,
+        hasAdmissionController: this.renderUploadAdmission !== null,
+      });
+      await publish();
+      return null;
+    }
+    const manifest = await this.renderAdapter.finalizeProjectedUploadManifest(projected, {
+      generation,
+    });
+    if (!manifest) {
+      throw new Error(`staged Near owner has no ProjectedUploadManifest: ${projected?.key ?? 'unknown'}`);
+    }
+    this.#recordPresentationOwnerTrace(ownerKey, 'admission:manifest-ready', {
+      generation,
+      uploadBytes: manifest.uploadBytes,
+      meshCount: manifest.meshCount,
+      resourceBucketCount: manifest.resourceBuckets.length,
+    });
+    if (manifest.ownerKey !== projected.key || manifest.generation !== generation) {
+      throw new Error(
+        `staged Near owner upload identity mismatch: ${projected.key}:${generation}`,
+      );
+    }
+    const stageBucket = manifest.resourceBuckets.length > 0 ? async admission => {
+      if (!this.stageProjectedUpload) {
+        throw new Error(`Near owner has no upload staging hook: ${projected.key}`);
+      }
+      return this.stageProjectedUpload(Object.freeze({ projected, ...admission }));
+    } : null;
+    let result;
+    try {
+      this.#recordPresentationOwnerTrace(ownerKey, 'admission:queued', {
+        generation,
+        controllerQueueDepthBefore: this.renderUploadAdmission.snapshot?.().queueDepth ?? null,
+      });
+      result = await this.renderUploadAdmission.admit({
+        ownerKey: projected.key,
+        generation,
+        manifest,
+        stageBucket,
+        isCurrent,
+        publish,
+        receiptProvesPublication: receipt => (
+          this.renderAdapter.projectedOwnerUploadProof(projected.key, receipt, manifest) === true
+        ),
+      });
+      this.#recordPresentationOwnerTrace(ownerKey, 'admission:receipt-proven', {
+        generation,
+        frameSequence: result?.frameSequence ?? null,
+        staged: result?.staged === true,
+      });
+    } catch (error) {
+      const currentAtFailure = isCurrent() === true;
+      this.#recordPresentationOwnerTrace(ownerKey, 'admission:failed', {
+        generation,
+        name: error?.name ?? 'Error',
+        message: error?.message ?? String(error),
+        code: error?.code ?? null,
+        current: currentAtFailure,
+      });
+      if (!currentAtFailure) {
+        throw runtimeTransitionRetryableError(
+          error,
+          'near-upload-superseded',
+          {
+            code: 'RUNTIME_TRANSITION_RETRYABLE_PRESENTATION',
+            faultDomain: 'presentation',
+          },
+        );
+      }
+      throw error;
+    }
+    if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-near-upload-admitted', {
+      ownerKey: projected.key,
+      generation,
+      uploadBytes: manifest.uploadBytes,
+      meshCount: manifest.meshCount,
+      staged: result?.staged === true,
+      frameSequence: result?.frameSequence ?? null,
+    });
+    return result;
+  }
+
+  async #performTransition(chunkX, chunkZ, {
+    required = false,
+    intentSequence = ++this.residencyIntentSequence,
+  } = {}) {
     if (this.isShutdown) throw new Error('chunk runtime manager is shut down');
     if (this.centerChunkX === chunkX && this.centerChunkZ === chunkZ) {
-      await this.#releaseObsoleteRenderOwners(this.renderedKeys, []);
-      this.#validateRuntimeInvariants();
+      const retainNewerSliding = (this.presentationSlidingTarget?.intentSequence ?? -1)
+        > intentSequence;
+      const retained = new Set([
+        ...this.renderedKeys,
+        ...(retainNewerSliding ? this.presentationSlidingDesiredKeys : []),
+      ]);
+      await this.#releaseObsoleteRenderOwners(retained, []);
+      this.#assertRuntimeInvariants('transition-coalesced');
       this.counts.transitionsCoalesced += 1;
       return this.latestTransition;
     }
@@ -2085,7 +3313,18 @@ export class ChunkRuntimeManager {
     const desiredDataKeys = new Set(desiredDataCoordinates.map(coordinate => coordinate.key));
     const desiredRenderCoordinates = prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1);
     const desiredRenderKeys = new Set(desiredRenderCoordinates.map(coordinate => coordinate.key));
-    if (!prepared) await this.#materializeMissingData(desiredDataCoordinates, { chunkX, chunkZ });
+    if (!prepared) await this.#materializeMissingData(
+      desiredDataCoordinates,
+      { chunkX, chunkZ, required },
+    );
+    this.transitionProtectedDataKeys = desiredDataKeys;
+    this.transitionProtectedRenderKeys = desiredRenderKeys;
+    await this.#awaitPresentationSlidingOwners(desiredRenderKeys);
+    // Drain any owner-level publication/retirement operation that was already
+    // active before this transition protected its 3x3. The sliding path keeps
+    // progressing independently, but the compatibility commit must take its
+    // physical snapshot only after earlier retire work has settled.
+    await this.presentationSlidingPublicationChain;
     const previousOrigin = this.renderOrigin;
     const targetOrigin = this.#targetRenderOrigin(chunkX, chunkZ);
     const physicalBefore = this.#physicalRenderKeys();
@@ -2093,7 +3332,8 @@ export class ChunkRuntimeManager {
     const attached = [];
     const publicationSequence = [];
     let replacementCommitted = false;
-    this.transitionProtectedDataKeys = desiredDataKeys;
+    let projectedPublicationBatch = null;
+    const uploadGeneration = prepared?.epoch ?? this.transitionEpoch;
     if (prepared) prepared.committing = true;
     try {
       for (const coordinate of desiredRenderCoordinates) {
@@ -2103,9 +3343,19 @@ export class ChunkRuntimeManager {
           const entry = this.cache.get(coordinate.key);
           if (!entry?.data) throw new Error(`prepared ChunkData is undefined: ${coordinate.key}`);
           const projectionStartedAt = this.clock();
-          projected = await this.renderAdapter.projectChunk(entry.data, targetOrigin, {
+          const compatibilityTargetKey = createChunkKey(chunkX, chunkZ);
+          projected = await this.#queueProjectedChunk(entry.data, this.renderOrigin, {
             deferredRegistration: true,
             yieldToHost: this.yieldToHost,
+          }, {
+            intent: 'compatibility-commit',
+            priority: this.#compatibilityProjectionIsCurrent(compatibilityTargetKey, { initial })
+              ? PROJECTION_PRIORITY.COMPATIBILITY_CURRENT
+              : PROJECTION_PRIORITY.COMPATIBILITY_BACKGROUND,
+            intentSequence,
+            isCurrent: () => !this.isShutdown
+              && prepared?.discarded !== true
+              && prepared?.released !== true,
           });
           this.performance.record('projection', this.clock() - projectionStartedAt);
           if (required) this.counts.terrainReadyRequiredProjections += 1;
@@ -2115,29 +3365,54 @@ export class ChunkRuntimeManager {
       }
 
       if (prepared?.discarded || prepared?.released) {
-        throw new Error(`transition preparation was superseded for ${prepared.key}`);
+        throw runtimeTransitionRetryableError(
+          new Error(`transition preparation was superseded for ${prepared.key}`),
+          'transition-preparation-superseded',
+        );
+      }
+      if (!initial && staged.length > 0 && this.renderAdapter.beginProjectedPublicationBatch) {
+        projectedPublicationBatch = this.renderAdapter.beginProjectedPublicationBatch({
+          batchId: `near:${chunkX},${chunkZ}:${uploadGeneration}`,
+          ownerKeys: staged.map(entry => entry.key),
+        });
       }
       for (const entry of staged) {
-        const loadStartedAt = this.clock();
         const promotedTerrain = this.provisionalTerrainKeys.has(entry.key);
-        await this.renderAdapter.loadProjected(entry.projected);
-        this.performance.record('load', this.clock() - loadStartedAt);
-        prepared?.projectedByKey.delete(entry.key);
-        if (promotedTerrain) this.provisionalTerrainKeys.delete(entry.key);
-        entry.promotedTerrain = promotedTerrain;
-        attached.push(entry);
-        if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-attached', {
-          ownerKey: entry.key,
-          targetOwnerKey: createChunkKey(chunkX, chunkZ),
-          chunkX,
-          chunkZ,
-          preparedEpoch: prepared?.epoch ?? null,
+        let publicationApplied = false;
+        await this.#publishProjectedOwnerWithAdmission(entry.projected, {
+          initial,
+          generation: uploadGeneration,
+          isCurrent: () => !this.isShutdown
+            && prepared?.discarded !== true
+            && prepared?.released !== true,
+          onPublished: () => {
+            if (publicationApplied) {
+              throw new Error(`Near owner publication was acknowledged twice: ${entry.key}`);
+            }
+            publicationApplied = true;
+            prepared?.projectedByKey.delete(entry.key);
+            if (promotedTerrain) this.provisionalTerrainKeys.delete(entry.key);
+            entry.promotedTerrain = promotedTerrain;
+            attached.push(entry);
+            if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-attached', {
+              ownerKey: entry.key,
+              targetOwnerKey: createChunkKey(chunkX, chunkZ),
+              chunkX,
+              chunkZ,
+              preparedEpoch: prepared?.epoch ?? null,
+            });
+            publicationSequence.push(Object.freeze({
+              type: 'replacement-attached', ownerKey: entry.key,
+            }));
+            this.counts.renderLoaded += 1;
+          },
         });
-        publicationSequence.push(Object.freeze({ type: 'replacement-attached', ownerKey: entry.key }));
-        this.counts.renderLoaded += 1;
+        if (!publicationApplied) {
+          throw new Error(`Near owner admission completed without publication: ${entry.key}`);
+        }
       }
 
-      this.#validateReplacementRenderCoverage(desiredRenderKeys, attached);
+      this.#assertReplacementRenderCoverage(desiredRenderKeys, attached);
       if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-coverage-verified', {
         ownerKey: createChunkKey(chunkX, chunkZ),
         chunkX,
@@ -2240,10 +3515,42 @@ export class ChunkRuntimeManager {
         );
       }
 
-      for (const key of physicalBefore) {
-        if (!desiredRenderKeys.has(key)) this.deferredRenderReleaseKeys.add(key);
+      // A stale/intermediate compatibility transition must never tear down the
+      // latest Player-visible sliding owners. Keep the newly committed 3x3 and
+      // the latest sliding target physically resident; later owner-level
+      // retirement removes only keys outside both sets.
+      const retainNewerSliding = (this.presentationSlidingTarget?.intentSequence ?? -1)
+        > intentSequence;
+      if (!retainNewerSliding) {
+        this.presentationSlidingDesiredKeys = new Set(desiredRenderKeys);
+        this.presentationSlidingTarget = Object.freeze({
+          key: createChunkKey(chunkX, chunkZ),
+          chunkX,
+          chunkZ,
+          planEpoch: this.terrainReadyPlan?.epoch ?? 0,
+          intentSequence,
+          desiredKeys: Object.freeze(sortedKeys(desiredRenderKeys)),
+          requestedAtMs: this.clock(),
+          source: 'transition-commit',
+        });
       }
-      for (const key of desiredRenderKeys) this.deferredRenderReleaseKeys.delete(key);
+      const retainedPhysicalKeys = new Set([
+        ...desiredRenderKeys,
+        ...(retainNewerSliding ? this.presentationSlidingDesiredKeys : []),
+      ]);
+      for (const key of physicalBefore) {
+        if (!retainedPhysicalKeys.has(key)) this.deferredRenderReleaseKeys.add(key);
+      }
+      for (const key of desiredRenderKeys) {
+        this.deferredRenderReleaseKeys.delete(key);
+        this.presentationSlidingPublishedKeys.delete(key);
+      }
+      for (const key of retainNewerSliding ? this.presentationSlidingDesiredKeys : []) {
+        if (!desiredRenderKeys.has(key) && physicalBefore.has(key)) {
+          this.deferredRenderReleaseKeys.delete(key);
+          this.presentationSlidingPublishedKeys.add(key);
+        }
+      }
       this.activeDataKeys = desiredDataKeys;
       this.renderedKeys = desiredRenderKeys;
       this.centerChunkX = chunkX;
@@ -2262,11 +3569,16 @@ export class ChunkRuntimeManager {
       this.counts.cacheHits += cacheHits;
       this.counts.dataDeactivated += dataDeactivated;
       this.transitionProtectedDataKeys = new Set();
+      this.transitionProtectedRenderKeys = new Set();
+      if (projectedPublicationBatch) {
+        this.renderAdapter.commitProjectedPublicationBatch(projectedPublicationBatch);
+        projectedPublicationBatch = null;
+      }
       replacementCommitted = true;
       this.terrainPresentationClaimTargetKey = null;
       this.#scheduleEligibleTerrainPresentationGenerations();
 
-      await this.#releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence);
+      await this.#releaseObsoleteRenderOwners(retainedPhysicalKeys, publicationSequence);
       if (terrainPresentationEntry) {
         terrainPresentationEntry.oldReleaseAtMs = this.clock();
         if (this.onPipelineEvent) this.#recordPipelineEvent(
@@ -2289,9 +3601,9 @@ export class ChunkRuntimeManager {
           },
         );
       }
-      await this.#releaseObsoleteProvisionalTerrains(desiredRenderKeys);
+      await this.#releaseObsoleteProvisionalTerrains(retainedPhysicalKeys);
       this.#evictInactiveCacheEntries();
-      this.#validateRuntimeInvariants();
+      this.#assertRuntimeInvariants('transition-commit');
       this.counts.transitionsPerformed += 1;
       this.counts.maxCacheSize = Math.max(this.counts.maxCacheSize, this.cache.size);
       this.counts.maxActiveDataCount = Math.max(this.counts.maxActiveDataCount, this.activeDataKeys.size);
@@ -2352,10 +3664,19 @@ export class ChunkRuntimeManager {
         message: error?.message ?? String(error),
       });
       this.transitionProtectedDataKeys = new Set();
+      this.transitionProtectedRenderKeys = new Set();
       this.terrainPresentationClaimTargetKey = null;
       this.#scheduleEligibleTerrainPresentationGenerations();
       if (replacementCommitted) throw error;
       const rollbackErrors = [];
+      if (projectedPublicationBatch) {
+        try {
+          this.renderAdapter.rollbackProjectedPublicationBatch(projectedPublicationBatch);
+          projectedPublicationBatch = null;
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError);
+        }
+      }
       for (const entry of [...attached].reverse()) {
         try {
           if (entry.promotedTerrain) {
@@ -2400,7 +3721,11 @@ export class ChunkRuntimeManager {
   }
 
   #physicalRenderKeys() {
-    return new Set([...this.renderedKeys, ...this.deferredRenderReleaseKeys]);
+    return new Set([
+      ...this.renderedKeys,
+      ...this.presentationSlidingPublishedKeys,
+      ...this.deferredRenderReleaseKeys,
+    ]);
   }
 
   #validateReplacementRenderCoverage(desiredRenderKeys, attached) {
@@ -2425,15 +3750,29 @@ export class ChunkRuntimeManager {
     }
   }
 
-  async #releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence) {
+  async #releaseObsoleteRenderOwners(desiredRenderKeys, publicationSequence, {
+    slidingReason = null,
+  } = {}) {
     const obsolete = sortedKeys(this.#physicalRenderKeys()).filter(key => !desiredRenderKeys.has(key));
     for (const key of obsolete) {
+      if (slidingReason !== null && this.transitionProtectedRenderKeys.has(key)) continue;
+      const wasSliding = this.presentationSlidingPublishedKeys.has(key);
       const unloadStartedAt = this.clock();
       try {
         await this.renderAdapter.unloadChunk(key);
         this.performance.record('unload', this.clock() - unloadStartedAt);
+        this.presentationSlidingPublishedKeys.delete(key);
         this.deferredRenderReleaseKeys.delete(key);
         this.counts.renderUnloaded += 1;
+        if (wasSliding) {
+          const lifecycle = this.presentationSlidingOwnerStates.get(key);
+          if (lifecycle) {
+            this.#setPresentationSlidingOwnerState(lifecycle, 'retire', {
+              event: slidingReason ?? 'retired-after-transition',
+            });
+          }
+          this.counts.presentationSlidingOwnersRetired += 1;
+        }
         publicationSequence.push(Object.freeze({ type: 'old-owner-released', ownerKey: key }));
         if (this.onPipelineEvent) this.#recordPipelineEvent('runtime-terrain-old-owner-released', {
           ownerKey: key,
@@ -2466,7 +3805,11 @@ export class ChunkRuntimeManager {
     const identity = Object.freeze({ chunkId: chunkData.chunkId, contentHash: chunkData.contentHash });
     const existing = this.identityAudit.get(key);
     if (existing && (existing.chunkId !== identity.chunkId || existing.contentHash !== identity.contentHash)) {
-      throw new Error(`regenerated chunk changed identity/content: ${key}`);
+      throw runtimeWorldInvariantError(
+        new Error(`regenerated chunk changed identity/content: ${key}`),
+        'chunk-identity-registration',
+        { code: 'CANONICAL_WORLD_INVARIANT', faultDomain: 'canonical-world' },
+      );
     }
     if (existing) this.identityAudit.delete(key);
     this.identityAudit.set(key, identity);
@@ -2485,6 +3828,22 @@ export class ChunkRuntimeManager {
     }
   }
 
+  #assertReplacementRenderCoverage(desiredRenderKeys, attached) {
+    try {
+      this.#validateReplacementRenderCoverage(desiredRenderKeys, attached);
+    } catch (error) {
+      throw runtimeWorldInvariantError(error, 'replacement-render-coverage');
+    }
+  }
+
+  #assertRuntimeInvariants(stage) {
+    try {
+      this.#validateRuntimeInvariants();
+    } catch (error) {
+      throw runtimeWorldInvariantError(error, stage);
+    }
+  }
+
   #validateRuntimeInvariants() {
     if (this.activeDataKeys.size !== 25) throw new Error(`active data set must remain 25, got ${this.activeDataKeys.size}`);
     if (this.renderedKeys.size !== 9) throw new Error(`render set must remain 9, got ${this.renderedKeys.size}`);
@@ -2492,8 +3851,18 @@ export class ChunkRuntimeManager {
     for (const key of this.renderedKeys) {
       if (!this.activeDataKeys.has(key)) throw new Error(`rendered chunk is outside active data set: ${key}`);
     }
+    for (const key of this.presentationSlidingPublishedKeys) {
+      if (this.renderedKeys.has(key)) {
+        throw new Error(`Near owner is both committed and sliding-published: ${key}`);
+      }
+      if (!this.cache.get(key)?.data) {
+        throw new Error(`sliding-published Near owner has no canonical ChunkData: ${key}`);
+      }
+    }
     for (const key of this.provisionalTerrainKeys) {
-      if (this.renderedKeys.has(key)) throw new Error(`Terrain owner is both committed and provisional: ${key}`);
+      if (this.#isFullNearOwnerPublished(key)) {
+        throw new Error(`Terrain owner is both full Near and provisional: ${key}`);
+      }
       if (!this.activeDataKeys.has(key)) throw new Error(`provisional Terrain is outside active data set: ${key}`);
     }
     const renderCoverage = this.renderAdapter.renderCoverageSnapshot?.();
@@ -2565,8 +3934,11 @@ export class ChunkRuntimeManager {
     const candidates = [...this.cache.entries()]
       .filter(([key]) => !this.activeDataKeys.has(key)
         && !this.renderedKeys.has(key)
+        && !this.presentationSlidingPublishedKeys.has(key)
+        && !this.deferredRenderReleaseKeys.has(key)
         && !this.provisionalTerrainKeys.has(key)
         && !this.transitionProtectedDataKeys.has(key)
+        && !this.transitionProtectedRenderKeys.has(key)
         && !this.residentRequiredDataKeys.has(key))
       .sort((a, b) => a[1].lastUsed - b[1].lastUsed
         || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -2601,11 +3973,17 @@ export class ChunkRuntimeManager {
 
   isStreamingBusy() {
     return this.transitionPendingCount > 0 || this.preparationPendingCount > 0
+      || this.presentationSlidingOwnerJobs.size > 0
       || this.pendingPrefetchKeys.size > 0
       || this.terrainPresentationPendingIdentity !== null
       || [...this.terrainPresentationEntries.values()].some(entry => (
         entry.state === 'queued' || entry.state === 'building'
-      ));
+      ))
+      || (this.renderUploadAdmission?.snapshot().queueDepth ?? 0) > 0;
+  }
+
+  acknowledgeRenderReceipt(receipt) {
+    return this.renderUploadAdmission?.acknowledgeRenderReceipt(receipt) ?? false;
   }
 
   getCommittedChunkState() {
@@ -2628,6 +4006,9 @@ export class ChunkRuntimeManager {
       pendingPrefetchCount: this.pendingPrefetchKeys.size,
       preparedTransitionCount: this.preparedTransitions.size,
       deferredRenderReleaseCount: this.deferredRenderReleaseKeys.size,
+      presentationSlidingPendingCount: this.presentationSlidingOwnerJobs.size,
+      presentationSlidingPublishedCount: this.presentationSlidingPublishedKeys.size,
+      presentationSlidingTargetKey: this.presentationSlidingTarget?.key ?? null,
       provisionalTerrainCount: this.provisionalTerrainKeys.size,
       terrainReadyPlanPending: this.terrainReadyPlan !== null
         && !this.terrainReadyPlan.ready
@@ -2639,6 +4020,252 @@ export class ChunkRuntimeManager {
           || entry.state === 'queued' || entry.state === 'building').length,
       terrainPresentationReadyCount: [...this.terrainPresentationEntries.values()]
         .filter(entry => entry.state === 'ready').length,
+      renderUploadAdmission: this.renderUploadAdmission?.snapshot() ?? null,
+    });
+  }
+
+  #diagnosticSampleKeys(values) {
+    return Object.freeze(sortedKeys(values).slice(0, PRESENTATION_OWNER_TRACE_SAMPLE_KEY_LIMIT));
+  }
+
+  #cacheOwnershipDiagnosticSnapshot() {
+    const service = this.chunkDataService.snapshot?.() ?? null;
+    const completed = new Set(service?.completedKeys ?? []);
+    const serviceProtected = new Set(service?.protectedOwnerKeys ?? []);
+    const currentRender = new Set(this.presentationSlidingDesiredKeys);
+    const currentData = new Set(this.terrainReadyDesiredDataKeys);
+    const currentResident = new Set(this.residentRequiredDataKeys);
+    const legacyActive = new Set(this.activeDataKeys);
+    const legacyRendered = new Set(this.renderedKeys);
+    const transitionProtected = new Set([
+      ...this.transitionProtectedDataKeys,
+      ...this.transitionProtectedRenderKeys,
+    ]);
+    const select = predicate => [...completed].filter(predicate);
+    const currentRenderCompleted = select(key => currentRender.has(key));
+    const currentDataCompleted = select(key => currentData.has(key));
+    const currentResidentCompleted = select(key => currentResident.has(key));
+    const legacyActiveCompleted = select(key => legacyActive.has(key));
+    const legacyRenderedCompleted = select(key => legacyRendered.has(key));
+    const protectedCompleted = select(key => serviceProtected.has(key));
+    const evictionEligible = select(key => !serviceProtected.has(key));
+    const outsideCurrentData = select(key => !currentData.has(key));
+    const staleProtected = outsideCurrentData.filter(key => serviceProtected.has(key));
+    const legacyOnly = select(key => (
+      (legacyActive.has(key) || legacyRendered.has(key) || transitionProtected.has(key))
+        && !currentData.has(key)
+    ));
+    return Object.freeze({
+      schemaVersion: 'runtime-cache-ownership-diagnostic-1',
+      occupancy: completed.size,
+      capacity: service?.cacheCapacity ?? this.cacheCapacity,
+      runtimeCacheOccupancy: this.cache.size,
+      serviceProtectedCount: serviceProtected.size,
+      currentRenderDesiredCount: currentRender.size,
+      currentRenderCompletedCount: currentRenderCompleted.length,
+      currentDataDesiredCount: currentData.size,
+      currentDataCompletedCount: currentDataCompleted.length,
+      currentResidentRequiredCount: currentResident.size,
+      currentResidentCompletedCount: currentResidentCompleted.length,
+      legacyActiveCount: legacyActive.size,
+      legacyActiveCompletedCount: legacyActiveCompleted.length,
+      legacyRenderedCount: legacyRendered.size,
+      legacyRenderedCompletedCount: legacyRenderedCompleted.length,
+      protectedCompletedCount: protectedCompleted.length,
+      evictionEligibleCount: evictionEligible.length,
+      completedOutsideCurrentDataCount: outsideCurrentData.length,
+      staleProtectedCount: staleProtected.length,
+      legacyOnlyCompletedCount: legacyOnly.length,
+      samples: Object.freeze({
+        currentRenderMissing: this.#diagnosticSampleKeys(
+          [...currentRender].filter(key => !completed.has(key)),
+        ),
+        evictionEligible: this.#diagnosticSampleKeys(evictionEligible),
+        outsideCurrentData: this.#diagnosticSampleKeys(outsideCurrentData),
+        staleProtected: this.#diagnosticSampleKeys(staleProtected),
+        legacyOnly: this.#diagnosticSampleKeys(legacyOnly),
+      }),
+    });
+  }
+
+  #presentationAuthorityDiagnosticSnapshot() {
+    const runtimeCenterKey = this.centerChunkX === null
+      ? null : createChunkKey(this.centerChunkX, this.centerChunkZ);
+    const slidingTargetKey = this.presentationSlidingTarget?.key ?? null;
+    return Object.freeze({
+      schemaVersion: 'runtime-presentation-authority-diagnostic-1',
+      runtimeCenterKey,
+      slidingTargetKey,
+      diverged: runtimeCenterKey !== null && slidingTargetKey !== null
+        && runtimeCenterKey !== slidingTargetKey,
+      preferredPreparationKey: this.preferredPreparationKey ?? null,
+      transitionProtectedDataCount: this.transitionProtectedDataKeys.size,
+      transitionProtectedRenderCount: this.transitionProtectedRenderKeys.size,
+      compatibilityTransitionPending: this.preparationPendingCount > 0
+        || this.transitionProtectedDataKeys.size > 0
+        || this.transitionProtectedRenderKeys.size > 0,
+      terrainPresentationPlayerCenterKey: this.terrainPresentationPlayerCenter?.key ?? null,
+      terrainPresentationClaimTargetKey: this.terrainPresentationClaimTargetKey,
+      terrainPresentationInFlightIdentity: this.terrainPresentationInFlightIdentity,
+      terrainPresentationPendingIdentity: this.terrainPresentationPendingIdentity,
+      uploadAdmission: this.renderUploadAdmission?.snapshot() ?? null,
+    });
+  }
+
+  #presentationOwnerTraceSnapshot(ownerKeyInput = null) {
+    const ownerKey = typeof ownerKeyInput === 'string' && ownerKeyInput.length > 0
+      ? ownerKeyInput
+      : this.presentationSlidingTarget?.key
+        ?? (this.centerChunkX === null ? null : createChunkKey(this.centerChunkX, this.centerChunkZ));
+    if (ownerKey === null) return null;
+    const trace = this.presentationOwnerTraceByKey.get(ownerKey) ?? null;
+    const slidingState = this.presentationSlidingOwnerStates.get(ownerKey) ?? null;
+    const projectionActive = this.projectionActiveJob?.ownerKey === ownerKey;
+    const projectionQueued = this.projectionQueue.some(job => job.ownerKey === ownerKey);
+    const admission = this.renderUploadAdmission?.snapshot() ?? null;
+    const chunkDataServiceSnapshot = this.chunkDataService.snapshot?.() ?? null;
+    const completedKeys = new Set(chunkDataServiceSnapshot?.completedKeys ?? []);
+    const protectedKeys = new Set(chunkDataServiceSnapshot?.protectedOwnerKeys ?? []);
+    const physicalRenderKeys = this.#physicalRenderKeys();
+    const flags = Object.freeze({
+      desiredRender: this.presentationSlidingDesiredKeys.has(ownerKey),
+      pendingPresentation: this.presentationSlidingOwnerJobs.has(ownerKey),
+      slidingPublished: this.presentationSlidingPublishedKeys.has(ownerKey),
+      committedRendered: this.renderedKeys.has(ownerKey),
+      physicalRendered: physicalRenderKeys.has(ownerKey),
+      runtimeChunkDataCached: this.cache.has(ownerKey),
+      serviceChunkDataCompleted: completedKeys.has(ownerKey),
+      serviceChunkDataProtected: protectedKeys.has(ownerKey),
+      terrainDataDesired: this.terrainReadyDesiredDataKeys.has(ownerKey),
+      terrainRenderDesired: this.terrainReadyDesiredRenderKeys.has(ownerKey),
+      terrainRenderReady: this.#isTerrainRenderReady(ownerKey),
+      projectionActive,
+      projectionQueued,
+      uploadAdmissionActive: admission?.activeOwnerKey === ownerKey,
+      uploadAwaitingReceipt: admission?.pendingPublicationOwnerKey === ownerKey,
+    });
+    let blocker = 'unknown';
+    if (flags.physicalRendered || slidingState?.state === 'drawn') blocker = 'drawn';
+    else if (flags.uploadAwaitingReceipt) blocker = 'awaiting-render-receipt';
+    else if (flags.uploadAdmissionActive) blocker = 'upload-admission-active';
+    else if (flags.projectionActive) blocker = 'projection-active';
+    else if (flags.projectionQueued) blocker = 'projection-queued';
+    else if (slidingState?.state === 'ready') blocker = 'ready-before-projection-or-publication';
+    else if (flags.pendingPresentation && !flags.runtimeChunkDataCached) blocker = 'waiting-chunk-data';
+    else if (flags.pendingPresentation) blocker = 'waiting-dependency-or-publication-chain';
+    else if (slidingState?.state === 'retire') blocker = 'superseded-or-retiring';
+    else if (slidingState?.state === 'failed') blocker = 'failed';
+    return Object.freeze({
+      schemaVersion: 'runtime-presentation-owner-full-trace-1',
+      ownerKey,
+      observedAtMs: this.clock(),
+      targetKey: this.presentationSlidingTarget?.key ?? null,
+      runtimeCenterKey: this.centerChunkX === null
+        ? null : createChunkKey(this.centerChunkX, this.centerChunkZ),
+      blocker,
+      flags,
+      slidingState: slidingState ? Object.freeze({
+        state: slidingState.state,
+        targetKey: slidingState.targetKey,
+        planEpoch: slidingState.planEpoch,
+        neededAtMs: slidingState.neededAtMs,
+        requestedAtMs: slidingState.requestedAtMs,
+        readyAtMs: slidingState.readyAtMs,
+        admittedAtMs: slidingState.admittedAtMs,
+        drawnAtMs: slidingState.drawnAtMs,
+        retiredAtMs: slidingState.retiredAtMs,
+        frameSequence: slidingState.frameSequence,
+        failure: slidingState.failure,
+      }) : null,
+      terrainOwnerDiagnostic: this.terrainReadyChunkDataOwnerDiagnostics.has(ownerKey)
+        ? Object.freeze({ ...this.terrainReadyChunkDataOwnerDiagnostics.get(ownerKey) }) : null,
+      projection: Object.freeze({
+        activeOwnerKey: this.projectionActiveJob?.ownerKey ?? null,
+        activeIntent: this.projectionActiveJob?.intent ?? null,
+        queueDepth: this.projectionQueue.length,
+        queuedOwnerKeys: Object.freeze(this.projectionQueue.map(job => job.ownerKey)),
+      }),
+      uploadAdmission: admission,
+      events: Object.freeze((trace?.events ?? []).map(event => event)),
+    });
+  }
+
+  presentationOwnerTrace(ownerKey = null) {
+    return this.#presentationOwnerTraceSnapshot(ownerKey);
+  }
+
+  phaseADiagnosticSnapshot(ownerKey = null) {
+    return Object.freeze({
+      schemaVersion: 'runtime-phase-a-presentation-diagnostic-1',
+      observedAtMs: this.clock(),
+      ownerTrace: this.#presentationOwnerTraceSnapshot(ownerKey),
+      authority: this.#presentationAuthorityDiagnosticSnapshot(),
+      cacheOwnership: this.#cacheOwnershipDiagnosticSnapshot(),
+      presentationSliding: this.#presentationSlidingSnapshot(),
+      projectionScheduling: this.#projectionSchedulerSnapshot(),
+      terrainReady: this.#terrainReadySnapshot(),
+    });
+  }
+
+  #projectionSchedulerSnapshot() {
+    const queued = [...this.projectionQueue]
+      .sort((left, right) => (
+        left.priority - right.priority
+        || right.intentSequence - left.intentSequence
+        || left.sequence - right.sequence
+      ))
+      .map(job => Object.freeze({
+        ownerKey: job.ownerKey,
+        intent: job.intent,
+        priority: job.priority,
+        intentSequence: job.intentSequence,
+        queuedAtMs: job.queuedAtMs,
+        cancelRequested: job.cancelRequested,
+      }));
+    const active = this.projectionActiveJob;
+    return Object.freeze({
+      schemaVersion: 'runtime-projection-scheduler-1',
+      activeOwnerKey: active?.ownerKey ?? null,
+      activeIntent: active?.intent ?? null,
+      activePriority: active?.priority ?? null,
+      activeIntentSequence: active?.intentSequence ?? null,
+      activeStartedAtMs: active?.startedAtMs ?? null,
+      activeCancelRequested: active?.cancelRequested ?? false,
+      queueDepth: queued.length,
+      queuedOwnerKeys: Object.freeze(queued.map(job => job.ownerKey)),
+      queued: Object.freeze(queued),
+      recentLifecycle: Object.freeze(this.projectionLifecycleHistory.map(entry => entry)),
+    });
+  }
+
+  #presentationSlidingSnapshot() {
+    const ownerStates = [...this.presentationSlidingOwnerStates.values()]
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map(entry => Object.freeze({
+        ownerKey: entry.key,
+        chunkX: entry.chunkX,
+        chunkZ: entry.chunkZ,
+        state: entry.state,
+        targetKey: entry.targetKey,
+        planEpoch: entry.planEpoch,
+        neededAtMs: entry.neededAtMs,
+        requestedAtMs: entry.requestedAtMs,
+        readyAtMs: entry.readyAtMs,
+        admittedAtMs: entry.admittedAtMs,
+        drawnAtMs: entry.drawnAtMs,
+        retiredAtMs: entry.retiredAtMs,
+        frameSequence: entry.frameSequence,
+        failure: entry.failure,
+      }));
+    return Object.freeze({
+      schemaVersion: 'runtime-presentation-sliding-1',
+      target: this.presentationSlidingTarget,
+      desiredKeys: Object.freeze(sortedKeys(this.presentationSlidingDesiredKeys)),
+      publishedKeys: Object.freeze(sortedKeys(this.presentationSlidingPublishedKeys)),
+      pendingKeys: Object.freeze(sortedKeys(this.presentationSlidingOwnerJobs.keys())),
+      physicalRenderKeys: Object.freeze(sortedKeys(this.#physicalRenderKeys())),
+      ownerStates: Object.freeze(ownerStates),
+      recentLifecycle: Object.freeze(this.presentationSlidingLifecycleHistory.map(entry => entry)),
     });
   }
 
@@ -2779,8 +4406,11 @@ export class ChunkRuntimeManager {
     const protectedChunkDataKeys = new Set([
       ...this.activeDataKeys,
       ...this.renderedKeys,
+      ...this.presentationSlidingPublishedKeys,
+      ...this.deferredRenderReleaseKeys,
       ...this.provisionalTerrainKeys,
       ...this.transitionProtectedDataKeys,
+      ...this.transitionProtectedRenderKeys,
       ...this.residentRequiredDataKeys,
     ]);
     const chunkDataOwnerDiagnostics = Object.freeze(
@@ -2976,6 +4606,8 @@ export class ChunkRuntimeManager {
       activeDataKeys: this.activeDataKeyList,
       pendingPrefetchKeys: Object.freeze(sortedKeys(this.pendingPrefetchKeys)),
       renderedKeys: this.renderedKeyList,
+      presentationSliding: this.#presentationSlidingSnapshot(),
+      projectionScheduling: this.#projectionSchedulerSnapshot(),
       deferredRenderReleaseKeys: Object.freeze(sortedKeys(this.deferredRenderReleaseKeys)),
       provisionalTerrainKeys: Object.freeze(sortedKeys(this.provisionalTerrainKeys)),
       transitionContract: this.committedTransitionContract,
@@ -2983,6 +4615,7 @@ export class ChunkRuntimeManager {
       terrainReady: this.#terrainReadySnapshot(),
       counts: Object.freeze({ ...this.counts }),
       latestTransition: this.latestTransition,
+      renderUploadAdmission: this.renderUploadAdmission?.snapshot() ?? null,
       performance,
       warnings: evaluateW1APerformanceWarnings(performance),
       chunkDataService: this.chunkDataService.snapshot?.() ?? null,
@@ -2992,6 +4625,14 @@ export class ChunkRuntimeManager {
   async shutdown() {
     if (this.isShutdown) return;
     this.isShutdown = true;
+    this.#pruneObsoleteProjectionJobs('shutdown');
+    // A transition may be waiting for a renderer receipt. Reject admission
+    // before joining transitionChain so shutdown cannot deadlock after the
+    // final rAF has already been cancelled.
+    this.renderUploadAdmission?.shutdown();
+    this.renderAdapter.cancelPendingProjectedUploadManifestWaiters?.(new Error(
+      'chunk runtime shut down before projected upload manifest finalized',
+    ));
     if (this.terrainReadyPlan && !this.terrainReadyPlan.discarded) {
       this.terrainReadyPlan.discarded = true;
       this.chunkDataService.cancelConsumer({
@@ -3004,8 +4645,18 @@ export class ChunkRuntimeManager {
       residentRequiredKeys: new Set(),
       nextPlanEpoch: this.terrainReadyPlanEpoch + 1,
     });
+    this.presentationSlidingDesiredKeys = new Set();
+    this.presentationSlidingTarget = null;
+    for (const job of [...this.presentationSlidingOwnerJobs.values()]) {
+      this.#supersedePresentationSlidingOwnerJob(job, 'shutdown');
+    }
     await this.transitionChain;
     await this.preparationChain;
+    await Promise.allSettled(
+      [...this.presentationSlidingActiveJobPromises],
+    );
+    await this.presentationSlidingPublicationChain;
+    await this.projectionChain;
     await this.terrainPresentationPreparationChain;
     this.invalidateTerrainPresentationGenerations();
     for (const plan of [...this.preparedPlanRegistry]) await this.#discardPreparedTransition(plan);
@@ -3025,10 +4676,22 @@ export class ChunkRuntimeManager {
       }
     }
     this.renderedKeys.clear();
+    this.presentationSlidingPublishedKeys.clear();
+    this.presentationSlidingDesiredKeys.clear();
+    this.presentationSlidingOwnerJobs.clear();
+    this.presentationSlidingActiveJobPromises.clear();
+    this.presentationSlidingOwnerStates.clear();
+    this.presentationSlidingLifecycleHistory.length = 0;
+    this.presentationSlidingRetirementQueued = false;
+    this.projectionQueue.length = 0;
+    this.projectionActiveJob = null;
+    this.projectionLifecycleHistory.length = 0;
+    this.presentationOwnerTraceByKey.clear();
     this.provisionalTerrainKeys.clear();
     this.provisionalTerrainPromises.clear();
     this.deferredRenderReleaseKeys.clear();
     this.transitionProtectedDataKeys.clear();
+    this.transitionProtectedRenderKeys.clear();
     this.terrainReadyDesiredDataKeys.clear();
     this.residentRequiredDataKeys.clear();
     this.terrainReadyDesiredRenderKeys.clear();

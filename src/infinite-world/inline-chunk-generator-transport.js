@@ -9,6 +9,47 @@ import {
   WORLD_GENERATION_STATE,
 } from './world-generation-scheduler.js';
 
+function createInlineMacrotaskYielder() {
+  let channel = null;
+  let scheduled = false;
+  const pending = [];
+  const releasePending = () => {
+    scheduled = false;
+    const ready = pending.splice(0);
+    for (const resolve of ready) resolve();
+  };
+  const yieldMacrotask = () => {
+    if (typeof globalThis.scheduler?.yield === 'function') return globalThis.scheduler.yield();
+    return new Promise(resolve => {
+      pending.push(resolve);
+      if (scheduled) return;
+      scheduled = true;
+      if (typeof globalThis.setImmediate === 'function') {
+        globalThis.setImmediate(releasePending);
+        return;
+      }
+      if (typeof globalThis.MessageChannel === 'function') {
+        if (!channel) {
+          channel = new globalThis.MessageChannel();
+          channel.port1.onmessage = releasePending;
+          channel.port1.start?.();
+        }
+        channel.port2.postMessage(null);
+        return;
+      }
+      globalThis.setTimeout(releasePending, 0);
+    });
+  };
+  const close = () => {
+    channel?.port1?.close?.();
+    channel?.port2?.close?.();
+    channel = null;
+    scheduled = false;
+    for (const resolve of pending.splice(0)) resolve();
+  };
+  return Object.freeze({ yieldMacrotask, close });
+}
+
 /**
  * Stage 2B-0 transport.  It deliberately has the same small surface that the
  * module Worker transport will implement in Stage 2B-1.
@@ -34,6 +75,7 @@ export function createInlineChunkGeneratorTransport({
   let shutdownPromise = null;
   let controlRequestId = 1_000_000_000;
   const forestHorizonCancelledBeforeEpoch = new Map();
+  const macrotaskYielder = createInlineMacrotaskYielder();
   const scheduler = createWorldGenerationScheduler({
     clock,
     onEvent: onSchedulerEvent,
@@ -50,7 +92,18 @@ export function createInlineChunkGeneratorTransport({
 
   const runOperation = ({ envelope, operation, onCancel = null }) => {
     if (isShutdown) return Promise.reject(new Error('inline ChunkData transport is shut down'));
-    const handle = scheduler.schedule({ envelope, execute: operation, onCancel });
+    const handle = scheduler.schedule({
+      envelope,
+      execute: execution => operation(Object.freeze({
+        ...execution,
+        cooperativeCheckpoint: async () => {
+          execution.checkpoint();
+          await macrotaskYielder.yieldMacrotask();
+          execution.checkpoint();
+        },
+      })),
+      onCancel,
+    });
     return handle.promise.then(result => {
       if (result.state === WORLD_GENERATION_STATE.COMPLETED) return result.value;
       if (result.state === WORLD_GENERATION_STATE.CANCELLED) return null;
@@ -100,6 +153,7 @@ export function createInlineChunkGeneratorTransport({
           priority,
           scheduler: envelope,
           checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
         });
       } });
     },
@@ -139,11 +193,13 @@ export function createInlineChunkGeneratorTransport({
           return generator.generateForestHorizonManifest(chunkX, chunkZ, {
             scheduler: envelope,
             checkpoint: execution.checkpoint,
+            cooperativeCheckpoint: execution.cooperativeCheckpoint,
           });
         }
         return createW8ForestHorizonManifest(await generator.generateChunk(chunkX, chunkZ, {
           scheduler: envelope,
           checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
         }));
       } });
     },
@@ -188,6 +244,7 @@ export function createInlineChunkGeneratorTransport({
         return generator.generatePresentationOwner(chunkX, chunkZ, {
           scheduler: envelope,
           checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
         });
       } });
     },
@@ -239,6 +296,7 @@ export function createInlineChunkGeneratorTransport({
         return generator.generateCanonicalTreeCell(macroX, macroZ, {
           scheduler: envelope,
           checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
         });
       } });
     },
@@ -278,9 +336,20 @@ export function createInlineChunkGeneratorTransport({
         stream: options.telemetryStream ?? 'distant',
         scheduler: options.scheduler ?? null,
       });
-      return runOperation({ envelope, operation: () => generator.distributor.findSettlementsNear(
-        centerWorldX, centerWorldZ, radiusMeters,
-      ) });
+      return runOperation({ envelope, operation: async execution => {
+        await execution.cooperativeCheckpoint();
+        const settlements = await generator.distributor.findSettlementsNear(
+          centerWorldX,
+          centerWorldZ,
+          radiusMeters,
+          {
+            checkpoint: execution.checkpoint,
+            cooperativeCheckpoint: execution.cooperativeCheckpoint,
+          },
+        );
+        await execution.cooperativeCheckpoint();
+        return settlements;
+      } });
     },
     resolveSettlementPresentationTemplate({ candidate, ...options } = {}) {
       const requestId = ++controlRequestId;
@@ -297,11 +366,15 @@ export function createInlineChunkGeneratorTransport({
         stream: options.telemetryStream ?? 'distant',
         scheduler: options.scheduler ?? null,
       });
-      return runOperation({ envelope, operation: () => {
+      return runOperation({ envelope, operation: execution => {
         if (typeof generator.resolveSettlementPresentationTemplate !== 'function') {
           throw new Error('Chunk generator does not expose Settlement presentation templates');
         }
-        return generator.resolveSettlementPresentationTemplate({ candidate });
+        return generator.resolveSettlementPresentationTemplate({
+          candidate,
+          checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
+        });
       } });
     },
     resolveCanonicalMajorRoadOwnerCoverage({
@@ -333,6 +406,8 @@ export function createInlineChunkGeneratorTransport({
           centerWorldX,
           centerWorldZ,
           radiusMeters,
+          checkpoint: execution.checkpoint,
+          cooperativeCheckpoint: execution.cooperativeCheckpoint,
         });
         execution.checkpoint();
         return coverage;
@@ -380,6 +455,7 @@ export function createInlineChunkGeneratorTransport({
           generator = null;
           lastGeneratorSnapshot = null;
           forestHorizonCancelledBeforeEpoch.clear();
+          macrotaskYielder.close();
         }
       })();
       return shutdownPromise;

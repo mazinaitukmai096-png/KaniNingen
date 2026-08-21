@@ -10,6 +10,7 @@ import {
   createRendererGpuAttributeMirror,
   createVisualContinuityRegistry,
   isDrawableInCompletedFrame,
+  isObjectUploadTargetInCompletedFrame,
 } from '../src/infinite-world/visual-continuity.js';
 
 function createAttribute(values, itemSize = 1) {
@@ -350,6 +351,134 @@ test('renderer GPU shadow uses the Three r160 upload callback when WebGLAttribut
   receipt = frames.completeFrame(token, { scene: drawable.scene, renderer });
   assert.deepEqual(Array.from(gpuMirror.read(attribute)), [9, 2]);
   assert.equal(isDrawableInCompletedFrame({ mesh: drawable.mesh, receipt }), true);
+});
+
+test('renderer receipt evidence piggybacks the single GPU mirror Scene traversal', () => {
+  const drawable = createDrawable();
+  const sceneChildren = drawable.scene.children;
+  const meshChildren = drawable.mesh.children;
+  let childrenReads = 0;
+  Object.defineProperty(drawable.scene, 'children', {
+    configurable: true,
+    get() { childrenReads += 1; return sceneChildren; },
+  });
+  Object.defineProperty(drawable.mesh, 'children', {
+    configurable: true,
+    get() { childrenReads += 1; return meshChildren; },
+  });
+  const renderer = {
+    attributes: {
+      get: attribute => ({ version: attribute.version ?? 0 }),
+    },
+  };
+  const gpuMirror = createRendererGpuAttributeMirror();
+  const frames = createRenderFrameAcknowledger({ clock: () => 1, gpuMirror });
+  const token = frames.beginFrame({ frameSequence: 1, scene: drawable.scene });
+  assert.equal(childrenReads, 2, 'one traversal visits Scene and Mesh exactly once');
+  const receipt = frames.completeFrame(token, { scene: drawable.scene, renderer });
+  assert.equal(childrenReads, 2,
+    'receipt completion consumes staged evidence without traversing Scene again');
+  assert.equal(isDrawableInCompletedFrame({ mesh: drawable.mesh, receipt }), true);
+  const secondToken = frames.beginFrame({ frameSequence: 2, scene: drawable.scene });
+  assert.equal(childrenReads, 4,
+    'the next frame performs exactly one new traversal');
+  const secondReceipt = frames.completeFrame(
+    secondToken,
+    { scene: drawable.scene, renderer },
+  );
+  assert.equal(childrenReads, 4,
+    'the next receipt also reuses that frame traversal');
+  assert.equal(isDrawableInCompletedFrame({ mesh: drawable.mesh, receipt: secondReceipt }), true);
+  for (let frameSequence = 3; frameSequence <= 600; frameSequence += 1) {
+    const repeatedToken = frames.beginFrame({ frameSequence, scene: drawable.scene });
+    frames.completeFrame(repeatedToken, { scene: drawable.scene, renderer });
+  }
+  assert.equal(childrenReads, 1_200,
+    '600 frames must perform one traversal without a receipt-side traversal');
+  assert.deepEqual(gpuMirror.snapshot(), {
+    schemaVersion: 'gpu-attribute-mirror-1',
+    frameCount: 600,
+    pending: false,
+    attributeUploadCount: 1,
+    componentUploadCount: 3,
+    evidenceTraversalCount: 600,
+    completedEvidenceCount: 600,
+    evidenceRegistry: {
+      objectRegistrationCount: 2,
+      relationRegistryAllocationCount: 1,
+      relationRegistrationCount: 1,
+      drawableRecordAllocationCount: 1,
+      residencyRecordAllocationCount: 1,
+    },
+  });
+  assert.deepEqual(frames.snapshot(), {
+    active: false,
+    completedFrameCount: 600,
+    lastSequence: 600,
+    stagedEvidenceCaptureCount: 600,
+    fallbackEvidenceCaptureCount: 0,
+  });
+});
+
+test('persistent receipt registries never backfill old object or attribute membership', () => {
+  const firstAttribute = createAttribute([1, 2, 3], 3);
+  const drawable = createDrawable(firstAttribute);
+  const renderer = {
+    attributes: {
+      get: attribute => ({ version: attribute.version ?? 0 }),
+    },
+  };
+  const gpuMirror = createRendererGpuAttributeMirror();
+  const frames = createRenderFrameAcknowledger({ clock: () => 1, gpuMirror });
+  let token = frames.beginFrame({ frameSequence: 1, scene: drawable.scene });
+  const firstReceipt = frames.completeFrame(token, { scene: drawable.scene, renderer });
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: drawable.mesh,
+    attribute: firstAttribute,
+    receipt: firstReceipt,
+  }), true);
+
+  const lateDrawable = createDrawable(createAttribute([4, 5, 6], 3)).mesh;
+  drawable.scene.children.push(lateDrawable);
+  lateDrawable.parent = drawable.scene;
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: lateDrawable,
+    attribute: lateDrawable.geometry.attributes.density,
+    receipt: firstReceipt,
+  }), false, 'an object attached after completion cannot backfill the old receipt');
+
+  token = frames.beginFrame({ frameSequence: 2, scene: drawable.scene });
+  const secondReceipt = frames.completeFrame(token, { scene: drawable.scene, renderer });
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: lateDrawable,
+    attribute: lateDrawable.geometry.attributes.density,
+    receipt: secondReceipt,
+  }), true, 'the later receipt proves the relationship captured in its own frame');
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: drawable.mesh,
+    attribute: firstAttribute,
+    receipt: firstReceipt,
+  }), false, 'a later frame may conservatively retire an older receipt');
+
+  const replacementAttribute = createAttribute([7, 8, 9], 3);
+  drawable.mesh.geometry.attributes.density = replacementAttribute;
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: drawable.mesh,
+    attribute: replacementAttribute,
+    receipt: secondReceipt,
+  }), false, 'post-receipt attribute replacement cannot inherit prior residency');
+  token = frames.beginFrame({ frameSequence: 3, scene: drawable.scene });
+  const thirdReceipt = frames.completeFrame(token, { scene: drawable.scene, renderer });
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: drawable.mesh,
+    attribute: replacementAttribute,
+    receipt: thirdReceipt,
+  }), true);
+  assert.equal(isObjectUploadTargetInCompletedFrame({
+    object: drawable.mesh,
+    attribute: replacementAttribute,
+    receipt: secondReceipt,
+  }), false, 'a newer registry mark never backfills an older frame sequence');
 });
 
 test('deadline metrics include owners that have never drawn', () => {

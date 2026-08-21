@@ -13,6 +13,7 @@ import { squareChunkCoordinates } from '../src/infinite-world/chunk-coordinates.
 import { createSandboxChunkGenerator } from '../src/infinite-world/sandbox-chunk-generator.js';
 import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
 import { shouldDeferAutosaveForStreaming } from '../src/infinite-world/sandbox-boot.js';
+import { createOwnerGenerationCoordinator } from '../src/infinite-world/owner-generation-coordinator.js';
 
 class PreparedAdapter {
   constructor() {
@@ -49,6 +50,46 @@ class PreparedAdapter {
     this.discarded.push(projected.key);
   }
   async shutdown() { this.loaded.clear(); }
+}
+
+class CooperativeProjectionAdapter extends PreparedAdapter {
+  constructor() {
+    super();
+    this.holdEnabled = false;
+    this.blockingKey = null;
+    this.cancelledKeys = [];
+    this.startedResolve = null;
+    this.startedPromise = Promise.resolve(null);
+  }
+
+  armNextProjection() {
+    this.holdEnabled = true;
+    this.blockingKey = null;
+    this.startedPromise = new Promise(resolve => { this.startedResolve = resolve; });
+    return this.startedPromise;
+  }
+
+  async projectChunk(data, origin, options = {}) {
+    const key = `${data.chunkX},${data.chunkZ}`;
+    if (this.holdEnabled && this.blockingKey === null) {
+      this.blockingKey = key;
+      this.startedResolve?.(key);
+      for (let turn = 0; turn < 10_000; turn += 1) {
+        if (options.shouldCancel?.() === true) {
+          this.cancelledKeys.push(key);
+          this.holdEnabled = false;
+          const error = new Error(`test projection cancelled: ${key}`);
+          error.code = 'CHUNK_PROJECTION_CANCELLED';
+          error.retryable = true;
+          error.cancelled = true;
+          throw error;
+        }
+        await new Promise(resolve => setImmediate(resolve));
+      }
+      throw new Error(`test projection did not receive cancellation: ${key}`);
+    }
+    return super.projectChunk(data, origin);
+  }
 }
 
 class TerrainPresentationGenerationAdapter {
@@ -215,6 +256,20 @@ function movingReadyPlan({
   });
 }
 
+function corridorCoverageKeySet(corridorCenters, radiusChunks) {
+  const keys = new Set();
+  for (const center of corridorCenters) {
+    for (const coordinate of squareChunkCoordinates(center.chunkX, center.chunkZ, radiusChunks)) {
+      keys.add(coordinate.key);
+    }
+  }
+  return keys;
+}
+
+function sortedKeys(keys) {
+  return [...keys].sort();
+}
+
 function maxSprintStressCenter(step) {
   return { chunkX: step, chunkZ: 0 };
 }
@@ -231,6 +286,7 @@ async function createRuntime(seed, {
   onPipelineEvent = null,
   terrainPresentationAdapter = null,
   fastChunks = false,
+  renderAdapter = null,
 } = {}) {
   const source = await createSandboxChunkGenerator({ worldSeed: seed });
   const fastTemplate = fastChunks ? await source.generateChunk(0, 0) : null;
@@ -255,7 +311,7 @@ async function createRuntime(seed, {
       return source.generateChunk(chunkX, chunkZ);
     },
   };
-  const adapter = new PreparedAdapter();
+  const adapter = renderAdapter ?? new PreparedAdapter();
   const chunkDataService = new ChunkDataService({
     transport: createInlineChunkGeneratorTransport({ generator }),
     cacheCapacity: 81,
@@ -450,6 +506,16 @@ test('Runtime Terrain READY planner unions an owner once and grows a bounded vel
         assert.equal(new Set(renderKeys).size, renderKeys.length);
         assert.ok(renderKeys.every(key => dataKeys.includes(key)));
         assert.ok(dataKeys.length <= 81, `${stageId}/${sprint}/${path} exceeds cache capacity`);
+        assert.deepEqual(
+          sortedKeys(dataKeys),
+          sortedKeys(corridorCoverageKeySet(plan.corridorCenters, 2)),
+          `${stageId}/${sprint}/${path} data must equal the independent 5x5 corridor union`,
+        );
+        assert.deepEqual(
+          sortedKeys(renderKeys),
+          sortedKeys(corridorCoverageKeySet(plan.corridorCenters, 1)),
+          `${stageId}/${sprint}/${path} render must equal the independent 3x3 corridor union`,
+        );
         assert.deepEqual(plan, readyPlan({ stageId, sprint, path }));
         rows.push({ stageId, sprint, path, plan });
       }
@@ -459,8 +525,14 @@ test('Runtime Terrain READY planner unions an owner once and grows a bounded vel
   const maxSprint = rows.find(row => row.stageId === 'MAX' && row.sprint && row.path === 'straight').plan;
   assert.ok(maxSprint.corridorCenters.length > maxWalk.corridorCenters.length);
   assert.ok(maxSprint.dataCoordinates.length > maxWalk.dataCoordinates.length);
-  assert.equal(maxSprint.dataCoordinates.length, 60);
-  assert.equal(maxSprint.renderCoordinates.length, 30);
+  assert.equal(
+    maxSprint.dataCoordinates.length,
+    corridorCoverageKeySet(maxSprint.corridorCenters, 2).size,
+  );
+  assert.equal(
+    maxSprint.renderCoordinates.length,
+    corridorCoverageKeySet(maxSprint.corridorCenters, 1).size,
+  );
 });
 
 test('MAX Sprint straight and diagonal consume the authoritative READY set with zero arrival projection', async () => {
@@ -492,6 +564,335 @@ test('MAX Sprint straight and diagonal consume the authoritative READY set with 
     await runtime.shutdown();
     await chunkDataService.shutdown();
   }
+});
+
+test('Phase 3 continuous sliding publishes the current Player 3x3 before the compatibility center commits', async () => {
+  const { runtime, adapter, chunkDataService } = await createRuntime(
+    'phase3-owner-sliding-current-player',
+    { fastChunks: true },
+  );
+  const plan = movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 1, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  });
+
+  await runtime.updateTerrainReadySet(plan);
+  let snapshot = runtime.snapshot();
+  assert.equal(snapshot.centerChunkX, 0);
+  assert.equal(snapshot.centerChunkZ, 0);
+  assert.equal(snapshot.presentationSliding.target.key, '1,0');
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, ['2,-1', '2,0', '2,1']);
+  assert.equal(snapshot.presentationSliding.physicalRenderKeys.length, 12);
+  assert.equal(runtime.isTerrainCoveragePublished(2, 0), true);
+
+  const projectedBeforeCommit = adapter.projected.length;
+  await runtime.transitionToChunk(1, 0, { required: true });
+  snapshot = runtime.snapshot();
+  assert.equal(adapter.projected.length, projectedBeforeCommit,
+    'compatibility commit promotes already-published owners without re-projecting them');
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, []);
+  assert.equal(snapshot.presentationSliding.physicalRenderKeys.length, 9);
+  assert.deepEqual(
+    [...adapter.loaded.keys()].sort(),
+    squareChunkCoordinates(1, 0, 1).map(value => value.key).sort(),
+  );
+  assert.equal(snapshot.counts.presentationSlidingOwnersDrawn >= 3, true);
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase A diagnostic traces one owner end-to-end without adding work to the normal runtime snapshot', async () => {
+  const { runtime, chunkDataService } = await createRuntime(
+    'phase-a-owner-full-lifecycle-trace',
+    { fastChunks: true },
+  );
+  const plan = movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 1, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  });
+
+  await runtime.updateTerrainReadySet(plan);
+  const normalSnapshot = runtime.snapshot();
+  assert.equal(normalSnapshot.presentationOwnerTrace, undefined,
+    'expensive Phase A diagnostics must stay off the frame-path snapshot');
+  assert.equal(normalSnapshot.cacheOwnership, undefined);
+
+  const diagnostic = runtime.phaseADiagnosticSnapshot('2,0');
+  assert.equal(diagnostic.schemaVersion, 'runtime-phase-a-presentation-diagnostic-1');
+  assert.equal(diagnostic.ownerTrace.ownerKey, '2,0');
+  assert.equal(diagnostic.ownerTrace.blocker, 'drawn');
+  assert.equal(diagnostic.ownerTrace.flags.physicalRendered, true);
+  assert.equal(diagnostic.authority.runtimeCenterKey, '0,0');
+  assert.equal(diagnostic.authority.slidingTargetKey, '1,0');
+  assert.equal(diagnostic.authority.diverged, true);
+  assert.equal(diagnostic.cacheOwnership.currentRenderDesiredCount, 9);
+  assert.equal(diagnostic.cacheOwnership.currentRenderCompletedCount, 9);
+  assert.equal(diagnostic.cacheOwnership.evictionEligibleCount >= 0, true);
+
+  const stages = diagnostic.ownerTrace.events.map(event => event.stage);
+  for (const stage of [
+    'presentation:needed',
+    'presentation:requested',
+    'dependency:wait-start',
+    'dependency:ready',
+    'publication:owner-start',
+    'projection:queued',
+    'projection:started',
+    'projection:completed',
+    'admission:bypassed',
+    'publication:load-start',
+    'publication:load-complete',
+    'publication:callback-applied',
+    'presentation:admitted',
+    'presentation:drawn',
+  ]) assert.ok(stages.includes(stage), `owner trace must include ${stage}`);
+  const order = [
+    'presentation:requested',
+    'dependency:ready',
+    'publication:owner-start',
+    'projection:queued',
+    'projection:started',
+    'projection:completed',
+    'publication:load-start',
+    'publication:load-complete',
+    'presentation:admitted',
+    'presentation:drawn',
+  ].map(stage => stages.indexOf(stage));
+  assert.ok(order.every((value, index) => index === 0 || value > order[index - 1]),
+    `owner trace must preserve lifecycle order: ${JSON.stringify(stages)}`);
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase A diagnostic identifies a current visible owner stalled before ChunkData completion', async () => {
+  const controlled = await createControlledChunkDataRuntime(
+    'phase-a-owner-stall-trace',
+    { delayedOwnerKey: '3,0' },
+  );
+  const { runtime, chunkDataService, delayedStarted, releaseDelayed } = controlled;
+  const readyPromise = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 3, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  }));
+  await delayedStarted;
+
+  const diagnostic = runtime.phaseADiagnosticSnapshot('3,0');
+  assert.equal(diagnostic.ownerTrace.ownerKey, '3,0');
+  assert.equal(diagnostic.ownerTrace.flags.desiredRender, true);
+  assert.equal(diagnostic.ownerTrace.flags.pendingPresentation, true);
+  assert.equal(diagnostic.ownerTrace.flags.runtimeChunkDataCached, false);
+  assert.equal(diagnostic.ownerTrace.blocker, 'waiting-chunk-data');
+  assert.ok(diagnostic.ownerTrace.events.some(event => event.stage === 'dependency:wait-start'));
+  assert.ok(diagnostic.ownerTrace.events.some(event => event.stage === 'chunk-data:request-start'));
+  assert.equal(diagnostic.ownerTrace.events.some(
+    event => event.stage === 'chunk-data:request-complete' && event.details?.result === 'ready',
+  ), false);
+
+  releaseDelayed();
+  await readyPromise;
+  const completed = runtime.phaseADiagnosticSnapshot('3,0');
+  assert.equal(completed.ownerTrace.blocker, 'drawn');
+  assert.ok(completed.ownerTrace.events.some(event => event.stage === 'chunk-data:request-complete'));
+  assert.ok(completed.ownerTrace.events.some(event => event.stage === 'presentation:drawn'));
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase 3 visible owner publication is not blocked by a slow non-render owner in the 5x5 READY batch', async () => {
+  const controlled = await createControlledChunkDataRuntime(
+    'phase3-owner-sliding-tail-independence',
+    { delayedOwnerKey: '3,2' },
+  );
+  const { runtime, chunkDataService, delayedStarted, releaseDelayed } = controlled;
+  const plan = movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 1, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  });
+
+  let readySettled = false;
+  const readyPromise = runtime.updateTerrainReadySet(plan).finally(() => { readySettled = true; });
+  await delayedStarted;
+  const enteringKeys = ['2,-1', '2,0', '2,1'];
+  for (let turn = 0; turn < 2_000; turn += 1) {
+    const published = runtime.snapshot().presentationSliding.publishedKeys;
+    if (enteringKeys.every(key => published.includes(key))) break;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  const duringTail = runtime.snapshot();
+  assert.equal(readySettled, false, 'the delayed non-render dependency still holds the full READY batch');
+  assert.deepEqual(duringTail.presentationSliding.publishedKeys, enteringKeys);
+  assert.equal(duringTail.centerChunkX, 0);
+
+  releaseDelayed();
+  await readyPromise;
+  assert.equal(runtime.snapshot().terrainReady.queueDepth, 0);
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase 3 keeps a newer Player sliding target while an older compatibility transition commits', async () => {
+  const { runtime, adapter, chunkDataService } = await createRuntime(
+    'phase3-newer-player-target-survives-intermediate-commit',
+    { fastChunks: true },
+  );
+
+  const intermediateTransition = runtime.transitionToChunk(1, 0, { required: true });
+  const latestReady = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 2, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  }));
+  await Promise.all([intermediateTransition, latestReady]);
+
+  let snapshot = runtime.snapshot();
+  assert.equal(snapshot.centerChunkX, 1);
+  assert.equal(snapshot.presentationSliding.target.key, '2,0');
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, ['3,-1', '3,0', '3,1']);
+  assert.equal(snapshot.presentationSliding.physicalRenderKeys.length, 12);
+  assert.ok(['3,-1', '3,0', '3,1'].every(key => adapter.loaded.has(key)));
+
+  await runtime.transitionToChunk(2, 0, { required: true });
+  snapshot = runtime.snapshot();
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, []);
+  assert.equal(snapshot.presentationSliding.physicalRenderKeys.length, 9);
+  assert.deepEqual(
+    [...adapter.loaded.keys()].sort(),
+    squareChunkCoordinates(2, 0, 1).map(value => value.key).sort(),
+  );
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase 3 supersedes historical Player owner waits immediately and bounds pending work to the latest 3x3', async () => {
+  const controlled = await createControlledChunkDataRuntime(
+    'phase3-latest-spatial-demand-supersedes-history',
+    { delayedOwnerKey: '3,0' },
+  );
+  const { runtime, chunkDataService, delayedStarted, releaseDelayed } = controlled;
+  const oldReady = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 3, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  }));
+  await delayedStarted;
+
+  const latestPlayer = { chunkX: 8, chunkZ: -21 };
+  const latestReady = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: latestPlayer,
+    direction: { x: 1, z: -1 },
+  }));
+  const latestKeys = squareChunkCoordinates(
+    latestPlayer.chunkX,
+    latestPlayer.chunkZ,
+    1,
+  ).map(value => value.key).sort();
+
+  let snapshot = runtime.snapshot();
+  assert.equal(snapshot.presentationSliding.target.key, '8,-21');
+  assert.equal(snapshot.presentationSliding.pendingKeys.length <= 9, true);
+  assert.ok(snapshot.presentationSliding.pendingKeys.every(key => latestKeys.includes(key)));
+  assert.equal(snapshot.presentationSliding.pendingKeys.includes('3,0'), false,
+    'an obsolete held dependency must not remain a Presentation sliding waiter');
+
+  releaseDelayed();
+  await Promise.allSettled([oldReady, latestReady]);
+  snapshot = runtime.snapshot();
+  assert.deepEqual(snapshot.presentationSliding.pendingKeys, []);
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, latestKeys);
+  assert.equal(snapshot.counts.presentationSlidingMaximumPendingCount <= 9, true);
+  assert.equal(snapshot.counts.presentationSlidingOwnersSuperseded > 0, true);
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase 3 rapid Player target churn never accumulates historical sliding jobs', async () => {
+  const { runtime, chunkDataService } = await createRuntime(
+    'phase3-rapid-target-churn-bounded-pending',
+    { fastChunks: true },
+  );
+  const work = [];
+  const targetCount = 24;
+  for (let step = 1; step <= targetCount; step += 1) {
+    work.push(runtime.updateTerrainReadySet(movingReadyPlan({
+      runtimeCenter: { chunkX: 0, chunkZ: 0 },
+      playerCenter: { chunkX: step, chunkZ: -step },
+      direction: { x: 1, z: -1 },
+    })));
+    const snapshot = runtime.snapshot().presentationSliding;
+    const latestKeys = new Set(squareChunkCoordinates(step, -step, 1).map(value => value.key));
+    assert.equal(snapshot.pendingKeys.length <= 9, true);
+    assert.ok(snapshot.pendingKeys.every(key => latestKeys.has(key)));
+  }
+
+  await Promise.allSettled(work);
+  const snapshot = runtime.snapshot();
+  const latestKeys = squareChunkCoordinates(targetCount, -targetCount, 1)
+    .map(value => value.key).sort();
+  assert.equal(snapshot.presentationSliding.target.key, `${targetCount},${-targetCount}`);
+  assert.deepEqual(snapshot.presentationSliding.pendingKeys, []);
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, latestKeys);
+  assert.equal(snapshot.counts.presentationSlidingMaximumPendingCount <= 9, true);
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
+});
+
+test('Phase 3 cooperatively cancels an in-flight obsolete projection so the latest Player 3x3 can publish', async () => {
+  const adapter = new CooperativeProjectionAdapter();
+  const { runtime, chunkDataService } = await createRuntime(
+    'phase3-projection-cooperative-supersession',
+    { fastChunks: true, renderAdapter: adapter },
+  );
+  const oldStarted = adapter.armNextProjection();
+  const oldReady = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: { chunkX: 3, chunkZ: 0 },
+    direction: { x: 1, z: 0 },
+  }));
+  oldReady.catch(() => {});
+  const oldProjectionKey = await oldStarted;
+  assert.equal(oldProjectionKey, '2,0');
+
+  const latestPlayer = { chunkX: 8, chunkZ: -21 };
+  const latestReady = runtime.updateTerrainReadySet(movingReadyPlan({
+    runtimeCenter: { chunkX: 0, chunkZ: 0 },
+    playerCenter: latestPlayer,
+    direction: { x: 1, z: -1 },
+  }));
+  const latestKeys = squareChunkCoordinates(
+    latestPlayer.chunkX,
+    latestPlayer.chunkZ,
+    1,
+  ).map(value => value.key).sort();
+
+  for (let turn = 0; turn < 4_000; turn += 1) {
+    const snapshot = runtime.snapshot();
+    if (snapshot.presentationSliding.publishedKeys.length === latestKeys.length
+      && latestKeys.every(key => snapshot.presentationSliding.publishedKeys.includes(key))) break;
+    await new Promise(resolve => setImmediate(resolve));
+  }
+
+  const settled = await Promise.allSettled([oldReady, latestReady]);
+  assert.ok(settled.every(result => result.status === 'fulfilled'));
+  const snapshot = runtime.snapshot();
+  assert.deepEqual(snapshot.presentationSliding.publishedKeys, latestKeys);
+  assert.deepEqual(adapter.cancelledKeys, [oldProjectionKey]);
+  assert.equal(snapshot.counts.projectionJobsCancelledInFlight >= 1, true);
+  assert.equal(snapshot.projectionScheduling.activeOwnerKey, null);
+  assert.equal(snapshot.projectionScheduling.queueDepth, 0);
+
+  await runtime.shutdown();
+  await chunkDataService.shutdown();
 });
 
 test('MAX Sprint claims complete Terrain presentation generations without arrival compose or mixed release order', async () => {
@@ -668,10 +1069,24 @@ test('READY plan supersede preserves a shared queued ChunkData request and its q
   const blockerB = controlled.chunkDataService.requestChunk({
     chunkX: 101, chunkZ: 0, priority: 1, consumerId: 'queue-blocker-b', required: true,
   });
-  for (let turn = 0; turn < 100 && controlled.chunkDataService.snapshot().inFlightCount < 2; turn += 1) {
-    await new Promise(resolve => setImmediate(resolve));
+  let blockerSnapshot = null;
+  for (let turn = 0; turn < 100 && blockerSnapshot === null; turn += 1) {
+    const snapshot = controlled.chunkDataService.snapshot();
+    const queuedBlocker = snapshot.queued.find(value => value.key === '101,0') ?? null;
+    if (snapshot.inFlightKeys[0] === '100,0' && queuedBlocker) {
+      blockerSnapshot = { snapshot, queuedBlocker };
+    } else {
+      await new Promise(resolve => setImmediate(resolve));
+    }
   }
-  assert.equal(controlled.chunkDataService.snapshot().inFlightCount, 2);
+  assert.ok(blockerSnapshot);
+  assert.equal(blockerSnapshot.snapshot.coordinator.maximumConcurrentRequests, 1);
+  assert.equal(blockerSnapshot.snapshot.pendingCount, 2);
+  assert.equal(blockerSnapshot.snapshot.inFlightCount, 1);
+  assert.deepEqual(blockerSnapshot.snapshot.inFlightKeys, ['100,0']);
+  assert.equal(blockerSnapshot.snapshot.queuedCount, 1);
+  assert.equal(blockerSnapshot.queuedBlocker.priority, 1);
+  assert.equal(blockerSnapshot.queuedBlocker.required, true);
 
   const planA = movingReadyPlan({
     runtimeCenter: { chunkX: 0, chunkZ: 0 },
@@ -708,6 +1123,15 @@ test('READY plan supersede preserves a shared queued ChunkData request and its q
 
   controlled.releaseHeld('100,0');
   assert.equal((await blockerA.promise).chunkX, 100);
+  for (let turn = 0; turn < 100
+    && controlled.chunkDataService.snapshot().inFlightKey !== '101,0'; turn += 1) {
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.equal(controlled.chunkDataService.snapshot().inFlightKey, '101,0');
+  assert.deepEqual(
+    controlled.calls.filter(key => key === '100,0' || key === '101,0'),
+    ['100,0', '101,0'],
+  );
   controlled.releaseHeld('101,0');
   assert.equal((await blockerB.promise).chunkX, 101);
   assert.equal(await workA, null);
@@ -735,10 +1159,19 @@ test('READY plan supersede preserves the shared in-flight ChunkData owner and re
   const dataB = new Set(planB.dataCoordinates.map(value => value.key));
   const overlap = [...dataA].filter(key => dataB.has(key));
   const entering = [...dataB].filter(key => !dataA.has(key));
-  assert.equal(dataA.size, 60);
-  assert.equal(dataB.size, 60);
-  assert.equal(overlap.length, 55);
+  const leaving = [...dataA].filter(key => !dataB.has(key));
+  const expectedA = corridorCoverageKeySet(planA.corridorCenters, 2);
+  const expectedB = corridorCoverageKeySet(planB.corridorCenters, 2);
+  const expectedEntering = [...expectedB].filter(key => !expectedA.has(key));
+  const expectedLeaving = [...expectedA].filter(key => !expectedB.has(key));
+  assert.deepEqual(sortedKeys(dataA), sortedKeys(expectedA));
+  assert.deepEqual(sortedKeys(dataB), sortedKeys(expectedB));
+  assert.equal(dataA.size, dataB.size);
+  assert.equal(overlap.length, dataA.size - entering.length);
+  assert.deepEqual(sortedKeys(entering), sortedKeys(expectedEntering));
+  assert.deepEqual(sortedKeys(leaving), sortedKeys(expectedLeaving));
   assert.equal(entering.length, 5);
+  assert.equal(leaving.length, 5);
 
   const workA = controlled.runtime.updateTerrainReadySet(planA);
   await controlled.delayedStarted;
@@ -746,7 +1179,11 @@ test('READY plan supersede preserves the shared in-flight ChunkData owner and re
   assert.equal(requestBefore.inFlightKey, '3,-1');
   const workB = controlled.runtime.updateTerrainReadySet(planB);
   const during = controlled.runtime.snapshot().terrainReady.chunkDataSubscriberDiagnostics;
-  assert.deepEqual(during.lastOwnerSetDiff, { unchanged: 55, entering: 5, leaving: 5 });
+  assert.deepEqual(during.lastOwnerSetDiff, {
+    unchanged: overlap.length,
+    entering: entering.length,
+    leaving: leaving.length,
+  });
   assert.equal(during.chunkDataSubscribersTransferred, 1);
   assert.equal(during.chunkDataUnderlyingRequestsReused, 1);
   assert.equal(during.chunkDataWorkerCancelRequests, 0);
@@ -872,6 +1309,8 @@ test('latest Terrain 5x5 registers as a bounded batch and a 750ms tail does not 
   for (const tailKey of tailKeys) {
     const requestCountByOwner = new Map();
     const pipelineEvents = [];
+    let activeRequestCount = 0;
+    let maximumActiveRequestCount = 0;
     const fastChunk = (chunkX, chunkZ) => Object.freeze({
       ...template,
       chunkX,
@@ -896,17 +1335,32 @@ test('latest Terrain 5x5 registers as a bounded batch and a 750ms tail does not 
       async generateChunk(request) {
         const key = `${request.chunkX},${request.chunkZ}`;
         requestCountByOwner.set(key, (requestCountByOwner.get(key) ?? 0) + 1);
-        if (dependencyKeys.has(key)) {
-          const delayMs = key === tailKey ? 750 : shortDelayByKey.get(key);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
+        activeRequestCount += 1;
+        maximumActiveRequestCount = Math.max(maximumActiveRequestCount, activeRequestCount);
+        try {
+          if (dependencyKeys.has(key)) {
+            const delayMs = key === tailKey ? 750 : shortDelayByKey.get(key);
+            await new Promise(resolve => setTimeout(resolve, delayMs));
+          }
+          return fastChunk(request.chunkX, request.chunkZ);
+        } finally {
+          activeRequestCount -= 1;
         }
-        return fastChunk(request.chunkX, request.chunkZ);
       },
       cancelGenerationRequest: () => false,
       snapshot: () => Object.freeze({ kind: 'p2g-tail-latency' }),
       shutdown: () => Promise.resolve(),
     };
-    const chunkDataService = new ChunkDataService({ transport, cacheCapacity: 81 });
+    // The fixture models one Worker's bounded request-admission window. Using
+    // the default single active coordinator here would serialize these timer
+    // delays exactly like the serial control and reduce the assertion to timer
+    // jitter rather than testing Terrain batch registration.
+    const coordinator = createOwnerGenerationCoordinator({ maximumConcurrentRequests: 4 });
+    const chunkDataService = new ChunkDataService({
+      transport,
+      cacheCapacity: 81,
+      coordinator,
+    });
     await chunkDataService.initialize();
     const runtime = new ChunkRuntimeManager({
       chunkDataService,
@@ -955,6 +1409,9 @@ test('latest Terrain 5x5 registers as a bounded batch and a 750ms tail does not 
     assert.equal(ownerRequests.some(event => event.priorityClass === 2 && event.priority === 4), true);
     assert.equal(ownerRequests.some(event => event.priorityClass === 3 && event.priority === 5), true);
     assert.equal(scheduler.workerCount, 1);
+    assert.equal(chunkDataService.snapshot().coordinator.maximumConcurrentRequests, 4);
+    assert.equal(maximumActiveRequestCount, 4,
+      'the bounded admission window must let later owners progress around the tail');
     assert.ok(scheduler.queueWaitMs.count >= 25);
     assert.ok(elapsedMs >= dependency.targetToAllDependenciesResolvedMs);
     rows.push({
@@ -970,6 +1427,7 @@ test('latest Terrain 5x5 registers as a bounded batch and a 750ms tail does not 
     });
     await runtime.shutdown();
     await chunkDataService.shutdown();
+    await coordinator.shutdown();
   }
   await source.shutdown?.();
   t.diagnostic(JSON.stringify({

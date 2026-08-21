@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { PLAYER_MAX_SPRINT_METERS_PER_SECOND } from '../src/player-scale-profile.js';
 import { LOGICAL_CHUNK_SIZE_METERS } from '../src/infinite-world/chunk-coordinates.js';
 import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
 import {
@@ -12,7 +13,6 @@ import {
   productionHarnessTraverseVisitCount,
 } from './helpers/infinite-world-production-scheduling-harness.mjs';
 
-const MAX_SPRINT_METERS_PER_SECOND = 47.85;
 const POSITION_EPSILON_METERS = 1e-9;
 
 const logicalPosition = snapshot => Object.freeze({
@@ -109,7 +109,7 @@ function assertVisualContinuityReceiptState(snapshot, phase) {
 
 function assertMaxSprint(step, name) {
   const speed = magnitude(step) / PRODUCTION_FRAME_SECONDS;
-  assertNear(speed, MAX_SPRINT_METERS_PER_SECOND, 1e-7,
+  assertNear(speed, PLAYER_MAX_SPRINT_METERS_PER_SECOND, 1e-7,
     `${name} must use the production MAX sprint speed`);
 }
 
@@ -179,13 +179,14 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     }
   };
   const maxProfile = getW6ScaleProfile('MAX');
-  assert.equal(maxProfile.sprintMetersPerSecond, MAX_SPRINT_METERS_PER_SECOND,
-    'the test speed is read against the protected production scale contract');
+  assert.equal(maxProfile.sprintMetersPerSecond, PLAYER_MAX_SPRINT_METERS_PER_SECOND,
+    'the runtime meter profile must derive the protected production scale contract');
 
-    const harness = await bootProductionSchedulingHarness();
+  const harness = await bootProductionSchedulingHarness();
   try {
     const booted = harness.snapshot();
-    const initialRendererCount = harness.environment.renderer().renderCount;
+    const initialWorldRendererCount = harness.environment.renderer().worldRenderCount;
+    const initialStagingRendererCount = harness.environment.renderer().stagingRenderCount;
     const initialTransportGenerated = booted.chunkDataService.transport.counts.generated;
     const initialTerrainCommitCount = booted.presentation.localTerrainCommitCount;
     const initialStaticPlanCount = booted.staticObjectStreaming.counts.plans;
@@ -194,21 +195,27 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.equal(booted.boot.status, 'ready');
     assert.equal(booted.experience.runPhase, 'playing');
     assert.equal(booted.gameplay.state.activeScaleStageId, 'MAX');
-    assert.equal(booted.chunkDataService.transport.kind, 'worker');
+    assert.equal(booted.chunkDataService.transport.kind, 'worker-fixed-lanes');
     assert.equal(booted.chunkDataService.transport.mode, 'worker',
       JSON.stringify(booted.chunkDataService.transport.fallbackReason));
     assert.equal(booted.chunkDataService.transport.fallbackOccurred, false);
+    assert.equal(booted.chunkDataService.transport.lanes.critical.mode, 'worker');
+    assert.equal(booted.chunkDataService.transport.lanes.background.mode, 'worker');
     assert.ok(initialTransportGenerated >= 25,
       'boot must obtain the resident set through the production Worker transport');
     assert.ok(booted.chunkDataService.counts.transportCalls >= 25,
       'the full ChunkDataService must dispatch the initial resident set');
     assert.equal(booted.presentationOwnerData.transport.serviceGeneration,
       booted.chunkDataService.transport.serviceGeneration,
-      'Full and PresentationOwner services must share one production Worker transport');
+      'Full and PresentationOwner services must share one fixed-lane transport');
     assert.ok(booted.presentationOwnerData.counts.requests < 1_757,
       'boot must not require-prewarm the complete 368 m Presentation coverage');
-    assert.equal(booted.ownerGeneration.maximumConcurrentRequests, 1,
-      'the global owner queue must feed exactly one operation into the serial Worker');
+    assert.equal(booted.ownerGeneration.maximumConcurrentRequests, 2,
+      'the global owner queue must expose exactly the fixed Critical/Background lanes');
+    assert.equal(booted.ownerGeneration.lanes.critical.maximumConcurrentRequests, 2,
+      'Critical admits one required Full beside one cancellable future-Full');
+    assert.equal(booted.ownerGeneration.lanes.background.maximumConcurrentRequests, 1,
+      'Background remains single-flight');
     assert.equal(booted.staticObjectStreaming.counts.plans > 0, true);
     assert.equal(booted.staticObjectStreaming.prefetchedOwnerCount, 0,
       'stationary boot must not create a degenerate velocity corridor');
@@ -226,10 +233,12 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       < booted.staticObjectStreaming.requiredOwnerCount,
     'the 16 m resource prewarm margin must stay outside visual Expected');
     assert.ok(booted.staticObjectStreaming.coarsePrewarmOwnerCount > 0);
-    assert.ok(booted.staticObjectStreaming.visualExpectedOwnerCount
-      + booted.staticObjectStreaming.coarsePrewarmOwnerCount
-      < booted.staticObjectStreaming.requiredOwnerCount,
-    'the coarse safety shell must not promote the complete 368 m Resource window');
+    assert.equal(
+      booted.staticObjectStreaming.visualExpectedOwnerCount
+        + booted.staticObjectStreaming.coarsePrewarmOwnerCount,
+      booted.staticObjectStreaming.requiredOwnerCount,
+      'visual Expected and coarse prewarm must partition the 368 m Resource window',
+    );
     assert.deepEqual(new Set(booted.staticObjectStreaming.policyKinds), new Set([
       'natural-tree',
       'natural-rock',
@@ -603,15 +612,20 @@ test('full production boot scheduling stays continuous through MAX sprint direct
     assert.equal(schedulerSnapshot.pendingAnimationFrameCount, 1,
       'the production loop must retain exactly one next-frame request');
     assert.equal(
-      harness.environment.renderer().renderCount,
-      initialRendererCount + schedulerSnapshot.frameCount,
+      harness.environment.renderer().worldRenderCount,
+      initialWorldRendererCount + schedulerSnapshot.frameCount,
       'every injected production rAF must reach render exactly once',
+    );
+    assert.equal(
+      harness.environment.renderer().stagingRenderCount - initialStagingRendererCount,
+      settled.runtime.renderUploadAdmission.counts.stagedBuckets,
+      'every admitted upload bucket must use exactly one private staging render',
     );
     if (settled.visualContinuity) {
       assert.equal(
         settled.visualContinuity.renderFrames.completedFrameCount,
-        harness.environment.renderer().renderCount,
-        'renderer acknowledger must issue exactly one completed receipt per production render',
+        harness.environment.renderer().worldRenderCount,
+        'renderer acknowledger must issue exactly one completed receipt per world render',
       );
     }
 
@@ -663,6 +677,27 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       'movement must not miss collision Terrain coverage');
     assert.equal(releaseProof.movementBlock, 0,
       'Terrain readiness must not block movement');
+    assert.equal(settled.runtimeTransitionFault.mutationStopped, false);
+    assert.equal(settled.runtimeTransitionFault.retry.status, 'idle',
+      'a successful production transition must reset retry ownership');
+    assert.equal(settled.runtimeTransitionFault.retry.attempts, 0);
+    assert.equal(settled.runtimeTransitionFault.retry.timerCount, 0,
+      'a successful production transition cannot retain a backoff timer');
+    const nearUploadAdmission = settled.runtime.renderUploadAdmission;
+    assert.equal(nearUploadAdmission?.schemaVersion,
+      'render-upload-admission-snapshot-1',
+    'production boot must route Near replacement owners through upload admission');
+    assert.equal(nearUploadAdmission.ownerLimitPerFrame, 1);
+    assert.equal(nearUploadAdmission.queueDepth, 0,
+      'settled MAX sprint must drain every Near upload admission');
+    assert.equal(nearUploadAdmission.pendingPublicationOwnerKey, null);
+    assert.equal(nearUploadAdmission.counts.published, 3,
+      'one entering Near column must publish exactly three replacement owners');
+    assert.ok(nearUploadAdmission.counts.maximumFrameBytes
+      <= nearUploadAdmission.budgetBytes,
+    `Near upload bytes exceeded the per-render envelope: ${JSON.stringify(
+      nearUploadAdmission,
+    )}`);
     assert.equal(releaseGate.schemaVersion,
       'infinite-world-production-release-gate-metrics-1');
     assert.deepEqual(releaseGate.lifecycle, {
@@ -766,6 +801,7 @@ test('full production boot scheduling stays continuous through MAX sprint direct
       rendererDrawCalls: settled.renderInfo.drawCalls,
       naturalLodAttributeCount: reversalNaturalLodAttributes.length,
       cameraYawTriggeredGeneration,
+      nearUploadAdmission,
       releaseProof,
       releaseGate,
     }));
