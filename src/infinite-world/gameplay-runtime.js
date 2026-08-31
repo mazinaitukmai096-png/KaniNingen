@@ -34,6 +34,11 @@ import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js';
 import { resolveW8RockCanonicalObject } from './rock-canonical-object.js';
 import { resolveW8CanonicalWorldObject } from './world-object-canonical-contract.js';
+import {
+  buildingResidentPose,
+  buildingResidentStableId,
+  walkBuildingResidentIntoOwner,
+} from './building-resident-kernel.js';
 import { resolveCanonicalPlayerMovement } from './player-world-collision.js';
 import {
   createChunkCoverageSignature,
@@ -210,34 +215,27 @@ async function entityStableId({ worldSeedHash, generatorMajor, featureType, pare
 }
 
 async function humanDescriptor({ building, chunkData, worldSeedHash, generatorMajor }) {
-  const result = await entityStableId({
-    worldSeedHash,
-    generatorMajor,
-    featureType: 'human',
-    parentStableId: building.stableId,
-    purposeKey: 'w6-building-resident',
+  // Identity and pose come from the shared resident kernel rather than being derived here,
+  // so any tier that shows the same residents further out arrives at the same people instead
+  // of look-alikes that would vanish as the player walks up to them.
+  const stableId = await buildingResidentStableId({
+    worldSeedHash, generatorMajor, buildingStableId: building.stableId,
   });
-  const seed64 = await deriveLocalSeed64({
-    worldSeedHash,
-    namespace: 'w6-human-spawn',
-    semanticKey: result.stableId,
+  const result = { stableId, canonicalInput: null };
+  const { angle, distanceMeters: distance } = await buildingResidentPose({
+    worldSeedHash, stableId, buildingRadiusMeters: building.radiusMeters,
   });
-  const random = createDeterministicRandom(seed64);
-  const angle = await random.float01('angle') * Math.PI * 2;
-  const distance = (building.radiusMeters ?? 2) + 0.75
-    + await random.float01('distance') * 0.75;
   const ownerChunkKey = createChunkKey(chunkData.chunkX, chunkData.chunkZ);
-  let x = building.worldPosition.x;
-  let z = building.worldPosition.z;
-  for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidateAngle = angle + attempt * Math.PI / 4;
-    const candidateX = building.worldPosition.x + Math.cos(candidateAngle) * distance;
-    const candidateZ = building.worldPosition.z + Math.sin(candidateAngle) * distance;
-    if (!ownerContains(ownerChunkKey, candidateX, candidateZ)) continue;
-    x = candidateX;
-    z = candidateZ;
-    break;
-  }
+  // The walk lives in the resident kernel so a far tier lands the same person on the same
+  // spot; deriving it twice is what would let the figure jump at the handoff.
+  const { x, z } = walkBuildingResidentIntoOwner({
+    originX: building.worldPosition.x,
+    originZ: building.worldPosition.z,
+    angle,
+    distanceMeters: distance,
+    ownerChunkX: chunkData.chunkX,
+    ownerChunkZ: chunkData.chunkZ,
+  });
   return Object.freeze({
     stableId: result.stableId,
     canonicalInput: result.canonicalInput,
