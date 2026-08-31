@@ -25,16 +25,40 @@ export const W8_GRASS_FIELD_PRESENTATION_SCHEMA = 'w8-grass-field-presentation-1
 // roughly 0.45 m x 0.65 m, which is reproduced here so a cluster reads like Near grass.
 const BLADE_PARTS = Object.freeze([
   Object.freeze({
+    geometry: 'box',
     position: Object.freeze([-0.13, 0.3, 0]),
     scale: Object.freeze([0.08, 0.6, 0.08]),
     rotationZ: -0.16,
     colorHex: 0x376b22,
   }),
   Object.freeze({
+    geometry: 'box',
     position: Object.freeze([0.12, 0.25, 0.05]),
     scale: Object.freeze([0.07, 0.5, 0.07]),
     rotationZ: 0.2,
     colorHex: 0x75a83a,
+  }),
+]);
+
+// Authored Near flower: a thin stem with a coloured head. Baked into the same cluster as
+// the blades rather than carried separately - flowers are decoration with no gameplay role,
+// so they need no identity of their own, and riding the existing geometry means they cost
+// no extra instances, draw calls or generation time. The Near field is roughly one flower
+// per three grass details, and the cluster keeps that ratio.
+const FLOWER_PARTS = Object.freeze([
+  Object.freeze({
+    geometry: 'box',
+    position: Object.freeze([0, 0.22, 0]),
+    scale: Object.freeze([0.05, 0.44, 0.05]),
+    rotationZ: 0,
+    colorHex: 0x376b22,
+  }),
+  Object.freeze({
+    geometry: 'sphere',
+    position: Object.freeze([0, 0.5, 0]),
+    scale: Object.freeze([0.2, 0.16, 0.2]),
+    rotationZ: 0,
+    colorHex: 0xffd54f,
   }),
 ]);
 const DETAIL_SIZE_METERS = Object.freeze({ width: 0.45, height: 0.65, depth: 0.45 });
@@ -61,8 +85,9 @@ function requireConstructor(THREE, name) {
  * `cellSizeMeters`. Colors are baked as vertex colors so the whole cluster is one draw call
  * instead of one per blade material.
  */
-function createClusterGeometry(THREE, { detailCount, cellSizeMeters }) {
+function createClusterGeometry(THREE, { detailCount, flowerCount, cellSizeMeters }) {
   const BoxGeometry = requireConstructor(THREE, 'BoxGeometry');
+  const SphereGeometry = requireConstructor(THREE, 'SphereGeometry');
   const BufferGeometry = requireConstructor(THREE, 'BufferGeometry');
   const Float32BufferAttribute = requireConstructor(THREE, 'Float32BufferAttribute');
   const Matrix4 = requireConstructor(THREE, 'Matrix4');
@@ -87,18 +112,20 @@ function createClusterGeometry(THREE, { detailCount, cellSizeMeters }) {
   // leaves visible clumps and bald patches, and the gaps line up along cluster boundaries
   // where two cells meet. A jittered grid keeps coverage even at no runtime cost: the
   // scatter is baked into the shared geometry once.
-  const strata = Math.max(1, Math.ceil(Math.sqrt(detailCount)));
+  const bake = (parts, count, salt) => {
+  const strata = Math.max(1, Math.ceil(Math.sqrt(count)));
   const strideMeters = (cellSizeMeters / strata);
-  for (let detail = 0; detail < detailCount; detail += 1) {
+  for (let detail = 0; detail < count; detail += 1) {
     const strataX = detail % strata;
     const strataZ = Math.floor(detail / strata) % strata;
-    const offsetX = -spread + (strataX + unitHash(detail, 11)) * strideMeters;
-    const offsetZ = -spread + (strataZ + unitHash(detail, 23)) * strideMeters;
-    const yaw = unitHash(detail, 37) * Math.PI * 2;
-    const detailScale = 0.85 + unitHash(detail, 53) * 0.4;
+    const offsetX = -spread + (strataX + unitHash(detail, 11 + salt)) * strideMeters;
+    const offsetZ = -spread + (strataZ + unitHash(detail, 23 + salt)) * strideMeters;
+    const yaw = unitHash(detail, 37 + salt) * Math.PI * 2;
+    const detailScale = 0.85 + unitHash(detail, 53 + salt) * 0.4;
 
-    for (const part of BLADE_PARTS) {
-      const geometry = new BoxGeometry(1, 1, 1);
+    for (const part of parts) {
+      const geometry = part.geometry === 'sphere'
+        ? new SphereGeometry(0.5, 6, 5) : new BoxGeometry(1, 1, 1);
       euler.set(0, yaw, part.rotationZ);
       quaternion.setFromEuler(euler);
       translation.set(
@@ -138,6 +165,11 @@ function createClusterGeometry(THREE, { detailCount, cellSizeMeters }) {
       geometry.dispose();
     }
   }
+  };
+  bake(BLADE_PARTS, detailCount, 0);
+  // Flowers use their own stratification and salt so they land between the blades rather
+  // than on top of them.
+  bake(FLOWER_PARTS, flowerCount, 101);
 
   const merged = new BufferGeometry();
   merged.setAttribute('position', new Float32BufferAttribute(positions, 3));
@@ -152,6 +184,9 @@ export function createW8GrassFieldPresentation({
   THREE,
   root = null,
   detailCount = 16,
+  // The Near field carries roughly one flower per three grass details; the cluster keeps
+  // that ratio so the colour reads the same on both sides of the handoff.
+  flowerCount = 5,
   cellSizeMeters = 8,
   density = 1,
   // Distance compensation. A thin upright blade falls below one pixel of width as it
@@ -168,7 +203,7 @@ export function createW8GrassFieldPresentation({
   // (isolated harnesses run against a minimal fake) simply goes without it rather than
   // breaking the Distant presentation it hangs off.
   const REQUIRED = ['InstancedMesh', 'Matrix4', 'Quaternion', 'Euler', 'Vector3', 'Color',
-    'BoxGeometry', 'BufferGeometry', 'Float32BufferAttribute'];
+    'BoxGeometry', 'SphereGeometry', 'BufferGeometry', 'Float32BufferAttribute'];
   const Material = THREE?.MeshLambertMaterial ?? THREE?.MeshBasicMaterial;
   if (REQUIRED.some(name => typeof THREE?.[name] !== 'function') || typeof Material !== 'function') {
     return null;
@@ -179,7 +214,7 @@ export function createW8GrassFieldPresentation({
   const Euler = THREE.Euler;
   const Vector3 = THREE.Vector3;
 
-  const geometry = createClusterGeometry(THREE, { detailCount, cellSizeMeters });
+  const geometry = createClusterGeometry(THREE, { detailCount, flowerCount, cellSizeMeters });
   const material = new Material({ vertexColors: true, flatShading: true });
   const meshes = new Map();
   const staged = new Map();
@@ -224,6 +259,7 @@ export function createW8GrassFieldPresentation({
       identityFree: true,
       clusterCount: clusters.length,
       detailsPerCluster: detailCount,
+      flowersPerCluster: flowerCount,
     };
     const originX = (origin?.buildOriginChunkX ?? 0) * LOGICAL_CHUNK_SIZE_METERS;
     const originZ = (origin?.buildOriginChunkZ ?? 0) * LOGICAL_CHUNK_SIZE_METERS;
