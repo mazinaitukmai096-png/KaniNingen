@@ -52,6 +52,18 @@ function draggedVerticalDistance(initialVelocity, elapsedSeconds, gravity = FINI
     - gravity * elapsedSeconds / drag;
 }
 
+// Debris comes to rest where it lands instead of sinking through the ground.
+// Freezing the shared motion clock at touchdown stops the arc, the horizontal
+// slide and the tumble together, which is what leaves a scattered field of
+// wreckage lying around for the rest of the effect's lifetime.
+function settledDebrisMotionSeconds(initialVerticalVelocity, elapsedSeconds) {
+  const landingSeconds = Math.max(
+    0,
+    2 * initialVerticalVelocity / FINITE_PARTICLE_GRAVITY_PER_SECOND,
+  );
+  return Math.min(elapsedSeconds, landingSeconds);
+}
+
 export class GameplayRenderAdapter {
   constructor({
     THREE,
@@ -346,56 +358,84 @@ export class GameplayRenderAdapter {
         const sparkCount = elapsedSeconds <= 2 ? (finite.sparkCount ?? 0) : 0;
         const bloodCount = elapsedSeconds <= 2 ? (finite.bloodCount ?? 0) : 0;
         for (let index = 0; index < charredCount; index += 1) {
-          const angle = index / Math.max(1, charredCount) * Math.PI * 2
-            + (event.sequence ?? 0) * 0.31;
-          const travel = progress * (0.25 + index * 0.08) * unit;
+          const velocityX = (presentationRandom(event.sequence, index, 10) - 0.5)
+            + Math.sin(directionHeading) * 3;
+          const velocityY = 3 + presentationRandom(event.sequence, index, 11) * 8;
+          const velocityZ = (presentationRandom(event.sequence, index, 12) - 0.5)
+            + Math.cos(directionHeading) * 3;
+          const motionSeconds = settledDebrisMotionSeconds(velocityY, elapsedSeconds);
+          const size = 0.3 * (0.6 + presentationRandom(event.sequence, index, 13) * 0.8);
           this.#appendEffectInstance('charredImpact', {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + (0.15 + Math.sin(progress * Math.PI) * (0.25 + index * 0.04)) * unit,
-            z: base.z + Math.sin(angle) * travel,
-            scaleX: 0.3 * unit, scaleY: 0.3 * unit, scaleZ: 0.3 * unit,
-            rotationX: progress * 4 + index, rotationY: angle,
+            x: base.x + draggedDistance(velocityX * 6, motionSeconds) * unit,
+            y: baseY + Math.max(0, draggedVerticalDistance(velocityY, motionSeconds)) * unit,
+            z: base.z + draggedDistance(velocityZ * 6, motionSeconds) * unit,
+            scaleX: size * unit, scaleY: size * unit, scaleZ: size * unit,
+            rotationX: (presentationRandom(event.sequence, index, 14) - 0.5) * 12 * motionSeconds,
+            rotationY: (presentationRandom(event.sequence, index, 15) - 0.5) * 12 * motionSeconds,
           });
         }
         for (let index = 0; index < sparkCount; index += 1) {
-          const angle = index / Math.max(1, sparkCount) * Math.PI * 2
-            + (event.sequence ?? 0) * 0.19;
-          const travel = progress * (0.35 + index * 0.07) * unit;
+          const velocityX = (presentationRandom(event.sequence, index, 20) - 0.5)
+            + Math.sin(directionHeading) * 2.5;
+          const velocityY = 4 + presentationRandom(event.sequence, index, 21) * 10;
+          const velocityZ = (presentationRandom(event.sequence, index, 22) - 0.5)
+            + Math.cos(directionHeading) * 2.5;
+          const motionSeconds = settledDebrisMotionSeconds(velocityY, elapsedSeconds);
+          const size = 0.2 * (0.6 + presentationRandom(event.sequence, index, 23) * 0.8);
           this.#appendEffectInstance('goldSpark', {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.35 + index * 0.03)) * unit,
-            z: base.z + Math.sin(angle) * travel,
-            scaleX: 0.2 * unit, scaleY: 0.2 * unit, scaleZ: 0.2 * unit,
-            rotationX: progress * 6 + index, rotationY: angle,
+            x: base.x + draggedDistance(velocityX * 8, motionSeconds) * unit,
+            y: baseY + Math.max(0, draggedVerticalDistance(velocityY, motionSeconds)) * unit,
+            z: base.z + draggedDistance(velocityZ * 8, motionSeconds) * unit,
+            scaleX: size * unit, scaleY: size * unit, scaleZ: size * unit,
+            rotationX: (presentationRandom(event.sequence, index, 24) - 0.5) * 18 * motionSeconds,
+            rotationY: (presentationRandom(event.sequence, index, 25) - 0.5) * 18 * motionSeconds,
           });
         }
         for (let index = 0; index < bloodCount; index += 1) {
-          const angle = index / Math.max(1, bloodCount) * Math.PI * 2
-            + (event.sequence ?? 0) * 0.11;
-          const variation = ((index * 17 + (event.sequence ?? 0) * 7) % 31) / 31;
-          const travel = progress * (0.3 + variation * 1.8) * unit;
+          const spray = presentationRandom(event.sequence, index, 30) * Math.PI * 2;
+          const speed = 2 + presentationRandom(event.sequence, index, 31) * 8;
+          const velocityY = 3 + presentationRandom(event.sequence, index, 32) * 9;
+          const motionSeconds = settledDebrisMotionSeconds(velocityY, elapsedSeconds);
+          const size = 0.3 * (0.6 + presentationRandom(event.sequence, index, 33) * 0.7);
           this.#appendEffectInstance('blood', {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + (0.2 + Math.sin(progress * Math.PI) * (0.4 + variation)) * unit,
-            z: base.z + Math.sin(angle) * travel,
-            scaleX: 0.3 * unit, scaleY: 0.3 * unit, scaleZ: 0.3 * unit,
-            rotationX: progress * 5 + index, rotationY: angle,
+            x: base.x + draggedDistance(
+              Math.cos(spray) * speed + Math.sin(directionHeading) * 4, motionSeconds,
+            ) * unit,
+            y: baseY + Math.max(0, draggedVerticalDistance(velocityY, motionSeconds)) * unit,
+            z: base.z + draggedDistance(
+              Math.sin(spray) * speed + Math.cos(directionHeading) * 4, motionSeconds,
+            ) * unit,
+            // Droplets stay stretched along their fall, matching the finite game.
+            scaleX: size * 0.6 * unit, scaleY: size * 1.6 * unit, scaleZ: size * 0.6 * unit,
+            rotationX: (presentationRandom(event.sequence, index, 34) - 0.5) * 10 * motionSeconds,
+            rotationY: spray,
           });
         }
         for (let index = 0; index < (finite.debrisCount ?? 0); index += 1) {
-          const angle = index / Math.max(1, finite.debrisCount) * Math.PI * 2
-            + (event.sequence ?? 0) * 0.23;
-          const travel = progress * (0.4 + index * 0.12) * unit;
-          const role = finite.targetType === 'rock' || finite.targetType === 'pebble'
-            ? 'rockDebris' : 'debris';
+          const isRock = finite.targetType === 'rock' || finite.targetType === 'pebble';
+          const role = isRock ? 'rockDebris' : 'debris';
+          // Finite-game launch speeds: rock shards 400-1000 units/s, wreckage
+          // 300-720, both biased along the blow that broke the target.
+          const speed = isRock
+            ? finiteWorldUnitsToMeters(400 + presentationRandom(event.sequence, index, 40) * 600)
+            : finiteWorldUnitsToMeters(300 + presentationRandom(event.sequence, index, 40) * 420);
+          const scatter = presentationRandom(event.sequence, index, 41) * Math.PI * 2;
+          const bias = 0.55 + presentationRandom(event.sequence, index, 42) * 0.9;
+          const velocityX = Math.cos(scatter) * speed + Math.sin(directionHeading) * speed * bias;
+          const velocityZ = Math.sin(scatter) * speed + Math.cos(directionHeading) * speed * bias;
+          const velocityY = finiteWorldUnitsToMeters(
+            180 + presentationRandom(event.sequence, index, 43) * 480,
+          );
+          const motionSeconds = settledDebrisMotionSeconds(velocityY, elapsedSeconds);
+          const size = Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4)
+            * (0.55 + presentationRandom(event.sequence, index, 44) * 0.9);
           this.#appendEffectInstance(role, {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + (0.3 + Math.sin(progress * Math.PI) * (0.7 + index * 0.08)) * unit,
-            z: base.z + Math.sin(angle) * travel,
-            scaleX: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
-            scaleY: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
-            scaleZ: Math.max(0.12, (finite.radiusMeters ?? 0.3) * 0.4) * unit,
-            rotationX: progress * 4 + index, rotationY: angle,
+            x: base.x + draggedDistance(velocityX, motionSeconds) * unit,
+            y: baseY + Math.max(0, draggedVerticalDistance(velocityY, motionSeconds)) * unit,
+            z: base.z + draggedDistance(velocityZ, motionSeconds) * unit,
+            scaleX: size * unit, scaleY: size * unit, scaleZ: size * unit,
+            rotationX: (presentationRandom(event.sequence, index, 45) - 0.5) * 9 * motionSeconds,
+            rotationY: (presentationRandom(event.sequence, index, 46) - 0.5) * 9 * motionSeconds,
           });
         }
         if ((finite.shockwaveRadiusMeters ?? 0) > 0 && elapsedSeconds <= 1) {
@@ -696,20 +736,25 @@ export class GameplayRenderAdapter {
       }
       if (event.type === 'player-landing-dust') {
         const dustCount = Math.max(4, Math.round(14 * intensity));
+        const elapsedSeconds = entry.durationSeconds - entry.remainingSeconds;
         for (let index = 0; index < dustCount; index += 1) {
-          const angle = index / dustCount * Math.PI * 2 + (event.sequence ?? 0) * 0.37;
-          const variation = ((index * 17 + (event.sequence ?? 0) * 13) % 29) / 29;
-          const travel = progress * (10 + variation * 12.5) * intensity * unit;
-          const dustScale = (0.375 + variation * 0.5) * intensity * unit;
+          const angle = presentationRandom(event.sequence, index, 60) * Math.PI * 2;
+          // 10-22.5 is the finite game's launch speed for landing dust. Using it
+          // as a travel distance instead blew the puff out into a 20 m ring.
+          const speed = (10 + presentationRandom(event.sequence, index, 61) * 12.5) * intensity;
+          const velocityY = (2 + presentationRandom(event.sequence, index, 62) * 4) * intensity;
+          const motionSeconds = settledDebrisMotionSeconds(velocityY, elapsedSeconds);
+          const dustScale = (0.375 + presentationRandom(event.sequence, index, 63) * 0.5)
+            * intensity * unit;
           this.#appendEffectInstance('dust', {
-            x: base.x + Math.cos(angle) * travel,
-            y: baseY + Math.sin(progress * Math.PI) * (0.6 + variation) * intensity * unit,
-            z: base.z + Math.sin(angle) * travel,
+            x: base.x + draggedDistance(Math.cos(angle) * speed, motionSeconds) * unit,
+            y: baseY + Math.max(0, draggedVerticalDistance(velocityY, motionSeconds)) * unit,
+            z: base.z + draggedDistance(Math.sin(angle) * speed, motionSeconds) * unit,
             scaleX: dustScale,
             scaleY: dustScale,
             scaleZ: dustScale,
-            rotationX: progress * 4 + index,
-            rotationY: progress * 3 - index,
+            rotationX: (presentationRandom(event.sequence, index, 64) - 0.5) * 6 * motionSeconds,
+            rotationY: angle,
           });
         }
         continue;

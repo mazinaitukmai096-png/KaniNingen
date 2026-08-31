@@ -45,11 +45,36 @@ import {
   createProjectedUploadManifest,
   projectedUploadDrawableObjects,
 } from '../render-upload-admission.js';
+import { W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID } from '../w8-parity-chunk-generator.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
 // projectChunk remains fully staged while yielding; this only bounds one main-thread task.
 const CHUNK_PROJECTION_COOPERATIVE_SLICE_MS = 4;
 const CAMERA_COLLISION_EPSILON = 1e-7;
+
+// Collapse motion for a destroyed feature's own parts, matching the finite
+// game's wreckage: 0.98-per-frame drag, 1500 units/s^2 gravity, and launch
+// speeds in the 300-720 units/s band, all expressed in metres.
+const FINITE_COLLAPSE_DRAG_PER_SECOND = -60 * Math.log(0.98);
+const FINITE_COLLAPSE_GRAVITY = 1_500 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const FINITE_COLLAPSE_SPEED_MIN = 300 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const FINITE_COLLAPSE_SPEED_RANGE = 420 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const FINITE_COLLAPSE_LIFT_MIN = 180 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const FINITE_COLLAPSE_LIFT_RANGE = 480 / PRODUCTION_VISUAL_UNITS_PER_METER;
+const FINITE_COLLAPSE_SECONDS = 4;
+
+function collapseTravel(initialVelocity, elapsedSeconds) {
+  return initialVelocity
+    * (1 - Math.exp(-FINITE_COLLAPSE_DRAG_PER_SECOND * elapsedSeconds))
+    / FINITE_COLLAPSE_DRAG_PER_SECOND;
+}
+
+function collapseRise(initialVelocity, elapsedSeconds) {
+  const drag = FINITE_COLLAPSE_DRAG_PER_SECOND;
+  return (initialVelocity + FINITE_COLLAPSE_GRAVITY / drag)
+    * (1 - Math.exp(-drag * elapsedSeconds)) / drag
+    - FINITE_COLLAPSE_GRAVITY * elapsedSeconds / drag;
+}
 
 function canonicalRenderRegistryError(message, stage) {
   const error = new Error(message);
@@ -293,10 +318,159 @@ export class ChunkRenderAdapter {
     hiddenTransform.scale.set(0, 0, 0);
     hiddenTransform.updateMatrix();
     this.hiddenFeatureMatrix = hiddenTransform.matrix.clone?.() ?? structuredClone(hiddenTransform.matrix);
+    // Features that are mid-collapse: their own parts stay drawn and fly apart
+    // for a moment before being hidden, instead of blinking out on the frame
+    // they are destroyed.
+    this.collapsingFeatures = new Map();
   }
 
   #cloneMatrix(matrix) {
     return matrix.clone?.() ?? structuredClone(matrix);
+  }
+
+  // Give every part of a destroyed feature its own launch so the structure
+  // comes apart into its actual walls and roof, the way the finite game throws
+  // a building's real child meshes outward before they settle.
+  #beginFeatureCollapse(entry) {
+    if (!entry.parts?.length || this.collapsingFeatures.has(entry.stableId)) return false;
+    const Vector3 = this.THREE?.Vector3;
+    const Quaternion = this.THREE?.Quaternion;
+    const Matrix4 = this.THREE?.Matrix4;
+    if (!Vector3 || !Quaternion || !Matrix4) return false;
+    const centerElements = entry.originalMatrix?.elements;
+    if (!centerElements) return false;
+    let seed = 0;
+    const stableId = String(entry.stableId ?? '');
+    for (let index = 0; index < stableId.length; index += 1) {
+      seed = (Math.imul(seed, 31) + stableId.charCodeAt(index)) >>> 0;
+    }
+    const noise = key => ((Math.imul(seed + key, 0x9e3779b1) >>> 8) % 1024) / 1024;
+    const pieces = entry.parts.map((part, index) => {
+      const elements = part.originalMatrix?.elements;
+      const offsetX = (elements?.[12] ?? 0) - centerElements[12];
+      const offsetZ = (elements?.[14] ?? 0) - centerElements[14];
+      const outward = Math.hypot(offsetX, offsetZ) || 1;
+      const scatter = noise(index * 4 + 1) * Math.PI * 2;
+      const speed = FINITE_COLLAPSE_SPEED_MIN
+        + noise(index * 4 + 2) * FINITE_COLLAPSE_SPEED_RANGE;
+      return {
+        part,
+        velocityX: (offsetX / outward) * speed * 0.75 + Math.cos(scatter) * speed * 0.6,
+        velocityY: FINITE_COLLAPSE_LIFT_MIN + noise(index * 4 + 3) * FINITE_COLLAPSE_LIFT_RANGE,
+        velocityZ: (offsetZ / outward) * speed * 0.75 + Math.sin(scatter) * speed * 0.6,
+        spinX: (noise(index * 4 + 4) - 0.5) * 5,
+        spinZ: (noise(index * 4 + 5) - 0.5) * 5,
+      };
+    });
+    this.collapsingFeatures.set(entry.stableId, {
+      entry, pieces, elapsedSeconds: 0, durationSeconds: FINITE_COLLAPSE_SECONDS,
+      position: new Vector3(), quaternion: new Quaternion(), scale: new Vector3(),
+      spin: new Quaternion(), spinAxis: new Vector3(), matrix: new Matrix4(),
+    });
+    return true;
+  }
+
+  // Advance every collapsing feature. Called once per rendered frame.
+  advanceFeatureCollapse(deltaSeconds) {
+    if (!(deltaSeconds > 0) || this.collapsingFeatures.size === 0) return;
+    for (const [stableId, collapse] of this.collapsingFeatures) {
+      collapse.elapsedSeconds += deltaSeconds;
+      const finished = collapse.elapsedSeconds >= collapse.durationSeconds;
+      const touched = new Set();
+      for (const piece of collapse.pieces) {
+        const part = piece.part;
+        if (finished || collapse.entry.destroyed !== true) {
+          part.mesh.setMatrixAt(part.index, this.hiddenFeatureMatrix);
+        } else {
+          const motionSeconds = Math.min(
+            collapse.elapsedSeconds,
+            Math.max(0, 2 * piece.velocityY / FINITE_COLLAPSE_GRAVITY),
+          );
+          part.originalMatrix.decompose(
+            collapse.position, collapse.quaternion, collapse.scale,
+          );
+          collapse.position.x += collapseTravel(piece.velocityX, motionSeconds);
+          collapse.position.y += Math.max(
+            -collapse.position.y,
+            collapseRise(piece.velocityY, motionSeconds),
+          );
+          collapse.position.z += collapseTravel(piece.velocityZ, motionSeconds);
+          collapse.spinAxis.set(piece.spinX, 1, piece.spinZ).normalize();
+          collapse.spin.setFromAxisAngle(
+            collapse.spinAxis, (piece.spinX + piece.spinZ) * motionSeconds,
+          );
+          collapse.quaternion.multiply(collapse.spin);
+          collapse.matrix.compose(
+            collapse.position, collapse.quaternion, collapse.scale,
+          );
+          part.mesh.setMatrixAt(part.index, collapse.matrix);
+        }
+        touched.add(part.mesh);
+      }
+      for (const mesh of touched) mesh.instanceMatrix.needsUpdate = true;
+      if (finished || collapse.entry.destroyed !== true) {
+        this.collapsingFeatures.delete(stableId);
+      }
+    }
+  }
+
+  // Wreckage left behind after a feature is destroyed: a few flat charred slabs
+  // settled on the ground where the structure stood. Reusing the feature's own
+  // transform for a single lump scaled it to the whole structure, so a
+  // destroyed building left a translucent black blob its original size.
+  #createFeatureRubble(entry) {
+    const elements = entry.originalMatrix?.elements;
+    if (!elements) return null;
+    const Mesh = requireConstructor(this.THREE, 'Mesh');
+    const Group = requireConstructor(this.THREE, 'Group');
+    const Object3D = requireConstructor(this.THREE, 'Object3D');
+    const width = Math.hypot(elements[0], elements[1], elements[2]);
+    const height = Math.hypot(elements[4], elements[5], elements[6]);
+    const depth = Math.hypot(elements[8], elements[9], elements[10]);
+    const footprint = Math.max(width, depth, 0.001);
+    const originX = elements[12];
+    const groundY = elements[13] - height / 2;
+    const originZ = elements[14];
+    let seed = 0;
+    const stableId = String(entry.stableId ?? '');
+    for (let index = 0; index < stableId.length; index += 1) {
+      seed = (Math.imul(seed, 31) + stableId.charCodeAt(index)) >>> 0;
+    }
+    const noise = key => ((Math.imul(seed + key, 0x9e3779b1) >>> 8) % 1024) / 1024;
+    const group = new Group();
+    group.name = 'w8-persistent-destruction-rubble';
+    const transform = new Object3D();
+    const slabCount = 1 + (seed % 3);
+    for (let index = 0; index < slabCount; index += 1) {
+      const slabHeight = footprint * (0.12 + noise(index * 8 + 1) * 0.16);
+      transform.position.set(
+        originX + (noise(index * 8 + 2) - 0.5) * footprint * 0.7,
+        groundY + slabHeight / 2,
+        originZ + (noise(index * 8 + 3) - 0.5) * footprint * 0.7,
+      );
+      transform.rotation.set(
+        (noise(index * 8 + 4) - 0.5) * 0.5,
+        noise(index * 8 + 5) * Math.PI * 2,
+        (noise(index * 8 + 6) - 0.5) * 0.5,
+      );
+      transform.scale.set(
+        footprint * (0.5 + noise(index * 8 + 7) * 0.5),
+        slabHeight,
+        footprint * (0.4 + noise(index * 8 + 8) * 0.45),
+      );
+      transform.updateMatrix();
+      const slab = new Mesh(
+        this.visualAssets.geometries.box,
+        this.visualAssets.materials.charred,
+      );
+      slab.matrixAutoUpdate = false;
+      if (slab.matrix?.copy) slab.matrix.copy(transform.matrix);
+      else slab.matrix = this.#cloneMatrix(transform.matrix);
+      slab.castShadow = true;
+      slab.receiveShadow = true;
+      group.add(slab);
+    }
+    return group;
   }
 
   #installProjectedDrawProbe(projected, kind) {
@@ -933,6 +1107,8 @@ export class ChunkRenderAdapter {
       this.featureInstances.delete(stableId);
       this.occludedFeatureIds.delete(stableId);
       this.occlusionLastHitAt.delete(stableId);
+      // Drop any in-flight collapse: its parts belong to this chunk's meshes.
+      this.collapsingFeatures.delete(stableId);
     }
     this.chunkFeatureIds.delete(key);
   }
@@ -999,7 +1175,13 @@ export class ChunkRenderAdapter {
       this.#invalidateVisibleStableIds();
       this.#invalidateDrawableReceiptOwner(entry.chunkKey);
     }
+    // A freshly destroyed feature collapses first; #advanceFeatureCollapse owns
+    // its part matrices until the wreckage has fallen. Features that were
+    // already destroyed when their chunk loaded skip straight to hidden.
+    const collapsing = visibilityChanged && nextDestroyed && !occluded
+      && this.#beginFeatureCollapse(entry);
     for (const part of entry.parts) {
+      if (collapsing) continue;
       part.mesh.setMatrixAt(part.index, nextDestroyed || occluded
         ? this.hiddenFeatureMatrix : part.originalMatrix);
       part.mesh.instanceMatrix.needsUpdate = true;
@@ -1018,18 +1200,11 @@ export class ChunkRenderAdapter {
       this.treePathAudit.lastUpdateAtMs = globalThis.performance?.now?.() ?? Date.now();
     }
     if (nextDestroyed && destructionPresentation === 'rubble' && !entry.rubbleMesh) {
-      const Mesh = requireConstructor(this.THREE, 'Mesh');
-      const rubble = new Mesh(
-        this.visualAssets.geometries.dodeca,
-        this.visualAssets.materials.scorch ?? this.visualAssets.materials.charred,
-      );
-      rubble.name = 'w8-persistent-destruction-rubble';
-      rubble.matrixAutoUpdate = false;
-      if (rubble.matrix?.copy) rubble.matrix.copy(entry.originalMatrix);
-      else rubble.matrix = this.#cloneMatrix(entry.originalMatrix);
-      rubble.castShadow = true; rubble.receiveShadow = true;
-      entry.group?.add?.(rubble);
-      entry.rubbleMesh = rubble;
+      const rubble = this.#createFeatureRubble(entry);
+      if (rubble) {
+        entry.group?.add?.(rubble);
+        entry.rubbleMesh = rubble;
+      }
     } else if ((!nextDestroyed || destructionPresentation !== 'rubble') && entry.rubbleMesh) {
       entry.group?.remove?.(entry.rubbleMesh);
       entry.rubbleMesh = null;
@@ -2178,7 +2353,27 @@ export class ChunkRenderAdapter {
 
     if (waterSurfaces.length) {
       const resources = this.#ensureSettlementResources();
-      const wetlandInstances = waterSurfaces.filter(surface => surface.waterType !== 'river')
+      // Wetland is authored one quad per terrain cell so that adjacent wet cells tile into a
+      // continuous shore. Where the moisture field is patchy a cell can qualify alone, and a
+      // lone tile reads as a floating blue square on the grass rather than as water. Isolated
+      // tiles are dropped from presentation only - the canonical surfaces, their Stable IDs
+      // and the safe-spawn contract are untouched.
+      const wetlandSource = waterSurfaces.filter(surface => surface.waterType !== 'river');
+      const wetlandKept = wetlandSource.filter(surface => {
+        if (surface.stableId === W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID) return true;
+        const reach = (surface.widthMeters ?? 1) * 1.6;
+        // A tile whose neighbour lives in the next Chunk cannot be seen from here, so tiles
+        // near the owner boundary are kept rather than culled on incomplete information.
+        const localX = surface.worldPosition.x - chunkData.chunkX * LOGICAL_CHUNK_SIZE_METERS;
+        const localZ = surface.worldPosition.z - chunkData.chunkZ * LOGICAL_CHUNK_SIZE_METERS;
+        if (localX <= reach || localZ <= reach
+          || LOGICAL_CHUNK_SIZE_METERS - localX <= reach
+          || LOGICAL_CHUNK_SIZE_METERS - localZ <= reach) return true;
+        return wetlandSource.some(other => other !== surface
+          && Math.hypot(other.worldPosition.x - surface.worldPosition.x,
+            other.worldPosition.z - surface.worldPosition.z) <= reach);
+      });
+      const wetlandInstances = wetlandKept
         .map(surface => ({
           stableId: surface.stableId,
           x: surface.worldPosition.x,
@@ -2286,6 +2481,12 @@ export class ChunkRenderAdapter {
       }
     };
     for (const detail of ambientDetails) {
+      // Grass is drawn by the identity-free Mid Grass field, which covers the whole visible
+      // world including this Near band, so drawing the Full-residency Grass here as well
+      // doubled its density inside 100 m. The canonical ambient Grass records are still
+      // generated - only this duplicate presentation is dropped. Flower has no counterpart
+      // in the field and Shrub keeps its canonical identity, so both still draw here.
+      if (detail.detailType === 'grass') continue;
       addDetail(ambientDetailParts, detail, detail.detailType === 'shrub'
         ? { width: 0.75, height: 0.7, depth: 0.75 }
         : { width: 0.45, height: 0.65, depth: 0.45 });

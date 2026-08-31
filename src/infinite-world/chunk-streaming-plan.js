@@ -32,6 +32,10 @@ const currentRenderDistance = resolveW8RenderDistancePolicy(
 // Standard to keep Current's entire resource window required.
 export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS =
   currentRenderDistance.distanceContract.residentCoverageDistanceMeters;
+// Full residency is the only tier that generates ambient Grass/Bush details, so
+// this radius decides how far ground vegetation reaches. Widening it scales
+// full chunk generation with the area, which is the dominant streaming cost --
+// 128 m already meant 241 resident chunks against 145 here.
 export const FULL_RESIDENT_RADIUS_METERS = 100;
 
 export function resolvePresentationResidentRadiusMeters(
@@ -220,7 +224,7 @@ export const PRESENTATION_OWNER_CACHE_CAPACITY =
 export const FULL_CHUNK_DATA_CACHE_CAPACITY =
   FULL_RESIDENT_OWNER_COUNT + FULL_RESIDENT_BOUNDED_PREFETCH_OWNER_COUNT;
 // Compatibility name for consumers that size the Full ChunkData cache. The
-// production data-plane now protects only the nested 100 m Full view.
+// production data-plane now protects only the nested Full view.
 export const RESIDENT_WORLD_CHUNK_DATA_CACHE_CAPACITY = FULL_CHUNK_DATA_CACHE_CAPACITY;
 
 function finite(value, name) {

@@ -21,7 +21,10 @@ const q6 = value => {
 };
 
 const smoothstep = value => value * value * (3 - 2 * value);
-const srgbChannelToLinear = channel => (
+// Renderer output is sRGB, so every authored hex must be linearized before it
+// enters a color buffer. Shared so the Terrain vertex-color palette uses the
+// same transform as these Settlement colors instead of mixing color spaces.
+export const srgbChannelToLinear = channel => (
   channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4
 );
 const rgb = hex => [

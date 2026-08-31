@@ -371,6 +371,15 @@ let inputController, rendererController;
             }
         }
 
+        // InstancedMeshは自身のインスタンス行列/カラーバッファを保持するため、
+        // シーンから外して安全に破棄できるようにする（initMap再実行時のGPUメモリリーク防止）。
+        function disposeInstancedMesh(mesh) {
+            if (!mesh) return;
+            scene.remove(mesh);
+            safeDispose(mesh);
+            if (typeof mesh.dispose === 'function') mesh.dispose();
+        }
+
         // 既存の「60fps時の1frame確率」を、経過した基準frame数へ変換する。
         // 状態遷移・spawnのように1更新内で最大1回だけ起きる処理に使用する。
         function timeAdjustedProbability(frameProbability, frameScale) {
@@ -663,6 +672,14 @@ let inputController, rendererController;
         }
 
         // --- 追加: 岩・小石のインスタンス描画管理 ---
+        // 容量はInstancedMesh生成時と配置ループのガード条件の両方で使うため、ここで一元管理する
+        // （生成時と配置時で数値がズレると、超過分が黙って捨てられて原因が追いにくくなる）
+        const ROCK_CAPACITY = 3000;
+        const PEBBLE_CAPACITY = 5000;
+        const TREE_CAPACITY = 5000;
+        const GRASS_CAPACITY = 60000;
+        const BUSH_CAPACITY = 4000;
+        const FLOWER_CAPACITY = 9000;
         let rockInstancedMesh = null;
         let pebbleInstancedMesh = null;
         let nextRockInstanceIndex = 0;
@@ -1274,7 +1291,7 @@ let inputController, rendererController;
                 dummy.rotation.set(0, 0, 0);
                 dummy.scale.set(12, 60, 12);
                 dummy.updateMatrix();
-                if (treeTrunkInstancedMesh && nextTreeTrunkInstanceIndex < 5000) {
+                if (treeTrunkInstancedMesh && nextTreeTrunkInstanceIndex < TREE_CAPACITY) {
                     treeTrunkInstancedMesh.setMatrixAt(nextTreeTrunkInstanceIndex, dummy.matrix);
                     treeInstances.push({ mesh: treeTrunkInstancedMesh, index: nextTreeTrunkInstanceIndex });
                     nextTreeTrunkInstanceIndex++;
@@ -1286,7 +1303,7 @@ let inputController, rendererController;
                     dummy.position.set(x, 90, z);
                     dummy.scale.set(40, 110, 40);
                     dummy.updateMatrix();
-                    if (treeConeInstancedMesh && nextTreeConeInstanceIndex < 5000) {
+                    if (treeConeInstancedMesh && nextTreeConeInstanceIndex < TREE_CAPACITY) {
                         treeConeInstancedMesh.setMatrixAt(nextTreeConeInstanceIndex, dummy.matrix);
                         treeConeInstancedMesh.setColorAt(nextTreeConeInstanceIndex, leafMat.color);
                         treeInstances.push({ mesh: treeConeInstancedMesh, index: nextTreeConeInstanceIndex });
@@ -1298,7 +1315,7 @@ let inputController, rendererController;
                     dummy.position.set(x, 80, z);
                     dummy.scale.set(55, 65, 55);
                     dummy.updateMatrix();
-                    if (treeSphere1InstancedMesh && nextTreeSphere1InstanceIndex < 5000) {
+                    if (treeSphere1InstancedMesh && nextTreeSphere1InstanceIndex < TREE_CAPACITY) {
                         treeSphere1InstancedMesh.setMatrixAt(nextTreeSphere1InstanceIndex, dummy.matrix);
                         treeSphere1InstancedMesh.setColorAt(nextTreeSphere1InstanceIndex, leafMat.color);
                         treeInstances.push({ mesh: treeSphere1InstancedMesh, index: nextTreeSphere1InstanceIndex });
@@ -1312,7 +1329,7 @@ let inputController, rendererController;
                     dummy.position.set(x + offX, 95, z + offZ);
                     dummy.scale.set(35, 35, 35);
                     dummy.updateMatrix();
-                    if (treeSphere2InstancedMesh && nextTreeSphere2InstanceIndex < 5000) {
+                    if (treeSphere2InstancedMesh && nextTreeSphere2InstanceIndex < TREE_CAPACITY) {
                         treeSphere2InstancedMesh.setMatrixAt(nextTreeSphere2InstanceIndex, dummy.matrix);
                         treeSphere2InstancedMesh.setColorAt(nextTreeSphere2InstanceIndex, leafMat.color);
                         treeInstances.push({ mesh: treeSphere2InstancedMesh, index: nextTreeSphere2InstanceIndex });
@@ -1334,7 +1351,7 @@ let inputController, rendererController;
                 dummy.scale.setScalar(h / 2.8);
                 dummy.updateMatrix();
 
-                if (rockInstancedMesh && nextRockInstanceIndex < 3000) {
+                if (rockInstancedMesh && nextRockInstanceIndex < ROCK_CAPACITY) {
                     rockInstancedMesh.setMatrixAt(nextRockInstanceIndex, dummy.matrix);
                     // 岩肌に苔をまとわせるバリエーション（高地バイオーム以外で3割の確率）：単調な岩色を崩す
                     if (biome !== 'highland' && Math.random() < 0.3) {
@@ -1358,7 +1375,7 @@ let inputController, rendererController;
                 dummy.scale.setScalar(size * 0.7);
                 dummy.updateMatrix();
 
-                if (pebbleInstancedMesh && nextPebbleInstanceIndex < 5000) {
+                if (pebbleInstancedMesh && nextPebbleInstanceIndex < PEBBLE_CAPACITY) {
                     pebbleInstancedMesh.setMatrixAt(nextPebbleInstanceIndex, dummy.matrix);
                     // 小石にも苔バリエーションを混ぜて統一感のあるアクセントにする
                     if (biome !== 'highland' && Math.random() < 0.3) {
@@ -2011,14 +2028,27 @@ let inputController, rendererController;
             humanSpawnPool.length = 0; // 人間の配置候補プールも再生成時にリセット
             humanPoolActivatedCount = 0;
             waterZones.length = 0; // 池・川の位置データも再生成時にリセット（追加：蓄積バグ防止）
+
+            // 再生成前に前回のInstancedMesh群を破棄（破棄しないとリスタートのたびにGPUメモリが積み上がる）
+            disposeInstancedMesh(rockInstancedMesh);
+            disposeInstancedMesh(pebbleInstancedMesh);
+            disposeInstancedMesh(worldDetailInstancedMesh);
+            disposeInstancedMesh(treeTrunkInstancedMesh);
+            disposeInstancedMesh(treeConeInstancedMesh);
+            disposeInstancedMesh(treeSphere1InstancedMesh);
+            disposeInstancedMesh(treeSphere2InstancedMesh);
+            disposeInstancedMesh(grassInstancedMesh);
+            disposeInstancedMesh(bushInstancedMesh);
+            disposeInstancedMesh(flowerInstancedMesh);
+
             // 1500個ずつの最大容量でインスタンスを事前生成（ドローコールを1回に集約）
             // ベースマテリアルの色を白色 (0xffffff) にしたクローンを使うことで、
             // setColorAt で色が掛け算（乗算）されて暗く退化する現象を完全に防止します。
             const instancedRockMat = materials.rock.clone();
             instancedRockMat.color.setHex(0xffffff);
 
-            rockInstancedMesh = new THREE.InstancedMesh(geometries.dodeca, instancedRockMat, 3000);
-            pebbleInstancedMesh = new THREE.InstancedMesh(geometries.dodeca, instancedRockMat, 5000);
+            rockInstancedMesh = new THREE.InstancedMesh(geometries.dodeca, instancedRockMat, ROCK_CAPACITY);
+            pebbleInstancedMesh = new THREE.InstancedMesh(geometries.dodeca, instancedRockMat, PEBBLE_CAPACITY);
             rockInstancedMesh.castShadow = true;
             rockInstancedMesh.receiveShadow = true;
             pebbleInstancedMesh.castShadow = true;
@@ -2046,7 +2076,6 @@ let inputController, rendererController;
             const instancedLeafMat = materials.treeLeaves.clone();
             instancedLeafMat.color.setHex(0xffffff);
 
-            const TREE_CAPACITY = 5000;
             treeTrunkInstancedMesh = new THREE.InstancedMesh(geometries.box, materials.treeTrunk, TREE_CAPACITY);
             treeConeInstancedMesh = new THREE.InstancedMesh(geometries.cone, instancedLeafMat, TREE_CAPACITY);
             treeSphere1InstancedMesh = new THREE.InstancedMesh(geometries.sphere, instancedLeafMat, TREE_CAPACITY);
@@ -2070,7 +2099,7 @@ let inputController, rendererController;
             // 草専用のInstancedMesh（四角錐を細長くして草の刃に見立てる。束にするため容量を増やす）
             const instancedGrassMat = materials.treeLeaves.clone();
             instancedGrassMat.color.setHex(0xffffff);
-            grassInstancedMesh = new THREE.InstancedMesh(geometries.pyramid, instancedGrassMat, 60000);
+            grassInstancedMesh = new THREE.InstancedMesh(geometries.pyramid, instancedGrassMat, GRASS_CAPACITY);
             grassInstancedMesh.castShadow = false; // 影は落とさず軽くする
             grassInstancedMesh.receiveShadow = true;
             grassInstancedMesh.frustumCulled = true;
@@ -2079,7 +2108,7 @@ let inputController, rendererController;
             // 茂み専用のInstancedMesh（球体を低く潰して丸い低木に見立てる。純粋な装飾で当たり判定なし）
             const instancedBushMat = materials.treeLeaves.clone();
             instancedBushMat.color.setHex(0xffffff);
-            bushInstancedMesh = new THREE.InstancedMesh(geometries.sphere, instancedBushMat, 4000);
+            bushInstancedMesh = new THREE.InstancedMesh(geometries.sphere, instancedBushMat, BUSH_CAPACITY);
             bushInstancedMesh.castShadow = true;
             bushInstancedMesh.receiveShadow = true;
             bushInstancedMesh.frustumCulled = true;
@@ -2088,7 +2117,7 @@ let inputController, rendererController;
             // 花専用のInstancedMesh（小さな円錐を花びらの塊に見立て、鮮やかな色を散りばめて彩りを足す）
             const instancedFlowerMat = materials.treeLeaves.clone();
             instancedFlowerMat.color.setHex(0xffffff);
-            flowerInstancedMesh = new THREE.InstancedMesh(geometries.cone, instancedFlowerMat, 9000);
+            flowerInstancedMesh = new THREE.InstancedMesh(geometries.cone, instancedFlowerMat, FLOWER_CAPACITY);
             flowerInstancedMesh.castShadow = false;
             flowerInstancedMesh.receiveShadow = false;
             flowerInstancedMesh.frustumCulled = true;
@@ -3019,7 +3048,7 @@ let inputController, rendererController;
 
                         const bladeCount = 2 + Math.floor(Math.random() * 2);
                         for (let b = 0; b < bladeCount; b++) {
-                            if (grassInstancedMesh && nextGrassInstanceIndex < 60000) {
+                            if (grassInstancedMesh && nextGrassInstanceIndex < GRASS_CAPACITY) {
                                 const height = 12 + Math.random() * 16;
                                 const width = 2.5 + Math.random() * 2;
                                 const offsetX = (Math.random() - 0.5) * 8;
@@ -3249,7 +3278,7 @@ let inputController, rendererController;
                     spawnEntity('rock', x, z, null, biomeCfg.matBiome);
                 } else if (r < biomeCfg.treeRatio + biomeCfg.rockRatio + 0.08) {
                     // 茂み（低木）：当たり判定のない純粋な装飾で、木と岩だけの単調さを崩す
-                    if (bushInstancedMesh && nextBushInstanceIndex < 4000) {
+                    if (bushInstancedMesh && nextBushInstanceIndex < BUSH_CAPACITY) {
                         const bushScale = 22 + Math.random() * 18;
                         dummyBush.position.set(x, bushScale * 0.55, z);
                         dummyBush.scale.set(bushScale, bushScale * 0.8, bushScale);
@@ -3268,9 +3297,19 @@ let inputController, rendererController;
             if (bushInstancedMesh) {
                 bushInstancedMesh.instanceMatrix.needsUpdate = true;
                 if (bushInstancedMesh.instanceColor) bushInstancedMesh.instanceColor.needsUpdate = true;
+                bushInstancedMesh.count = nextBushInstanceIndex;
+                bushInstancedMesh.computeBoundingSphere();
             }
+            // 木・岩・小石はここまでで全ての配置(公園・田舎散布含む)が完了するため、
+            // 未使用スロット分の描画負荷を避け、境界球を実際の分布に合わせて確定させる。
+            if (treeTrunkInstancedMesh) { treeTrunkInstancedMesh.count = nextTreeTrunkInstanceIndex; treeTrunkInstancedMesh.computeBoundingSphere(); }
+            if (treeConeInstancedMesh) { treeConeInstancedMesh.count = nextTreeConeInstanceIndex; treeConeInstancedMesh.computeBoundingSphere(); }
+            if (treeSphere1InstancedMesh) { treeSphere1InstancedMesh.count = nextTreeSphere1InstanceIndex; treeSphere1InstancedMesh.computeBoundingSphere(); }
+            if (treeSphere2InstancedMesh) { treeSphere2InstancedMesh.count = nextTreeSphere2InstanceIndex; treeSphere2InstancedMesh.computeBoundingSphere(); }
+            if (rockInstancedMesh) { rockInstancedMesh.count = nextRockInstanceIndex; rockInstancedMesh.computeBoundingSphere(); }
+            if (pebbleInstancedMesh) { pebbleInstancedMesh.count = nextPebbleInstanceIndex; pebbleInstancedMesh.computeBoundingSphere(); }
 
-            // --- 草の大量配置（当たり判定を持たない純粋な装飾） ---
+            // --- 草の大量配置(当たり判定を持たない純粋な装飾) ---
             const GRASS_CLUSTER_COUNT = 17000;
             const dummyGrass = new THREE.Object3D();
             for (let i = 0; i < GRASS_CLUSTER_COUNT; i++) {
@@ -3336,7 +3375,7 @@ let inputController, rendererController;
                 // 1つの座標に2〜3本の細長い刃を束ねて配置
                 const bladeCount = 2 + Math.floor(Math.random() * 2);
                 for (let b = 0; b < bladeCount; b++) {
-                    if (grassInstancedMesh && nextGrassInstanceIndex < 60000) {
+                    if (grassInstancedMesh && nextGrassInstanceIndex < GRASS_CAPACITY) {
                         const height = 12 + Math.random() * 16; // 高く細く
                         const width = 2.5 + Math.random() * 2;
                         
@@ -3362,6 +3401,8 @@ let inputController, rendererController;
             if (grassInstancedMesh) {
                 grassInstancedMesh.instanceMatrix.needsUpdate = true;
                 if (grassInstancedMesh.instanceColor) grassInstancedMesh.instanceColor.needsUpdate = true;
+                grassInstancedMesh.count = nextGrassInstanceIndex;
+                grassInstancedMesh.computeBoundingSphere();
             }
 
             // --- 花畑の配置（純粋な装飾、彩りを足して単調な緑を崩す） ---
@@ -3420,7 +3461,7 @@ let inputController, rendererController;
                 const petalCount = 6 + Math.floor(Math.random() * 7);
                 const patchColor = flowerPetalColors[Math.floor(Math.random() * flowerPetalColors.length)];
                 for (let p = 0; p < petalCount; p++) {
-                    if (flowerInstancedMesh && nextFlowerInstanceIndex < 9000) {
+                    if (flowerInstancedMesh && nextFlowerInstanceIndex < FLOWER_CAPACITY) {
                         const offsetX = (Math.random() - 0.5) * 90;
                         const offsetZ = (Math.random() - 0.5) * 90;
                         const petalHeight = 10 + Math.random() * 8;
@@ -3463,6 +3504,8 @@ let inputController, rendererController;
             if (flowerInstancedMesh) {
                 flowerInstancedMesh.instanceMatrix.needsUpdate = true;
                 if (flowerInstancedMesh.instanceColor) flowerInstancedMesh.instanceColor.needsUpdate = true;
+                flowerInstancedMesh.count = nextFlowerInstanceIndex;
+                flowerInstancedMesh.computeBoundingSphere();
             }
             scene.userData.capitalCivicCoreVegetationSummary = Object.freeze({
                 rejectedCount: capitalCivicCoreVegetationRejectedCount,
@@ -4519,6 +4562,19 @@ let inputController, rendererController;
 
         function animate() {
             animationId = requestAnimationFrame(animate);
+            try {
+                animateFrame();
+            } catch (err) {
+                // 1フレームの例外でループ全体が無言で停止しないようにする。
+                // 次フレームは既にrequestAnimationFrameで予約済みなのでゲームは継続できる。
+                console.error('[animate] frame update failed, skipping frame:', err);
+                try { rendererController.render(); } catch (renderErr) {
+                    console.error('[animate] fallback render also failed:', renderErr);
+                }
+            }
+        }
+
+        function animateFrame() {
             const nowMs = performance.now();
 
             // --- FPS上限（発熱・電池消費対策）：目標間隔に達していないフレームは処理・描画をスキップ ---
