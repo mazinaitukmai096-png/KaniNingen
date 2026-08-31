@@ -1,4 +1,11 @@
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
+import {
+  ambientDetailProposals,
+  ambientDetailStableId,
+  ambientFieldSeed,
+  ambientParentChunkId,
+  applyAmbientDetailCap,
+} from './ambient-detail-kernel.js';
 import { canonicalizeJson } from './legacy-core/g0/canonical-json.js';
 import { hashWorldSeed, normalizeWorldSeed } from './legacy-core/g0/seed.js';
 import { sha256Hex } from './legacy-core/g0/sha256.js';
@@ -32,16 +39,74 @@ export const PRESENTATION_OWNER_SHARED_CORE_REVISION =
 export const W8_CANONICAL_TREE_CELL_SCHEMA = 'w8-canonical-tree-cell-5';
 export const W8_CANONICAL_NATURAL_PRESENCE_SCHEMA = 'w8-canonical-natural-presence-4';
 export const W8_CANONICAL_TREE_PREPARER_REVISION =
-  `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1:decorative-bush-only-1:canonical-rock-presence-4`;
+  `${PRESENTATION_OWNER_SHARED_CORE_REVISION}:${W8_NATURAL_PRESENTATION_PHASE_1.schemaVersion}:production-exclusions-1:decorative-bush-only-1:canonical-rock-presence-5`;
 export const W8_CANONICAL_TREE_MACRO_SIZE_METERS = 64;
 export const W8_CANONICAL_TREE_OWNERS_PER_AXIS =
   W8_CANONICAL_TREE_MACRO_SIZE_METERS / LOGICAL_CHUNK_SIZE_METERS;
 const PRESENTATION_CANONICAL_GENERATOR_MAJOR = 8;
+// Macro Natural presence reaches past Full residency across every owner in the
+// Presentation view, so this cap is multiplied by roughly 1,700 chunks -- each
+// extra rock per owner is thousands of additional instances.
 const W8_CANONICAL_NATURAL_PRESENCE_MAX_ROCKS_PER_OWNER = 4;
+
+// --- S-2: Mid Grass field -------------------------------------------------
+// Ambient Grass is generated only by Full residency, which is pinned at 100 m by worker
+// throughput, so beyond that the ground had no Grass at all. The Mid band instead carries
+// an identity-free Grass *field*: deterministic cluster positions, no Stable ID, no Save
+// participation. Giving these clusters canonical identities is explicitly forbidden -
+// they have no Near counterpart, and 'Far-only synthetic Grass objects are forbidden from
+// Macro Natural presence'. They are a representation of grassland, not world objects.
+//
+// 8 m cells keep the draw budget at Tree scale (about 2,900 clusters across the Mid ring
+// against roughly 2,100 Trees); each cluster carries the blades that one Near-density
+// patch of that area would hold, so density and silhouette match the Near field.
+// Shrub is Near-only ambient decoration today: Full residency authors it and stops at 100 m,
+// which is why the Bush band ends abruptly once Grass reaches the horizon. Unlike Grass it
+// carries a collision radius and a canonical identity, so it cannot become an identity-free
+// field - it has to be the *same* object at both distances. The shared ambient kernel makes
+// that a property of calling one function rather than of two derivations staying in step.
+export const W8_CANONICAL_SHRUB_FIELD_SCHEMA = 'w8-canonical-shrub-field-1';
+export const W8_AMBIENT_CELL_SIZE_METERS = 2;
+export const W8_AMBIENT_CONTENT_SCHEMA_VERSION = 'w8-finite-experience-content-1';
+
+export const W8_CANONICAL_GRASS_FIELD_SCHEMA = 'w8-canonical-grass-field-1';
+const GRASS_FIELD_CELL_SIZE_METERS = 8;
+const GRASS_FIELD_ACCEPTANCE = 0.48;
+export const W8_GRASS_CLUSTER_DETAIL_COUNT = 16;
+
+const grassMix32 = value => {
+  let result = value >>> 0;
+  result ^= result >>> 16;
+  result = Math.imul(result, 0x7feb352d);
+  result ^= result >>> 15;
+  result = Math.imul(result, 0x846ca68b);
+  result ^= result >>> 16;
+  return result >>> 0;
+};
+const grassTextSeed = value => {
+  let hash = 0x811c9dc5;
+  for (const character of String(value)) {
+    hash ^= character.codePointAt(0);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return grassMix32(hash);
+};
+// Cheap deterministic unit hash. Stable IDs are deliberately not used here: they cost
+// about 35 us each through async Web Crypto, and identity is exactly what this field
+// must not have.
+const grassUnit = (seed, x, z, salt) => grassMix32(
+  seed ^ Math.imul(x | 0, 0x1f123bb5) ^ Math.imul(z | 0, 0x5f356495)
+    ^ Math.imul(salt, 0x9e3779b9),
+) / 0xffffffff;
 // Far Rock presentation is a deterministic subset of the exact canonical Rock
 // proposal lattice. It is sparse by design so the existing Tree Macro path does
 // not regain the Rock-generation cost that previously hurt Streaming.
-const W8_CANONICAL_NATURAL_PRESENCE_ROCK_PROPOSAL_SAMPLE_RATE = 1 / 16;
+// Far Rock presence previously sampled only 1/16 of the Rock proposals, which left
+// 0-1 Rocks per 64 m canonical cell against 16-28 Trees: beyond Full residency the world
+// simply had no Rocks, while Trees were complete. Sampling every proposal restores Rock
+// density to Tree-comparable levels (measured 9-15 per cell) for ~31% more owner
+// generation time; the per-owner MAX_ROCKS_PER_OWNER cap still bounds the worst case.
+const W8_CANONICAL_NATURAL_PRESENCE_ROCK_PROPOSAL_SAMPLE_RATE = 1;
 
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
@@ -589,6 +654,8 @@ export async function createPresentationOwnerGenerator({
   const prepareOwner = async (chunkX, chunkZ, {
     includeRocks = true,
     includeCoarsePresence = false,
+    includeGrassField = false,
+    includeShrubField = false,
     materializePresentationOwner = true,
     resolvedContext = undefined,
     resolvedContextPromise = null,
@@ -603,6 +670,12 @@ export async function createPresentationOwnerGenerator({
     }
     if (typeof includeRocks !== 'boolean') {
       throw new TypeError('includeRocks must be boolean');
+    }
+    if (typeof includeShrubField !== 'boolean') {
+      throw new TypeError('includeShrubField must be boolean');
+    }
+    if (typeof includeGrassField !== 'boolean') {
+      throw new TypeError('includeGrassField must be boolean');
     }
     if (typeof includeCoarsePresence !== 'boolean') {
       throw new TypeError('includeCoarsePresence must be boolean');
@@ -834,6 +907,113 @@ export async function createPresentationOwnerGenerator({
         rocks: Object.freeze(rocks),
       });
     })() : null;
+    const grassFieldStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    const grassField = includeGrassField ? (() => {
+      // One 8 m cell may place one cluster. Position, rotation and variation come from a
+      // cheap deterministic hash of the world cell, so the same cell always resolves to the
+      // same cluster without carrying an identity.
+      const seed = grassTextSeed('grass-field:' + worldSeedHash);
+      const size = GRASS_FIELD_CELL_SIZE_METERS;
+      const perOwner = Math.max(1, Math.round(LOGICAL_CHUNK_SIZE_METERS / size));
+      const baseCellX = chunkX * perOwner;
+      const baseCellZ = chunkZ * perOwner;
+      const clusters = [];
+      for (let localZ = 0; localZ < perOwner; localZ += 1) {
+        for (let localX = 0; localX < perOwner; localX += 1) {
+          const cellX = baseCellX + localX;
+          const cellZ = baseCellZ + localZ;
+          if (grassUnit(seed, cellX, cellZ, 1) > GRASS_FIELD_ACCEPTANCE) continue;
+          const worldX = q6((cellX + 0.5 + (grassUnit(seed, cellX, cellZ, 2) - 0.5) * 0.7) * size);
+          const worldZ = q6((cellZ + 0.5 + (grassUnit(seed, cellX, cellZ, 3) - 0.5) * 0.7) * size);
+          const surface = ground.finalGround(worldX, worldZ);
+          if (surface?.isWater === true || surface?.isRoad === true) continue;
+          clusters.push(Object.freeze({
+            x: worldX,
+            z: worldZ,
+            y: q6(surface.heightMeters),
+            rotationY: q6(grassUnit(seed, cellX, cellZ, 4) * Math.PI * 2),
+            variation: q6(0.85 + grassUnit(seed, cellX, cellZ, 5) * 0.35),
+          }));
+        }
+      }
+      return Object.freeze({
+        schemaVersion: W8_CANONICAL_GRASS_FIELD_SCHEMA,
+        cellSizeMeters: size,
+        detailsPerCluster: W8_GRASS_CLUSTER_DETAIL_COUNT,
+        clusters: Object.freeze(clusters),
+      });
+    })() : null;
+    const grassFieldCpuMs = q6((globalThis.performance?.now?.() ?? Date.now()) - grassFieldStartedAt);
+    const shrubFieldStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    const shrubField = includeShrubField ? await (async () => {
+      // Proposals, jitter and Stable IDs all come from the shared kernel, so these are the
+      // very objects Full residency authors - not look-alikes generated a second way.
+      const proposals = ambientDetailProposals({
+        seed: ambientFieldSeed({
+          worldSeedHash,
+          contentSchemaVersion: W8_AMBIENT_CONTENT_SCHEMA_VERSION,
+        }),
+        chunkX,
+        chunkZ,
+        cellSizeMeters: W8_AMBIENT_CELL_SIZE_METERS,
+        // The cap ranks every ambient type together, so all types must be resolved before
+        // the Shrubs that survive it can be known.
+      });
+      if (proposals.length === 0) {
+        return Object.freeze({
+          schemaVersion: W8_CANONICAL_SHRUB_FIELD_SCHEMA, shrubs: Object.freeze([]),
+        });
+      }
+      const parentChunkId = ambientParentChunkId({ worldSeedHash, chunkX, chunkZ });
+      const identified = [];
+      for (const proposal of proposals) {
+        identified.push({
+          proposal,
+          stableId: await ambientDetailStableId({
+            worldSeedHash,
+            parentChunkId,
+            detailType: proposal.detailType,
+            cellX: proposal.cellX,
+            cellZ: proposal.cellZ,
+          }),
+        });
+      }
+      const shrubs = [];
+      for (const { proposal, stableId } of applyAmbientDetailCap(identified)) {
+        if (proposal.detailType !== 'shrub') continue;
+        const surface = ground.finalGround(proposal.x, proposal.z);
+        if (surface?.isWater === true || surface?.isRoad === true) continue;
+        // Reuse the exclusion Trees and Rocks already run against Settlements. It only ever
+        // rejects more than the Full pass would, never less, so this tier cannot invent a
+        // Shrub that has no Near counterpart.
+        if (!candidateAllowed({
+          candidateId: null,
+          worldPosition: { x: proposal.x, z: proposal.z },
+          metadata: { candidateRadiusMeters: 0.45 },
+        })) continue;
+        // Emit the same compact Natural record Trees and Rocks use, built from the same
+        // ambient-detail shape the Full tier feeds through resolveW8CanonicalWorldObject, so
+        // the renderer consumes Shrub through its existing canonical path.
+        shrubs.push(compactNatural(Object.freeze({
+          schemaVersion: 'w8-ambient-detail-1',
+          stableId,
+          detailType: 'shrub',
+          worldPosition: Object.freeze({
+            x: q6(proposal.x), y: q6(surface.heightMeters), z: q6(proposal.z),
+          }),
+          rotationY: q6(proposal.rotationY),
+          variation: q6(proposal.variation),
+          destructible: false,
+          owningChunkCoordinate: Object.freeze({ x: chunkX, z: chunkZ }),
+        })));
+      }
+      return Object.freeze({
+        schemaVersion: W8_CANONICAL_SHRUB_FIELD_SCHEMA,
+        cellSizeMeters: W8_AMBIENT_CELL_SIZE_METERS,
+        shrubs: Object.freeze(shrubs),
+      });
+    })() : null;
+    const shrubFieldCpuMs = q6((globalThis.performance?.now?.() ?? Date.now()) - shrubFieldStartedAt);
     // Natural Stable IDs and X/Z admission remain unchanged, but canonical Y
     // is the same post-grading/post-river finalGround used by visible Terrain.
     // Near, Distant, and the Tree-only batch therefore share one immutable
@@ -868,6 +1048,8 @@ export async function createPresentationOwnerGenerator({
       resource,
       trees,
       coarsePresence,
+      grassField,
+      shrubField,
       ground,
       canonicalSurfacePolicy,
       riverProjection,
@@ -890,6 +1072,10 @@ export async function createPresentationOwnerGenerator({
         coarseNaturalPresenceGenerated: includeCoarsePresence,
         coarseShrubCount: 0,
         coarseRockCount: coarsePresence?.rocks.length ?? 0,
+        grassClusterCount: grassField?.clusters.length ?? 0,
+        grassFieldCpuMs,
+        shrubCount: shrubField?.shrubs.length ?? 0,
+        shrubFieldCpuMs,
         canonicalCandidatesReused: candidates.reused === true,
         vegetationCandidateCpuMs: candidates.timings.vegetationMs,
         rockCandidateCpuMs: candidates.timings.rockMs,
@@ -944,6 +1130,8 @@ export async function createPresentationOwnerGenerator({
         rockProposalSampleRate: W8_CANONICAL_NATURAL_PRESENCE_ROCK_PROPOSAL_SAMPLE_RATE,
         sharedRockFieldCache,
         includeCoarsePresence: true,
+        includeGrassField: true,
+        includeShrubField: true,
         materializePresentationOwner: false,
         resolvedContextPromise: resolvedContextsPromise?.then(contexts => contexts[index]) ?? null,
         ...(generationControl ?? {}),
@@ -955,6 +1143,8 @@ export async function createPresentationOwnerGenerator({
     )));
     const trees = [];
     const rocks = [];
+    const grassClusters = [];
+    const shrubs = [];
     const ownerBoundaries = [];
     for (let ownerIndex = 0; ownerIndex < preparedOwners.length; ownerIndex += 1) {
       const prepared = preparedOwners[ownerIndex];
@@ -987,6 +1177,9 @@ export async function createPresentationOwnerGenerator({
       }));
       trees.push(...ownerTrees);
       rocks.push(...ownerRocks);
+      // Grass clusters carry no Stable ID, so they never enter the identity audit below.
+      grassClusters.push(...(prepared.grassField?.clusters ?? []));
+      shrubs.push(...(prepared.shrubField?.shrubs ?? []));
       if ((ownerIndex + 1) % 4 === 0 || ownerIndex === preparedOwners.length - 1) {
         await reachGenerationCheckpoint(generationControl);
       }
@@ -1021,6 +1214,16 @@ export async function createPresentationOwnerGenerator({
       ownerBoundaries: frozenOwnerBoundaries,
       trees: frozenTrees,
       naturalPresence: frozenNaturalPresence,
+      shrubField: Object.freeze({
+        schemaVersion: W8_CANONICAL_SHRUB_FIELD_SCHEMA,
+        shrubs: Object.freeze(shrubs),
+      }),
+      grassField: Object.freeze({
+        schemaVersion: W8_CANONICAL_GRASS_FIELD_SCHEMA,
+        cellSizeMeters: GRASS_FIELD_CELL_SIZE_METERS,
+        detailsPerCluster: W8_GRASS_CLUSTER_DETAIL_COUNT,
+        clusters: Object.freeze(grassClusters),
+      }),
     });
     const contentHash = await hashCanonicalTreeCellContent(content);
     await reachGenerationCheckpoint(generationControl);
@@ -1032,6 +1235,8 @@ export async function createPresentationOwnerGenerator({
         treeCount: trees.length,
         coarseShrubCount: 0,
         coarseRockCount: rocks.length,
+        grassClusterCount: grassClusters.length,
+        shrubCount: shrubs.length,
         sourceVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
           sum + prepared.diagnostics.sourceVegetationCandidateCount
         ), 0),

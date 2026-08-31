@@ -55,6 +55,7 @@ import {
   resolveCanonicalGroundSurface,
   resolveCanonicalSurfaceColorRgb,
   resolveCanonicalSurfaceWeights,
+  srgbChannelToLinear,
 } from '../w8-surface-policy.js';
 import {
   canonicalRiverMayAffectChunk,
@@ -108,6 +109,7 @@ import {
   createRoadRibbonHeightSampler,
 } from './settlement-road-ribbon-geometry.js';
 import { createMacroCoarseWorldPresentation } from './macro-coarse-world-presentation.js';
+import { createW8GrassFieldPresentation } from './w8-grass-field-presentation.js';
 
 export {
   W8_NATURAL_CANONICAL_VISIBILITY_METERS,
@@ -761,12 +763,22 @@ export function resolveW8PersistentNaturalBucketCapacity({
   return capacity;
 }
 
+// Authored as sRGB hex, stored linear: these feed a vertex-color attribute, and
+// the renderer treats that attribute as linear before encoding to sRGB. Without
+// the transform the Terrain rendered washed-out khaki instead of these colors,
+// and mixed inconsistently with the already-linear Settlement surface colors.
+const terrainPaletteEntry = hex => Object.freeze([
+  hex >> 16 & 0xff,
+  hex >> 8 & 0xff,
+  hex & 0xff,
+].map(channel => srgbChannelToLinear(channel / 255)));
+
 export const W8_PRESENTATION_TERRAIN_PALETTE = Object.freeze([
-  Object.freeze([0x7d / 255, 0x8f / 255, 0x4f / 255]),
-  Object.freeze([0x9a / 255, 0x82 / 255, 0x64 / 255]),
-  Object.freeze([0x5c / 255, 0x6b / 255, 0x38 / 255]),
-  Object.freeze([0x8f / 255, 0xae / 255, 0x4f / 255]),
-  Object.freeze([0xa0 / 255, 0x78 / 255, 0x5a / 255]),
+  terrainPaletteEntry(0x7d8f4f),
+  terrainPaletteEntry(0x9a8264),
+  terrainPaletteEntry(0x5c6b38),
+  terrainPaletteEntry(0x8fae4f),
+  terrainPaletteEntry(0xa0785a),
 ]);
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
@@ -1519,6 +1531,12 @@ export async function createW8DistantPresentation({
   let settlementShadowCanonicalObjectScanCount = 0;
   let settlementShadowStableIdMaterializationCount = 0;
   let persistentDistantRoot = null;
+  // Identity-free Mid Grass lane. The canonical distant lane cannot carry Grass clusters:
+  // registerCanonicalRecord requires a Stable ID and enters the identity audit, and a
+  // Far-only Grass identity is exactly what the Macro Natural invariant forbids.
+  let grassFieldPresentation = null;
+  let grassFieldOriginChunkX = null;
+  let grassFieldOriginChunkZ = null;
   let persistentDistantPublishedGeneration = null;
   const liveDistantEntries = new Map();
   let pendingDistantPublication = null;
@@ -1547,6 +1565,7 @@ export async function createW8DistantPresentation({
   let roadPriorityPublicationCount = 0;
   let roadPriorityReplacementCount = 0;
   let roadPriorityRemovalCount = 0;
+  let roadPriorityDeferredRemovalCount = 0;
   let independentRoadTargetRevision = 0;
   let independentRoadTarget = null;
   let independentRoadDesiredOwners = new Map();
@@ -2688,6 +2707,7 @@ export async function createW8DistantPresentation({
       settlementPublicationRevision,
     });
     persistentDistantPublishedGeneration = generation;
+    syncGrassFieldRoot();
     markRoadLifecyclePublished(generation);
     positionGenerationForOrigin(generation, committedRenderOrigin);
     if (generation.naturalReveal < 1) generation.naturalRevealStartedAt = monotonicNow();
@@ -3292,6 +3312,9 @@ export async function createW8DistantPresentation({
     if (!presentation) return false;
     macroCoarseWorldLastPlayerX = playerLogicalX;
     macroCoarseWorldLastPlayerZ = playerLogicalZ;
+    // Distance compensation for the Grass field follows the player; the module itself
+    // ignores movement below its own threshold, so this is cheap to call every update.
+    grassFieldPresentation?.setViewer(playerLogicalX, playerLogicalZ);
     macroCoarseWorldLastRenderOrigin = renderOrigin;
     const detailTerrainGeneration = activeLocalTerrainGeneration?.root?.parent === root
       ? activeLocalTerrainGeneration : null;
@@ -5259,6 +5282,17 @@ export async function createW8DistantPresentation({
     const livePair = [...liveDistantEntries.entries()]
       .find(([, entry]) => isSettlementRoadEntry(entry)) ?? null;
     const previous = livePair?.[1] ?? null;
+    // Every Road in the world shares one merged bucket, and the live mesh is removed
+    // before the replacement is added. When this generation still carries Road records
+    // but has not produced a Road mesh yet, publishing it would drop the entire Road
+    // layer until some later generation composes one - the player sees all Roads blink
+    // out together while moving. Keep the last known good Roads and let the caller
+    // dispose this generation, exactly as preserveExistingRoadWhenEmpty already does
+    // for the genuinely Road-free case.
+    if (!desiredPair && previous && roadObjectsByOwner(generation).size > 0) {
+      roadPriorityDeferredRemovalCount += 1;
+      return false;
+    }
     if (livePair) {
       persistentDistantRoot.remove(previous.mesh);
       liveDistantEntries.delete(livePair[0]);
@@ -9847,11 +9881,49 @@ export async function createW8DistantPresentation({
     return false;
   };
 
+  let grassFieldPresentationUnavailable = false;
+  const ensureGrassFieldPresentation = () => {
+    if (!grassFieldPresentation && !grassFieldPresentationUnavailable) {
+      grassFieldPresentation = createW8GrassFieldPresentation({ THREE, root: persistentDistantRoot });
+      grassFieldOriginChunkX = persistentDistantPublishedGeneration?.buildOriginChunkX ?? null;
+      grassFieldOriginChunkZ = persistentDistantPublishedGeneration?.buildOriginChunkZ ?? null;
+      grassFieldPresentationUnavailable = grassFieldPresentation === null;
+    }
+    return grassFieldPresentation;
+  };
+
+  // Cluster matrices are baked against the build origin of the root they hang under, so a
+  // root or origin change has to restage every cell. The batches are already retained in
+  // directCanonicalTreeCells, so this needs no regeneration.
+  const syncGrassFieldRoot = () => {
+    if (!grassFieldPresentation) return;
+    grassFieldPresentation.setRoot(persistentDistantRoot);
+    const originX = persistentDistantPublishedGeneration?.buildOriginChunkX ?? null;
+    const originZ = persistentDistantPublishedGeneration?.buildOriginChunkZ ?? null;
+    if (originX === grassFieldOriginChunkX && originZ === grassFieldOriginChunkZ) return;
+    grassFieldOriginChunkX = originX;
+    grassFieldOriginChunkZ = originZ;
+    for (const [cellKey, batch] of directCanonicalTreeCells) {
+      if (!batch?.grassField) continue;
+      grassFieldPresentation.stage(cellKey, batch.grassField, {
+        buildOriginChunkX: originX, buildOriginChunkZ: originZ,
+      });
+    }
+  };
+
   stageDirectCanonicalTreeCell = batch => {
     if (!directCanonicalTreeSupply || batch?.schemaVersion !== W8_CANONICAL_TREE_CELL_SCHEMA) {
       return false;
     }
     directCanonicalTreeCells.set(batch.key, batch);
+    if (batch.grassField?.clusters?.length) {
+      const presentation = ensureGrassFieldPresentation();
+      syncGrassFieldRoot();
+      presentation?.stage(batch.key, batch.grassField, {
+        buildOriginChunkX: grassFieldOriginChunkX,
+        buildOriginChunkZ: grassFieldOriginChunkZ,
+      });
+    }
     for (const ownerKey of batch.ownerKeys) directCanonicalTreeOwnerKeys.add(ownerKey);
     return !persistentTreeGeneration || enqueueDirectCanonicalTreeBatch(batch);
   };
@@ -9860,6 +9932,7 @@ export async function createW8DistantPresentation({
     const batch = directCanonicalTreeCells.get(key);
     if (!batch) return false;
     directCanonicalTreeCells.delete(key);
+    grassFieldPresentation?.retire(key);
     for (const ownerKey of batch.ownerKeys) directCanonicalTreeOwnerKeys.delete(ownerKey);
     const pageKey = `${DIRECT_CANONICAL_TREE_PAGE_PREFIX}${key}`;
     pendingPersistentTreePages.delete(pageKey);
@@ -14771,6 +14844,7 @@ export async function createW8DistantPresentation({
         if (incrementalStaticTreePages) {
           persistentDistantRoot = generation.root;
           persistentDistantPublishedGeneration = generation;
+          syncGrassFieldRoot();
           liveDistantEntries.clear();
           for (const [key, entry] of directCanonicalMeshEntries(generation)) {
             liveDistantEntries.set(key, entry);
@@ -14861,6 +14935,7 @@ export async function createW8DistantPresentation({
       retireGeneration(distant.previous);
       persistentDistantRoot = distantGeneration.root;
       persistentDistantPublishedGeneration = distantGeneration;
+      syncGrassFieldRoot();
       liveDistantEntries.clear();
       for (const [key, entry] of directCanonicalMeshEntries(distantGeneration)) {
         liveDistantEntries.set(key, entry);
@@ -15840,6 +15915,8 @@ export async function createW8DistantPresentation({
         roadPriorityPublicationCount,
         roadPriorityReplacementCount,
         roadPriorityRemovalCount,
+        roadPriorityDeferredRemovalCount,
+        grassField: grassFieldPresentation?.snapshot() ?? null,
         roadPriorityPublishedEpoch: publishedRoadGeneration?.epoch ?? null,
         runtimePresentationHandoffPending: pendingRuntimePresentationHandoff !== null,
         runtimePresentationHandoffStage: pendingRuntimePresentationHandoff?.stage ?? null,
@@ -16441,6 +16518,12 @@ export async function createW8DistantPresentation({
         });
       }));
     },
+    setGrassFieldDensity(value) {
+      return grassFieldPresentation?.setDensity(value) ?? null;
+    },
+    grassFieldSnapshot() {
+      return grassFieldPresentation?.snapshot() ?? null;
+    },
     markFirstDraw(receipt) {
       if (!isCompletedRenderFrameReceipt(receipt)) return 0;
       const firstDrawAtMs = receipt.completedAtMs;
@@ -16595,6 +16678,8 @@ export async function createW8DistantPresentation({
         generation.ownedMaterials?.clear?.();
       }
       retiredDistantGenerations.clear();
+      grassFieldPresentation?.dispose();
+      grassFieldPresentation = null;
       persistentDistantRoot = null;
       persistentDistantPublishedGeneration = null;
       pendingDistantFirstDraw = null;

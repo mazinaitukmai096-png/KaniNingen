@@ -272,6 +272,10 @@ function resolveW8CacheCapacities(overrides) {
   }
   return Object.freeze(resolved);
 }
+// The safe-spawn pond is validated by identity at boot and throws if it no longer matches,
+// so presentation filters must never drop it even when it is a single isolated tile.
+export const W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID =
+  'wf1:water-surface:0fdcd2fc660122cf5e89d7a3f0d5c855';
 const PROTECTED_SAFE_SPAWN_BOOTSTRAP = Object.freeze({
   worldSeedHash: 'sha256:0ee3540b10572232690cdefc6ee897c8a3a59ffe3ad582617ef0d1c80696c24d',
   x: 549.75,

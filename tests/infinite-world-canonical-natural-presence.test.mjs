@@ -28,7 +28,7 @@ test('canonical 64 m Tree batch carries only bounded real canonical Rock presenc
   const cell = await generator.generateCanonicalTreeCell(1, 0);
 
   assert.equal(cell.schemaVersion, W8_CANONICAL_TREE_CELL_SCHEMA);
-  assert.match(cell.identity.sourceRevision, /decorative-bush-only-1:canonical-rock-presence-4$/);
+  assert.match(cell.identity.sourceRevision, /decorative-bush-only-1:canonical-rock-presence-5$/);
   assert.equal(cell.naturalPresence.schemaVersion, W8_CANONICAL_NATURAL_PRESENCE_SCHEMA);
   assert.equal(cell.ownerKeys.length, 16);
   assert.equal(cell.ownerBoundaries.length, 16);
