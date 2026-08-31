@@ -1,4 +1,5 @@
 import { createChunkId } from './legacy-core/g0/chunk-id.js';
+import { resolveBuildingResident } from './building-resident-kernel.js';
 import {
   ambientDetailProposals,
   ambientDetailStableId,
@@ -44,6 +45,9 @@ export const W8_CANONICAL_TREE_MACRO_SIZE_METERS = 64;
 export const W8_CANONICAL_TREE_OWNERS_PER_AXIS =
   W8_CANONICAL_TREE_MACRO_SIZE_METERS / LOGICAL_CHUNK_SIZE_METERS;
 const PRESENTATION_CANONICAL_GENERATOR_MAJOR = 8;
+// Residents must be parented exactly as Full residency parents them, or the far figures
+// would be different people wearing the same buildings.
+const RESIDENT_GENERATOR_MAJOR = 800;
 // Macro Natural presence reaches past Full residency across every owner in the
 // Presentation view, so this cap is multiplied by roughly 1,700 chunks -- each
 // extra rock per owner is thousands of additional instances.
@@ -656,6 +660,7 @@ export async function createPresentationOwnerGenerator({
     includeCoarsePresence = false,
     includeGrassField = false,
     includeShrubField = false,
+    includeResidents = false,
     materializePresentationOwner = true,
     resolvedContext = undefined,
     resolvedContextPromise = null,
@@ -907,6 +912,36 @@ export async function createPresentationOwnerGenerator({
         rocks: Object.freeze(rocks),
       });
     })() : null;
+    // Human NPCs are Building residents, so the same people can be shown out here by asking
+    // the shared kernel who lives in each Building this owner holds. Identity and placement
+    // both come from that kernel, so these are the same residents Full residency will hand
+    // over - not look-alikes that would shift or vanish as the player walks up.
+    const residentsStartedAt = globalThis.performance?.now?.() ?? Date.now();
+    const residents = [];
+    if (includeResidents) {
+      for (const structure of preliminaryStructures) {
+        if (structure?.featureType !== 'settlement-building') continue;
+        const resident = await resolveBuildingResident({
+          worldSeedHash,
+          // Full residency parents the resident on the parity generator major, so the
+          // presentation major would derive a different person entirely.
+          generatorMajor: RESIDENT_GENERATOR_MAJOR,
+          building: structure,
+          ownerChunkX: chunkX,
+          ownerChunkZ: chunkZ,
+        });
+        const surface = ground.finalGround(resident.x, resident.z);
+        residents.push(Object.freeze({
+          stableId: resident.stableId,
+          buildingStableId: resident.buildingStableId,
+          x: resident.x,
+          z: resident.z,
+          y: q6(surface.heightMeters),
+          rotationY: resident.angle,
+        }));
+      }
+    }
+    const residentsCpuMs = q6((globalThis.performance?.now?.() ?? Date.now()) - residentsStartedAt);
     const grassFieldStartedAt = globalThis.performance?.now?.() ?? Date.now();
     const grassField = includeGrassField ? (() => {
       // One 8 m cell may place one cluster. Position, rotation and variation come from a
@@ -1049,6 +1084,7 @@ export async function createPresentationOwnerGenerator({
       trees,
       coarsePresence,
       grassField,
+      residents: Object.freeze(residents),
       shrubField,
       ground,
       canonicalSurfacePolicy,
@@ -1073,6 +1109,8 @@ export async function createPresentationOwnerGenerator({
         coarseShrubCount: 0,
         coarseRockCount: coarsePresence?.rocks.length ?? 0,
         grassClusterCount: grassField?.clusters.length ?? 0,
+        residentCount: residents.length,
+        residentsCpuMs,
         grassFieldCpuMs,
         shrubCount: shrubField?.shrubs.length ?? 0,
         shrubFieldCpuMs,
@@ -1131,6 +1169,7 @@ export async function createPresentationOwnerGenerator({
         sharedRockFieldCache,
         includeCoarsePresence: true,
         includeGrassField: true,
+        includeResidents: true,
         includeShrubField: true,
         materializePresentationOwner: false,
         resolvedContextPromise: resolvedContextsPromise?.then(contexts => contexts[index]) ?? null,
@@ -1144,6 +1183,7 @@ export async function createPresentationOwnerGenerator({
     const trees = [];
     const rocks = [];
     const grassClusters = [];
+    const residents = [];
     const shrubs = [];
     const ownerBoundaries = [];
     for (let ownerIndex = 0; ownerIndex < preparedOwners.length; ownerIndex += 1) {
@@ -1179,6 +1219,7 @@ export async function createPresentationOwnerGenerator({
       rocks.push(...ownerRocks);
       // Grass clusters carry no Stable ID, so they never enter the identity audit below.
       grassClusters.push(...(prepared.grassField?.clusters ?? []));
+      residents.push(...(prepared.residents ?? []));
       shrubs.push(...(prepared.shrubField?.shrubs ?? []));
       if ((ownerIndex + 1) % 4 === 0 || ownerIndex === preparedOwners.length - 1) {
         await reachGenerationCheckpoint(generationControl);
@@ -1218,6 +1259,7 @@ export async function createPresentationOwnerGenerator({
         schemaVersion: W8_CANONICAL_SHRUB_FIELD_SCHEMA,
         shrubs: Object.freeze(shrubs),
       }),
+      residents: Object.freeze(residents),
       grassField: Object.freeze({
         schemaVersion: W8_CANONICAL_GRASS_FIELD_SCHEMA,
         cellSizeMeters: GRASS_FIELD_CELL_SIZE_METERS,
@@ -1236,6 +1278,7 @@ export async function createPresentationOwnerGenerator({
         coarseShrubCount: 0,
         coarseRockCount: rocks.length,
         grassClusterCount: grassClusters.length,
+        residentCount: residents.length,
         shrubCount: shrubs.length,
         sourceVegetationCandidateCount: preparedOwners.reduce((sum, prepared) => (
           sum + prepared.diagnostics.sourceVegetationCandidateCount
