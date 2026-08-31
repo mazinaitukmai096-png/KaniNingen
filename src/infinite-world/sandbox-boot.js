@@ -110,7 +110,6 @@ import {
 } from './vegetation-lod-policy.js';
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
-  W8_RENDER_FOG_COLOR_HEX,
   W8_RENDER_DISTANCE_PRESETS,
   normalizeW8RenderDistancePreset,
   resolveW8RenderDistancePolicy,
@@ -661,6 +660,75 @@ const FINITE_TO_INFINITE_RENDER_SCALE = UNITS_PER_METER / PRODUCTION_VISUAL_UNIT
 const finiteVisualToRender = value => value * FINITE_TO_INFINITE_RENDER_SCALE;
 const W8_GAMEPLAY_CAMERA_FAR = finiteVisualToRender(35_000);
 const W8_GAMEPLAY_FOG_NEAR = finiteVisualToRender(3_000);
+// P0 visual pass: filmic (ACES) tone mapping exposure. The scene is lit brightly
+// (hemisphere 1.3 + directional 1.2), so a slight >1 exposure keeps midtones from
+// darkening while the highlight roll-off grades the canyon and atomic FX into one
+// cohesive image instead of clipping to flat sRGB. Tunable in one place.
+const W8_RENDER_TONE_MAPPING_EXPOSURE = 1.15;
+// P2 art-direction pass: scene-level atmosphere & lighting. Material *types* are pinned
+// by the W8 finite-parity contract (tests assert MeshPhong/MeshLambert), so the look is
+// lifted purely through the light rig, a hazy horizon fog, and a gradient sky — with no
+// per-material changes. All tunable in one place; graded together with the ACES exposure.
+// A viewport can legitimately report zero at load: the window may be behind another one,
+// a virtual desktop may be mid-switch, or a multi-monitor session may still be settling.
+// Sizing the renderer to 0x0 there leaves a permanently blank canvas, because the resize
+// listener is only attached once boot finishes and therefore misses the widening. Clamping
+// keeps the first frame drawable, and the post-boot re-apply picks up the real size.
+const W8_MINIMUM_VIEWPORT_PIXELS = Object.freeze({ width: 640, height: 360 });
+const resolveViewportSize = (measurementViewport, globalObject) => Object.freeze({
+  width: Math.max(
+    W8_MINIMUM_VIEWPORT_PIXELS.width,
+    Math.floor(measurementViewport?.width ?? globalObject?.innerWidth ?? 0) || 0,
+  ),
+  height: Math.max(
+    W8_MINIMUM_VIEWPORT_PIXELS.height,
+    Math.floor(measurementViewport?.height ?? globalObject?.innerHeight ?? 0) || 0,
+  ),
+});
+
+const W8_ATMOSPHERE = Object.freeze({
+  fogColorHex: 0xd7e6ee,        // hazy horizon the distant world dissolves into
+  skyZenithCss: '#2f74b4',      // gradient sky — top
+  skyMidCss: '#79b0da',         // gradient sky — mid
+  skyHorizonCss: '#d9e7ef',     // gradient sky — horizon haze (matches fog)
+  fallbackSkyHex: 0x86b9e0,     // flat background when a gradient canvas is unavailable
+  hemiSkyHex: 0xbfd9ef,         // cool skylight fill from above
+  hemiGroundHex: 0x5c4a30,      // warm earth bounce from below
+  hemiIntensity: 1.0,
+  sunColorHex: 0xfff1cf,        // warm late-afternoon key light
+  sunIntensity: 1.35,
+  fillColorHex: 0x9ab8d6,       // cool rim/fill opposite the sun
+  fillIntensity: 0.3,
+});
+
+// Browser-only vertical gradient sky. Returns null when a 2D canvas or THREE.CanvasTexture
+// is unavailable (the Node parity/boot tests run on a fake THREE with neither), and the
+// caller keeps a flat Color background. Rendered screen-space, which reads well for this
+// game's near-horizontal third-person camera, and adds no scene child or managed draw call.
+function createGradientSkyTexture(THREE, documentRef) {
+  if (typeof THREE?.CanvasTexture !== 'function' || typeof documentRef?.createElement !== 'function') {
+    return null;
+  }
+  try {
+    const canvas = documentRef.createElement('canvas');
+    canvas.width = 8;
+    canvas.height = 256;
+    const ctx = canvas.getContext?.('2d');
+    if (!ctx) return null;
+    const gradient = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    gradient.addColorStop(0, W8_ATMOSPHERE.skyZenithCss);
+    gradient.addColorStop(0.55, W8_ATMOSPHERE.skyMidCss);
+    gradient.addColorStop(1, W8_ATMOSPHERE.skyHorizonCss);
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const texture = new THREE.CanvasTexture(canvas);
+    if (THREE.SRGBColorSpace !== undefined) texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+    return texture;
+  } catch {
+    return null;
+  }
+}
 const defaultRenderDistancePolicy = resolveW8RenderDistancePolicy();
 
 function defaultClock() {
@@ -2575,12 +2643,16 @@ export async function bootInfiniteWorldSandbox({
     const selectedRenderChunkSize = renderProfile.selectedRenderChunkSize;
 
     const rendererContext = await runStage('Renderer', () => {
-      const viewportWidth = measurementViewport?.width ?? globalObject.innerWidth;
-      const viewportHeight = measurementViewport?.height ?? globalObject.innerHeight;
+      const bootViewport = resolveViewportSize(measurementViewport, globalObject);
+      const viewportWidth = bootViewport.width;
+      const viewportHeight = bootViewport.height;
       const nextScene = new THREE.Scene();
-      nextScene.background = new THREE.Color(W8_RENDER_FOG_COLOR_HEX);
+      // P2: gradient sky (browser) with a flat fallback (tests); distant terrain melts
+      // into the hazy horizon fog color, which matches the sky's lowest gradient stop.
+      const skyTexture = createGradientSkyTexture(THREE, globalObject.document);
+      nextScene.background = skyTexture ?? new THREE.Color(W8_ATMOSPHERE.fallbackSkyHex);
       nextScene.fog = new THREE.Fog(
-        W8_RENDER_FOG_COLOR_HEX,
+        W8_ATMOSPHERE.fogColorHex,
         W8_GAMEPLAY_FOG_NEAR,
         defaultRenderDistancePolicy.worldPresentationDistanceMeters * UNITS_PER_METER,
       );
@@ -2598,21 +2670,40 @@ export async function bootInfiniteWorldSandbox({
         ? 1 : Math.min(globalObject.devicePixelRatio ?? 1, 1.5));
       nextRenderer.setSize(viewportWidth, viewportHeight);
       nextRenderer.outputColorSpace = THREE.SRGBColorSpace;
+      // P0 visual pass: grade the whole frame through the ACES filmic curve so the
+      // bright sky, canyon, and atomic/acid FX resolve as one image. Applied by the
+      // renderer to every tone-mapped material during render(); it adds no extra draw
+      // calls and does not touch the acknowledged render loop or draw-call diagnostics.
+      if (THREE.ACESFilmicToneMapping !== undefined) {
+        nextRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+      }
+      nextRenderer.toneMappingExposure = W8_RENDER_TONE_MAPPING_EXPOSURE;
       nextRenderer.shadowMap ??= {};
       nextRenderer.shadowMap.enabled = true;
       nextRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
       appendElement(viewport, nextRenderer.domElement);
 
-      nextScene.add(new THREE.HemisphereLight(0xffcfa0, 0x4a5c2e, 1.3));
-      const sun = new THREE.DirectionalLight(0xffeb3b, 1.2);
+      // P2 light rig: cool sky / warm earth ambient, a stronger warm key light for
+      // directional form, and a cool fill opposite it to lift silhouettes off the sky.
+      nextScene.add(new THREE.HemisphereLight(
+        W8_ATMOSPHERE.hemiSkyHex, W8_ATMOSPHERE.hemiGroundHex, W8_ATMOSPHERE.hemiIntensity,
+      ));
+      const sun = new THREE.DirectionalLight(W8_ATMOSPHERE.sunColorHex, W8_ATMOSPHERE.sunIntensity);
       sun.position.set(1500, 2500, 1000);
       sun.castShadow = true;
       sun.shadow ??= { camera: {}, mapSize: {} };
       sun.shadow.camera ??= {};
       Object.assign(sun.shadow.camera, { left: -5000, right: 5000, top: 5000, bottom: -5000 });
       sun.shadow.mapSize ??= {};
-      Object.assign(sun.shadow.mapSize, { width: 1024, height: 1024 });
+      Object.assign(sun.shadow.mapSize, { width: 2048, height: 2048 });
+      sun.shadow.bias = -0.0004;
+      sun.shadow.radius = 3;
       nextScene.add(sun);
+      const fillLight = new THREE.DirectionalLight(
+        W8_ATMOSPHERE.fillColorHex, W8_ATMOSPHERE.fillIntensity,
+      );
+      fillLight.position.set(-1400, 1200, -1600);
+      nextScene.add(fillLight);
 
       visualAssets = createW8ParityVisualAssetLibrary({ THREE });
       const playerMarker = visualAssets.createPlayerModel();
@@ -4586,8 +4677,9 @@ export async function bootInfiniteWorldSandbox({
     if (measurement.mode) await experienceShell.start('new', { skipConfirmation: true });
 
     function resize() {
-      const width = measurementViewport?.width ?? globalObject.innerWidth;
-      const height = measurementViewport?.height ?? globalObject.innerHeight;
+      const viewport = resolveViewportSize(measurementViewport, globalObject);
+      const width = viewport.width;
+      const height = viewport.height;
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
       renderer.setSize(width, height);
@@ -4603,6 +4695,9 @@ export async function bootInfiniteWorldSandbox({
       return Object.freeze({ width, height });
     }
     addWindowListener('resize', resize);
+    // Re-apply the size once boot completes: any widening that happened while boot was
+    // running fired before this listener existed, and would otherwise never be observed.
+    resize();
     addWindowListener('pagehide', handlePageHide);
 
     const transitionGenerationForRequest = () => {
@@ -5064,6 +5159,7 @@ export async function bootInfiniteWorldSandbox({
         nowMs: clock(),
         enabled: shellSnapshot.runPhase === 'intro',
       });
+      renderAdapter.advanceFeatureCollapse?.(deltaSeconds);
       const committedChunkState = runtime.getCommittedChunkState();
       const settlementStreamingObservation = diagnosticMeasure(
         'settlement-shadow-observation',

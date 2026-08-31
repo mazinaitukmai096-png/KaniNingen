@@ -183,11 +183,11 @@ test('Natural visibility contract separates detail reach from shared World prese
     },
     standard: {
       world: 218.181818,
-      detail: { tree: 218.181818, bush: 112, grass: 67.2, rock: 112 },
+      detail: { tree: 218.181818, bush: 112, grass: 80, rock: 112 },
     },
     current: {
       world: 300,
-      detail: { tree: 300, bush: 140, grass: 84, rock: 140 },
+      detail: { tree: 300, bush: 140, grass: 100, rock: 140 },
     },
   };
   for (const [preset, values] of Object.entries(expected)) {
@@ -229,7 +229,7 @@ test('Natural visibility contract separates detail reach from shared World prese
   assert.deepEqual(resolveW8VegetationLodPolicy('bush', 'current').atmosphericFade,
     { minimum: 116, maximum: 140 });
   assert.deepEqual(resolveW8VegetationLodPolicy('grass', 'current').coarsePresenceEntry,
-    { minimum: 78, maximum: 90 });
+    { minimum: 94, maximum: 106 });
   assert.deepEqual(resolveW8VegetationLodPolicy('rock', 'current').coarsePresenceEntry,
     { minimum: 132, maximum: 148 });
   for (const kind of ['grass', 'rock']) {

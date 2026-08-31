@@ -133,7 +133,10 @@ test('W8 settlement and atmosphere materials use the finite visual baseline', ()
     material: assets.snapshot().sharedMaterialCount,
   };
   assert.ok(assets.materials.road instanceof MeshPhongMaterial);
-  assert.deepEqual(assets.materials.road.options, { color: 0xc2a878, shininess: 3 });
+  assert.deepEqual(assets.materials.road.options, {
+    color: 0xc2a878, shininess: 3,
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  });
   assert.equal(assets.materials.houseWall.options.color, 0xeeeeee);
   assert.equal(assets.materials.houseRoof.options.color, 0xaa2222);
   assert.equal(assets.materials.factoryWall.options.color, 0x707878);

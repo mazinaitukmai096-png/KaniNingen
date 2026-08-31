@@ -1574,7 +1574,7 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       'the boot Camera near plane must derive the active canonical scale profile',
     );
     assert.equal(gameplayCamera.far, 224000);
-    assert.deepEqual(gameplayFog.values, [0x5dade2, 19200, 76800]);
+    assert.deepEqual(gameplayFog.values, [0xd7e6ee, 19200, 76800]);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-cyclic-scene-clouds'), false);
     const cloudRoot = gameplayScene.children.find(
       child => child.name === 'w8-finite-cloud-instance-pool',

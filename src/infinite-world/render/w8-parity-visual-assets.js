@@ -113,6 +113,28 @@ function settlementMaterialKey(color) {
   return `settlement-${Number(color).toString(16).padStart(6, '0')}`;
 }
 
+// Buildings are seated on a single sampled ground height, so where the terrain under
+// the footprint is uneven the base can hover and show a gap beneath the walls. The
+// foundation extends the building's own wall material straight down from its base: on
+// level ground it is fully buried and invisible, and it only becomes visible where it
+// closes a gap. Appended last so parts[0] and the first 'wall'/'roof' lookups (near
+// presentation, remote horizon body/cap selection, house variant keys) are unchanged.
+const W8_BUILDING_FOUNDATION_HEIGHT_RATIO = 0.08;
+
+function withW8BuildingFoundation(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) return parts;
+  const body = parts.find(part => part.materialRole === 'wall') ?? parts[0];
+  if (!body?.material || body.geometry !== 'box') return parts;
+  return Object.freeze([...parts, descriptor(
+    'box',
+    body.material,
+    [0, -W8_BUILDING_FOUNDATION_HEIGHT_RATIO / 2, 0],
+    [body.scale[0], W8_BUILDING_FOUNDATION_HEIGHT_RATIO, body.scale[2]],
+    [0, 0, 0],
+    'wall',
+  )]);
+}
+
 export function resolveW8BuildingParts(building) {
   const source = building?.buildingType === 'house'
     ? W8_FINITE_HOUSE_VARIANTS[stableVariantIndex(building.stableId, W8_FINITE_HOUSE_VARIANTS.length)]
@@ -155,9 +177,10 @@ export function resolveW8BuildingParts(building) {
       return part;
     })
     : source;
+  const grounded = withW8BuildingFoundation(facadeSource);
   const visual = building?.visual;
-  if (!visual) return facadeSource;
-  return facadeSource.map(part => {
+  if (!visual) return grounded;
+  return grounded.map(part => {
     const color = part.materialRole === 'wall' ? visual.wallColor
       : part.materialRole === 'roof' ? visual.roofColor : null;
     const roofScale = part.materialRole === 'roof' ? visual.roofScale ?? 1 : 1;
@@ -336,9 +359,23 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     treeLeaves: phong(0x2e7d32, { shininess: 3 }),
     treeLeavesForest: phong(0x1b5e20, { shininess: 3 }),
     treeLeavesMeadow: phong(0x7cb342, { shininess: 3 }),
-    road: phong(0xc2a878, { shininess: 3 }),
-    lotResidential: phong(0xa58c68, { shininess: 2 }),
-    lotCivic: phong(0x918d84, { shininess: 4 }),
+    // The road ribbon is a thin decal sitting ~7.5cm above the terrain it samples,
+    // so at grazing view angles / distance it z-fights and the road flickers or drops
+    // out as the camera turns. polygonOffset biases the road's depth toward the camera
+    // so it reliably wins over the coplanar ground without lifting the geometry (which
+    // would gap on slopes). View-angle robust; no streaming or geometry change.
+    road: phong(0xc2a878, {
+      shininess: 3, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    }),
+    // Lot ground patches are flat terrain decals like the road, so they z-fight the
+    // same way. Same polygonOffset bias keeps the plot surface stable under the
+    // building instead of flickering as the camera turns.
+    lotResidential: phong(0xa58c68, {
+      shininess: 2, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    }),
+    lotCivic: phong(0x918d84, {
+      shininess: 4, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+    }),
     houseWall: phong(0xeeeeee), houseRoof: phong(0xaa2222),
     towerWall: phong(0x78909c), towerRoof: phong(0x37474f),
     churchWall: phong(0xe0e0e0), churchRoof: phong(0x37474f),
@@ -355,26 +392,30 @@ export function createW8ParityVisualAssetLibrary({ THREE } = {}) {
     cowDark: phong(0x2b2b2b), streetLight: material(0xffe28a), roadSign: material(0x244b59),
     water: phong(0x2f6fa8, { transparent: true, opacity: 0.82, shininess: 70, depthWrite: false }),
     scorch: material(0x241b18, { transparent: true, opacity: 0.72 }),
-    blood: material(0x7e1019), acid: material(0x7cff31),
+    blood: material(0x7e1019),
+    // P0 visual pass: self-lit combat FX bypass tone mapping so they stay vivid
+    // (read as "hot"/glowing) against the now filmic-graded world, and are ready to
+    // drive a bloom pass. World surfaces keep tone mapping for the cohesive image.
+    acid: material(0x7cff31, { toneMapped: false }),
     bossSegmentDark: phong(0x4a1c2c, { shininess: 40 }),
     bossSegmentMid: phong(0x63263a, { shininess: 40 }),
     bossSegmentLight: phong(0x7b354b, { shininess: 40 }),
     bossTeeth: phong(0xeeeedd, { shininess: 80 }),
-    bossEyeCyan: phong(0x00ffcc, { shininess: 100, emissive: 0x004c3d }),
-    atomicFlash: basic(0xffffff, { transparent: true, opacity: 0.65, depthWrite: false }),
-    atomicOrange: basic(0xffaa00, { transparent: true, opacity: 0.65, depthWrite: false }),
-    shockwave: phong(0xffb020, { transparent: true, opacity: 0.72, depthWrite: false }),
+    bossEyeCyan: phong(0x00ffcc, { shininess: 100, emissive: 0x004c3d, toneMapped: false }),
+    atomicFlash: basic(0xffffff, { transparent: true, opacity: 0.65, depthWrite: false, toneMapped: false }),
+    atomicOrange: basic(0xffaa00, { transparent: true, opacity: 0.65, depthWrite: false, toneMapped: false }),
+    shockwave: phong(0xffb020, { transparent: true, opacity: 0.72, depthWrite: false, toneMapped: false }),
     landingOuter: basic(0xff3300, {
       side: THREE.DoubleSide, transparent: true, opacity: 0.85,
-      depthTest: false, depthWrite: false,
+      depthTest: false, depthWrite: false, toneMapped: false,
     }),
     landingInner: basic(0xffaa00, {
       side: THREE.DoubleSide, transparent: true, opacity: 0.85,
-      depthTest: false, depthWrite: false,
+      depthTest: false, depthWrite: false, toneMapped: false,
     }),
-    wind: basic(0xffffff, { transparent: true, opacity: 0.8, depthWrite: false }),
+    wind: basic(0xffffff, { transparent: true, opacity: 0.8, depthWrite: false, toneMapped: false }),
     smoke: phong(0x4a413d, { transparent: true, opacity: 0.68, depthWrite: false }),
-    lobbyFire: phong(0xff5500, { emissive: 0x662200, shininess: 0 }),
+    lobbyFire: phong(0xff5500, { emissive: 0x662200, shininess: 0, toneMapped: false }),
     lobbySmoke: phong(0x1a1a1a, { shininess: 0 }),
     cloud: phong(0xffffff, {
       transparent: true, opacity: 0.72, depthWrite: false, shininess: 4,

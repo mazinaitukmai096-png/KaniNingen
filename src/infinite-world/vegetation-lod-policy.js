@@ -255,9 +255,18 @@ const profileFor = (kind, renderDistance) => {
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.GRASS) {
+    // Grass keeps its own shorter band rather than following Bush and Rock out
+    // to Natural Detail distance: it is the densest geometry in the world, so
+    // its cost grows with the square of this number.
+    // Full residency generates ambient Grass out to 100 m, but Grass was only drawn to
+    // 84 m, so the outer 16 m of already-generated Grass was thrown away every frame and
+    // the player saw a bare carpet edge well inside the data boundary. Drawing to the data
+    // boundary costs render time only - no extra chunk generation, and no change to the
+    // streaming budget that pins Full residency at 100 m. Short/Standard keep their
+    // smaller, quality-selected reach.
     const detailVisibilityMeters = q6(Math.min(
       naturalVisibilityMeters,
-      Math.max(64, 84 * scale),
+      Math.max(64, 100 * scale),
     ));
     const visibilityMeters = renderDistance.worldPresentationDistanceMeters;
     const fullToForest = Object.freeze({ minimum: 48, maximum: 52 });
