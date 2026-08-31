@@ -225,28 +225,33 @@ const profileFor = (kind, renderDistance) => {
     });
   }
   if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
-    // Bush is finite-style ambient decoration, not World-presence geometry.
-    // It fades within Natural Detail distance and never opens a Macro/Far lane.
+    // Bush used to fade inside Natural Detail distance and never opened a Macro/Far lane,
+    // on the grounds that it is ambient decoration rather than World-presence geometry.
+    // That held only while the far tier had no way to name the same Bushes: a far-only
+    // identity would have vanished on approach. The shared ambient kernel removes that
+    // objection - presentation Shrub identities are derived from the same source as the
+    // Full tier's and match them exactly - so Bush now follows Rock and stays present to
+    // the world boundary instead of stopping at a line the player can walk up to.
     const detailVisibilityMeters = naturalVisibilityMeters;
-    const visibilityMeters = detailVisibilityMeters;
+    const visibilityMeters = renderDistance.worldPresentationDistanceMeters;
     const fullToForest = handoffSafeBand(44, 56, scale);
     const forestStart = Math.max(fullToForest.maximum + 8, 76 * scale);
     const forestToAtmospheric = Object.freeze({
       minimum: q6(forestStart),
       maximum: q6(forestStart + Math.max(6, 12 * scale)),
     });
-    const fadeStart = Math.max(
-      forestToAtmospheric.maximum,
-      visibilityMeters - Math.max(12, 24 * scale),
-    );
+    const coarsePresence = coarsePresenceBands(detailVisibilityMeters, visibilityMeters, {
+      entryWidthMeters: 16,
+      fadeWidthMeters: 8,
+    });
     return Object.freeze({
       kind,
       fullToForest,
       forestToAtmospheric,
-      atmosphericFade: Object.freeze({
-        minimum: q6(fadeStart),
-        maximum: q6(visibilityMeters),
-      }),
+      atmosphericFade: coarsePresence.fade,
+      coarsePresenceEntry: coarsePresence.entry,
+      coarsePresenceFade: coarsePresence.fade,
+      coarsePresenceFogStartMeters: coarsePresence.fogStartMeters,
       detailVisibilityMeters,
       visibilityMeters,
       forestScale: 1,

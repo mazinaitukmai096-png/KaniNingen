@@ -202,14 +202,6 @@ test('Natural visibility contract separates detail reach from shared World prese
         assert.equal(contract.byKind[kind].envelopeDistanceMeters, values.world);
         assert.equal(policy.visibilityMeters, values.world);
         assert.equal(contract.byKind[kind].horizonDistanceMeters, null);
-      } else if (kind === W8_VEGETATION_LOD_KINDS.BUSH) {
-        assert.equal(policy.detailVisibilityMeters, exactDistanceMeters);
-        assert.equal(policy.visibilityMeters, exactDistanceMeters);
-        assert.equal(contract.byKind[kind].envelopeDistanceMeters, exactDistanceMeters);
-        assert.equal(contract.byKind[kind].horizonDistanceMeters, exactDistanceMeters);
-        assert.equal(policy.coarsePresenceEntry, undefined);
-        assert.equal(policy.coarsePresenceFade, undefined);
-        assert.equal(policy.coarsePresenceFogStartMeters, undefined);
       } else {
         assert.equal(contract.byKind[kind].envelopeDistanceMeters, values.world);
         assert.equal(policy.visibilityMeters, values.world);
@@ -226,8 +218,13 @@ test('Natural visibility contract separates detail reach from shared World prese
     }
   }
 
-  assert.deepEqual(resolveW8VegetationLodPolicy('bush', 'current').atmosphericFade,
-    { minimum: 116, maximum: 140 });
+  // Bush now holds solid to a thin fade at the boundary, like Rock: detail reach is still
+  // 140 m, but presence continues to the world edge instead of stopping where the player
+  // can walk up to it.
+  assert.deepEqual(resolveW8VegetationLodPolicy('bush', 'current').coarsePresenceEntry,
+    { minimum: 132, maximum: 148 });
+  assert.deepEqual(resolveW8VegetationLodPolicy('bush', 'current').coarsePresenceFade,
+    { minimum: 292, maximum: 300 });
   assert.deepEqual(resolveW8VegetationLodPolicy('grass', 'current').coarsePresenceEntry,
     { minimum: 94, maximum: 106 });
   assert.deepEqual(resolveW8VegetationLodPolicy('rock', 'current').coarsePresenceEntry,

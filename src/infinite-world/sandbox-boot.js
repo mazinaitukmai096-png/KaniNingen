@@ -853,9 +853,17 @@ function directCanonicalTreeOwnerView(batch, boundary, worldSeedHash) {
   }
   const trees = batch.trees.slice(treeOffset, treeOffset + treeCount);
   const rocks = presence.rocks.slice(rockOffset, rockOffset + rockCount);
-  const natural = [...trees, ...rocks]
+  // Shrubs travel beside Macro Natural presence rather than inside it, and are selected by
+  // ownership rather than by a boundary slice. Both follow from the same rule: the Macro
+  // Natural contract is reserved for Tree and canonical Rock, so Bush must not widen the
+  // boundary shape. Shrub identities are derived by the shared ambient kernel and are an
+  // exact subset of the Full tier's, so publishing them here cannot introduce a record the
+  // near tier will not also produce.
+  const shrubs = (batch.shrubField?.shrubs ?? [])
+    .filter(record => record?.owner === ownerKey);
+  const natural = [...trees, ...rocks, ...shrubs]
     .sort((left, right) => left.stableId.localeCompare(right.stableId));
-  if (natural.some(record => !['tree', 'rock'].includes(record?.objectType)
+  if (natural.some(record => !['tree', 'rock', 'shrub'].includes(record?.objectType)
     || record.owner !== ownerKey || typeof record.stableId !== 'string'
     || (record.objectType === 'rock' && record.coarsePresenceKind !== 'canonical-rock'))) {
     throw new Error(`canonical Natural owner view escaped ${ownerKey}`);

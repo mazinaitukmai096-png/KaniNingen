@@ -8063,9 +8063,18 @@ test('direct 64m canonical Natural batch keeps Tree exclusive while publishing c
   ].filter(record => record.objectType !== 'tree').map(record => record.stableId))].sort();
   assert.ok(ownerNonTreeStableIds.length > 0,
     'the same Macro batch must supply bounded canonical Rock presence to its owner views');
-  assert.equal([...naturalOwnerView.resource.natural, ...rockOwnerView.resource.natural]
-    .some(record => ['grass', 'shrub'].includes(record.objectType)), false,
-  'Macro owner views must not publish Grass or Bush; Bush is Near-only decoration');
+  // Grass stays out of owner views: it is a field, not a set of world objects, and a Grass
+  // identity here would have no Near counterpart to match. Bush is published, because it does
+  // have one - the shared ambient kernel derives presentation Shrub identities from the same
+  // source as the Full tier, so every Shrub here reappears as itself on approach rather than
+  // vanishing. Both records must still carry the ordinary ambient-detail identity.
+  const ownerRecords = [...naturalOwnerView.resource.natural, ...rockOwnerView.resource.natural];
+  assert.equal(ownerRecords.some(record => record.objectType === 'grass'), false,
+    'Macro owner views must not publish Grass: it is a field, not a world object');
+  for (const shrub of ownerRecords.filter(record => record.objectType === 'shrub')) {
+    assert.ok(shrub.stableId.startsWith('wf1:ambient-detail:'),
+      'published Bush must keep the ordinary Full-tier ambient detail identity');
+  }
   const rockTarget = rockOwnerView.resource.natural.find(record => record.objectType === 'rock');
   assert.ok(rockTarget, 'fixture must expose one real canonical Rock');
   assert.equal(rockTarget.coarsePresenceKind, 'canonical-rock');
