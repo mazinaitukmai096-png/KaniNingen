@@ -584,12 +584,18 @@ export function resolveW8CanonicalWorldObject(source) {
   if (cached) return cached;
   const naturalSubtype = ['broadleaf-tree', 'conifer-tree', 'wetland-tree', 'shrub']
     .includes(source.subtype);
+  // A formal candidate carrying neither candidateType nor featureType is inferred to be
+  // Rock, because Rock is the one Natural candidate whose sources predate those fields.
+  // That inference has to stay an inference: a source that does declare itself vegetation
+  // is vegetation whatever its subtype says. Reading the declaration inside the Rock arm
+  // only to ignore it silently turned every subtype-less Shrub into a Rock.
+  const declaredVegetation = source.candidateType === 'vegetation'
+    || source.featureType === 'natural-vegetation';
   if (source.candidateType === 'rock' || source.featureType === 'natural-rock'
-    || (source.candidateId && !naturalSubtype && !source.featureType)) {
+    || (source.candidateId && !declaredVegetation && !naturalSubtype && !source.featureType)) {
     return resolveRock(source);
   }
-  if (source.candidateType === 'vegetation' || source.featureType === 'natural-vegetation'
-    || (source.candidateId && naturalSubtype)) {
+  if (declaredVegetation || (source.candidateId && naturalSubtype)) {
     return resolveNatural(source);
   }
   if (source.featureType === 'settlement-building') return resolveBuilding(source);

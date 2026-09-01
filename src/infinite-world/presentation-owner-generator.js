@@ -390,7 +390,11 @@ export function expandPresentationNaturalRecord(record) {
     : Object.freeze({
       candidateId: record.stableId,
       candidateType: record.objectType === 'rock' ? 'rock' : 'vegetation',
-      subtype: record.subtype,
+      // Ambient Shrubs are authored as World Details, so their canonical record carries a
+      // detailType and no subtype, and compacting one leaves subtype null. Vegetation is
+      // resolved back to Tree or Bush by subtype alone, so expanding without restoring it
+      // turns an ambient Shrub into a Tree. objectType already says which it is.
+      subtype: record.subtype ?? (record.objectType === 'shrub' ? 'shrub' : null),
       variationSeed: record.variationSeed,
       orientationSeed: record.rotationY / (Math.PI * 2),
       worldPosition: position,

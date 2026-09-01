@@ -209,6 +209,41 @@ test('formal and ambient Shrub are pure Near-only decoration while other World D
   }
 });
 
+test('a declared vegetation candidate is never resolved as Rock', () => {
+  // The route the owner-view broker takes. An ambient Shrub is authored as a World Detail,
+  // so its canonical record carries a detailType and no subtype; compacting and expanding
+  // one produces a formal candidate that declares candidateType 'vegetation' and carries
+  // neither a subtype nor a featureType. The Rock arm inferred Rock from the missing
+  // subtype and swallowed the declaration, so every Shrub reaching the renderer this way
+  // arrived as a Rock. The declaration decides; the inference only fills a silence.
+  const declaredWithoutSubtype = Object.freeze({
+    candidateId: 'wf1:ambient-detail:declared-vegetation',
+    candidateType: 'vegetation',
+    subtype: null,
+    variationSeed: null,
+    orientationSeed: 0.125,
+    worldPosition: position,
+    owningChunkCoordinate: owner,
+    metadata: Object.freeze({ candidateRadiusMeters: 0.2, boundsType: 'horizontal-circle' }),
+  });
+  const resolved = resolveW8CanonicalWorldObject(declaredWithoutSubtype);
+
+  assert.notEqual(resolved.objectType, 'rock',
+    'a declared vegetation candidate must not be resolved as Rock');
+  assert.notEqual(resolved.presentation.partSetKey, 'rock');
+  assert.equal(resolved.collision.blocksPlayer, false,
+    'Rock is the only Natural candidate that blocks the player');
+
+  // The same source with a Rock subtype still resolves as Rock, so the fix narrows the
+  // inference rather than disabling it.
+  assert.equal(resolveW8CanonicalWorldObject(Object.freeze({
+    ...declaredWithoutSubtype,
+    candidateId: 'detail-v1:rock:inferred',
+    candidateType: undefined,
+    sizeClass: 'medium',
+  })).objectType, 'rock');
+});
+
 test('future World Detail categories are reserved without generating new objects', () => {
   assert.deepEqual(W8_RESERVED_WORLD_DETAIL_TYPES, [
     'bench', 'trashBin', 'planter', 'vendingMachine', 'parkedCar', 'fence',

@@ -16,6 +16,7 @@ import {
   derivePresentationOwnerCoarseSummary,
   validatePresentationOwnerResource,
 } from '../src/infinite-world/presentation-owner-generator.js';
+import { resolveW8CanonicalCandidateSet } from '../src/infinite-world/render/w8-distant-presentation.js';
 
 const repoRoot = resolve(import.meta.dirname, '..');
 const worldSeedHash = 'sha256:canonical-tree-sandbox-wiring';
@@ -207,6 +208,53 @@ test('direct Tree batch fans out to real per-owner metadata without Presentation
     cacheHitCount: 1,
     cancelledSubscriberCount: 1,
   });
+  assert.equal(broker.dispose(), true);
+});
+
+test('a brokered Shrub reaches the renderer as a Shrub', async () => {
+  // The broker publishes Shrubs beside Macro Natural presence, and the renderer reads an
+  // owner view back through resolveW8CanonicalCandidateSet. An ambient Shrub is authored as
+  // a World Detail, so its compact record carries objectType 'shrub' and no subtype - and
+  // that shape used to expand into a Rock, which is why Bushes never appeared past the Full
+  // residency boundary while phantom Rocks did.
+  const base = createBatch(5, 3);
+  const ownerKey = base.ownerKeys[0];
+  const batch = Object.freeze({
+    ...base,
+    shrubField: Object.freeze({
+      schemaVersion: 'w8-canonical-shrub-field-1',
+      cellSizeMeters: 4,
+      shrubs: Object.freeze([Object.freeze({
+        stableId: `wf1:ambient-detail:shrub:${ownerKey}`,
+        owner: ownerKey,
+        position: Object.freeze([Number(ownerKey.split(',')[0]) * 16 + 8, 3.5,
+          Number(ownerKey.split(',')[1]) * 16 + 8]),
+        objectType: 'shrub',
+        subtype: null,
+        visualKind: 'shrub',
+        dimensions: Object.freeze([0.75, 0.7, 0.75]),
+        rotationY: 1.125,
+        variationSeed: null,
+        densityRank: 0.4,
+        paletteKey: 'shrub:shrub',
+      })]),
+    }),
+  });
+  const broker = createCanonicalTreeOwnerViewBroker({ worldSeedHash, readyCapacity: 32 });
+  assert.equal(broker.publishBatch(batch), 16);
+  const view = await broker.requestOwner({ ownerKey }).promise;
+
+  assert.equal(view.resource.natural.filter(record => record.objectType === 'shrub').length, 1,
+    'the owner view must carry the brokered Shrub');
+
+  const candidates = resolveW8CanonicalCandidateSet(view);
+  assert.deepEqual(candidates.rocks.map(candidate => candidate.stableId), [`rock:${ownerKey}`],
+    'a brokered Shrub must not arrive at the renderer as a Rock');
+  const shrubs = candidates.vegetation.filter(candidate => candidate.objectType === 'shrub');
+  assert.equal(shrubs.length, 1);
+  assert.equal(shrubs[0].stableId, `wf1:ambient-detail:shrub:${ownerKey}`);
+  assert.equal(shrubs[0].presentation.partSetKey, 'shrub');
+  assert.equal(shrubs[0].collision.blocksPlayer, false);
   assert.equal(broker.dispose(), true);
 });
 
