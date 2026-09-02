@@ -110,6 +110,7 @@ import {
 } from './settlement-road-ribbon-geometry.js';
 import { createMacroCoarseWorldPresentation } from './macro-coarse-world-presentation.js';
 import { createW8GrassFieldPresentation } from './w8-grass-field-presentation.js';
+import { createW8ShrubFieldPresentation } from './w8-shrub-field-presentation.js';
 import { createW8DistantResidentPresentation } from './w8-distant-resident-presentation.js';
 
 export {
@@ -1538,6 +1539,7 @@ export async function createW8DistantPresentation({
   let residentPresentation = null;
   let residentPresentationUnavailable = false;
   let grassFieldPresentation = null;
+  let shrubFieldPresentation = null;
   let grassFieldOriginChunkX = null;
   let grassFieldOriginChunkZ = null;
   let persistentDistantPublishedGeneration = null;
@@ -3318,6 +3320,9 @@ export async function createW8DistantPresentation({
     // Distance compensation for the Grass field follows the player; the module itself
     // ignores movement below its own threshold, so this is cheap to call every update.
     grassFieldPresentation?.setViewer(playerLogicalX, playerLogicalZ);
+    // The Bush lane needs the viewer for the opposite reason: it decides which owner Chunks
+    // are Full-resident, and those Bushes are the Near tier's to draw.
+    shrubFieldPresentation?.setViewer(playerLogicalX, playerLogicalZ);
     // Residents need the viewer too: it decides which of them the gameplay tier is
     // already drawing, so the far figure can step aside instead of doubling.
     residentPresentation?.setViewer(playerLogicalX, playerLogicalZ);
@@ -9888,6 +9893,10 @@ export async function createW8DistantPresentation({
   };
 
   let grassFieldPresentationUnavailable = false;
+  let shrubFieldPresentationUnavailable = false;
+  // Counted from the generator's own per-cell diagnostics rather than from the lane, so the
+  // two sides of "did every generated Bush reach the renderer" are counted independently.
+  let directCanonicalTreeShrubGeneratedCount = 0;
   const ensureResidentPresentation = () => {
     if (!residentPresentation && !residentPresentationUnavailable) {
       residentPresentation = createW8DistantResidentPresentation({ THREE, root: persistentDistantRoot });
@@ -9906,12 +9915,26 @@ export async function createW8DistantPresentation({
     return grassFieldPresentation;
   };
 
+  const ensureShrubFieldPresentation = () => {
+    if (!shrubFieldPresentation && !shrubFieldPresentationUnavailable) {
+      shrubFieldPresentation = createW8ShrubFieldPresentation({
+        THREE, root: persistentDistantRoot,
+      });
+      // The build origin is deliberately left alone here: syncGrassFieldRoot uses it to
+      // detect an origin change it still owes the Grass field a restage for, and adopting
+      // the current origin on this path would swallow that.
+      shrubFieldPresentationUnavailable = shrubFieldPresentation === null;
+    }
+    return shrubFieldPresentation;
+  };
+
   // Cluster matrices are baked against the build origin of the root they hang under, so a
   // root or origin change has to restage every cell. The batches are already retained in
   // directCanonicalTreeCells, so this needs no regeneration.
   const syncGrassFieldRoot = () => {
-    if (!grassFieldPresentation) return;
-    grassFieldPresentation.setRoot(persistentDistantRoot);
+    if (!grassFieldPresentation && !shrubFieldPresentation) return;
+    grassFieldPresentation?.setRoot(persistentDistantRoot);
+    shrubFieldPresentation?.setRoot(persistentDistantRoot);
     residentPresentation?.setRoot(persistentDistantRoot);
     const originX = persistentDistantPublishedGeneration?.buildOriginChunkX ?? null;
     const originZ = persistentDistantPublishedGeneration?.buildOriginChunkZ ?? null;
@@ -9919,10 +9942,16 @@ export async function createW8DistantPresentation({
     grassFieldOriginChunkX = originX;
     grassFieldOriginChunkZ = originZ;
     for (const [cellKey, batch] of directCanonicalTreeCells) {
-      if (!batch?.grassField) continue;
-      grassFieldPresentation.stage(cellKey, batch.grassField, {
-        buildOriginChunkX: originX, buildOriginChunkZ: originZ,
-      });
+      if (batch?.grassField) {
+        grassFieldPresentation?.stage(cellKey, batch.grassField, {
+          buildOriginChunkX: originX, buildOriginChunkZ: originZ,
+        });
+      }
+      if (batch?.shrubField) {
+        shrubFieldPresentation?.stage(cellKey, batch.shrubField, {
+          buildOriginChunkX: originX, buildOriginChunkZ: originZ,
+        });
+      }
     }
   };
 
@@ -9930,6 +9959,9 @@ export async function createW8DistantPresentation({
     if (!directCanonicalTreeSupply || batch?.schemaVersion !== W8_CANONICAL_TREE_CELL_SCHEMA) {
       return false;
     }
+    // Restaging the same cell must not count its Bushes twice.
+    directCanonicalTreeShrubGeneratedCount -=
+      directCanonicalTreeCells.get(batch.key)?.diagnostics?.shrubCount ?? 0;
     directCanonicalTreeCells.set(batch.key, batch);
     if (batch.residents?.length) {
       const presentation = ensureResidentPresentation();
@@ -9947,6 +9979,15 @@ export async function createW8DistantPresentation({
         buildOriginChunkZ: grassFieldOriginChunkZ,
       });
     }
+    directCanonicalTreeShrubGeneratedCount += batch.diagnostics?.shrubCount ?? 0;
+    if (batch.shrubField?.shrubs?.length) {
+      const presentation = ensureShrubFieldPresentation();
+      syncGrassFieldRoot();
+      presentation?.stage(batch.key, batch.shrubField, {
+        buildOriginChunkX: grassFieldOriginChunkX,
+        buildOriginChunkZ: grassFieldOriginChunkZ,
+      });
+    }
     for (const ownerKey of batch.ownerKeys) directCanonicalTreeOwnerKeys.add(ownerKey);
     return !persistentTreeGeneration || enqueueDirectCanonicalTreeBatch(batch);
   };
@@ -9955,7 +9996,9 @@ export async function createW8DistantPresentation({
     const batch = directCanonicalTreeCells.get(key);
     if (!batch) return false;
     directCanonicalTreeCells.delete(key);
+    directCanonicalTreeShrubGeneratedCount -= batch.diagnostics?.shrubCount ?? 0;
     grassFieldPresentation?.retire(key);
+    shrubFieldPresentation?.retire(key);
     residentPresentation?.retire(key);
     for (const ownerKey of batch.ownerKeys) directCanonicalTreeOwnerKeys.delete(ownerKey);
     const pageKey = `${DIRECT_CANONICAL_TREE_PAGE_PREFIX}${key}`;
@@ -15941,6 +15984,8 @@ export async function createW8DistantPresentation({
         roadPriorityRemovalCount,
         roadPriorityDeferredRemovalCount,
         grassField: grassFieldPresentation?.snapshot() ?? null,
+        shrubField: shrubFieldPresentation?.snapshot() ?? null,
+        shrubGeneratedCount: directCanonicalTreeShrubGeneratedCount,
         distantResidents: residentPresentation?.snapshot() ?? null,
         roadPriorityPublishedEpoch: publishedRoadGeneration?.epoch ?? null,
         runtimePresentationHandoffPending: pendingRuntimePresentationHandoff !== null,
@@ -16549,6 +16594,18 @@ export async function createW8DistantPresentation({
     grassFieldSnapshot() {
       return grassFieldPresentation?.snapshot() ?? null;
     },
+    shrubFieldSnapshot() {
+      const snapshot = shrubFieldPresentation?.snapshot() ?? null;
+      return snapshot === null ? null : Object.freeze({
+        ...snapshot,
+        // The generator's count of the Bushes in the retained cells, held against the lane's
+        // count of the Bushes it staged from them. Equal means nothing was lost on the way.
+        generatedCount: directCanonicalTreeShrubGeneratedCount,
+      });
+    },
+    shrubFieldDrawnStableIds() {
+      return shrubFieldPresentation?.drawnStableIds() ?? Object.freeze([]);
+    },
     markFirstDraw(receipt) {
       if (!isCompletedRenderFrameReceipt(receipt)) return 0;
       const firstDrawAtMs = receipt.completedAtMs;
@@ -16707,6 +16764,8 @@ export async function createW8DistantPresentation({
       residentPresentation = null;
       grassFieldPresentation?.dispose();
       grassFieldPresentation = null;
+      shrubFieldPresentation?.dispose();
+      shrubFieldPresentation = null;
       persistentDistantRoot = null;
       persistentDistantPublishedGeneration = null;
       pendingDistantFirstDraw = null;

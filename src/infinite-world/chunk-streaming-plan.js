@@ -38,6 +38,24 @@ export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS =
 // 128 m already meant 241 resident chunks against 145 here.
 export const FULL_RESIDENT_RADIUS_METERS = 100;
 
+/**
+ * Whether an owner Chunk lies inside Full residency for a player standing in
+ * `centerChunkX,centerChunkZ`. Full residency is the only tier that authors ambient
+ * Grass/Bush details, so this predicate is also the boundary between the tier that draws
+ * those details and the tier that carries them onward - both sides read it here rather than
+ * approximating it with a radius of their own, which is what keeps the handoff free of both
+ * gaps and overlaps.
+ */
+export function isFullResidentOwnerChunk(chunkX, chunkZ, centerChunkX, centerChunkZ) {
+  if (![chunkX, chunkZ, centerChunkX, centerChunkZ].every(Number.isSafeInteger)) {
+    throw new TypeError('Full residency membership requires safe Chunk coordinates');
+  }
+  const centerX = centerChunkX * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2;
+  const centerZ = centerChunkZ * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2;
+  return Math.sqrt(chunkAabbDistanceSquared(chunkX, chunkZ, centerX, centerZ))
+    <= FULL_RESIDENT_RADIUS_METERS;
+}
+
 export function resolvePresentationResidentRadiusMeters(
   renderDistancePreset = W8_DEFAULT_RENDER_DISTANCE_PRESET,
 ) {

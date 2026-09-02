@@ -8057,12 +8057,16 @@ test('direct 64m canonical Natural batch keeps Tree exclusive while publishing c
   const rockBoundary = batch.ownerBoundaries.find(boundary => boundary.rockCount > 0);
   assert.ok(rockBoundary, 'real canonical batch fixture must contain one sparse canonical Rock');
   const rockOwnerView = await ownerBroker.requestOwner({ ownerKey: rockBoundary.ownerKey }).promise;
-  const ownerNonTreeStableIds = [...new Set([
+  const ownerRecordsByType = objectType => [...new Set([
     ...naturalOwnerView.resource.natural,
     ...rockOwnerView.resource.natural,
-  ].filter(record => record.objectType !== 'tree').map(record => record.stableId))].sort();
-  assert.ok(ownerNonTreeStableIds.length > 0,
+  ].filter(record => record.objectType === objectType).map(record => record.stableId))].sort();
+  const ownerRockStableIds = ownerRecordsByType('rock');
+  const ownerShrubStableIds = ownerRecordsByType('shrub');
+  assert.ok(ownerRockStableIds.length > 0,
     'the same Macro batch must supply bounded canonical Rock presence to its owner views');
+  assert.ok(ownerShrubStableIds.length > 0,
+    'the fixture must carry Bush through the owner views, so its exclusion below is real');
   // Grass stays out of owner views: it is a field, not a set of world objects, and a Grass
   // identity here would have no Near counterpart to match. Bush is published, because it does
   // have one - the shared ambient kernel derives presentation Shrub identities from the same
@@ -8162,8 +8166,15 @@ test('direct 64m canonical Natural batch keeps Tree exclusive while publishing c
     presentation.update(playerLogicalX, playerLogicalZ, renderOrigin);
     await new Promise(resolve => setImmediate(resolve));
     const snapshot = presentation.snapshot();
+    // Waiting on the Tree owners alone read the audit before the Rock owner view had been
+    // published, so the Rock assertions below saw an arbitrary prefix of the batch and the
+    // count moved with anything that changed how much else was in flight. Wait for the Rock
+    // records this test actually asserts on.
+    const published = new Set(presentation.canonicalAuditSnapshot()
+      .map(value => value.identity.stableId));
     if (snapshot.macroCoarseWorld.canonicalTreeResidentCellCount === 1
-      && snapshot.staticTreeCurrentPublishedOwnerCount === 16) break;
+      && snapshot.staticTreeCurrentPublishedOwnerCount === 16
+      && ownerRockStableIds.every(stableId => published.has(stableId))) break;
   }
   let snapshot = presentation.snapshot();
   assert.equal(targetRequestCount, 1, 'one Macro cell is one logical Tree-only request');
@@ -8177,10 +8188,18 @@ test('direct 64m canonical Natural batch keeps Tree exclusive while publishing c
   let audit = Object.fromEntries(presentation.canonicalAuditSnapshot().map(value => (
     [value.identity.stableId, value]
   )));
-  assert.equal(Object.keys(audit).length, batch.trees.length + ownerNonTreeStableIds.length);
-  for (const stableId of ownerNonTreeStableIds) {
+  assert.equal(Object.keys(audit).length, batch.trees.length + ownerRockStableIds.length);
+  for (const stableId of ownerRockStableIds) {
     assert.ok(audit[stableId], 'owner-view canonical Rock presence must reach the renderer');
     assert.equal(audit[stableId].naturalLod.kind, 'rock');
+  }
+  // Bush travels through the owner views but must reach the canonical audit as nothing at
+  // all. Checking only that no audit entry is *labelled* bush was not enough: a Bush that
+  // resolved to the wrong type satisfied that while still being published, which is exactly
+  // how Bushes reached the renderer disguised as Rocks. Their Stable IDs must be absent.
+  for (const stableId of ownerShrubStableIds) {
+    assert.equal(audit[stableId], undefined,
+      'Distant/Macro presentation must publish no record for a Bush, under any type');
   }
   assert.equal(presentation.canonicalAuditSnapshot().some(value => (
     value.naturalLod?.kind === 'bush'
