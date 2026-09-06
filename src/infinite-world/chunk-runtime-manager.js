@@ -1,4 +1,5 @@
 import {
+  RENDER_BLOCK_CHUNK_RADIUS,
   assertLogicalChunkCoordinate,
   createChunkKey,
   squareChunkCoordinates,
@@ -727,7 +728,7 @@ export class ChunkRuntimeManager {
   #presentationSlidingVisibleCoordinates(plan) {
     const centerChunkX = plan.input.visibleCenterChunkX;
     const centerChunkZ = plan.input.visibleCenterChunkZ;
-    const coordinates = [...squareChunkCoordinates(centerChunkX, centerChunkZ, 1)]
+    const coordinates = [...squareChunkCoordinates(centerChunkX, centerChunkZ, RENDER_BLOCK_CHUNK_RADIUS)]
       .sort((left, right) => {
         const leftDistance = (left.chunkX - centerChunkX) ** 2
           + (left.chunkZ - centerChunkZ) ** 2;
@@ -1552,7 +1553,7 @@ export class ChunkRuntimeManager {
       priorityIndex,
       arrivalSeconds,
       dataCoordinates: dataCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 2),
-      renderCoordinates: renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1),
+      renderCoordinates: renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, RENDER_BLOCK_CHUNK_RADIUS),
       state: 'waiting',
       promise: null,
       presentationGeneration: null,
@@ -2528,7 +2529,7 @@ export class ChunkRuntimeManager {
       chunkZ,
       fromCenterKey,
       dataCoordinates: squareChunkCoordinates(chunkX, chunkZ, 2),
-      renderCoordinates: squareChunkCoordinates(chunkX, chunkZ, 1),
+      renderCoordinates: squareChunkCoordinates(chunkX, chunkZ, RENDER_BLOCK_CHUNK_RADIUS),
       projectedByKey: new Map(),
       required: false,
       ready: false,
@@ -3032,7 +3033,7 @@ export class ChunkRuntimeManager {
     const epoch = ++this.transitionEpoch;
     this.chunkDataService.cancelConsumer({ consumerId: 'runtime-transition', beforeEpoch: epoch });
     const targetKey = createChunkKey(chunkX, chunkZ);
-    const renderKeys = new Set(squareChunkCoordinates(chunkX, chunkZ, 1).map(coordinate => coordinate.key));
+    const renderKeys = new Set(squareChunkCoordinates(chunkX, chunkZ, RENDER_BLOCK_CHUNK_RADIUS).map(coordinate => coordinate.key));
     const schedulerRequired = this.#compatibilityTransitionGenerationRequired(targetKey, required);
     const generated = await Promise.all(missing.map(async coordinate => {
       const chunkData = await this.#requestChunkData(coordinate, {
@@ -3117,7 +3118,7 @@ export class ChunkRuntimeManager {
         priorityIndex: -1,
         arrivalSeconds: 0,
         dataCoordinates: prepared?.dataCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 2),
-        renderCoordinates: prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1),
+        renderCoordinates: prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, RENDER_BLOCK_CHUNK_RADIUS),
         required,
       });
     }
@@ -3311,7 +3312,7 @@ export class ChunkRuntimeManager {
     });
     const desiredDataCoordinates = prepared?.dataCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 2);
     const desiredDataKeys = new Set(desiredDataCoordinates.map(coordinate => coordinate.key));
-    const desiredRenderCoordinates = prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, 1);
+    const desiredRenderCoordinates = prepared?.renderCoordinates ?? squareChunkCoordinates(chunkX, chunkZ, RENDER_BLOCK_CHUNK_RADIUS);
     const desiredRenderKeys = new Set(desiredRenderCoordinates.map(coordinate => coordinate.key));
     if (!prepared) await this.#materializeMissingData(
       desiredDataCoordinates,

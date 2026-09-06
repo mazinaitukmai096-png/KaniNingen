@@ -1,5 +1,6 @@
 import {
   LOGICAL_CHUNK_SIZE_METERS,
+  RENDER_BLOCK_CHUNK_RADIUS,
   createChunkKey,
   logicalWorldToOwnedChunk,
   squareChunkCoordinates,
@@ -39,21 +40,23 @@ export const RESIDENT_WORLD_MAXIMUM_VISIBLE_RADIUS_METERS =
 export const FULL_RESIDENT_RADIUS_METERS = 100;
 
 /**
- * Whether an owner Chunk lies inside Full residency for a player standing in
- * `centerChunkX,centerChunkZ`. Full residency is the only tier that authors ambient
- * Grass/Bush details, so this predicate is also the boundary between the tier that draws
- * those details and the tier that carries them onward - both sides read it here rather than
- * approximating it with a radius of their own, which is what keeps the handoff free of both
- * gaps and overlaps.
+ * Whether an owner Chunk is inside the render block for a player standing in
+ * `centerChunkX,centerChunkZ` - that is, whether the renderer is projecting that Chunk and
+ * so drawing the ambient details it carries.
+ *
+ * This is deliberately the *render* set and not Full residency. Full residency is the tier
+ * that authors ambient Grass and Bush, and reading it as the boundary of what gets drawn is
+ * a mistake that costs whole objects: the two differ by roughly 145 Chunks against 9, and
+ * every ambient detail in between belongs to a tier that generates it and a renderer that
+ * never projects it. Anything handing work to the near tier must ask this question, whose
+ * answer is exactly membership of squareChunkCoordinates(center, RENDER_BLOCK_CHUNK_RADIUS).
  */
-export function isFullResidentOwnerChunk(chunkX, chunkZ, centerChunkX, centerChunkZ) {
+export function isRenderedOwnerChunk(chunkX, chunkZ, centerChunkX, centerChunkZ) {
   if (![chunkX, chunkZ, centerChunkX, centerChunkZ].every(Number.isSafeInteger)) {
-    throw new TypeError('Full residency membership requires safe Chunk coordinates');
+    throw new TypeError('render block membership requires safe Chunk coordinates');
   }
-  const centerX = centerChunkX * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2;
-  const centerZ = centerChunkZ * LOGICAL_CHUNK_SIZE_METERS + LOGICAL_CHUNK_SIZE_METERS / 2;
-  return Math.sqrt(chunkAabbDistanceSquared(chunkX, chunkZ, centerX, centerZ))
-    <= FULL_RESIDENT_RADIUS_METERS;
+  return Math.abs(chunkX - centerChunkX) <= RENDER_BLOCK_CHUNK_RADIUS
+    && Math.abs(chunkZ - centerChunkZ) <= RENDER_BLOCK_CHUNK_RADIUS;
 }
 
 export function resolvePresentationResidentRadiusMeters(

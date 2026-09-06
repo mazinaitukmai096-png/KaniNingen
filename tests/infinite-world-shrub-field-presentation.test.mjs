@@ -1,17 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 
 import {
   W8_SHRUB_FIELD_DISTANCE_BANDS_METERS,
   W8_SHRUB_FIELD_PRESENTATION_SCHEMA,
   createW8ShrubFieldPresentation,
 } from '../src/infinite-world/render/w8-shrub-field-presentation.js';
+import { isRenderedOwnerChunk } from '../src/infinite-world/chunk-streaming-plan.js';
 import {
-  FULL_RESIDENT_RADIUS_METERS,
-  createResidentWorldCoverage,
-  isFullResidentOwnerChunk,
-} from '../src/infinite-world/chunk-streaming-plan.js';
-import { LOGICAL_CHUNK_SIZE_METERS, UNITS_PER_METER } from '../src/infinite-world/chunk-coordinates.js';
+  LOGICAL_CHUNK_SIZE_METERS,
+  RENDER_BLOCK_CHUNK_RADIUS,
+  UNITS_PER_METER,
+  squareChunkCoordinates,
+} from '../src/infinite-world/chunk-coordinates.js';
 import { W8_PARITY_FEATURE_PARTS } from '../src/infinite-world/render/w8-parity-visual-assets.js';
 
 // A THREE stand-in that composes matrices for real, so the instance transforms this lane
@@ -164,24 +167,39 @@ const shrubField = shrubs => Object.freeze({
   shrubs: Object.freeze(shrubs),
 });
 
-test('the Full residency predicate is exactly the Full residency view', () => {
-  // The Bush handoff is only free of gaps and overlaps because both sides read one rule.
-  // This is that rule held against the view it has to agree with.
+test('the handoff predicate is exactly the render block', () => {
+  // The Bush handoff is only free of gaps and overlaps because both sides read one rule, and
+  // it must be the rule for what the renderer *draws*. Reading the tier that merely authors
+  // ambient details instead left 746 Bushes drawn by nobody, so this holds the predicate
+  // against the very coordinate set the renderer projects.
   for (const [centerChunkX, centerChunkZ] of [[0, 0], [7, -13], [-40, 25]]) {
-    const coverage = createResidentWorldCoverage({ centerChunkX, centerChunkZ });
-    const fullOwnerKeys = new Set(coverage.fullView.ownerKeys);
-    assert.ok(fullOwnerKeys.size > 0);
-    const span = Math.ceil(FULL_RESIDENT_RADIUS_METERS / LOGICAL_CHUNK_SIZE_METERS) + 2;
+    const rendered = new Set(squareChunkCoordinates(
+      centerChunkX, centerChunkZ, RENDER_BLOCK_CHUNK_RADIUS,
+    ).map(value => value.key));
+    assert.equal(rendered.size, (RENDER_BLOCK_CHUNK_RADIUS * 2 + 1) ** 2);
+    const span = RENDER_BLOCK_CHUNK_RADIUS + 3;
     for (let chunkZ = centerChunkZ - span; chunkZ <= centerChunkZ + span; chunkZ += 1) {
       for (let chunkX = centerChunkX - span; chunkX <= centerChunkX + span; chunkX += 1) {
         assert.equal(
-          isFullResidentOwnerChunk(chunkX, chunkZ, centerChunkX, centerChunkZ),
-          fullOwnerKeys.has(`${chunkX},${chunkZ}`),
+          isRenderedOwnerChunk(chunkX, chunkZ, centerChunkX, centerChunkZ),
+          rendered.has(`${chunkX},${chunkZ}`),
           `${chunkX},${chunkZ} around ${centerChunkX},${centerChunkZ}`,
         );
       }
     }
   }
+});
+
+test('the render block the handoff reads is the one the runtime projects', () => {
+  // The predicate and the renderer's own coordinate set must stay one definition; a second
+  // radius written down anywhere else is how the two sides drift apart again.
+  const runtime = readFileSync(
+    resolve(import.meta.dirname, '..', 'src/infinite-world/chunk-runtime-manager.js'), 'utf8',
+  );
+  assert.match(runtime, /squareChunkCoordinates([^)]*RENDER_BLOCK_CHUNK_RADIUS)/,
+    'the runtime must build its render set from the shared radius');
+  assert.equal(/squareChunkCoordinates((?:chunkX|centerChunkX), (?:chunkZ|centerChunkZ), 1)/
+    .test(runtime), false, 'no render set may restate the radius as a literal');
 });
 
 test('a Bush this lane draws carries the Near tier\'s own transform', () => {
@@ -230,11 +248,13 @@ test('Bushes the Near tier owns are never drawn twice', () => {
   });
   presentation.setViewer(0, 0);
 
-  assert.equal(isFullResidentOwnerChunk(0, 0, 0, 0), true);
-  assert.equal(isFullResidentOwnerChunk(40, 0, 0, 0), false);
+  // Viewer (0, 0) owns Chunk -1,-1, so Chunk 0,0 is inside its render block and Chunk 40,0
+  // is far outside it.
+  assert.equal(isRenderedOwnerChunk(0, 0, -1, -1), true);
+  assert.equal(isRenderedOwnerChunk(40, 0, -1, -1), false);
   const mesh = root.children[0];
   // The handed-over Bush collapses to nothing in place: instance order stays stable, so
-  // walking back out of Full residency brings it back without a rebuild.
+  // walking back out of the render block brings it back without a rebuild.
   assert.equal(Math.hypot(mesh.matrices[0][0], mesh.matrices[0][1], mesh.matrices[0][2]), 0);
   assert.ok(Math.hypot(mesh.matrices[1][0], mesh.matrices[1][1], mesh.matrices[1][2]) > 0);
   assert.deepEqual(presentation.drawnStableIds(), [far.stableId]);

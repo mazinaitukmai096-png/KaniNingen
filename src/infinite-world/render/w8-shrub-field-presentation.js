@@ -3,12 +3,12 @@ import {
   UNITS_PER_METER,
   logicalWorldToOwnedChunk,
 } from '../chunk-coordinates.js';
-import { isFullResidentOwnerChunk } from '../chunk-streaming-plan.js';
+import { isRenderedOwnerChunk } from '../chunk-streaming-plan.js';
 import { W8_WORLD_DETAIL_CONTRACTS } from '../gameplay-contract.js';
 import { W8_PARITY_FEATURE_PARTS } from './w8-parity-visual-assets.js';
 
 /**
- * Bush presentation past the Full residency boundary.
+ * Bush presentation past the render block.
  *
  * Ambient Bush is authored only by Full residency, pinned at 100 m by worker throughput, so
  * the ground beyond that carried no Bush at all while the Trees and Buildings among them
@@ -27,10 +27,16 @@ import { W8_PARITY_FEATURE_PARTS } from './w8-parity-visual-assets.js';
  * come from the shared ambient kernel that Full residency uses, so a Bush drawn here is the
  * same Bush the Near tier draws, from the same numbers.
  *
- * Handoff is by owner Chunk against the Full residency boundary itself, the single rule that
- * decides who authors a Bush at all. The Near tier draws exactly the Bushes of the Chunks
- * inside that boundary, this lane draws exactly the rest, and neither a gap nor an overlap
- * can open between them because both sides read one predicate.
+ * Handoff is by owner Chunk against the render block - the 3x3 Chunks the renderer actually
+ * projects, and therefore the only Chunks whose ambient Bushes the near tier draws. This lane
+ * draws every other Bush.
+ *
+ * It was first written against the Full residency boundary instead, on the reasoning that
+ * Full residency is the only tier that authors ambient Bush. It is - but authoring and
+ * drawing are different tiers, and the gap between them is not small: 145 Chunks against 9.
+ * Measured in the running game, that handed 794 Bushes to a near tier drawing 48 of them, so
+ * 746 were suppressed here and drawn by nobody, in a ring that moved with the player. Which
+ * tier draws an object is the only question a draw handoff may ask.
  *
  * Frame budget, deliberately split, and the two halves go opposite ways:
  *
@@ -43,7 +49,9 @@ import { W8_PARITY_FEATURE_PARTS } from './w8-parity-visual-assets.js';
  *   the old boundary and half on the new - reintroducing exactly the double draw and the gap
  *   the handoff exists to prevent. It is self-limited instead: only a Chunk crossing can move
  *   the boundary, so it runs at most once per 16 m of travel and rewrites matrices in place
- *   rather than rebuilding meshes.
+ *   rather than rebuilding meshes. It is not cheap at world scale - see the measured cost in
+ *   the snapshot rather than assuming, and note that an early reading taken before the world
+ *   had filled was wrong by more than an order of magnitude.
  *
  * Unbudgeted work is easy to lose track of, so the refresh times itself and reports its last
  * and worst cost in the snapshot: it does not compete for a slice, but it is not invisible.
@@ -54,10 +62,11 @@ export const W8_SHRUB_FIELD_PRESENTATION_SCHEMA = 'w8-shrub-field-presentation-1
 /**
  * Distance bands the snapshot reports instances in, so the drawn population can be reconciled
  * against the generated one by count rather than by looking at it - a judgement that has twice
- * called Bush present at the horizon when it was Trees. 100 m is the Full residency boundary
- * this lane hands off at; 368 m is the Grass field's distance-compensation reach, so the two
- * ground layers are reported against the same outer bound. Instances past the last band are
- * counted separately rather than folded into it.
+ * called Bush present at the horizon when it was Trees. These are reporting bands only: the
+ * handoff happens at the render block, a few tens of metres in, not at any of these radii.
+ * 100 m is where ambient authoring stops and 368 m is the Grass field's distance-compensation
+ * reach, so the two ground layers are reported against the same outer bound. Instances past
+ * the last band are counted separately rather than folded into it.
  */
 export const W8_SHRUB_FIELD_DISTANCE_BANDS_METERS = Object.freeze([100, 200, 368]);
 
@@ -195,13 +204,13 @@ export function createW8ShrubFieldPresentation({
   const translation = new THREE.Vector3();
   const scale = new THREE.Vector3();
 
-  // The Near tier draws the Bushes of every Full-resident Chunk, so this lane draws none of
-  // them. One predicate, read by both sides, is what makes that exhaustive and exclusive
-  // rather than approximately aligned.
+  // The near tier draws the ambient Bushes of the Chunks it projects, so this lane draws none
+  // of those and all of the rest. The predicate is the render block's own membership test, so
+  // the two sides cannot answer the question differently.
   const isNearDrawn = ownerKey => {
     if (viewerOwnerChunk === null) return false;
     const owner = parseOwnerChunk(ownerKey);
-    return owner !== null && isFullResidentOwnerChunk(
+    return owner !== null && isRenderedOwnerChunk(
       owner.chunkX, owner.chunkZ, viewerOwnerChunk.chunkX, viewerOwnerChunk.chunkZ,
     );
   };

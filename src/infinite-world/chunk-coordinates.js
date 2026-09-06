@@ -116,6 +116,14 @@ export function logicalWorldToRenderLocal(
   });
 }
 
+/**
+ * Chebyshev radius of the render block: the 3x3 Chunks the renderer actually projects, as
+ * opposed to the wider set whose data is resident. Named here because more than one layer
+ * has to agree on it - anything deciding what is drawn must read this rather than restate a
+ * radius of its own.
+ */
+export const RENDER_BLOCK_CHUNK_RADIUS = 1;
+
 export function squareChunkCoordinates(centerChunkX, centerChunkZ, radius) {
   const centerX = assertLogicalChunkCoordinate(centerChunkX, 'centerChunkX');
   const centerZ = assertLogicalChunkCoordinate(centerChunkZ, 'centerChunkZ');
