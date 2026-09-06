@@ -5956,18 +5956,27 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
               hitch: latestFrameDurationMs > 50,
             }), null);
         }
-        const visualFrameToken = renderFrameAcknowledger.beginFrame({
-          frameSequence: ++completedRenderFrameSequence,
-          scene,
-        });
+        // Measurement points only: 'render' wraps three whole-scene passes besides the draw
+        // itself, and attributing its cost between them was guesswork without these. Each is
+        // a pass-through when diagnostics are off.
+        const visualFrameToken = diagnostics.measure(
+          'render-mirror-begin',
+          () => renderFrameAcknowledger.beginFrame({
+            frameSequence: ++completedRenderFrameSequence,
+            scene,
+          }),
+        );
         let completedRenderReceipt = null;
         try {
           renderAdapter.beginProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
-          renderer.render(scene, camera);
+          diagnostics.measure('render-draw', () => renderer.render(scene, camera));
           renderAdapter.completeProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
-          completedRenderReceipt = renderFrameAcknowledger.completeFrame(
-            visualFrameToken,
-            { scene, renderer },
+          completedRenderReceipt = diagnostics.measure(
+            'render-mirror-complete',
+            () => renderFrameAcknowledger.completeFrame(
+              visualFrameToken,
+              { scene, renderer },
+            ),
           );
         } catch (error) {
           renderAdapter.abortProjectedOwnerDrawFrame?.(visualFrameToken.frameSequence);
@@ -6003,7 +6012,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
               committedTerrainState.centerChunkX,
               committedTerrainState.centerChunkZ,
             ) ?? null;
-          actualDrawableCount = visualContinuity.acknowledgeScene({
+          actualDrawableCount = diagnostics.measure('render-visual-continuity', () => visualContinuity.acknowledgeScene({
             receipt: completedRenderReceipt,
             scene,
             terrainCoverage: {
@@ -6017,7 +6026,7 @@ Render resources: draw ${renderInfo?.render?.calls ?? 'n/a'}  geometry ${renderI
                 outerBoundaryMeters: actualTerrainCoverage.clipmapExtentMeters,
               } : null,
             },
-          });
+          }));
         } catch (error) {
           // Preserve the previous presenter set. A failed observation must be
           // visible in diagnostics without invalidating an otherwise valid draw.
