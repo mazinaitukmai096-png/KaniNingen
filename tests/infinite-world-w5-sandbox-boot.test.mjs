@@ -403,8 +403,20 @@ class WebGLRenderTarget {
   constructor() { this.texture = {}; }
   dispose() { this.disposed = true; }
 }
-class HemisphereLight extends NodeObject {}
-class DirectionalLight extends NodeObject {}
+// The light rig was previously unverifiable: these dropped their constructor arguments, so
+// any colour or intensity could change without a test noticing.
+class HemisphereLight extends NodeObject {
+  constructor(skyColor, groundColor, intensity) {
+    super();
+    Object.assign(this, { skyColor, groundColor, intensity });
+  }
+}
+class DirectionalLight extends NodeObject {
+  constructor(color, intensity) {
+    super();
+    Object.assign(this, { color, intensity });
+  }
+}
 class Color { constructor(value) { this.value = value; } }
 class Fog {
   static instances = [];
@@ -1579,6 +1591,22 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
     // Natural and remote Settlement silhouettes haze toward W8_RENDER_FOG_COLOR_HEX in their
     // own shaders, and a literal here would let scene fog drift away from them again.
     assert.deepEqual(gameplayFog.values, [W8_RENDER_FOG_COLOR_HEX, 19200, 76800]);
+    // The light rig, asserted as literals on purpose. Fog is asserted through its shared
+    // constant because two shaders must agree with it; these values have exactly one source,
+    // so what needs catching here is the value silently changing. Changing the rig means
+    // changing these numbers too, and docs/infinite-world/ATMOSPHERE.md says why each is
+    // what it is.
+    const hemisphere = gameplayScene.children.find(child => child instanceof HemisphereLight);
+    assert.ok(hemisphere, 'the boot scene must carry a hemisphere light');
+    assert.deepEqual(
+      [hemisphere.skyColor, hemisphere.groundColor, hemisphere.intensity],
+      [0xffcfa0, 0x4a5c2e, 1.0],
+    );
+    const directionals = gameplayScene.children
+      .filter(child => child instanceof DirectionalLight);
+    assert.equal(directionals.length, 2, 'a key light and one fill light');
+    assert.deepEqual([directionals[0].color, directionals[0].intensity], [0xffefa8, 1.35]);
+    assert.deepEqual([directionals[1].color, directionals[1].intensity], [0x9ab8d6, 0.3]);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-cyclic-scene-clouds'), false);
     const cloudRoot = gameplayScene.children.find(
       child => child.name === 'w8-finite-cloud-instance-pool',

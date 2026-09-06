@@ -697,12 +697,24 @@ const W8_ATMOSPHERE = Object.freeze({
   fogColorHex: W8_RENDER_FOG_COLOR_HEX,
   skyZenithCss: '#2f74b4',      // gradient sky — top
   skyMidCss: '#79b0da',         // gradient sky — mid
-  skyHorizonCss: '#d9e7ef',     // gradient sky — horizon haze (matches fog)
+  // Unresolved: this no longer matches the fog it meets. It was written when scene fog was
+  // 0xd7e6ee; fog is now 0x5dade2, which is 124 red away. The seam is currently hidden
+  // because a band of Trees covers the horizon, and it should be expected to show wherever
+  // Trees do not grow - badlands, water, or any view down from height.
+  skyHorizonCss: '#d9e7ef',     // gradient sky — horizon
   fallbackSkyHex: 0x86b9e0,     // flat background when a gradient canvas is unavailable
-  hemiSkyHex: 0xbfd9ef,         // cool skylight fill from above
-  hemiGroundHex: 0x5c4a30,      // warm earth bounce from below
+  // Warm rig, tuned against the finite game rather than copied from it. The finite game
+  // lights with a peach sky (0xffcfa0), an olive earth bounce (0x4a5c2e) and a strongly
+  // yellow sun (0xffeb3b); its colours are what make its ground read yellow-green instead
+  // of saturated green, so the hemisphere colours are taken from it exactly. The sun is not:
+  // warm skylight and a yellow key add up, and at 0xffeb3b the result was too yellow, so the
+  // sun sits between the two rigs. Intensities stay at this world's values - the finite
+  // game's 1.3/1.2 were balanced against its own flat sky and no fill light.
+  // docs/infinite-world/ATMOSPHERE.md records the comparison and why each value was chosen.
+  hemiSkyHex: 0xffcfa0,         // warm skylight from above, as the finite game
+  hemiGroundHex: 0x4a5c2e,      // olive earth bounce from below, as the finite game
   hemiIntensity: 1.0,
-  sunColorHex: 0xfff1cf,        // warm late-afternoon key light
+  sunColorHex: 0xffefa8,        // warm key light, pulled back from the finite game's yellow
   sunIntensity: 1.35,
   fillColorHex: 0x9ab8d6,       // cool rim/fill opposite the sun
   fillIntensity: 0.3,
