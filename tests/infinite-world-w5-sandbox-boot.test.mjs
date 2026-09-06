@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
 
+import { W8_RENDER_FOG_COLOR_HEX } from '../src/infinite-world/render-distance-policy.js';
 import {
   bootInfiniteWorldSandbox,
   classifyRuntimeTransitionFault,
@@ -1574,7 +1575,10 @@ test('browser-equivalent W5 entry resolves every import and completes the real m
       'the boot Camera near plane must derive the active canonical scale profile',
     );
     assert.equal(gameplayCamera.far, 224000);
-    assert.deepEqual(gameplayFog.values, [0xd7e6ee, 19200, 76800]);
+    // The horizon colour is asserted through the shared constant, not a copy of it. Distant
+    // Natural and remote Settlement silhouettes haze toward W8_RENDER_FOG_COLOR_HEX in their
+    // own shaders, and a literal here would let scene fog drift away from them again.
+    assert.deepEqual(gameplayFog.values, [W8_RENDER_FOG_COLOR_HEX, 19200, 76800]);
     assert.equal(gameplayScene.children.some(child => child.name === 'w8-cyclic-scene-clouds'), false);
     const cloudRoot = gameplayScene.children.find(
       child => child.name === 'w8-finite-cloud-instance-pool',

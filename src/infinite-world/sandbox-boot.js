@@ -111,6 +111,7 @@ import {
 import {
   W8_DEFAULT_RENDER_DISTANCE_PRESET,
   W8_RENDER_DISTANCE_PRESETS,
+  W8_RENDER_FOG_COLOR_HEX,
   normalizeW8RenderDistancePreset,
   resolveW8RenderDistancePolicy,
 } from './render-distance-policy.js';
@@ -687,7 +688,13 @@ const resolveViewportSize = (measurementViewport, globalObject) => Object.freeze
 });
 
 const W8_ATMOSPHERE = Object.freeze({
-  fogColorHex: 0xd7e6ee,        // hazy horizon the distant world dissolves into
+  // The horizon colour has to be one value, not a copy. Distant Natural blends toward it in
+  // its own shader at 0.88 strength (w8NaturalFogColor) and remote Settlement silhouettes at
+  // up to 0.96 (settlement-presentation-policy), both reading W8_RENDER_FOG_COLOR_HEX with
+  // scene fog switched off. When this held a separate 0xd7e6ee, the ground and sky hazed to
+  // near-white while the Trees and Buildings standing on them hazed to blue, so distant
+  // silhouettes separated from their own background instead of dissolving into it.
+  fogColorHex: W8_RENDER_FOG_COLOR_HEX,
   skyZenithCss: '#2f74b4',      // gradient sky — top
   skyMidCss: '#79b0da',         // gradient sky — mid
   skyHorizonCss: '#d9e7ef',     // gradient sky — horizon haze (matches fog)
