@@ -1,7 +1,9 @@
 import {
   LOGICAL_CHUNK_SIZE_METERS,
+  RENDER_BLOCK_CHUNK_RADIUS,
   UNITS_PER_METER,
   logicalWorldToOwnedChunk,
+  squareChunkCoordinates,
 } from '../chunk-coordinates.js';
 import { isRenderedOwnerChunk } from '../chunk-streaming-plan.js';
 import { W8_WORLD_DETAIL_CONTRACTS } from '../gameplay-contract.js';
@@ -37,6 +39,16 @@ import { W8_PARITY_FEATURE_PARTS } from './w8-parity-visual-assets.js';
  * Measured in the running game, that handed 794 Bushes to a near tier drawing 48 of them, so
  * 746 were suppressed here and drawn by nobody, in a ring that moved with the player. Which
  * tier draws an object is the only question a draw handoff may ask.
+ *
+ * The handoff is exact in the steady state and briefly inexact across a crossing, because the
+ * near tier projects and retires its Chunks over a few frames while this lane switches on the
+ * frame the viewer's Chunk changes. Measured over 467 frames and 4 crossings: 12 frames
+ * disagreed, all within two frames of a crossing. Eleven were the near tier still holding a
+ * leaving Chunk, which draws those Bushes twice at identical transforms and is invisible. One
+ * was the other way - two Bushes handed over one frame before the entering Chunk was
+ * projected, a real two-instance gap lasting one frame. That is the near tier's projection
+ * latency rather than anything decided here, it predates this lane, and at two instances for
+ * one frame it is left alone deliberately rather than unnoticed.
  *
  * Frame budget, deliberately split, and the two halves go opposite ways:
  *
@@ -185,7 +197,12 @@ export function createW8ShrubFieldPresentation({
   const meshes = new Map();
   const staged = new Map();
   const origins = new Map();
-  const handedOverByCell = new Map();
+  // Which instances belong to each owner Chunk, and which owner Chunks each cell brought.
+  // The handoff is decided per owner Chunk, so this is the index that lets a crossing touch
+  // only the Chunks whose answer changed instead of every staged instance.
+  const instancesByOwner = new Map();
+  const ownersByCell = new Map();
+  let nearOwnerKeys = new Set();
   let currentRoot = root;
   let viewerX = null;
   let viewerZ = null;
@@ -215,47 +232,90 @@ export function createW8ShrubFieldPresentation({
     );
   };
 
+  const writeInstance = (mesh, shrub, index, originX, originZ, nearDrawn) => {
+    translation.set(
+      (shrub.position[0] - originX) * UNITS_PER_METER,
+      shrub.position[1] * UNITS_PER_METER,
+      (shrub.position[2] - originZ) * UNITS_PER_METER,
+    );
+    euler.set(0, shrub.rotationY ?? 0, 0);
+    quaternion.setFromEuler(euler);
+    // A Bush the near tier owns collapses to nothing rather than being removed, so the
+    // instance order stays stable and crossing the boundary back needs no rebuild.
+    scale.set(
+      nearDrawn ? 0 : shrub.dimensions[0],
+      nearDrawn ? 0 : shrub.dimensions[1],
+      nearDrawn ? 0 : shrub.dimensions[2],
+    );
+    matrix.compose(translation, quaternion, scale);
+    mesh.setMatrixAt(index, matrix);
+  };
+
+  const originOf = origin => Object.freeze({
+    x: (origin?.buildOriginChunkX ?? 0) * LOGICAL_CHUNK_SIZE_METERS,
+    z: (origin?.buildOriginChunkZ ?? 0) * LOGICAL_CHUNK_SIZE_METERS,
+  });
+
+  /** Full write, for a cell arriving or being rebased. */
   const writeMatrices = (mesh, shrubs, origin) => {
-    const originX = (origin?.buildOriginChunkX ?? 0) * LOGICAL_CHUNK_SIZE_METERS;
-    const originZ = (origin?.buildOriginChunkZ ?? 0) * LOGICAL_CHUNK_SIZE_METERS;
-    let handedOver = 0;
+    const { x: originX, z: originZ } = originOf(origin);
     for (let index = 0; index < shrubs.length; index += 1) {
       const shrub = shrubs[index];
-      const nearDrawn = isNearDrawn(shrub.owner);
-      if (nearDrawn) handedOver += 1;
-      translation.set(
-        (shrub.position[0] - originX) * UNITS_PER_METER,
-        shrub.position[1] * UNITS_PER_METER,
-        (shrub.position[2] - originZ) * UNITS_PER_METER,
-      );
-      euler.set(0, shrub.rotationY ?? 0, 0);
-      quaternion.setFromEuler(euler);
-      // A Bush the Near tier owns collapses to nothing rather than being removed, so the
-      // instance order stays stable and crossing the boundary back needs no rebuild.
-      scale.set(
-        nearDrawn ? 0 : shrub.dimensions[0],
-        nearDrawn ? 0 : shrub.dimensions[1],
-        nearDrawn ? 0 : shrub.dimensions[2],
-      );
-      matrix.compose(translation, quaternion, scale);
-      mesh.setMatrixAt(index, matrix);
+      writeInstance(mesh, shrub, index, originX, originZ, isNearDrawn(shrub.owner));
     }
     if (mesh.instanceMatrix) mesh.instanceMatrix.needsUpdate = true;
-    return handedOver;
   };
 
-  const restageCell = (cellKey, mesh) => {
-    const handedOver = writeMatrices(mesh, staged.get(cellKey) ?? [], origins.get(cellKey));
-    handedOverCount += handedOver - (handedOverByCell.get(cellKey) ?? 0);
-    handedOverByCell.set(cellKey, handedOver);
+  /**
+   * The handed-over instances are exactly those in the render block's owner Chunks, so the
+   * tally is a sum over nine keys rather than a scan of the staged world.
+   */
+  const recountHandedOver = () => {
+    handedOverCount = 0;
+    for (const ownerKey of nearOwnerKeys) {
+      handedOverCount += instancesByOwner.get(ownerKey)?.length ?? 0;
+    }
   };
 
-  // Only a Chunk crossing can move the boundary, so this runs on a crossing rather than on
-  // a cell arriving or leaving - those keep their own tally instead. It is timed because it
-  // runs outside every frame budget: nothing would otherwise show it growing.
+  /** Rewrites just the instances of one owner Chunk, whose handoff answer has changed. */
+  const applyOwnerState = (ownerKey, nearDrawn, touched) => {
+    const entries = instancesByOwner.get(ownerKey);
+    if (!entries) return;
+    for (const entry of entries) {
+      const mesh = meshes.get(entry.cellKey);
+      const shrubs = staged.get(entry.cellKey);
+      if (!mesh || !shrubs) continue;
+      const { x: originX, z: originZ } = originOf(origins.get(entry.cellKey));
+      writeInstance(mesh, shrubs[entry.index], entry.index, originX, originZ, nearDrawn);
+      touched.add(mesh);
+    }
+  };
+
+  /**
+   * Only a Chunk crossing can move the boundary, and a crossing shifts the render block by
+   * one Chunk: three Chunks leave, three enter, and every other staged instance keeps the
+   * answer it already had. Rewriting all of them cost 15-28 ms at world scale, over a frame;
+   * measured, 34-40 instances of 11,212 actually change side, so this walks the old and new
+   * block instead - a bounded number of owner Chunks whatever the world holds.
+   *
+   * It is still timed: it runs outside every frame budget, and nothing else would show it
+   * growing again.
+   */
   const refreshHandoff = () => {
     const startedAtMs = globalThis.performance?.now?.() ?? Date.now();
-    for (const [cellKey, mesh] of meshes) restageCell(cellKey, mesh);
+    const nextKeys = viewerOwnerChunk === null ? new Set() : new Set(squareChunkCoordinates(
+      viewerOwnerChunk.chunkX, viewerOwnerChunk.chunkZ, RENDER_BLOCK_CHUNK_RADIUS,
+    ).map(value => value.key));
+    const touched = new Set();
+    for (const ownerKey of nearOwnerKeys) {
+      if (!nextKeys.has(ownerKey)) applyOwnerState(ownerKey, false, touched);
+    }
+    for (const ownerKey of nextKeys) {
+      if (!nearOwnerKeys.has(ownerKey)) applyOwnerState(ownerKey, true, touched);
+    }
+    for (const mesh of touched) if (mesh.instanceMatrix) mesh.instanceMatrix.needsUpdate = true;
+    nearOwnerKeys = nextKeys;
+    recountHandedOver();
     lastRefreshMs = (globalThis.performance?.now?.() ?? Date.now()) - startedAtMs;
     maximumRefreshMs = Math.max(maximumRefreshMs, lastRefreshMs);
     refreshCount += 1;
@@ -319,7 +379,17 @@ export function createW8ShrubFieldPresentation({
       meshes.set(cellKey, mesh);
       staged.set(cellKey, shrubs);
       origins.set(cellKey, origin ?? null);
-      restageCell(cellKey, mesh);
+      const owners = new Set();
+      for (let index = 0; index < shrubs.length; index += 1) {
+        const ownerKey = shrubs[index].owner;
+        owners.add(ownerKey);
+        const entries = instancesByOwner.get(ownerKey);
+        if (entries) entries.push({ cellKey, index });
+        else instancesByOwner.set(ownerKey, [{ cellKey, index }]);
+      }
+      ownersByCell.set(cellKey, owners);
+      writeMatrices(mesh, shrubs, origin ?? null);
+      recountHandedOver();
       currentRoot?.add?.(mesh);
       stagedCount += 1;
       return true;
@@ -333,15 +403,21 @@ export function createW8ShrubFieldPresentation({
       meshes.delete(cellKey);
       staged.delete(cellKey);
       origins.delete(cellKey);
-      handedOverCount -= handedOverByCell.get(cellKey) ?? 0;
-      handedOverByCell.delete(cellKey);
+      for (const ownerKey of ownersByCell.get(cellKey) ?? []) {
+        const entries = (instancesByOwner.get(ownerKey) ?? [])
+          .filter(entry => entry.cellKey !== cellKey);
+        if (entries.length === 0) instancesByOwner.delete(ownerKey);
+        else instancesByOwner.set(ownerKey, entries);
+      }
+      ownersByCell.delete(cellKey);
+      recountHandedOver();
       retiredCount += 1;
       return true;
     },
 
     /**
-     * Only the viewer's owner Chunk can move the Full residency boundary, so matrices are
-     * rewritten on a Chunk crossing rather than on every step.
+     * Only the viewer's owner Chunk can move the render block, so the handoff is refreshed on
+     * a Chunk crossing rather than on every step.
      */
     setViewer(x, z) {
       if (!Number.isFinite(x) || !Number.isFinite(z) || disposed) return false;
@@ -405,7 +481,9 @@ export function createW8ShrubFieldPresentation({
       meshes.clear();
       staged.clear();
       origins.clear();
-      handedOverByCell.clear();
+      instancesByOwner.clear();
+      ownersByCell.clear();
+      nearOwnerKeys = new Set();
       handedOverCount = 0;
       geometry.dispose?.();
       material.dispose?.();

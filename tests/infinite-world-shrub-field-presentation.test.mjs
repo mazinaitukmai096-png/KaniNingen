@@ -132,10 +132,14 @@ class InstancedMesh extends Node {
     this.material = material;
     this.count = capacity;
     this.matrices = [];
+    this.writes = 0;
     this.instanceMatrix = { needsUpdate: false };
     this.disposed = false;
   }
-  setMatrixAt(index, matrix) { this.matrices[index] = Float64Array.from(matrix.elements); }
+  setMatrixAt(index, matrix) {
+    this.writes += 1;
+    this.matrices[index] = Float64Array.from(matrix.elements);
+  }
   dispose() { this.disposed = true; }
 }
 const FakeThree = {
@@ -327,6 +331,53 @@ test('the snapshot reports drawn Bushes by distance band', () => {
   assert.deepEqual(snapshot.distanceBands.map(band => band.drawnCount), [0, 1, 1]);
   assert.equal(snapshot.beyondOutermostBandCount, 1,
     'a Bush past the retained Macro window is reported rather than silently counted in');
+  presentation.dispose();
+});
+
+test('a crossing rewrites only the Chunks whose answer changed', () => {
+  // Rewriting every staged instance on each crossing cost 15-28 ms at world scale, over a
+  // frame. A crossing shifts the render block by one Chunk, so only the Chunks entering and
+  // leaving it can change side - measured in the real world, 34-40 instances of 11,212.
+  const presentation = createW8ShrubFieldPresentation({ THREE: FakeThree });
+  const root = new Node();
+  presentation.setRoot(root);
+  const shrubs = [];
+  for (let chunkZ = -6; chunkZ <= 6; chunkZ += 1) {
+    for (let chunkX = -6; chunkX <= 6; chunkX += 1) {
+      for (let n = 0; n < 4; n += 1) {
+        shrubs.push(shrubRecord(chunkX, chunkZ, 2 + n * 3, 2 + n * 3, `:${n}`));
+      }
+    }
+  }
+  presentation.stage('cell', shrubField(shrubs), {
+    buildOriginChunkX: 0, buildOriginChunkZ: 0,
+  });
+  presentation.setViewer(8, 8);
+  const mesh = root.children[0];
+
+  const perChunk = 4;
+  const blockWidth = RENDER_BLOCK_CHUNK_RADIUS * 2 + 1;
+  // One step: blockWidth Chunks leave the block and blockWidth enter it.
+  const changeable = 2 * blockWidth * perChunk;
+  mesh.writes = 0;
+  assert.equal(presentation.setViewer(8 + LOGICAL_CHUNK_SIZE_METERS, 8), true);
+  assert.ok(mesh.writes > 0, 'the crossing must rewrite the instances that changed side');
+  assert.ok(mesh.writes <= changeable,
+    `a crossing rewrote ${mesh.writes} instances, more than the ${changeable} that can change`);
+  assert.ok(mesh.writes < shrubs.length / 4, 'a crossing must not rewrite the staged world');
+
+  // Whatever it rewrote, every instance must still agree with the predicate.
+  for (let index = 0; index < shrubs.length; index += 1) {
+    const [chunkX, chunkZ] = shrubs[index].owner.split(',').map(Number);
+    const nearDrawn = isRenderedOwnerChunk(chunkX, chunkZ, 1, 0);
+    const size = Math.hypot(
+      mesh.matrices[index][0], mesh.matrices[index][1], mesh.matrices[index][2],
+    );
+    assert.equal(size === 0, nearDrawn, `instance ${index} (owner ${shrubs[index].owner})`);
+  }
+  const snapshot = presentation.snapshot();
+  assert.equal(snapshot.drawnCount + snapshot.handedOverCount, snapshot.shrubCount);
+  assert.equal(snapshot.handedOverCount, blockWidth * blockWidth * perChunk);
   presentation.dispose();
 });
 
