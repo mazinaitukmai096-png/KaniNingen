@@ -800,10 +800,9 @@ Of 13 CITY-home seeds in a 120-seed scan, only 5 boot.
 pond with a clear intro camera corridor, expanding from
 `W8_SPAWN_SAFETY_CONTRACT.preparedDataRadiusChunks` (2) out to 6 chunks, and throws
 `no safe W8 pond spawn and intro camera corridor were found` if it finds none.
-Wetland is 1.33% of the world by primary biome, so this is a demanding condition.
 
 Measured over 10 arbitrary seeds: **4 boot, 6 fail.** Over the 13 CITY-home seeds:
-5 boot, 8 fail.
+5 boot, 8 fail. The cause is dissected in "Why most seeds do not boot" below.
 
 **This is pre-existing and unrelated to the arterial frontage change** - the same 10
 seeds give the identical 4/6 split on `0edd98a~1`. It is recorded because a
@@ -824,6 +823,121 @@ offline: 43 buildings, 6 fronting an arterial, 6 in the outer half
 
 Identical, including `roadClassCounts`. The offline harness used throughout this
 document reflects what the app actually builds.
+
+## Why most seeds do not boot
+
+The 6-of-10 failure was dissected before choosing a fix. Everything below is measured.
+
+### It is always the pond, never the corridor
+
+The search was instrumented to classify each round. Per candidate: does the pond
+itself sit clear of buildings and roads, and does any of 32 headings offer a clear
+69.3 m intro corridor?
+
+```
+seed "city-probe-35"           (FAILS)
+  radius 2  (5x5 chunks,  80 m square): ponds 0
+  radius 3  (7x7,        112 m):        ponds 0
+  radius 4  (9x9,        144 m):        ponds 0
+  radius 5  (11x11,      176 m):        ponds 0
+  radius 6  (13x13,      208 m):        ponds 0
+
+seed "KaniNingen Infinite Natural World"  (BOOTS)
+  radius 2  (5x5 chunks,  80 m square): ponds 194  viable 119  no-corridor 75  pond-blocked 0
+```
+
+**Failing seeds find zero ponds at every radius.** Where ponds exist there are
+hundreds, 61% of them pass the corridor test, and the pond-position test rejects none
+at all. The corridor has never been the binding constraint in any sample.
+
+### The rarity figure is not the 1.33% biome share
+
+`createWaterSurfaces` does not gate on the wetland biome. It gates on terrain
+`moisture >= W8_PARITY_CONTENT.wetlandMoistureThreshold` (0.64), plus a cell height
+range under 0.42 m, plus no Settlement conflict, capped at 24 per chunk. Measured over
+1,050,625 samples on a 4 m grid:
+
+```
+terrain moisture: min 0.0975  p50 0.4075  p90 0.5880  p99 0.6713  max 0.7551
+at or above 0.64: 14.208% of the world
+```
+
+So the gate is **14.2%**, not the 1.33% wetland-primary share quoted earlier in this
+document - that share answers a different question. 14.2% is still patchy enough to
+leave large dry regions, which is what the failures are.
+
+Distance from 40 random positions to the nearest qualifying cell:
+
+```
+within 104 m (the current radius-6 reach): 53%
+within 208 m: 70%     within 320 m: 85%     within 480 m: 95%     within 600 m: 98%
+p50 88 m, max 492 m, and 1 of 40 found nothing inside 600 m
+```
+
+The observed 40% boot rate sits just under the 53% the reach predicts, the remainder
+being the flatness, Settlement-conflict and per-chunk-cap filters.
+
+### The finite game has a fallback that the port dropped
+
+`findLandingSpot` in `src/game.js`:
+
+```js
+// マップ生成後、町はずれの池のほとりをゲーム開始地点として選ぶ。
+// 池が生成されていない場合はマップ中心付近にフォールバックする。
+function findLandingSpot() {
+    const ponds = waterZones.filter(wz => wz.isPond);
+    if (ponds.length > 0) { /* start in the pond, facing the shore */ }
+    return { x: 0, z: 500, facingAngle: 0 };   // <- no pond, start anyway
+}
+```
+
+The pond is an authored opening - the player wakes in the water at the edge of town and
+walks out - but the finite game **never treats it as a requirement**. When no pond
+exists it starts somewhere else and the game begins.
+
+The Infinite World kept the preference and dropped the fallback, turning it into a hard
+throw. **This is the third instance of the same shape in this document**, after
+`grassPatches` and the arterial `frontageEligible` boolean: a graded or fallback rule
+flattened into an absolute one during a port.
+
+### The two "protected pond" mechanisms are neither of these
+
+There are two separate things named after the same pond, and today's failures involve
+neither:
+
+- `W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID` is exported and consumed once, in
+  `chunk-render-adapter.js:2363`, exempting that pond from the isolated-wetland-tile
+  presentation filter. Its own comment says the canonical surfaces, Stable IDs and the
+  safe-spawn contract are untouched. Dropping it would make the pond invisible, not
+  throw.
+- `PROTECTED_SAFE_SPAWN_BOOTSTRAP` is module-private and pins pond
+  `wf1:water-surface:0fdcd2fc...` at (549.75, 431.25) for the default seed's hash, with
+  its own two errors (`protected W8 safe pond bootstrap no longer matches canonical W5
+  data`, `...failed its current corridor validation`). **It is gated on
+  `!useExperimentalRoadGraph`, and production runs road-graph-v3, so this path never
+  executes in production.** Confirmed by instrumentation: the default seed goes through
+  the general search and reports 194 ponds at radius 2.
+
+### What each option would buy
+
+| option | boot rate | cost |
+| --- | --- | --- |
+| today: pond only, radius <= 6 | **4/10** | 2.9 s to fail |
+| widen to radius 13 (+-216 m) | ~70% predicted | 3,644 chunks, **8.2x**, ~24 s |
+| widen to radius 20 (+-328 m) | ~85% | 12,331 chunks, **27.7x**, ~80 s |
+| widen to radius 30 (+-488 m) | ~95% | 39,701 chunks, **89.2x**, ~260 s |
+| **dry fallback, radius unchanged** | **10/10** | unchanged |
+
+Widening is the wrong lever: cumulative chunk generation grows about as the cube of the
+radius while the success rate climbs slowly, and it never reaches 100% - 1 of 40 probes
+found no qualifying cell within 600 m.
+
+The dry fallback was simulated by feeding `selectSafeExperienceSpawn` candidates drawn
+from the same terrain grid `createWaterSurfaces` walks, keeping its flatness rule and
+dropping only the moisture gate. Every one of the six failing seeds then found a spawn,
+and only 400 of 173,056 available candidates were sampled, so the real margin is far
+wider. The point and corridor tests were left completely unchanged - the same clearance
+rules that a pond spawn passes today.
 
 ## Also worth knowing
 
