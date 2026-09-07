@@ -377,6 +377,121 @@ The properties those tests assert - isolated / repeated / adjacent-order Worker
 reproduction, and diagnostics-on equalling diagnostics-off - all still hold: every
 path produced the same new hash. Only the anchor was stale.
 
+## The Settlement radius is a scale knob, not a lever
+
+After the slot-pitch fix, CITY still built a median 27 against a legacy 49-52, and
+the remaining gap is road length. The obvious next question - add road, or shrink the
+radius? - has a measured answer: **neither, because road length is downstream of the
+radius.**
+
+`road-graph-v3` emits a **fixed segment count per class** and scales its geometry to
+whatever radius it is handed. Regenerating the same Settlement at several radii:
+
+```
+CITY     60.8 m  22 segs  158 m  13.6 km/km2      TOWN   47.3 m  28 segs  172 m  24.5
+         85.0 m  22 segs  221 m   9.7                    66.2 m  28 segs  240 m  17.5
+        121.5 m  22 segs  316 m   6.8                    94.5 m  28 segs  343 m  12.2
+        157.9 m  22 segs  410 m   5.2                   122.8 m  28 segs  446 m   9.4
+```
+
+Road length is exactly proportional to radius, so density goes as 1/radius. Running
+the whole placement pipeline at scaled radii:
+
+```
+factor  radius   road  density  slots  built  requested  built/requested
+CITY
+  0.60   72.9    189    11.3      48      8      73        11.0%
+  1.00  121.5    316     6.8      82     21     203        10.3%
+  1.25  151.9    395     5.4     102     31     316         9.8%
+TOWN
+  0.60   56.7    206    20.4      58     11      44        25.0%
+  1.00   94.5    343    12.2      98     30     123        24.4%
+  1.25  118.1    429     9.8     122     38     191        19.9%
+```
+
+**Shrinking a CITY to 0.6x turns 21 buildings into 8** while the ratio barely moves,
+because `requested` goes as radius^2 and supply as radius^1. The shape of the problem
+is invariant under the radius. Do not reach for it.
+
+### Street density is inverted by class
+
+```
+CITY   radius 121.5 m   29 segments   411 m    8.9 km/km2   27 buildings
+TOWN   radius  94.5 m   28 segments   352 m   12.5 km/km2   29 buildings
+RURAL  radius  87.8 m   16 segments   237 m   10.2 km/km2   11 buildings
+```
+
+**The capital has the sparsest street network of the three**, and CITY (29 segments)
+and TOWN (28) generate essentially the same number of streets - the CITY just spreads
+them over 1.65x the area. Share of the disc within 12 m of any road: CITY **13.6%**,
+TOWN 26.8%, RURAL 23.9%.
+
+### The outer half of every Settlement cannot be built on
+
+Split the disc at radius/sqrt(2), which gives two equal-area halves. The outer one:
+
+| | road out there | frontage-eligible | buildings |
+| --- | --- | --- | --- |
+| CITY | 50 m, **100% arterial** | **0 m** | **0%** |
+| TOWN | 40 m, **100% arterial** | **0 m** | **0%** |
+| RURAL | 53 m, 69% arterial / 31% local | 16 m | 0% |
+
+**Every one of the 95 arterial segments across all 48 Settlements carries
+`frontageEligible: false`.** In CITY and TOWN the outer half contains nothing but
+arterials, so it has zero buildable frontage by construction. Half the declared
+Settlement area is empty because of the road class that reaches it, not because the
+radius is too large.
+
+### Three road parameters are unread on the production path
+
+Declared in `SETTLEMENT_ROAD_PARAMETERS`, consumed by `road-graph-v1`,
+`road-graph-v2` and the finite game's `road-town-structure.js` - and referenced
+**zero times** by `road-graph-v3`, which is the production generator:
+
+| | value | v3 references |
+| --- | --- | --- |
+| `alleyCount` | CITY 2 / TOWN 1 / RURAL 3 | 0 |
+| `roadLengthMultiplier` | CITY 1.02 | 0 |
+| `sampleSpacing` | CITY 48 | 0 |
+
+Measured: **0 alley segments across all 48 Settlements.** `ROAD_GRAPH_CLASSES.ALLEY`
+exists and `roadWidths()` derives a width for it; only the generation side is missing.
+Same shape as `fpsCap` and the fog colour. Alleys are the class that subdivides a
+block, which is exactly what raises density.
+
+### A connected CITY is emptier than an isolated one
+
+```
+mode                    n  segs  eligible segs  eligible len  routes  raw slots  slots  built
+ISOLATED_FALLBACK       5    20        20           412 m       5       136      106     47
+CONNECTIVITY_GATEWAYS  13    29        26           295 m       6        98       52     25
+```
+
+Two losses compound. Buildable road drops 412 -> 295 m (-28%) because the arterial
+gateways are ineligible, and splitting 26 eligible segments across 6 routes shortens
+every route, so junction-clearance survival falls from 106/136 (78%) to 52/98 (53%).
+**A CITY that is connected to its neighbours builds about half as much as one that is
+isolated.**
+
+### How the legacy path fills the same radius
+
+The earlier note that the legacy layout is "a 24 x 30 m cluster" is true of its
+*internal* roads and misleading about its buildings:
+
+```
+CITY legacy   internal road  115 / 110 /   0 /   0  m   (0-30 / 30-60 / 60-90 / 90-125 m)
+              buildings       18 /  19 /   6 /   8
+CITY v3       road            83 / 116 /  73 /  44  m
+              buildings        5 /  12 /   4 /   0
+```
+
+Legacy puts 14 of its 51 buildings beyond 60 m, where it has no internal road at all.
+They front the **594 m of MAJOR gateway road** that `createMigratedHierarchy` bolts on
+by inventing three neighbour towns at 200 m. The Infinite World has a real
+inter-settlement network instead - and classifies it arterial, which forbids frontage.
+The exact mechanism the legacy capital uses to fill its outer ring is the one v3
+closes off.
+
 ## Settlement distribution
 
 Accepted Settlements within 15,744 m of the origin: **748** - CITY 18, TOWN 544,
