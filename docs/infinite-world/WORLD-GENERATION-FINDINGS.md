@@ -725,6 +725,18 @@ Any future simulation that reconstructs this pipeline outside the adapter has to
 translate by `candidate.center` first, and should be validated against
 `resolveSettlementTemplate` on a known fixture before its numbers are believed.
 
+The same shape happened a second time during the live check, differently dressed. A
+seed was screenshotted 10 s after navigation on the pre-change build, showed a title
+screen, and was read as "this seed boots"; the post-change build showed the boot
+error, so the change looked like the cause. The title screen was still displaying
+`起動中: Terrain` - the boot had not finished. A deterministic headless probe gave the
+identical 4/6 split on both revisions, and waiting 30 s in the browser reproduced the
+failure on the pre-change build too.
+
+**A partial state and a finished state are not comparable, in either direction.**
+Both mistakes were the same error: comparing two things that were not the same kind
+of thing, and only the deterministic re-measurement caught it.
+
 ## Settlement distribution
 
 Accepted Settlements within 15,744 m of the origin: **748** - CITY 18, TOWN 544,
@@ -760,21 +772,58 @@ nearest CITY on the default seed is 9.08 km away**, at (-8057, 4196). That is or
 local variation in a smooth field - and it makes CITY hard to inspect, because the
 sandbox spawns at the nearest Settlement.
 
-**To get a CITY at spawn, use a seed.** `?seed=` is read in `sandbox-boot.js`.
-Measured home Settlements:
+**To get a CITY at spawn, use a seed.** `?seed=` is read in `sandbox-boot.js`. But a
+seed has to clear a second bar first - see "Most seeds do not boot" below - so pick
+one from this list, every entry of which was boot-tested:
 
-| seed | home | distance from origin |
-| --- | --- | --- |
-| `KaniNingen Infinite Natural World` | RURAL / suburb | 0.66 km |
-| `city-probe-35` | **CITY / capital** | 0.80 km |
-| `city-probe-31` | **CITY / capital** | 2.07 km |
+| seed | home | distance from origin | boots |
+| --- | --- | --- | --- |
+| `KaniNingen Infinite Natural World` | RURAL / suburb | 0.66 km | yes |
+| `city-probe-22` | **CITY / capital** | 2.88 km | **yes** |
+| `city-probe-61` | **CITY / capital** | 1.32 km | **yes** |
+| `city-probe-75` | **CITY / capital** | 1.35 km | **yes** |
+| `city-probe-101` | **CITY / capital** | 1.99 km | **yes** |
+| `city-probe-111` | **CITY / capital** | 3.15 km | **yes** |
+| `city-probe-29` | TOWN / school_town | 2.82 km | yes; nearest CITY 1.04 km from the origin |
+| ~~`city-probe-35`~~ | CITY / capital | 0.80 km | **no - fails to boot** |
+| ~~`city-probe-31`~~ | CITY / capital | 2.07 km | **no - fails to boot** |
 
-`infinite-world-sandbox.html?seed=city-probe-35` spawns directly in a capital.
+`infinite-world-sandbox.html?seed=city-probe-22` spawns in a capital and boots.
 
-A seed changes the whole world, so this is a development probe rather than a fixture -
-but the two above were found by scanning 40 candidate strings for a CITY within 2500 m
-of the origin, which takes seconds and can be redone for any property worth
-inspecting.
+An earlier revision of this document recommended `city-probe-35`, which does not boot.
+It was found by scanning for "home Settlement is a CITY" and never actually launched.
+Of 13 CITY-home seeds in a 120-seed scan, only 5 boot.
+
+### Most seeds do not boot
+
+`w8-parity-chunk-generator.js` resolves an experience spawn by looking for a wetland
+pond with a clear intro camera corridor, expanding from
+`W8_SPAWN_SAFETY_CONTRACT.preparedDataRadiusChunks` (2) out to 6 chunks, and throws
+`no safe W8 pond spawn and intro camera corridor were found` if it finds none.
+Wetland is 1.33% of the world by primary biome, so this is a demanding condition.
+
+Measured over 10 arbitrary seeds: **4 boot, 6 fail.** Over the 13 CITY-home seeds:
+5 boot, 8 fail.
+
+**This is pre-existing and unrelated to the arterial frontage change** - the same 10
+seeds give the identical 4/6 split on `0edd98a~1`. It is recorded because a
+non-booting seed looks like a regression when you meet it just after changing
+Settlement generation, and because "pick a seed to inspect X" is only useful advice if
+the seed launches.
+
+### The live app agrees with the offline measurements exactly
+
+`globalThis.__infiniteWorldSandbox` exposes `generator.resolveSettlementPresentationTemplate`
+and `generator.distributor.findSettlementsNear`, so a running world can be queried
+directly. For the TOWN at (-1139, 2581) on `city-probe-29`:
+
+```
+live:    43 buildings, 6 fronting an arterial, 6 in the outer half
+offline: 43 buildings, 6 fronting an arterial, 6 in the outer half
+```
+
+Identical, including `roadClassCounts`. The offline harness used throughout this
+document reflects what the app actually builds.
 
 ## Also worth knowing
 
