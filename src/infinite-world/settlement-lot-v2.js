@@ -2,6 +2,7 @@ import {
   BUILDING_FRONTAGE_PROFILES,
   createFrontagePlacement,
   frontageSpotsConflict,
+  getFrontagePairGaps,
 } from '../building-frontage.js';
 import { createBuildingLot, orientedRectanglesOverlap } from '../building-lot.js';
 import { ROAD_KINDS } from '../road-town-structure.js';
@@ -23,11 +24,6 @@ import { createSemanticIdKeyedRandom } from './settlement-semantic-identity.js';
 import { createW8SettlementBuildingTypeSelector } from './w8-settlement-building-visual-policy.js';
 
 export const SETTLEMENT_LOT_V2_GENERATOR_ID = 'lot-v2';
-
-export const SETTLEMENT_LOT_V2_FALLBACK_PARAMETERS = Object.freeze({
-  slotSpacingMeters: 12,
-  junctionClearanceMeters: 8,
-});
 
 export const SETTLEMENT_LOT_V2_PLACEMENT_SOURCES = Object.freeze({
   LOT: 'LOT',
@@ -114,6 +110,36 @@ const BUILDING_HEIGHT_UNITS = Object.freeze({
   tower: 420,
   school: 190,
   church: 335,
+});
+
+// The smallest separation frontageSpotsConflict actually permits between two
+// Houses: radius + radius + passageGap, in finite units. Houses are 55-88% of
+// every SETTLEMENT_BUILDING_COMPOSITION, so this pair sets the usable pitch.
+// School and church pairs need up to 9.125 m and simply skip a slot, which the
+// placement loop already handles by trying the next one.
+const HOUSE_PAIR_MINIMUM_SEPARATION_METERS = (
+  APPROXIMATE_BUILDING_RADIUS.house * 2
+  + getFrontagePairGaps('house', 'house').passageGap
+) / FINITE_WORLD_UNITS_PER_METER;
+
+// Derived from the Frontage rule the slots have to satisfy rather than chosen. The
+// previous literal 12 was 2.2x the 5.375 m that house|house permits, and measured as
+// the single largest cause of the Settlement building shortage: a TOWN offered 42 raw
+// slot positions where its roads could carry 90.
+const FALLBACK_SLOT_SPACING_METERS = Math.ceil(HOUSE_PAIR_MINIMUM_SEPARATION_METERS);
+
+export const SETTLEMENT_LOT_V2_FALLBACK_PARAMETERS = Object.freeze({
+  slotSpacingMeters: FALLBACK_SLOT_SPACING_METERS,
+  // One slot pitch: do not offer the slot adjacent to a junction. This is not what
+  // keeps a building out of the carriageway - the road-overlap test in the placement
+  // loop is, and it rejects any building lot overlapping any road rectangle. What
+  // this clearance protects is orientation: closer to a corner than this, a building
+  // ends up nearer the perpendicular road than the one it faces, which
+  // infinite-world-lot-v2.test.mjs asserts against at 30 degrees. Measured as the
+  // smallest value that still holds that invariant across the CITY/TOWN fixtures;
+  // 5 m breaks it. The previous 8 m removed 52% of all slots, because road-graph-v3
+  // routes are 22-36 m long and an 8 m clearance ate both ends.
+  junctionClearanceMeters: FALLBACK_SLOT_SPACING_METERS,
 });
 const LEGACY_KIND_BY_CLASS = Object.freeze({
   [ROAD_GRAPH_CLASSES.ARTERIAL]: ROAD_KINDS.MAJOR,

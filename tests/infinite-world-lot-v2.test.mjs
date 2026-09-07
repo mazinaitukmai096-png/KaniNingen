@@ -24,7 +24,9 @@ import {
   buildDeterministicFrontageFallbackBuildingsV2,
   buildDeterministicRuralFrontageFallbackBuildingsV2,
 } from '../src/infinite-world/settlement-lot-v2.js';
+import { getFrontagePairGaps } from '../src/building-frontage.js';
 import {
+  FINITE_WORLD_UNITS_PER_METER,
   MIGRATED_SETTLEMENT_PROFILES,
 } from '../src/infinite-world/single-rural-settlement.js';
 import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
@@ -189,6 +191,27 @@ function ruralSelectionSnapshot(template) {
   });
 }
 
+test('lot-v2 fallback slot pitch is the Frontage rule, not a value above it', () => {
+  const { passageGap } = getFrontagePairGaps('house', 'house');
+  // APPROXIMATE_BUILDING_RADIUS is module-private in every file that holds a copy.
+  const houseRadiusFiniteUnits = 90;
+  const houseMinimumSeparationMeters = (houseRadiusFiniteUnits * 2 + passageGap)
+    / FINITE_WORLD_UNITS_PER_METER;
+  assert.equal(houseMinimumSeparationMeters, 5.375);
+
+  const { slotSpacingMeters, junctionClearanceMeters } = SETTLEMENT_LOT_V2_FALLBACK_PARAMETERS;
+  // A pitch below the rule wastes work: every second slot would be rejected anyway.
+  assert.ok(slotSpacingMeters >= houseMinimumSeparationMeters);
+  // A pitch a whole slot above the rule is what caused the Settlement building
+  // shortage. The literal 12 this replaced offered a TOWN 42 raw slot positions
+  // where the same roads carry 90.
+  assert.ok(slotSpacingMeters < houseMinimumSeparationMeters * 2);
+  // One slot pitch of corner exclusion - the smallest value that still keeps a
+  // building nearer the road it faces than the perpendicular road at a junction,
+  // which the CITY/TOWN fixture test asserts at 30 degrees.
+  assert.equal(junctionClearanceMeters, slotSpacingMeters);
+});
+
 test('lot-v2 is gated by road-graph-v3 and W8 keeps overlay scatter disabled', async () => {
   await assert.rejects(createDistributedSettlementChunkGenerator({
     worldSeed: 'invalid lot-v2 combination',
@@ -331,7 +354,18 @@ test('CITY/TOWN baseline fixtures use only Lots and validated frontage fallback'
   }
   assert.equal(metricRows.length, 6);
   assert.ok(metricRows.every(row => row.v2LegacyScatterCount === 0));
-  assert.ok(metricRows.every(row => row.v2BuildingCount < row.v1BuildingCount));
+  // Both modes share the Lot stage, so its yield must be identical; everything that
+  // differs between v1 and v2 is what fills the space the Lots do not.
+  assert.ok(metricRows.every(row => row.v2LotBuildingCount === row.v1LotBuildingCount));
+  // This used to assert v2BuildingCount < v1BuildingCount, i.e. that dropping v1's
+  // unvalidated legacy scatter always cost buildings. It stopped being true once the
+  // fallback slot pitch was derived from the Frontage rule instead of the literal
+  // 12 m: on these six fixtures v2 went 16/15/10/15/31/18 -> 33/30/23/33/49/37
+  // against an unchanged v1 of 46/39/46/41/43/41, so one row now exceeds v1. The
+  // inequality described the shortage rather than any property worth keeping, and
+  // the ratio does not separate the two regimes cleanly enough to become a bound
+  // (before: 0.22-0.72, after: 0.50-1.14). What still has to hold is the line above
+  // plus the per-building overlap, orientation and clearance assertions.
 });
 
 test('production default RURAL applies a Road Graph village-core candidate density gradient', async t => {

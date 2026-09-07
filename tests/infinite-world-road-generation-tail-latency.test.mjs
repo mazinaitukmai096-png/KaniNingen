@@ -31,11 +31,11 @@ const ROAD_HEAVY_OWNER = Object.freeze({ x: 55, z: 77 });
 const ROAD_HEAVY_OWNER_KEY = `${ROAD_HEAVY_OWNER.x},${ROAD_HEAVY_OWNER.z}`;
 const REPORTED_OWNER = Object.freeze({ x: 160, z: 29 });
 const REPORTED_OWNER_CONTENT_HASH =
-  'sha256:d3f2838c2b19a1862e55918a12a4d7fcf5fba47f4abe2fd0523cfd213378caab';
+  'sha256:f1a2009615c5084bff4e596d623403508a1fe02d9ef3faa22157ec9df008ce25';
 const REPORTED_OWNER_PREDECESSOR = Object.freeze({ x: 159, z: 29 });
 const REPORTED_OWNER_COMPARISON = Object.freeze({ x: 161, z: 29 });
 const ROAD_HEAVY_OWNER_CONTENT_HASH =
-  'sha256:9dd3b8a235e2e59ccc143e568b2a3da1eff37906117c08a9f02523789a7f93e0';
+  'sha256:98308c3eecff0abd6305c310f285cbed2eb698f34b4c15a891dcedd96c73d4bc';
 const WORLD_SEED = 'KaniNingen Infinite Natural World';
 const BUILDING_SELECTOR_INDEX_COUNT = 512;
 const CANONICAL_MATRIX_OWNERS = Object.freeze([
