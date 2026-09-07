@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import test, { after } from 'node:test';
 
 import { orientedRectanglesOverlap } from '../src/building-lot.js';
+import { ROAD_KINDS } from '../src/road-town-structure.js';
 import { SETTLEMENT_TYPES } from '../src/settlement-type.js';
 import { createDistributedSettlementChunkGenerator } from '../src/infinite-world/distributed-settlement-chunk-generator.js';
 import { buildDeterministicBuildingsFromLots } from '../src/infinite-world/lot-building-adapter-v1.js';
@@ -15,6 +18,7 @@ import {
   settlementPolygonsOverlap,
 } from '../src/infinite-world/settlement-lot-v1.js';
 import {
+  FINITE_ROAD_KIND_FRONTAGE_RANK,
   SETTLEMENT_LOT_V2_FALLBACK_PARAMETERS,
   SETTLEMENT_LOT_V2_GENERATOR_ID,
   SETTLEMENT_LOT_V2_PLACEMENT_SOURCES,
@@ -190,6 +194,57 @@ function ruralSelectionSnapshot(template) {
     selectedCandidateCount: validation.selectedCandidateCount,
   });
 }
+
+test('the MAJOR frontage rank still matches the protected finite table it mirrors', () => {
+  // src/building-frontage.js is byte-identity protected against fixed commits, so it
+  // cannot export ROAD_KIND_DISTANCE_BIAS and settlement-lot-v2.js keeps a copy.
+  // Read the finite source and prove the copy has not drifted, the way the fog colour
+  // silently drifted from its own constant.
+  const source = readFileSync(
+    resolve(import.meta.dirname, '..', 'src/building-frontage.js'),
+    'utf8',
+  );
+  const table = source.match(/const ROAD_KIND_DISTANCE_BIAS = Object\.freeze\(\{([^}]*)\}\)/);
+  assert.ok(table, 'ROAD_KIND_DISTANCE_BIAS is still declared in the finite module');
+  const finite = Object.fromEntries([...table[1].matchAll(/ROAD_KINDS\.(\w+)\]:\s*(\d+)/g)]
+    .map(([, kind, value]) => [kind.toLowerCase(), Number(value)]));
+  assert.deepEqual(finite, { local: 0, alley: 24, major: 320 });
+  assert.deepEqual({ ...FINITE_ROAD_KIND_FRONTAGE_RANK }, {
+    [ROAD_KINDS.LOCAL]: finite.local,
+    [ROAD_KINDS.ALLEY]: finite.alley,
+    [ROAD_KINDS.MAJOR]: finite.major,
+  });
+  // The finite module also names MAJOR a valid frontage kind outright. If that ever
+  // stops being true, arterial frontage has to be reconsidered rather than kept.
+  assert.match(source, /frontage road must be MAJOR, LOCAL, or ALLEY/);
+});
+
+test('arterial frontage is granted but suppressed within the finite MAJOR bias', async () => {
+  const fixture = await fixturePromises[0];
+  const candidate = fixture.byType[SETTLEMENT_TYPES.CITY];
+  const v2 = await fixture.v2.resolveSettlementTemplate({ candidate });
+  const arterials = v2.roadGraph.segments.filter(s => s.class === 'arterial');
+  assert.ok(arterials.length > 0, 'the fixture CITY has gateway arterials');
+  // Granted: the gateway arterial is frontage-eligible, restoring what the finite
+  // game allowed and the port turned into a boolean prohibition.
+  assert.ok(arterials.every(segment => segment.flags.frontageEligible === true));
+
+  const arterialIds = new Set(arterials.map(segment => segment.edgeId));
+  const onArterial = v2.buildings.filter(b => arterialIds.has(b.frontageEdgeId));
+  assert.ok(onArterial.length > 0, 'the Settlement actually uses its arterial frontage');
+
+  // Suppressed: no building takes an arterial where a street runs within the finite
+  // MAJOR bias of it, which is where selectFrontageRoad would have chosen the street.
+  const biasMeters = FINITE_ROAD_KIND_FRONTAGE_RANK[ROAD_KINDS.MAJOR] / FINITE_WORLD_UNITS_PER_METER;
+  const streets = v2.roadGraph.segments.filter(s => s.class !== 'arterial');
+  for (const building of onArterial) {
+    const frontage = closestPoint(building, v2.roadGraph.segments
+      .find(s => s.edgeId === building.frontageEdgeId)).point;
+    const nearestStreet = Math.min(...streets.map(s => closestPoint(frontage, s).distance));
+    assert.ok(nearestStreet > biasMeters,
+      `arterial frontage at ${nearestStreet.toFixed(2)} m from a street is inside the ${biasMeters} m bias`);
+  }
+});
 
 test('lot-v2 fallback slot pitch is the Frontage rule, not a value above it', () => {
   const { passageGap } = getFrontagePairGaps('house', 'house');

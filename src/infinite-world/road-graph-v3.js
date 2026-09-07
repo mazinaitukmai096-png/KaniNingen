@@ -331,7 +331,17 @@ async function addGatewayConnection({
   requiredGatewayNodeIds.push(terminal.nodeId);
   await builder.addEdge(terminal, innerNode, ROAD_GRAPH_CLASSES.ARTERIAL,
     `connectivity-gateway:${gateway.gatewayId}`, {
-      frontageEligible: false,
+      // The finite game never forbade frontage on a MAJOR road. selectFrontageRoad
+      // adds ROAD_KIND_DISTANCE_BIAS to the distance when choosing one,
+      // buildFrontageAnchorPlan sorts MAJOR last, and createFrontagePlacement says
+      // outright that a frontage road must be "MAJOR, LOCAL, or ALLEY". That graded
+      // last-resort collapsed into a boolean during the port to road-graph-v3, and
+      // it cost the outer half of every Settlement its only buildable road: this
+      // edge runs 0.64R to 0.92R, and past radius/sqrt(2) - half the area - it is
+      // the only class present in a CITY or TOWN. The suppression is restored where
+      // the finite game spends it - as a distance, in majorRoadFrontageIsPermitted in
+      // settlement-lot-v2.js - rather than dropped.
+      frontageEligible: true,
       connectivityGateway: true,
       targetSettlementId: gateway.targetSettlementId,
       routeId: `${settlementId}:arterial:${gateway.gatewayId}`,

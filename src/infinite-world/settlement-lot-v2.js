@@ -148,6 +148,27 @@ const LEGACY_KIND_BY_CLASS = Object.freeze({
   [ROAD_GRAPH_CLASSES.ALLEY]: ROAD_KINDS.ALLEY,
 });
 
+// A mirror of ROAD_KIND_DISTANCE_BIAS in src/building-frontage.js, which is
+// byte-identity protected against fixed commits by
+// infinite-world-protected-integrity.test.mjs and city-local-roads.test.mjs and so
+// cannot export it. infinite-world-lot-v2.test.mjs reads the finite source and
+// asserts this mirror still matches, so the copy is checked rather than silent.
+//
+// The finite game spends this as a distance: selectFrontageRoad picks the road
+// minimising distance + bias, so a MAJOR road wins only when it is more than 8 m
+// closer than any alternative. This slot enumerator has no distance to add it to -
+// slots are generated from roads rather than chosen for an anchor - so the table is
+// used as the rank it already encodes, which is the same order buildFrontageAnchorPlan
+// applies (LOCAL, then ALLEY, then everything else). The effect is the finite game's:
+// a MAJOR road is filled only after the streets are.
+const FINITE_ROAD_KIND_DISTANCE_BIAS = Object.freeze({
+  [ROAD_KINDS.LOCAL]: 0,
+  [ROAD_KINDS.ALLEY]: 24,
+  [ROAD_KINDS.MAJOR]: 320,
+});
+
+export const FINITE_ROAD_KIND_FRONTAGE_RANK = FINITE_ROAD_KIND_DISTANCE_BIAS;
+
 const q6 = value => {
   const rounded = Math.round(value * 1e6) / 1e6;
   return Object.is(rounded, -0) ? 0 : rounded;
@@ -334,12 +355,75 @@ function createFallbackSlots({ roadGraph, candidate }) {
           routeDistanceMeters: q6(routeDistance),
           side,
           road: roadAtSlot,
+          // Logical world position of the slot. localRoad() keeps its geometry
+          // Settlement-local, and suppressMajorRoadSlots has to measure against the
+          // Road Graph, which is in world coordinates.
+          worldPosition: Object.freeze({ x: q6(position.x), z: q6(position.z) }),
           sourceOwner: located.segment.sourceOwner,
         }));
       }
     }
   }
-  return Object.freeze(slots);
+  return Object.freeze(suppressMajorRoadSlots(slots, roadGraph));
+}
+
+/**
+ * Restores the finite game's graded suppression of MAJOR-road frontage.
+ *
+ * selectFrontageRoad chooses the road minimising `distance + bias`, so an anchor
+ * takes a MAJOR road only when every other road is more than the MAJOR bias further
+ * away. A slot sits on its own road at distance zero, which makes the same rule
+ * exact here: keep a MAJOR slot only when no other road class passes within the bias
+ * of it. Near the centre, where the gateway arterial runs alongside collectors, the
+ * streets win and the slot is dropped; out towards the Settlement edge, where the
+ * arterial is the only road, it is kept.
+ *
+ * Ordering is applied as well, matching buildFrontageAnchorPlan's road priority, so
+ * the surviving MAJOR slots are still the last ones the placement loop reaches.
+ */
+const FINITE_MAJOR_ROAD_FRONTAGE_BIAS_METERS =
+  FINITE_ROAD_KIND_DISTANCE_BIAS[ROAD_KINDS.MAJOR] / FINITE_WORLD_UNITS_PER_METER;
+
+/**
+ * The suppression itself, shared by both fallback paths: a point on a MAJOR road may
+ * take that road as its frontage only where no other road class runs within the
+ * finite MAJOR bias of it, which is exactly where selectFrontageRoad would have
+ * preferred the street.
+ */
+function majorRoadFrontageIsPermitted(segment, position, roadGraph) {
+  if (LEGACY_KIND_BY_CLASS[segment.class] !== ROAD_KINDS.MAJOR) return true;
+  return !roadGraph.segments.some(other => (
+    LEGACY_KIND_BY_CLASS[other.class] !== ROAD_KINDS.MAJOR
+    && pointToSegmentDistance(position, other.start, other.end)
+      <= FINITE_MAJOR_ROAD_FRONTAGE_BIAS_METERS
+  ));
+}
+
+function suppressMajorRoadSlots(slots, roadGraph) {
+  const segmentsById = new Map(roadGraph.segments.map(segment => [segment.edgeId, segment]));
+  const kept = slots.filter(slot => majorRoadFrontageIsPermitted(
+    segmentsById.get(slot.frontageEdgeId),
+    slot.worldPosition,
+    roadGraph,
+  ));
+  // Array.prototype.sort is stable, so each kind keeps its route/slot/side order and
+  // only the kinds move relative to each other.
+  kept.sort((left, right) => (
+    (FINITE_ROAD_KIND_DISTANCE_BIAS[left.road.kind] ?? 0)
+      - (FINITE_ROAD_KIND_DISTANCE_BIAS[right.road.kind] ?? 0)
+  ));
+  return kept;
+}
+
+function pointToSegmentDistance(point, start, end) {
+  const dx = end.x - start.x;
+  const dz = end.z - start.z;
+  const lengthSquared = dx * dx + dz * dz;
+  const t = lengthSquared <= 1e-12 ? 0 : Math.max(0, Math.min(
+    1,
+    ((point.x - start.x) * dx + (point.z - start.z) * dz) / lengthSquared,
+  ));
+  return Math.hypot(point.x - start.x - dx * t, point.z - start.z - dz * t);
 }
 
 function nodeDegrees(roadGraph) {
@@ -428,6 +512,16 @@ async function createRuralFrontageFallbackSlots({
     }
   }
   const eligible = roadGraph.segments
+    // A gateway arterial is frontage-eligible now, and this village path is not where
+    // it belongs. ruralFrontageEdgeClass would file it under 'alley/dead-end', because
+    // it dead-ends at its gateway terminal - giving a highway the sparsest, most
+    // informal interval in the table under a name that means the opposite. The
+    // zero-Block RURAL contract is collector plus local: every measured row reports
+    // deadEndFrontageCount 0, and the class ratios in
+    // infinite-world-lot-v2.test.mjs are asserted to sum to one across those two.
+    // Putting a village on a trunk road is a separate decision from restoring the
+    // frontage the finite game already allowed, so it stays out until it is made.
+    .filter(segment => LEGACY_KIND_BY_CLASS[segment.class] !== ROAD_KINDS.MAJOR)
     .filter(segment => segment.flags?.frontageEligible === true)
     .map(segment => Object.freeze({
       segment,
@@ -778,8 +872,12 @@ function measureRuralUsableFrontage({
   const sampleStepMeters = 0.25;
   let totalUsableMeters = 0;
   let coreUsableMeters = 0;
+  // Measure what this path will actually build on. A gateway arterial is
+  // frontage-eligible, but the zero-Block RURAL placer excludes it, so counting it
+  // here would report usable frontage the village never uses.
   for (const segment of roadGraph.segments.filter(value => (
     value.flags?.frontageEligible === true
+    && LEGACY_KIND_BY_CLASS[value.class] !== ROAD_KINDS.MAJOR
   ))) {
     const length = Math.hypot(
       segment.end.x - segment.start.x,
