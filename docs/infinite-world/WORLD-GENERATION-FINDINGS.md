@@ -583,6 +583,148 @@ right angle (RURAL already declares 60-120 degrees and the highest `alleyCurvatu
 `role: 'alley-terminal'`, and the finite game's corridor guards with an omitted-route
 record on failure.
 
+## Arterial frontage: a graded rule that was flattened into a prohibition
+
+The outer half of every Settlement was empty because the only road reaching it was
+arterial, and arterial carried `frontageEligible: false`. That flag turned out not to
+be a rule the finite game ever had.
+
+**The finite game does not forbid frontage on a MAJOR road. It makes one a last
+resort.** Three places in `src/building-frontage.js` say so:
+
+```js
+const ROAD_KIND_DISTANCE_BIAS = Object.freeze({
+  [ROAD_KINDS.LOCAL]: 0,
+  [ROAD_KINDS.ALLEY]: 24,
+  [ROAD_KINDS.MAJOR]: 320,      // 8 m at 40 units per metre
+});
+```
+
+`selectFrontageRoad` picks the road minimising `distance + bias`, so a MAJOR road wins
+only when it is more than 8 m closer than any street. `buildFrontageAnchorPlan` sorts
+MAJOR last (`roadPriority` 3, behind LOCAL spine, LOCAL and ALLEY). And
+`createFrontagePlacement` throws
+`'frontage road must be MAJOR, LOCAL, or ALLEY'` — naming MAJOR a valid frontage kind
+outright. The only kind genuinely excluded is `START_APPROACH`, which has no bias
+entry at all.
+
+**A graded suppression became a boolean during the port to road-graph-v3.** Neither
+commit that introduced it (`16e3a6f` for v1, `290888d` for v3) carries a message body,
+and no document records a rationale. This is the `grassPatches` shape: a rule with a
+middle setting, collapsed to off.
+
+**The rest of the pipeline was already ready.** `LEGACY_KIND_BY_CLASS` maps
+`ARTERIAL -> ROAD_KINDS.MAJOR`, which is the kind `createFrontagePlacement` accepts and
+`ROAD_KIND_DISTANCE_BIAS` has an entry for. Every consumer of `frontageEligible` is a
+segment-level boolean check. One flag at graph-build time was the whole obstruction.
+
+### The position-dependent rule turned out to be unnecessary
+
+The obvious design — "eligible inside the Settlement radius, not outside" — is already
+satisfied by construction:
+
+```
+arterial radial extent, as a fraction of the declared radius
+RURAL   0.658 .. 0.920      inside the radius: 100.0% of all arterial
+TOWN    0.657 .. 0.920      100.0%
+CITY    0.641 .. 0.920      100.0%
+```
+
+**road-graph-v3 never draws arterial past 0.92R.** All 95 arterial segments across 48
+Settlements have `purpose: connectivity-gateway` — a single spur from the gateway
+terminal inward. What actually connects Settlements to each other is
+`canonical-major-road-network.js`, a separate system the frontage placer never sees.
+So no rule is needed to keep buildings out of the countryside, and the placement loop's
+`town.radius - APPROXIMATE_BUILDING_RADIUS[type]` gate is a second guard behind that
+(measured `OUTSIDE_RADIUS: 0`).
+
+### Arterial width costs nothing
+
+```js
+const centerDistance = road.width / 2 + profile.frontExtent + setback;
+```
+
+The setback is measured from the road edge, not the centreline, so a wider road only
+pushes the building further out. A CITY house sits 4.58 m from an arterial centreline
+against 4.19 m from a local one. Measured building/road overlaps: 0.
+
+### What was implemented
+
+`road-graph-v3.js` grants the gateway arterial `frontageEligible: true`, and
+`settlement-lot-v2.js` restores the suppression where the finite game spends it:
+
+```js
+majorRoadFrontageIsPermitted(segment, position, roadGraph)
+  // a point on a MAJOR road may take it only where no other class runs within
+  // FINITE_ROAD_KIND_DISTANCE_BIAS[MAJOR] / 40 = 8 m of it
+```
+
+That is `selectFrontageRoad`'s rule made exact: a slot sits on its own road at distance
+zero, so the road wins only when every street is more than the bias away. Slots are
+also ordered by the same table, matching `buildFrontageAnchorPlan`. The finite table is
+mirrored rather than imported, because `src/building-frontage.js` is byte-identity
+protected against fixed commits; `infinite-world-lot-v2.test.mjs` reads the finite
+source and asserts the mirror has not drifted, so the copy is checked rather than
+silent.
+
+**Ordering alone does almost nothing here, and that is worth knowing.** Sorting MAJOR
+slots last changed the total from 1522 to 1516 — six buildings. Demand
+(`attemptedBuildingCount` 64-123) far exceeds slot supply, so the loop exhausts nearly
+every viable slot whatever the order; ordering decides which building index lands
+where, not whether a slot is used. The distance rule is what actually suppresses.
+
+| | baseline | simple flip | ordering only | distance rule (shipped) |
+| --- | --- | --- | --- | --- |
+| total buildings | 1218 | 1522 | 1516 | **1452** |
+| CITY total / median | 565 / 27 | 741 | 740 / 42 | **705 / 39** |
+| TOWN total / median | 399 / 29 | 481 | 477 / 35 | **477 / 35** |
+| RURAL total / median | 254 / 11 | 300 | 299 | **270 / 11** |
+| fronting an arterial | 0 | 298 | 298 | **234** |
+| outer half of the disc | 29 (2.4%) | 292 (19.2%) | 292 | **263 (18.1%)** |
+
+A connected CITY goes from 25 to 36 median, against 47 for an isolated one, so the
+"more connected, emptier" inversion is reduced rather than removed.
+
+### The zero-Block RURAL path is deliberately excluded
+
+`ruralFrontageEdgeClass` would file a gateway arterial under `'alley/dead-end'`,
+because it dead-ends at its terminal — giving a trunk road the sparsest, most informal
+interval in the table under a name that means the opposite. More to the point, that
+path's tested contract is collector plus local: every row in the twelve-seed
+characterisation reports `deadEndFrontageCount: 0`, and the class ratios are asserted
+to sum to one across those two. Putting a village on a trunk road is a separate
+decision, so arterial is filtered out of that path and out of
+`measureRuralUsableFrontage`, which would otherwise report frontage the village never
+uses. RURAL still gains 16 arterial-fronting buildings through the 4 of 17 villages
+that draw a loop and therefore take the non-RURAL fallback.
+
+### One dormant exemption is now live
+
+`gatewayApproachIsClear` in `canonical-major-road-network.js` skips obstacles whose
+`frontageRoadStableId` matches the arterial a canonical MAJOR road is joining. Until
+now no building ever fronted an arterial, so that branch never fired. Measured across
+19 canonical MAJOR roads and 225 buildings: **0 road/building overlaps** — the router
+is fed the Settlement's buildings and lots as obstacles
+(`obstacleAudit: {buildingCount: 82, lotCount: 82}`) and routes around them, and the
+approach stays inside the arterial corridor the buildings are set back from. Worth
+re-checking if either width or the setback profile changes.
+
+### A measurement error worth remembering
+
+The first pass reported 912 of 1522 buildings violating the 30-degree frontage-direction
+rule, which would have killed the change. It was wrong: `buildDeterministicFrontage-
+FallbackBuildingsV2` returns buildings in Settlement-local coordinates and the adapter
+translates them, while `roadGraph.segments` are already in world coordinates — the
+check was comparing the two frames. Running the repo's own check against the repo's own
+fixture returned 0, which is what exposed it.
+
+**Counts do not depend on the coordinate frame; every safety number does.** Building
+totals from the broken run were correct and matched an independent audit exactly
+(1218). Overlap counts, angle counts and radial distributions were all meaningless.
+Any future simulation that reconstructs this pipeline outside the adapter has to
+translate by `candidate.center` first, and should be validated against
+`resolveSettlementTemplate` on a known fixture before its numbers are believed.
+
 ## Settlement distribution
 
 Accepted Settlements within 15,744 m of the origin: **748** - CITY 18, TOWN 544,
