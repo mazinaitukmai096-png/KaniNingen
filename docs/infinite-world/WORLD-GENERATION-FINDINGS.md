@@ -492,6 +492,97 @@ inter-settlement network instead - and classifies it arterial, which forbids fro
 The exact mechanism the legacy capital uses to fill its outer ring is the one v3
 closes off.
 
+## Alleys: investigated, not implemented
+
+`alleyCount` is the most obvious of the three unread parameters, and it was surveyed
+as a candidate lever. It was dropped: the estimate is **+2 buildings for a CITY whose
+median is 27**. The findings are kept because they will otherwise be re-derived.
+
+**The ordering is not "more alleys in bigger places".** `alleyCount` is CITY 2 /
+TOWN 1 / **RURAL 3** - the village gets the most and the town the fewest, and it is
+not even monotonic. In the finite game's terms that is deliberate: CITY is
+`roadPattern: GRID` with `localBranchCount: 6` and gets its density from the grid,
+while RURAL is `ORGANIC` with `localBranchCount: 3` and `deadEndBias: 0.68`, where
+alleys are the texture of a village. Implementing `alleyCount` faithfully would
+**narrow** the gap between the classes, not widen it.
+
+**All three existing implementations do the same thing**, and none of them subdivides
+a block:
+
+| | attaches to | direction | length | frontage |
+| --- | --- | --- | --- | --- |
+| `road-graph-v1` | a local branch terminal | along `axis`, alternating | `radius * 0.22` | `true`, explicit |
+| `road-graph-v2` | a local boundary node | along `normal`, alternating | `radius * 0.18` | `true`, explicit |
+| finite game | a local-branch T where exactly 2 roads meet | parent `normal`, **outward preferred** | `max(alleyWidth*3, coreRadius * 0.13 * roadLengthMultiplier)` | on the frontage route |
+
+Only the finite game guards the geometry (`isFullCorridorClear`,
+`isSafeJunctionPoint`, `isRoadEndClear`) and records failures as
+`omitRoute(..., 'END_OR_CORRIDOR_BLOCKED')`. The lengths differ by a factor of three
+for the same Settlement - 8.95 m for a finite CITY against 26.7 m for v1 - so v1 and
+v2 are not faithful ports.
+
+**An alley is a leaf, so it changes no topology invariant.** It adds one node and one
+edge, `cycleRank = E - V + 1` is unchanged, and since block count equals cycle rank,
+**no new blocks and no new Lots appear**. That also means the natural insertion point
+is the graph-generation stage, as a post-pass after the class grammar and before
+`buildSegments()` - exactly where v1 and v2 put it - not anywhere downstream of block
+extraction.
+
+**Frontage needs no change**: `road-graph-v3.js:261` already sets
+`frontageEligible: roadClass !== ROAD_GRAPH_CLASSES.ARTERIAL`, so an alley added
+through the normal builder is eligible automatically.
+
+**The RURAL placer is already wired for alleys and has never seen one.**
+`ruralFrontageEdgeClass` maps `segment.class === ALLEY` to `'alley/dead-end'`, which
+has full entries in `RURAL_FRONTAGE_EDGE_PLACEMENT_TABLE` and in
+`RURAL_VILLAGE_CORE_DENSITY_GRADIENT.candidateIntervals` (CORE 14 / MIDDLE 20 /
+OUTER 26 m). Every measured run reports
+`rawByClass: {collector: 21, local: 6, "alley/dead-end": 0}`. This is the fourth
+instance of the declared-but-never-produced shape, after `fpsCap`, the fog colour and
+the Bush handoff.
+
+**The finite game's alley length is unusable here.** RURAL comes out at 5.8 m, below
+the `minimumLengthMeters: 11` that same RURAL table requires, so those alleys would be
+rejected outright. It also collides with the 6 m slot pitch: `floor(5.8 / 6)` is zero
+positions.
+
+**And the slot arithmetic mostly cancels.** A new T-junction on a parent route deletes
+the slot positions within the 6 m junction clearance - roughly one either side, on
+both sides of the road, so about 4 slots. A 26.7 m alley offers `floor(26.7 / 6)` = 4
+positions, loses the one next to its own attach junction, and keeps 3 x 2 sides = 6.
+**Net gain is about +2 slots per alley**, which at the measured ~50% slot-to-building
+conversion is +1 building. The pitch fix in e8f90df is part of why: tightening the
+lattice raised the baseline that an alley has to beat.
+
+| | net slots | buildings |
+| --- | --- | --- |
+| CITY (2 alleys) | +4 | **+2** |
+| TOWN (1 alley) | +2 | **+1** |
+| RURAL (3 alleys) | +3 raw candidates on its own path | **+1-2** |
+
+**Two validation invariants would break on the obvious implementation.** Measured
+headroom:
+
+| | current | limit | with perpendicular alleys |
+| --- | --- | --- | --- |
+| RURAL `exactRightAngleRate` | **0.000** (3 junctions, 9 angle pairs) | < 0.25 | **6/18 = 0.333, fails** |
+| TOWN `exactRightAngleRate` | 0.000 (5 junctions, 15 pairs) | < 0.50 | 2/18 = 0.111, safe |
+| TOWN `localDeadEndRatio` | **0.600** | 0.15..0.65 | **0.800 if the terminal role is `'dead-end'`, fails** |
+| CITY center vs outer junction density | 5.32e-4 vs 0.00 | center > outer | 5.4e-5 outer, safe |
+| `cycleRank`, `collectorRouteCount` | - | class ranges | unchanged |
+
+A degree-2 node becoming degree-3 adds three angle pairs, two of them at exactly 90
+degrees if the alley is perpendicular, and the check tolerates +-1 degree.
+`localDeadEnds` filters on `role === 'dead-end'` exactly, so the terminal must be
+named something else - v1 and v2 use `'alley-terminal'`. v3 also validates
+`selfIntersectionCount` and throws, which neither v1 nor v2 guards against.
+
+**If it is ever implemented**, the minimum shape that passes all four invariants is:
+v1's length (`radius * 0.22`), the profile's own branch-angle range rather than a
+right angle (RURAL already declares 60-120 degrees and the highest `alleyCurvature`),
+`role: 'alley-terminal'`, and the finite game's corridor guards with an omitted-route
+record on failure.
+
 ## Settlement distribution
 
 Accepted Settlements within 15,744 m of the origin: **748** - CITY 18, TOWN 544,
