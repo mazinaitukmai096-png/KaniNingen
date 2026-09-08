@@ -1647,6 +1647,66 @@ resident chunks and `w8-distant-presentation.js` for the merged distant bucket, 
 through `settlementReplacementBarrier`. The handover is a second place where a road can be
 briefly owned by neither.
 
+### Correction: a comment is not the implementation
+
+The previous entry named the merged road bucket's remove-then-add swap as the likely cause
+of the flicker, on the strength of the code's own comment describing exactly that symptom.
+That was wrong, and the way it was wrong is worth keeping.
+
+`publishPriorityRoadGeneration` removes the live mesh and adds the replacement **inside one
+synchronous function call**. No frame is rendered between them, so the scene graph is never
+without roads and the swap cannot blink. The comment describes a failure that the guard
+directly beneath it - `roadPriorityDeferredRemovalCount` - already prevents. It documents a
+fixed bug in the present tense.
+
+This is the same error as reading a declaration as behaviour (`roadPattern: GRID`), one step
+further removed: a comment was read as a proxy for what the code does now, when it records
+what someone believed while writing it. A comment is evidence about intent and history, not
+about current behaviour. Confirm the mechanism in the code, then read the comment for why.
+
+### Confirmed: the flicker is a coplanar double draw
+
+`settlementPresentationHolds` retains an unloaded chunk's presentation, and a hold carries a
+`road` component holding `layerMeshes.roads` and the `roadRibbonGeometry`. `held.group` is
+attached to `worldRoot` and is removed only when the hold is released. Nothing lowers its
+visibility - there is no `.visible = false` anywhere in `chunk-render-adapter.js`.
+
+The adapter states the overlap as a premise:
+
+```js
+if (projected?.group) roots.push(projected.group);
+if (held?.group && held.group !== projected?.group) roots.push(held.group);
+```
+
+One owner, two groups, both live. `createDrawableReplacementBarrier` makes this deliberate:
+the hold is released "only after the returning Near detail has crossed an actual completed
+renderer receipt", so a returning chunk's fresh road mesh and the held one coexist until the
+receipt lands. Both are built by `buildSettlementRoadRibbonMeshData` from the same road
+records at the same `surfaceOffsetMeters`, so they are exactly coplanar, and which one wins
+a pixel flips with the view. That is the flicker, and it recurs whenever chunks re-enter
+residency - which is to say, while moving.
+
+Cell-wise road publication would not close this window. It is a different axis: spatial
+granularity against LOD handover. Symptom 1 is separable and small; symptoms 3 and 4 remain
+with the single merged bucket.
+
+### The obvious site for the grounding fix has no roads in it
+
+Making contact aware of the road surface needs to know whether the player stands on one.
+The natural place is `gameplay-runtime.js`, beside `#tryTerrainHeightAt`, which reads
+`tankTerrainChunks`. That cache cannot answer it:
+
+```js
+sourceChunkData: Object.freeze({ chunkX, chunkZ, terrain: source.terrain }),
+```
+
+`#rememberTankTerrainChunk` deliberately keeps terrain and drops everything else, so
+`settlementFeatures` - and with them every road - are gone by the time the runtime samples a
+height. Roads are not colliders either, so the spatial models that answer
+`#canonicalPlayerColliders` do not carry them. There is currently no road geometry reachable
+from the layer that decides where the player's feet go.
+
+
 ### What is measured and what is inferred
 
 Measured: the 0.075 m offset; zero terrain poke-through in 560 samples; that the vertical
