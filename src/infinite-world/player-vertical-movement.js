@@ -84,6 +84,7 @@ export function createPlayerVerticalMovementState() {
   return {
     rootY: null,
     terrainHeightMeters: null,
+    surfaceLiftMeters: 0,
     groundRootY: null,
     footOffsetMeters: 0,
     heightMeters: 0,
@@ -93,21 +94,32 @@ export function createPlayerVerticalMovementState() {
   };
 }
 
-function applySurface(state, terrainHeightMeters, scaleProfile) {
+// The surface underfoot is the terrain plus whatever is laid on it. Roads are drawn
+// SETTLEMENT_ROAD_SURFACE_LIFT_METERS above the ground they follow, and this state knew only
+// about terrain, so the player's feet rested that far below the road they appeared to stand
+// on. footOffsetMeters shrinks with the scale stage while the road lift does not, so the
+// fixed 7.5 cm grew into a large fraction of a small player's height and they sank into the
+// carriageway.
+function applySurface(state, terrainHeightMeters, scaleProfile, surfaceLiftMeters) {
   const target = verticalState(state);
   const terrainHeight = finite(terrainHeightMeters, 'terrainHeightMeters');
+  const lift = Number.isFinite(surfaceLiftMeters) ? surfaceLiftMeters : 0;
+  if (lift < 0) throw new RangeError('surfaceLiftMeters must not be negative');
   const metrics = getScalePlayerVerticalMetrics(scaleProfile);
   target.terrainHeightMeters = terrainHeight;
+  target.surfaceLiftMeters = lift;
   target.footOffsetMeters = metrics.footOffsetMeters;
   target.heightMeters = metrics.heightMeters;
   target.radiusMeters = metrics.radiusMeters;
-  target.groundRootY = terrainHeight + metrics.footOffsetMeters;
+  target.groundRootY = terrainHeight + lift + metrics.footOffsetMeters;
   return metrics;
 }
 
-export function resetPlayerGrounding(state, { terrainHeightMeters, scaleProfile } = {}) {
+export function resetPlayerGrounding(state, {
+  terrainHeightMeters, scaleProfile, surfaceLiftMeters = 0,
+} = {}) {
   const target = verticalState(state);
-  applySurface(target, terrainHeightMeters, scaleProfile);
+  applySurface(target, terrainHeightMeters, scaleProfile, surfaceLiftMeters);
   target.rootY = target.groundRootY;
   target.velocityMetersPerSecond = 0;
   target.grounded = true;
@@ -127,11 +139,12 @@ export function stepPlayerVerticalMovement(state, {
   deltaSeconds,
   terrainHeightMeters,
   scaleProfile,
+  surfaceLiftMeters = 0,
 } = {}) {
   const target = verticalState(state);
   const delta = finite(deltaSeconds, 'deltaSeconds');
   if (delta < 0) throw new RangeError('deltaSeconds must not be negative');
-  const metrics = applySurface(target, terrainHeightMeters, scaleProfile);
+  const metrics = applySurface(target, terrainHeightMeters, scaleProfile, surfaceLiftMeters);
 
   if (!Number.isFinite(target.rootY) || target.grounded) {
     target.rootY = target.groundRootY;
@@ -155,6 +168,7 @@ export function snapshotPlayerVerticalMovement(state) {
   return Object.freeze({
     rootY: target.rootY,
     terrainHeightMeters: target.terrainHeightMeters,
+    surfaceLiftMeters: target.surfaceLiftMeters,
     groundRootY: target.groundRootY,
     footOffsetMeters: target.footOffsetMeters,
     heightMeters: target.heightMeters,

@@ -53,6 +53,9 @@ export function createInfiniteExperienceShell({
   worldState,
   initialScaleProfile,
   getTerrainHeightMeters,
+  // Roads are drawn above the terrain they follow, so the surface underfoot is not always
+  // the ground. A shell without this still runs; the player simply stands on the terrain.
+  getRoadSurfaceLiftMeters = () => 0,
   resolvePlayerHorizontalMovement = ({
     startX, startZ, displacementX, displacementZ,
   }) => Object.freeze({
@@ -79,6 +82,9 @@ export function createInfiniteExperienceShell({
 } = {}) {
   if (!worldState || typeof worldState.setScaleStage !== 'function') {
     throw new TypeError('experience shell requires the existing InfiniteWorldState');
+  }
+  if (typeof getRoadSurfaceLiftMeters !== 'function') {
+    throw new TypeError('getRoadSurfaceLiftMeters must be a function');
   }
   if (typeof getTerrainHeightMeters !== 'function') {
     throw new TypeError('experience shell requires the formal Terrain height resolver');
@@ -292,6 +298,7 @@ export function createInfiniteExperienceShell({
     state.lastScaleProfile = scaleProfile;
     return resetPlayerGrounding(state.playerVertical, {
       terrainHeightMeters: getTerrainHeightMeters(player.x, player.z),
+      surfaceLiftMeters: getRoadSurfaceLiftMeters(player.x, player.z),
       scaleProfile,
     });
   }
@@ -686,6 +693,7 @@ export function createInfiniteExperienceShell({
       deltaSeconds: state.paused ? 0 : deltaSeconds,
       terrainHeightMeters: Number.isFinite(resolvedTerrainHeightMeters)
         ? resolvedTerrainHeightMeters : getTerrainHeightMeters(player.x, player.z),
+      surfaceLiftMeters: getRoadSurfaceLiftMeters(player.x, player.z),
       scaleProfile,
     });
     const landed = !wasGrounded && vertical.grounded

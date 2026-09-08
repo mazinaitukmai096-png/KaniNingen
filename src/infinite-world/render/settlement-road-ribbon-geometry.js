@@ -1,3 +1,5 @@
+import { SETTLEMENT_ROAD_SURFACE_LIFT_METERS } from '../settlement-road-surface.js';
+
 const EPSILON = 1e-9;
 const POSITION_QUANTIZATION = 1e6;
 const DEFAULT_MITER_LIMIT = 3;
@@ -355,7 +357,7 @@ export function createSettlementRoadRibbonMeshWork({
   originX = 0,
   originZ = 0,
   unitsPerMeter = 1,
-  surfaceOffsetMeters = 0.075,
+  surfaceOffsetMeters = SETTLEMENT_ROAD_SURFACE_LIFT_METERS,
   miterLimit = DEFAULT_MITER_LIMIT,
   clipBounds = null,
 } = {}) {

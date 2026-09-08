@@ -1750,6 +1750,38 @@ constraint and the exception are compatible; the reason to slim was never "settl
 is heavy", it was "vegetation and presentation layers are".
 
 
+### The player now stands on the road, and the offset has one owner
+
+`applySurface` took only a terrain height and computed `groundRootY` from it, so the player's
+feet rested `SETTLEMENT_ROAD_SURFACE_LIFT_METERS` below the road they appeared to be on. It
+now takes a `surfaceLiftMeters` as well, supplied by the runtime from the road segments under
+the player.
+
+The lift itself was written down twice and agreed by coincidence - the render adapter's
+`3 / PRODUCTION_VISUAL_UNITS_PER_METER` and the ribbon builder's `0.075` default. Both now
+import `SETTLEMENT_ROAD_SURFACE_LIFT_METERS` from `settlement-road-surface.js`, which also
+carries the two functions the runtime needs. Adding a third consumer to a duplicated constant
+was not an option worth taking.
+
+The gameplay runtime keeps the road segments beside the terrain it already caches, in the
+lightest form a surface test can use - two endpoints and a half width. That respects the
+reason the cache is slimmed: it exists to avoid pinning presentation payload, and roads are
+0.2% of it.
+
+**The kerb is a step, not a ramp.** The 0.075 m is a drawing offset, not a rise in the
+ground; smoothing it would give the world a kerb it does not have and make an artefact of
+drawing into something the player can trip on. Stepping on and off is stateless and exactly
+reversible, so a player standing on the kerb line cannot be shaken by it - a regression test
+crosses it ten times and lands where one crossing did.
+
+**The surface test is a capsule, not a rectangle.** Roads chain end to end and their mitred
+joins widen the ribbon slightly, so a rectangle would leave slivers at the joins where the
+surface drops and returns, lifting and dropping a player standing there every frame -
+precisely the vibration a step risks. Overshooting a true dead end by a half width lifts
+someone 7.5 cm just past the road, which is harmless. The first version of the test asserted
+the rectangle and was wrong, not the code.
+
+
 ### What is measured and what is inferred
 
 Measured: the 0.075 m offset; zero terrain poke-through in 560 samples; that the vertical

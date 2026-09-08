@@ -46,8 +46,11 @@ import {
   projectedUploadDrawableObjects,
 } from '../render-upload-admission.js';
 import { W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID } from '../w8-parity-chunk-generator.js';
+import { SETTLEMENT_ROAD_SURFACE_LIFT_METERS } from '../settlement-road-surface.js';
 
-const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
+// One owner for the road drawing offset; the value used to be repeated here and as the
+// ribbon builder's default, agreeing by coincidence.
+const FINITE_ROAD_SURFACE_HEIGHT_METERS = SETTLEMENT_ROAD_SURFACE_LIFT_METERS;
 // How far a held Settlement presentation's road sits below the live one, so the two stop
 // fighting for pixels while both are attached. Not a chosen number: it is the separation
 // this renderer already puts between a road and the entrance forecourt laid over it, at

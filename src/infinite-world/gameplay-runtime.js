@@ -29,6 +29,10 @@ import {
   finiteWorldUnitsToMeters,
   getW6ScaleProfile,
 } from './gameplay-contract.js';
+import {
+  projectRoadSurfaceSegments,
+  roadSurfaceLiftMetersAt as roadSurfaceLiftAt,
+} from './settlement-road-surface.js';
 import { createDeterministicRandom, deriveLocalSeed64 } from './legacy-core/g0/deterministic-random.js';
 import { createWorldFeatureId } from './legacy-core/g0/stable-id.js';
 import { isW8NaturalCandidateVisible } from './w8-natural-presentation-policy.js';
@@ -1472,10 +1476,15 @@ export class InfiniteGameplayRuntime {
   #rememberTankTerrainChunk(key, chunkData) {
     if (!chunkData) return null;
     const source = chunkData.sourceChunkData;
+    // Terrain is kept and the rest dropped because holding whole Chunks behind a 128-entry
+    // cache pins 15.76 MiB of presentation payload against 0.54 MiB. Road segments are 0.2%
+    // of that and are needed here: the player stands on the terrain while the road they
+    // appear to be on is drawn SETTLEMENT_ROAD_SURFACE_LIFT_METERS above it.
     const cachedChunkData = source?.terrain
       ? Object.freeze({
         chunkX: chunkData.chunkX,
         chunkZ: chunkData.chunkZ,
+        roadSurfaceSegments: projectRoadSurfaceSegments(source.settlementFeatures),
         sourceChunkData: Object.freeze({
           chunkX: source.chunkX,
           chunkZ: source.chunkZ,
@@ -1547,6 +1556,16 @@ export class InfiniteGameplayRuntime {
       });
     this.pendingTankTerrainChunks.set(owner.key, pending);
     return pending;
+  }
+
+  // The road surface the player is standing on, or nothing when they are not on one. The
+  // step at the kerb is intentional: the lift is a drawing offset rather than a rise in the
+  // ground, so smoothing it would give the world a kerb it does not have.
+  roadSurfaceLiftMetersAt(x, z) {
+    const owner = logicalWorldToOwnedChunk(x, z);
+    const cached = this.tankTerrainChunks.get(owner.key);
+    if (!cached?.roadSurfaceSegments?.length) return 0;
+    return roadSurfaceLiftAt(x, z, cached.roadSurfaceSegments);
   }
 
   #tryTerrainHeightAt(x, z, requestMissingTerrain = true) {

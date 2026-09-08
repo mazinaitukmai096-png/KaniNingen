@@ -4488,6 +4488,7 @@ export async function bootInfiniteWorldSandbox({
       worldState,
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
+      getRoadSurfaceLiftMeters: (x, z) => gameplay.roadSurfaceLiftMetersAt(x, z),
       resolvePlayerHorizontalMovement: input => {
         const horizontalMovement = gameplay.resolvePlayerHorizontalMovement(input);
         const gatedMovement = gatePlayerMovementByTerrainCoverage({
