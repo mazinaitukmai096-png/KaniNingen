@@ -1574,6 +1574,91 @@ than its own frontage - which the inset above has already cleared, and where a t
 contact is the Lot meeting its own kerb.
 
 
+## Four Road symptoms, two causes
+
+Reported from the running game: the road surface flickers as the view moves; a small-scale
+player sinks into it; roads arrive later than trees while moving; roads sometimes break.
+They are not four bugs. Sinking is its own defect, and the other three are one.
+
+### Not z-fighting, and not the ground poking through
+
+The road ribbon is drawn at terrain height plus `FINITE_ROAD_SURFACE_HEIGHT_METERS`,
+`3 / PRODUCTION_VISUAL_UNITS_PER_METER` = **0.075 m**.
+
+Vertices are emitted only at road corner points and clip-boundary points -
+`roadVertexIndex` is the single caller of `heightAt`, and nothing subdivides a segment
+along its length - so a straight run is one quad interpolating between its endpoints while
+the terrain beneath it is a ~0.5 m grid free to rise in between. That is a real hazard, but
+it is not what is happening here. Sampling every road segment around a capital at 0.25 m:
+
+```
+road surface offset 0.075 m; 560 samples
+samples where the ground sits above the road surface: 0 (0.00%)
+worst poke-through: 0.0000 m
+segment length: min 0.1  median 4.5  max 16.8 m
+```
+
+Chunk clipping keeps segments short and the terrain is smooth at that scale, so the road
+never dips into the ground. Neither symptom is z-fighting against the terrain.
+
+### The player stands on the ground; the road floats above it
+
+`player-vertical-movement.js` knows only about terrain:
+
+```js
+function applySurface(state, terrainHeightMeters, scaleProfile) {
+  ...
+  target.groundRootY = terrainHeight + metrics.footOffsetMeters;
+}
+```
+
+There is no road term anywhere in the vertical state - `terrainHeightMeters` is the only
+surface it is given. So the player's feet rest 0.075 m below the road they appear to be
+standing on. At the default scale that gap is invisible. `footOffsetMeters` shrinks with the
+scale stage while the road offset does not, so as the player gets smaller the same 7.5 cm
+grows to a large fraction of their height and they visibly sink into the carriageway. That
+is the whole of symptom 2, and it is independent of the other three.
+
+### Every road in the world is one mesh, removed before its replacement is added
+
+`w8-distant-presentation.js` says it in its own comment:
+
+> Every Road in the world shares one merged bucket, and the live mesh is removed before the
+> replacement is added. When this generation still carries Road records but has not produced
+> a Road mesh yet, publishing it would drop the entire Road layer until some later
+> generation composes one - the player sees all Roads blink out together while moving.
+
+That is the reported flicker, the reported lateness and the reported gaps, in the source.
+Any recomposition anywhere - the player moving, a settlement entering range - rebuilds the
+single global road bucket, and the swap is remove-then-add.
+
+The comparison with trees is the asymmetry that makes roads feel worse. Trees publish per
+terrain cell (`canonicalTreeCell` staged alongside each `terrainCell`), so a moving player
+gets them incrementally and locally. Roads have no per-cell publication: one bucket for the
+world, recomposed whole.
+
+There is already a partial guard - `preserveExistingRoadWhenEmpty` and the
+`roadPriorityDeferredRemovalCount` path keep the last good roads when a generation carries
+road records but has not composed a mesh. It covers that one case, not recomposition in
+general.
+
+Two systems build road ribbons from the same geometry code: `chunk-render-adapter.js` for
+resident chunks and `w8-distant-presentation.js` for the merged distant bucket, handed over
+through `settlementReplacementBarrier`. The handover is a second place where a road can be
+briefly owned by neither.
+
+### What is measured and what is inferred
+
+Measured: the 0.075 m offset; zero terrain poke-through in 560 samples; that the vertical
+state has no road term; that roads are one merged bucket removed before replacement while
+trees publish per cell.
+
+Inferred, not yet confirmed against the running game: that the flicker the player sees *is*
+that bucket swap rather than something else on top of it. The static evidence is strong -
+the code comment describes the exact symptom - but it has not been watched with the road
+diagnostics on while flicker is happening.
+
+
 ## Running the test suite without losing two hours
 
 Every item here cost real time in this session. None of them is a defect in the code
