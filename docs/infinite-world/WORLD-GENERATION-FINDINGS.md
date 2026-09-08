@@ -1388,6 +1388,54 @@ relaxed".** Through the existing formula with CITY's own 85-95 preferred band it
 The relaxation has to be sourced deliberately and separately, not read out of 0.92.
 
 
+## Lots were allowed to lie under Roads
+
+`settlement-lot-v1` sized every Lot against the Block polygon and never against the Roads
+themselves. `footprintFromDescriptor` insets the Lot by half a Road width along `inward` -
+away from the Lot's own frontage - and nothing insets its two sides or its back:
+
+```js
+const roadInset = descriptor.segment.widthMeters / 2;
+const insetStart = { x: frontStart.x + descriptor.inward.x * roadInset, ... };
+// ... and the remaining three corners are placed by `inward * depth` alone
+```
+
+The containment test that follows, `polygonInsidePolygon(footprint, polygon)`, measures
+against a Block polygon drawn through Road **centre lines**. So neither failure is visible
+to it:
+
+- **Sideways.** Lots are laid along a boundary edge and centred with `remainder / 2` of
+  slack at each end. When an edge length is close to a whole multiple of the target Lot
+  width that slack is near zero, the end Lot reaches the Block corner, and the
+  perpendicular Road's half width - 0.925 m for a CITY lane - is already inside it.
+- **Backwards.** In a shallow Block the Lot's back edge lands within half a width of the
+  Road behind it, again inside the centre-line polygon.
+
+### The grid did not cause this; it exposed it
+
+The defect is as old as the Lot path. It stayed invisible because the Lot path was barely
+used: measured on the radial CITY, Blocks produced 3 Lots each and Lots supplied **7.3%**
+of a capital's buildings. Rectilinear Blocks tile with rectangular Lots, which took Blocks
+to 19 Lots each and the Lot share to **35.9%** - and six buildings immediately came out
+sitting on lanes they did not front onto.
+
+It is latent in the other classes too. Across a 48-Settlement sample the corrected check
+rejects five Lots outside CITY: RURAL 270 to 269 buildings, TOWN 477 to 473. Those never
+surfaced as building overlaps, but the Lot rectangles were under Roads all along.
+
+### Widening the Blocks is the wrong fix
+
+Scaling lane spacing with the lane count, so a fourth lane does not squeeze Blocks to 24 m,
+takes the overlaps from **6 to 4** - it never reaches zero, because the sideways case is a
+corner effect rather than a depth effect. It also trades away the density the grid was
+built to gain. That change was reverted.
+
+Checking the Lot against the Roads themselves takes it to **0**, with no geometry change at
+all. `lotCoversRoad` rejects a candidate whose footprint overlaps any Road rectangle other
+than its own frontage - which the inset above has already cleared, and where a touching
+contact is the Lot meeting its own kerb.
+
+
 ## Running the test suite without losing two hours
 
 Every item here cost real time in this session. None of them is a defect in the code

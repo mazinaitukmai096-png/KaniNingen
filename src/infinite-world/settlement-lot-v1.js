@@ -223,6 +223,44 @@ function boundaryDescriptor({ block, edgeIndex, maps }) {
   };
 }
 
+// A Block polygon is drawn through Road centre lines, and footprintFromDescriptor insets
+// only along `inward` - away from the Lot's own frontage Road. Nothing insets the Lot's
+// two sides or its back, so a Lot flush against the end of its boundary edge reaches the
+// Block corner where the perpendicular Road's half width intrudes, and a Lot in a shallow
+// Block reaches within half a width of the Road behind it. polygonInsidePolygon cannot see
+// either, because it measures against those same centre lines.
+//
+// This has always been true. It stayed invisible while CITY produced three Lots per Block
+// on arc-bounded Blocks and the Lot path supplied 7% of its buildings; a rectilinear grid
+// raised that to 36% and the Lots started landing under the Roads. The Lot has to be
+// checked against the Roads themselves, not against the polygon of their centre lines.
+function roadFootprint(segment) {
+  const halfWidth = segment.widthMeters / 2;
+  const alongX = segment.end.x - segment.start.x;
+  const alongZ = segment.end.z - segment.start.z;
+  const length = Math.hypot(alongX, alongZ);
+  if (length <= GEOMETRY_EPSILON) return null;
+  const normalX = -alongZ / length * halfWidth;
+  const normalZ = alongX / length * halfWidth;
+  return Object.freeze([
+    point(segment.start.x + normalX, segment.start.z + normalZ),
+    point(segment.end.x + normalX, segment.end.z + normalZ),
+    point(segment.end.x - normalX, segment.end.z - normalZ),
+    point(segment.start.x - normalX, segment.start.z - normalZ),
+  ]);
+}
+
+function lotCoversRoad(footprint, frontageEdgeId, roadGraph) {
+  for (const segment of roadGraph.segments) {
+    // The frontage Road is already cleared by the inset above, and a touching contact there
+    // is the Lot meeting its own kerb rather than covering the carriageway.
+    if (segment.edgeId === frontageEdgeId) continue;
+    const rectangle = roadFootprint(segment);
+    if (rectangle && convexPolygonsOverlap(footprint, rectangle)) return true;
+  }
+  return false;
+}
+
 function footprintFromDescriptor(descriptor, frontageInterval, depth) {
   const canonicalStart = descriptor.canonicalForward ? descriptor.from : descriptor.to;
   const canonicalEnd = descriptor.canonicalForward ? descriptor.to : descriptor.from;
@@ -306,7 +344,8 @@ async function candidateLotsForBlock({ worldSeedHash, roadGraph, block, maps, po
       if (Math.abs(signedArea(footprint)) + GEOMETRY_EPSILON
           < SETTLEMENT_LOT_V1_PARAMETERS.minimumAreaSquareMeters
         || hasSelfIntersection(footprint)
-        || !polygonInsidePolygon(footprint, polygon)) {
+        || !polygonInsidePolygon(footprint, polygon)
+        || lotCoversRoad(footprint, descriptor.frontageEdgeId, roadGraph)) {
         frontageFailureCount += 1;
         continue;
       }
