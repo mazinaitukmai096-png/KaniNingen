@@ -48,6 +48,12 @@ import {
 import { W8_PROTECTED_SAFE_SPAWN_POND_STABLE_ID } from '../w8-parity-chunk-generator.js';
 
 const FINITE_ROAD_SURFACE_HEIGHT_METERS = 3 / PRODUCTION_VISUAL_UNITS_PER_METER;
+// How far a held Settlement presentation's road sits below the live one, so the two stop
+// fighting for pixels while both are attached. Not a chosen number: it is the separation
+// this renderer already puts between a road and the entrance forecourt laid over it, at
+// the same distances and in the same depth buffer, which is the same coplanar-surfaces
+// problem solved once already. 0.75 mm is far below a visible step.
+const HELD_ROAD_DEPTH_BIAS_METERS = 0.00075;
 // projectChunk remains fully staged while yielding; this only bounds one main-thread task.
 const CHUNK_PROJECTION_COOPERATIVE_SLICE_MS = 4;
 const CAMERA_COLLISION_EPSILON = 1e-7;
@@ -1521,6 +1527,21 @@ export class ChunkRenderAdapter {
       geometry.dispose?.();
       this.disposedChunkGeometries.add(geometry);
       this.counts.chunkOwnedGeometriesDisposed += 1;
+    }
+    // A hold and a returning projection are both attached to worldRoot for the same owner -
+    // the barrier releases the hold only once the returning Near detail crosses a completed
+    // renderer receipt, and #settlementPresentationRoots pushes both groups as a premise.
+    // Their road ribbons come from the same builder at the same surfaceOffsetMeters, so
+    // they are exactly coplanar and the depth comparison flips per pixel as the view moves.
+    // That is the flicker. Hiding the held roads instead would open, for the length of the
+    // window, precisely the gap the hold exists to cover, so the held surface is lowered to
+    // let the live one win. HELD_ROAD_DEPTH_BIAS_METERS is the separation this renderer
+    // already relies on between the road and the entrance forecourt laid on top of it.
+    for (const component of presentation.components ?? []) {
+      if (component.kind !== 'road') continue;
+      for (const mesh of component.meshes ?? []) {
+        mesh.position.y -= HELD_ROAD_DEPTH_BIAS_METERS * this.unitsPerMeter;
+      }
     }
     const held = {
       key: projected.key,

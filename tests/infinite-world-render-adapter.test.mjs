@@ -1472,6 +1472,20 @@ test('Settlement presentation hold releases Terrain and collision while retainin
   assert.equal(projected.group.children.some(child => /lot-paths/.test(child.name)), false);
   assert.equal(roadGeometry.disposed, false);
 
+  // A hold and a returning projection are both attached for the same owner, by design: the
+  // barrier releases the hold only once the returning Near detail is receipted. Their road
+  // ribbons are built identically, so unless the held one is pushed below the live one they
+  // are coplanar and fight for pixels as the view moves. Hiding it instead would open the
+  // gap the hold exists to cover.
+  const heldRoadMesh = projected.group.children
+    .find(child => child.name === 'infinite-settlement-roads');
+  assert.ok(heldRoadMesh, 'the hold keeps its road mesh attached');
+  assert.equal(heldRoadMesh.visible !== false, true, 'held roads stay drawn, not hidden');
+  assert.ok(heldRoadMesh.position.y < 0,
+    'a held road sits below the live one so the live one wins the depth test');
+  assert.ok(Math.abs(heldRoadMesh.position.y) < 0.01 * adapter.renderChunkSize,
+    'the bias is far below a visible step');
+
   await adapter.rebase({ renderOriginChunkX: 2, renderOriginChunkZ: -1, rebaseCount: 1 });
   assert.deepEqual({ x: projected.group.position.x, z: projected.group.position.z }, {
     x: -2 * adapter.renderChunkSize,

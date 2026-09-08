@@ -1707,6 +1707,49 @@ height. Roads are not colliders either, so the spatial models that answer
 from the layer that decides where the player's feet go.
 
 
+### Symptom 1 fixed by separating the two surfaces, not by hiding one
+
+Hiding the held roads would have opened, for the length of the window, exactly the gap the
+hold exists to cover - the same all-roads-gone failure the bucket guard was written for.
+Instead the held road mesh is lowered so the live one wins the depth test, and both stay
+drawn.
+
+`HELD_ROAD_DEPTH_BIAS_METERS` is 0.00075 m. It is not a chosen number: it is the separation
+this renderer already puts between a road and the entrance forecourt laid over it
+(`building.worldPosition.y + FINITE_ROAD_SURFACE_HEIGHT_METERS + 0.00075`), which is the
+same coplanar-surfaces problem in the same depth buffer at the same distances, already
+shipping. 0.75 mm is far below a visible step, and the step is only present while the hold
+is the sole road - during which there is nothing to compare it against.
+
+The duplicate draw itself remains. Earlier profiling put `render-draw` at 12-26% of render
+and render itself under a fifth of the frame, so a duplicated road ribbon is unlikely to
+matter; if it ever measures otherwise the fix is to shorten the window, not to hide a layer.
+
+### The terrain cache is slimmed for retention, and roads fit inside that reason
+
+`#rememberTankTerrainChunk` keeps `terrain` and drops the rest. Measured over 49 chunks
+around a capital:
+
+```
+per chunk                              at the 128-entry capacity
+  terrain only (cached today)  4.31 KiB      0.54 MiB
+  whole source chunk         126.11 KiB     15.76 MiB
+  settlementFeatures (all)     0.44 KiB      0.59 MiB
+  settlement roads only        0.26 KiB      0.57 MiB
+  roads as {start,end,width}   0.03 KiB      0.54 MiB
+```
+
+The slimming is justified and the reason is retention, not transfer - the whole chunk has
+already arrived when the cache trims it, so nothing is saved on the worker hop. What it
+saves is pinning 15.8 MiB of presentation payload behind a 128-entry cache long after the
+renderer let go.
+
+Roads are 0.2% of that payload. Retaining them costs 0.03 MiB at capacity, and retaining
+only the line segments and widths a surface-height test needs costs nothing measurable. The
+constraint and the exception are compatible; the reason to slim was never "settlement data
+is heavy", it was "vegetation and presentation layers are".
+
+
 ### What is measured and what is inferred
 
 Measured: the 0.075 m offset; zero terrain poke-through in 560 samples; that the vertical
