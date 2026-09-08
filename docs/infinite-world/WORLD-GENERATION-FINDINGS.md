@@ -2030,6 +2030,72 @@ lifted. It has no width, the surface either side of it is correct, and closing i
 a neighbour lookup near every boundary each frame. Recorded rather than fixed.
 
 
+## Symptom 4: the Road is attributed by its centre line and drawn with its width
+
+The tears are at Chunk boundaries, and the clip is not what makes them. Comparing the ribbon
+each Chunk *would* build without bounds against the union of what every Chunk actually draws,
+over a 9x9 window around a capital:
+
+```
+points inside the intended ribbon, drawn by nobody : 23 / 1120  (2.05%)
+every one of them lands in a Chunk across a boundary
+      from the Chunk owning the Road, and that Chunk does not list the Road
+
+scanned as a band 1.5 m either side of every Chunk boundary:
+  lost surface  9.21 m2 in 18 separate tears
+  largest       1.50 x 6.46 m   at the x = -1040 boundary
+  second        1.04 x 4.72 m   at the x = -1024 boundary
+```
+
+A Road record belongs to one Chunk, chosen by where its **centre line** runs, and each Chunk
+clips its own ribbon to its own square. But a ribbon has **width**: 39 of 42 Roads in the
+window have a carriageway reaching outside their owner's square. Where the neighbour holds
+its own piece of the same Road - a Road crossing the boundary head on - the two bands butt
+together and nothing is lost. Where the neighbour holds nothing covering that ground, the
+owner clips the spill away and no one else draws it.
+
+The worst case is a Road running nearly *along* a boundary. A 2.25 m major road at bearing
+103.1 degrees hugs x = -1040 and weaves across it, so consecutive pieces are attributed
+alternately to the Chunk either side; each piece's carriageway spills onto ground where the
+other Chunk holds a different piece of the same Road, covering different ground. The result
+is a tear running metres along the boundary. The attribution also emits an 8 cm segment,
+`(-1040, 2816.056652) -> (-1040.018765, 2816.137316)`, which is a piece of Road that exists
+only because the centre line crossed a line on a map.
+
+### The clip is correct, and so is the cap extension
+
+Both mechanisms that were suspected are intact and were measured working.
+
+`clipPolygonToBounds` emits exact vertices on the boundary, so adjacent bands meet with
+neither gap nor overlap. Of 48 Road endpoints landing on a Chunk boundary, 44 are continued
+by a neighbour at the same point, and sampling across all 44 crossings found no hole.
+
+`boundaryExtension` fires as designed. It exists precisely so an angled Road's square cap is
+pushed outward far enough that clipping leaves a full-width band flush with the boundary. All
+seven Roads carrying a tear reach the boundary at a degree-1 node lying exactly on it, so the
+extension applies in every one of those cases. Neither is the cause.
+
+The two ribbon builders are not the cause either. `chunk-render-adapter.js:1650` and
+`w8-distant-presentation.js:6066` pass identical clip bounds - the Chunk square - so the
+handover between resident and distant adds no mismatch. (`w8-distant-presentation.js` does
+still pass a hardcoded `surfaceOffsetMeters: 0.075` where the resident path now imports
+`SETTLEMENT_ROAD_SURFACE_LIFT_METERS`. It agrees today by coincidence, which is the condition
+that produced the duplicate in the first place.)
+
+### Cell-wise publication does not address this
+
+The reported lateness is gone, so the reason cell-wise publication was raised has lapsed. It
+would not help here in any case: this is not a granularity problem but an attribution one.
+The same rule - own by centre line, clip by square - applies at any cell size, and smaller
+cells make it worse by putting more boundary under the same amount of Road.
+
+What closes it is for a Chunk to build its ribbon from every Road whose **carriageway**
+intersects its square rather than every Road whose centre line it owns, then clip exactly as
+now. The clip stays the thing that prevents double drawing. Simply widening the clip bounds
+instead would have both Chunks paint the overlap, which is a coplanar double draw - symptom 1
+again, by a different route.
+
+
 ## Also worth knowing
 
 - **28% of CITY Settlements have no connectivity gateways.** `buildConnectivityGraphNear`
