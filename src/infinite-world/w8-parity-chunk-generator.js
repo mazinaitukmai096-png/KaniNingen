@@ -876,6 +876,77 @@ async function createWaterSurfaces(chunk, worldSeedHash) {
     .slice(0, W8_PARITY_CONTENT.maximumWaterSurfacesPerChunk);
 }
 
+// The finite game's findLandingSpot prefers a pond shore but says in its own comment
+// that it falls back when the map generated none: "池が生成されていない場合はマップ中心
+// 付近にフォールバックする". The port kept the preference and dropped the fallback, so a
+// preference became an absolute requirement and a seed with no wetland cell in range
+// could not boot at all. These candidates restore the fallback by offering the spawn
+// selector the same flat, settlement-clear cells createWaterSurfaces walks, minus its
+// wetland moisture gate. The point, corridor and clearance tests are unchanged: a dry
+// landing has to earn its place exactly as a pond does.
+async function createDryLandingCandidates(chunk, worldSeedHash) {
+  const cells = [];
+  const terrain = chunk.terrain;
+  const width = terrain.resolution.x;
+  const depth = terrain.resolution.z;
+  const cellWidth = LOGICAL_CHUNK_SIZE_METERS / (width - 1);
+  const cellDepth = LOGICAL_CHUNK_SIZE_METERS / (depth - 1);
+  for (let z = 0; z < depth - 1; z += 1) {
+    for (let x = 0; x < width - 1; x += 1) {
+      const indices = [z * width + x, z * width + x + 1, (z + 1) * width + x, (z + 1) * width + x + 1];
+      const heights = indices.map(index => terrain.heights[index] * terrain.heightUnitMeters);
+      const minimum = Math.min(...heights);
+      const maximum = Math.max(...heights);
+      if (maximum - minimum > 0.42) continue;
+      const localX = (x + 0.5) * cellWidth;
+      const localZ = (z + 0.5) * cellDepth;
+      const worldX = q6(chunk.chunkX * LOGICAL_CHUNK_SIZE_METERS + localX);
+      const worldZ = q6(chunk.chunkZ * LOGICAL_CHUNK_SIZE_METERS + localZ);
+      if (conflictsWithSettlement({ x: worldX, z: worldZ }, chunk, 0.5)) continue;
+      cells.push({ x, z, worldX, worldZ, minimum });
+    }
+  }
+  // Dropping the moisture gate leaves nearly every cell of the chunk qualifying, where a
+  // wetland leaves a handful. Spread the same per-chunk budget evenly over the survivors
+  // before hashing, so the fallback costs what the pond search already costs.
+  const budget = W8_PARITY_CONTENT.maximumWaterSurfacesPerChunk;
+  const stride = Math.max(1, Math.ceil(cells.length / budget));
+  const candidates = [];
+  for (let index = 0; index < cells.length; index += stride) {
+    const cell = cells[index];
+    const stableId = await stableFeatureId({
+      worldSeedHash,
+      featureType: 'dry-landing-candidate',
+      parentStableId: chunk.chunkId,
+      purposeKey: 'open-ground',
+      semanticLocalKey: `${cell.x}:${cell.z}`,
+    });
+    candidates.push(Object.freeze({
+      schemaVersion: 'w8-dry-landing-candidate-1',
+      stableId,
+      worldPosition: Object.freeze({ x: cell.worldX, y: q6(cell.minimum), z: cell.worldZ }),
+      owningChunkCoordinate: Object.freeze({ x: chunk.chunkX, z: chunk.chunkZ }),
+    }));
+  }
+  return candidates.sort((a, b) => a.stableId.localeCompare(b.stableId)).slice(0, budget);
+}
+
+// A dry landing reaches selectSafeExperienceSpawn through its water-surface parameter
+// because that is the candidate channel the selector takes, but it is not a pond: strip
+// the attribution so the HUD reports "none" and spawnSafety claims no water intersection.
+function attributeDryLanding(spawn) {
+  if (!spawn) return spawn;
+  return Object.freeze({
+    ...spawn,
+    pondStableId: null,
+    dryLandingStableId: spawn.pondStableId,
+    spawnSafety: Object.freeze({
+      ...spawn.spawnSafety,
+      waterSurfaceIntersections: Object.freeze([]),
+    }),
+  });
+}
+
 async function createSettlementLandmarks(
   chunk,
   seed,
@@ -2173,8 +2244,40 @@ export async function createW8ParityChunkGenerator({
           settlementLandmarks,
         });
       }
+      // The pond is the preference, not the requirement. When a seed grows no wetland
+      // within reach, fall back to open ground over the same radii, exactly as the finite
+      // game falls back when its map generated no pond. A world with a pond still starts
+      // on the same pond it does today: this loop only runs when the one above found none.
+      for (let radius = W8_SPAWN_SAFETY_CONTRACT.preparedDataRadiusChunks;
+        radius <= 6 && !experienceSpawn; radius += 1) {
+        const sourceChunks = await prepareSourceSquare(spawnOwner.chunkX, spawnOwner.chunkZ, radius);
+        const settlementLandmarks = (await Promise.all(sourceChunks
+          .map(source => createSettlementLandmarks(source, seed, base.worldSeedHash)))).flat();
+        // Where a wetland leaves a handful of cells, open ground leaves nearly the whole
+        // square, and every extra candidate costs a full 32-heading corridor sweep. The
+        // selector already prefers candidates within preferredPondDistanceMeters (16 m,
+        // one chunk) of the review spawn, so offer the owning chunk's open ground first
+        // and widen to the rest only if none of it survives. The obstacle set stays the
+        // whole prepared square either way; only the candidate supply narrows.
+        const owningChunk = sourceChunks.filter(source =>
+          source.chunkX === spawnOwner.chunkX && source.chunkZ === spawnOwner.chunkZ);
+        for (const candidateSources of [owningChunk, sourceChunks]) {
+          const dryLandings = (await Promise.all(candidateSources
+            .map(source => createDryLandingCandidates(source, base.worldSeedHash)))).flat();
+          if (!dryLandings.length) continue;
+          experienceSpawn = attributeDryLanding(selectSafeExperienceSpawn({
+            reviewSpawn: base.reviewSpawn,
+            waterSurfaces: dryLandings,
+            sourceChunks,
+            settlementLandmarks,
+          }));
+          if (experienceSpawn) break;
+        }
+      }
     }
-    if (!experienceSpawn) throw new Error('no safe W8 pond spawn and intro camera corridor were found');
+    if (!experienceSpawn) {
+      throw new Error('no safe W8 pond or dry landing with an intro camera corridor was found');
+    }
     const selectedOwner = decomposeLogicalWorldPosition(experienceSpawn.x, experienceSpawn.z);
     const preparedSources = preparedSpawnSources ?? await prepareSourceSquare(
         selectedOwner.chunkX,

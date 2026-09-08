@@ -939,6 +939,222 @@ and only 400 of 173,056 available candidates were sampled, so the real margin is
 wider. The point and corridor tests were left completely unchanged - the same clearance
 rules that a pond spawn passes today.
 
+## The fallback, restored
+
+`findLandingSpot`'s structure is back: pond if one exists, open ground if none does. The
+pond branch is untouched, so a world with a pond starts exactly where it starts today.
+
+### What was and was not changed
+
+`selectSafeExperienceSpawn` was not modified at all. Its point test, its 32-heading
+69.3 m corridor test, and its player and camera clearances are the same code that a pond
+start passes today. The investigation had already shown that dry candidates pass those
+tests unchanged, so there was nothing to relax and relaxing anything would have been the
+wrong fix.
+
+What was added is a second **candidate source**, `createDryLandingCandidates`, mirroring
+`createWaterSurfaces` cell for cell - the same terrain grid walk, the same 0.42 m height
+range, the same `conflictsWithSettlement(..., 0.5)` rejection, the same per-chunk budget
+- with the `moisture >= 0.64` gate removed. The pond loop runs first over radii 2..6; the
+dry loop runs only if it found nothing, over the same radii.
+
+A dry landing reaches the selector through its `waterSurfaces` parameter because that is
+the candidate channel the selector takes. `attributeDryLanding` then strips the pond
+attribution from the result, so `pondStableId` is `null`, `dryLandingStableId` carries the
+identity instead, and `spawnSafety.waterSurfaceIntersections` is empty rather than naming
+a pond the player is not standing in. The HUD already rendered `Pond: none` for a missing
+`pondStableId`.
+
+### Candidate volume, not candidate quality, is what costs
+
+The first version fed the whole prepared square's open ground to the selector: 598
+candidates, and the boot went from 2.9 s of failing to **18.3 s**, of which 14.0 s was
+inside `selectSafeExperienceSpawn`.
+
+The cause is not the tests being slow, it is that open ground *passes* them. A pond
+candidate wedged against a building aborts its corridor sweep on the first sample; open
+ground runs all 32 headings x 73 samples to completion. Measured per candidate: 11 ms on
+the pond path, 23 ms on the dry path.
+
+The selector cannot exit early - it ranks candidates by clearance, and that ranking is
+part of the contract that was deliberately left alone. So the supply was narrowed
+instead. The selector already prefers candidates within `preferredPondDistanceMeters`
+(16 m, exactly one chunk) of the review spawn, so the dry loop offers the owning chunk's
+open ground first and widens to the rest of the square only if none of it survives. The
+obstacle set stays the whole prepared square in both cases - only the candidate supply
+narrows, never the safety model.
+
+```
+                                    dry-build   select     boot total
+whole prepared square (598 cands)     2782 ms  13968 ms      18288 ms
+owning chunk first    ( 24 cands)       21 ms    475 ms       4773 ms
+```
+
+Every seed found its landing in the owning chunk on the first try; the widening branch
+has not yet been needed in any sample.
+
+### Measured result
+
+Same ten seeds as the 4/10 baseline, `generateChunk(0, 0)` under road-graph-v3 and
+settlement-lot-v2:
+
+| seed | before | after | landing |
+| --- | --- | --- | --- |
+| `KaniNingen Infinite Natural World` | boots | boots | pond, unchanged |
+| `city-probe-29` | boots | boots | pond, unchanged |
+| `city-probe-16` | boots | boots | pond, unchanged |
+| `road-v3-seed-c` | boots | boots | pond, unchanged |
+| `city-probe-35` | **throws** | boots | dry |
+| `city-probe-31` | **throws** | boots | dry |
+| `city-probe-3` | **throws** | boots | dry |
+| `W5 distributed golden` | **throws** | boots | dry |
+| `road-v3-seed-a` | **throws** | boots | dry |
+| `road-v3-seed-b` | **throws** | boots | dry |
+
+**4/10 -> 10/10.** The four pond seeds were re-run against a stashed tree and produce
+byte-identical spawns: same `x`, `y`, `z`, `facingY`, `cameraYaw`, same pond Stable ID,
+same clearances. The preference is intact; only the throw is gone.
+
+The six dry landings clear the contract with room to spare - player clearance 3.33 m to
+18.5 m against a 3.25 m requirement, camera clearance 3.08 m to 24.0 m against 0.6 m.
+They are not marginal passes.
+
+### The intro needs no branch
+
+The finite game's pond opening is authored - the player wakes in the water and walks to
+the shore - so a dry landing might have needed its own choreography. It does not. The
+intro is a camera move plus a forced forward walk, and neither half knows about water:
+
+- `experience-shell.js:740` drives the intro camera purely from `gameplayTimeMs`,
+  `facingY` and `playerRootY`. There is no water term.
+- `experience-shell.js:641` is the whole of intro locomotion: `forward = intro ? 1 : ...`
+  at `0.35` speed. No buoyancy, no swim state, no wade.
+- `world-state-store.js:634` `restartRun` reads only `playerSpawn.x` and `.z`. The spawn's
+  `y` never reaches the player; ground height is resampled at runtime.
+- `w8-natural-presentation-policy.js:158` clears vegetation along the intro corridor from
+  the spawn point and `facingY` alone.
+
+There is no swimming, buoyancy or water-collision code anywhere in the Infinite World. A
+dry landing plays the identical intro, so no presentation branch was written - adding one
+would have been inventing behaviour the game does not have.
+
+## Suspect this first when porting from the finite game
+
+Three separate investigations in this document, started from three unrelated symptoms,
+each ended at the same defect: **a rule that is graded or has a fallback in
+`src/game.js` became an absolute prohibition or an absolute requirement in the port.**
+
+| finite game | port | symptom it caused |
+| --- | --- | --- |
+| `grassPatches`: a staged clause, thinning near Settlements | an outright ban | Grass missing where it should have thinned |
+| `ROAD_KIND_DISTANCE_BIAS` MAJOR: 320 - an 8 m penalty on arterial frontage | `frontageEligible: false` - a boolean prohibition | the outer half of every Settlement held 2.4% of its buildings |
+| `findLandingSpot`: pond preferred, open ground otherwise | pond required, else `throw` | 6 of 10 seeds could not boot |
+
+The mechanism is the same each time. The finite rule expresses a *preference* through a
+weight, a penalty, a staged condition or a fallback branch. Porting compresses it to the
+end of its range that was easiest to reproduce - the hard end - and the intermediate
+behaviour disappears. Nothing crashes at the port, and the code reads as if it were
+always meant that way, so the loss is only visible much later as a shortage, an absence,
+or a failure rate.
+
+Two things follow for anyone porting more of `src/game.js`:
+
+- **Read the finite implementation, not the ported one, when a rule looks absolute.** All
+  three defects were found by opening `src/game.js` and finding the graded original -
+  twice with the intent written in a Japanese comment right above it, as with
+  `findLandingSpot`'s "池が生成されていない場合はマップ中心付近にフォールバックする".
+- **Restore the gradation, do not just invert the flag.** Flipping
+  `frontageEligible: false` to `true` would have produced something looser than the
+  finite game, not equal to it; the fix reused the finite table's own MAJOR: 320 as an
+  8 m suppression. Likewise, removing the pond requirement outright would have discarded
+  a deliberate opening; the fix kept the pond first and restored only the fallback.
+
+
+## Running the test suite without losing two hours
+
+Every item here cost real time in this session. None of them is a defect in the code
+under test, and all of them look like one.
+
+### Do not run the whole suite in parallel
+
+`node --test "tests/*.test.mjs"` runs files concurrently. In this session one worker
+went to **zero CPU progress for two hours** and the run never ended. The parallel
+runner also gives no file attribution, so a hang cannot be traced to the file that
+caused it.
+
+Run per file instead. It is slower in the best case and far faster in the bad case,
+and a hang names itself:
+
+```sh
+while IFS= read -r f; do
+  echo "== $f"
+  node --test "$f" 2>&1 | grep -E '^ℹ (tests|pass|fail)|^✖'
+done < filelist
+```
+
+Two further traps in that loop:
+
+- **`timeout N node --test ...` does not reliably kill it on Windows.** A run given
+  `timeout 500` was still alive at 640 s. Check for survivors with
+  `Get-CimInstance Win32_Process -Filter "Name='node.exe'"` and stop them by PID.
+- **Redirecting to a file block-buffers the output.** `node --test ... > log.txt` does
+  not line-buffer, so the file plateaus for minutes and looks hung when it is not, and
+  a partial flush read as progress gives a wrong failure count. Judge liveness from
+  process CPU time, not from the log's length.
+
+### Killing a run orphans an http-server, and the orphan holds port 8021
+
+`infinite-world-w5-sandbox-boot.test.mjs` and `infinite-world-w5-http-entry.test.mjs`
+serve the repo on `127.0.0.1:8021`. Cancelling a run - a tool-level task stop, Ctrl-C,
+anything that does not let the test tear down - leaves `npx http-server . -p 8021`
+running. **The next run of those files then blocks forever waiting for the port**, with
+no error message that mentions the port.
+
+This happened twice here and produced two false conclusions before it was found: once a
+"hung test suite", once a "failing test file" that actually passes 24 of 25. Before
+blaming a boot test, check:
+
+```sh
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { \$_.CommandLine -like '*http-server*' } | Select-Object ProcessId, CommandLine"
+```
+
+and kill what it finds.
+
+### Gates that cannot go green on this machine
+
+Some tests can never pass here, so a red suite is the normal state and the only useful
+question is *which* tests are red compared with a clean tree:
+
+- **CRLF byte-identity guards.** They compare `readFileSync(path, 'utf8')` with
+  `git show <baseline>:<path>`. `autocrlf` is on, the working copy is CRLF, the blob is
+  LF, so the comparison cannot pass. This is most of the standing failures.
+- **Wall-clock performance gates.** `infinite-world-w5-sandbox-boot` (real boot path,
+  ~18 s budgets), `full production boot scheduling stays continuous through MAX sprint
+  direction changes` (120 s observed), `a newly visible full Chunk object is
+  damage-queryable before deferred presentation work` (383 s observed), and the
+  Presentation throughput gates all measure elapsed time. They fail or pass depending on
+  what else is running, and they flip between runs on an unloaded machine too - one of
+  them passed on the changed tree and failed on the clean tree in this session, which
+  means nothing.
+
+### How to tell a real regression from the standing noise
+
+Never compare failure *counts*, and never compare against a remembered number. Run the
+affected files twice - once as-is, once with the change stashed at the same HEAD - and
+diff the failing test **names**:
+
+```sh
+git stash push -- <your changed files>
+# run, collect names
+git stash pop
+# run, collect names, then: comm -23 changed.txt baseline.txt
+```
+
+Only the files that can reach the changed module need this. For a change confined to
+one module, that set is the tests importing it plus the tests importing its importers.
+For the spawn fallback above that was 39 of 108 files, and the diff was empty.
+
+
 ## Also worth knowing
 
 - **28% of CITY Settlements have no connectivity gateways.** `buildConnectivityGraphNear`

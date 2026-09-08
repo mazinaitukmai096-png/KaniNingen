@@ -704,3 +704,57 @@ test('Settlement center ownership deterministically adds finite-language landmar
       && value.owningChunkCoordinate.z === owner.chunkZ), true);
   }
 });
+
+// The finite game's findLandingSpot prefers a pond shore and falls back to open ground
+// when the map generated no pond. The port kept the preference and dropped the fallback,
+// so a seed with no wetland cell in reach threw instead of booting: 6 of 10 sampled seeds.
+// The fallback is restored, and it has to clear the same bar a pond clears.
+test('a seed with no pond in reach lands on open ground that passes the unchanged spawn contract', async () => {
+  // Documented in WORLD-GENERATION-FINDINGS.md as finding zero ponds at every search
+  // radius; before the fallback was restored this seed could not boot at all.
+  const generator = await createW8ParityChunkGenerator({ worldSeed: 'city-probe-35' });
+  const spawnPoint = generator.experienceSpawn;
+  assert.equal(spawnPoint.pondStableId, null, 'a dry landing must not be attributed to a pond');
+  assert.equal(typeof spawnPoint.dryLandingStableId, 'string');
+  assert.deepEqual(spawnPoint.spawnSafety.waterSurfaceIntersections, []);
+  assert.equal(spawnPoint.spawnSafety.safe, true);
+  assert.equal(spawnPoint.spawnSafety.introPathClear, true);
+  assert.equal(spawnPoint.spawnSafety.introCameraPathClear, true);
+  assert.equal(spawnPoint.spawnSafety.preparedChunkKeys.length, 25);
+  assert.ok(Number.isFinite(spawnPoint.facingY));
+  assert.ok(Number.isFinite(spawnPoint.cameraYaw));
+  assert.ok(spawnPoint.spawnSafety.minimumPlayerClearanceMeters
+    >= W8_SPAWN_SAFETY_CONTRACT.playerClearanceMeters);
+  assert.ok(spawnPoint.spawnSafety.minimumCameraClearanceMeters
+    >= W8_SPAWN_SAFETY_CONTRACT.cameraClearanceMeters);
+  // The point itself clears buildings, lots, landmarks and roads by the same margins the
+  // pond start is held to - the tests inside selectSafeExperienceSpawn were not relaxed.
+  const preparedChunks = await Promise.all(spawnPoint.spawnSafety.preparedChunkKeys
+    .map(key => key.split(',').map(Number))
+    .map(([chunkX, chunkZ]) => generator.generateChunk(chunkX, chunkZ)));
+  for (const prepared of preparedChunks) {
+    for (const feature of prepared.settlementFeatures ?? []) {
+      if (feature.featureType === 'settlement-road') {
+        assert.ok(distanceToSegment(spawnPoint, feature.start, feature.end)
+          >= feature.widthMeters / 2 + W8_SPAWN_SAFETY_CONTRACT.roadClearanceMeters);
+      } else if (feature.featureType === 'settlement-building') {
+        assert.ok(pointToRotatedRectangleDistance(spawnPoint, {
+          x: feature.worldPosition.x, z: feature.worldPosition.z,
+          width: feature.widthMeters, depth: feature.depthMeters,
+          rotationY: feature.rotationY,
+        }) >= W8_SPAWN_SAFETY_CONTRACT.playerClearanceMeters);
+      }
+    }
+    for (const landmark of prepared.settlementLandmarks ?? []) {
+      assert.ok(pointToRotatedRectangleDistance(spawnPoint, {
+        x: landmark.worldPosition.x, z: landmark.worldPosition.z,
+        width: landmark.widthMeters, depth: landmark.depthMeters,
+        rotationY: landmark.rotationY,
+      }) >= W8_SPAWN_SAFETY_CONTRACT.playerClearanceMeters);
+    }
+  }
+  // The fallback is a fallback: a world that has a pond in reach still starts on it.
+  const pondWorld = await createW8ParityChunkGenerator({ worldSeed: seed });
+  assert.equal(typeof pondWorld.experienceSpawn.pondStableId, 'string');
+  assert.equal(pondWorld.experienceSpawn.dryLandingStableId, undefined);
+});
