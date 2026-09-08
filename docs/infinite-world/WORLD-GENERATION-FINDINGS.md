@@ -1234,6 +1234,160 @@ because supply is no longer the binding constraint - the CITY maximum is now 61 
 64 cap, so `requestedBuildingCount` starts binding next.
 
 
+## The profile says GRID and the implementation draws a starburst
+
+The capital reads as radial from every angle. That is not a tuning problem; the CITY
+grammar builds radial COLLECTOR spokes from a hub plus concentric arcs, and the local
+streets added above are stubs growing off that skeleton.
+
+### `roadPattern` is never a branch condition in road-graph-v3
+
+`GRID` / `SEMI_GRID` / `ORGANIC` are compared **zero times**. The parameter reaches only
+three places, none structural: the `profileUsage` diagnostic echo, an RNG key prefix
+(`` `${profile.roadPattern}:main-axis` ``), and an edge `flags.grammar` label. The grammar
+is chosen by `legacySettlementClass === SETTLEMENT_TYPES.CITY` instead. This is the same
+"declared but unread" shape as `alleyCount`, and `hardBranchAngleMin/Max` is a third case -
+the finite game rejects branches outside it (`road-town-structure.js:962`), v3 never reads
+it and retreats through a hardcoded ladder that reaches +/-34 degrees, beyond the +/-15 the
+finite game would refuse.
+
+### Measured grid-ness, and the ordering is inverted
+
+Bearings of street segments (collector + local), folded modulo 90 degrees; concentration
+1.0 is a perfect grid, 0 is uniform.
+
+```
+class   roadPattern  gridBias   concentration   angular spread   exactRightAngleRate
+CITY    GRID         0.92          0.245          sigma 24.0 deg        3.0%
+TOWN    SEMI_GRID    0.58          0.422          sigma 18.8 deg        0.0%
+RURAL   ORGANIC      0.12          0.329          sigma 21.4 deg        0.0%
+finite capital                     ~1.0           sigma  0.6 deg      100% at 0/90
+```
+
+**The class declared GRID is the least rectilinear of the three.** No subjective judgement
+is needed to see the inconsistency.
+
+### `gridBias` is read six times and never reaches an angle in CITY
+
+The one place `gridBias` produces right angles is
+
+```js
+const gridAngle = 90 + (rawAngle - 90) * (1 - profile.gridBias);   // line 492
+```
+
+which lives in `createOrganicOrTownGrammar` - the grammar CITY never enters. CITY's 0.92 is
+the largest of the three and controls only warp damping on its radial corridors.
+
+It also turns out this term is nearly inert even where it does run. Decomposing the measured
+spread against what the formula alone can produce:
+
+```
+TOWN  band 75-105, gridBias 0.58  ->  formula gives sigma 3.6 deg
+      measured sigma 18.8 deg     ->  formula explains 3.7% of the variance
+CITY  band 85-95,  gridBias 0.92  ->  formula gives sigma 0.23 deg
+```
+
+The spread comes from the parent-relative frame, not the angle term: branches are grown
+perpendicular to the local tangent of a *curved* collector, so a perfectly perpendicular
+branch still lands on an arbitrary absolute bearing. **Perpendicularity to a curved parent
+does not make a grid; a grid needs a global axis frame.** Routing CITY through the organic
+grammar as a probe confirms it - the ordering becomes correct (CITY 0.466 > TOWN 0.424 >
+RURAL 0.329) but concentration only reaches 0.466, still sigma ~18 degrees.
+
+### The grammar calls itself a grid
+
+`GATEWAY_RADIAL_WARPED_GRID_WITH_INCOMPLETE_CROSS_CONNECTIONS`. The name carries
+"WARPED_GRID"; the implementation is radial spokes and arcs.
+
+### The reference implementation fails the validation
+
+The finite capital's own street network, measured against v3's CITY invariants:
+
+```
+nodes 43  edges 42  components 1
+
+cycleRank                    = 0   required 2..3   FAIL   a pure tree
+collector/spine route count  = 2   required 2..3   PASS
+centerJunctionDensity > outer      10 / 0          PASS
+incomplete cross connections = 0   required >= 1   FAIL   it has no arcs at all
+```
+
+Two of the four CITY invariants reject the thing they are supposedly describing.
+
+`CITY requires incomplete cross connections` is the decisive one. `crossConnection: true`
+and `incomplete: true` are **hardcoded literals at the single `addArcConnection` call
+site** - never computed, never false. So the check reduces to "at least one edge came from
+`addArcConnection`". It tests provenance, not a property. A validator that names an
+implementation function cannot be describing what a city is.
+
+### The radial structure is new in v3, and undocumented
+
+- The finite game contains no radial road generation at all: no `fromPolar`, no concentric
+  ring, no angular spoke placement in `road-town-structure.js`.
+- `road-graph-v1` has no CITY-specific grammar. All three classes use
+  `OFFSET_COLLECTOR_SPINE_WITH_LOCAL_BRANCHES` - spine plus branches, the finite shape -
+  and CITY differs only by a branch-length coefficient (0.46 against 0.42).
+- `road-graph-v2` has no CITY-specific grammar either, only a per-class count.
+- `createCityGrammar` arrives whole in commit `290888d`, "Add experimental settlement road
+  graph v3". The message is that one line. There is no design note in the commit, in the
+  code, in the tests, or in any document.
+
+### The fifth porting instance: the structure itself was replaced
+
+| # | finite rule | what the port did | shape |
+| --- | --- | --- | --- |
+| 1 | `grassPatches`: staged thinning | outright ban | graded -> absolute |
+| 2 | arterial frontage: 8 m penalty | `frontageEligible: false` | graded -> absolute |
+| 3 | `findLandingSpot`: pond preferred | pond required, else throw | fallback -> absolute |
+| 4 | capital: six LOCAL branches | resolved to 6, multiplied by an unrelated bias to 1 | correct value, wrong consumer |
+| 5 | capital: 100% of angles at 0/90 | radial spokes plus arcs | **structure replaced** |
+
+The first four are reachable by following a value or a rule. The fifth is not: every value
+matches, every rule matches, and `localBranchCount`, `deadEndBias` and `densityMultiplier`
+all lead nowhere. It surfaces only by cross-checking a declaration against its consumers -
+noticing that `roadPattern: GRID` is written down and that no line of code branches on that
+string. When porting, audit declared-but-unread parameters as a class; three of them
+(`alleyCount`, `roadPattern`, `hardBranchAngle*`) are unread in v3, and one of those turned
+out to be hiding a whole-structure divergence.
+
+### The Lot path is marginal in every class, CITY most of all
+
+Measured against the design question "does closing blocks make the Lot path work":
+
+```
+class   n    blocks  lots   from lots   frontage fallback   scatter   total
+CITY     18      34    113        66  (7.3%)        841        0       907
+TOWN    543     585   5380      2836 (12.7%)      17322     2142     22300
+RURAL   185      37    504       213  (7.8%)       2523        0      2736
+```
+
+CITY averages 1.9 blocks per Settlement, which tracks its `cycleRank` of 2-3, and those
+blocks yield 3.3 Lots each at 58% occupancy. **92.7% of a capital's buildings come from the
+frontage fallback, not from Lots.**
+
+This tempers the block argument. Closing two or three rectilinear blocks instead of arc
+blocks should raise both Lots-per-block and occupancy, because a rectangle tiles with
+rectangular Lots and a circular arc does not - but the path being improved currently
+supplies 7% of the buildings. Rectilinear blocks are worth doing for the shape of the
+result, not as a building-count lever. Any claim about the count has to be measured on a
+prototype rather than argued from the block count.
+
+
+### The goal here is not to reproduce the finite game
+
+The finite capital is a perfect lattice: every one of its 42 street segments lies at exactly
+0 or 90 degrees, and its branch spacings are even (380, 380 and 400, 400). Reproduced
+faithfully that reads as mechanical. The target is instead what `gridBias` 0.92 designates -
+mostly rectilinear, slightly relaxed - which lands deliberately short of the reference. This
+is a different decision from instances 1 through 4, where the finite intent was restored as
+found.
+
+One caveat carried into the design: **`gridBias` 0.92 does not itself produce "slightly
+relaxed".** Through the existing formula with CITY's own 85-95 preferred band it yields
+90 +/- 0.40 degrees, a concentration of 0.9999 - tighter than the finite capital measures.
+The relaxation has to be sourced deliberately and separately, not read out of 0.92.
+
+
 ## Running the test suite without losing two hours
 
 Every item here cost real time in this session. None of them is a defect in the code
