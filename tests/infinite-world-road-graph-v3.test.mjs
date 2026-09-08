@@ -172,6 +172,51 @@ test('v3 registers only a Road Graph stage and its adapter uses the existing Bui
   }
 });
 
+// CITY resolved localBranchCount 6 and densityMultiplier 1.25 into localGrowthCount 6, then
+// spent it as Math.round(localGrowthCount * deadEndBias); CITY's deadEndBias of 0.18 rounds
+// to 1, so a capital grew a single 21.7 m street where a TOWN grows 127.5 m. The finite
+// capital grows six LOCAL branches, three on each of two spines (road-town-structure.js:727),
+// which is the same 6. A street that cannot be placed is now omitted and counted rather than
+// failing the whole Settlement.
+test('CITY spends its resolved localGrowthCount on local streets and counts the ones it omits', async () => {
+  for (const fixturePromise of fixturePromises) {
+    const fixture = await fixturePromise;
+    const input = await graphInput(fixture, SETTLEMENT_TYPES.CITY);
+    const graph = await createRoadGraphV3(input);
+    assertCleanValidation(validateRoadGraphV3(graph));
+
+    const resolved = graph.metadata.profileUsage.resolvedLocalGrowthCount;
+    assert.equal(resolved, 6);
+    const omitted = graph.metadata.omittedRoutes;
+    const localDeadEndRoutes = new Set(graph.edges
+      .filter(edge => edge.class === 'local' && edge.flags?.localGrowth)
+      .map(edge => edge.flags.routeId));
+    // Every resolved street is either built or recorded as omitted - never silently dropped.
+    assert.equal(localDeadEndRoutes.size + omitted.length, resolved);
+    for (const entry of omitted) {
+      assert.equal(entry.class, 'local');
+      assert.equal(entry.reason, 'END_OR_CORRIDOR_BLOCKED');
+      assert.match(entry.routeId, /:local:dead-end:\d+$/);
+      assert.equal(localDeadEndRoutes.has(entry.routeId), false);
+    }
+
+    // The count survives into the diagnostic surface the Settlement template publishes.
+    const template = await createRoadGraphV3SettlementTemplate({
+      worldSeedHash: fixture.generator.worldSeedHash,
+      candidate: input.candidate,
+      connectivityGraph: input.connectivityGraph,
+      settlementLotMode: SETTLEMENT_LOT_V2_GENERATOR_ID,
+    });
+    assert.equal(template.roadSummary.omittedRouteCount, omitted.length);
+
+    // TOWN and RURAL keep their own grammar and omit nothing through this path.
+    for (const settlementType of [SETTLEMENT_TYPES.TOWN, SETTLEMENT_TYPES.RURAL]) {
+      const other = await createRoadGraphV3(await graphInput(fixture, settlementType));
+      assert.deepEqual(other.metadata.omittedRoutes, []);
+    }
+  }
+});
+
 test('three classes by three seeds satisfy common topology and class grammar metrics', async () => {
   const graphsByType = Object.fromEntries(Object.values(SETTLEMENT_TYPES).map(type => [type, []]));
   for (const fixturePromise of fixturePromises) {

@@ -546,6 +546,7 @@ export async function createRoadGraphV3SettlementTemplate({
       gatewayMode: graph.metadata.gatewayMode,
       gatewayHandoffCount: gatewayHandoffs.length,
       fallbackType: graph.metadata.fallbackType,
+      omittedRouteCount: graph.metadata.omittedRoutes.length,
       fictitiousGatewayCount: 0,
       blockCount: blocks.length,
       roadOnly: settlementLotMode !== SETTLEMENT_LOT_V1_GENERATOR_ID

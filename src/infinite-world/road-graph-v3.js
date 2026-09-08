@@ -803,19 +803,30 @@ async function createCityGrammar({
     crossConnectionCount += 1;
   }
 
-  const deadEndCount = clamp(Math.round(localGrowthCount * profile.deadEndBias), 1, 2);
-  for (let index = 0; index < deadEndCount; index += 1) {
+  // The finite capital grows six LOCAL branches - three on each of its two LOCAL spines
+  // (road-town-structure.js:727) - which is exactly this profile's localBranchCount of 6.
+  // This grammar resolved the same 6 into localGrowthCount and then spent it as
+  // Math.round(localGrowthCount * profile.deadEndBias); CITY's deadEndBias of 0.18 rounds
+  // that to 1, so a capital got a single 21.7 m street where a TOWN gets 127.5 m.
+  // deadEndBias decides how many local streets end blind, not how many exist.
+  const localStreetCount = localGrowthCount;
+  const omittedRoutes = [];
+  for (let index = 0; index < localStreetCount; index += 1) {
     const parent = routeRecords[index % routeRecords.length].middleNode;
     const record = routeRecords[index % routeRecords.length];
     const next = routeRecords[(index + 1) % routeRecords.length];
     let delta = positiveAngle(next.angle - record.angle);
     if (delta > Math.PI) delta -= Math.PI * 2;
-    const branchLength = radius * (0.13 + profile.outerRoadBias * 0.08);
+    // (0.13 + outerRoadBias * 0.08) sizes a decorative spur - 21.6 m here, too short to
+    // carry lots. These are the CITY's local streets now, so they take the local-street
+    // coefficient createOrganicOrTownGrammar already uses for the same job.
+    const branchLength = radius * (0.20 + profile.outerRoadBias * 0.13);
     let deadEndPlan = null;
     for (const angularFraction of [0.28 + index * 0.12, 0.5, 0.72]) {
       const branchAngle = record.angle + delta * angularFraction;
       const direction = fromPolar(branchAngle, 1);
-      for (const lengthScale of [1, 0.78, 0.58]) {
+      // Retreat as far as createOrganicOrTownGrammar does before giving up on a branch.
+      for (const lengthScale of [1, 0.82, 0.66, 0.48, 0.34, 0.24]) {
         const resolvedLength = branchLength * lengthScale;
         const endPosition = add(parent.position, scale(direction, resolvedLength));
         const curveNormal = perpendicular(direction);
@@ -831,7 +842,17 @@ async function createCityGrammar({
       }
       if (deadEndPlan) break;
     }
-    if (!deadEndPlan) throw new Error(`unable to grow planar CITY dead-end: ${index}`);
+    // A street that will not fit is one street fewer, not a Settlement that cannot exist.
+    // The finite game records the same outcome with
+    // omitRoute(..., ROAD_KINDS.LOCAL, 'END_OR_CORRIDOR_BLOCKED') and keeps building.
+    if (!deadEndPlan) {
+      omittedRoutes.push(Object.freeze({
+        routeId: `${settlementId}:local:dead-end:${index}`,
+        class: ROAD_GRAPH_CLASSES.LOCAL,
+        reason: 'END_OR_CORRIDOR_BLOCKED',
+      }));
+      continue;
+    }
     const { endPosition, bend } = deadEndPlan;
     await builder.addPolyline({
       startNode: parent,
@@ -850,6 +871,7 @@ async function createCityGrammar({
     localGrowthCount,
     majorRouteCount,
     loopCount: crossConnectionCount,
+    omittedRoutes: Object.freeze(omittedRoutes),
     grammar: 'GATEWAY_RADIAL_WARPED_GRID_WITH_INCOMPLETE_CROSS_CONNECTIONS',
   });
 }
@@ -1186,6 +1208,9 @@ export async function createRoadGraphV3({ worldSeedHash, settlement, gateways = 
       }),
       grammar: grammarResult.grammar,
       loopTarget: grammarResult.loopCount,
+      // Counted, not silent: a local street the grammar could not fit shows up here the
+      // way the finite game surfaces omittedRouteCount on its town summary.
+      omittedRoutes: grammarResult.omittedRoutes ?? Object.freeze([]),
       profileUsage: createProfileUsage(profile, grammarResult.localGrowthCount, grammarResult.majorRouteCount),
     }),
     nodes: Object.freeze(builder.nodes.sort((left, right) => left.nodeId.localeCompare(right.nodeId))),

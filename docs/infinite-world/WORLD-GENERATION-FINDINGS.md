@@ -1070,6 +1070,170 @@ Two things follow for anyone porting more of `src/game.js`:
   a deliberate opening; the fix kept the pond first and restored only the fallback.
 
 
+## The capital had one street
+
+CITY was the sparsest of the three classes: 22 segments over a 121.5 m radius, 8.9 km/km2,
+against TOWN's 32 over 94.5 m and 12.5 km/km2. The capital had fewer streets than a town.
+
+### localGrowthCount resolves to 6 and was then spent down to 1
+
+Both grammars compute the same expression, and CITY's result is the largest of the three:
+
+```
+             localBranchCount  densityMultiplier  round(branch * (0.8 + density * 0.2))
+CITY                6               1.25                  6.3  ->  6
+TOWN                5               1.02                  5.02 ->  5
+RURAL               3               0.68                  2.81 ->  3
+```
+
+`createOrganicOrTownGrammar` grows one local branch per station from that number.
+`createCityGrammar` used it in exactly one place:
+
+```js
+const deadEndCount = clamp(Math.round(localGrowthCount * profile.deadEndBias), 1, 2);
+```
+
+CITY's `deadEndBias` is 0.18, so `round(6 * 0.18)` is 1. **Every CITY grew exactly one
+local street** - `localDeadEndCount` measured min 1, median 1, max 1 across all 18. The
+clamp ceiling of 2 never bound; `deadEndBias` did. Measured composition:
+
+```
+CITY   city-inner-cross      4.83 seg   52.2 m   } structural cycle arcs
+       city-middle-cross     1.50 seg   54.0 m   } between the radial routes
+       city-local-dead-end   2.00 seg   21.7 m   <- the only street
+TOWN   local-growth         10.00 seg  127.5 m   <- five streets
+       partial-loop          5.36 seg   91.6 m
+RURAL  local-growth          6.00 seg   72.2 m   <- three streets
+       partial-loop          1.48 seg   33.1 m
+```
+
+**21.7 m of local street in a capital against 127.5 m in a town.** `deadEndBias` should
+decide how many local streets end blind, not how many exist.
+
+### createCityGrammar has no local-growth layer
+
+CITY dispatches to a separate grammar (`road-graph-v3.js:1152`). It builds radial COLLECTOR
+routes from a hub plus cross-connection arcs, and its LOCAL class is those arcs plus a
+decorative stub - there is no local-growth stage at all. `localSpineCount: 2` is
+repurposed there as `majorRouteCount`, the count of radial collectors, so the LOCAL spine
+concept the parameter names is gone.
+
+The finite game does have a capital grammar, and it grows **six** LOCAL branches: three on
+each of two LOCAL spines (`road-town-structure.js:727`, `spine0BranchPoints` and
+`spine1BranchPoints`). That is exactly `localBranchCount: 6`. The target was never a chosen
+number - the profile constant, this grammar's own resolved `localGrowthCount`, and the
+finite capital's actual branch count all say 6.
+
+### The fourth porting instance, and a different sub-shape
+
+This is the fourth time a finite-game rule arrived diminished, but it is **not** the shape
+of the first three, and looking for that shape would not have found it:
+
+| # | finite rule | what the port did | shape |
+| --- | --- | --- | --- |
+| 1 | `grassPatches`: staged thinning near Settlements | outright ban | graded -> absolute |
+| 2 | arterial frontage: an 8 m distance penalty | `frontageEligible: false` | graded -> absolute |
+| 3 | `findLandingSpot`: pond preferred, ground otherwise | pond required, else throw | fallback -> absolute |
+| 4 | capital: six LOCAL branches on two spines | value resolved to 6, then multiplied by an unrelated bias to 1 | **correct value, wrong consumer** |
+
+The first three are found by asking *"was this prohibition once conditional?"*. The fourth
+would pass that test - nothing is prohibited, no branch was deleted, and `localBranchCount`
+and `densityMultiplier` are both read and both correct. It is found instead by asking
+**"this parameter resolves to 6 - where does the 6 actually go?"**, and following the value
+to its single consumer. Trace resolved values to their use sites, not just rules to their
+conditions.
+
+### There is no radius-to-count mechanism anywhere
+
+Segment counts derive only from `settlementType` profile constants. `radius` appears solely
+as a multiplier on positions and lengths (`radius * 0.20`, `branchLength = radius * (...)`).
+The proof is in the data rather than the code: radius is a per-`townType` constant - capital
+121.5 m, church_town and school_town 94.5 m, residential and military 87.75 m, **suburb
+81 m** - while counts key off `settlementType`. Suburb and residential are 8% apart in
+radius and produce byte-identical counts. It is not a mechanism that misfires on CITY;
+there is none to misfire. CITY being 1.29x the radius of a TOWN at equal counts is therefore
+a guaranteed density deficit, not an accident.
+
+### Invariant headroom, measured before changing anything
+
+```
+collectorRouteCount  2..3      min 2  med 3  max 3     at the ceiling
+cycleRank            2..3      min 2  med 2  max 3     one spare cycle
+centerD > outerD               outer density is 0      wide
+junctionSpacing CV   > 0       min 0.264               wide
+straightContinuation <= 77.8   max 53.3                wide
+gatewayContinuity    < 25 deg  max 5.97                wide
+exactRightAngleRate            no CITY bound (TOWN < 50%, RURAL < 25%)
+```
+
+`cycleRank` is the only tight bound, and dead-end branches do not touch it: a tree edge adds
+one node and one edge. Only loops and through-connections raise it, and there is room for
+about one. `centerJunctionDensity > outerJunctionDensity` holds trivially because CITY has
+zero junctions outside 0.45r, and stays comfortable even with several.
+
+### "Zero failures in 18 samples" is not evidence
+
+Four variants were measured. The first three looked safe on the default seed's 18 CITY and
+were not:
+
+| variant | change | CITY buildings med | total (18) | **generation failures / 226** |
+| --- | --- | --- | --- | --- |
+| baseline | - | 39 | 705 | **0** |
+| A | `deadEndCount = localGrowthCount` | 43 | 784 | 2 (0.88%) |
+| B | A + the local-street length coefficient | 52 | - | 6 (2.65%) |
+| C | B + the organic fallback ladder | 52 | 907 | 2 (0.88%) |
+| **D** | **C + omit an unplannable street** | **52** | **907** | **0** |
+
+A alone buys only +11%: the stub coefficient `(0.13 + outerRoadBias * 0.08)` gives 21.6 m
+branches, too short to carry lots. The local-street coefficient the other grammar already
+uses, `(0.20 + outerRoadBias * 0.13)`, gives 33.8 m.
+
+**On 18 CITY, A, C and D all showed zero failures. On 226 CITY across seven seeds, A and C
+show 0.88%.** A generation throw is a world that will not load - the same class of bug as
+the spawn pond. The small sample said "safe" about two variants that are not. Sample size
+for a failure rate has to be set by the rate you would still refuse to ship, not by whatever
+the default seed happens to contain.
+
+### What shipped
+
+Four changes, all inside `createCityGrammar`. Three reuse values already in the file:
+
+- `deadEndCount = clamp(round(localGrowthCount * deadEndBias), 1, 2)` becomes
+  `localStreetCount = localGrowthCount`.
+- the branch length coefficient becomes the local-street one from
+  `createOrganicOrTownGrammar`.
+- the length-scale retreat ladder becomes that grammar's six-step ladder instead of three.
+- `throw new Error('unable to grow planar CITY dead-end')` becomes an omission. The finite
+  game does the same thing with `omitRoute(routeId, ROAD_KINDS.LOCAL, 'END_OR_CORRIDOR_BLOCKED')`
+  and keeps building. Omissions are counted, not silent: they appear in
+  `graph.metadata.omittedRoutes` as `{ routeId, class, reason }` and as
+  `roadSummary.omittedRouteCount`, mirroring the finite town summary's field of the same name.
+
+Measured result:
+
+```
+                     baseline     after      finite game (anchor)
+local segments       8 (8-11)     18 (14-21)
+total segments       29           39
+road length          411 m        592 m      819 m
+density              8.9          12.8 km/km2
+buildings median     39           52         50
+buildings total      705          907        898
+generation failures  0/226        0/226
+```
+
+CITY reaches the finite capital's building count rather than exceeding it. Before this,
+CITY and TOWN both sat at a median of 39 buildings - the capital and a town were
+indistinguishable; now the capital is 33% larger. TOWN and RURAL are unchanged: identical
+segment counts, lengths and densities, and zero omissions outside CITY. Across 141 CITY in
+four seeds, two settlements omitted three streets between them and generated normally at 16
+and 14 local segments instead of 18.
+
+Road length is still 592 m against the finite capital's 819 m. The building count matches
+because supply is no longer the binding constraint - the CITY maximum is now 61 against the
+64 cap, so `requestedBuildingCount` starts binding next.
+
+
 ## Running the test suite without losing two hours
 
 Every item here cost real time in this session. None of them is a defect in the code
