@@ -1878,6 +1878,121 @@ Only the files that can reach the changed module need this. For a change confine
 one module, that set is the tests importing it plus the tests importing its importers.
 For the spawn fallback above that was 39 of 108 files, and the diff was empty.
 
+## The grounding fix was wired to a cache nothing fills
+
+The road lift shipped, its tests passed, and in the running game the player was still
+buried in the carriageway. Two independent gaps, either of which alone produces the
+symptom.
+
+### Gap 1: the lift is answered from a cache the player never fills
+
+`roadSurfaceLiftMetersAt` reads `tankTerrainChunks` and, on a miss, returns 0 without
+requesting anything:
+
+```js
+const cached = this.tankTerrainChunks.get(owner.key);
+if (!cached?.roadSurfaceSegments?.length) return 0;
+```
+
+That cache is filled only by `#requestTankTerrainChunk`, reached from `#ensureTankTerrainAt`
+(Tank spawning and grounding) and from `#tryTerrainHeightAt` with `requestMissingTerrain`
+left true. Of those callers, the only one at the *player's* own position is the
+`#terrainHeightAt(player.x, player.z)` inside the Tank occurrence loop - and that loop
+`continue`s on `activeScaleStageId !== 'MAX'` several lines earlier. At the small scale
+stages, which is exactly where the sinking is visible, nothing puts the player's Chunk in
+that cache.
+
+Driving the real runtime with the real generator, standing on a drawn 1.85 m lane:
+
+```
+tank terrain cache entries at construction : 0
+roadSurfaceLiftMetersAt there              : 0
+  ... asked ten more times                 : 0,0,0,0,0,0,0,0,0,0
+tank terrain cache entries after asking    : 0
+
+what the answer would be if the cache were populated:
+  from the owner chunk  : 0.075  (1 segments)
+```
+
+The player's terrain height does not come from here at all. `getPlayerTerrainHeightMeters`
+calls `sampleCanonicalTerrainHeightMeters(x, z)` with no queried Chunk, which reads
+`runtime.getChunkData(...)` - the resident Chunk store, holding the whole Chunk. So the two
+halves of one contact decision were taken from two different data paths: the height from
+the resident store, the lift from a Tank cache. Only one of them is kept alive for the
+player.
+
+### Gap 2: the cached Chunk is the W5 source, which has no major Roads
+
+`#rememberTankTerrainChunk` slims a Chunk to `{chunkX, chunkZ, sourceChunkData:{terrain}}`,
+and the road projection was hung off the `source` variable already in hand:
+
+```js
+roadSurfaceSegments: projectRoadSurfaceSegments(source.settlementFeatures),
+```
+
+`chunkData.sourceChunkData` is the W5 source Chunk. The owner-level
+`chunkData.settlementFeatures` is built from it in `buildW8CanonicalChunkContext` as
+
+```js
+const settlementFeatures = [...localSettlementFeatures, ...majorRoadFeatures].sort(...)
+```
+
+so every inter-Settlement highway is appended after the source Chunk exists and is
+invisible to anything reading the source. 289 Chunks around a capital:
+
+```
+roads in BOTH source and owner         : 101
+roads drawn but not in source          :  33   (all 2.25 m, the major road network)
+roads in source but NOT drawn (phantom):   0
+owner-list roads reaching outside their own chunk square: 0 of 134
+```
+
+The owner list is also the *correct* list, not merely the larger one. It is what the
+renderer draws - `formal.roadsAndBuildings` is literally `chunk.settlementFeatures` - and it
+is post-filter: `sourceFeatures` drops Roads that intersect a Settlement Building, so the
+source list can contain Roads that are never drawn and would lift a player standing on
+nothing. That filter removed none in the measured seed, but the direction of the difference
+favours the owner list unconditionally.
+
+Nothing else in `src/` reads `sourceChunkData.settlementFeatures`; every other consumer of
+that field takes `contentHash` or `terrain`. The neighbouring reader in the same file,
+`createW6ChunkGameplay`, already takes Buildings from `chunkData.settlementFeatures`. The
+source read was the odd one out.
+
+## Named: a proxy is not the thing, and this is the fourth
+
+Four times in this work a thing that resembles the target was treated as the target.
+
+| what was consulted | what it was taken to prove | why it could not |
+| --- | --- | --- |
+| `roadPattern: GRID` in the profile | the roads form a grid | a declaration is an intent; nothing enforced it |
+| a code comment naming the symptom | the code still does that | a comment records a belief at writing time |
+| literal fixtures in a test | the runtime supplies this data | a fixture is data the test author chose |
+| projecting segments from Chunk data | the runtime answers a lift there | the runtime reads a cache, not the Chunk |
+
+The fourth is inside the diagnosis of the third. Having just concluded that the tests never
+exercised the live path, the measurement written to prove it also never exercised the live
+path - it called `projectRoadSurfaceSegments` on Chunk data directly and reported "40 of 40
+lift correctly". Through the runtime the same points answer 0. The habit survives being
+named once.
+
+**The check:** before believing a measurement, say out loud what the claim is about and what
+the measurement touched. If those are different objects, the measurement is evidence about
+the second one only. A declaration is not behaviour, a comment is not code, a fixture is not
+a supply, and a projection is not a runtime.
+
+### Partial success is more dangerous than none
+
+The supply was not missing, it was *incomplete*: 101 Roads present, 33 absent. Had it been
+empty the first probe would have shown 0 segments and the wiring would have been suspected
+immediately. Instead every settlement lane in the cache answered correctly, which read as
+confirmation, and the failure was pushed onto the one class of Road not being looked at.
+Gap 1 hid the same way behind Gap 2: a plausible cause was found and it stopped the search
+before the dominant cause was reached.
+
+A partial result should raise the question of what partitions it, before it is read as
+support. "Which cases work and which do not, and what separates them" is the first question
+of a partial pass, not a follow-up.
 
 ## Also worth knowing
 
