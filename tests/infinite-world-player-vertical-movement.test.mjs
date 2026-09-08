@@ -1,6 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { getW6ScaleProfile } from '../src/infinite-world/gameplay-contract.js';
+import { LOGICAL_CHUNK_SIZE_METERS } from '../src/infinite-world/chunk-coordinates.js';
+import { createW8ParityChunkGenerator } from '../src/infinite-world/w8-parity-chunk-generator.js';
+import { ROAD_GRAPH_V3_GENERATOR_ID } from '../src/infinite-world/road-graph-v3.js';
+import { SETTLEMENT_LOT_V2_GENERATOR_ID } from '../src/infinite-world/settlement-lot-v2.js';
 import {
   PLAYER_MODEL_VERTICAL_BOUNDS_UNITS,
   createPlayerVerticalMovementState,
@@ -12,6 +18,7 @@ import {
 } from '../src/infinite-world/player-vertical-movement.js';
 import {
   SETTLEMENT_ROAD_SURFACE_LIFT_METERS,
+  createRoadSurfaceLiftSampler,
   projectRoadSurfaceSegments,
   roadSurfaceLiftMetersAt,
 } from '../src/infinite-world/settlement-road-surface.js';
@@ -288,4 +295,129 @@ test('a road surface is found only inside the carriageway', () => {
     'the rounded cap keeps joins gap-free at the cost of a little overshoot');
   assert.equal(roadSurfaceLiftMetersAt(-2.5, 0, segments), 0, 'but it does not reach forever');
   assert.equal(roadSurfaceLiftMetersAt(5, 0, []), 0, 'a Settlement-free world lifts nothing');
+});
+
+// The tests above are the judgement layer: given segments, is the surface decided correctly.
+// They construct their segments from literals, so they say nothing about whether segments
+// reach the judgement at all - and the first version of this fix shipped with a judgement
+// that was never given any. These are the supply layer: real Chunks from the real generator,
+// read through the sampler the running game uses.
+async function generateRoadWindow() {
+  const generator = await createW8ParityChunkGenerator({
+    worldSeed: 'city-probe-22',
+    settlementRoadGraphGeneratorId: ROAD_GRAPH_V3_GENERATOR_ID,
+    settlementLotMode: SETTLEMENT_LOT_V2_GENERATOR_ID,
+  });
+  const spawn = generator.experienceSpawn;
+  const spawnChunkX = Math.floor(spawn.x / LOGICAL_CHUNK_SIZE_METERS);
+  const spawnChunkZ = Math.floor(spawn.z / LOGICAL_CHUNK_SIZE_METERS);
+  const chunks = new Map();
+  let majorRoad = null;
+  let settlementLane = null;
+  for (let dz = -3; dz <= 3; dz += 1) {
+    for (let dx = -3; dx <= 3; dx += 1) {
+      const chunkX = spawnChunkX + dx;
+      const chunkZ = spawnChunkZ + dz;
+      const chunk = await generator.generateChunk(chunkX, chunkZ);
+      chunks.set(`${chunkX},${chunkZ}`, chunk);
+      const sourceIds = new Set((chunk.sourceChunkData?.settlementFeatures ?? [])
+        .map(feature => feature.stableId));
+      for (const feature of chunk.settlementFeatures ?? []) {
+        if (feature.featureType !== 'settlement-road') continue;
+        // The major road network is appended to the owner Chunk after its W5 source exists,
+        // which is exactly what tells the two apart - and exactly what the broken supply
+        // could not see.
+        if (sourceIds.has(feature.stableId)) settlementLane ??= feature;
+        else majorRoad ??= feature;
+      }
+    }
+  }
+  await generator.shutdown?.();
+  return { chunks, majorRoad, settlementLane };
+}
+
+const roadWindow = await generateRoadWindow();
+
+test('the running game is supplied with both classes of Road', () => {
+  const { chunks, majorRoad, settlementLane } = roadWindow;
+  assert.ok(majorRoad, 'the sampled world must contain an inter-Settlement major road');
+  assert.ok(settlementLane, 'the sampled world must contain a Settlement street');
+  // Widths are asserted because the two classes are the two halves of the reported symptom:
+  // 2.25 m carriageways between Settlements and 1.85 m streets inside one.
+  assert.ok(majorRoad.widthMeters > 2, `major road width ${majorRoad.widthMeters}`);
+  assert.ok(settlementLane.widthMeters < 2, `street width ${settlementLane.widthMeters}`);
+
+  const sampleLift = createRoadSurfaceLiftSampler(
+    (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`) ?? null,
+  );
+  const lift = SETTLEMENT_ROAD_SURFACE_LIFT_METERS;
+  const pointOn = (road, t) => [
+    road.start.x + (road.end.x - road.start.x) * t,
+    road.start.z + (road.end.z - road.start.z) * t,
+  ];
+  // Every drawn Road in the window, not just the two representatives, and along its whole
+  // length rather than at a few chosen points.
+  const roads = [...chunks.values()].flatMap(chunk => (chunk.settlementFeatures ?? [])
+    .filter(feature => feature.featureType === 'settlement-road'));
+  assert.ok(roads.length >= 10, `the sampled world must carry Roads (${roads.length})`);
+  for (const road of roads) {
+    for (let step = 1; step < 40; step += 1) {
+      assert.equal(sampleLift(...pointOn(road, step / 40)), lift,
+        `${road.stableId} is drawn here and must lift the player`);
+    }
+  }
+  // Endpoints are sampled a micrometre inside. A Road that terminates exactly on a Chunk
+  // boundary has its last line owned by the neighbouring Chunk, which holds no piece of it,
+  // so that one line answers 0 - measured at 2 of 38 endpoints here, and gone at an inset of
+  // 1e-6 m. The seam has no width, the surface either side of it is right, and closing it
+  // would cost a neighbour lookup on every frame near a boundary.
+  for (const road of roads) {
+    const length = Math.hypot(road.end.x - road.start.x, road.end.z - road.start.z);
+    const inset = length > 0 ? 1e-6 / length : 0;
+    assert.equal(sampleLift(...pointOn(road, inset)), lift, `${road.stableId} start`);
+    assert.equal(sampleLift(...pointOn(road, 1 - inset)), lift, `${road.stableId} end`);
+  }
+  // A Chunk the store does not hold lifts nothing rather than throwing, which is the same
+  // degradation the terrain height takes on the same miss.
+  assert.equal(sampleLift(majorRoad.start.x + 1e6, majorRoad.start.z), 0);
+});
+
+test('the W5 source Chunk is not a supply of Roads', () => {
+  const { chunks, majorRoad } = roadWindow;
+  // This is the defect the fix was shipped with, kept as a guard. Reading the source Chunk
+  // looks right - it is where Settlement Roads are generated, and it answers correctly on
+  // every street - but it cannot see a single major road, so the failure was partial and
+  // read as success.
+  const sampleFromSource = createRoadSurfaceLiftSampler(
+    (chunkX, chunkZ) => chunks.get(`${chunkX},${chunkZ}`)?.sourceChunkData ?? null,
+  );
+  const midpointX = (majorRoad.start.x + majorRoad.end.x) / 2;
+  const midpointZ = (majorRoad.start.z + majorRoad.end.z) / 2;
+  assert.equal(sampleFromSource(midpointX, midpointZ), 0,
+    'if this ever lifts, the two feature lists have merged and the guard can go');
+
+  let ownerRoads = 0;
+  let sourceRoads = 0;
+  for (const chunk of chunks.values()) {
+    const roads = features => (features ?? [])
+      .filter(feature => feature.featureType === 'settlement-road').length;
+    ownerRoads += roads(chunk.settlementFeatures);
+    sourceRoads += roads(chunk.sourceChunkData?.settlementFeatures);
+  }
+  assert.ok(ownerRoads > sourceRoads,
+    `owner Chunks must carry more Roads than their sources (${ownerRoads} vs ${sourceRoads})`);
+});
+
+test('the sandbox reads the lift from the store it reads terrain heights from', () => {
+  // The one link the sampler test above cannot reach: which store the running game hands it.
+  // Answering a lift from a different store than the terrain height is what shipped broken,
+  // and nothing in the sampler can detect it.
+  const boot = readFileSync(
+    resolve(import.meta.dirname, '..', 'src/infinite-world/sandbox-boot.js'),
+    'utf8',
+  );
+  assert.match(boot, /createRoadSurfaceLiftSampler\(\s*\(chunkX, chunkZ\) => runtime\.getChunkData\(chunkX, chunkZ\),?\s*\)/);
+  assert.match(boot, /const chunkData = queriedChunkData \?\? runtime\.getChunkData\(/);
+  assert.doesNotMatch(boot, /roadSurfaceLiftMetersAt\(x, z\)/,
+    'the lift must not come back from the gameplay runtime Tank terrain cache');
 });

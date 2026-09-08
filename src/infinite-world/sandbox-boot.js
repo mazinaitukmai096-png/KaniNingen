@@ -39,6 +39,7 @@ import {
   createResidentWorldCoverage,
   planRuntimeTerrainReadySet,
 } from './chunk-streaming-plan.js';
+import { createRoadSurfaceLiftSampler } from './settlement-road-surface.js';
 import { sameRuntimeTransitionContract } from './runtime-transition-contract.js';
 import { ChunkRenderAdapter } from './render/chunk-render-adapter.js';
 import {
@@ -4045,6 +4046,12 @@ export async function bootInfiniteWorldSandbox({
       return lastSafePlayerTerrainHeightMeters;
     }
 
+    // The Road surface under the player, read from the resident Chunk store - the same store
+    // `sampleCanonicalTerrainHeightMeters` reads for the height these feet stand at.
+    const getPlayerRoadSurfaceLiftMeters = createRoadSurfaceLiftSampler(
+      (chunkX, chunkZ) => runtime.getChunkData(chunkX, chunkZ),
+    );
+
     function isPlayerTerrainCoveragePublished(owner) {
       const committed = runtime.getCommittedChunkState();
       return committed.transitionContract !== null
@@ -4488,7 +4495,7 @@ export async function bootInfiniteWorldSandbox({
       worldState,
       initialScaleProfile: getW6ScaleProfile(worldState.activeScaleStageId),
       getTerrainHeightMeters: getPlayerTerrainHeightMeters,
-      getRoadSurfaceLiftMeters: (x, z) => gameplay.roadSurfaceLiftMetersAt(x, z),
+      getRoadSurfaceLiftMeters: getPlayerRoadSurfaceLiftMeters,
       resolvePlayerHorizontalMovement: input => {
         const horizontalMovement = gameplay.resolvePlayerHorizontalMovement(input);
         const gatedMovement = gatePlayerMovementByTerrainCoverage({
