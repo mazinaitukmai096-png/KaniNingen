@@ -196,7 +196,7 @@ test('CITY spends its resolved localGrowthCount on local streets and counts the 
     for (const entry of omitted) {
       assert.equal(entry.class, 'local');
       assert.equal(entry.reason, 'END_OR_CORRIDOR_BLOCKED');
-      assert.match(entry.routeId, /:local:dead-end:\d+$/);
+      assert.match(entry.routeId, /:local:branch:\d+$/);
       assert.equal(localDeadEndRoutes.has(entry.routeId), false);
     }
 
@@ -257,7 +257,14 @@ test('three classes by three seeds satisfy common topology and class grammar met
         degree.set(edge.startNodeId, degree.get(edge.startNodeId) + 1);
         degree.set(edge.endNodeId, degree.get(edge.endNodeId) + 1);
       });
-      assert.ok(bendNodeIds.size > 0);
+      // The substantive rule is the one below: a bend is geometry, so it must have degree
+      // exactly 2. This non-vacuity guard rides along with it and only holds for a grammar
+      // that curves. In v3 a `bend` node is the articulation of a polyline drawn through
+      // intermediate points, and CITY's lattice runs straight from junction to junction, so
+      // it creates none - its nodes are crossings, branch junctions and terminals. (The
+      // finite capital does carry 21 degree-2 nodes, but those come from subdividing its
+      // straight runs, not from curvature, so it is not evidence that a grid should bend.)
+      if (settlementType !== SETTLEMENT_TYPES.CITY) assert.ok(bendNodeIds.size > 0);
       assert.ok([...bendNodeIds].every(nodeId => degree.get(nodeId) === 2));
       assert.equal(graph.edges.length, graph.segments.length);
 
@@ -281,9 +288,20 @@ test('three classes by three seeds satisfy common topology and class grammar met
         const majorRoutes = new Set(graph.edges.filter(edge => edge.flags.hierarchy === 'major-route')
           .map(edge => edge.flags.routeId));
         assert.ok(majorRoutes.size >= 2 && majorRoutes.size <= 3);
-        assert.ok(graph.edges.some(edge => edge.flags.crossConnection && edge.flags.incomplete));
+        // CITY declares roadPattern GRID, so its streets have to actually sit on two
+        // perpendicular axes. This replaces an assertion that the graph contain an edge
+        // flagged crossConnection and incomplete - two hardcoded literals at the single
+        // addArcConnection call site, which tested which function drew the edge rather
+        // than any property of the result, and which the finite capital fails outright
+        // because it has no arcs.
+        assert.ok(metrics.streetBearingConcentration >= 0.75,
+          `CITY street bearings are not rectilinear: ${metrics.streetBearingConcentration}`);
+        assert.ok(metrics.localDeadEndCount >= 1);
         assert.ok(metrics.centerJunctionDensity > metrics.outerJunctionDensity);
-        assert.ok(metrics.exactRightAngleRate < 0.5);
+        // No upper bound on right angles for CITY. The finite capital puts every one of
+        // its 42 street segments at exactly 0 or 90 degrees, so any ceiling below 100%
+        // rejects the reference layout; the bound that used to sit here was written for
+        // the radial grammar, where right angles were incidental.
         assert.ok(metrics.cycleRank >= 2 && metrics.cycleRank <= 3);
       }
     }

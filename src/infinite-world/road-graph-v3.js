@@ -22,6 +22,11 @@ export const ROAD_GRAPH_V3_ISOLATED_FALLBACK = 'CLASS_GRAMMAR_WITHOUT_FICTITIOUS
 
 const GEOMETRY_EPSILON = 1e-7;
 const ROAD_CLASS_SET = new Set(Object.values(ROAD_GRAPH_CLASSES));
+// The floor for CITY's street-bearing concentration, the measured form of the
+// `roadPattern: GRID` the profile declares. It has to reject what a non-grid produces -
+// the radial CITY this replaced measured 0.245 and the SEMI_GRID TOWN measures 0.422 -
+// while leaving room under the 0.90 to 0.95 band a deliberately loosened grid targets.
+const CITY_GRID_CONCENTRATION_MINIMUM = 0.75;
 const SETTLEMENT_CLASS_SET = new Set(Object.values(SETTLEMENT_TYPES));
 const q6 = value => {
   const rounded = Math.round(value / SETTLEMENT_NODE_QUANTIZATION.gridWidthMeters)
@@ -226,7 +231,18 @@ async function createBuilder({ worldSeedHash, settlementId, sourceOwner, widths 
       purpose,
       profileRevision: ROAD_GRAPH_V3_PROFILE_REVISION,
       sourceOwner,
-      flags: Object.freeze({ ...flags }),
+      // Every Road Edge carries a frontage verdict. addPolyline used to be the only place
+      // this default lived, so an edge added through addEdge directly got no verdict at
+      // all and silently dropped out of both frontage selection and Block Lot generation.
+      // The CITY lattice was built that way and lost its entire skeleton to it: 23 lanes
+      // frontage-ineligible, the closed Blocks rejected as NO_VALID_FRONTAGE, and a
+      // capital with 73% more road and half the buildable length. The default belongs on
+      // the primitive that makes the edge, not on one of its two callers. An explicit flag
+      // still wins - addGatewayConnection sets frontageEligible on an ARTERIAL on purpose.
+      flags: Object.freeze({
+        frontageEligible: roadClass !== ROAD_GRAPH_CLASSES.ARTERIAL,
+        ...flags,
+      }),
     });
     edges.push(edge);
     return edge;
@@ -258,7 +274,6 @@ async function createBuilder({ worldSeedHash, settlementId, sourceOwner, widths 
     routeNodes.push(resolvedEnd);
     for (let index = 1; index < routeNodes.length; index += 1) {
       await addEdge(routeNodes[index - 1], routeNodes[index], roadClass, `${purpose}:segment:${index - 1}`, {
-        frontageEligible: roadClass !== ROAD_GRAPH_CLASSES.ARTERIAL,
         ...flags,
         routeId,
         routeOrder: routeOrderStart + index - 1,
@@ -658,6 +673,22 @@ async function addArcConnection({ builder, center, radius, first, second, purpos
   });
 }
 
+// The profile declares `roadPattern: GRID` for CITY and nothing in this file ever branched
+// on that string; the grammar built radial COLLECTOR spokes from a hub with concentric arcs
+// between them. Measured, the class declared GRID was the least rectilinear of the three
+// (bearing concentration 0.245 against TOWN 0.422 and RURAL 0.329), while the finite
+// capital puts every one of its 42 street segments at exactly 0 or 90 degrees.
+//
+// The cause is the frame, not the angle term. Branches grown perpendicular to the local
+// tangent of a curved parent land on arbitrary absolute bearings, which is why `gridBias`
+// explains 0.01% of CITY's measured spread and 3.7% of TOWN's. A grid needs a global axis
+// frame, so this grammar lays a lattice on the `GRID:base-axis` frame it already computed
+// and used only to fan its spokes out.
+//
+// The lattice is deliberately not the finite capital's perfect one: that is regular in
+// angle and in spacing (380/380 and 400/400) and reads as mechanical. Angles stay rigid
+// here and the irregularity is spent on lane spacing instead, which is how real street
+// grids read - orthogonal streets, uneven blocks.
 async function createCityGrammar({
   builder,
   random,
@@ -668,94 +699,18 @@ async function createCityGrammar({
   gateways,
   requiredGatewayNodeIds,
 }) {
-  const extraRoute = gateways.length >= 3
-    || (gateways.length === 0 && await random.float01('GRID:major-route-count') < profile.densityMultiplier - 0.75);
-  const majorRouteCount = clamp(profile.localSpineCount + (extraRoute ? 1 : 0), 2, 3);
   const localGrowthCount = clamp(
     Math.round(profile.localBranchCount * (0.8 + profile.densityMultiplier * 0.2)),
     3,
     6,
   );
   const baseAngle = await random.float01('GRID:base-axis') * Math.PI * 2;
-  const directions = gateways.map(gateway => ({
-    key: gateway.gatewayId,
-    gateway,
-    direction: gateway.direction,
-    angle: gateway.angle,
-  }));
-  for (let index = directions.length; index < majorRouteCount; index += 1) {
-    const gridAngle = baseAngle + index * Math.PI * 2 / majorRouteCount;
-    const warp = await keyedSigned(random, `GRID:synthetic-route-angle:${index}`)
-      * (1 - profile.gridBias) * 0.32;
-    const angle = positiveAngle(gridAngle + warp);
-    directions.push({ key: `isolated:${index}`, gateway: null, direction: fromPolar(angle, 1), angle });
-  }
-  directions.splice(majorRouteCount);
-  directions.sort((left, right) => left.angle - right.angle || left.key.localeCompare(right.key));
-
-  const hubOffsetAngle = await random.float01('GRID:hub-offset-angle') * Math.PI * 2;
-  const hubOffsetRadius = radius * (1 - profile.centerConnectionBias) * 0.025;
-  const hub = await builder.addNode('central-junction', add(center, fromPolar(hubOffsetAngle, hubOffsetRadius)),
-    'city-central-junction');
-  const innerRadius = radius * (0.20 + (1 - profile.centerConnectionBias) * 0.055);
-  const middleRadius = radius * (0.40 + profile.junctionSpacingMultiplier * 0.025);
+  const axisA = fromPolar(baseAngle, 1);
+  const axisB = perpendicular(axisA);
   const outerRadius = radius * (0.62 + profile.outerRoadBias * 0.035);
-  const routeRecords = [];
 
-  for (let index = 0; index < directions.length; index += 1) {
-    const spec = directions[index];
-    const innerNode = await builder.addNode('central-junction', add(center, scale(spec.direction, innerRadius)),
-      `city-route:${index}:inner-junction`);
-    const middleNode = await builder.addNode('cross-junction', add(center, scale(spec.direction, middleRadius)),
-      `city-route:${index}:middle-junction`);
-    const outerNode = await builder.addNode(spec.gateway ? 'gateway-junction' : 'collector-terminal',
-      add(center, scale(spec.direction, outerRadius)),
-      `city-route:${index}:outer-junction`,
-      spec.gateway ? { gatewayId: spec.gateway.gatewayId } : {});
-    const routeId = `${settlementId}:collector:city-route:${index}`;
-    const tangentNormal = perpendicular(spec.direction);
-    const warpSign = (await random.float01(`GRID:route-warp-side:${index}`)) < 0.5 ? -1 : 1;
-    const nearestAngularGap = Math.min(...directions
-      .filter(other => other.key !== spec.key)
-      .map(other => {
-        const gap = positiveAngle(other.angle - spec.angle);
-        return Math.min(gap, Math.PI * 2 - gap);
-      }));
-    const desiredWarp = radius * (profile.localCurvature * 0.35 + (1 - profile.gridBias) * 0.01);
-    const angularClearance = innerRadius * Math.sin(Math.min(nearestAngularGap, Math.PI / 2)) * 0.12;
-    const warpAmount = Math.min(desiredWarp, angularClearance) * warpSign;
-    const firstBend = add(lerp(outerNode.position, middleNode.position, 0.5), scale(tangentNormal, warpAmount));
-    const secondBend = add(lerp(middleNode.position, innerNode.position, 0.5), scale(tangentNormal, -warpAmount * 0.75));
-    const thirdBend = lerp(innerNode.position, hub.position, 0.5);
-    let order = 0;
-    for (const [startNode, endNode, bend, label] of [
-      [outerNode, middleNode, firstBend, 'outer'],
-      [middleNode, innerNode, secondBend, 'middle'],
-      [innerNode, hub, thirdBend, 'inner'],
-    ]) {
-      const result = await builder.addPolyline({
-        startNode,
-        endNode,
-        intermediatePositions: [bend],
-        roadClass: ROAD_GRAPH_CLASSES.COLLECTOR,
-        purpose: `city-major-route:${index}:${label}`,
-        routeId,
-        routeOrderStart: order,
-        flags: { hierarchy: 'major-route', gatewayRoute: Boolean(spec.gateway), grammar: profile.roadPattern },
-      });
-      order += result.nodes.length - 1;
-    }
-    if (spec.gateway) {
-      await addGatewayConnection({ builder, gateway: spec.gateway, innerNode: outerNode, center, radius,
-        settlementId, requiredGatewayNodeIds });
-    }
-    routeRecords.push(Object.freeze({ ...spec, innerNode, middleNode, outerNode }));
-  }
-
-  const innerRecords = routeRecords.map(record => ({ ...record, node: record.innerNode }));
-  const middleRecords = routeRecords.map(record => ({ ...record, node: record.middleNode }));
-  const innerPairs = adjacentAngularPairs(innerRecords);
-  const middlePairs = adjacentAngularPairs(middleRecords);
+  // A 2 x n lattice encloses (2-1)(n-1) = n-1 bounded faces, so n of 3 or 4 puts the cycle
+  // rank on exactly 2 or 3, and which one it is varies by seed.
   const extraCycleProbability = clamp(
     (profile.densityMultiplier - 1) * 0.8
       + profile.centerConnectionBias * 0.3
@@ -763,119 +718,296 @@ async function createCityGrammar({
     0.25,
     0.75,
   );
-  const desiredCycles = 2 + (majorRouteCount === 3
-    && await random.float01('GRID:extra-cycle') < extraCycleProbability ? 1 : 0);
-  const usedPairKeys = new Set();
-  let crossConnectionCount = 0;
-  for (const pair of innerPairs.slice(0, Math.min(majorRouteCount - 1, desiredCycles))) {
-    const key = [pair.first.key, pair.second.key].sort().join('|');
-    usedPairKeys.add(key);
-    await addArcConnection({
-      builder,
-      center,
-      radius: innerRadius,
-      first: pair.first,
-      second: pair.second,
-      purpose: `city-inner-cross:${crossConnectionCount}`,
-      routeId: `${settlementId}:local:inner-cross:${crossConnectionCount}`,
-      profile,
-      outwardScale: 1 + (1 - profile.centerConnectionBias) * 0.06,
-    });
-    crossConnectionCount += 1;
-  }
-  for (const pair of middlePairs) {
-    if (crossConnectionCount >= desiredCycles) break;
-    const key = [pair.first.key, pair.second.key].sort().join('|');
-    if (!usedPairKeys.has(key) && middlePairs.some(candidate => (
-      usedPairKeys.has([candidate.first.key, candidate.second.key].sort().join('|'))
-    ))) continue;
-    await addArcConnection({
-      builder,
-      center,
-      radius: middleRadius,
-      first: pair.first,
-      second: pair.second,
-      purpose: `city-middle-cross:${crossConnectionCount}`,
-      routeId: `${settlementId}:local:middle-cross:${crossConnectionCount}`,
-      profile,
-      outwardScale: 1 + (1 - profile.gridBias) * 0.04,
-    });
-    crossConnectionCount += 1;
+  const laneBCount = (await random.float01('GRID:extra-cycle') < extraCycleProbability) ? 4 : 3;
+
+  // Lane positions carry the whole of the irregularity. The jitter scale is the one
+  // createOrganicOrTownGrammar already uses for its collector stations.
+  const spacingJitter = 0.055 / profile.junctionSpacingMultiplier;
+  const lanePositions = async (count, span, key) => {
+    const offsets = [];
+    for (let index = 0; index < count; index += 1) {
+      const regular = count === 1 ? 0 : (index / (count - 1) - 0.5) * span;
+      const jitter = await keyedSigned(random, `${key}:${index}`) * spacingJitter;
+      offsets.push(radius * (regular + jitter));
+    }
+    return offsets.sort((left, right) => left - right);
+  };
+  // Kept inside 0.45R so every lattice crossing counts as a center junction.
+  const laneA = await lanePositions(2, 0.52, 'GRID:lane-a');
+  const laneB = await lanePositions(laneBCount, 0.60, 'GRID:lane-b');
+  const laneEndScalar = offset =>
+    Math.sqrt(Math.max(outerRadius ** 2 - offset ** 2, (radius * 0.1) ** 2));
+
+  // localSpineCount is 2, so two lanes carry the branches: the outermost of each family,
+  // where growing away from the lattice leaves clear ground. Three branches each is what
+  // the finite capital grows (spine0BranchPoints 3 + spine1BranchPoints 3).
+  const outermost = offsets => offsets.reduce((best, value) =>
+    Math.abs(value) > Math.abs(best) ? value : best, offsets[0]);
+  const spineOffsets = [outermost(laneA), outermost(laneB)].slice(0, profile.localSpineCount);
+  const branchesPerSpine = Math.round(localGrowthCount / Math.max(1, spineOffsets.length));
+
+  // Branch attachment scalars are planned before the lanes are built so each one can be a
+  // node in its lane's chain. Splitting an existing edge afterwards would break planarity.
+  const branchPlans = [];
+  let branchIndex = 0;
+  for (let spine = 0; spine < spineOffsets.length; spine += 1) {
+    const acrossOffset = spineOffsets[spine];
+    const alongAxis = spine === 0 ? axisA : axisB;
+    const reach = laneEndScalar(acrossOffset);
+    for (let step = 0; step < branchesPerSpine; step += 1) {
+      const fraction = (step + 1) / (branchesPerSpine + 1);
+      const jitter = await keyedSigned(random, `GRID:branch-offset:${branchIndex}`) * spacingJitter;
+      branchPlans.push({
+        index: branchIndex,
+        spine,
+        alongAxis,
+        acrossOffset,
+        scalar: (fraction - 0.5 + jitter) * 2 * reach * 0.86,
+      });
+      branchIndex += 1;
+    }
   }
 
-  // The finite capital grows six LOCAL branches - three on each of its two LOCAL spines
-  // (road-town-structure.js:727) - which is exactly this profile's localBranchCount of 6.
-  // This grammar resolved the same 6 into localGrowthCount and then spent it as
-  // Math.round(localGrowthCount * profile.deadEndBias); CITY's deadEndBias of 0.18 rounds
-  // that to 1, so a capital got a single 21.7 m street where a TOWN gets 127.5 m.
-  // deadEndBias decides how many local streets end blind, not how many exist.
-  const localStreetCount = localGrowthCount;
-  const omittedRoutes = [];
-  for (let index = 0; index < localStreetCount; index += 1) {
-    const parent = routeRecords[index % routeRecords.length].middleNode;
-    const record = routeRecords[index % routeRecords.length];
-    const next = routeRecords[(index + 1) % routeRecords.length];
-    let delta = positiveAngle(next.angle - record.angle);
-    if (delta > Math.PI) delta -= Math.PI * 2;
-    // (0.13 + outerRoadBias * 0.08) sizes a decorative spur - 21.6 m here, too short to
-    // carry lots. These are the CITY's local streets now, so they take the local-street
-    // coefficient createOrganicOrTownGrammar already uses for the same job.
-    const branchLength = radius * (0.20 + profile.outerRoadBias * 0.13);
-    let deadEndPlan = null;
-    for (const angularFraction of [0.28 + index * 0.12, 0.5, 0.72]) {
-      const branchAngle = record.angle + delta * angularFraction;
-      const direction = fromPolar(branchAngle, 1);
-      // Retreat as far as createOrganicOrTownGrammar does before giving up on a branch.
-      for (const lengthScale of [1, 0.82, 0.66, 0.48, 0.34, 0.24]) {
-        const resolvedLength = branchLength * lengthScale;
-        const endPosition = add(parent.position, scale(direction, resolvedLength));
-        const curveNormal = perpendicular(direction);
-        for (const curveSign of [index % 2 ? -1 : 1, index % 2 ? 1 : -1]) {
-          const bend = add(lerp(parent.position, endPosition, 0.5),
-            scale(curveNormal, resolvedLength * profile.localCurvature * curveSign));
-          if (polylinePlanIsPlanar(builder, parent, null, endPosition, [bend])) {
-            deadEndPlan = { endPosition, bend };
-            break;
-          }
-        }
-        if (deadEndPlan) break;
-      }
-      if (deadEndPlan) break;
+  const laneBase = (alongAxis, acrossOffset) =>
+    add(center, scale(alongAxis === axisA ? axisB : axisA, acrossOffset));
+  const branchNodes = new Map();
+  for (const plan of branchPlans) {
+    const position = add(laneBase(plan.alongAxis, plan.acrossOffset), scale(plan.alongAxis, plan.scalar));
+    branchNodes.set(plan.index, await builder.addNode(
+      'local-junction', position, `city-branch-junction:${plan.index}`,
+    ));
+  }
+
+  // Gateway entry points are planned before the lanes are built, the same way the branch
+  // attachments are, so each one can be a node in its lane's chain. Routing to a lane end
+  // afterwards and turning to reach it cannot be made reliable: segmentsIntersect counts a
+  // bare touch as an intersection, and any turn that reaches a lane end either lands its
+  // corner on a lane or runs along one. Entering where the gateway's own bearing first
+  // meets a lane avoids the problem entirely - the approach is one radial leg, it stops at
+  // the first thing it reaches, and the lane already has a node there.
+  const axisComponent = (vector, axis) => vector.x * axis.x + vector.z * axis.z;
+  const gatewayEntries = [];
+  for (const gateway of [...gateways].sort((left, right) => left.angle - right.angle
+    || left.gatewayId.localeCompare(right.gatewayId))) {
+    const alongA = axisComponent(gateway.direction, axisA);
+    const alongB = axisComponent(gateway.direction, axisB);
+    let best = null;
+    for (let i = 0; i < laneA.length; i += 1) {
+      if (Math.abs(alongB) < 1e-6) continue;
+      const distance = laneA[i] / alongB;
+      const scalar = alongA * distance;
+      if (distance <= radius * 0.05 || distance >= outerRadius) continue;
+      if (Math.abs(scalar) >= laneEndScalar(laneA[i]) - 1e-6) continue;
+      if (!best || distance > best.distance) best = { family: 'a', index: i, distance, scalar };
     }
-    // A street that will not fit is one street fewer, not a Settlement that cannot exist.
-    // The finite game records the same outcome with
-    // omitRoute(..., ROAD_KINDS.LOCAL, 'END_OR_CORRIDOR_BLOCKED') and keeps building.
-    if (!deadEndPlan) {
+    for (let j = 0; j < laneB.length; j += 1) {
+      if (Math.abs(alongA) < 1e-6) continue;
+      const distance = laneB[j] / alongA;
+      const scalar = alongB * distance;
+      if (distance <= radius * 0.05 || distance >= outerRadius) continue;
+      if (Math.abs(scalar) >= laneEndScalar(laneB[j]) - 1e-6) continue;
+      if (!best || distance > best.distance) best = { family: 'b', index: j, distance, scalar };
+    }
+    if (!best) continue;
+    gatewayEntries.push({ gateway, ...best });
+  }
+  // Two gateways whose bearings meet the same lane at nearly the same point would put two
+  // nodes on top of each other, which the builder refuses.
+  const acceptedEntries = [];
+  for (const entry of gatewayEntries) {
+    const clash = acceptedEntries.some(other => other.family === entry.family
+      && other.index === entry.index && Math.abs(other.scalar - entry.scalar) < radius * 0.08);
+    if (!clash) acceptedEntries.push(entry);
+  }
+  const gatewayEntryNodes = new Map();
+  for (const entry of acceptedEntries) {
+    const alongAxis = entry.family === 'a' ? axisA : axisB;
+    const acrossOffset = entry.family === 'a' ? laneA[entry.index] : laneB[entry.index];
+    const position = add(laneBase(alongAxis, acrossOffset), scale(alongAxis, entry.scalar));
+    gatewayEntryNodes.set(entry.gateway.gatewayId, await builder.addNode(
+      'gateway-junction', position, `city-gateway-entry:${entry.gateway.gatewayId}`,
+      { gatewayId: entry.gateway.gatewayId },
+    ));
+  }
+
+  const crossings = [];
+  for (let i = 0; i < laneA.length; i += 1) {
+    crossings.push([]);
+    for (let j = 0; j < laneB.length; j += 1) {
+      crossings[i].push(await builder.addNode(
+        'cross-junction',
+        add(center, add(scale(axisA, laneB[j]), scale(axisB, laneA[i]))),
+        `city-lattice-crossing:${i}:${j}`,
+      ));
+    }
+  }
+
+  // Each lane runs out to the same outer circle the radial routes used, so the Settlement
+  // keeps its footprint.
+  const laneEndNodes = [];
+  const laneRecords = [];
+  const addLane = async (kind, index, alongAxis, acrossOffset, through) => {
+    const reach = laneEndScalar(acrossOffset);
+    const base = laneBase(alongAxis, acrossOffset);
+    const lowEnd = await builder.addNode('collector-terminal',
+      add(base, scale(alongAxis, -reach)), `city-lane-${kind}:${index}:low-end`);
+    const highEnd = await builder.addNode('collector-terminal',
+      add(base, scale(alongAxis, reach)), `city-lane-${kind}:${index}:high-end`);
+    const ordered = [...through].sort((left, right) => left.scalar - right.scalar);
+    const nodes = [lowEnd, ...ordered.map(entry => entry.node), highEnd];
+    laneEndNodes.push(
+      { node: lowEnd, axis: alongAxis, inward: 1, acrossOffset },
+      { node: highEnd, axis: alongAxis, inward: -1, acrossOffset },
+    );
+    for (let step = 1; step < nodes.length; step += 1) {
+      await builder.addEdge(nodes[step - 1], nodes[step], ROAD_GRAPH_CLASSES.LOCAL,
+        `city-lane-${kind}:${index}:segment:${step - 1}`, {
+          latticeLane: true,
+          grammar: profile.roadPattern,
+          routeId: `${settlementId}:local:lane-${kind}:${index}`,
+          routeOrder: step - 1,
+        });
+    }
+    laneRecords.push({ kind, index, base, alongAxis, acrossOffset, reach });
+  };
+
+  for (let i = 0; i < laneA.length; i += 1) {
+    const through = laneB.map((offset, j) => ({ node: crossings[i][j], scalar: offset }));
+    for (const plan of branchPlans) {
+      if (plan.spine === 0 && plan.acrossOffset === laneA[i]) {
+        through.push({ node: branchNodes.get(plan.index), scalar: plan.scalar });
+      }
+    }
+    for (const entry of acceptedEntries) {
+      if (entry.family !== 'a' || entry.index !== i) continue;
+      through.push({ node: gatewayEntryNodes.get(entry.gateway.gatewayId), scalar: entry.scalar });
+    }
+    await addLane('a', i, axisA, laneA[i], through);
+  }
+  for (let j = 0; j < laneB.length; j += 1) {
+    const through = laneA.map((offset, i) => ({ node: crossings[i][j], scalar: offset }));
+    for (const plan of branchPlans) {
+      if (plan.spine === 1 && plan.acrossOffset === laneB[j]) {
+        through.push({ node: branchNodes.get(plan.index), scalar: plan.scalar });
+      }
+    }
+    for (const entry of acceptedEntries) {
+      if (entry.family !== 'b' || entry.index !== j) continue;
+      through.push({ node: gatewayEntryNodes.get(entry.gateway.gatewayId), scalar: entry.scalar });
+    }
+    await addLane('b', j, axisB, laneB[j], through);
+  }
+
+  // Gateways. The approach node sits on the outer circle along the gateway bearing, so the
+  // ARTERIAL edge stays radial exactly as before, and the single COLLECTOR leg continues
+  // along that same bearing to the entry node planned into the lane above. One collinear
+  // leg is what holds gatewayContinuityAngles at zero, and stopping at the first lane the
+  // bearing reaches is what keeps it from crossing anything.
+  const routeRecords = [];
+  const usedLaneEnds = new Set();
+  const gatewayRouteIds = [];
+  for (const gateway of [...gateways].sort((left, right) => left.angle - right.angle
+    || left.gatewayId.localeCompare(right.gatewayId))) {
+    const entryNode = gatewayEntryNodes.get(gateway.gatewayId);
+    if (!entryNode) continue;
+    const approachNode = await builder.addNode('gateway-junction',
+      add(center, scale(gateway.direction, outerRadius)),
+      `city-gateway-approach:${gateway.gatewayId}`, { gatewayId: gateway.gatewayId });
+    // At most three trunk routes are allowed, so gateways past the third share the last id.
+    const routeId = gatewayRouteIds.length < 3
+      ? `${settlementId}:collector:gateway:${gateway.gatewayId}`
+      : gatewayRouteIds[gatewayRouteIds.length - 1];
+    if (gatewayRouteIds.length < 3) gatewayRouteIds.push(routeId);
+    await builder.addEdge(approachNode, entryNode, ROAD_GRAPH_CLASSES.COLLECTOR,
+      `city-gateway-route:${gateway.gatewayId}`, {
+        hierarchy: 'major-route',
+        gatewayRoute: true,
+        grammar: profile.roadPattern,
+        routeId,
+        routeOrder: 0,
+      });
+    await addGatewayConnection({ builder, gateway, innerNode: approachNode, center, radius,
+      settlementId, requiredGatewayNodeIds });
+    routeRecords.push(gateway.gatewayId);
+  }
+  // Branches grow outward, away from the lattice interior.
+  const omittedRoutes = [];
+  for (const plan of branchPlans) {
+    const attachNode = branchNodes.get(plan.index);
+    const outward = scale(plan.alongAxis === axisA ? axisB : axisA,
+      plan.acrossOffset >= 0 ? 1 : -1);
+    const branchLength = radius * (0.20 + profile.outerRoadBias * 0.13);
+    let endPosition = null;
+    for (const lengthScale of [1, 0.82, 0.66, 0.48, 0.34, 0.24]) {
+      const candidate = add(attachNode.position, scale(outward, branchLength * lengthScale));
+      if (!polylinePlanIsPlanar(builder, attachNode, null, candidate, [])) continue;
+      endPosition = candidate;
+      break;
+    }
+    if (!endPosition) {
+      // A street that will not fit is one street fewer, not a Settlement that cannot exist.
       omittedRoutes.push(Object.freeze({
-        routeId: `${settlementId}:local:dead-end:${index}`,
+        routeId: `${settlementId}:local:branch:${plan.index}`,
         class: ROAD_GRAPH_CLASSES.LOCAL,
         reason: 'END_OR_CORRIDOR_BLOCKED',
       }));
       continue;
     }
-    const { endPosition, bend } = deadEndPlan;
     await builder.addPolyline({
-      startNode: parent,
-      intermediatePositions: [bend],
+      startNode: attachNode,
       roadClass: ROAD_GRAPH_CLASSES.LOCAL,
-      purpose: `city-local-dead-end:${index}`,
-      routeId: `${settlementId}:local:dead-end:${index}`,
+      purpose: `city-local-branch:${plan.index}`,
+      routeId: `${settlementId}:local:branch:${plan.index}`,
       flags: { localGrowth: true, through: false, grammar: profile.roadPattern },
       endRole: 'dead-end',
       endPosition,
-      endPurpose: `city-local-dead-end:${index}:terminal`,
+      endPurpose: `city-local-branch:${plan.index}:terminal`,
     });
+  }
+
+  // A Settlement with no accepted neighbour still needs its two trunk routes, so promote
+  // lane ends to COLLECTOR stubs pointing out along their own lane.
+  let stubIndex = 0;
+  while (routeRecords.length < 2) {
+    const entry = laneEndNodes.find(value => !usedLaneEnds.has(value.node.nodeId));
+    if (!entry) break;
+    // The finite capital's trunk is an L - west to hub to corner, then a right angle north
+    // (road-town-structure.js:679) - so the stub bends once rather than running straight
+    // out. It also gives an isolated CITY, which has no gateway route, the bend nodes every
+    // Road Graph is expected to carry.
+    const outward = scale(entry.axis, -entry.inward);
+    const sideways = scale(entry.axis === axisA ? axisB : axisA,
+      entry.acrossOffset >= 0 ? 1 : -1);
+    const bendPosition = add(entry.node.position, scale(outward, radius * 0.09));
+    const stubPosition = add(bendPosition, scale(sideways, radius * 0.09));
+    if (!polylinePlanIsPlanar(builder, entry.node, null, stubPosition, [bendPosition])) {
+      usedLaneEnds.add(entry.node.nodeId);
+      continue;
+    }
+    await builder.addPolyline({
+      startNode: entry.node,
+      intermediatePositions: [bendPosition],
+      roadClass: ROAD_GRAPH_CLASSES.COLLECTOR,
+      purpose: `city-trunk-stub:${stubIndex}`,
+      routeId: `${settlementId}:collector:trunk:${stubIndex}`,
+      flags: { hierarchy: 'major-route', grammar: profile.roadPattern },
+      endRole: 'collector-terminal',
+      endPosition: stubPosition,
+      endPurpose: `city-trunk-stub:${stubIndex}:terminal`,
+    });
+    usedLaneEnds.add(entry.node.nodeId);
+    routeRecords.push(`trunk:${stubIndex}`);
+    stubIndex += 1;
   }
 
   return Object.freeze({
     localGrowthCount,
-    majorRouteCount,
-    loopCount: crossConnectionCount,
+    majorRouteCount: routeRecords.length,
+    loopCount: (laneA.length - 1) * (laneB.length - 1),
     omittedRoutes: Object.freeze(omittedRoutes),
-    grammar: 'GATEWAY_RADIAL_WARPED_GRID_WITH_INCOMPLETE_CROSS_CONNECTIONS',
+    grammar: 'GLOBAL_AXIS_LATTICE_WITH_PERPENDICULAR_BRANCHES',
   });
 }
-
 export function analyzeRoadGraphV3(graph) {
   const nodes = Array.isArray(graph?.nodes) ? graph.nodes : [];
   const edges = Array.isArray(graph?.edges) ? graph.edges : [];
@@ -932,6 +1064,67 @@ export function analyzeRoadGraphV3(graph) {
       junctionSpacings.push(length(subtract(junctions[first].position, junctions[second].position)));
     }
   }
+  // How tightly the street bearings sit on two perpendicular axes. Folding each bearing
+  // modulo 90 degrees collapses a rectilinear grid's two families onto one value, so the
+  // circular concentration of the folded angles is 1 for a perfect grid and 0 for bearings
+  // spread uniformly. Roads that leave for a neighbouring Settlement are excluded, because
+  // they are aimed at that neighbour rather than laid along the town plan: the arterial by
+  // class, and the collector approach that carries it inward by its gatewayRoute flag. The
+  // same exclusion applied to the finite capital is what shows all 42 of its street
+  // segments sitting at exactly 0 or 90 degrees.
+  const streetEdges = edges.filter(edge => (edge.class === ROAD_GRAPH_CLASSES.COLLECTOR
+    || edge.class === ROAD_GRAPH_CLASSES.LOCAL) && edge.flags?.gatewayRoute !== true);
+  let bearingCosine = 0;
+  let bearingSine = 0;
+  for (const edge of streetEdges) {
+    const start = nodesById.get(edge.startNodeId)?.position;
+    const end = nodesById.get(edge.endNodeId)?.position;
+    if (!start || !end) continue;
+    const folded = Math.atan2(end.z - start.z, end.x - start.x) * 4;
+    bearingCosine += Math.cos(folded);
+    bearingSine += Math.sin(folded);
+  }
+  const streetBearingConcentration = streetEdges.length
+    ? Math.hypot(bearingCosine, bearingSine) / streetEdges.length
+    : 0;
+
+  // Trunk routes are the ones carrying gateway or major-route traffic. Two are "linked"
+  // when a single street route touches nodes on both of them.
+  const trunkRouteIds = [...new Set(edges
+    .filter(edge => edge.flags?.hierarchy === 'major-route')
+    .map(edge => edge.flags?.routeId))].filter(Boolean).sort();
+  const nodeTrunkRoutes = new Map();
+  for (const edge of edges) {
+    if (edge.flags?.hierarchy !== 'major-route') continue;
+    for (const nodeId of [edge.startNodeId, edge.endNodeId]) {
+      if (!nodeTrunkRoutes.has(nodeId)) nodeTrunkRoutes.set(nodeId, new Set());
+      nodeTrunkRoutes.get(nodeId).add(edge.flags.routeId);
+    }
+  }
+  const linkedPairs = new Set();
+  const routeTouchedTrunks = new Map();
+  for (const edge of edges) {
+    if (edge.flags?.hierarchy === 'major-route') continue;
+    const routeId = edge.flags?.routeId;
+    if (!routeId) continue;
+    if (!routeTouchedTrunks.has(routeId)) routeTouchedTrunks.set(routeId, new Set());
+    for (const nodeId of [edge.startNodeId, edge.endNodeId]) {
+      for (const trunkId of nodeTrunkRoutes.get(nodeId) ?? []) {
+        routeTouchedTrunks.get(routeId).add(trunkId);
+      }
+    }
+  }
+  for (const touched of routeTouchedTrunks.values()) {
+    const list = [...touched].sort();
+    for (let first = 0; first < list.length; first += 1) {
+      for (let second = first + 1; second < list.length; second += 1) {
+        linkedPairs.add(`${list[first]}\u0000${list[second]}`);
+      }
+    }
+  }
+  const trunkRoutePairs = trunkRouteIds.length * (trunkRouteIds.length - 1) / 2;
+  const linkedTrunkRoutePairs = linkedPairs.size;
+
   const gatewayContinuityAngles = [];
   for (const edge of edges.filter(value => value.flags?.connectivityGateway)) {
     const gatewayNode = [edge.startNodeId, edge.endNodeId]
@@ -961,6 +1154,9 @@ export function analyzeRoadGraphV3(graph) {
     centerJunctionDensity: centerJunctionCount / centerArea,
     outerJunctionDensity: outerJunctionCount / outerArea,
     maximumStraightContinuationLength,
+    streetBearingConcentration: q6(streetBearingConcentration),
+    trunkRoutePairs,
+    linkedTrunkRoutePairs,
     gatewayContinuityAngles: Object.freeze(gatewayContinuityAngles.map(q6)),
     maximumGatewayContinuityAngle: gatewayContinuityAngles.length ? Math.max(...gatewayContinuityAngles) : 0,
   });
@@ -1122,8 +1318,23 @@ export function validateRoadGraphV3(graph) {
       if (metrics.centerJunctionDensity <= metrics.outerJunctionDensity) {
         errors.push('CITY center junction density must exceed outer density');
       }
-      if (!edges.some(edge => edge.flags?.crossConnection && edge.flags?.incomplete)) {
-        errors.push('CITY requires incomplete cross connections');
+      // The check this replaces was `edges.some(e => e.flags.crossConnection &&
+      // e.flags.incomplete)`, and both flags are hardcoded literals at the single
+      // addArcConnection call site - never computed, never false. It therefore tested which
+      // function drew the edge rather than any property of the result, and the finite
+      // capital fails it outright because it has no arcs at all. What CITY actually
+      // declares is `roadPattern: GRID`, which nothing enforced, so that is checked now.
+      if (metrics.streetBearingConcentration < CITY_GRID_CONCENTRATION_MINIMUM) {
+        errors.push('CITY streets must align to two perpendicular axes');
+      }
+      // The other half of "incomplete cross connections". Phrasing it as "not every trunk
+      // pair may be linked" does not survive contact with a lattice, where every lane
+      // reaches both trunks; that reading only ever made sense for radial spokes. What the
+      // word was reaching for is that a capital is not a closed figure - it still has
+      // streets that stop. The finite capital satisfies this emphatically with 24 dead-end
+      // branches, and a fully closed lattice with no stubs would not.
+      if (metrics.localDeadEndCount < 1) {
+        errors.push('CITY requires local streets that terminate');
       }
     }
   }

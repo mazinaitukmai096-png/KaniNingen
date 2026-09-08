@@ -1388,6 +1388,144 @@ relaxed".** Through the existing formula with CITY's own 85-95 preferred band it
 The relaxation has to be sourced deliberately and separately, not read out of 0.92.
 
 
+## Stage 1: the lattice
+
+The CITY grammar now lays a rectilinear lattice on the global `GRID:base-axis` frame it
+previously used only to fan its radial spokes out. Two lanes on one axis and three or four
+on the other, crossing; `localSpineCount` of 2 restored to its name as the two lanes that
+carry branches; `localGrowthCount` of 6 branches, three per spine, perpendicular; gateways
+entering where their own bearing first meets a lane.
+
+```
+                     radial (before)   lattice (after)   finite capital
+bearing concentration      0.245            0.948            ~1.0
+within 10 deg of an axis   33.3%            96.9%            100%
+exact right angles          3.0%            60.3%            100%
+road length                592 m           1094 m            819 m
+frontage-eligible          592 m           1094 m
+raw slots                    196              364
+Lots per Block               3.0             19.0
+buildings from Lots         7.7%            35.9%
+buildings (median)            52               64  <- at the cap
+generation failures        0/226            0/226
+```
+
+TOWN and RURAL road networks are untouched - identical segment counts, lengths and
+densities. The target band for stage 3 was 0.90 to 0.95 concentration, and the lattice
+lands at 0.948 on lane-spacing jitter alone, so the planned "loosening" stage is not
+needed.
+
+### The whole grid was frontage-ineligible
+
+The first lattice put 73% more road on the ground and **halved** the buildable length, from
+592 m to 290 m, and the capital dropped from 52 buildings to 30. The closed Blocks it
+finally produced generated zero Lots, rejected as `NO_VALID_FRONTAGE`. In the game the
+streets were laid out neatly with nothing between them.
+
+`addPolyline` set the frontage verdict on every edge it made:
+
+```js
+frontageEligible: roadClass !== ROAD_GRAPH_CLASSES.ARTERIAL,
+```
+
+`addEdge`, the primitive underneath it, set nothing. The lattice lanes are built with
+`addEdge` directly, so all 23 of them carried `frontageEligible: undefined` and dropped out
+of both frontage selection and Lot generation - taking the Blocks they bound with them.
+
+The default now lives on `addEdge` and the duplicate in `addPolyline` is gone. That is safe
+precisely because it was only ever missing at the new call sites: of the four callers, the
+two that predate this work (`addPolyline` itself and `addGatewayConnection`) both set the
+flag explicitly, and an explicit flag still wins - `addGatewayConnection` marks an ARTERIAL
+frontage-eligible on purpose. A default belongs on the primitive that makes the thing, not
+on one of its two callers.
+
+### Gateways enter where their bearing meets a lane
+
+Three constructions were tried and abandoned before one held, and the reason each failed is
+the same fact: **`segmentsIntersect` counts a bare touch as an intersection.** A shared
+endpoint, a T-junction, a collinear overlap - all true.
+
+```
+touching at an endpoint  -> true
+T-junction (mid contact) -> true
+proper crossing          -> true
+collinear overlap        -> true
+```
+
+Radial spokes never met this, because spokes radiating from one hub cannot touch. A lattice
+is nothing but contacts. Routing a gateway to a lane *end* and turning to reach it puts the
+corner on whichever lane runs through that end, or runs the second leg along it; either way
+the graph is rejected. Widening the search only moved which settlement failed.
+
+What works is to stop routing and start planning: compute where each gateway's bearing
+first meets a lane, put a node there, and weave it into that lane's chain the way branch
+attachments already are. The approach is then one radial leg from the outer circle to that
+node - it touches nothing because it stops at the first thing it reaches, and the lane
+already has a node waiting. `gatewayContinuityAngles` sits at 0 because the leg is
+collinear with the arterial that feeds it.
+
+One trap on the way: a `0.005R` margin that skipped entry candidates too close to a lane
+end. Rejecting a lane as a *candidate* does not remove it as an *obstacle* - it just hides
+it, and the leg then runs through the lane it declined to stop at. No margin is small
+enough to fix that; only a crossing genuinely beyond the lane end is not a crossing.
+
+### Two CITY invariants were replaced
+
+`CITY requires incomplete cross connections` tested `edges.some(e => e.flags.crossConnection
+&& e.flags.incomplete)`, and both flags are hardcoded literals at the single
+`addArcConnection` call site - never computed, never false. It tested which function drew
+the edge. The finite capital fails it outright, having no arcs at all.
+
+In its place, the declaration nothing enforced: `roadPattern: GRID` becomes a measured
+floor on street-bearing concentration. Roads leaving for a neighbour are excluded - the
+arterial by class and the collector approach by its `gatewayRoute` flag - because they are
+aimed at that neighbour rather than laid along the town plan, which is the same exclusion
+that shows all 42 of the finite capital's street segments at exactly 0 or 90 degrees.
+
+The second half of "incomplete" became `localDeadEndCount >= 1`. Phrasing it as "not every
+trunk pair may be linked" does not survive a lattice, where every lane reaches both trunks;
+that reading only ever made sense for radial spokes. A capital is not a closed figure - it
+still has streets that stop, and the finite capital satisfies that with 12 of them.
+
+Both rewritten checks pass on the finite capital. The checks they replaced did not.
+
+### What the failing tests actually meant
+
+Three tests broke and none of them meant what its name suggested.
+
+- **The determinism test was not a determinism failure.** `createRoadGraphV3` threw on one
+  fixture Settlement and execution never reached a single determinism assertion. The margin
+  bug above was the cause.
+- **The lever 1 test** (`resolved 6 = streets built + streets omitted`) was collateral from
+  the same throw; only the route id pattern needed updating for the new grammar.
+- **`bendNodeIds.size > 0`** guards a real rule - a bend is geometry, so it must have degree
+  exactly 2 - against being vacuous. In v3 a `bend` is the articulation of a polyline drawn
+  through intermediate points, and a lattice runs straight from junction to junction, so it
+  makes none. The guard is now scoped to the grammars that curve. The first guess, that it
+  encoded a radial assumption, was wrong: the finite capital does carry 21 degree-2 nodes.
+  They come from subdividing its straight runs, not from curvature, so they are not evidence
+  that a grid should bend.
+
+### Lever 3's arterial test asserted the wrong half
+
+It required `onArterial.length > 0` - that a CITY actually places buildings on its gateway
+arterial. That passed only because the radial CITY offered 592 m of street and ran out. With
+1094 m the suppression works as designed and no CITY building takes an arterial:
+
+```
+buildings fronting the gateway ARTERIAL
+  CITY     0 / 1152 =  0.0%
+  TOWN  2993 / 22300 = 13.4%
+  RURAL  143 / 2736 =  5.2%
+```
+
+The mechanism is plainly alive where frontage is still scarce. What lever 3 restored was
+that an arterial is *available* as a last resort, never that it is always taken, so the
+test now checks that every arterial stays frontage-eligible and that street frontage exists
+to be preferred. The suppression check - nothing takes an arterial where a street runs
+within the finite 8 m MAJOR bias - is unchanged.
+
+
 ## Lots were allowed to lie under Roads
 
 `settlement-lot-v1` sized every Lot against the Block polygon and never against the Roads
