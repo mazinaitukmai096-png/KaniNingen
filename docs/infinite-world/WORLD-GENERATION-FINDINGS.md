@@ -1994,6 +1994,42 @@ A partial result should raise the question of what partitions it, before it is r
 support. "Which cases work and which do not, and what separates them" is the first question
 of a partial pass, not a follow-up.
 
+### Named: the fix and the symptom had disjoint conditions
+
+Separate from the proxy pattern, and a different kind of failure. The road lift was answered
+from the Tank terrain cache, which is filled only while `activeScaleStageId === 'MAX'`. The
+sinking is visible only at the small stages, because `footOffsetMeters` shrinks with scale
+while the 7.5 cm lift does not. So:
+
+```
+symptom visible   : TINY, MID
+fix has any effect: MAX
+intersection      : none
+```
+
+The fix could not have worked in any situation where anyone would look for it, and no
+measurement taken at one end says anything about the other. The tests never noticed because
+they built the state directly and so satisfied both conditions at once - a thing the running
+game cannot do.
+
+**The check:** state the condition under which the fix takes effect and the condition under
+which the symptom appears, and confirm they overlap. This is cheap - it is two sentences -
+and it catches a whole class of fix that tests at the unit level cannot. When the two are
+disjoint, no amount of passing tests at either end is evidence.
+
+The repair is not to widen the conditions but to remove the split. `getRoadSurfaceLiftMeters`
+now reads the resident Chunk store, the same store the player's terrain height comes from, so
+there is no second condition left to diverge: whatever supplies the ground supplies the road
+on it, and a miss degrades both the same way. The gameplay runtime's Tank cache went back to
+holding terrain and nothing else, which was the reason it was slimmed in the first place.
+
+The seam that remains is a Road ending exactly on a Chunk boundary: that final line is owned
+by the neighbouring Chunk, which holds no piece of the Road, so it answers 0. Measured at 2
+of 38 endpoints and gone at an inset of one micrometre, with 741 of 741 interior samples
+lifted. It has no width, the surface either side of it is correct, and closing it would cost
+a neighbour lookup near every boundary each frame. Recorded rather than fixed.
+
+
 ## Also worth knowing
 
 - **28% of CITY Settlements have no connectivity gateways.** `buildConnectivityGraphNear`
